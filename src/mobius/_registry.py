@@ -29,11 +29,13 @@ from mobius._configs import (
     Gemma4AssistantConfig,
     Gemma4Config,
     Lfm2Config,
+    Lfm2VlConfig,
     MMSConfig,
     MoonshineConfig,
     MuseGlimmerConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
+    SenseNovaU1Config,
     WhisperConfig,
 )
 from mobius.models import (
@@ -66,6 +68,8 @@ from mobius.models import (
     Glm4CausalLMModel,
     Glm4MoECausalLMModel,
     GlmCausalLMModel,
+    GlmMoeDsaCausalLMModel,
+    GlmOcrForConditionalGeneration,
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
@@ -75,6 +79,7 @@ from mobius.models import (
     InternLM2CausalLMModel,
     LayerNormCausalLMModel,
     Lfm2CausalLMModel,
+    Lfm2VlForConditionalGeneration,
     LLaDAModel,
     Llama4CausalLMModel,
     MageVLForConditionalGeneration,
@@ -123,6 +128,7 @@ from mobius.models.cohere import CohereCausalLMModel
 from mobius.models.ctrl import CTRLCausalLMModel
 from mobius.models.depth_anything import DepthAnythingForDepthEstimation
 from mobius.models.distilbert import DistilBertModel
+from mobius.models.esm import EsmConfig, EsmModel
 from mobius.models.falcon import (
     BloomCausalLMModel,
     FalconCausalLMModel,
@@ -130,6 +136,7 @@ from mobius.models.falcon import (
 )
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
@@ -157,6 +164,7 @@ from mobius.models.qwen3_tts import Qwen3TTSForConditionalGeneration
 from mobius.models.qwen3_tts_tokenizer import Qwen3TTSTokenizerV2Model
 from mobius.models.sam2 import Sam2VisionModel
 from mobius.models.segformer import SegformerForSemanticSegmentation
+from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5ForConditionalGeneration
@@ -186,6 +194,7 @@ class ModelRegistration:
             phimoe).  ``None`` means auto-derive from the model_type prefix.
         variant: Short label identifying the code-path variant (e.g. ``"mla"``,
             ``"moe"``, ``"sliding_window"``).  Used for dashboard display.
+        test_revision: Optional immutable HuggingFace revision for L2 validation.
     """
 
     module_class: type[nn.Module]
@@ -194,6 +203,7 @@ class ModelRegistration:
     test_model_id: str | None = None
     family: str | None = None
     variant: str | None = None
+    test_revision: str | None = None
 
 
 class ModelRegistry:
@@ -229,6 +239,7 @@ class ModelRegistry:
         test_model_id: str | None = None,
         family: str | None = None,
         variant: str | None = None,
+        test_revision: str | None = None,
     ) -> None:
         """Register a module class for an architecture name.
 
@@ -242,6 +253,7 @@ class ModelRegistry:
             test_model_id: HuggingFace model ID for L2 architecture validation.
             family: Dashboard family grouping override.
             variant: Short label for the code-path variant.
+            test_revision: Optional immutable HuggingFace revision for L2 validation.
         """
         self._map[architecture] = ModelRegistration(
             module_class,
@@ -250,6 +262,7 @@ class ModelRegistry:
             test_model_id,
             family,
             variant,
+            test_revision,
         )
 
     def get(self, architecture: str) -> type[nn.Module]:
@@ -576,6 +589,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "deepseek_v3": ModelRegistration(DeepSeekV3CausalLMModel),
     "deepseek_v4": ModelRegistration(DeepSeekV4CausalLMModel, task="deepseek-v4"),
     "deepseek_vl_v2": ModelRegistration(DeepSeekOCR2CausalLMModel),
+    # --- GLM-5.2 (MLA + DeepSeek Sparse Attention (DSA) + MoE) ---
+    "glm_moe_dsa": ModelRegistration(GlmMoeDsaCausalLMModel, task="glm-moe-dsa"),
     # --- SSM (Mamba / Mamba2) ---
     "falcon_mamba": ModelRegistration(MambaCausalLMModel),
     "mamba": ModelRegistration(MambaCausalLMModel),
@@ -611,8 +626,21 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4v_moe": ModelRegistration(LLaVAModel, task="vision-language"),
     "glm4v_moe_text": ModelRegistration(Glm4MoECausalLMModel),
     "glm4v_text": ModelRegistration(Glm4CausalLMModel),
+    "glm_ocr": ModelRegistration(
+        GlmOcrForConditionalGeneration,
+        task="glm-ocr",
+        test_model_id="zai-org/GLM-OCR",
+        test_revision="ca5d8b3e287e52589e37c28385d9655ee4372f9d",
+    ),
     "got_ocr2": ModelRegistration(LLaVAModel, task="vision-language"),
     "hunyuan_vl_mot": ModelRegistration(HunYuanVLMoTModel, task="hunyuan-vl-mot"),
+    "neo_chat": ModelRegistration(
+        SenseNovaU1Model,
+        task="sensenova-u1",
+        config_class=SenseNovaU1Config,
+        family="sensenova",
+        variant="mot_unified",
+    ),
     "idefics2": ModelRegistration(LLaVAModel, task="vision-language"),
     "idefics3": ModelRegistration(LLaVAModel, task="vision-language"),
     "instructblip": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -620,6 +648,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "internvl": ModelRegistration(InternVL2Model, task="vision-language"),
     "internvl2": ModelRegistration(InternVL2Model, task="vision-language"),
     "internvl_chat": ModelRegistration(InternVL2Model, task="vision-language"),
+    "lfm2_vl": ModelRegistration(
+        Lfm2VlForConditionalGeneration,
+        task="lfm2-vl",
+        config_class=Lfm2VlConfig,
+    ),
     "mage_vl": ModelRegistration(MageVLForConditionalGeneration, task="mage-vl"),
     "janus": ModelRegistration(LLaVAModel, task="vision-language"),
     "llava": ModelRegistration(LLaVAModel, task="vision-language"),
@@ -680,6 +713,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "fun_asr": ModelRegistration(
         FunASRForConditionalGeneration, task="fun-asr-speech-language"
     ),
+    "glmasr": ModelRegistration(GlmAsrForConditionalGeneration, task="glmasr-speech-language"),
     "qwen3_asr": ModelRegistration(Qwen3ASRForConditionalGeneration, task="speech-language"),
     "qwen3_forced_aligner": ModelRegistration(
         Qwen3ASRForConditionalGeneration, task="speech-language"
@@ -710,7 +744,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "electra": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie": ModelRegistration(BertModel, task="feature-extraction"),
     "ernie_m": ModelRegistration(BertModel, task="feature-extraction"),
-    "esm": ModelRegistration(BertModel, task="feature-extraction"),
+    "esm": ModelRegistration(EsmModel, task="feature-extraction", config_class=EsmConfig),
     "flaubert": ModelRegistration(BertModel, task="feature-extraction"),
     "ibert": ModelRegistration(BertModel, task="feature-extraction"),
     "layoutlm": ModelRegistration(BertModel, task="feature-extraction"),
@@ -843,7 +877,14 @@ def _create_default_registry() -> ModelRegistry:
     reg = ModelRegistry()
     for arch, entry in _REGISTRATIONS.items():
         reg.register(
-            arch, entry.module_class, task=entry.task, config_class=entry.config_class
+            arch,
+            entry.module_class,
+            task=entry.task,
+            config_class=entry.config_class,
+            test_model_id=entry.test_model_id,
+            family=entry.family,
+            variant=entry.variant,
+            test_revision=entry.test_revision,
         )
     # Attach test_model_id, family, and variant metadata to registrations.
     _apply_test_metadata(reg)
@@ -863,6 +904,12 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "muse_glimmer_text": "muse_glimmer_text",
     "gemma3n": "gemma3n_text",
     "gemma3n_text": "gemma3n_text",
+    # Shipped Gemma 4 multimodal checkpoints (e.g. ``google/gemma-4-E2B-it``)
+    # declare ``model_type="gemma4"`` with a nested ``text_config`` whose own
+    # ``model_type`` is ``gemma4_text``. Both resolve to the same
+    # ``Gemma4CausalLMModel`` backbone, so ``text_only=True`` is supported.
+    "gemma4": "gemma4_text",
+    "gemma4_text": "gemma4_text",
     "gemma4_unified": "gemma4_unified_text",
     "gemma4_unified_text": "gemma4_unified_text",
     # Qwen3.5-MoE-VL (Qwen3.6-35B-A3B): export just the hybrid MoE text
@@ -1002,6 +1049,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
     "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
+    # --- GLM-5.2 (MLA + DSA + MoE) ---
+    "glm_moe_dsa": "zai-org/GLM-5.2",
 
     # --- SSM (Mamba) ---
     "mamba": "state-spaces/mamba-130m-hf",
@@ -1018,6 +1067,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen2_vl_text": "Qwen/Qwen2-VL-2B-Instruct",
     "qwen2_5_vl": "Qwen/Qwen2.5-VL-3B-Instruct",
     "qwen2_5_vl_text": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "glm_ocr": "zai-org/GLM-OCR",
     "qwen3_vl": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_vl_text": "Qwen/Qwen3-VL-2B-Instruct",
     "qwen3_5": "Qwen/Qwen3.5-2B",
@@ -1044,6 +1094,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "molmo": "allenai/MolmoE-1B-0924",
     "mistral3": "mistralai/Ministral-3-3B-Instruct-2512",
     "minicpmv4_6": "openbmb/MiniCPM-V-4.6",
+    "lfm2_vl": "LiquidAI/LFM2.5-VL-3B",
     "aya_vision": "CohereForAI/aya-vision-8b",
     "chameleon": "facebook/chameleon-7b",
     "cohere2_vision": "CohereForAI/c4ai-command-r7b-12-2024",
@@ -1053,10 +1104,11 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "fuyu": "adept/fuyu-8b",
     "glm4v": "THUDM/glm-4v-9b",
     "glm4v_moe": "THUDM/glm-4v-9b",
-    "glm4v_moe_text": "THUDM/glm-4v-9b",
+    "glm4v_moe_text": "zai-org/GLM-4.5V",
     "glm4v_text": "THUDM/glm-4v-9b",
     "got_ocr2": "stepfun-ai/GOT-OCR2_0",
     "hunyuan_vl_mot": "tencent/HY-Embodied-0.5-X",
+    "neo_chat": "sensenova/SenseNova-U1.5-8B-MoT",
     "instructblipvideo": "Salesforce/instructblip-flan-t5-xl",
     "internvl": "OpenGVLab/InternVL2-1B",
     "internvl_chat": "OpenGVLab/InternVL-Chat-V1-5",
@@ -1079,6 +1131,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",
+    "glmasr": "zai-org/GLM-ASR-Nano-2512",
     "sensevoice_small": "mlx-community/SenseVoiceSmall",
     "mms": "facebook/mms-300m",
     "parakeet_ctc": "nvidia/parakeet-ctc-1.1b",
@@ -1252,6 +1305,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",
     "fun_asr": "qwen",
+    "glmasr": "glm",
     "qwen3_tts": "qwen",
     "qwen3_tts_tokenizer_12hz": "qwen",
     "deepseek_v2": "deepseek",
@@ -1259,6 +1313,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "deepseek_v3": "deepseek",
     "deepseek_v4": "deepseek",
     "deepseek_vl_v2": "deepseek",
+    "glm_moe_dsa": "glm",
     "olmo": "olmo",
     "olmo2": "olmo",
     "olmo3": "olmo",
@@ -1267,6 +1322,7 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "code_llama": "llama",
     "llama4_text": "llama",
     "lfm2": "lfm",
+    "lfm2_vl": "lfm",
     "mllama": "llama",
     "mistral": "mistral",
     "mistral3": "mistral",
@@ -1331,6 +1387,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "deepseek_v2_moe": "mla+moe",
     "deepseek_v3": "mla+moe",
     "deepseek_v4": "dense-csa-fallback+mtp+moe+hc",
+    "glm_moe_dsa": "mla+dsa-indexshare+full-attention-fallback+moe",
     "phi3small": "blocksparse",
     "falcon_h1": "hybrid-ssm",
     "mamba": "ssm",
@@ -1339,6 +1396,7 @@ _VARIANT_LABELS: dict[str, str] = {
     "jamba": "hybrid-ssm+attn",
     "bamba": "hybrid-mamba2+attn",
     "lfm2": "hybrid-conv+attn",
+    "lfm2_vl": "siglip2-naflex+hybrid-conv+attn",
     "qwen3_next": "moe+linear-attn",
 }
 

@@ -362,6 +362,7 @@ def _register_builtins() -> None:
                 {ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16}
             ),
             supports_skip_layer_norm=False,
+            supports_matmul_nbits=False,
             enable_graph_capture=True,
             supports_past_present_share_buffer=True,
         ),

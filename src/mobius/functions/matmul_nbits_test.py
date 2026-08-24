@@ -131,7 +131,7 @@ class TestMatMulNBitsInlineParity:
 
 
 class TestMatMulNBitsEpGating:
-    """A qnn build lowers MatMulNBits to QDQ; a cpu build keeps the contrib op."""
+    """EPs without native MatMulNBits support lower blockwise INT4 to QDQ."""
 
     def _build(self, ep: str):
         import dataclasses
@@ -179,5 +179,10 @@ class TestMatMulNBitsEpGating:
 
     def test_qnn_lowers_to_qdq(self):
         ops = self._build("qnn")
+        assert ops.get("MatMulNBits", 0) == 0
+        assert ops.get("DequantizeLinear", 0) > 0
+
+    def test_trt_rtx_lowers_to_qdq(self):
+        ops = self._build("trt-rtx")
         assert ops.get("MatMulNBits", 0) == 0
         assert ops.get("DequantizeLinear", 0) > 0

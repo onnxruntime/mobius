@@ -84,6 +84,17 @@ _SKIP_REASONS: dict[str, str] = {
     # Zamba weight-tying references layers.2.shared_transf (the third layer) but
     # the tiny config only has 2 layers — HF tie_weights validation crashes.
     "zamba": "Zamba weight-tying requires num_layers > 2; tiny 2-layer config causes HF tie_weights error",
+    # GLM-5.2's default (config.use_dsa=True) DSA/IndexShare path emits
+    # pkg.nxrt::IndexShare -- a custom onnx-genai-runtime domain with no
+    # stock-ORT registration, so this generic OnnxModelSession-based harness
+    # can never execute it (unlike com.microsoft::QMoE, a real ORT contrib
+    # op). DSA numeric correctness is covered instead by the dedicated
+    # GlmMoeDsaIndexer-vs-transformers parity test in glm_moe_dsa_test.py and
+    # by onnx-genai's native-CPU/CUDA e2e regression
+    # (glm_tiny_qmoe_native_cuda_e2e.rs); the config.use_dsa=False
+    # (--glm-full-attention) dense-MLA fallback has no custom ops and would
+    # be exercised by this harness if the tiny config defaulted to it.
+    "glm_moe_dsa": "DSA/IndexShare emits pkg.nxrt::IndexShare, unsupported by stock ORT",
 }
 
 # Per-model atol overrides for L3 synthetic parity.
@@ -160,10 +171,19 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Gemma3 VL: same QK-norm FP accumulation as gemma3_text (~0.045 max diff).
     # argmax_match=True (near-tie), cosine=0.996 — functionally correct.
     "gemma3": 0.05,
-    # DeepSeek-V3: sigmoid-gated MoE with fused expert weights. Sequential vs batched
-    # expert dispatch produces FP accumulation differences → ~0.034 max diff.
-    # Near-tie argmax, cosine=0.996 — functionally correct.
-    "deepseek_v3": 0.04,
+    # DeepSeek-V3: previously carried a 0.04 override attributed to "MoE
+    # dispatch FP accumulation", but that was masking a real bug: the
+    # DeepSeek-V2/V3 MLA softmax scale was missing the YaRN
+    # mscale_all_dim^2 correction HF applies (see
+    # ``mobius.components._rotary_embedding.yarn_apply_mscale``). Fixed in
+    # ``_deepseek_mla.py``. Post-fix, remaining diff is genuine FP-order
+    # noise from parallel MoE dispatch: ~3.5e-5 measured via a standalone
+    # interpreter, ~1.2e-3 measured under this pytest process (both
+    # reproducible in their own harness — the residual gap is ORT
+    # intra-op thread-schedule dependent, not seed-dependent). 0.0025
+    # keeps ~2x headroom over the higher measurement while staying 16x
+    # tighter than the old 0.04.
+    "deepseek_v3": 0.0025,
     # dots1: same DeepSeek V3 architecture (sigmoid routing + shared experts).
     # MoE dispatch accumulation differences → similar tolerance needed.
     "dots1": 0.04,

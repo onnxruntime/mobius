@@ -25,13 +25,23 @@ from mobius._configs import QuantizationConfig
 logger = logging.getLogger(__name__)
 
 # Key suffixes marking a *packed quantized* sidecar tensor rather than a float
-# weight. Olive appends them with an underscore directly to the parameter name
-# (``<pname>_qweight``, see Olive's ``olive/common/quant/state_dict.py``), while
-# GPTQ/AWQ store dotted sibling buffers on the owning module
-# (``<module>.qweight``). Both conventions occur in raw HF checkpoints.
-OLIVE_PACKED_QUANT_SUFFIXES = ("_qweight", "_scales", "_qzeros")
-DOTTED_PACKED_QUANT_SUFFIXES = (".qweight", ".scales", ".qzeros")
-PACKED_QUANT_SUFFIXES = OLIVE_PACKED_QUANT_SUFFIXES + DOTTED_PACKED_QUANT_SUFFIXES
+# weight. A "sidecar" here is an auxiliary tensor that rides alongside a
+# quantized parameter's canonical ``.weight`` key instead of replacing it —
+# the packed integer payload (``qweight``) plus its per-group ``scales`` and
+# ``qzeros`` are each stored under their own key, so one logical weight is
+# split across several sidecar keys until they are unpacked back into a
+# single dequantized tensor. Olive appends them with an underscore directly
+# to the parameter name (``<pname>_qweight``, see Olive's
+# ``olive/common/quant/state_dict.py``), while GPTQ/AWQ store dotted sibling
+# buffers on the owning module (``<module>.qweight``). Both conventions occur
+# in raw HF checkpoints.
+OLIVE_PACKED_QUANT_SUFFIXES: frozenset[str] = frozenset({"_qweight", "_scales", "_qzeros"})
+DOTTED_PACKED_QUANT_SUFFIXES: frozenset[str] = frozenset({".qweight", ".scales", ".qzeros"})
+# str.endswith() requires a tuple (not a set), so the combined predicate below
+# needs a tuple even though the two suffix sets above are otherwise unordered.
+PACKED_QUANT_SUFFIXES: tuple[str, ...] = tuple(
+    OLIVE_PACKED_QUANT_SUFFIXES | DOTTED_PACKED_QUANT_SUFFIXES
+)
 
 
 def is_packed_quant_key(name: str) -> bool:

@@ -28,6 +28,7 @@ import ast
 import contextlib
 import dataclasses
 import functools
+import json
 import os
 import shutil
 import warnings
@@ -320,7 +321,7 @@ def _make_empty_kv_cache(
             ltype = (
                 layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
             )
-            if ltype in ("linear_attention", "mamba", "mamba2"):
+            if ltype in ("conv", "linear_attention", "mamba", "mamba2"):
                 # Fixed-size recurrent state: replace symbolic dims with 1
                 static = [d if isinstance(d, int) and d > 0 else 1 for d in shape]
             else:
@@ -1208,10 +1209,11 @@ def _make_vl_decoder_cache_feeds(
         ltype = layer_types[layer_idx] if layer_idx < len(layer_types) else "full_attention"
         shape = dec_session.get_input_shape(name) or []
 
-        if ltype in ("linear_attention", "mamba", "mamba2"):
+        if ltype in ("conv", "linear_attention", "mamba", "mamba2"):
             # Fixed-size recurrent state: replace symbolic/zero dims with 1
             feeds[name] = np.zeros(
-                [d if isinstance(d, int) and d > 0 else 1 for d in shape], dtype=np.float32
+                [d if isinstance(d, int) and d > 0 else 1 for d in shape],
+                dtype=dec_session.get_input_dtype(name) or np.float32,
             )
         else:
             # Standard KV cache: seq dim starts at 0 (empty)
@@ -1230,7 +1232,9 @@ def _update_vl_cache(
     num_hidden_layers = getattr(config, "num_hidden_layers", 0)
     for i in range(num_hidden_layers):
         ltype = layer_types[i] if i < len(layer_types) else "full_attention"
-        if ltype == "linear_attention":
+        if ltype == "conv":
+            suffixes = ("conv_state",)
+        elif ltype == "linear_attention":
             suffixes = ("conv_state", "recurrent_state")
         elif ltype in ("mamba", "mamba2"):
             suffixes = ("conv_state", "ssm_state")
@@ -1770,18 +1774,29 @@ def _run_speech_language_prefill(
     # full Qwen3ASRProcessor) because the HF repo lacks auto_map.
     # Fall back to WhisperFeatureExtractor which is what Qwen3-ASR
     # actually uses under the hood.
-    fe = getattr(processor, "feature_extractor", None)
-    if fe is None or not hasattr(fe, "sampling_rate"):
-        fe = transformers.WhisperFeatureExtractor.from_pretrained(
-            case.model_id,
-            revision=case.revision,
+    if case.model_type == "glmasr":
+        processed = processor.apply_transcription_request(
+            audio_array,
+            return_tensors="pt",
         )
-    audio_processed = fe(
-        [audio_array],
-        sampling_rate=16000,
-        return_tensors="np",
-        padding=False,
-    )
+        audio_processed = {
+            name: value.cpu().numpy()
+            for name, value in processed.items()
+            if name in {"input_features", "input_features_mask"}
+        }
+    else:
+        fe = getattr(processor, "feature_extractor", None)
+        if fe is None or not hasattr(fe, "sampling_rate"):
+            fe = transformers.WhisperFeatureExtractor.from_pretrained(
+                case.model_id,
+                revision=case.revision,
+            )
+        audio_processed = fe(
+            [audio_array],
+            sampling_rate=16000,
+            return_tensors="np",
+            padding=False,
+        )
 
     # Step 1: Run audio encoder
     audio_session = OnnxModelSession(pkg["audio_encoder"], **device_kwargs)
@@ -1806,7 +1821,10 @@ def _run_speech_language_prefill(
         ):
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
-            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+            audio_feeds["input_features_mask"] = np.ones(
+                (feats.shape[0], feats.shape[-1]),
+                dtype=mask_dtype,
+            )
         # Qwen3-ASR requires ``feature_attention_mask`` of shape
         # ``(batch, mel_seq)`` where ``input_features`` is
         # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
@@ -1834,11 +1852,18 @@ def _run_speech_language_prefill(
     finally:
         audio_session.close()
 
-    audio_hidden = audio_out[next(iter(audio_out))]
-    # Audio encoder output is [batch, seq, hidden]; embedding expects
-    # [num_tokens, hidden] (no batch dim).
+    audio_hidden = audio_out["audio_features"]
+    # Legacy speech encoders return padded [B, T, H] plus valid lengths;
+    # newer stages (including GLM-ASR) strip padding inside the ONNX graph.
     if audio_hidden.ndim == 3:
-        audio_hidden = audio_hidden[0]  # squeeze batch
+        lengths = audio_out.get("audio_feature_lengths")
+        if lengths is not None:
+            audio_hidden = np.concatenate(
+                [rows[: int(length)] for rows, length in zip(audio_hidden, lengths)],
+                axis=0,
+            )
+        else:
+            audio_hidden = audio_hidden[0]
 
     # Build input_ids from golden reference
     input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
@@ -2624,18 +2649,29 @@ def _run_speech_language_generation(
     audio_path = _TESTDATA_DIR / case.audio[0]
     audio_array, _sr = librosa.load(str(audio_path), sr=16000)
 
-    fe = getattr(processor, "feature_extractor", None)
-    if fe is None or not hasattr(fe, "sampling_rate"):
-        fe = transformers.WhisperFeatureExtractor.from_pretrained(
-            case.model_id,
-            revision=case.revision,
+    if case.model_type == "glmasr":
+        processed = processor.apply_transcription_request(
+            audio_array,
+            return_tensors="pt",
         )
-    audio_processed = fe(
-        [audio_array],
-        sampling_rate=16000,
-        return_tensors="np",
-        padding=False,
-    )
+        audio_processed = {
+            name: value.cpu().numpy()
+            for name, value in processed.items()
+            if name in {"input_features", "input_features_mask"}
+        }
+    else:
+        fe = getattr(processor, "feature_extractor", None)
+        if fe is None or not hasattr(fe, "sampling_rate"):
+            fe = transformers.WhisperFeatureExtractor.from_pretrained(
+                case.model_id,
+                revision=case.revision,
+            )
+        audio_processed = fe(
+            [audio_array],
+            sampling_rate=16000,
+            return_tensors="np",
+            padding=False,
+        )
 
     # --- Step 1: audio encoder ---
     suppress_ids = _load_suppress_token_ids(
@@ -2662,7 +2698,10 @@ def _run_speech_language_generation(
         ):
             feats = audio_feeds["input_features"]
             mask_dtype = audio_session.get_input_dtype("input_features_mask") or np.bool_
-            audio_feeds["input_features_mask"] = np.ones(feats.shape[:2], dtype=mask_dtype)
+            audio_feeds["input_features_mask"] = np.ones(
+                (feats.shape[0], feats.shape[-1]),
+                dtype=mask_dtype,
+            )
         # Qwen3-ASR requires ``feature_attention_mask`` of shape
         # ``(batch, mel_seq)`` where ``input_features`` is
         # ``(batch, n_mels, mel_seq)``.  The feature extractor is called with
@@ -2690,9 +2729,16 @@ def _run_speech_language_generation(
     finally:
         audio_session.close()
 
-    audio_hidden = audio_out[next(iter(audio_out))]
+    audio_hidden = audio_out["audio_features"]
     if audio_hidden.ndim == 3:
-        audio_hidden = audio_hidden[0]  # squeeze batch → [seq, hidden]
+        lengths = audio_out.get("audio_feature_lengths")
+        if lengths is not None:
+            audio_hidden = np.concatenate(
+                [rows[: int(length)] for rows, length in zip(audio_hidden, lengths)],
+                axis=0,
+            )
+        else:
+            audio_hidden = audio_hidden[0]
 
     # --- Build input_ids from golden reference ---
     input_ids = np.array(golden.input_ids, dtype=np.int64).reshape(1, -1)
@@ -2785,10 +2831,20 @@ def _run_speech_language_generation(
         past_seq_len = prompt_seq_len
 
         # --- Step 4: decode loop ---
-        empty_audio = np.zeros((0, hidden_size), dtype=np.float32)
-        eos_token_id = case.generation_params.get("eos_token_id")
+        audio_dtype = (
+            emb_session.get_input_dtype(audio_feat_input)
+            if audio_feat_input is not None
+            else None
+        ) or np.float32
+        empty_audio = np.zeros((0, hidden_size), dtype=audio_dtype)
+        eos_token_id = case.generation_params.get(
+            "eos_token_id", getattr(config, "eos_token_id", None)
+        )
+        eos_token_ids = (
+            {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or ())
+        )
         for _ in range(max_new_tokens - 1):
-            if eos_token_id is not None and np.all(next_token == eos_token_id):
+            if eos_token_ids and np.all(np.isin(next_token, tuple(eos_token_ids))):
                 break
 
             # Embed single token (no new audio features during decode)
@@ -2799,7 +2855,8 @@ def _run_speech_language_generation(
                 if name not in step_emb_feeds:
                     shape = emb_session.get_input_shape(name) or []
                     static_shape = [d if isinstance(d, int) and d > 0 else 0 for d in shape]
-                    step_emb_feeds[name] = np.zeros(static_shape, dtype=np.float32)
+                    input_dtype = emb_session.get_input_dtype(name) or np.float32
+                    step_emb_feeds[name] = np.zeros(static_shape, dtype=input_dtype)
             step_emb_out = emb_session.run(step_emb_feeds)
             step_embeds = step_emb_out[next(iter(step_emb_out))]
 
@@ -2943,12 +3000,42 @@ class TestL5GenerationE2E:
         expected_tokens = np.array(expected_token_ids, dtype=np.int64)
         expected_len = len(expected_tokens)
         actual_len = len(new_tokens)
+        if case.generation_params.get("exact_match", False):
+            assert actual_len == expected_len, (
+                f"L5 FAIL: exact length mismatch for {case.case_id}: "
+                f"expected {expected_len}, got {actual_len}"
+            )
+            assert np.array_equal(new_tokens, expected_tokens), (
+                f"L5 FAIL: exact token mismatch for {case.case_id}\n"
+                f"  Expected: {expected_tokens.tolist()}\n"
+                f"  Got:      {new_tokens.tolist()}"
+            )
+            with open(gen_path, encoding="utf-8") as f:
+                expected_text = json.load(f)["generated_text"]
+            import transformers
+
+            processor = transformers.AutoProcessor.from_pretrained(
+                case.model_id,
+                revision=case.revision,
+                trust_remote_code=case.trust_remote_code,
+            )
+            actual_text = processor.decode(new_tokens.tolist(), skip_special_tokens=True)
+            assert actual_text == expected_text, (
+                f"L5 FAIL: exact transcript mismatch for {case.case_id}\n"
+                f"  Expected: {expected_text!r}\n"
+                f"  Got:      {actual_text!r}"
+            )
         if case.task_type in {"ctc-asr", "feature-ctc-asr"} and actual_len != expected_len:
             pytest.fail(
                 f"L5 FAIL: CTC frame count changed for {case.case_id}: "
                 f"expected {expected_len}, got {actual_len}"
             )
         if actual_len != expected_len:
+            if tolerances.min_token_match_ratio >= 1.0:
+                pytest.fail(
+                    f"L5 FAIL: exact generation length changed for {case.case_id}: "
+                    f"expected {expected_len}, got {actual_len}"
+                )
             warnings.warn(
                 f"Length mismatch for {case.case_id}: "
                 f"expected {expected_len} tokens, "

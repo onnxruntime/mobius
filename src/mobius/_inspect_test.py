@@ -239,7 +239,8 @@ def test_explicit_task_without_config_returns_roles_without_source_paths(monkeyp
         staticmethod(lambda *a, **k: (_ for _ in ()).throw(OSError("no config"))),
     )
     monkeypatch.setattr(
-        "mobius.integrations.transformers._config_resolver._try_load_config_json", lambda *_a, **_k: None
+        "mobius.integrations.transformers._config_resolver._try_load_config_json",
+        lambda *_a, **_k: None,
     )
 
     components = inspect_components("anything", task="vision-language")
@@ -280,7 +281,8 @@ def test_unresolvable_config_raises(monkeypatch):
         staticmethod(lambda *a, **k: (_ for _ in ()).throw(OSError("no config"))),
     )
     monkeypatch.setattr(
-        "mobius.integrations.transformers._config_resolver._try_load_config_json", lambda *_a, **_k: None
+        "mobius.integrations.transformers._config_resolver._try_load_config_json",
+        lambda *_a, **_k: None,
     )
     with pytest.raises(ValueError, match="Could not load a HuggingFace config"):
         inspect_components("fake/diffusers-pipeline")
@@ -320,7 +322,15 @@ _MULTI_COMPONENT_MODEL_TYPES = [
     "qwen3_tts",
     "fastconformer_rnnt",
 ]
-_EMPTY_SOURCE_PATHS = {("trocr", "encoder")}
+_EMPTY_SOURCE_PATHS = {
+    ("trocr", "encoder"),
+    # Loop-wiring graphs mobius authors itself — no HuggingFace sub-module
+    # backs them.
+    ("qwen3_tts", "code_predictor_prefill"),
+    ("qwen3_tts", "code_predictor_step_embedder"),
+    ("qwen3_tts", "code_predictor_indices"),
+    ("qwen3_tts", "talker_text_step"),
+}
 
 
 @pytest.mark.parametrize("model_type", _MULTI_COMPONENT_MODEL_TYPES)

@@ -36,6 +36,7 @@ from _test_configs import (
     VISION_CONFIGS,
     VL_CONFIGS,
     _base_config,
+    vl_overrides,
 )
 
 from mobius._registry import registry
@@ -254,6 +255,46 @@ class TestNemotronParseWeightAlignment:
         _assert_identity_roundtrip(model_type, config_overrides)
 
 
+def test_lfm2_vl_huggingface_weight_alignment() -> None:
+    """Every three-model initializer is populated from the upstream key layout."""
+    config = _base_config(**vl_overrides("lfm2_vl"))
+    module = registry.get("lfm2_vl")(config)
+    pkg = get_task(_default_task_for_model("lfm2_vl")).build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+
+    hf_state: dict[str, torch.Tensor] = {}
+    for name in parameter_names:
+        if name.startswith("vision_encoder.vision_tower."):
+            suffix = name[len("vision_encoder.vision_tower.") :]
+            suffix = suffix.replace(".mlp.up_proj.", ".mlp.fc1.")
+            suffix = suffix.replace(".mlp.down_proj.", ".mlp.fc2.")
+            hf_name = f"model.vision_tower.vision_model.{suffix}"
+        elif name.startswith("vision_encoder.multi_modal_projector."):
+            hf_name = f"model.multi_modal_projector.{name[len('vision_encoder.multi_modal_projector.') :]}"
+        elif name in {
+            "decoder.lm_head.weight",
+            "decoder.model.embed_tokens.weight",
+            "embedding.embed_tokens.weight",
+        }:
+            hf_name = "model.language_model.embed_tokens.weight"
+        elif name.startswith("decoder.model."):
+            suffix = name[len("decoder.model.") :]
+            suffix = suffix.replace(".self_attn.o_proj.", ".self_attn.out_proj.")
+            suffix = suffix.replace(".self_attn.q_norm.", ".self_attn.q_layernorm.")
+            suffix = suffix.replace(".self_attn.k_norm.", ".self_attn.k_layernorm.")
+            suffix = suffix.replace(".feed_forward.gate_proj.", ".feed_forward.w1.")
+            suffix = suffix.replace(".feed_forward.up_proj.", ".feed_forward.w3.")
+            suffix = suffix.replace(".feed_forward.down_proj.", ".feed_forward.w2.")
+            hf_name = f"model.language_model.{suffix}"
+        else:
+            raise AssertionError(f"Unrecognized LFM2-VL parameter name: {name}")
+        hf_state[hf_name] = torch.ones(1)
+
+    aligned = module.preprocess_weights(hf_state)
+    missing = parameter_names - set(aligned)
+    assert not missing, f"LFM2-VL preprocessing missed: {sorted(missing)}"
+
+
 # ---------------------------------------------------------------------------
 # Detection model weight alignment
 # ---------------------------------------------------------------------------
@@ -298,5 +339,33 @@ def test_mage_vl_huggingface_checkpoint_alignment():
 
     # The shared source embedding must populate both decoder and embedding models.
     hf_state["model.language_model.embed_tokens.weight"] = torch.ones(1)
+    aligned = module.preprocess_weights(hf_state)
+    assert set(aligned) == parameter_names
+
+
+def test_glm_ocr_huggingface_checkpoint_alignment():
+    """Every exported GLM-OCR parameter maps to its checkpoint tensor name."""
+    config_overrides = next(overrides for mt, overrides, _ in VL_CONFIGS if mt == "glm_ocr")
+    config = _base_config(**config_overrides)
+    module = registry.get("glm_ocr")(config)
+    pkg = get_task("glm-ocr").build(module, config)
+    parameter_names = _collect_parameter_names(pkg)
+
+    hf_state: dict[str, torch.Tensor] = {}
+    for name in parameter_names:
+        if name == "embedding.embed_tokens.weight":
+            hf_name = "model.language_model.embed_tokens.weight"
+        elif name.startswith("decoder.model."):
+            hf_name = f"model.language_model.{name.removeprefix('decoder.model.')}"
+        elif name == "decoder.lm_head.weight":
+            hf_name = "lm_head.weight"
+        elif name.startswith("vision_encoder.visual."):
+            hf_name = f"model.{name.removeprefix('vision_encoder.')}"
+        else:
+            raise AssertionError(f"Unrecognized GLM-OCR parameter name: {name}")
+        hf_state[hf_name] = torch.ones(1)
+
+    # The real checkpoint has one auxiliary predictor layer after the decoder.
+    hf_state["model.language_model.layers.2.input_layernorm.weight"] = torch.ones(1)
     aligned = module.preprocess_weights(hf_state)
     assert set(aligned) == parameter_names

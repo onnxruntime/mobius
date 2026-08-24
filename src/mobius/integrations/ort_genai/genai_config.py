@@ -108,6 +108,7 @@ def _make_session_options(
     ep: str,
     *,
     enable_graph_capture: bool | None = None,
+    provider_options: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return session options with EP-specific provider_options.
 
@@ -117,12 +118,16 @@ def _make_session_options(
     """
     from mobius.integrations.ort_genai.ep_config import make_provider_options
 
+    options = make_provider_options(
+        ep,
+        enable_graph_capture=enable_graph_capture,
+    )
+    if provider_options and options:
+        next(iter(options[0].values())).update(provider_options)
+
     return {
         "log_id": "onnxruntime-genai",
-        "provider_options": make_provider_options(
-            ep,
-            enable_graph_capture=enable_graph_capture,
-        ),
+        "provider_options": options,
     }
 
 
@@ -211,6 +216,7 @@ class GenaiConfigGenerator:
         self._vision: dict[str, Any] | None = None
         self._embedding: dict[str, Any] | None = None
         self._vlm_token_ids: dict[str, int] = {}
+        self._special_token_ids: dict[str, int] = {}
 
         # Optional audio fields (set via with_audio())
         self._audio: dict[str, Any] | None = None
@@ -305,6 +311,8 @@ class GenaiConfigGenerator:
         tokens_per_second: float | None = None,
         patch_size: int | None = None,
         window_size: int | None = None,
+        vision_provider_options: dict[str, str] | None = None,
+        embedding_provider_options: dict[str, str] | None = None,
     ) -> GenaiConfigGenerator:
         """Add VLM vision + embedding sections.
 
@@ -332,6 +340,10 @@ class GenaiConfigGenerator:
             tokens_per_second: Video/image timestamp rate for Qwen3-VL.
             patch_size: Vision patch size.
             window_size: Vision window size.
+            vision_provider_options: Provider option overrides merged into
+                the EP defaults for the vision encoder session.
+            embedding_provider_options: Provider option overrides merged into
+                the EP defaults for the embedding session.
 
         Returns self for chaining.
         """
@@ -358,6 +370,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=vision_provider_options,
             ),
         }
         if spatial_merge_size is not None:
@@ -380,6 +393,7 @@ class GenaiConfigGenerator:
             "session_options": _make_session_options(
                 self.ep,
                 enable_graph_capture=False,
+                provider_options=embedding_provider_options,
             ),
         }
         self._vlm_token_ids["image_token_id"] = image_token_id
@@ -387,6 +401,46 @@ class GenaiConfigGenerator:
             self._vlm_token_ids["vision_start_token_id"] = vision_start_token_id
         if video_token_id is not None:
             self._vlm_token_ids["video_token_id"] = video_token_id
+        return self
+
+    def with_embedding(
+        self,
+        *,
+        filename: str = "embedding/model.onnx",
+        input_names: dict[str, str] | None = None,
+        output_names: dict[str, str] | None = None,
+        provider_options: dict[str, str] | None = None,
+    ) -> GenaiConfigGenerator:
+        """Add a standalone multimodal embedding stage.
+
+        Args:
+            filename: Embedding ONNX model filename.
+            input_names: Override embedding model input name mapping.
+                Defaults to input_ids + audio_features.
+            output_names: Override embedding model output name mapping.
+                Defaults to inputs_embeds.
+            provider_options: Provider option overrides merged into the EP
+                defaults for the embedding session.
+
+        Returns self for chaining.
+        """
+        self._embedding = {
+            "filename": filename,
+            "inputs": input_names
+            if input_names is not None
+            else {
+                "input_ids": "input_ids",
+                "audio_features": "audio_features",
+            },
+            "outputs": output_names
+            if output_names is not None
+            else {"inputs_embeds": "inputs_embeds"},
+            "session_options": _make_session_options(
+                self.ep,
+                enable_graph_capture=False,
+                provider_options=provider_options,
+            ),
+        }
         return self
 
     def with_audio(
@@ -449,6 +503,14 @@ class GenaiConfigGenerator:
 
         return self
 
+    def with_special_tokens(self, **token_ids: int) -> GenaiConfigGenerator:
+        """Add model-specific special token IDs."""
+        reserved_token_ids = {"bos_token_id", "eos_token_id", "pad_token_id"}
+        if reserved := reserved_token_ids & token_ids.keys():
+            raise ValueError(f"Special tokens cannot override {', '.join(sorted(reserved))}")
+        self._special_token_ids.update(token_ids)
+        return self
+
     def generate(self) -> dict[str, Any]:
         """Generate the full genai_config.json dict."""
         is_multimodal = self._vision is not None or self._audio is not None
@@ -474,7 +536,7 @@ class GenaiConfigGenerator:
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
         }
-        if self.model_type == "lfm2":
+        if self.model_type in {"lfm2", "lfm2_vl"}:
             decoder["layer_types"] = self._layer_types or []
             decoder["conv_cache_size"] = (
                 self._conv_cache_size if self._conv_cache_size is not None else 3
@@ -496,6 +558,7 @@ class GenaiConfigGenerator:
             model["eos_token_id"] = self.eos_token_id
         if self.pad_token_id is not None:
             model["pad_token_id"] = self.pad_token_id
+        model.update(self._special_token_ids)
 
         # VLM sections
         if self._vision is not None:
@@ -516,7 +579,7 @@ class GenaiConfigGenerator:
             context_length=self.context_length,
             supports_in_place_kv_cache=self._supports_in_place_kv_cache,
         )
-        if self.model_type == "lfm2":
+        if self.model_type in {"lfm2", "lfm2_vl"}:
             # ORT GenAI's LFM2 cache mixes fixed convolution windows with
             # dynamic attention KV; shared in-place KV buffers are unsupported.
             search["past_present_share_buffer"] = False

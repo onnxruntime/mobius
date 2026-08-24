@@ -495,6 +495,30 @@ class ArchitectureConfig(BaseModelConfig):
     swiglu_limit: float = 0.0
     num_nextn_predict_layers: int = 0
 
+    # GLM-5.2 (``glm_moe_dsa``) DeepSeek Sparse Attention (DSA).
+    #
+    # ``use_dsa`` is not an upstream HF field -- it is a Mobius export-time
+    # toggle (default True) flipped to False by ``--glm-full-attention`` /
+    # ``config_overrides={"use_dsa": False}`` to fall back to plain dense MLA
+    # (reusing ``DeepSeekV3TextModel`` unchanged) on runtimes that cannot yet
+    # execute ``pkg.nxrt::IndexShare``.
+    use_dsa: bool = True
+    # Per-layer indexer schedule ("full" runs the indexer; "shared" reuses the
+    # top-k selection from the closest preceding "full" layer). When the
+    # checkpoint config omits this list, it is derived from
+    # ``index_topk_freq`` / ``index_skip_topk_offset`` -- see
+    # ``mobius.models.glm_moe_dsa._indexer_types``, which mirrors HF
+    # ``GlmMoeDsaConfig.__post_init__`` exactly.
+    indexer_types: list[str] | None = None
+    index_topk_freq: int | None = None
+    index_skip_topk_offset: int | None = None
+    indexer_rope_interleave: bool = False
+    # Whether the (currently unexported, see ``glm_moe_dsa.py``) MTP layer is
+    # meant to reuse the target's shared top-k indices rather than running its
+    # own indexer pass. Recorded for round-tripping/documentation; not yet
+    # acted on since MTP export itself is out of scope this cycle.
+    index_share_for_mtp_iteration: bool = False
+
     # Vision shared fields (accessed as top-level config.X by tasks)
     mm_tokens_per_image: int | None = None
     image_token_id: int | None = None
@@ -660,7 +684,7 @@ class ArchitectureConfig(BaseModelConfig):
             config,
             "rope_interleave",
             (getattr(config, "qk_rope_head_dim", None) or 0) > 0
-            or model_type in ("glm", "glm4", "glm4_moe", "chatglm"),
+            or model_type in ("glm", "glm4", "glm4_moe", "glm_ocr_text", "chatglm"),
         )
         if rope_config is not None:
             rope_config = dataclasses.replace(rope_config, rope_interleave=rope_interleave)
@@ -897,8 +921,20 @@ class ArchitectureConfig(BaseModelConfig):
             n_group=getattr(config, "n_group", 1),
             topk_group=getattr(config, "topk_group", 1),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
-            scoring_func=getattr(config, "scoring_func", "softmax"),
-            topk_method=getattr(config, "topk_method", "greedy"),
+            # ``scoring_func``/``topk_method`` are not real HF dataclass
+            # fields on ``GlmMoeDsaConfig`` -- transformers hardcodes
+            # sigmoid + e_score_correction_bias + (degenerate, n_group=1)
+            # top-k routing for GLM-5.2 rather than exposing it as a config
+            # knob. A checkpoint that omits these keys entirely (unlike the
+            # real zai-org/GLM-5.2 config.json, which sets them explicitly)
+            # would otherwise silently default to the wrong (softmax/greedy)
+            # DeepSeek-V2 routing.
+            scoring_func=getattr(
+                config, "scoring_func", "sigmoid" if model_type == "glm_moe_dsa" else "softmax"
+            ),
+            topk_method=getattr(
+                config, "topk_method", "noaux_tc" if model_type == "glm_moe_dsa" else "greedy"
+            ),
             first_k_dense_replace=getattr(config, "first_k_dense_replace", 0),
             n_shared_experts=getattr(config, "n_shared_experts", None),
             # Multi-head Latent Attention (MLA)
@@ -927,6 +963,21 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", 0.0),
             num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
+            # GLM-5.2 DSA. ``use_dsa`` has no HF equivalent -- every checkpoint
+            # defaults to the sparse path; ``--glm-full-attention`` overrides
+            # it afterwards via ``dataclasses.replace``/``config_overrides``.
+            use_dsa=getattr(config, "use_dsa", True),
+            indexer_types=(
+                list(config.indexer_types)
+                if getattr(config, "indexer_types", None) is not None
+                else None
+            ),
+            index_topk_freq=getattr(config, "index_topk_freq", None),
+            index_skip_topk_offset=getattr(config, "index_skip_topk_offset", None),
+            indexer_rope_interleave=getattr(config, "indexer_rope_interleave", False),
+            index_share_for_mtp_iteration=getattr(
+                config, "index_share_for_mtp_iteration", False
+            ),
             # Encoder-specific
             type_vocab_size=getattr(config, "type_vocab_size", 0),
             # Encoder-decoder
@@ -1125,6 +1176,14 @@ class ArchitectureConfig(BaseModelConfig):
                 max_position_embeddings=getattr(ec, "max_position_embeddings", 8000),
                 num_quantizers=getattr(ec, "num_quantizers", 32),
                 num_semantic_quantizers=getattr(ec, "num_semantic_quantizers", 1),
+                audio_channels=getattr(ec, "audio_channels", 1),
+                num_filters=getattr(ec, "num_filters", 64),
+                num_residual_layers=getattr(ec, "num_residual_layers", 1),
+                kernel_size=getattr(ec, "kernel_size", 7),
+                last_kernel_size=getattr(ec, "last_kernel_size", 3),
+                residual_kernel_size=getattr(ec, "residual_kernel_size", 3),
+                compress=getattr(ec, "compress", 2),
+                upsampling_ratios=list(getattr(ec, "upsampling_ratios", [8, 6, 5, 4])),
             )
 
         # Model dtype
@@ -1208,6 +1267,29 @@ class ArchitectureConfig(BaseModelConfig):
             raise ValueError(
                 "Invalid ArchitectureConfig:\n" + "\n".join(f"  - {e}" for e in errors)
             )
+
+
+def _as_attribute_config(value: object) -> object:
+    """Recursively give a plain ``dict`` HF sub-config attribute access.
+
+    ``transformers`` 5.x increasingly leaves nested sub-configs (a decoder,
+    a vision tower) as plain dicts on the parent config rather than as
+    ``PretrainedConfig`` instances. Every ``from_transformers`` here reads its
+    input with ``getattr``, so a dict silently degrades: ``getattr(d, "x", None)``
+    is always ``None``, which turns into a wrong default rather than an error,
+    or into ``AttributeError`` on a required field.
+
+    Non-dict values, including real config objects, are returned unchanged.
+    """
+    import types
+
+    if isinstance(value, dict):
+        return types.SimpleNamespace(
+            **{key: _as_attribute_config(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_as_attribute_config(item) for item in value]
+    return value
 
 
 def _shallow_fields(config) -> dict:
@@ -1304,18 +1386,8 @@ class NemotronParseConfig(ArchitectureConfig):
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> NemotronParseConfig:
         del parent_config
-        import types
 
-        def _namespace(value):
-            if isinstance(value, dict):
-                return types.SimpleNamespace(
-                    **{key: _namespace(item) for key, item in value.items()}
-                )
-            if isinstance(value, list):
-                return [_namespace(item) for item in value]
-            return value
-
-        decoder = _namespace(getattr(config, "decoder", None))
+        decoder = _as_attribute_config(getattr(config, "decoder", None))
         if decoder is None:
             raise ValueError("Nemotron Parse config is missing its decoder sub-config")
         base = ArchitectureConfig.from_transformers(decoder, parent_config=config)
@@ -1341,7 +1413,7 @@ class NemotronParseConfig(ArchitectureConfig):
         else:
             image_height, image_width = (int(raw_image_size[0]), int(raw_image_size[1]))
 
-        encoder = _namespace(getattr(config, "encoder", None))
+        encoder = _as_attribute_config(getattr(config, "encoder", None))
         patch_size = int(getattr(encoder, "patch_size", 16))
         max_resolution = int(
             getattr(encoder, "max_resolution", max(image_height, image_width))
@@ -1452,6 +1524,44 @@ class Lfm2Config(CausalLMConfig):
             block_ffn_dim_multiplier=getattr(config, "block_ffn_dim_multiplier", 1.0),
             block_auto_adjust_ff_dim=getattr(config, "block_auto_adjust_ff_dim", True),
         )
+
+
+@dataclasses.dataclass
+class Lfm2VlConfig(Lfm2Config):
+    """Configuration for LiquidAI LFM2-VL (SigLIP2 NaFlex + LFM2 decoder).
+
+    The HuggingFace ``Lfm2VlConfig`` is composite: the LFM2 decoder fields
+    live under ``text_config`` (which is what ``config`` refers to here) and
+    the projector knobs sit on the top-level composite, reachable through
+    ``parent_config``.  The SigLIP2 NaFlex geometry is extracted separately
+    into :attr:`ArchitectureConfig.vision`.
+    """
+
+    downsample_factor: int = 2
+    projector_hidden_act: str = "gelu"
+    projector_hidden_size: int = 2048
+    projector_bias: bool = True
+    projector_use_layernorm: bool = False
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2VlConfig:
+        base = Lfm2Config.from_transformers(config, parent_config)
+        # Projector fields are top-level on the composite config.
+        source = parent_config if parent_config is not None else config
+        result = cls(
+            **_shallow_fields(base),
+            downsample_factor=getattr(source, "downsample_factor", 2),
+            projector_hidden_act=getattr(source, "projector_hidden_act", "gelu"),
+            projector_hidden_size=getattr(source, "projector_hidden_size", base.hidden_size),
+            projector_bias=getattr(source, "projector_bias", True),
+            projector_use_layernorm=getattr(source, "projector_use_layernorm", False),
+        )
+        # Preserve the composite identity; ``config`` is the nested LFM2 text
+        # config and would otherwise report ``model_type="lfm2"``.
+        result.model_type = "lfm2_vl"
+        if result.image_token_id is None:
+            result.image_token_id = getattr(source, "image_token_id", None)
+        return result
 
 
 @dataclasses.dataclass
@@ -2750,6 +2860,151 @@ class JetMoeConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class GlmAsrConfig(CausalLMConfig):
+    """Configuration for GLM-ASR audio-language models."""
+
+    projector_hidden_act: str = "gelu"
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> GlmAsrConfig:
+        composite = parent_config or config
+        text_config = getattr(composite, "text_config", None) or config
+        base = ArchitectureConfig.from_transformers(text_config, parent_config=composite)
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type=getattr(composite, "model_type", "glmasr"),
+            audio_token_id=getattr(composite, "audio_token_id", base.audio_token_id),
+            tie_word_embeddings=getattr(
+                composite, "tie_word_embeddings", base.tie_word_embeddings
+            ),
+        )
+        resolved_dtype = _resolve_dtype(composite)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+        return cls(
+            **fields,
+            projector_hidden_act=getattr(composite, "projector_hidden_act", "gelu"),
+        )
+
+
+@dataclasses.dataclass
+class SenseNovaU1Config(CausalLMConfig):
+    """Configuration for SenseNova-U1.5 ``neo_chat`` (NEO-unify) models.
+
+    NEO-unify is a *native* unified any-to-any architecture: a single
+    Qwen3 backbone carries two complete sets of transformer weights
+    ("Mixture of Transformers").  The understanding branch consumes text
+    and reference-image tokens; the ``_mot_gen`` branch consumes noisy
+    image tokens during flow-matching sampling.  The text-decoder fields
+    are lifted from the nested ``llm_config``; the extra fields below
+    describe the spatial rotary axes and the flow-matching image head.
+
+    Attributes:
+        rope_theta_hw: RoPE base for the spatial (height/width) axes.
+            ``rope_theta`` (inherited) drives the temporal/text axis.
+        max_position_embeddings_hw: Position limit for the spatial axes.
+        patch_size: ViT patch size (pixels per patch side).
+        downsample_ratio: Patch-merge ratio; ``1 / downsample_ratio`` is
+            the merge factor applied by the ``dense_embedding`` conv.
+        use_pixel_head: When true the flow-matching head is a
+            pixel-shuffle ``ConvDecoder`` predicting RGB directly (no VAE).
+        fm_head_dim / fm_head_layers / fm_head_mlp_ratio: Geometry of the
+            deep ``SimpleMLPAdaLN`` head, used only when
+            ``fm_head_layers > 2`` (not the case for the released model).
+        add_noise_scale_embedding: Add a second sinusoidal embedder whose
+            input is the resolution-dependent noise scale.
+        noise_scale / noise_scale_mode / noise_scale_base_image_seq_len /
+        noise_scale_max_value: Noise-scale schedule parameters.
+        timestep_shift / time_schedule: Flow-matching timestep warping.
+        t_eps: Lower clamp on ``1 - t`` when converting the head's
+            x0-prediction into a velocity.
+    """
+
+    rope_theta_hw: float = 10_000.0
+    max_position_embeddings_hw: int = 10_000
+    patch_size: int = 16
+    downsample_ratio: float = 0.5
+    use_pixel_head: bool = True
+    fm_head_dim: int = 1536
+    fm_head_layers: int = 2
+    fm_head_mlp_ratio: float = 1.0
+    add_noise_scale_embedding: bool = True
+    noise_scale: float = 1.0
+    noise_scale_mode: str = "resolution"
+    noise_scale_base_image_seq_len: int = 64
+    noise_scale_max_value: float = 16.0
+    timestep_shift: float = 1.0
+    time_schedule: str = "standard"
+    t_eps: float = 0.05
+    frequency_embedding_size: int = 256
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> SenseNovaU1Config:
+        # ``neo_chat`` is a composite config: the Qwen3 text-decoder fields
+        # live under ``llm_config`` while the flow-matching / patchify
+        # fields sit at the top level next to ``vision_config``.
+        composite = parent_config or config
+        llm_config = getattr(composite, "llm_config", None) or config
+        base = ArchitectureConfig.from_transformers(llm_config, parent_config=composite)
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type=getattr(composite, "model_type", "neo_chat"),
+            tie_word_embeddings=bool(getattr(composite, "tie_word_embeddings", False)),
+        )
+        resolved_dtype = _resolve_dtype(composite)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+
+        vision_config = getattr(composite, "vision_config", None)
+
+        def _pick(name: str, default):
+            # Prefer the top-level value, then the vision sub-config, then
+            # the llm sub-config; the released config.json spreads these
+            # three groups across all three levels.
+            for source in (composite, vision_config, llm_config):
+                if source is None:
+                    continue
+                value = getattr(source, name, None)
+                if value is not None:
+                    return value
+            return default
+
+        return cls(
+            **{
+                **fields,
+                "rope_theta_hw": float(_pick("rope_theta_hw", 10_000.0)),
+                "max_position_embeddings_hw": int(_pick("max_position_embeddings_hw", 10_000)),
+                "patch_size": int(_pick("patch_size", 16)),
+                "downsample_ratio": float(_pick("downsample_ratio", 0.5)),
+                "use_pixel_head": bool(_pick("use_pixel_head", True)),
+                "fm_head_dim": int(_pick("fm_head_dim", 1536)),
+                "fm_head_layers": int(_pick("fm_head_layers", 2)),
+                "fm_head_mlp_ratio": float(_pick("fm_head_mlp_ratio", 1.0)),
+                "add_noise_scale_embedding": bool(_pick("add_noise_scale_embedding", True)),
+                "noise_scale": float(_pick("noise_scale", 1.0)),
+                "noise_scale_mode": str(_pick("noise_scale_mode", "resolution")),
+                "noise_scale_base_image_seq_len": int(
+                    _pick("noise_scale_base_image_seq_len", 64)
+                ),
+                "noise_scale_max_value": float(_pick("noise_scale_max_value", 16.0)),
+                "timestep_shift": float(_pick("timestep_shift", 1.0)),
+                "time_schedule": str(_pick("time_schedule", "standard")),
+                "t_eps": float(_pick("t_eps", 0.05)),
+            }
+        )
+
+    @property
+    def merge_size(self) -> int:
+        """Patch-merge factor applied by ``dense_embedding`` (2 for 0.5)."""
+        return round(1.0 / self.downsample_ratio)
+
+    @property
+    def pixels_per_token(self) -> int:
+        """Image-token stride in pixels (``patch_size * merge_size`` = 32)."""
+        return self.patch_size * self.merge_size
+
+
+@dataclasses.dataclass
 class SpeechToTextConfig(ArchitectureConfig):
     """Shared configuration contract for encoder-decoder speech models."""
 
@@ -2782,6 +3037,11 @@ class WhisperConfig(SpeechToTextConfig):
                 f"({self.encoder_input_channels}) must equal num_mel_bins "
                 f"({self.num_mel_bins})."
             )
+        # The decoder's learned position table is the model's context bound;
+        # Whisper spells it `max_target_positions`, so mirror it onto the
+        # architecture-wide field consumers read.
+        if self.max_position_embeddings == DEFAULT_INT:
+            self.max_position_embeddings = self.max_target_positions
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> WhisperConfig:
@@ -2814,6 +3074,8 @@ class WhisperConfig(SpeechToTextConfig):
             max_target_positions=getattr(config, "max_target_positions", 448),
             scale_embedding=getattr(config, "scale_embedding", False),
             decoder_start_token_id=getattr(config, "decoder_start_token_id", None),
+            bos_token_id=getattr(config, "bos_token_id", None),
+            eos_token_id=getattr(config, "eos_token_id", None),
         )
 
         # Model dtype
@@ -2899,6 +3161,30 @@ class MoonshineConfig(SpeechToTextConfig):
         return cls(**options)
 
 
+def _conv_widths(config, defaults, hidden_size: int) -> tuple[int, ...]:
+    """Per-layer channel widths of a wav2vec2-family convolutional feature encoder.
+
+    ``conv_dim``, ``conv_kernel`` and ``conv_stride`` describe one conv stack, so
+    the depth they imply has to agree. M-CTC-T states its single subsampling
+    convolution through ``conv_kernel``/``conv_stride`` alone and never publishes
+    ``conv_dim``; inheriting wav2vec2's seven-layer default there would describe a
+    stack the checkpoint does not have. Size the widths to the declared depth
+    instead, preferring the checkpoint's own ``conv_channels`` when present.
+    """
+    declared = getattr(config, "conv_dim", None)
+    if declared:
+        return tuple(declared)
+    depth = len(tuple(getattr(config, "conv_kernel", None) or defaults.conv_kernel))
+    if depth == len(defaults.conv_dim):
+        return defaults.conv_dim
+    channels = getattr(config, "conv_channels", None)
+    if channels is None:
+        return (hidden_size,) * depth
+    if isinstance(channels, (list, tuple)):
+        return tuple(channels)
+    return (int(channels),) * depth
+
+
 @dataclasses.dataclass
 class MMSConfig(ArchitectureConfig):
     """Configuration for MMS (Massively Multilingual Speech) CTC models.
@@ -2910,6 +3196,13 @@ class MMSConfig(ArchitectureConfig):
     weights into the model.
 
     HuggingFace class: ``Wav2Vec2ForCTC`` with ``config.model_type == "wav2vec2"``
+
+    The convolutional feature-encoder geometry (``conv_dim``/``conv_kernel``/
+    ``conv_stride``) is *not* boilerplate: it fixes the waveform-to-frame
+    downsampling ratio, so it must come from the checkpoint rather than from a
+    hard-coded default.  ``facebook/wav2vec2-base-960h`` downsamples by 320
+    (``prod(conv_stride)``) and disables conv bias, while
+    ``facebook/mms-1b-all`` enables it.
     """
 
     add_adapter: bool = False
@@ -2918,24 +3211,78 @@ class MMSConfig(ArchitectureConfig):
     adapter_stride: int = 2
     num_adapter_layers: int = 3
 
+    # Convolutional feature encoder (raw waveform → frames).
+    conv_dim: tuple[int, ...] = (512, 512, 512, 512, 512, 512, 512)
+    conv_kernel: tuple[int, ...] = (10, 3, 3, 3, 3, 2, 2)
+    conv_stride: tuple[int, ...] = (5, 2, 2, 2, 2, 2, 2)
+    conv_bias: bool = False
+    feat_extract_norm: str = "group"
+
+    # Transformer encoder shape.
+    do_stable_layer_norm: bool = False
+    num_conv_pos_embeddings: int = 128
+    num_conv_pos_embedding_groups: int = 16
+    layer_norm_eps: float = 1e-5
+
     def __post_init__(self):
         if self.output_hidden_size == 0:
             self.output_hidden_size = self.hidden_size
+        # Normalize sequence fields so downstream code can index them freely
+        # regardless of whether the checkpoint used a list or a tuple.
+        self.conv_dim = tuple(self.conv_dim)
+        self.conv_kernel = tuple(self.conv_kernel)
+        self.conv_stride = tuple(self.conv_stride)
+        if not (len(self.conv_dim) == len(self.conv_kernel) == len(self.conv_stride)):
+            raise ValueError(
+                "conv_dim, conv_kernel and conv_stride must have equal length; got "
+                f"{len(self.conv_dim)}, {len(self.conv_kernel)}, {len(self.conv_stride)}"
+            )
+        if self.feat_extract_norm not in ("group", "layer"):
+            raise ValueError(
+                f"feat_extract_norm must be 'group' or 'layer', got {self.feat_extract_norm!r}"
+            )
+
+    def feature_extract_output_length(self, num_samples: int) -> int:
+        """Return the frame count the conv stack emits for *num_samples*.
+
+        Mirrors ``Wav2Vec2PreTrainedModel._get_feat_extract_output_lengths``:
+        each conv applies ``floor((L - kernel) / stride) + 1``.  Callers use it
+        to segment a padded batch back into per-row transcripts.
+        """
+        length = num_samples
+        for kernel, stride in zip(self.conv_kernel, self.conv_stride):
+            length = (length - kernel) // stride + 1
+        if self.add_adapter:
+            for _ in range(self.num_adapter_layers):
+                length = (length - 1) // self.adapter_stride + 1
+        return length
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> MMSConfig:
         """Extract MMSConfig from a HuggingFace Wav2Vec2Config."""
         base = ArchitectureConfig.from_transformers(config, parent_config=parent_config)
         base_fields = _shallow_fields(base)
+        defaults = cls(hidden_size=1)
         return cls(
             **base_fields,
-            add_adapter=getattr(config, "add_adapter", False),
+            add_adapter=getattr(config, "add_adapter", False) or False,
             output_hidden_size=getattr(
                 config, "output_hidden_size", base_fields["hidden_size"]
             ),
             adapter_kernel_size=getattr(config, "adapter_kernel_size", 3),
             adapter_stride=getattr(config, "adapter_stride", 2),
             num_adapter_layers=getattr(config, "num_adapter_layers", 3),
+            conv_dim=_conv_widths(config, defaults, base_fields["hidden_size"]),
+            conv_kernel=tuple(getattr(config, "conv_kernel", None) or defaults.conv_kernel),
+            conv_stride=tuple(getattr(config, "conv_stride", None) or defaults.conv_stride),
+            conv_bias=bool(getattr(config, "conv_bias", False)),
+            feat_extract_norm=getattr(config, "feat_extract_norm", None) or "group",
+            do_stable_layer_norm=bool(getattr(config, "do_stable_layer_norm", False)),
+            num_conv_pos_embeddings=getattr(config, "num_conv_pos_embeddings", None) or 128,
+            num_conv_pos_embedding_groups=(
+                getattr(config, "num_conv_pos_embedding_groups", None) or 16
+            ),
+            layer_norm_eps=getattr(config, "layer_norm_eps", None) or 1e-5,
         )
 
 

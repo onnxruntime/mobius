@@ -60,6 +60,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+### Fixed
+
+- An exported graph is no longer transcribed into its own workflow component.
+  A component backed by a shipped `.onnx` file now declares only `ports.roles`;
+  the artifact answers every question about which ports exist and what shape
+  they have, and the runtime resolves them against the live session. The
+  removed block was a second statement of the same ABI with nothing keeping the
+  two in agreement — the same defect as `model.io`, one level down. Package
+  validation and runtime conformance both stay at 11/11 against the pinned ONNX
+  GenAI branch, and the contract tests now resolve every role, invocation
+  binding and state pair against the graph itself rather than against the
+  metadata's agreement with a copy of itself, which is a strictly stronger
+  check.
+
+  Policy graphs keep their contracts, and that boundary was measured rather
+  than assumed: a workflow value inherits its dtype, rank and request axis from
+  the port that produced it, so dropping them left row-wise emits untyped and
+  made 4 of the 11 packages invalid. Those contracts type the workflow's own
+  dataflow; they do not describe an external interface.
+
+- Deep decoders are now covered where the cache layer annotation actually
+  matters. Every metadata package built in the test suite had two layers, and
+  below ten a cell label sorts identically whether ordered lexicographically,
+  numerically or by insertion — so a `layer` derived from a cell's position
+  rather than parsed from its port name would have passed every assertion while
+  transposing caches on any real model. `canonical_workflow_contract_test` now
+  builds twelve-layer dynamic, static-cache and hybrid decoders and pins that
+  the declared layer restates the port name, that ordering by it recovers the
+  buffer lists, and that a hybrid's alternating groups own layers their cells'
+  positions never equal. A producer that dropped the parse leaves the 101
+  pre-existing assertions green and fails seven of these.
+
+- Every component a task builds now declares an optimization role. Qwen3-TTS's
+  four loop-wiring graphs (`code_predictor_prefill`,
+  `code_predictor_step_embedder`, `code_predictor_indices`, `talker_text_step`)
+  were absent from `TTSTask.model_roles`, so `build_from_module` fell back to
+  the `"decoder"` role and offered them the GQA / QKV-packing passes meant for
+  attention stacks, and `inspect_components` under-reported the package by four
+  components. They now declare a `"glue"` role: a parameter-free graph that
+  reads every tensor it uses from a graph input. `arch_validation_test` fails
+  any task that builds a component it does not declare, and a network-free unit
+  test pins the same invariant for Qwen3-TTS.
+
+### One canonical serialized representation
+
+#### Changed
+
+- **`pipeline.workflow` is now the only place a package describes its graph
+  ABI.** No export emits `model.io`, including a bare single-file decoder: that
+  case is a one-component workflow, not a different kind of document. `model`
+  keeps package-wide geometry and capabilities and nothing else. Two writable
+  statements of one fact are a defect whatever they contain — nothing forces
+  them to agree, and a reader of either never learns the other exists — so a
+  runtime that wants an optimized single-graph path derives it by lowering the
+  workflow instead. Verified end to end: the ONNX GenAI runtime executes the
+  fixed-capacity decode path from the workflow alone, with no `model.io` in the
+  package.
+
+#### Added
+
+- An ONNX component that ships an artifact declares no port contracts. The
+  `.onnx` file travels inside the package and is authoritative for which ports
+  exist and what each one's dtype, rank and shape is, so transcribing that into
+  YAML would be a second writable statement of one fact — the very thing this
+  section removes — sitting one level below `model.io` rather than beside it.
+  The runtime resolves ports against the live session, which catches a name the
+  graph does not expose instead of agreeing with a stale echo of it. A
+  producer-synthesized policy graph is the exception and states its contracts,
+  because a workflow value takes its dtype, rank and request axis from the port
+  that produced it: those contracts are the dataflow's type annotations, not a
+  description of an external interface.
+- Every ONNX component declares `ports.roles`: what it *does* with a value bound
+  to a port. An invocation records which SSA value reaches a port, not whether
+  that port is tokens, a mask or logits. Mobius mints these port names in its own
+  task builders, so it states the mapping (`input_ids`→`token_ids`,
+  `inputs_embeds`, `attention_mask`, `position_ids`, `logits`,
+  `last_hidden_state`→`hidden_states`, `encoder_hidden_states`,
+  `audio_features`) rather than inferring it. A port outside that vocabulary
+  carries no role.
+- State port aliases declare `role` (`key`/`value`) and `layer`. A layer's key
+  and value buffers are the same dtype and shape, and a cell's label sorts
+  lexicographically so `cache_10` precedes `cache_2` — pairing per-layer buffers
+  positionally would silently transpose two layers' caches. Both fields are
+  emitted together or not at all, so a recurrent or convolution cache is never
+  given a fabricated index.
+- `IndexedScatter.kv_length_ports` names the port carrying the graph-visible
+  valid length, beside the existing `write_indices_ports`. The two control
+  vectors are both rank-1 integers and are therefore indistinguishable by shape;
+  with both named, the whole fixed-capacity ABI is recoverable from the workflow.
+- `tests/canonical_workflow_contract_test.py` pins the invariant. It asks one
+  set of shape-agnostic questions of dynamic, static-cache, FP8, heterogeneous
+  and composite packages — and of all 11 checked-in fixtures — so a future
+  feature cannot grow its own top-level block while every feature-specific test
+  keeps passing.
+
+### Fixed-capacity (static) KV cache and FP8 KV cache metadata
+
+#### Added
+
+- `--features static-cache` now produces onnx-genai metadata instead of being
+  refused. The producer publishes the write cursor (`write_indices`), the valid
+  length (`nonpad_kv_seqlen`), the fixed-capacity buffer contracts, the
+  per-layer input/output pairs, and an `indexed_scatter` state-service update
+  discipline naming the cursor, the capacity and the per-component port that
+  carries it. The buffers are declared as `recurrence: {kind: invariant}` loop
+  cells and the capacity as a `package.cache_capacity` literal workflow input.
+  Nothing dispatches on model name; the ports are read from the graph.
+- Heterogeneous caches keep their own disciplines. Gemma 4's sliding layers stay
+  on a growing rank-4 BNSH cache while its full-attention layers use rank-3
+  fixed-capacity buffers, and only the layers that own a buffer bind ports in a
+  state group — its KV-shared suffix owns none.
+- A `static_cache` package joined the checked-in onnx-genai conformance
+  fixtures, so the engine exercises the fixed-capacity carry and the write
+  cursor rather than only the growing-tensor path.
+
+#### Fixed
+
+- Gemma 4's shared-KV fallback pinned a 4-D BNSH shape onto *any* borrowed KV
+  tensor whose rank was not 4. A static-cache source hands over a fully known
+  rank-3 `[batch, capacity, kv_hidden]` buffer, so this overwrote a correct
+  shape with a wrong one — corrupting the declared shape of
+  `updated_key_cache.N` and defeating the rank-3 static-source test further
+  down, which would then have transposed a rank-3 tensor as BNSH. The fallback
+  now only supplies a shape when there is none.
+- Gemma 4's vision-language decoder dropped `attention_mask` whenever the export
+  was static, but a Gemma 4 decoder is only *partly* static: its sliding layers
+  keep a dynamic cache and build their bias from that mask. The hybrid decoder
+  therefore lost all padding information. Both builders now apply one rule — a
+  mask exists exactly when some layer still has a dynamic cache — so a fully
+  static decoder carries no unused port and a hybrid one keeps its mask.
+- `--features fp8-kv-cache` no longer silently produces a float16 cache. The
+  gate only tested whether GQA fusion was *expected*; the pass now reports how
+  many caches it converted and the build fails when the answer is zero, naming
+  the reason: FP8 KV storage needs an attention operator with `k_scale`/
+  `v_scale` inputs, which a `TensorScatter` + `ai.onnx` `Attention` static-cache
+  graph does not have.
+
+
 ### Qwen3.5/3.6-MoE mixed float/quantized decoder (Olive checkpoints)
 
 #### Fixed

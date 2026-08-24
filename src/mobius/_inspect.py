@@ -32,9 +32,11 @@ class ComponentInfo:
         name: Component name. This is the ``ModelPackage`` key mobius produces
             (and the subfolder name a multi-component export is saved under).
         role: Optimization role of the component, e.g. ``"decoder"``,
-            ``"encoder"``, or ``"embedding"``. Mobius uses this to gate fusion
-            passes (only ``"decoder"`` receives GQA / QKV-packing). It is the
-            value declared in the task's ``model_roles``.
+            ``"encoder"``, ``"embedding"``, or ``"glue"``. Mobius uses this to
+            gate fusion passes (only ``"decoder"`` receives GQA / QKV-packing).
+            ``"glue"`` marks a parameter-free graph that only wires a
+            generation loop — it carries no weights and no fusion applies. It
+            is the value declared in the task's ``model_roles``.
         source_paths: Runtime ``named_modules()`` paths that make up this
             component inside the full HuggingFace model. These are not
             checkpoint/state-dict key prefixes. A single component may map to

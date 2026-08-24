@@ -40,6 +40,8 @@ from mobius.components._codec_vq import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import onnx_ir as ir
     import torch
 
@@ -223,20 +225,22 @@ class Qwen3TTSCodecEncoderModel(nn.Module):
         head_dim = enc.head_dim if enc else 64
         intermediate = enc.intermediate_size if enc else 2048
 
-        # Conv encoder: series of Conv1d + optional residual blocks
-        # Based on MimiModel encoder with num_filters=64, ratios=[8,6,5,4]
-        # Layer structure from actual weights:
-        #   0: Conv1d(1->64, k=7)
-        #   1: ResBlock(64) [conv1d k=3 + conv1d k=1]
-        #   3: Conv1d(64->128, k=8, stride=4)
-        #   4: ResBlock(128)
-        #   6: Conv1d(128->256, k=10, stride=5)
-        #   7: ResBlock(256)
-        #   9: Conv1d(256->512, k=12, stride=6)
-        #  10: ResBlock(512)
-        #  12: Conv1d(512->1024, k=16, stride=8)
-        #  14: Conv1d(1024->512, k=3)
-        self.encoder = _MimiConvEncoder()
+        # Conv encoder: series of Conv1d + residual blocks, derived from
+        # config exactly like HF ``MimiEncoder.__init__``. With the
+        # checkpoint's defaults (num_filters=64, upsampling_ratios=[8,6,5,4],
+        # num_residual_layers=1, kernel_size=7, last_kernel_size=3) this
+        # yields 1->64->128->256->512->1024->hidden_size.
+        self.encoder = _MimiConvEncoder(
+            hidden_size=hidden_size,
+            audio_channels=enc.audio_channels if enc else 1,
+            num_filters=enc.num_filters if enc else 64,
+            num_residual_layers=enc.num_residual_layers if enc else 1,
+            kernel_size=enc.kernel_size if enc else 7,
+            last_kernel_size=enc.last_kernel_size if enc else 3,
+            residual_kernel_size=enc.residual_kernel_size if enc else 3,
+            compress=enc.compress if enc else 2,
+            upsampling_ratios=tuple(enc.upsampling_ratios) if enc else (8, 6, 5, 4),
+        )
 
         # Transformer
         self.encoder_transformer = CodecEncoderTransformerModel(
@@ -248,7 +252,7 @@ class Qwen3TTSCodecEncoderModel(nn.Module):
             head_dim=head_dim,
         )
 
-        # Downsample: Conv1d(512->512, k=4, stride=2)
+        # Downsample: Conv1d(hidden_size->hidden_size, k=4, stride=2)
         self.downsample = _DownsampleConv(hidden_size, hidden_size, 4, 2)
 
         # Quantizer (encoder-side): uses argmin for encoding
@@ -264,11 +268,11 @@ class Qwen3TTSCodecEncoderModel(nn.Module):
         Returns:
             codes: (B, 16, T) int64 audio codes.
         """
-        # 1. Conv encoder: (B, 1, samples) -> (B, 512, T')
+        # 1. Conv encoder: (B, 1, samples) -> (B, hidden_size, T')
         hidden = self.encoder(op, waveform)
 
         # 2. Transformer: channels-last
-        # (B, 512, T') -> (B, T', 512)
+        # (B, hidden_size, T') -> (B, T', hidden_size)
         hidden = op.Transpose(hidden, perm=[0, 2, 1])
         seq_len = op.Shape(hidden, start=1, end=2)
         position_ids = op.Unsqueeze(
@@ -280,25 +284,33 @@ class Qwen3TTSCodecEncoderModel(nn.Module):
             [0],
         )
         hidden = self.encoder_transformer(op, hidden, position_ids)
-        # (B, T', 512) -> (B, 512, T')
+        # (B, T', hidden_size) -> (B, hidden_size, T')
         hidden = op.Transpose(hidden, perm=[0, 2, 1])
 
-        # 3. Downsample: (B, 512, T') -> (B, 512, T'/2)
+        # 3. Downsample: (B, hidden_size, T') -> (B, hidden_size, T'/2)
         hidden = self.downsample(op, hidden)
 
-        # 4. Quantize: (B, 512, T) -> (B, 16, T)
+        # 4. Quantize: (B, hidden_size, T) -> (B, 16, T)
         codes = self.quantizer(op, hidden)
 
         return codes
 
 
 class _MimiConvEncoder(nn.Module):
-    """Mimi-style convolutional encoder.
+    """Mimi-style convolutional encoder, derived from config.
 
-    Progressively downsamples and increases channels:
-    1->64->128->256->512->1024->512
+    Mirrors HF ``MimiEncoder.__init__``: one leading conv, then for each
+    upsampling ratio (in reverse) ``num_residual_layers`` residual blocks,
+    an ELU and a strided conv that doubles the channel count, then a
+    trailing ELU and a conv down to ``hidden_size``.
 
-    Weight structure from HF (encoder.encoder.layers.*):
+    The parameterless ELU modules occupy list slots so that the resulting
+    parameter names line up with the checkpoint's
+    ``encoder.encoder.layers.*`` numbering. With the checkpoint defaults
+    (``num_filters=64``, ``upsampling_ratios=[8, 6, 5, 4]``,
+    ``num_residual_layers=1``, ``kernel_size=7``, ``last_kernel_size=3``)
+    the stack is 1->64->128->256->512->1024->512 and numbers as:
+
         0: Conv1d(1->64, k=7)
         1: ResBlock(64): block.1 Conv1d(64->32,k=3), block.3 Conv1d(32->64,k=1)
         3: Conv1d(64->128, k=8, stride=4)
@@ -309,37 +321,69 @@ class _MimiConvEncoder(nn.Module):
        10: ResBlock(512)
        12: Conv1d(512->1024, k=16, stride=8)
        14: Conv1d(1024->512, k=3)
+
+    Parameters:
+        hidden_size: Output channels of the final conv.
+        audio_channels: Input channels of the waveform (1 for mono).
+        num_filters: Channel count after the leading conv.
+        num_residual_layers: Residual blocks per downsampling stage.
+        kernel_size: Kernel of the leading conv.
+        last_kernel_size: Kernel of the final conv.
+        residual_kernel_size: Kernel of the first conv inside a residual block.
+        compress: Channel-reduction factor inside a residual block.
+        upsampling_ratios: Downsampling strides, applied in reverse order.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        hidden_size: int = 512,
+        audio_channels: int = 1,
+        num_filters: int = 64,
+        num_residual_layers: int = 1,
+        kernel_size: int = 7,
+        last_kernel_size: int = 3,
+        residual_kernel_size: int = 3,
+        compress: int = 2,
+        upsampling_ratios: Sequence[int] = (8, 6, 5, 4),
+    ):
         super().__init__()
-        # Non-sequential layer indices to match HF weight names
-        self.layers = nn.Sequential(
-            _EncoderConvLayer(1, 64, 7, 1),  # 0
-            _EncoderResBlock(64),  # 1
-            _ELUModule(),  # 2: ELU before downsample
-            _EncoderConvLayer(64, 128, 8, 4),  # 3
-            _EncoderResBlock(128),  # 4
-            _ELUModule(),  # 5
-            _EncoderConvLayer(128, 256, 10, 5),  # 6
-            _EncoderResBlock(256),  # 7
-            _ELUModule(),  # 8
-            _EncoderConvLayer(256, 512, 12, 6),  # 9
-            _EncoderResBlock(512),  # 10
-            _ELUModule(),  # 11
-            _EncoderConvLayer(512, 1024, 16, 8),  # 12
-            _ELUModule(),  # 13
-            _EncoderConvLayer(1024, 512, 3, 1),  # 14
+        layers: list[nn.Module] = [
+            _EncoderConvLayer(audio_channels, num_filters, kernel_size, 1),
+        ]
+        scaling = 1
+        # Encoder downsamples in reverse of the decoder's upsampling order:
+        # ratios [8, 6, 5, 4] -> strides 4, 5, 6, 8.
+        for ratio in reversed(upsampling_ratios):
+            current_scale = scaling * num_filters
+            for _ in range(num_residual_layers):
+                layers.append(
+                    _EncoderResBlock(
+                        current_scale,
+                        kernel=residual_kernel_size,
+                        compress=compress,
+                    )
+                )
+            layers.append(_ELUModule())
+            # Strided conv doubles channels; kernel is 2x the stride.
+            layers.append(
+                _EncoderConvLayer(current_scale, current_scale * 2, ratio * 2, ratio)
+            )
+            scaling *= 2
+        layers.append(_ELUModule())
+        layers.append(
+            _EncoderConvLayer(scaling * num_filters, hidden_size, last_kernel_size, 1)
         )
+        self.layers = nn.Sequential(*layers)
+        self.output_channels = hidden_size
 
     def forward(self, op: OpBuilder, x: ir.Value):
         """Encode waveform through conv layers.
 
         Args:
-            x: (B, 1, audio_samples).
+            x: (B, audio_channels, audio_samples).
 
         Returns:
-            (B, 512, T).
+            (B, hidden_size, T).
         """
         return self.layers(op, x)
 
@@ -397,14 +441,19 @@ class _EncoderResBlock(nn.Module):
 
     HF weight structure: block.1.conv (dilated), block.3.conv (pointwise).
     block.0 and block.2 are ELU activations.
+
+    Parameters:
+        dim: Input/output channels.
+        kernel: Kernel of the first (channel-reducing) conv.
+        compress: Channel-reduction factor for the block's inner width.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, kernel: int = 3, compress: int = 2):
         super().__init__()
-        half = dim // 2
+        half = dim // compress
         self.block = nn.Sequential(
             _ELUModule(),  # 0: ELU
-            _EncoderConvLayer(dim, half, 3, 1),  # 1: dilated conv
+            _EncoderConvLayer(dim, half, kernel, 1),  # 1: dilated conv
             _ELUModule(),  # 2: ELU
             _EncoderConvLayer(half, dim, 1, 1),  # 3: pointwise conv
         )
@@ -456,28 +505,32 @@ class _EncoderSplitRVQ(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         enc = config.codec_encoder
-        codebook_dim = enc.codebook_dim if enc else 512
+        codebook_dim = enc.codebook_dim if enc else 256
         codebook_size = enc.codebook_size if enc else 2048
         num_quantizers = enc.num_quantizers if enc else 32
         num_semantic = enc.num_semantic_quantizers if enc else 1
+        hidden_size = enc.hidden_size if enc else 512
 
-        dim = codebook_dim // 2
+        # The RVQ consumes the encoder's hidden features and projects them
+        # down to the codebook dimension, matching HF ``MimiResidualVector
+        # Quantizer``: input_proj is Conv1d(hidden_size -> codebook_dim, k=1).
+        dim = codebook_dim
 
         # Semantic quantizer
         self.semantic_residual_vector_quantizer = _EncoderRVQ(
             num_quantizers=num_semantic,
             codebook_size=codebook_size,
             dim=dim,
-            input_dim=codebook_dim,
-            output_dim=codebook_dim,
+            input_dim=hidden_size,
+            output_dim=hidden_size,
         )
         # Acoustic quantizer
         self.acoustic_residual_vector_quantizer = _EncoderRVQ(
             num_quantizers=num_quantizers - num_semantic,
             codebook_size=codebook_size,
             dim=dim,
-            input_dim=codebook_dim,
-            output_dim=codebook_dim,
+            input_dim=hidden_size,
+            output_dim=hidden_size,
         )
         self._num_semantic = num_semantic
         self._num_valid = config.num_quantizers if hasattr(config, "num_quantizers") else 16
@@ -486,7 +539,7 @@ class _EncoderSplitRVQ(nn.Module):
         """Encode features to discrete codes.
 
         Args:
-            hidden: (B, codebook_dim, T) continuous features.
+            hidden: (B, hidden_size, T) continuous features.
 
         Returns:
             codes: (B, num_valid_quantizers, T) int64.

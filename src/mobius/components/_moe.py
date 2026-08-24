@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Callable
 
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
@@ -52,6 +53,80 @@ def _flatten_to_2d(op: OpBuilder, tensor: ir.Value) -> ir.Value:
     last_dim = op.Shape(tensor, start=-1)
     flat_shape = op.Concat(op.Constant(value_ints=[-1]), last_dim, axis=0)
     return op.Reshape(tensor, flat_shape)
+
+
+def _scatter_selected_to_full(
+    op: OpBuilder,
+    routing_weights: ir.Value,
+    selected_experts: ir.Value,
+    num_experts: int,
+) -> tuple[ir.Value, ir.Value]:
+    """Adapt an already-selected (routing_weights, selected_experts) pair.
+
+    (top-k-shaped, e.g. ``[..., top_k]``) into the full ``[..., num_experts]``
+    ``(router_probs, router_weights)`` tensors QMoE requires.
+
+    QMoE always performs its own top-k selection over ``router_probs``
+    (governed by the ``k`` attribute); there is no ABI to hand it externally
+    chosen expert indices directly. This matters for gates whose selection is
+    not expressible as "top-k of a per-expert score", most notably hash-table
+    routing (e.g. DeepSeek-V4's ``tid2eid`` lookup): the natural per-expert
+    score used to pick a weight need not rank the selected experts above the
+    rest, so passing it straight through as ``router_probs`` could make QMoE's
+    internal top-k pick a *different* set of experts than the gate actually
+    chose.
+
+    This adapter sidesteps that by constructing ``router_probs`` as ``-inf``
+    everywhere except a constant positive marker at exactly the selected
+    positions: any of the ``top_k`` marked slots trivially outranks every
+    ``-inf`` slot, so QMoE's internal top-k recovers precisely the selected
+    expert set regardless of relative order among ties. ``router_weights`` is
+    the real per-slot weight scattered at the same positions (zero
+    elsewhere, never read since QMoE only gathers ``router_weights`` at its
+    own top-k selection, which is exactly the scattered set). This changes
+    neither the selection algorithm nor the weight values -- it only encodes
+    an already-final ``(routing_weights, selected_experts)`` pair in the
+    tensor shape QMoE's ABI requires, the same idea ``DeepSeekMoEGate``
+    already uses (mask non-selected groups to ``-inf`` before ``TopK``).
+
+    Requires ``routing_weights`` to be non-negative (true for softmax/
+    sigmoid/sqrt-softplus scoring, the scoring functions used by every
+    caller today) and ``normalize_routing_weights=0`` at the QMoE call site,
+    since these weights are already final and must not be re-normalized.
+    Also requires ``selected_experts`` to name ``top_k`` *distinct* experts
+    per token: ``ScatterElements`` does not accumulate duplicate indices, so
+    a repeated expert would silently drop one of its contributions. Every
+    gate in this module (and DeepSeek-V4's hash table) already guarantees
+    this -- top-k selection over a score tensor never repeats an index, and
+    a hash table has no reason to route a token to the same expert twice.
+
+    CPU-only correctness: ORT's CPU QMoE honors Input 14 (``router_weights``)
+    by gathering it at the selected experts, but CUDA QMoE ignores Input 14
+    and always derives weights by softmax-top-k over ``router_probs`` itself
+    (see ``contrib_ops/cpu/moe/moe_quantization_cpu.cc`` vs
+    ``contrib_ops/cuda/moe/moe_quantization.cc``). Unlike ``TopKGate``/
+    ``SoftmaxTopKGate``/``SigmoidTopKGate`` above, whose selection score
+    doubles as (a monotonic function of) the aggregation weight -- so raw
+    logits can be passed as ``router_probs`` and CUDA's internal recompute
+    reproduces ``forward()`` exactly -- callers of this adapter select
+    experts by an index with no such relationship to a per-expert score
+    (hash lookup, or a selection tensor that differs from the weighting
+    tensor, e.g. DeepSeek noaux_tc-style bias-corrected top-k). There is no
+    ``router_probs`` encoding that makes CUDA's forced internal recompute
+    reproduce the correct weights in that case. This is the same limitation
+    already present in ``DeepSeekMoEGate.qmoe_routing`` (V3) and is tracked
+    upstream at https://github.com/microsoft/onnxruntime/pull/31570 (adds
+    CUDA ``router_weights`` support). Until that lands, callers of this
+    adapter are CPU-EP-correct only; do not execute on the CUDA EP.
+    """
+    lead_shape = op.Shape(selected_experts, end=-1)
+    full_shape = op.Concat(lead_shape, op.Constant(value_ints=[num_experts]), axis=0)
+    neg_inf = op.Expand(op.CastLike(float("-inf"), routing_weights), full_shape)
+    marker = op.Expand(op.CastLike(1.0, routing_weights), op.Shape(selected_experts))
+    router_probs = op.ScatterElements(neg_inf, selected_experts, marker, axis=-1)
+    zeros = op.Expand(op.CastLike(0.0, routing_weights), full_shape)
+    router_weights = op.ScatterElements(zeros, selected_experts, routing_weights, axis=-1)
+    return router_probs, router_weights
 
 
 class TopKGate(nn.Module):
@@ -320,6 +395,10 @@ class MoELayer(nn.Module):
         config: ArchitectureConfig,
         gate: nn.Module | None = None,
         linear_class: type | None = None,
+        expert_factory: Callable[[ArchitectureConfig, type | None], nn.Module] | None = None,
+        activation_alpha: float | None = None,
+        activation_beta: float | None = None,
+        swiglu_limit: float | None = None,
     ):
         super().__init__()
         assert config.num_local_experts is not None
@@ -327,6 +406,17 @@ class MoELayer(nn.Module):
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self._qmoe_quantization = _supported_qmoe_quantization(config.quantization)
+        # Clipped-SwiGLU attributes (QMoE's ``activation_alpha``/``activation_beta``/
+        # ``swiglu_limit``). Left ``None`` by default so existing callers get a
+        # byte-identical QMoE call (the attributes are simply omitted, even though
+        # the schema defaults happen to match the plain-SwiGLU behaviour already in
+        # use). Callers with a clipped-SwiGLU expert (e.g. DeepSeek-V4) pass these
+        # explicitly; ``swiglu_limit`` must be finite to actually clip, or
+        # ``math.inf`` to disable clipping (QMoE treats ``0.0`` as "clip to zero",
+        # not "no limit" -- see ``qmoe_routing`` callers for the exact mapping).
+        self.activation_alpha = activation_alpha
+        self.activation_beta = activation_beta
+        self.swiglu_limit = swiglu_limit
         if gate is not None:
             self.gate = gate
         else:
@@ -346,11 +436,12 @@ class MoELayer(nn.Module):
             # native QMoE ABI). Without threading it here, this fallback
             # path would silently lose quantization for every per-expert
             # MLP even though the caller requested a quantized linear_class.
+            # ``expert_factory`` lets callers with a non-standard expert MLP
+            # (e.g. DeepSeek-V4's clipped-SwiGLU expert) reuse this dense
+            # fallback instead of duplicating the mask-and-sum loop below.
+            factory = expert_factory or (lambda cfg, lc: MLP(cfg, linear_class=lc))
             self.experts = nn.ModuleList(
-                [
-                    MLP(expert_config, linear_class=linear_class)
-                    for _ in range(self.num_experts)
-                ]
+                [factory(expert_config, linear_class) for _ in range(self.num_experts)]
             )
 
     def _init_qmoe_parameters(self, expert_config: ArchitectureConfig) -> None:
@@ -400,7 +491,7 @@ class MoELayer(nn.Module):
                 dtype=ir.DataType.UINT8,
             )
 
-    def _qmoe_forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def _qmoe_forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
         quantization = self._qmoe_quantization
         assert quantization is not None
         # ``qmoe_routing`` is called directly (not via ``self.gate(op, ...)``)
@@ -423,7 +514,7 @@ class MoELayer(nn.Module):
             for param in self.gate.parameters(recurse=False):
                 param._realize(op.builder)  # pylint: disable=protected-access
             router_probs, router_weights, normalize, output_scale = self.gate.qmoe_routing(
-                op, hidden_states
+                op, hidden_states, *gate_args
             )
         finally:
             op.builder.pop_module()
@@ -445,6 +536,17 @@ class MoELayer(nn.Module):
             if self.fc1_experts_zero_points is not None
             else None
         )
+        # ``activation_alpha``/``activation_beta``/``swiglu_limit`` are only
+        # passed when a caller explicitly set them (e.g. DeepSeek-V4's
+        # clipped-SwiGLU expert); omitting them for every other existing
+        # caller keeps their emitted QMoE node byte-identical to before.
+        activation_kwargs = {}
+        if self.activation_alpha is not None:
+            activation_kwargs["activation_alpha"] = self.activation_alpha
+        if self.activation_beta is not None:
+            activation_kwargs["activation_beta"] = self.activation_beta
+        if self.swiglu_limit is not None:
+            activation_kwargs["swiglu_limit"] = self.swiglu_limit
         result = op.QMoE(
             hidden_states,
             router_probs,
@@ -470,16 +572,17 @@ class MoELayer(nn.Module):
             quant_type="int",
             weights_prepacked=0,
             _domain="com.microsoft",
+            **activation_kwargs,
         )
         if output_scale != 1.0:  # noqa: RUF069
             result = op.Mul(result, op.CastLike(output_scale, result))
         return result
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+    def forward(self, op: OpBuilder, hidden_states: ir.Value, *gate_args):
         if self.experts is None:
-            return self._qmoe_forward(op, hidden_states)
+            return self._qmoe_forward(op, hidden_states, *gate_args)
 
-        routing_weights, selected_experts = self.gate(op, hidden_states)
+        routing_weights, selected_experts = self.gate(op, hidden_states, *gate_args)
 
         result = None
         for expert_idx, expert in enumerate(self.experts):

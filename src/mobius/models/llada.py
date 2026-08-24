@@ -6,9 +6,9 @@
 LLaDA is a Llama backbone (RMSNorm, RoPE, SwiGLU MLP, full multi-head
 attention with no bias) run **bidirectionally**: every position attends to
 every other position, exactly like a BERT encoder and unlike a Llama decoder.
-It is a mask predictor for discrete (masked) diffusion — onnx-genai's
-``masked_diffusion`` scheduler drives the reverse process by repeatedly
-feeding the predicted logits back as ``input_ids``.
+It is a mask predictor for discrete (masked) diffusion. The onnx-genai generic
+SSA workflow repeatedly invokes the denoiser and the packaged masked-update
+policy artifact while carrying token, mask, and RNG state.
 
 Two properties distinguish it from the standard :class:`CausalLMModel`:
 
@@ -177,8 +177,8 @@ class LLaDAModel(nn.Module):
     A Llama backbone run bidirectionally with a separate (untied) language
     modelling head. The forward pass maps ``input_ids [batch, sequence_len]``
     (int64) to ``logits [batch, sequence_len, vocab_size]`` (float) in a
-    single full-sequence pass — the mask-predictor contract consumed by
-    onnx-genai's ``masked_diffusion`` scheduler.
+    single full-sequence pass. The task also exposes greedy token proposals for
+    the onnx-genai generic masked-update workflow.
 
     Replicates the ``LLaDALlamaBlock`` architecture of HuggingFace's
     ``LLaDAModelLM`` (``block_type: "llama"``, ``layer_norm_type: "rms"``,

@@ -1,25 +1,27 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# SECURITY: Do NOT use torch.load() or pickle deserialization anywhere in this
-# module.  Only safetensors is permitted for weight loading to prevent arbitrary
-# code execution from untrusted weight files.
+# SECURITY: Prefer safetensors. Legacy PyTorch checkpoints are loaded only with
+# ``weights_only=True``, which rejects arbitrary Python objects.
 
 """Weight loading and application for ONNX models.
 
 This module handles downloading model weights from HuggingFace Hub and
-applying them to ONNX IR models. All weight loading uses the safetensors
-format exclusively — no ``torch.load`` or pickle deserialization is used,
-eliminating arbitrary code execution risks from untrusted weight files.
+applying them to ONNX IR models. Safetensors is preferred. Legacy HuggingFace
+checkpoints that only publish ``pytorch_model.bin`` are loaded with
+``torch.load(weights_only=True)`` so arbitrary Python objects are rejected.
 """
 
 from __future__ import annotations
 
 __all__ = [
     "apply_weights",
+    "stream_safetensors_to_model",
+    "external_data_checksums",
 ]
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import pathlib
@@ -31,6 +33,7 @@ import tqdm
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from onnx_ir import tensor_adapters
+from safetensors import safe_open
 
 from mobius._optimizations import fold_initializers_after_weights
 
@@ -38,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 _WEIGHT_INDEX_NAME = "model.safetensors.index.json"
 _SINGLE_WEIGHT_NAME = "model.safetensors"
+_PYTORCH_WEIGHT_INDEX_NAME = "pytorch_model.bin.index.json"
+_SINGLE_PYTORCH_WEIGHT_NAME = "pytorch_model.bin"
 
 
 def _assign_weight(
@@ -197,7 +202,7 @@ def _parallel_download(
 
 
 def _validate_weight_filenames(filenames: list[str]) -> list[str]:
-    """Validate safetensors filenames from a weight index.
+    """Validate filenames from a weight index.
 
     The HuggingFace index is model data, so reject absolute paths and path traversal
     before using entries as local filesystem paths or Hub filenames.
@@ -207,7 +212,7 @@ def _validate_weight_filenames(filenames: list[str]) -> list[str]:
         normalized = filename.replace("\\", "/")
         path = pathlib.PurePosixPath(normalized)
         if path.is_absolute() or ".." in path.parts:
-            raise ValueError(f"Unsafe weight filename in safetensors index: {filename!r}")
+            raise ValueError(f"Unsafe weight filename in weight index: {filename!r}")
         validated.append(normalized)
     return validated
 
@@ -218,20 +223,28 @@ def _weight_filenames_from_index(index_path: pathlib.Path) -> list[str]:
     return _validate_weight_filenames(sorted(set(index["weight_map"].values())))
 
 
-def _local_weight_paths(model_dir: pathlib.Path) -> list[str] | None:
-    """Return local safetensors paths for a HuggingFace checkpoint directory."""
+def _local_weight_paths(model_dir: pathlib.Path) -> tuple[list[str], str] | None:
+    """Return local weight paths and format for a HuggingFace checkpoint directory."""
     if not model_dir.is_dir():
         return None
 
     index_path = model_dir / _WEIGHT_INDEX_NAME
     if index_path.is_file():
         filenames = _weight_filenames_from_index(index_path)
+        weight_format = "safetensors"
     elif (model_dir / _SINGLE_WEIGHT_NAME).is_file():
         filenames = [_SINGLE_WEIGHT_NAME]
+        weight_format = "safetensors"
+    elif (model_dir / _PYTORCH_WEIGHT_INDEX_NAME).is_file():
+        filenames = _weight_filenames_from_index(model_dir / _PYTORCH_WEIGHT_INDEX_NAME)
+        weight_format = "pytorch"
+    elif (model_dir / _SINGLE_PYTORCH_WEIGHT_NAME).is_file():
+        filenames = [_SINGLE_PYTORCH_WEIGHT_NAME]
+        weight_format = "pytorch"
     else:
         raise FileNotFoundError(
             f"Local checkpoint directory has no '{_WEIGHT_INDEX_NAME}' or "
-            f"'{_SINGLE_WEIGHT_NAME}': {model_dir}"
+            f"'{_SINGLE_WEIGHT_NAME}', nor legacy PyTorch weights: {model_dir}"
         )
 
     root = model_dir.resolve()
@@ -241,15 +254,11 @@ def _local_weight_paths(model_dir: pathlib.Path) -> list[str] | None:
         try:
             path.relative_to(root)
         except ValueError as exc:
-            raise ValueError(
-                f"Unsafe weight filename in safetensors index: {filename!r}"
-            ) from exc
+            raise ValueError(f"Unsafe weight filename in weight index: {filename!r}") from exc
         if not path.is_file():
-            raise FileNotFoundError(
-                f"Weight file referenced by safetensors index not found: {path}"
-            )
+            raise FileNotFoundError(f"Weight file referenced by index not found: {path}")
         paths.append(str(path))
-    return paths
+    return paths, weight_format
 
 
 def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -304,34 +313,274 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
     return {k: v for k, v in result.items() if not any(k.endswith(s) for s in aux_suffixes)}
 
 
+def _resolve_shard_paths(model_id: str, revision: str | None = None) -> list[str]:
+    """Resolve local safetensors shard paths for the streaming loader.
+
+    Uses local files when *model_id* is a directory, otherwise downloads the
+    shards from HuggingFace Hub (once) and returns their cache paths. The
+    streaming loader reads tensors via ``safe_open``, so this is safetensors
+    only and refuses a legacy PyTorch checkpoint (use the eager
+    :func:`_download_weights` path for those).
+    """
+    local = _local_weight_paths(pathlib.Path(model_id))
+    if local is not None:
+        paths, weight_format = local
+        if weight_format != "safetensors":
+            raise ValueError(
+                "stream_safetensors_to_model supports safetensors checkpoints "
+                f"only, but {model_id!r} holds '{weight_format}' weights; use the "
+                "eager apply_weights path."
+            )
+        return paths
+
+    try:
+        kwargs = {"repo_id": model_id, "filename": _WEIGHT_INDEX_NAME}
+        if revision is not None:
+            kwargs["revision"] = revision
+        index_path = pathlib.Path(hf_hub_download(**kwargs))
+        all_files = _weight_filenames_from_index(index_path)
+    except EntryNotFoundError:
+        all_files = [_SINGLE_WEIGHT_NAME]
+
+    return _parallel_download(model_id, all_files, revision=revision, desc="safetensors")
+
+
 def _download_weights(model_id: str, revision: str | None = None) -> dict[str, torch.Tensor]:
     """Download weights from HuggingFace and return as a state dict.
 
-    Uses local safetensors files when *model_id* is a directory, otherwise
-    downloads from HuggingFace Hub. Uses parallel downloads when multiple
-    safetensors shards exist.
+    Prefers safetensors and falls back to legacy PyTorch state dictionaries
+    loaded with ``weights_only=True``. Uses parallel downloads for shards.
+
+    .. note::
+       This loader holds **every shard resident at once** — the returned state
+       dict references the whole checkpoint. For a checkpoint larger than host
+       RAM prefer :func:`stream_safetensors_to_model`, which keeps a bounded
+       working set (safetensors only).
     """
-    paths = _local_weight_paths(pathlib.Path(model_id))
-    if paths is None:
+    local_weights = _local_weight_paths(pathlib.Path(model_id))
+    if local_weights is None:
         try:
             kwargs = {"repo_id": model_id, "filename": _WEIGHT_INDEX_NAME}
             if revision is not None:
                 kwargs["revision"] = revision
             index_path = pathlib.Path(hf_hub_download(**kwargs))
             all_files = _weight_filenames_from_index(index_path)
+            weight_format = "safetensors"
         except EntryNotFoundError:
-            all_files = [_SINGLE_WEIGHT_NAME]
-
-        paths = _parallel_download(
-            model_id,
-            all_files,
-            revision=revision,
-            desc="safetensors",
-        )
+            try:
+                kwargs = {"repo_id": model_id, "filename": _SINGLE_WEIGHT_NAME}
+                if revision is not None:
+                    kwargs["revision"] = revision
+                paths = [hf_hub_download(**kwargs)]
+                weight_format = "safetensors"
+            except EntryNotFoundError:
+                try:
+                    kwargs = {"repo_id": model_id, "filename": _PYTORCH_WEIGHT_INDEX_NAME}
+                    if revision is not None:
+                        kwargs["revision"] = revision
+                    index_path = pathlib.Path(hf_hub_download(**kwargs))
+                    all_files = _weight_filenames_from_index(index_path)
+                    weight_format = "pytorch"
+                except EntryNotFoundError:
+                    all_files = [_SINGLE_PYTORCH_WEIGHT_NAME]
+                    weight_format = "pytorch"
+                paths = _parallel_download(
+                    model_id,
+                    all_files,
+                    revision=revision,
+                    desc=weight_format,
+                )
+        else:
+            paths = _parallel_download(
+                model_id,
+                all_files,
+                revision=revision,
+                desc=weight_format,
+            )
+    else:
+        paths, weight_format = local_weights
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in tqdm.tqdm(paths, desc="Loading weights"):
-        state_dict.update(safetensors.torch.load_file(path))
+        if weight_format == "safetensors":
+            state_dict.update(safetensors.torch.load_file(path))
+        else:
+            shard = torch.load(path, map_location="cpu", weights_only=True)
+            if not isinstance(shard, dict) or not all(
+                isinstance(name, str) and isinstance(value, torch.Tensor)
+                for name, value in shard.items()
+            ):
+                raise TypeError(f"Legacy weight file is not a tensor state dict: {path}")
+            state_dict.update(shard)
 
     state_dict = _dequantize_fp8_weights(state_dict)
     return state_dict
+
+
+def _shard_key_index(paths: list[str]) -> dict[str, tuple[str, list[int], str]]:
+    """Map each tensor key -> (shard_path, shape, dtype) by reading headers only.
+
+    ``safe_open(...).keys()`` and ``get_slice(...).get_shape()`` read only the
+    safetensors header, so this never materializes weight data. When a key
+    appears in more than one shard the first shard wins and a warning is logged.
+    """
+    key_index: dict[str, tuple[str, list[int], str]] = {}
+    for path in paths:
+        with safe_open(path, framework="pt") as handle:
+            for key in handle.keys():  # noqa: SIM118 - safe_open handle is not directly iterable
+                if key in key_index:
+                    logger.warning("Duplicate tensor key %r across shards; keeping first", key)
+                    continue
+                sliced = handle.get_slice(key)
+                key_index[key] = (path, list(sliced.get_shape()), sliced.get_dtype())
+    return key_index
+
+
+def _assign_lazy_from_shard(
+    initializer: ir.Value, shard_path: str, key: str, name: str
+) -> None:
+    """Assign an initializer a LazyTensor that reads its weight from a shard.
+
+    The closure re-opens the shard and reads exactly one tensor at serialization
+    time, so nothing is retained between assignment and ``ir.save`` and the peak
+    host RAM is bounded by the largest single tensor, not the whole checkpoint.
+    """
+    onnx_dtype = initializer.dtype
+    assert onnx_dtype is not None
+    target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+
+    def tensor_func(
+        p: str = shard_path, k: str = key, dt=target_dtype, n: str = name
+    ) -> tensor_adapters.TorchTensor:
+        with safe_open(p, framework="pt") as handle:
+            tensor = handle.get_tensor(k)
+        if tensor.dtype != dt:
+            tensor = tensor.to(dt)
+        return tensor_adapters.TorchTensor(tensor, name=n)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=onnx_dtype,
+        shape=ir.Shape(initializer.shape),
+        name=name,
+    )
+
+
+def stream_safetensors_to_model(
+    model: ir.Model,
+    model_id: str,
+    *,
+    revision: str | None = None,
+    require_passthrough: bool = True,
+) -> set[str]:
+    """Apply weights to *model* without holding the whole checkpoint in RAM.
+
+    Every graph initializer is bound to a :class:`ir.LazyTensor` that reads its
+    tensor from the owning safetensors shard on demand. Compared to
+    :func:`apply_weights` fed by :func:`_download_weights` — which materializes
+    the entire checkpoint as one state dict — this keeps at most one tensor
+    resident, so a checkpoint far larger than host RAM can be re-serialized to
+    ONNX external data.
+
+    This is a *pass-through* loader: it maps each ONNX initializer 1:1 to a
+    checkpoint tensor and only casts dtype. It deliberately does **not** perform
+    weight fusion, qkv splitting, or quantization/dequantization. When
+    *require_passthrough* is True (the default) it refuses two kinds of
+    non-passthrough sources rather than silently emitting a wrong graph: (1) a
+    quantized checkpoint (fp8 weights or ``*_scale_inv``/``*_scale`` tensors),
+    which needs the eager dequant path, and (2) a graph with an initializer that
+    has no matching checkpoint tensor — the signature of a model that needs
+    preprocessing. Such models must use the eager :func:`apply_weights` path.
+
+    Returns the set of initializer names that were bound.
+
+    Raises:
+        ValueError: on a shape mismatch; when the checkpoint is quantized; or
+            (in pass-through mode) when a graph initializer has no corresponding
+            checkpoint tensor.
+    """
+    paths = _resolve_shard_paths(model_id, revision)
+    key_index = _shard_key_index(paths)
+
+    if require_passthrough:
+        # An fp8 checkpoint stores raw float8 weights under the same name the
+        # graph expects for bf16, plus separate ``*_scale_inv``/``*_scale``
+        # tensors. Casting fp8 -> bf16 without multiplying by the scale silently
+        # produces wrong weights, and the scale keys never map to an
+        # initializer (so the missing-tensor guard below never fires). Refuse
+        # such quantized sources up front; they must use the eager
+        # apply_weights path, which applies the scale.
+        quant_signals = sorted(
+            k
+            for k, (_p, _s, dt) in key_index.items()
+            if dt.startswith("F8") or k.endswith(("_scale_inv", "weight_scale"))
+        )
+        if quant_signals:
+            raise ValueError(
+                f"Checkpoint appears quantized (fp8 / scaled weights, e.g. "
+                f"{quant_signals[:5]}); the pass-through streaming loader cannot "
+                f"dequantize it and would drop the weight scale. Use the eager "
+                f"apply_weights path (which applies weight_scale_inv)."
+            )
+
+    assigned: set[str] = set()
+    missing: list[str] = []
+    for name, initializer in list(model.graph.initializers.items()):
+        if initializer.const_value is not None:
+            continue
+        located = key_index.get(name)
+        if located is None:
+            missing.append(name)
+            continue
+        shard_path, shard_shape, _shard_dtype = located
+        if initializer.shape is not None:
+            expected = [int(d) for d in initializer.shape]
+            if expected != list(shard_shape):
+                raise ValueError(
+                    f"Weight shape mismatch for '{name}': model expects "
+                    f"{expected}, checkpoint has {list(shard_shape)}"
+                )
+        _assign_lazy_from_shard(initializer, shard_path, name, name)
+        assigned.add(name)
+
+    if missing and require_passthrough:
+        preview = missing[:5]
+        raise ValueError(
+            f"{len(missing)} graph initializer(s) have no matching checkpoint "
+            f"tensor and cannot be streamed as pass-through weights "
+            f"(e.g. {preview}). This model needs weight preprocessing "
+            f"(fusion/split/quantization); use the eager apply_weights path."
+        )
+    if missing:
+        logger.warning(
+            "Streaming left %d initializer(s) unassigned (require_passthrough=False)",
+            len(missing),
+        )
+
+    fold_initializers_after_weights(model)
+    return assigned
+
+
+def external_data_checksums(
+    output_dir: str | pathlib.PathLike,
+    *,
+    pattern: str = "*.onnx.data",
+    chunk_size: int = 1 << 20,
+) -> dict[str, dict[str, object]]:
+    """Compute a deterministic sha256 + size manifest for ONNX external data.
+
+    Returns ``{filename: {"sha256": hex, "size": bytes}}`` sorted by filename so
+    the manifest is byte-stable across runs. Use it to verify a re-export
+    reproduced identical external data (deterministic naming *and* content).
+    """
+    directory = pathlib.Path(output_dir)
+    manifest: dict[str, dict[str, object]] = {}
+    for path in sorted(directory.glob(pattern)):
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(chunk_size), b""):
+                digest.update(block)
+                size += len(block)
+        manifest[path.name] = {"sha256": digest.hexdigest(), "size": size}
+    return manifest

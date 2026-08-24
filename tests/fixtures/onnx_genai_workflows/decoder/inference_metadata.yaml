@@ -1,0 +1,1375 @@
+schema_version: '1.0'
+pipeline:
+  workflow:
+    manifest:
+      capabilities:
+      - workflow_ssa
+      - linear_effects
+      - nested_control_flow
+      - typed_emit
+      - emit_valid_length
+      - loop_induction_values
+      - serving_service_contract
+      - bounded_state_recurrence
+    inputs:
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      package.eos_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - E
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 127
+      package.one_token:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.one_step:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.max_context:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 8192
+      request.prompt_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: prompt_lengths
+        required: false
+        default: -1
+      request.eos_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - num_eos
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: eos_ids
+        required: false
+        default: 127
+      request.eos_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: eos_lengths
+        required: false
+        default: 1
+      request.row_max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: row_max_iterations
+        required: false
+        default: -1
+      request.temperature:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_temperature
+        source:
+          kind: request
+        required: false
+        default: 1.0
+      request.top_k:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_top_k
+        source:
+          kind: request
+        required: false
+        default: 1
+      request.top_p:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_top_p
+        source:
+          kind: request
+        required: false
+        default: 1.0
+      request.min_p:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: sampling_min_p
+        source:
+          kind: request
+        required: false
+        default: 0.0
+      request.seed:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      request.rng_counter:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: rng_counter
+        required: false
+        default: 0
+      package.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.not_done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.zero_batch:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - generated_sequence
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tokens
+        stage: pre_adapter
+    components:
+      model:
+        implementation:
+          kind: onnx
+          artifact: model.onnx
+        ports:
+          roles:
+            input_ids: token_ids
+            attention_mask: attention_mask
+            position_ids: position_ids
+            logits: logits
+      token_sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/token_sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            temperature:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            top_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            top_p:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            min_p:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.token-sampler
+          version: '2'
+          bindings:
+            logits: logits
+            token: token
+            temperature: temperature
+            top_k: top_k
+            top_p: top_p
+            min_p: min_p
+            active: active
+            done: done
+            seed: seed
+            counter: counter
+            next_counter: next_counter
+          parameters:
+            mode: seeded_stochastic
+            batching: per_row
+            inactive_rows: preserve
+        application_overridable: true
+      termination:
+        implementation:
+          kind: onnx
+          artifact: policies/termination.onnx
+        ports:
+          inputs:
+            tokens:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            eos_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - num_eos
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            eos_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            iteration:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
+        contract:
+          id: onnx-genai.termination-predicate
+          version: '2'
+          bindings:
+            tokens: tokens
+            eos_ids: eos_ids
+            iteration: iteration
+            max_iterations: max_iterations
+            eos_lengths: eos_lengths
+            active: active
+            done: done
+            next_active: next_active
+            continue: continue
+          parameters:
+            batching: per_row
+            inactive_rows: preserve
+      token_state_update:
+        implementation:
+          kind: onnx
+          artifact: policies/token_state_update.onnx
+        ports:
+          inputs:
+            current:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            update:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.state-update
+          version: '2'
+          bindings:
+            current: current
+            update: update
+            active: active
+            done: done
+            next: next
+          parameters:
+            batching: per_row
+            inactive_rows: preserve
+      last_token_logits:
+        implementation:
+          kind: onnx
+          artifact: policies/last_token_logits.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            last_logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      decoder_state_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_state_initializer.onnx
+        ports:
+          inputs:
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            prompt_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - total_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            body_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            body_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            token_slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            generated_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 2
+              - past_sequence
+              - 8
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 4
+              - past_sequence
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      decoder_step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/decoder_step_update.onnx
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      cache_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/cache_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      termination_batch_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/termination_batch_initializer.onnx
+        ports:
+          inputs:
+            input_eos_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - num_eos
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            input_eos_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            input_max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            fallback_max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            row_eos_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - num_eos
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            eos_lengths:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            max_iterations:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      token_to_slot:
+        implementation:
+          kind: onnx
+          artifact: policies/token_to_slot.onnx
+        ports:
+          inputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      generated_length_update:
+        implementation:
+          kind: onnx
+          artifact: policies/generated_length_update.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      token:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: initializer.token_slot
+        recurrence:
+          kind: invariant
+      logits:
+        contract:
+          dtype: float32
+          rank: 2
+          shape:
+          - batch
+          - 128
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: decoder.setup.last_logits
+        recurrence:
+          kind: invariant
+      generated_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: initializer.generated_lengths
+        recurrence:
+          kind: invariant
+      active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+      done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.not_done
+        recurrence:
+          kind: invariant
+      accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.zero_batch
+        recurrence:
+          kind: invariant
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.cache_lengths
+        recurrence:
+          kind: invariant
+      rng_counter:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        class: semantic
+        initializer: request.rng_counter
+        recurrence:
+          kind: invariant
+      attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - context
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: initializer.body_attention_mask
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one_step
+          max: package.max_context
+      position_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: initializer.body_position_ids
+        recurrence:
+          kind: invariant
+      cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 2
+          - past_sequence
+          - 8
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: decoder.setup.present.0.key
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_cache
+      cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 4
+          - past_sequence
+          - 4
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: decoder.setup.present.0.value
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_context
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_cache
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          decoder_cache:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            ports:
+              model:
+                cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: decoder_state_initializer
+        inputs:
+          prompt_tokens: request.input_ids
+          prompt_lengths: request.prompt_lengths
+        outputs:
+          attention_mask: initializer.attention_mask
+          body_attention_mask: initializer.body_attention_mask
+          token_slot: initializer.token_slot
+          generated_lengths: initializer.generated_lengths
+          position_ids: initializer.position_ids
+          body_position_ids: initializer.body_position_ids
+          past_key_values.0.key: initializer.past_key_values.0.key
+          past_key_values.0.value: initializer.past_key_values.0.value
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: request.input_ids
+          past_key_values.0.key: initializer.past_key_values.0.key
+          past_key_values.0.value: initializer.past_key_values.0.value
+          attention_mask: initializer.attention_mask
+          position_ids: initializer.position_ids
+        outputs:
+          logits: decoder.setup.logits
+          present.0.key: decoder.setup.present.0.key
+          present.0.value: decoder.setup.present.0.value
+      - kind: invoke
+        component: termination_batch_initializer
+        inputs:
+          input_eos_ids: request.eos_ids
+          input_eos_lengths: request.eos_lengths
+          input_max_iterations: request.row_max_iterations
+          fallback_max_iterations: request.max_iterations
+          active: package.active
+        outputs:
+          row_eos_ids: termination.eos_ids
+          eos_lengths: termination.eos_lengths
+          max_iterations: termination.max_iterations
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: decoder.setup.logits
+        outputs:
+          last_logits: decoder.setup.last_logits
+      steps:
+      - kind: invoke
+        component: token_sampler
+        inputs:
+          logits: logits
+          temperature: request.temperature
+          top_k: request.top_k
+          top_p: request.top_p
+          min_p: request.min_p
+          seed: request.seed
+          counter: rng_counter
+          active: active
+          done: done
+        outputs:
+          token: sample.body
+          next_counter: sample.next_counter
+      - kind: invoke
+        component: token_to_slot
+        inputs:
+          token: sample.body
+        outputs:
+          slot: sample.slot
+      - kind: invoke
+        component: generated_length_update
+        inputs:
+          left: generated_lengths
+          right: package.one_token
+          active: active
+          done: done
+        outputs:
+          total: token.next_lengths
+      - kind: invoke
+        component: generated_length_update
+        inputs:
+          left: package.zero_batch
+          right: package.one_token
+          active: active
+          done: done
+        outputs:
+          total: token.emitted_length
+      - kind: invoke
+        component: token_state_update
+        inputs:
+          current: token
+          update: sample.slot
+          active: active
+          done: done
+        outputs:
+          next: token.body
+      - kind: invoke
+        component: termination
+        inputs:
+          tokens: sample.body
+          eos_ids: termination.eos_ids
+          eos_lengths: termination.eos_lengths
+          iteration: loop.iteration
+          max_iterations: termination.max_iterations
+          active: active
+        outputs:
+          done: loop.done
+          continue: loop.continue
+          next_active: loop.next_active
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: cache_lengths
+          right: package.one_token
+          active: active
+          done: done
+        outputs:
+          total: cache_lengths.next
+      - kind: invoke
+        component: cache_length_update
+        inputs:
+          left: package.zero_batch
+          right: package.one_token
+          active: active
+          done: done
+        outputs:
+          total: accepted_len.next
+      - kind: emit
+        value: token.body
+        output: tokens
+        mode: append
+        valid_length: token.emitted_length
+        when: active
+      - kind: invoke
+        component: model
+        inputs:
+          input_ids: token.body
+          past_key_values.0.key: cache_0
+          past_key_values.0.value: cache_1
+          attention_mask: attention_mask
+          position_ids: position_ids
+        outputs:
+          logits: decoder.body.logits
+          present.0.key: decoder.body.present.0.key
+          present.0.value: decoder.body.present.0.value
+      - kind: invoke
+        component: last_token_logits
+        inputs:
+          logits: decoder.body.logits
+        outputs:
+          last_logits: decoder.body.last_logits
+      - kind: invoke
+        component: decoder_step_update
+        inputs:
+          attention_mask: attention_mask
+          position_ids: position_ids
+        outputs:
+          next_attention_mask: decoder_step.body_attention_mask
+          next_position_ids: decoder_step.body_position_ids
+      continue_when: active
+      max_iterations: request.max_iterations
+      carried:
+      - cell: token
+        next: token.body
+      - cell: logits
+        next: decoder.body.last_logits
+      - cell: generated_lengths
+        next: token.next_lengths
+      - cell: active
+        next: loop.next_active
+      - cell: done
+        next: loop.done
+      - cell: cache_lengths
+        next: cache_lengths.next
+      - cell: accepted_len
+        next: accepted_len.next
+      - cell: rng_counter
+        next: sample.next_counter
+      - cell: attention_mask
+        next: decoder_step.body_attention_mask
+      - cell: position_ids
+        next: decoder_step.body_position_ids
+      - cell: cache_0
+        next: decoder.body.present.0.key
+      - cell: cache_1
+        next: decoder.body.present.0.value
+      termination: generation_eos
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1

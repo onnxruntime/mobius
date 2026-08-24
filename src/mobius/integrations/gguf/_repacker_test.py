@@ -700,6 +700,78 @@ class TestRepackQ4K:
         assert can_repack(12) is True
 
 
+class TestRepackQ6K:
+    """Q6_K (type 14) -> MatMulNBits 4-bit repacking."""
+
+    def test_in_can_repack(self):
+        """Q6_K (type 14) is recognized as repackable."""
+        assert can_repack(14) is True
+
+    def test_dequantization_matches_gguf_reference_exactly(self):
+        """Our unpack must equal ggml's ``dequantize_row_q6_K``, bit for bit.
+
+        Q6_K interleaves each 256-element super-block across two halves, four
+        emission groups, and a 16-entry scale table. Every plausible-looking
+        wrong permutation still produces finite numbers of the right magnitude,
+        so only an exact comparison against the reference implementation can
+        distinguish a correct unpack from a subtly transposed one -- and the
+        lossy requantization that follows would mask the difference, which is
+        why this compares the dequantized floats directly.
+        """
+        gguf_quants = pytest.importorskip("gguf.quants")
+        from gguf.constants import GGMLQuantizationType
+
+        from mobius.integrations.gguf._repacker import _dequantize_q6_k
+
+        rng = np.random.default_rng(0)
+        n_super = 8
+        blocks = rng.integers(0, 256, size=(n_super, 210), dtype=np.uint8)
+        # Keep `d` finite and non-denormal so the comparison is about layout.
+        blocks[:, 208:210] = np.frombuffer(
+            np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
+        ).reshape(n_super, 2)
+
+        expected = (
+            gguf_quants.dequantize(blocks.reshape(-1).copy(), GGMLQuantizationType.Q6_K)
+            .astype(np.float32)
+            .ravel()
+        )
+        got = _dequantize_q6_k(blocks)
+
+        np.testing.assert_array_equal(got, expected)
+
+    def test_repack_stays_within_half_a_block_scale(self):
+        """The 4-bit requantization is lossy, but bounded by its own scale."""
+        from mobius.integrations.gguf._repacker import _dequantize_q6_k, _repack_q6_k
+
+        rng = np.random.default_rng(1)
+        n_out, k_in = 4, 256
+        n_super = n_out * k_in // 256
+        blocks = rng.integers(0, 256, size=(n_super, 210), dtype=np.uint8)
+        blocks[:, 208:210] = np.frombuffer(
+            np.float16([1.5] * n_super).tobytes(), dtype=np.uint8
+        ).reshape(n_super, 2)
+
+        reference = _dequantize_q6_k(blocks)[: n_out * k_in].reshape(n_out, k_in)
+        result = _repack_q6_k(blocks, n_out, k_in)
+        got = _dequantize_repacked_q4(result, k_in)
+
+        assert result.weight.shape[0] == n_out
+        max_scale = float(result.scales.max())
+        assert np.max(np.abs(got - reference)) <= max_scale * 0.51 + 1e-6
+
+    def test_super_block_byte_and_element_counts(self):
+        """Q6_K is 210 bytes per 256 elements; a wrong size mis-slices silently."""
+        from mobius.integrations.gguf._repacker import (
+            _BLOCK_BYTES,
+            _GGUF_BLOCK_ELEMENTS,
+            _GGUF_Q6_K,
+        )
+
+        assert _BLOCK_BYTES[_GGUF_Q6_K] == 210
+        assert _GGUF_BLOCK_ELEMENTS[_GGUF_Q6_K] == 256
+
+
 class TestRepackDequantizedTensor:
     def test_asymmetric_q4_round_trip_bound(self):
         rng = np.random.default_rng(0)

@@ -476,7 +476,9 @@ class TestCLIBuildGGUF:
             main(["build-gguf", "--help"])
         out = capsys.readouterr().out
         assert "--dequantize" in out
-        assert "preserved by default" in out
+        assert "--output OUTPUT_DIR" in out
+        assert "--keep-quantized" not in out, "the unread deprecated alias was removed"
+        assert "--max-shard-size" in out, "shard sizing applies to GGUF builds too"
 
     def test_missing_gguf_path_errors(self):
         """build-gguf requires a gguf_path argument."""
@@ -504,16 +506,21 @@ class TestCLIBuildGGUF:
         ("extra_args", "expected"),
         [
             ([], True),
-            (["--keep-quantized"], True),
             (["--dequantize"], False),
         ],
     )
     def test_quantization_flag_parsing(self, tmp_path, extra_args, expected):
-        """Default, compatibility alias, and explicit opt-out map to the API."""
+        """Quantization is preserved by default; ``--dequantize`` opts out.
+
+        The ``--keep-quantized`` alias that used to be covered here was removed:
+        it was never read (``keep_quantized = not args.dequantize``), so the case
+        asserting it produced ``True`` was really just re-testing the default.
+        """
         from mobius.__main__ import main
 
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
+        package.values.return_value = iter(())
         with mock.patch(
             "mobius.integrations.gguf.build_from_gguf",
             return_value=package,
@@ -530,34 +537,38 @@ class TestCLIBuildGGUF:
 
         assert build.call_args.kwargs["keep_quantized"] is expected
 
-    def test_contradictory_quantization_flags_error(self, tmp_path):
+    def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
+        """build-gguf forwards the selected runtime after saving the graph."""
         from mobius.__main__ import main
 
-        with pytest.raises(SystemExit) as exc_info:
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(())
+        output_dir = tmp_path / "output"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                return_value={"genai_config": str(output_dir / "genai_config.json")},
+            ) as write_runtime,
+        ):
             main(
                 [
                     "build-gguf",
                     str(tmp_path / "model.gguf"),
-                    "--keep-quantized",
-                    "--dequantize",
-                ]
-            )
-        assert exc_info.value.code == 2
-
-    def test_ort_genai_runtime_is_rejected_before_artifacts(self, tmp_path):
-        """build-gguf must not silently ignore an ORT GenAI runtime request."""
-        from mobius.__main__ import main
-
-        output_dir = tmp_path / "output"
-        with pytest.raises(SystemExit, match="does not yet support --runtime ort-genai"):
-            main(
-                [
-                    "build-gguf",
-                    str(tmp_path / "not-downloaded.gguf"),
-                    "--runtime",
-                    "ort-genai",
                     "--output",
                     str(output_dir),
+                    "--runtime",
+                    "ort-genai",
                 ]
             )
-        assert not output_dir.exists()
+
+        write_runtime.assert_called_once_with(
+            package,
+            str(tmp_path / "model.gguf"),
+            str(output_dir),
+            runtime="ort-genai",
+            save_model=False,
+        )

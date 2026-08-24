@@ -263,6 +263,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
             case.model_id,
             dtype=dtype_map[case.dtype],
             device=device,
+            revision=case.revision,
         )
     else:
         model, tokenizer = load_torch_model(
@@ -471,7 +472,10 @@ def _generate_vision_language(case: TestCase, json_path: Path, device: str) -> N
     }
     torch_dtype = dtype_map.get(case.dtype, torch.float32)
     model, _tokenizer, processor = load_torch_multimodal_model(
-        case.model_id, dtype=torch_dtype, device=device
+        case.model_id,
+        dtype=torch_dtype,
+        device=device,
+        revision=case.revision,
     )
 
     # Load real image/video media from testdata/.
@@ -700,7 +704,7 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
             **processed,
             decoder_input_ids=decoder_input_ids,
         )
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
     input_ids_np = decoder_input_ids.cpu().numpy()
 
@@ -796,7 +800,8 @@ def _generate_speech_language(case: TestCase, json_path: Path, device: str) -> N
     with torch.no_grad():
         outputs = forward_model(**processed)
 
-    last_logits = outputs.logits[0, -1, :].cpu().numpy()
+    # NumPy does not expose bfloat16; store reference logits as float32.
+    last_logits = outputs.logits[0, -1, :].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
     input_ids_np = processed["input_ids"].cpu().numpy()
 
@@ -852,7 +857,9 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
     _try_register_qwen3_asr()
 
     config = transformers.AutoConfig.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
     model_type = getattr(config, "model_type", "")
 
@@ -863,19 +870,50 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
 
         if device == "auto":
             model = Qwen3ASRForConditionalGeneration.from_pretrained(
-                case.model_id, torch_dtype=torch.float32, device_map=device
+                case.model_id,
+                revision=case.revision,
+                torch_dtype=torch.float32,
+                device_map=device,
             )
         else:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(
-                case.model_id, torch_dtype=torch.float32
+                case.model_id,
+                revision=case.revision,
+                torch_dtype=torch.float32,
             )
             model = model.to(device)
         model.eval()
         processor = transformers.AutoProcessor.from_pretrained(
-            case.model_id, trust_remote_code=True
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=True,
         )
         # Qwen3-ASR wraps a thinker; the thinker produces logits.
         forward_model = model.thinker
+    elif model_type == "glmasr":
+        dtype = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }.get(case.dtype, torch.float32)
+        if device == "cpu" and dtype != torch.float32:
+            dtype = torch.float32
+        model = transformers.GlmAsrForConditionalGeneration.from_pretrained(
+            case.model_id,
+            revision=case.revision,
+            dtype=dtype,
+        )
+        if device == "auto":
+            model = model.cuda()
+        else:
+            model = model.to(device)
+        model.eval()
+        processor = transformers.AutoProcessor.from_pretrained(
+            case.model_id,
+            revision=case.revision,
+            trust_remote_code=case.trust_remote_code,
+        )
+        forward_model = model
     else:
         # Gemma4-style: AutoModelForImageTextToText
         from mobius._testing.torch_reference import (
@@ -883,7 +921,9 @@ def _load_speech_language_model(case: TestCase, device: str) -> tuple:
         )
 
         model, _tokenizer, processor = load_torch_multimodal_model(
-            case.model_id, device=device
+            case.model_id,
+            device=device,
+            revision=case.revision,
         )
         forward_model = model
 
@@ -907,8 +947,17 @@ def _prepare_speech_language_inputs(
     # Detect Qwen3-ASR by processor class name (avoids redundant
     # config download).
     is_qwen3_asr = "Qwen3ASR" in type(processor).__name__
+    is_glmasr = "GlmAsr" in type(processor).__name__
 
-    if is_qwen3_asr:
+    if is_glmasr:
+        model_device = _get_model_device(model, device)
+        processed = processor.apply_transcription_request(
+            audio_array,
+            prompt=case.prompts[0] if case.prompts else None,
+            return_tensors="pt",
+        ).to(model_device, dtype=model.dtype)
+        prompt_for_golden = case.prompts[0] if case.prompts else str(audio_path)
+    elif is_qwen3_asr:
         # Qwen3-ASR prompt: system + user with audio placeholder
         messages = [
             {"role": "system", "content": ""},

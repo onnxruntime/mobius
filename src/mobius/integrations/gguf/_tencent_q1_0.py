@@ -103,7 +103,14 @@ def is_tencent_q1_0_layout(gguf_model) -> bool:
     """
     from gguf import GGMLQuantizationType
 
-    reader = gguf_model._reader
+    # Tencent's custom Q1_0 layout only occurs in single-file GGUFs. A
+    # :class:`~mobius.integrations.gguf._shard_set.GgufShardSet` exposes no
+    # single ``_reader`` (its tensors span several files), and the mainline
+    # repack path handles any genuinely-standard Q1_0 shard, so treat a split
+    # set as "not Tencent" rather than reaching into a reader that isn't there.
+    reader = getattr(gguf_model, "_reader", None)
+    if reader is None:
+        return False
     tensors = sorted(
         reader.tensors,
         key=_tensor_data_offset,

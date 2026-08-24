@@ -42,10 +42,13 @@ __all__ = [
     "Gemma4Task",
     "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
+    "GlmMoeDsaTask",
+    "GlmOcrVLTask",
     "HybridCausalLMTask",
     "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
+    "Lfm2VlTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
@@ -77,8 +80,10 @@ __all__ = [
     "SpeechToTextTask",
     "TASK_REGISTRY",
     "TTSTask",
+    "T5TextEncoderTask",
     "VAETask",
     "VideoDenoisingTask",
+    "VideoVAETask",
     "VisionLanguageTask",
     "VisionEncoderDecoderTask",
     "WorldModelTask",
@@ -118,6 +123,8 @@ from mobius.tasks._gemma4 import (
     Gemma4UnifiedTask,
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
+from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
+from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
@@ -137,18 +144,23 @@ from mobius.tasks._qwen_image import QwenImageDenoisingTask
 from mobius.tasks._qwen_image_text_encoder import QwenImageTextEncoderTask
 from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
+from mobius.tasks._sensenova_u1 import SenseNovaU1Task
 from mobius.tasks._seq2seq import Seq2SeqTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
+from mobius.tasks._t5_text_encoder import T5TextEncoderTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._video_denoising import VideoDenoisingTask
+from mobius.tasks._video_vae import VideoVAETask
 from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
+    GlmOcrVLTask,
     HybridQwenVLTask,
+    Lfm2VlTask,
     MageVLTask,
     MiniCPMVLTask,
     MllamaVisionLanguageTask,
@@ -186,6 +198,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "moshi-depformer": MoshiDepformerTask,
     "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
     "dflash-draft": DFlashDraftTask,
@@ -204,18 +217,23 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "mage-vl": MageVLTask,
     "muse-glimmer-vl": MuseGlimmerVLTask,
     "qwen-vl": QwenVLTask,
+    "glm-ocr": GlmOcrVLTask,
     "hybrid-qwen-vl": HybridQwenVLTask,
     "minicpm-vl": MiniCPMVLTask,
+    "lfm2-vl": Lfm2VlTask,
     "qwen3-vl-vision-language": Qwen3VLVisionLanguageTask,
     "gemma3n": Gemma3nTask,
     "gemma4": Gemma4Task,
     "gemma4-text-generation": Gemma4TextCausalLMTask,
     "gemma4-unified": Gemma4UnifiedTask,
     "gemma4-assistant": Gemma4AssistantTask,
+    "glm-moe-dsa": GlmMoeDsaTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
+    "sensenova-u1": SenseNovaU1Task,
     "multimodal": MultiModalTask,
     "phi4mm-multimodal": Phi4MMMultiModalTask,
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
+    "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
@@ -223,6 +241,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ssm2-text-generation": SSM2CausalLMTask,
     "tts": TTSTask,
     "video-denoising": VideoDenoisingTask,
+    "video-vae": VideoVAETask,
     "world-model": WorldModelTask,
 }
 

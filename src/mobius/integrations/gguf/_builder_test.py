@@ -661,7 +661,10 @@ class TestBuildQuantizedGguf:
             tensor_type=GGMLQuantizationType.Q4_0,
             shape=(64, 256),
         )
-        model = SimpleNamespace(_reader=SimpleNamespace(tensors=[tensor]))
+        model = SimpleNamespace(
+            _reader=SimpleNamespace(tensors=[tensor]),
+            reader_tensors=lambda: [tensor],
+        )
 
         assert _can_quantize_embedding(model, "llama", bits=4, block_size=32)
 
@@ -702,7 +705,7 @@ class TestBuildQuantizedGguf:
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
 
-    def test_pure_q6_k_requires_explicit_dequantization(self):
+    def test_unsupported_quant_type_requires_explicit_dequantization(self):
         """Unsupported quantized inputs fail instead of silently becoming float."""
         from gguf import GGMLQuantizationType
 
@@ -713,7 +716,7 @@ class TestBuildQuantizedGguf:
                 yield (
                     "blk.0.ffn_down.weight",
                     np.empty(0, dtype=np.uint8),
-                    GGMLQuantizationType.Q6_K,
+                    GGMLQuantizationType.Q5_K,
                     (64, 128),
                 )
 
@@ -721,11 +724,37 @@ class TestBuildQuantizedGguf:
             ValueError,
             match=(
                 r"No supported quantized preservation target for GGUF weight "
-                r"types: Q6_K. Use keep_quantized=False \(API\) or "
+                r"types: Q5_K. Use keep_quantized=False \(API\) or "
                 r"--dequantize \(CLI\) for explicit float import."
             ),
         ):
             _detect_quant_params(_UnsupportedModel(), "llama")
+
+    def test_q6_k_selects_the_asymmetric_four_bit_repack_target(self):
+        """Q6_K repacks to the same 4-bit/32 target as Q4_K, with zero points.
+
+        Q6_K's source form is symmetric around 32, but it reaches MatMulNBits
+        through the asymmetric affine requantizer, so zero points are required.
+        A missing entry in `type_can_omit_zero_points` raises `KeyError` here
+        rather than producing a wrong model.
+        """
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _Q6KModel:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q6_K,
+                    (64, 128),
+                )
+
+        bits, block_size, is_sym = _detect_quant_params(_Q6KModel(), "llama")
+
+        assert (bits, block_size) == (4, 32)
+        assert is_sym is False
 
     def test_runtime_unsupported_format_does_not_select_native_op(self):
         """A GGUF type outside the runtime contract remains on the fallback."""
@@ -1050,3 +1079,238 @@ class TestGGUFPreflightGuards:
 
         with pytest.raises(NotImplementedError, match="cannot assemble split tensor tables"):
             _raise_for_sharded_gguf(source="model-00001-of-00002.gguf", split_count=2)
+
+
+class TestNormalizeGgufWeights:
+    """Tests for GGUF-specific weight shape/value normalization."""
+
+    def test_deltanet_a_log_is_inverted_from_neg_exp(self):
+        """GGUF ssm_a = -exp(A_log); normalize must recover raw A_log = log(-ssm_a).
+
+        The GatedDeltaNet module re-applies ``-exp(A_log)`` at runtime, so the
+        round-trip ``-exp(normalize(ssm_a))`` must reproduce the original
+        ``ssm_a`` the converter stored.
+        """
+        import torch
+
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        # A representative raw A_log, and the value the GGUF converter stores.
+        a_log_raw = torch.tensor([-3.4688, -1.0703, -5.0, -0.5], dtype=torch.float32)
+        ssm_a = -torch.exp(a_log_raw)  # what llama.cpp writes to blk.N.ssm_a
+        assert bool((ssm_a < 0).all())  # sanity: pre-transformed value is negative
+
+        key = "model.layers.0.linear_attn.A_log"
+        out = _normalize_gguf_weights({key: ssm_a})
+
+        # The stored parameter must be the raw A_log again ...
+        assert torch.allclose(out[key], a_log_raw, atol=1e-5)
+        # ... so that the module's runtime -exp(A_log) recovers ssm_a exactly.
+        assert torch.allclose(-torch.exp(out[key]), ssm_a, atol=1e-6)
+
+    def test_non_deltanet_a_log_is_untouched(self):
+        """Mamba/PLaMo SSM ``A_log`` (consumed as ``A`` directly) must not be inverted."""
+        import torch
+
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        ssm_a = torch.tensor([-0.04, -0.5], dtype=torch.float32)
+        key = "backbone.layers.0.mixer.A_log"
+        out = _normalize_gguf_weights({key: ssm_a})
+        assert torch.allclose(out[key], ssm_a)
+
+    def test_zero_centered_norm_offset_removed_for_qwen35(self):
+        """qwen35 GGUF bakes +1 into transformer norms; normalize must strip it.
+
+        mobius applies the ``1 +`` at runtime via OffsetRMSNorm, so the stored
+        weight must be the raw zero-centered value again.
+        """
+        import torch
+
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        sd = {
+            "model.layers.0.input_layernorm.weight": torch.tensor([1.5, 2.0]),
+            "model.layers.3.self_attn.q_norm.weight": torch.tensor([1.25]),
+            "model.layers.3.self_attn.k_norm.weight": torch.tensor([1.1]),
+            "model.norm.weight": torch.tensor([1.94]),
+            # DeltaNet internal gated norm — converter did NOT add +1.
+            "model.layers.0.linear_attn.norm.weight": torch.tensor([0.87]),
+        }
+        out = _normalize_gguf_weights(dict(sd), gguf_arch="qwen35")
+
+        assert torch.allclose(
+            out["model.layers.0.input_layernorm.weight"], torch.tensor([0.5, 1.0])
+        )
+        assert torch.allclose(
+            out["model.layers.3.self_attn.q_norm.weight"], torch.tensor([0.25])
+        )
+        assert torch.allclose(out["model.norm.weight"], torch.tensor([0.94]))
+        # linear_attn.norm is a plain gated RMSNorm — must be left untouched.
+        assert torch.allclose(
+            out["model.layers.0.linear_attn.norm.weight"], torch.tensor([0.87])
+        )
+
+    def test_norm_offset_not_applied_for_non_offset_arch(self):
+        """Standard-RMSNorm archs (e.g. llama/qwen2) must not have norms shifted."""
+        import torch
+
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        sd = {
+            "model.layers.0.input_layernorm.weight": torch.tensor([1.0, 1.0]),
+            "model.norm.weight": torch.tensor([1.0]),
+        }
+        out = _normalize_gguf_weights(dict(sd), gguf_arch="qwen2")
+        assert torch.allclose(
+            out["model.layers.0.input_layernorm.weight"], torch.tensor([1.0, 1.0])
+        )
+        assert torch.allclose(out["model.norm.weight"], torch.tensor([1.0]))
+
+
+class TestReorderDeltaNetVHeads:
+    """Undo of the GGUF converter's grouped→tiled Gated-DeltaNet V-head order.
+
+    The llama.cpp converter reorders every V-indexed ``linear_attn`` tensor from
+    HuggingFace *grouped* order into ggml *tiled* order (see
+    ``_LinearAttentionVReorderBase._reorder_v_heads``). mobius consumes grouped
+    order, so ``_reorder_deltanet_v_heads`` must be the exact inverse.
+    """
+
+    # Small grouped linear-attention geometry: 2 K-heads, 6 V-heads (v_per_k=3).
+    CFG = SimpleNamespace(
+        linear_num_key_heads=2,
+        linear_num_value_heads=6,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+    )
+
+    @staticmethod
+    def _converter_reorder(tensor, dim, num_k_heads, num_v_per_k, head_dim):
+        """Reference grouped→tiled reorder copied from llama.cpp's converter."""
+        import torch  # noqa: F401
+
+        shape = list(tensor.shape)
+        if dim < 0:
+            dim += len(shape)
+        new_shape = [*shape[:dim], num_k_heads, num_v_per_k, head_dim, *shape[dim + 1 :]]
+        tensor = tensor.reshape(*new_shape)
+        perm = list(range(len(new_shape)))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return tensor.permute(*perm).contiguous().reshape(*shape)
+
+    def test_row_tensors_roundtrip(self):
+        """Grouped weights survive tile→untile for every V-row projection."""
+        import torch
+
+        from mobius.integrations.gguf._builder import _reorder_deltanet_v_heads
+
+        cfg = self.CFG
+        n_k, n_v = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+        v_per_k = n_v // n_k
+        hd_k, hd_v = cfg.linear_key_head_dim, cfg.linear_value_head_dim
+        key_dim, value_dim = hd_k * n_k, hd_v * n_v
+        hidden = 5
+        torch.manual_seed(0)
+
+        p = "model.layers.0.linear_attn."
+        grouped = {
+            f"{p}in_proj_z.weight": torch.randn(value_dim, hidden),
+            f"{p}in_proj_a.weight": torch.randn(n_v, hidden),
+            f"{p}in_proj_b.weight": torch.randn(n_v, hidden),
+            f"{p}A_log": torch.randn(n_v),
+            f"{p}dt_bias": torch.randn(n_v),
+            f"{p}conv1d.weight": torch.randn(2 * key_dim + value_dim, 1, 4),
+        }
+        # in_proj_qkv: only the V rows (after 2*key_dim) are reordered.
+        qkv = torch.randn(2 * key_dim + value_dim, hidden)
+        grouped[f"{p}in_proj_qkv.weight"] = qkv
+
+        # Build the tiled (GGUF) state by applying the converter's reorder.
+        tiled = {k: v.clone() for k, v in grouped.items()}
+        tiled[f"{p}in_proj_z.weight"] = self._converter_reorder(
+            grouped[f"{p}in_proj_z.weight"], 0, n_k, v_per_k, hd_v
+        )
+        for name in ("in_proj_a", "in_proj_b"):
+            tiled[f"{p}{name}.weight"] = self._converter_reorder(
+                grouped[f"{p}{name}.weight"], 0, n_k, v_per_k, 1
+            )
+        for name in ("A_log", "dt_bias"):
+            tiled[f"{p}{name}"] = self._converter_reorder(
+                grouped[f"{p}{name}"], 0, n_k, v_per_k, 1
+            )
+        # V portion of qkv / conv1d.
+        v0 = 2 * key_dim
+        qv = self._converter_reorder(qkv[v0:], 0, n_k, v_per_k, hd_v)
+        tiled[f"{p}in_proj_qkv.weight"] = torch.cat([qkv[:v0], qv], dim=0)
+        conv = grouped[f"{p}conv1d.weight"]
+        cv = self._converter_reorder(conv[v0:], 0, n_k, v_per_k, hd_v)
+        tiled[f"{p}conv1d.weight"] = torch.cat([conv[:v0], cv], dim=0)
+
+        out = _reorder_deltanet_v_heads({k: v.clone() for k, v in tiled.items()}, cfg)
+
+        for k in grouped:
+            assert torch.allclose(out[k], grouped[k]), k
+
+    def test_quantized_out_proj_columns_roundtrip(self):
+        """out_proj's quantized K axis (blocks + packed zero-points) round-trips."""
+        import torch
+
+        from mobius.integrations.gguf._builder import _reorder_deltanet_v_heads
+
+        cfg = self.CFG
+        n_k, n_v = cfg.linear_num_key_heads, cfg.linear_num_value_heads
+        v_per_k = n_v // n_k
+        hd_v = cfg.linear_value_head_dim  # 4
+        value_dim = hd_v * n_v  # 24
+        block = 2  # 2 elems/block -> head_v_dim(4) = 2 blocks (even -> byte aligned)
+        n_blocks = value_dim // block  # 12
+        hidden = 5
+        torch.manual_seed(1)
+
+        p = "model.layers.0.linear_attn."
+        # Grouped quantized out_proj triplet: [hidden, K/block, block/2], etc.
+        gw = torch.randint(0, 255, (hidden, n_blocks, block // 2 + 7), dtype=torch.uint8)
+        gs = torch.randn(hidden, n_blocks, dtype=torch.float16)
+        gz = torch.randint(0, 255, (hidden, n_blocks // 2), dtype=torch.uint8)
+        # Provide a grouped row tensor so the head geometry is exercised too.
+        grouped = {
+            f"{p}out_proj.weight": gw,
+            f"{p}out_proj.scales": gs,
+            f"{p}out_proj.zero_points": gz,
+        }
+        blocks_per_head = n_blocks // n_v  # 2
+        tiled = {
+            f"{p}out_proj.weight": self._converter_reorder(
+                gw, 1, n_k, v_per_k, blocks_per_head
+            ),
+            f"{p}out_proj.scales": self._converter_reorder(
+                gs, 1, n_k, v_per_k, blocks_per_head
+            ),
+            f"{p}out_proj.zero_points": self._converter_reorder(
+                gz, 1, n_k, v_per_k, blocks_per_head // 2
+            ),
+        }
+
+        out = _reorder_deltanet_v_heads({k: v.clone() for k, v in tiled.items()}, cfg)
+
+        for k in grouped:
+            assert torch.equal(out[k], grouped[k]), k
+
+    def test_no_reorder_when_heads_equal(self):
+        """Ungrouped linear attention (num_v == num_k) is left untouched."""
+        import torch
+
+        from mobius.integrations.gguf._builder import _reorder_deltanet_v_heads
+
+        cfg = SimpleNamespace(
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+        )
+        p = "model.layers.0.linear_attn."
+        sd = {f"{p}in_proj_z.weight": torch.randn(16, 5)}
+        ref = sd[f"{p}in_proj_z.weight"].clone()
+        out = _reorder_deltanet_v_heads({k: v.clone() for k, v in sd.items()}, cfg)
+        assert torch.equal(out[f"{p}in_proj_z.weight"], ref)

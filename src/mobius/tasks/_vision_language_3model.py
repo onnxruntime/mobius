@@ -219,6 +219,47 @@ class QwenVLTask(VisionLanguageTask):
         return _make_model(graph)
 
 
+class GlmOcrVLTask(QwenVLTask):
+    """GLM-OCR packed vision task with a float32 processor boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        total_patches = ir.SymbolicDim("total_patches")
+        num_images = ir.SymbolicDim("num_images")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 14
+        pixel_dim = (
+            vision_config.in_channels
+            * vision_config.temporal_patch_size
+            * patch_size
+            * patch_size
+        )
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[total_patches, pixel_dim],
+        )
+        image_grid_thw = builder.input(
+            "image_grid_thw",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 3],
+        )
+        model_pixels = builder.op.Cast(pixel_values, to=config.dtype)
+        image_features = vision(
+            builder.op,
+            pixel_values=model_pixels,
+            image_grid_thw=image_grid_thw,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class MuseGlimmerVLTask(QwenVLTask):
     """Muse Glimmer packed vision pipeline with standard 1D text RoPE."""
 
@@ -309,6 +350,77 @@ class HybridQwenVLTask(QwenVLTask):
             deepstack=deepstack,
         )
         return ModelPackage(models, config=config)
+
+
+class Lfm2VlTask(VisionLanguageTask):
+    """LFM2-VL split: SigLIP2 NaFlex vision with an LFM2 hybrid decoder.
+
+    The decoder mixes ``"conv"`` (gated short convolution) and
+    ``"full_attention"`` layers, so it uses the hybrid cache contract.  The
+    vision encoder takes the NaFlex triple emitted by the image processor:
+    pre-patchified pixels, a per-patch padding mask, and the per-image patch
+    grid, and returns the flat ``[num_image_tokens, text_hidden]`` stream that
+    the embedding model scatters onto the image placeholder tokens.
+    """
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models: dict[str, ir.Model] = {}
+        models["decoder"] = build_decoder_from_embeds(
+            module.decoder,
+            config,
+            hybrid=True,
+        )
+        models["vision_encoder"] = self._build_vision(module.vision_encoder, config)
+        models["embedding"] = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        return ModelPackage(models, config=config)
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build the NaFlex vision encoder: patchified pixels -> image features."""
+        num_images = ir.SymbolicDim("num_images")
+        max_patches = ir.SymbolicDim("max_num_patches")
+        vision_config = config.vision
+        assert vision_config is not None
+        patch_size = vision_config.patch_size or 16
+        patch_dim = vision_config.in_channels * patch_size * patch_size
+
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=config.dtype,
+            shape=[num_images, max_patches, patch_dim],
+        )
+        pixel_attention_mask = builder.input(
+            "pixel_attention_mask",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, max_patches],
+        )
+        spatial_shapes = builder.input(
+            "spatial_shapes",
+            dtype=ir.DataType.INT64,
+            shape=[num_images, 2],
+        )
+        image_features = vision(
+            builder.op,
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            spatial_shapes=spatial_shapes,
+        )
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
 
 
 class MiniCPMVLTask(VisionLanguageTask):

@@ -215,6 +215,21 @@ class GGUFModel:
         """List of all tensor names in the GGUF file."""
         return list(self._tensor_index.keys())
 
+    @property
+    def num_tensors(self) -> int:
+        """Number of tensors in the GGUF file."""
+        return len(self._tensor_index)
+
+    def reader_tensors(self):
+        """Underlying ``gguf.ReaderTensor`` records (``name``/``shape``/``tensor_type``).
+
+        Exposed so callers that previously reached into the private
+        ``_reader.tensors`` list keep working across a single file *and* a
+        multi-shard :class:`~mobius.integrations.gguf._shard_set.GgufShardSet`,
+        which yields the records of every shard in order.
+        """
+        return list(self._reader.tensors)
+
     def _dequantize_tensor(self, tensor) -> np.ndarray:
         """Dequantize a single :class:`ReaderTensor` to a numpy array.
 

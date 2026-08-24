@@ -187,10 +187,11 @@ def test_llada_matches_torch_reference():
         expected = _reference_logits(config, state, input_ids).numpy()
 
     session = _build_onnx_session(config, state)
-    actual = session.run(None, {"input_ids": input_ids.numpy()})[0]
+    actual, proposed = session.run(None, {"input_ids": input_ids.numpy()})
 
     max_delta = np.abs(actual - expected).max()
     assert max_delta < 1e-4, f"max|Δ|={max_delta}"
+    np.testing.assert_array_equal(proposed, np.argmax(actual, axis=-1))
 
 
 def test_llada_attention_is_bidirectional():
@@ -216,23 +217,21 @@ def test_llada_attention_is_bidirectional():
 
 
 def test_llada_export_signature_matches_masked_diffusion_metadata():
-    """The exported ONNX I/O matches the onnx-genai masked-diffusion contract.
+    """The exported ONNX I/O matches the onnx-genai masked workflow contract.
 
-    Builds a tiny LLaDA package and asserts the graph exposes exactly
-    ``input_ids [B, S]`` int64 in and ``logits [B, S, V]`` f32 out with no
-    past/present KV, then checks that
-    :func:`build_language_diffusion_pipeline_metadata` emits a pipeline whose
-    denoiser self-edge references those same ports.
+    Builds a tiny LLaDA package and checks that the graph exposes the logits and
+    executable proposal ports consumed by the generic SSA workflow.
     """
     import onnx_ir as ir
 
-    from mobius.integrations.onnx_genai.inference_metadata import (
+    from mobius.integrations.onnx_genai.workflow_metadata import (
         build_language_diffusion_pipeline_metadata,
     )
 
     config = _make_config()
     module = LLaDAModel(config)
-    model = MaskedDiffusionTask().build(module, config)["model"]
+    package = MaskedDiffusionTask().build(module, config)
+    model = package["model"]
     graph = model.graph
 
     # Exactly one input: input_ids [B, S] int64.
@@ -241,12 +240,14 @@ def test_llada_export_signature_matches_masked_diffusion_metadata():
     assert input_ids.dtype == ir.DataType.INT64
     assert len(input_ids.shape) == 2
 
-    # Exactly one output: logits [B, S, V] float.
-    assert [value.name for value in graph.outputs] == ["logits"]
+    assert [value.name for value in graph.outputs] == ["logits", "proposed_tokens"]
     logits = graph.outputs[0]
     assert logits.dtype == ir.DataType.FLOAT
     assert len(logits.shape) == 3
     assert logits.shape[2] == config.vocab_size
+    proposed = graph.outputs[1]
+    assert proposed.dtype == ir.DataType.INT64
+    assert len(proposed.shape) == 2
 
     # No KV-cache ports on either side.
     io_names = [value.name for value in (*graph.inputs, *graph.outputs)]
@@ -254,22 +255,13 @@ def test_llada_export_signature_matches_masked_diffusion_metadata():
         token in name for name in io_names for token in ("past", "present", "cache")
     )
 
-    # The emitted metadata must wire those exact ports into a masked-diffusion
-    # iterative loop with a logits -> input_ids self-edge.
     meta = build_language_diffusion_pipeline_metadata(
-        mask_token_id=126336,
+        package,
         num_inference_steps=8,
-        input_ids_port="input_ids",
-        logits_port="logits",
     )
-    pipeline = meta["pipeline"]
-    assert pipeline["models"]["denoiser"]["type"] == "denoiser"
-    assert pipeline["dataflow"] == [{"from": "denoiser.logits", "to": "denoiser.input_ids"}]
-    strategy = pipeline["strategy"]
-    assert strategy["kind"] == "iterative"
-    assert strategy["denoiser"] == "denoiser"
-    assert strategy["num_steps"] == 8
-    assert strategy["scheduler_config"] == {
-        "kind": "masked_diffusion",
-        "mask_token_id": 126336,
-    }
+    workflow = meta["pipeline"]["workflow"]
+    assert "strategy" not in meta["pipeline"]
+    assert workflow["steps"][0]["kind"] == "loop"
+    assert workflow["components"]["masked_update"]["contract"]["id"] == (
+        "onnx-genai.masked-update"
+    )

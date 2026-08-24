@@ -10,6 +10,10 @@ from onnxscript import GraphBuilder, nn
 
 from mobius._build_context import prefill_prefix_pruning
 from mobius._configs import ArchitectureConfig
+from mobius._constants import (
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius._model_package import ModelPackage
 from mobius.components._attention import StaticCacheState
 from mobius.tasks._base import (
@@ -425,12 +429,12 @@ def _make_static_cache_inputs(
 
     # Shared inputs across all layers
     write_indices = builder.input(
-        "write_indices",
+        STATIC_CACHE_WRITE_INDICES,
         dtype=ir.DataType.INT64,
         shape=[batch],
     )
     nonpad_kv_seqlen = builder.input(
-        "nonpad_kv_seqlen",
+        STATIC_CACHE_KV_SEQUENCE_LENGTH,
         dtype=ir.DataType.INT64,
         shape=[batch],
     )

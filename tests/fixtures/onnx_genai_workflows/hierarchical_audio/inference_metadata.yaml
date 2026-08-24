@@ -1,0 +1,2395 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis:
+        onnx-genai.text-assembly: '1'
+      capabilities:
+      - workflow_ssa
+      - nested_control_flow
+      - loop_induction_values
+      - loop_carried_state
+      - typed_emit
+      - serving_service_contract
+      - bounded_state_recurrence
+    inputs:
+      request.prompt_tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence_length
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_frames_with_warmup:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_output_tokens
+        source:
+          kind: request
+        required: true
+      request.seed:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: seed
+        source:
+          kind: request
+        required: false
+        default: 0
+      package.temperature:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1.0
+      package.top_k:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 50
+      package.top_p:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1.0
+      package.min_p:
+        contract:
+          dtype: float32
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0.0
+      package.one:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.one_batch:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 1
+      package.local_steps:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 7
+      package.local_context:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 9
+      package.global_context:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 64
+      package.carry_length:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 172
+      package.max_waveform_samples:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 15876000
+      package.flow_steps:
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 30
+      package.flow_rng_offset:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.loop_1_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.loop_3_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.loop_2_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+    outputs:
+      audio:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 2
+          - samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: audio
+        stage: pre_adapter
+        media:
+          container: wav
+          encoding: pcm_s16_le
+          sample_rate_hz: 32000
+          source_sample_rate_hz: 44100
+          channels: 2
+          delivery: buffered
+    components:
+      language_model:
+        implementation:
+          kind: onnx
+          artifact: language_model/model.onnx
+        ports:
+          roles:
+            inputs_embeds: inputs_embeds
+            attention_mask: attention_mask
+            position_ids: position_ids
+            logits: logits
+            last_hidden_state: hidden_states
+      language_model_embedding:
+        implementation:
+          kind: onnx
+          artifact: language_model_embedding/model.onnx
+        ports:
+          roles:
+            input_ids: token_ids
+            inputs_embeds: inputs_embeds
+      language_model_semantic_embedding:
+        implementation:
+          kind: onnx
+          artifact: language_model_semantic_embedding/model.onnx
+      rvq_depth_decoder:
+        implementation:
+          kind: onnx
+          artifact: rvq_depth_decoder/model.onnx
+        ports:
+          roles:
+            inputs_embeds: inputs_embeds
+      rvq_depth_decoder_projection:
+        implementation:
+          kind: onnx
+          artifact: rvq_depth_decoder_projection/model.onnx
+      rvq_depth_decoder_embedding:
+        implementation:
+          kind: onnx
+          artifact: rvq_depth_decoder_embedding/model.onnx
+      rvq_depth_decoder_feedback_embedding:
+        implementation:
+          kind: onnx
+          artifact: rvq_depth_decoder_feedback_embedding/model.onnx
+      rvq_depth_decoder_heads:
+        implementation:
+          kind: onnx
+          artifact: rvq_depth_decoder_heads/model.onnx
+      condition_encoder:
+        implementation:
+          kind: onnx
+          artifact: condition_encoder/model.onnx
+        ports:
+          roles:
+            encoder_hidden_states: encoder_hidden_states
+      transformer:
+        implementation:
+          kind: onnx
+          artifact: transformer/model.onnx
+        ports:
+          roles:
+            encoder_hidden_states: encoder_hidden_states
+      vocoder:
+        implementation:
+          kind: onnx
+          artifact: vocoder/model.onnx
+      speech_text_assembly:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.text-assembly
+          version: '1'
+          artifact: speech_processor.json
+        contract:
+          id: onnx-genai.text-assembly
+          version: '1'
+      global_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/global_initializer.onnx
+        ports:
+          inputs:
+            prompt_tokens:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - past_sequence_length + sequence_length
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            body_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - prompt_sequence + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            body_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            token_slot:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.key:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 1
+              - past_sequence_length
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.value:
+              dtype: float32
+              rank: 4
+              shape:
+              - batch
+              - 1
+              - past_sequence_length
+              - 4
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      global_step_update:
+        implementation:
+          kind: onnx
+          artifact: policies/global_step_update.onnx
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            next_attention_mask:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - context + 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_position_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      ar_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/ar_initializer.onnx
+        ports:
+          inputs: {}
+          outputs:
+            frame_history:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 0
+              - 64
+            rng_counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      length_step:
+        implementation:
+          kind: onnx
+          artifact: policies/length_step.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            right:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            total:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      guided_vocabulary:
+        implementation:
+          kind: onnx
+          artifact: policies/guided_vocabulary.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - sequence
+              - vocabulary
+          outputs:
+            candidate_logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - 1
+              - 16385
+      sampler:
+        implementation:
+          kind: onnx
+          artifact: policies/sampler.onnx
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - batch
+              - vocabulary
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            temperature:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            top_k:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            top_p:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            min_p:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_counter:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.token-sampler
+          version: '2'
+          bindings:
+            logits: logits
+            token: token
+            temperature: temperature
+            top_k: top_k
+            top_p: top_p
+            min_p: min_p
+            active: active
+            done: done
+            seed: seed
+            counter: counter
+            next_counter: next_counter
+          parameters:
+            mode: seeded_stochastic
+            batching: per_row
+            inactive_rows: preserve
+        application_overridable: true
+      candidate_map:
+        implementation:
+          kind: onnx
+          artifact: policies/candidate_map.onnx
+        ports:
+          inputs:
+            candidate:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            semantic_code:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - 1
+            semantic_token:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - 1
+            is_stop:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      continue_predicate:
+        implementation:
+          kind: onnx
+          artifact: policies/continue_predicate.onnx
+        ports:
+          inputs:
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            continue:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      last_global_hidden:
+        implementation:
+          kind: onnx
+          artifact: policies/last_global_hidden.onnx
+        ports:
+          inputs:
+            value:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - sequence
+              - 8
+          outputs:
+            last:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+      local_initializer:
+        implementation:
+          kind: onnx
+          artifact: policies/local_initializer.onnx
+        ports:
+          inputs:
+            global_hidden:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+            semantic_embedding:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+          outputs:
+            sequence:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - sequence
+              - 8
+            acoustic_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - codes
+            local_hidden_parts:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - parts
+              - 8
+      codebook_index:
+        implementation:
+          kind: onnx
+          artifact: policies/codebook_index.onnx
+        ports:
+          inputs:
+            left:
+              dtype: int64
+              rank: 0
+              shape: []
+            right:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            total:
+              dtype: int64
+              rank: 0
+              shape: []
+      local_logits:
+        implementation:
+          kind: onnx
+          artifact: policies/local_logits.onnx
+        ports:
+          inputs:
+            all_codebook_logits:
+              dtype: float32
+              rank: 4
+              shape:
+              - codebooks
+              - 2
+              - sequence
+              - vocabulary
+            codebook_index:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            logits:
+              dtype: float32
+              rank: 2
+              shape:
+              - 1
+              - vocabulary
+      embedding_id:
+        implementation:
+          kind: onnx
+          artifact: policies/embedding_id.onnx
+        ports:
+          inputs:
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            codebook_index:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            embedding_ids:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - 1
+      local_append:
+        implementation:
+          kind: onnx
+          artifact: policies/local_append.onnx
+        ports:
+          inputs:
+            sequence:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - sequence
+              - 8
+            projected_embedding:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+            acoustic_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - codes
+            token:
+              dtype: int64
+              rank: 1
+              shape:
+              - 1
+            hidden_states:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - sequence
+              - 8
+            local_hidden_parts:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - parts
+              - 8
+          outputs:
+            next_sequence:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - next_sequence_dim_1
+              - 8
+            next_acoustic_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - next_acoustic_codes_dim_1
+            next_local_hidden_parts:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - next_local_hidden_parts_dim_1
+              - 8
+      frame_append:
+        implementation:
+          kind: onnx
+          artifact: policies/frame_append.onnx
+        ports:
+          inputs:
+            history:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - frames
+              - 64
+            global_hidden:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+            local_hidden_parts:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 7
+              - 8
+          outputs:
+            next_history:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - next_history_dim_1
+              - 64
+      acoustic_frame:
+        implementation:
+          kind: onnx
+          artifact: policies/acoustic_frame.onnx
+        ports:
+          inputs:
+            acoustic_codes:
+              dtype: int64
+              rank: 2
+              shape:
+              - 2
+              - 7
+          outputs:
+            framed_acoustic_codes:
+              dtype: int64
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 7
+      feedback_sum:
+        implementation:
+          kind: onnx
+          artifact: policies/feedback_sum.onnx
+        ports:
+          inputs:
+            semantic:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+            acoustic:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+          outputs:
+            feedback:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 1
+              - 8
+      finalize_frames:
+        implementation:
+          kind: onnx
+          artifact: policies/finalize_frames.onnx
+        ports:
+          inputs:
+            history:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - frames_with_warmup
+              - 64
+            stopped:
+              dtype: bool
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            frame_hiddens:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - frames
+              - 64
+      chunk_plan:
+        implementation:
+          kind: onnx
+          artifact: policies/chunk_plan.onnx
+        ports:
+          inputs:
+            frame_hiddens:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - frames
+              - 64
+          outputs:
+            chunk_count:
+              dtype: int64
+              rank: 0
+              shape: []
+            waveform:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 2
+              - samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            previous_latent:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - 0
+            previous_condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 0
+              - 2048
+        contract:
+          id: mobius.policy.audio-chunk-plan
+          version: '1'
+          bindings: {}
+      chunk_slice:
+        implementation:
+          kind: onnx
+          artifact: policies/chunk_slice.onnx
+        ports:
+          inputs:
+            frame_hiddens:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - frames
+              - 64
+            chunk_index:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            frame_chunk:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - chunk_frames
+              - 64
+        contract:
+          id: mobius.policy.audio-chunk-slice
+          version: '1'
+          bindings: {}
+      overlap_prepare:
+        implementation:
+          kind: onnx
+          artifact: policies/overlap_prepare.onnx
+        ports:
+          inputs:
+            condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - latent_length
+              - 2048
+            previous_condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - carry_length
+              - 2048
+            previous_latent:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - carry_length
+          outputs:
+            guided_condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - guided_condition_dim_0
+              - guided_condition_dim_1
+              - guided_condition_dim_2
+            spliced_condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - spliced_condition_dim_0
+              - spliced_condition_dim_1
+              - spliced_condition_dim_2
+            overlap:
+              dtype: int64
+              rank: 0
+              shape: []
+            noise_row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - 2
+      latent_noise:
+        implementation:
+          kind: onnx
+          artifact: policies/latent_noise.onnx
+        ports:
+          inputs:
+            seed:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            row_shape:
+              dtype: int64
+              rank: 1
+              shape:
+              - 2
+          outputs:
+            noise:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - channels
+              - latent_length
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            next_offset:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.counter-rng
+          version: '1'
+          bindings:
+            seed: seed
+            offset: offset
+            row_shape: row_shape
+            noise: noise
+            next_offset: next_offset
+      flow_schedule:
+        implementation:
+          kind: onnx
+          artifact: policies/flow_schedule.onnx
+        ports:
+          inputs: {}
+          outputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - 31
+      flow_timestep:
+        implementation:
+          kind: onnx
+          artifact: policies/flow_timestep.onnx
+        ports:
+          inputs:
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+      overlap_blend:
+        implementation:
+          kind: onnx
+          artifact: policies/overlap_blend.onnx
+        ports:
+          inputs:
+            latents:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - latent_length
+            initial_noise:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - latent_length
+            previous_latent:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - carry_length
+            overlap:
+              dtype: int64
+              rank: 0
+              shape: []
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            blended_latents:
+              dtype: float32
+              rank: 3
+              shape:
+              - blended_latents_dim_0
+              - blended_latents_dim_1
+              - blended_latents_dim_2
+      flow_inputs:
+        implementation:
+          kind: onnx
+          artifact: policies/flow_inputs.onnx
+        ports:
+          inputs:
+            latents:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - latent_length
+            timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - 1
+          outputs:
+            guided_latents:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 128
+              - latent_length
+            guided_timestep:
+              dtype: float32
+              rank: 1
+              shape:
+              - 2
+      flow_guidance:
+        implementation:
+          kind: onnx
+          artifact: policies/flow_guidance.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 3
+              shape:
+              - 2
+              - 128
+              - latent_length
+          outputs:
+            velocity:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - latent_length
+      flow_solver:
+        implementation:
+          kind: onnx
+          artifact: policies/flow_solver.onnx
+        ports:
+          inputs:
+            sample:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - channels
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            derivative:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - channels
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            step:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            schedule:
+              dtype: float32
+              rank: 1
+              shape:
+              - schedule_length
+          outputs:
+            next_state:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - sequence
+              - channels
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.solver-step
+          version: '1'
+          bindings:
+            state: sample
+            estimate: derivative
+            step: step
+            schedule: schedule
+            next_state: next_state
+      chunk_update:
+        implementation:
+          kind: onnx
+          artifact: policies/chunk_update.onnx
+        ports:
+          inputs:
+            latents:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - latent_length
+            previous_latent:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - 128
+              - carry_length
+            condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - 1
+              - latent_length
+              - 2048
+            overlap:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            restored_latents:
+              dtype: float32
+              rank: 3
+              shape:
+              - restored_latents_dim_0
+              - restored_latents_dim_1
+              - restored_latents_dim_2
+            next_previous_latent:
+              dtype: float32
+              rank: 3
+              shape:
+              - next_previous_latent_dim_0
+              - next_previous_latent_dim_1
+              - next_previous_latent_dim_2
+            next_previous_condition:
+              dtype: float32
+              rank: 3
+              shape:
+              - next_previous_condition_dim_0
+              - next_previous_condition_dim_1
+              - next_previous_condition_dim_2
+      waveform_stitch:
+        implementation:
+          kind: onnx
+          artifact: policies/waveform_stitch.onnx
+        ports:
+          inputs:
+            waveform:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 2
+              - chunk_samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            history:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 2
+              - samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            chunk_index:
+              dtype: int64
+              rank: 0
+              shape: []
+            chunk_count:
+              dtype: int64
+              rank: 0
+              shape: []
+          outputs:
+            next_history:
+              dtype: float32
+              rank: 3
+              shape:
+              - batch
+              - 2
+              - next_samples
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+    state:
+      global_logits:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - sequence_length
+          - 168060
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        scope: invocation
+        initializer: global.setup.logits
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.global_context
+      global_hidden:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - sequence_length
+          - 8
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        scope: invocation
+        initializer: global.setup.hidden
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.global_context
+      global_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - past_sequence_length + sequence_length
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        scope: invocation
+        initializer: global.initial.body_attention_mask
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: package.global_context
+      global_position:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - 1
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        scope: invocation
+        initializer: global.initial.body_position_ids
+        recurrence:
+          kind: invariant
+      frame_history:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - 1
+          - frames
+          - 64
+        scope: invocation
+        initializer: ar.initial.history
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: request.max_frames_with_warmup
+      rng:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: ar.initial.counter
+        recurrence:
+          kind: invariant
+      active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: ar.initial.active
+        recurrence:
+          kind: invariant
+      done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: ar.initial.done
+        recurrence:
+          kind: invariant
+      global_length:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: ar.initial.counter
+        recurrence:
+          kind: invariant
+      local_sequence:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - 2
+          - steps
+          - 8
+        scope: invocation
+        initializer: local.initial_sequence
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: package.local_context
+      local_codes:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - 2
+          - codes
+        scope: invocation
+        initializer: local.initial_codes
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: package.local_steps
+      local_hidden:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - 1
+          - parts
+          - 8
+        scope: invocation
+        initializer: local.initial_hidden
+        recurrence:
+          kind: growing
+          axis: 1
+          increment: package.one
+          max: package.local_steps
+      local_rng:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: frame.next_rng
+        recurrence:
+          kind: invariant
+      flow_latents:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - 1
+          - 128
+          - latent_length
+        scope: invocation
+        initializer: chunk.initial_noise
+        recurrence:
+          kind: invariant
+      previous_latent:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - 1
+          - 128
+          - carry_length
+        scope: invocation
+        initializer: audio.initial_previous_latent
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.carry_length
+      previous_condition:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - 1
+          - carry_length
+          - 2048
+        scope: invocation
+        initializer: audio.initial_previous_condition
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.carry_length
+      waveform:
+        contract:
+          dtype: float32
+          rank: 3
+          shape:
+          - batch
+          - 2
+          - samples
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: audio.initial_waveform
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.max_waveform_samples
+      flow_rng:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        scope: invocation
+        initializer: package.flow_rng_offset
+        recurrence:
+          kind: invariant
+      global_cache_0:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 1
+          - past_sequence_length + sequence_length
+          - 4
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        class: semantic
+        scope: invocation
+        initializer: global.setup.cache_0
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.global_context
+        service_group: global_cache
+        management: runtime
+        release_boundary: invocation
+      global_cache_1:
+        contract:
+          dtype: float32
+          rank: 4
+          shape:
+          - batch
+          - 1
+          - past_sequence_length + sequence_length
+          - 4
+          batch_layout:
+            kind: request_expanded
+            axis: 0
+            factor: 2
+        class: semantic
+        scope: invocation
+        initializer: global.setup.cache_1
+        recurrence:
+          kind: bounded
+          axis: 2
+          max: package.global_context
+        service_group: global_cache
+        management: runtime
+        release_boundary: invocation
+      loop_1_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_1_active
+        recurrence:
+          kind: invariant
+      loop_0_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_0_active
+        recurrence:
+          kind: invariant
+      loop_3_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_3_active
+        recurrence:
+          kind: invariant
+      loop_2_active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - 1
+        scope: invocation
+        initializer: package.loop_2_active
+        recurrence:
+          kind: invariant
+    serving:
+      active: active
+      done: done
+      accepted_len: global_length
+      state_service:
+        groups:
+          global_cache:
+            kind: full_attention
+            sequence_axis: 2
+            layout: bnsh
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: false
+            ports:
+              language_model:
+                global_cache_0:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                global_cache_1:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+    steps:
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: global_initializer
+        inputs:
+          prompt_tokens: request.prompt_tokens
+        outputs:
+          attention_mask: global.initial.attention_mask
+          position_ids: global.initial.position_ids
+          body_attention_mask: global.initial.body_attention_mask
+          body_position_ids: global.initial.body_position_ids
+          token_slot: global.initial.token_slot
+          past_key_values.0.key: global.initial.past_key_values.0.key
+          past_key_values.0.value: global.initial.past_key_values.0.value
+      - kind: invoke
+        component: language_model_embedding
+        inputs:
+          input_ids: request.prompt_tokens
+        outputs:
+          inputs_embeds: global.prompt_embeds
+      - kind: invoke
+        component: language_model
+        inputs:
+          inputs_embeds: global.prompt_embeds
+          attention_mask: global.initial.attention_mask
+          position_ids: global.initial.position_ids
+          past_key_values.0.key: global.initial.past_key_values.0.key
+          past_key_values.0.value: global.initial.past_key_values.0.value
+        outputs:
+          logits: global.setup.logits
+          last_hidden_state: global.setup.hidden
+          present.0.key: global.setup.cache_0
+          present.0.value: global.setup.cache_1
+      - kind: invoke
+        component: ar_initializer
+        inputs: {}
+        outputs:
+          frame_history: ar.initial.history
+          rng_counter: ar.initial.counter
+          active: ar.initial.active
+          done: ar.initial.done
+      steps:
+      - kind: invoke
+        component: guided_vocabulary
+        inputs:
+          logits: global_logits
+        outputs:
+          candidate_logits: frame.candidate_logits
+      - kind: invoke
+        component: sampler
+        inputs:
+          logits: frame.candidate_logits
+          temperature: package.temperature
+          top_k: package.top_k
+          top_p: package.top_p
+          min_p: package.min_p
+          seed: request.seed
+          counter: rng
+          active: active
+          done: done
+        outputs:
+          token: frame.candidate
+          next_counter: frame.next_rng
+      - kind: invoke
+        component: candidate_map
+        inputs:
+          candidate: frame.candidate
+        outputs:
+          token: frame.token
+          semantic_code: frame.semantic_code
+          semantic_token: frame.semantic_token
+          is_stop: frame.is_stop
+      - kind: invoke
+        component: continue_predicate
+        inputs:
+          done: frame.is_stop
+        outputs:
+          continue: frame.continue
+      - kind: invoke
+        component: last_global_hidden
+        inputs:
+          value: global_hidden
+        outputs:
+          last: frame.global_hidden
+      - kind: invoke
+        component: language_model_embedding
+        inputs:
+          input_ids: frame.semantic_token
+        outputs:
+          inputs_embeds: frame.raw_semantic_embedding
+      - kind: invoke
+        component: rvq_depth_decoder_projection
+        inputs:
+          hidden_states: frame.global_hidden
+        outputs:
+          projected_states: frame.projected_global
+      - kind: invoke
+        component: rvq_depth_decoder_projection
+        inputs:
+          hidden_states: frame.raw_semantic_embedding
+        outputs:
+          projected_states: frame.projected_semantic
+      - kind: invoke
+        component: local_initializer
+        inputs:
+          global_hidden: frame.projected_global
+          semantic_embedding: frame.projected_semantic
+        outputs:
+          sequence: local.initial_sequence
+          acoustic_codes: local.initial_codes
+          local_hidden_parts: local.initial_hidden
+      - kind: loop
+        setup: []
+        steps:
+        - kind: invoke
+          component: codebook_index
+          inputs:
+            left: local.iteration
+            right: package.one
+          outputs:
+            total: local.codebook_index
+        - kind: invoke
+          component: rvq_depth_decoder
+          inputs:
+            inputs_embeds: local_sequence
+          outputs:
+            hidden_states: local.hidden_states
+        - kind: invoke
+          component: rvq_depth_decoder_heads
+          inputs:
+            hidden_states: local.hidden_states
+          outputs:
+            all_codebook_logits: local.all_logits
+        - kind: invoke
+          component: local_logits
+          inputs:
+            all_codebook_logits: local.all_logits
+            codebook_index: local.codebook_index
+          outputs:
+            logits: local.guided_logits
+        - kind: invoke
+          component: sampler
+          inputs:
+            logits: local.guided_logits
+            temperature: package.temperature
+            top_k: package.top_k
+            top_p: package.top_p
+            min_p: package.min_p
+            seed: request.seed
+            counter: local_rng
+            active: active
+            done: done
+          outputs:
+            token: local.token
+            next_counter: local.next_rng
+        - kind: invoke
+          component: embedding_id
+          inputs:
+            token: local.token
+            codebook_index: local.codebook_index
+          outputs:
+            embedding_ids: local.embedding_ids
+        - kind: invoke
+          component: rvq_depth_decoder_embedding
+          inputs:
+            code_ids: local.embedding_ids
+          outputs:
+            code_embeddings: local.code_embedding
+        - kind: invoke
+          component: rvq_depth_decoder_projection
+          inputs:
+            hidden_states: local.code_embedding
+          outputs:
+            projected_states: local.projected_embedding
+        - kind: invoke
+          component: local_append
+          inputs:
+            sequence: local_sequence
+            projected_embedding: local.projected_embedding
+            acoustic_codes: local_codes
+            token: local.token
+            hidden_states: local.hidden_states
+            local_hidden_parts: local_hidden
+          outputs:
+            next_sequence: local.next_sequence
+            next_acoustic_codes: local.next_codes
+            next_local_hidden_parts: local.next_hidden
+        continue_when: loop_1_active
+        max_iterations: package.local_steps
+        carried:
+        - cell: local_sequence
+          next: local.next_sequence
+        - cell: local_codes
+          next: local.next_codes
+        - cell: local_hidden
+          next: local.next_hidden
+        - cell: local_rng
+          next: local.next_rng
+        - cell: loop_1_active
+          next: active
+        iteration:
+          value: local.iteration
+          contract:
+            dtype: int64
+            rank: 0
+            shape: []
+      - kind: invoke
+        component: frame_append
+        inputs:
+          history: frame_history
+          global_hidden: frame.global_hidden
+          local_hidden_parts: local_hidden
+        outputs:
+          next_history: frame.history.next
+      - kind: invoke
+        component: acoustic_frame
+        inputs:
+          acoustic_codes: local_codes
+        outputs:
+          framed_acoustic_codes: frame.acoustic_codes
+      - kind: invoke
+        component: language_model_semantic_embedding
+        inputs:
+          semantic_codes: frame.semantic_code
+        outputs:
+          semantic_feedback_embedding: frame.semantic_feedback
+      - kind: invoke
+        component: rvq_depth_decoder_feedback_embedding
+        inputs:
+          acoustic_codes: frame.acoustic_codes
+        outputs:
+          acoustic_feedback_embedding: frame.acoustic_feedback
+      - kind: invoke
+        component: feedback_sum
+        inputs:
+          semantic: frame.semantic_feedback
+          acoustic: frame.acoustic_feedback
+        outputs:
+          feedback: frame.feedback
+      - kind: invoke
+        component: language_model
+        inputs:
+          inputs_embeds: frame.feedback
+          attention_mask: global_mask
+          position_ids: global_position
+          past_key_values.0.key: global_cache_0
+          past_key_values.0.value: global_cache_1
+        outputs:
+          logits: global.next.logits
+          last_hidden_state: global.next.hidden
+          present.0.key: global.next.cache_0
+          present.0.value: global.next.cache_1
+      - kind: invoke
+        component: global_step_update
+        inputs:
+          attention_mask: global_mask
+          position_ids: global_position
+        outputs:
+          next_attention_mask: global.mask.next
+          next_position_ids: global.position.next
+      - kind: invoke
+        component: length_step
+        inputs:
+          left: global_length
+          right: package.one_batch
+        outputs:
+          total: global.length.next
+      continue_when: loop_0_active
+      max_iterations: request.max_frames_with_warmup
+      carried:
+      - cell: global_logits
+        next: global.next.logits
+      - cell: global_hidden
+        next: global.next.hidden
+      - cell: global_mask
+        next: global.mask.next
+      - cell: global_position
+        next: global.position.next
+      - cell: frame_history
+        next: frame.history.next
+      - cell: rng
+        next: local_rng
+      - cell: active
+        next: frame.continue
+      - cell: done
+        next: frame.is_stop
+      - cell: global_length
+        next: global.length.next
+      - cell: global_cache_0
+        next: global.next.cache_0
+      - cell: global_cache_1
+        next: global.next.cache_1
+      - cell: loop_0_active
+        next: active
+      iteration:
+        value: frame.iteration
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+    - kind: loop
+      setup:
+      - kind: invoke
+        component: finalize_frames
+        inputs:
+          history: frame_history
+          stopped: done
+        outputs:
+          frame_hiddens: audio.frame_hiddens
+      - kind: invoke
+        component: chunk_plan
+        inputs:
+          frame_hiddens: audio.frame_hiddens
+        outputs:
+          chunk_count: audio.chunk_count
+          waveform: audio.initial_waveform
+          previous_latent: audio.initial_previous_latent
+          previous_condition: audio.initial_previous_condition
+      - kind: invoke
+        component: flow_schedule
+        inputs: {}
+        outputs:
+          schedule: flow.schedule
+      steps:
+      - kind: invoke
+        component: chunk_slice
+        inputs:
+          frame_hiddens: audio.frame_hiddens
+          chunk_index: chunk.iteration
+        outputs:
+          frame_chunk: chunk.frame_hiddens
+      - kind: invoke
+        component: condition_encoder
+        inputs:
+          hidden_states: chunk.frame_hiddens
+        outputs:
+          encoder_hidden_states: chunk.condition
+      - kind: invoke
+        component: overlap_prepare
+        inputs:
+          condition: chunk.condition
+          previous_condition: previous_condition
+          previous_latent: previous_latent
+        outputs:
+          guided_condition: chunk.guided_condition
+          spliced_condition: chunk.spliced_condition
+          overlap: chunk.overlap
+          noise_row_shape: chunk.noise_shape
+      - kind: invoke
+        component: latent_noise
+        inputs:
+          seed: request.seed
+          offset: flow_rng
+          row_shape: chunk.noise_shape
+        outputs:
+          noise: chunk.initial_noise
+          next_offset: chunk.next_rng
+      - kind: loop
+        setup: []
+        steps:
+        - kind: invoke
+          component: flow_timestep
+          inputs:
+            schedule: flow.schedule
+            step: flow.iteration
+          outputs:
+            timestep: flow.timestep.value
+        - kind: invoke
+          component: overlap_blend
+          inputs:
+            latents: flow_latents
+            initial_noise: chunk.initial_noise
+            previous_latent: previous_latent
+            overlap: chunk.overlap
+            timestep: flow.timestep.value
+          outputs:
+            blended_latents: flow.blended
+        - kind: invoke
+          component: flow_inputs
+          inputs:
+            latents: flow.blended
+            timestep: flow.timestep.value
+          outputs:
+            guided_latents: flow.guided_latents
+            guided_timestep: flow.guided_timestep
+        - kind: invoke
+          component: transformer
+          inputs:
+            hidden_states: flow.guided_latents
+            timestep: flow.guided_timestep
+            encoder_hidden_states: chunk.guided_condition
+          outputs:
+            sample: flow.sample
+        - kind: invoke
+          component: flow_guidance
+          inputs:
+            sample: flow.sample
+          outputs:
+            velocity: flow.velocity
+        - kind: invoke
+          component: flow_solver
+          inputs:
+            sample: flow.blended
+            derivative: flow.velocity
+            schedule: flow.schedule
+            step: flow.iteration
+          outputs:
+            next_state: flow.next_latents
+        continue_when: loop_3_active
+        max_iterations: package.flow_steps
+        carried:
+        - cell: flow_latents
+          next: flow.next_latents
+        - cell: loop_3_active
+          next: active
+        iteration:
+          value: flow.iteration
+          contract:
+            dtype: int64
+            rank: 1
+            shape:
+            - batch
+            batch_layout:
+              kind: request_aligned
+              axis: 0
+      - kind: invoke
+        component: chunk_update
+        inputs:
+          latents: flow_latents
+          previous_latent: previous_latent
+          condition: chunk.spliced_condition
+          overlap: chunk.overlap
+        outputs:
+          restored_latents: chunk.restored_latents
+          next_previous_latent: chunk.next_previous_latent
+          next_previous_condition: chunk.next_previous_condition
+      - kind: invoke
+        component: vocoder
+        inputs:
+          latents: chunk.restored_latents
+        outputs:
+          waveform: chunk.waveform
+      - kind: invoke
+        component: waveform_stitch
+        inputs:
+          waveform: chunk.waveform
+          history: waveform
+          chunk_index: chunk.iteration
+          chunk_count: audio.chunk_count
+        outputs:
+          next_history: chunk.waveform.next
+      continue_when: loop_2_active
+      max_iterations: audio.chunk_count
+      carried:
+      - cell: previous_latent
+        next: chunk.next_previous_latent
+      - cell: previous_condition
+        next: chunk.next_previous_condition
+      - cell: waveform
+        next: chunk.waveform.next
+      - cell: flow_rng
+        next: chunk.next_rng
+      - cell: loop_2_active
+        next: ar.initial.active
+      iteration:
+        value: chunk.iteration
+        contract:
+          dtype: int64
+          rank: 0
+          shape: []
+    - kind: emit
+      value: waveform
+      output: audio
+      mode: replace

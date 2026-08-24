@@ -4,44 +4,49 @@
 """Emit onnx-genai ``inference_metadata`` for multi-model pipelines.
 
 Mobius builds the neural components of a diffusion model (denoiser transformer,
-VAE, and — externally — a text encoder) as separate ONNX graphs, but does not
-itself carry a scheduler loop. onnx-genai's *iterative* pipeline supplies that
-loop declaratively: given an ``inference_metadata`` document describing the
-components, the loop-carried dataflow, a timestep input, a scheduler, and
-(optionally) classifier-free guidance, it drives the denoise loop and returns
-the decoded output.
+VAE, and — externally — a text encoder) as separate ONNX graphs. The document
+this module produces wires them into onnx-genai's ``pipeline.workflow``: a typed
+SSA graph in which the sampler is an executable component the package ships, so
+the sigma schedule and timestep table are constant components, the step index is
+the loop induction value, and classifier-free guidance is two denoiser
+invocations plus a combine component.
 
-This module produces that document from the component filenames + a scheduler
-config. It reads no torch/diffusers state — only plain values — so it is cheap
-to unit-test and safe to call anywhere.
+It builds that document from the component filenames plus a scheduler config,
+materializing the sampler components from mobius's policy library. It reads no
+torch/diffusers state — only plain values — so it is cheap to unit-test and safe
+to call anywhere.
 
-The emitted contract matches onnx-genai's pipeline schema:
-``schema/inference_metadata.schema.json`` (kind ``iterative`` with
-``denoiser`` / ``num_steps`` / ``timestep_input`` / ``scheduler_config`` /
-``cfg_conditioning_input`` and denoiser self-edge loop-carried dataflow).
+Not everything here is publishable: :func:`build_native_vlm_package_metadata`
+returns mobius's *internal* structural descriptor of a VLM package, from which
+:func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`
+derives the published contract.
 
 Autoregressive decoder-only LLM metadata (``model.attention`` + ``kv_cache``)
 lives in the sibling :mod:`mobius.integrations.onnx_genai.decoder_metadata`
-module. Composite multimodal pipelines retain those decoder properties while
-declaring their encoder, fusion, and decoder execution stages here.
+module.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import logging
 import math
 import os
 import re
 import shutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from mobius._constants import (
+    STATIC_CACHE_KV_SEQUENCE_LENGTH,
+    STATIC_CACHE_WRITE_INDICES,
+)
 from mobius._pipeline_contract import component_presence, optional_input_contract
 from mobius.upstream_patches import apply_asset_patches
 
@@ -59,6 +64,19 @@ _RUNTIME_ASSET_NAMES = (
     "processor_config.json",
     "preprocessor_config.json",
     "image_processor.json",
+)
+
+#: Assets a text-only package needs. Excludes the image/audio processor
+#: contracts, which would advertise media preprocessing a text package's
+#: graphs cannot consume. ``chat_template.jinja`` is required, not optional:
+#: instruction-tuned decoders (Gemma 4, Llama-3-Instruct, Qwen-Instruct)
+#: depend on their turn markers and leading BOS, and degenerate into
+#: repetition when a raw prompt reaches the model instead.
+_TEXT_RUNTIME_ASSET_NAMES = tuple(
+    name
+    for name in _RUNTIME_ASSET_NAMES
+    if name
+    not in {"processor_config.json", "preprocessor_config.json", "image_processor.json"}
 )
 
 
@@ -113,16 +131,79 @@ def _port(value: Any) -> _Port:
     )
 
 
-def _shape_metadata(port: _Port) -> list[int | str | None]:
+_BATCH_DIMENSION = "batch"
+"""Symbolic leading dimension mobius uses for per-request batching."""
+
+
+def _shape_metadata(port: _Port) -> list[int | str]:
     """Return a YAML-safe graph shape without losing symbolic dimensions."""
-    shape: list[int | str | None] = []
-    for dim in port.dims:
+    shape: list[int | str] = []
+    for axis, dim in enumerate(port.dims):
         if isinstance(dim, int):
             shape.append(dim)
             continue
         value = getattr(dim, "value", None)
-        shape.append(str(value) if value is not None else None)
+        # Metadata dimensions cannot be null. Preserve named graph dimensions;
+        # give anonymous dynamic dimensions a stable, port-local name instead
+        # of pretending they are static or serializing an invalid null.
+        shape.append(str(value) if value is not None else f"{port.name}_dim_{axis}")
     return shape
+
+
+def _name_image_preprocessing_program(image: dict[str, Any]) -> None:
+    """Convert structural preprocessing transforms into explicit typed SSA values."""
+    transforms = image["transforms"]
+    if all("source" in output for output in image["outputs"]) and all(
+        "outputs" in transform for transform in transforms
+    ):
+        # Already named: re-running would append duplicate derived transforms.
+        return
+    current: str | None = None
+    decoded: str | None = None
+    for index, transform in enumerate(transforms):
+        name = f"image.transform_{index}"
+        if transform["op"] in {"decode", "decode_rgb"}:
+            transform.pop("inputs", None)
+            decoded = name
+        else:
+            if current is None:
+                raise ValueError("image preprocessing must decode before transforming")
+            transform["inputs"] = [current]
+        transform["outputs"] = [name]
+        current = name
+    if current is None:
+        raise ValueError("image preprocessing must declare at least one transform")
+
+    derived_ops = {
+        "original_size": ("emit_original_size", decoded),
+        "transformed_size": ("emit_transformed_size", current),
+        "validity_mask": ("emit_validity_mask", current),
+        "patch_coordinates": ("emit_patch_coordinates", current),
+        "grid_dimensions": ("emit_grid_coordinates", current),
+    }
+    for output in image["outputs"]:
+        content = output["content"]
+        if content == "pixels":
+            output["source"] = current
+            continue
+        if content not in derived_ops:
+            raise ValueError(
+                f"image preprocessing output content {content!r} has no typed SSA producer"
+            )
+        operation, source = derived_ops[content]
+        if source is None:
+            raise ValueError(
+                f"image preprocessing output content {content!r} requires a decoded image"
+            )
+        name = f"image.output_{content}"
+        transforms.append(
+            {
+                "op": operation,
+                "inputs": [source],
+                "outputs": [name],
+            }
+        )
+        output["source"] = name
 
 
 def _port_metadata(port: _Port) -> dict[str, Any]:
@@ -413,6 +494,39 @@ def _match_area_grid(ports: list[_Port], values: dict[str, Any]) -> _ImageProgra
     )
 
 
+def _max_token_grid_transforms(config: Any, values: dict[str, Any]) -> list[dict[str, Any]]:
+    patch_size = int(values["patch_size"])
+    merge_size = int(values["merge_size"])
+    token_pixels = (patch_size * merge_size) ** 2
+    declared = dict(values)
+    declared["size"] = {
+        "shortest_edge": token_pixels,
+        "longest_edge": int(values["max_image_tokens"]) * token_pixels,
+    }
+    return _area_grid_transforms(config, declared)
+
+
+def _match_max_token_grid(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
+    bindings = _match_packed_grid(ports)
+    if bindings is None or not all(
+        isinstance(values.get(key), int)
+        for key in (
+            "patch_size",
+            "temporal_patch_size",
+            "merge_size",
+            "max_image_tokens",
+        )
+    ):
+        return None
+    return _ImageProgram(
+        name="max_token_packed_grid",
+        bindings=bindings,
+        transforms=_max_token_grid_transforms,
+        token_count_source="from_grid",
+        summary_contents=("grid_dimensions",),
+    )
+
+
 def _match_patch_budget(ports: list[_Port], values: dict[str, Any]) -> _ImageProgram | None:
     bindings = _match_packed_coordinates(ports)
     if (
@@ -459,6 +573,7 @@ _IMAGE_PROCESSOR_REGISTRY: tuple[
     Callable[[list[_Port], dict[str, Any]], _ImageProgram | None], ...
 ] = (
     _match_area_grid,
+    _match_max_token_grid,
     _match_patch_budget,
     _match_dynamic_hd,
 )
@@ -507,22 +622,33 @@ def _cached_source_assets(source: str) -> dict[str, str]:
     return assets
 
 
-def _source_asset_path(source: str, filename: str) -> str | None:
+def _source_asset_path(
+    source: str,
+    filename: str,
+    *,
+    revision: str | None = None,
+) -> str | None:
     if os.path.isdir(source):
         path = os.path.join(source, filename)
         return path if os.path.isfile(path) else None
-    cached = _cached_source_assets(source).get(filename)
-    if cached is not None and os.path.isfile(cached):
-        return cached
+    if revision is None:
+        cached = _cached_source_assets(source).get(filename)
+        if cached is not None and os.path.isfile(cached):
+            return cached
     try:
         from huggingface_hub import hf_hub_download
 
-        return hf_hub_download(source, filename)
+        return hf_hub_download(source, filename, revision=revision)
     except Exception:
         return None
 
 
-def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
+def _processor_values(
+    source: str | None,
+    config: Any,
+    *,
+    revision: str | None = None,
+) -> dict[str, Any]:
     """Load plain processor parameters without architecture dispatch."""
     values: dict[str, Any] = {}
     if source:
@@ -532,7 +658,7 @@ def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
             "preprocessor_config.json",
             "image_processor.json",
         ):
-            path = _source_asset_path(source, filename)
+            path = _source_asset_path(source, filename, revision=revision)
             if path is not None:
                 try:
                     with open(path, encoding="utf-8") as handle:
@@ -542,6 +668,33 @@ def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
     image_processor = values.get("image_processor")
     if isinstance(image_processor, dict):
         values.update(image_processor)
+    processor = values.get("processor")
+    if isinstance(processor, dict):
+        for transform in processor.get("transforms", []):
+            operation = transform.get("operation", {}) if isinstance(transform, dict) else {}
+            operation_type = operation.get("type")
+            attrs = operation.get("attrs", {})
+            if not isinstance(attrs, dict):
+                continue
+            for key, value in attrs.items():
+                values.setdefault(key, value)
+            if operation_type == "Resize":
+                values.setdefault("do_resize", True)
+                if "min_pixels" in attrs and "max_pixels" in attrs:
+                    values.setdefault(
+                        "size",
+                        {
+                            "shortest_edge": attrs["min_pixels"],
+                            "longest_edge": attrs["max_pixels"],
+                        },
+                    )
+            elif operation_type == "Rescale":
+                values.setdefault("do_rescale", True)
+                values.setdefault("rescale_factor", attrs.get("rescale_factor"))
+            elif operation_type == "Normalize":
+                values.setdefault("do_normalize", True)
+                values.setdefault("image_mean", attrs.get("mean"))
+                values.setdefault("image_std", attrs.get("std"))
 
     embedding = values.get("embd_layer")
     if isinstance(embedding, dict):
@@ -555,6 +708,7 @@ def _processor_values(source: str | None, config: Any) -> dict[str, Any]:
         "temporal_patch_size",
         "spatial_merge_size",
         "image_crop_size",
+        "size",
     ):
         value = getattr(vision, name, None)
         if value is None:
@@ -721,17 +875,17 @@ def _static_cache_io(
         if (layer, role) not in ports
     ]
     input_names = {port.name for port in decoder_inputs}
-    for control in ("write_indices", "nonpad_kv_seqlen"):
+    for control in (STATIC_CACHE_WRITE_INDICES, STATIC_CACHE_KV_SEQUENCE_LENGTH):
         if control not in input_names:
             missing.append(f"input.{control}")
     if missing:
         raise ValueError(
-            "Cannot emit model.io.static_cache because the exported TensorScatter "
-            f"ABI is incomplete: {missing}"
+            "Cannot describe the static-cache ABI because the exported "
+            f"TensorScatter ports are incomplete: {missing}"
         )
     return {
-        "write_indices_input": "write_indices",
-        "kv_sequence_length_input": "nonpad_kv_seqlen",
+        "write_indices_input": STATIC_CACHE_WRITE_INDICES,
+        "kv_sequence_length_input": STATIC_CACHE_KV_SEQUENCE_LENGTH,
         "key_cache_inputs": [inputs[(layer, "key")] for layer in layers],
         "value_cache_inputs": [inputs[(layer, "value")] for layer in layers],
         "key_cache_outputs": [outputs[(layer, "key")] for layer in layers],
@@ -1241,84 +1395,455 @@ def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
                 )
 
 
-def add_explicit_package_io(
+#: Symbolic leading dimension Mobius emits for every batched ONNX port. A port
+#: that opens with it holds exactly one entry per in-flight request, which is
+#: the structural fact a runtime needs to permute or drop rows.
+REQUEST_AXIS_SYMBOL = "batch"
+
+
+def request_batch_layout(shape: list[Any] | None) -> dict[str, Any] | None:
+    """Return the request-aligned batch layout implied by a port's shape."""
+    if shape and shape[0] == REQUEST_AXIS_SYMBOL:
+        return {"kind": "request_aligned", "axis": 0}
+    return None
+
+
+def add_policy_components_to_workflow(
     metadata: dict[str, Any],
     pkg: Any,
-    config: Any,
 ) -> dict[str, Any]:
-    """Attach explicit graph-port roles to emitted decoder and encoder models."""
-    pipeline = metadata.get("pipeline")
-    if not isinstance(pipeline, dict):
-        component_names = list(pkg.keys())
-        if len(component_names) != 1:
-            raise ValueError("bare decoder metadata requires exactly one graph component")
-        io, _ = _decoder_io(pkg[component_names[0]], set(), config)
-        metadata.setdefault("model", {})["io"] = io
+    """Reference attached ONNX policy artifacts from an existing workflow.
+
+    This helper intentionally does not synthesize a workflow or guess bindings.
+    It only adds schema-defined component declarations when a producer has
+    already emitted the exact workflow contract.
+    """
+    policy_components = getattr(pkg, "policy_components", {})
+    if not policy_components:
         return metadata
+    workflow = metadata.get("pipeline", {}).get("workflow")
+    if not isinstance(workflow, dict):
+        return metadata
+    components = workflow.setdefault("components", {})
 
-    models = pipeline.get("models", {})
-    routed_inputs: dict[str, set[str]] = {}
-    for edge in pipeline.get("dataflow", []):
-        target = edge.get("to", "")
-        component, separator, port = target.partition(".")
-        if separator:
-            routed_inputs.setdefault(component, set()).add(port)
-
-    component_ios: dict[str, dict[str, Any]] = {}
-    for name, model_spec in models.items():
-        if name not in pkg:
-            continue
-        if model_spec.get("type") == "decoder":
-            io, _ = _decoder_io(pkg[name], routed_inputs.get(name, set()), config)
-        else:
-            inputs = [_port(value) for value in pkg[name].graph.inputs]
-            outputs = [_port(value) for value in pkg[name].graph.outputs]
-            io = {
-                "inputs": [_port_metadata(port) for port in inputs],
-                "outputs": [_port_metadata(port) for port in outputs],
+    def semantic_contract(component: Any) -> dict[str, Any]:
+        contract = component.contract
+        contract_name, version = component.contract_id.rsplit("@", 1)
+        bindings = {
+            key: value
+            for key, value in contract.items()
+            if key
+            not in {
+                "role",
+                "mode",
+                "effect",
+                "rng",
+                "state_class",
+                "batching",
+                "inactive_rows",
             }
-            if model_spec.get("type") in {"encoder", "audio_encoder"}:
-                audio_prompt = _select_one(
-                    inputs, lambda port: _is_float(port) and port.rank == 3
-                )
-                token_prompt = _select_one(
-                    inputs, lambda port: _is_integer(port) and port.rank == 2
-                )
-                if audio_prompt is not None:
-                    io["audio_features_input"] = audio_prompt.name
-                elif token_prompt is not None:
-                    io["token_input"] = token_prompt.name
-                    io["sequence_source"] = "token_ids"
-        model_spec["io"] = io
-        component_ios[name] = io
+            and isinstance(value, str)
+        }
+        rng = contract.get("rng")
+        if isinstance(rng, dict):
+            bindings.update(
+                {key: value for key, value in rng.items() if isinstance(value, str)}
+            )
+        declaration: dict[str, Any] = {
+            "id": contract_name,
+            "version": version,
+            "bindings": bindings,
+        }
+        parameters = {
+            key: contract[key]
+            for key in ("mode", "batching", "inactive_rows")
+            if key in contract
+        }
+        if parameters:
+            declaration["parameters"] = parameters
+        return declaration
 
-    def annotate_strategy(strategy: dict[str, Any]) -> None:
-        if strategy.get("kind") == "nested_autoregressive" and not strategy.get(
-            "inner_embedding_output"
-        ):
-            inner_name = strategy.get("inner")
-            inner_io = component_ios.get(inner_name, {})
-            hidden_output = inner_io.get("hidden_output")
-            if not hidden_output:
+    def tensor_contract(value: Any) -> dict[str, Any]:
+        port = _port(value)
+        dtype = {
+            "fp32": "float32",
+            "fp16": "float16",
+            "bf16": "bfloat16",
+        }.get(port.dtype, port.dtype)
+        shape = _shape_metadata(port)
+        contract: dict[str, Any] = {
+            "dtype": dtype,
+            "rank": port.rank,
+            "shape": shape,
+        }
+        layout = request_batch_layout(shape)
+        if layout is not None:
+            contract["batch_layout"] = layout
+        return contract
+
+    for name, component in policy_components.items():
+        # A policy graph is synthesized by this producer to realize the
+        # workflow's own control flow, so its port contracts are not a
+        # transcription of an external interface: they are the type annotations
+        # of the workflow's dataflow. A workflow value acquires its dtype, rank
+        # and request axis from the port that produces it, and the validator
+        # reads metadata without the artifacts, so a policy output that states
+        # no contract leaves every value derived from it untyped.
+        declaration = {
+            "implementation": {
+                "kind": "onnx",
+                "artifact": f"policies/{name}.onnx",
+            },
+            "ports": {
+                "inputs": {
+                    value.name: tensor_contract(value)
+                    for value in component.model.graph.inputs
+                },
+                "outputs": {
+                    value.name: tensor_contract(value)
+                    for value in component.model.graph.outputs
+                },
+            },
+        }
+        if component.contract:
+            declaration["contract"] = semantic_contract(component)
+            if component.contract.get("role") == "token_sampler":
+                declaration["application_overridable"] = True
+        components[name] = declaration
+    declare_request_alignment(workflow)
+    declare_input_admission(workflow)
+    return metadata
+
+
+_BATCH_DIMENSION_NAMES = frozenset({"batch", "batch_size", "batch_dim", "b"})
+
+
+def declare_request_alignment(workflow: dict[str, Any]) -> None:
+    """Stamp the request-aligned row axis onto every batch-leading contract.
+
+    The runtime compacts finished rows out of a batch by applying one row
+    permutation to every request-aligned tensor. A contract whose leading axis
+    is the batch symbol but that does not say so is unpermutable, so state,
+    component ports, and outputs would silently drift apart after the first
+    eviction. Deriving the declaration from the admitted graph's own batch
+    symbol keeps alignment a property of the model interface rather than an
+    annotation every workflow builder has to remember.
+    """
+
+    def stamp(contract: Any) -> None:
+        if not isinstance(contract, dict) or "batch_layout" in contract:
+            return
+        shape = contract.get("shape") or []
+        if shape and str(shape[0]) in _BATCH_DIMENSION_NAMES:
+            contract["batch_layout"] = {"kind": "request_aligned", "axis": 0}
+
+    for section in ("inputs", "outputs", "state"):
+        for declaration in (workflow.get(section) or {}).values():
+            if isinstance(declaration, dict):
+                stamp(declaration.get("contract"))
+    for component in (workflow.get("components") or {}).values():
+        ports = component.get("ports", {}) if isinstance(component, dict) else {}
+        for side in ("inputs", "outputs"):
+            for contract in (ports.get(side) or {}).values():
+                stamp(contract)
+    # A cell backed by a state-service group is stored by the runtime, not by
+    # the workflow: the group owns the buffer and the eviction policy, so the
+    # cell also needs an explicit boundary at which the runtime may free it.
+    for declaration in (workflow.get("state") or {}).values():
+        if isinstance(declaration, dict) and declaration.get("service_group"):
+            declaration.setdefault("management", "runtime")
+            declaration.setdefault("release_boundary", declaration.get("scope", "invocation"))
+
+
+def published_value_references(workflow: dict[str, Any]) -> set[str]:
+    """Every value name the published program reads, on any path.
+
+    Reachability here is deliberately path-insensitive: it answers "does this
+    workflow ever look at this value", which is what an admission decision
+    needs. Whether a particular request reaches the branch that reads it is a
+    runtime fact, and a package that guessed at it would be describing one
+    caller rather than its own contract.
+    """
+    references: set[str] = set()
+
+    def note(value: Any) -> None:
+        if isinstance(value, str):
+            references.add(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                note(item)
+        elif isinstance(value, list):
+            for item in value:
+                note(item)
+
+    def visit(step: Any) -> None:
+        if isinstance(step, list):
+            for item in step:
+                visit(item)
+            return
+        if not isinstance(step, dict):
+            return
+        kind = step.get("kind")
+        if kind == "invoke":
+            note(step.get("inputs"))
+        elif kind == "emit":
+            note(step.get("value"))
+            note(step.get("valid_length"))
+            note(step.get("when"))
+        elif kind == "branch":
+            note(step.get("predicate"))
+            note(step.get("outputs"))
+            for case in (step.get("cases") or {}).values():
+                visit(case)
+            visit(step.get("default"))
+        elif kind == "loop":
+            note(step.get("continue_when"))
+            note(step.get("max_iterations"))
+            for carry in step.get("carried") or []:
+                note(carry.get("next"))
+                note(carry.get("initial"))
+        for key in ("steps", "setup", "nodes"):
+            visit(step.get(key))
+
+    visit(workflow.get("steps") or [])
+    for declaration in (workflow.get("state") or {}).values():
+        if isinstance(declaration, dict):
+            note(declaration.get("initializer"))
+            # A bounded or growing cell reads its own extent every step, so the
+            # bound and the step size are read positions like any other. The
+            # sibling ``kind``/``axis`` keys describe the recurrence rather than
+            # naming values, so they are not references.
+            recurrence = declaration.get("recurrence") or {}
+            note(recurrence.get("max"))
+            note(recurrence.get("increment"))
+    # The serving block names the workflow values a runtime reads to drive
+    # batching -- the active/done row masks and the accepted length.
+    serving = workflow.get("serving") or {}
+    for key, value in serving.items():
+        if key != "state_service":
+            note(value)
+    # ``state_service`` is mostly port and cell names rather than values, with
+    # one exception: a group's fixed update extent is itself a workflow value.
+    for group in ((serving.get("state_service") or {}).get("groups") or {}).values():
+        if isinstance(group, dict):
+            note((group.get("update") or {}).get("capacity"))
+    return references
+
+
+def declare_input_admission(workflow: dict[str, Any]) -> None:
+    """Publish every package input's admission requirement instead of implying it.
+
+    ``required`` is what a runtime admits a request against: an input it holds
+    required and the caller did not attach is a rejected request, on every path,
+    before a single component runs. A consumer cannot see what an *absent*
+    ``required`` key was meant to say, so it has to choose a default, and the
+    choice it makes is the opposite of what omission means to a producer -- a
+    value the workflow computes for itself, defaults for itself, or explicitly
+    branches on the absence of, silently becomes a mandatory caller attachment.
+
+    So the flag is derived from the published program rather than left to a
+    reader, and stamped on every declaration:
+
+    * a declaration the package can satisfy on its own -- it carries a
+      ``default``, which is also the only thing a package-owned ``literal``
+      source is ever bound from -- is not something a caller can be required to
+      send;
+    * a declaration whose absence the program *observes*, through a
+      ``present_as`` symbol the steps actually branch on, is one the workflow
+      has been written to run without;
+    * anything else is genuinely externally required, and says so out loud.
+
+    A builder that declares both an escape and ``required: True`` has written
+    two contradictory contracts, and there is no reading of the package that
+    satisfies both, so this fails closed rather than picking one. The mirror
+    case fails closed for the same reason: an input marked optional that the
+    package has no way to proceed without is not optional, it is a request that
+    is admitted and then fails part-way through on an unbound value, which is
+    strictly worse than the rejection it replaced.
+    """
+    inputs = workflow.get("inputs") or {}
+    if not inputs:
+        return
+    references = published_value_references(workflow)
+    for name, declaration in inputs.items():
+        if not isinstance(declaration, dict):
+            continue
+        escapes = []
+        literal = (declaration.get("source") or {}).get("kind") == "literal"
+        if "default" in declaration:
+            escapes.append("a package-supplied default" if literal else "a default")
+        elif literal:
+            # A literal source is resolved from the declaration's own default
+            # and from nothing else, so one without a default names a value the
+            # package neither holds nor can ask a caller for.
+            raise ValueError(
+                f"workflow input {name!r} is sourced from a package literal but "
+                "carries no default, so nothing ever binds it"
+            )
+        present_as = declaration.get("present_as")
+        if present_as is not None:
+            if present_as not in references:
                 raise ValueError(
-                    "Cannot emit pipeline.strategy.inner_embedding_output: the inner "
-                    f"decoder {inner_name!r} has no unique non-logits float output"
+                    f"workflow input {name!r} declares the presence symbol "
+                    f"{present_as!r} that no step reads, so the workflow never "
+                    "handles the input being absent"
                 )
-            strategy["inner_embedding_output"] = hidden_output
-        for stage in strategy.get("stages", []):
-            nested = stage.get("strategy")
-            if isinstance(nested, dict):
-                annotate_strategy(nested)
+            escapes.append(f"the presence gate {present_as!r}")
+        if not escapes:
+            if declaration.get("required", True) is False:
+                raise ValueError(
+                    f"workflow input {name!r} is declared optional but the workflow "
+                    "carries no default and no presence gate for it, so a request "
+                    "that omits it has no defined behaviour"
+                )
+            declaration["required"] = True
+            continue
+        if declaration.get("required", False):
+            raise ValueError(
+                f"workflow input {name!r} is declared required but the workflow "
+                f"already proceeds without it through {', '.join(escapes)}"
+            )
+        declaration["required"] = False
 
-    strategy = pipeline.get("strategy")
-    if isinstance(strategy, dict):
-        annotate_strategy(strategy)
-    if "model" in metadata:
-        decoder_names = [
-            name for name, model in models.items() if model.get("type") == "decoder"
-        ]
-        if decoder_names:
-            metadata["model"]["io"] = component_ios[decoder_names[0]]
+
+def add_adapter_service_to_metadata(
+    metadata: dict[str, Any],
+    pkg: Any,
+    output_dir: str,
+) -> dict[str, Any]:
+    """Attach the exact generic adapter catalog and saved artifact references."""
+    artifacts = getattr(pkg, "adapter_artifacts", {})
+    if not artifacts:
+        return metadata
+    workflow_value = metadata.get("pipeline", {}).get("workflow")
+    workflow = workflow_value if isinstance(workflow_value, dict) else None
+    manifest = getattr(pkg, "adapter_target_manifest", None)
+    if manifest is None:
+        raise ValueError("parameter adapters require an authoritative adapter target manifest")
+    options = pkg.adapter_service_options
+    inputs = workflow.setdefault("inputs", {}) if workflow is not None else {}
+
+    def compatible_input(
+        name: str,
+        *,
+        dtype: str,
+        shape: list[str | int],
+        role: str | None,
+    ) -> bool:
+        declaration = inputs.get(name)
+        if not isinstance(declaration, dict):
+            return False
+        contract = declaration.get("contract", {})
+        semantic_role = declaration.get("role", {})
+        return (
+            contract.get("dtype") == dtype
+            and contract.get("rank") == len(shape)
+            and contract.get("shape") == shape
+            # A selection tensor the service reads for every batch it plans has
+            # no package-side escape, so admission derivation stamps it required
+            # and this stays a required-input check either way.
+            and declaration.get("required", True)
+            and declaration.get("source", {}).get("kind") in {"request", "application"}
+            and (
+                role is None
+                or semantic_role == {"kind": "runtime", "version": "1.0", "role": role}
+            )
+        )
+
+    def ensure_input(
+        name: str,
+        *,
+        dtype: str,
+        shape: list[str | int],
+        role: str | None,
+        source: dict[str, str] | None = None,
+    ) -> None:
+        if name not in inputs:
+            inputs[name] = {
+                "contract": {"dtype": dtype, "rank": len(shape), "shape": shape},
+                "role": (
+                    {"kind": "runtime", "version": "1.0", "role": role}
+                    if role is not None
+                    else {"kind": "opaque"}
+                ),
+                "source": source or {"kind": "request"},
+                # A selection tensor has no package-side default and no
+                # presence gate: the service reads it for every batch it plans,
+                # so the caller supplies it or the request is not admissible.
+                "required": True,
+            }
+        if not compatible_input(name, dtype=dtype, shape=shape, role=role):
+            raise ValueError(
+                f"adapter {role} must reference a required "
+                "request/application-sourced "
+                f"{dtype}{shape} workflow input"
+            )
+
+    active = options.active
+    if workflow is not None:
+        ensure_input(
+            options.segments,
+            dtype="int64",
+            shape=["batch", options.max_adapters],
+            role="adapter_segments",
+        )
+        ensure_input(
+            options.adapter_counts,
+            dtype="int64",
+            shape=["batch"],
+            role="adapter_counts",
+        )
+        ensure_input(
+            options.scales,
+            dtype="float32",
+            shape=["batch", options.max_adapters],
+            role="adapter_scales",
+        )
+        if active is not None:
+            ensure_input(
+                active,
+                dtype="bool",
+                shape=["batch"],
+                role="adapter_active",
+            )
+
+    catalog = pkg.save_adapter_artifacts(output_dir)
+    if workflow is not None:
+        workflow.pop("adapters", None)
+    metadata["adapters"] = {
+        "target_manifest": pkg.adapter_target_manifest_metadata(),
+        "discovery_fallback": options.discovery_fallback,
+        "selection": {
+            "segments": options.segments,
+            "adapter_counts": options.adapter_counts,
+            "scales": options.scales,
+            **({"active": active} if active is not None else {}),
+            "max_adapters": options.max_adapters,
+        },
+        "application_capability": options.application_capability,
+        "portable_fallback": options.portable_fallback,
+        "cache": {
+            "max_entries": options.cache_max_entries,
+            "eviction": "lru",
+        },
+        "planning": {
+            "bucket_by_adapter_set": options.bucket_by_adapter_set,
+            "stable_buffers": options.stable_buffers,
+            "invalidate_capture_on_eviction": (options.invalidate_capture_on_eviction),
+        },
+        "artifacts": catalog,
+    }
+    if workflow is not None:
+        capabilities = workflow.setdefault("manifest", {}).setdefault("capabilities", [])
+        for capability in ("parameter_adapters", "heterogeneous_adapter_batching"):
+            if capability not in capabilities:
+                capabilities.append(capability)
+        # Selection inputs carry exactly one entry per in-flight request, so
+        # they are request-aligned by construction. Stamping here rather than
+        # inside `ensure_input` also covers the declarations a producer wrote
+        # by hand before attaching the adapter service.
+        declare_request_alignment(workflow)
+        declare_input_admission(workflow)
     return metadata
 
 
@@ -1369,9 +1894,18 @@ def build_native_vlm_package_metadata(
     *,
     config: Any,
     source: str | None = None,
+    revision: str | None = None,
     decoder_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Emit a native VLM contract by inspecting every component graph.
+    """Describe a native VLM package by inspecting every component graph.
+
+    This is mobius's **internal** structural descriptor, not a publishable
+    document: its ``pipeline`` key is a ``models``/``dataflow``/``strategy``
+    view used to reason about component wiring and validate the executable
+    closure. It is consumed by
+    :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`,
+    which publishes the workflow and the ``preprocessing`` program. Use
+    :func:`write_native_vlm_package_metadata` to emit the package contract.
 
     Processor selection is registry-driven from graph rank/dtype/shape
     signatures. No model type, architecture name, or model-name branch
@@ -1437,7 +1971,7 @@ def build_native_vlm_package_metadata(
         for edge in dataflow
         if edge["to"].startswith(f"{decoder_name}.")
     }
-    processor_values = _processor_values(source, config)
+    processor_values = _processor_values(source, config, revision=revision)
     image_program = _resolve_image_program(pkg["vision_encoder"], processor_values)
     decoder_io, positions = _decoder_io(pkg[decoder_name], routed_decoder_inputs, config)
 
@@ -1539,7 +2073,6 @@ def build_native_vlm_package_metadata(
             {
                 "name": f"run_{name}",
                 "strategy": strategy,
-                "run_on": phases[name]["run_on"],
             }
         )
 
@@ -1577,18 +2110,19 @@ def build_native_vlm_package_metadata(
     if decoder_io.get("token_input") and decoder_io.get("inputs_embeds_input"):
         capabilities.append("dual_sequence_inputs")
     metadata["required_capabilities"] = capabilities
-    metadata.setdefault("model", {})["io"] = decoder_io
     metadata["preprocessing"] = {
         "image": {
             "transforms": image_program.transforms(config, processor_values),
             "outputs": preprocessing_outputs,
         }
     }
+    # Bind every declared output to the processor-local value that produces it,
+    # so the runtime never has to guess which transform an output came from.
+    _name_image_preprocessing_program(metadata["preprocessing"]["image"])
     metadata["pipeline"] = {
         "models": models,
         "dataflow": dataflow,
         "strategy": {"kind": "composite", "stages": stages},
-        "phases": phases,
         "vision": vision_config,
     }
     if positions is not None:
@@ -1600,12 +2134,15 @@ def build_native_vlm_package_metadata(
 def _copy_runtime_assets(
     output_dir: str,
     source: str | None,
+    names: Sequence[str] = _RUNTIME_ASSET_NAMES,
+    *,
+    revision: str | None = None,
 ) -> dict[str, str]:
     if not source:
         return {}
     os.makedirs(output_dir, exist_ok=True)
-    for filename in _RUNTIME_ASSET_NAMES:
-        source_path = _source_asset_path(source, filename)
+    for filename in names:
+        source_path = _source_asset_path(source, filename, revision=revision)
         if source_path is not None:
             shutil.copy2(source_path, os.path.join(output_dir, filename))
 
@@ -1625,7 +2162,11 @@ def _copy_runtime_assets(
         try:
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(source, use_fast=True)
+            tokenizer = AutoTokenizer.from_pretrained(
+                source,
+                use_fast=True,
+                revision=revision,
+            )
             backend = getattr(tokenizer, "backend_tokenizer", None)
             if backend is not None:
                 backend.save(tokenizer_path)
@@ -1641,7 +2182,7 @@ def _copy_runtime_assets(
 
     return {
         Path(filename).stem: os.path.join(output_dir, filename)
-        for filename in _RUNTIME_ASSET_NAMES
+        for filename in names
         if os.path.isfile(os.path.join(output_dir, filename))
     }
 
@@ -1652,26 +2193,26 @@ def write_native_vlm_package_metadata(
     *,
     config: Any,
     source: str | None = None,
-    kv_native_dtype: str | None = None,
-    filename: str = "inference_metadata.yaml",
+    revision: str | None = None,
 ) -> dict[str, str]:
-    """Write native VLM metadata and the runtime's tokenizer/processor assets."""
-    from mobius.integrations.onnx_genai.decoder_metadata import (
-        decoder_metadata_from_config,
+    """Write the published VLM package contract and its tokenizer/processor assets.
+
+    What lands in ``inference_metadata.yaml`` is the typed SSA workflow built by
+    :func:`~mobius.integrations.onnx_genai.workflow_metadata.build_vlm_workflow_metadata`,
+    not the structural descriptor :func:`build_native_vlm_package_metadata`
+    returns.
+    """
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        write_vlm_workflow_metadata,
     )
 
-    metadata = build_native_vlm_package_metadata(
-        pkg,
-        config=config,
-        source=source,
-        decoder_metadata=decoder_metadata_from_config(config, kv_native_dtype=kv_native_dtype),
+    # Assets first: the workflow document declares their package-relative
+    # locations under ``package.tokenizer.artifacts``, so they have to be in the
+    # package before the document that names them is written.
+    artifacts = _copy_runtime_assets(directory, source, revision=revision)
+    artifacts["inference_metadata"] = write_vlm_workflow_metadata(
+        pkg, directory, config, source=source
     )
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, filename)
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
-    artifacts = {"inference_metadata": path}
-    artifacts.update(_copy_runtime_assets(directory, source))
     return artifacts
 
 
@@ -1685,6 +2226,13 @@ class SchedulerConfig:
     beta_end: float = 0.012
     beta_schedule: str = "scaled_linear"
     prediction_type: str = "epsilon"
+    clip_sample: bool = False
+    clip_sample_range: float = 1.0
+    set_alpha_to_one: bool = True
+    steps_offset: int = 0
+    timestep_spacing: str = "leading"
+    rescale_betas_zero_snr: bool = False
+    snr_shift_scale: float = 1.0
     use_karras_sigmas: bool = False
     use_exponential_sigmas: bool = False
     shift: float | None = None
@@ -1697,6 +2245,11 @@ class SchedulerConfig:
     time_shift_type: str | None = None
     invert_sigmas: bool = False
     stochastic_sampling: bool = False
+    algorithm_type: str = "dpmsolver++"
+    solver_order: int = 2
+    solver_type: str = "midpoint"
+    lower_order_final: bool = True
+    final_sigmas_type: str = "zero"
 
     def to_metadata(self) -> dict[str, Any]:
         meta: dict[str, Any] = {
@@ -1709,6 +2262,13 @@ class SchedulerConfig:
                 beta_start=self.beta_start,
                 beta_end=self.beta_end,
                 beta_schedule=self.beta_schedule,
+                clip_sample=self.clip_sample,
+                clip_sample_range=self.clip_sample_range,
+                set_alpha_to_one=self.set_alpha_to_one,
+                steps_offset=self.steps_offset,
+                timestep_spacing=self.timestep_spacing,
+                rescale_betas_zero_snr=self.rescale_betas_zero_snr,
+                snr_shift_scale=self.snr_shift_scale,
             )
         if self.use_karras_sigmas:
             meta["use_karras_sigmas"] = True
@@ -1785,6 +2345,13 @@ class SchedulerConfig:
                     "flow_prediction" if kind == "flow_match_euler" else "epsilon",
                 )
             ),
+            clip_sample=bool(config.get("clip_sample")),
+            clip_sample_range=float(config.get("clip_sample_range", 1.0)),
+            set_alpha_to_one=bool(config.get("set_alpha_to_one", True)),
+            steps_offset=int(config.get("steps_offset", 0)),
+            timestep_spacing=str(config.get("timestep_spacing", "leading")),
+            rescale_betas_zero_snr=bool(config.get("rescale_betas_zero_snr")),
+            snr_shift_scale=float(config.get("snr_shift_scale", 1.0)),
             use_karras_sigmas=bool(config.get("use_karras_sigmas")),
             use_exponential_sigmas=bool(config.get("use_exponential_sigmas")),
             shift=float(config["shift"]) if config.get("shift") is not None else None,
@@ -1817,10 +2384,19 @@ class SchedulerConfig:
             ),
             invert_sigmas=bool(config.get("invert_sigmas")),
             stochastic_sampling=bool(config.get("stochastic_sampling")),
+            algorithm_type=str(config.get("algorithm_type", cls.algorithm_type)),
+            solver_order=int(config.get("solver_order", cls.solver_order)),
+            solver_type=str(config.get("solver_type", cls.solver_type)),
+            lower_order_final=bool(config.get("lower_order_final", cls.lower_order_final)),
+            final_sigmas_type=str(config.get("final_sigmas_type", cls.final_sigmas_type)),
         )
 
 
-def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | None:
+def load_diffusers_scheduler_config(
+    source: str | None,
+    *,
+    revision: str | None = None,
+) -> SchedulerConfig | None:
     """Best-effort load of a diffusers ``scheduler/scheduler_config.json``.
 
     ``source`` may be a local diffusers checkpoint directory or a Hugging Face
@@ -1845,7 +2421,11 @@ def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | Non
         try:
             from huggingface_hub import hf_hub_download
 
-            path = hf_hub_download(source, "scheduler/scheduler_config.json")
+            path = hf_hub_download(
+                source,
+                "scheduler/scheduler_config.json",
+                revision=revision,
+            )
             with open(path, encoding="utf-8") as handle:
                 raw = json.load(handle)
         except Exception as err:
@@ -1860,74 +2440,133 @@ def load_diffusers_scheduler_config(source: str | None) -> SchedulerConfig | Non
         return None
 
 
-def build_language_diffusion_pipeline_metadata(
+def load_diffusers_vae_scaling_factor(
+    source: str | None,
     *,
-    mask_token_id: int,
-    num_inference_steps: int,
-    model_filename: str = "model.onnx",
-    input_ids_port: str = "input_ids",
-    logits_port: str = "logits",
-    block_length: int | None = None,
-    temperature: float | None = None,
-    guidance_scale: float | None = None,
-) -> dict[str, Any]:
-    """Build the onnx-genai ``inference_metadata`` for a masked language-diffusion model.
+    revision: str | None = None,
+) -> float | None:
+    """Best-effort load of a diffusers ``vae/config.json`` ``scaling_factor``.
 
-    For a masked (discrete) language-diffusion model (e.g. LLaDA / Dream).
-
-    The model is a mask predictor: it takes an int64 token sequence on
-    ``input_ids_port`` (prompt tokens plus a masked generation region) and emits
-    ``[B, S, V]`` logits on ``logits_port``. onnx-genai's ``masked_diffusion``
-    scheduler drives the reverse process — each step commits the highest-confidence
-    still-masked positions (LLaDA low-confidence remasking) via a loop-carried
-    ``logits -> input_ids`` self-edge, unmasking progressively.
-
-    Args:
-        mask_token_id: The ``[MASK]`` token id (e.g. 126336 for LLaDA-8B).
-        num_inference_steps: Total reverse-process steps (``strategy.num_steps``).
-        model_filename: The mask-predictor ONNX filename.
-        input_ids_port / logits_port: Model I/O port names.
-        block_length: Semi-autoregressive block length in tokens. When set, the
-            generation region is decoded in contiguous left-to-right blocks and
-            ``num_inference_steps`` must be divisible by the block count.
-        temperature: Gumbel-max sampling temperature (default 0 = argmax).
-        guidance_scale: Unsupervised classifier-free guidance multiplier. LLaDA's
-            effective multiplier is ``cfg_scale + 1``, so pass ``cfg_scale + 1``.
-
-    Returns:
-        A dict with a top-level ``pipeline`` key, ready to serialize to
-        ``inference_metadata.yaml``.
+    The latent a diffusion sampler carries is scaled by this factor before the
+    VAE decodes it, so the workflow needs the real value rather than a guess.
+    Returns ``None`` when the config cannot be read, letting the caller decide.
     """
-    if num_inference_steps < 1:
-        raise ValueError("num_inference_steps must be >= 1")
-    if block_length is not None and block_length < 1:
-        raise ValueError("block_length must be >= 1")
+    if not source:
+        return None
+    raw: dict[str, Any] | None = None
+    local = os.path.join(source, "vae", "config.json")
+    if os.path.isfile(local):
+        try:
+            with open(local, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError) as err:
+            _LOGGER.warning("could not read %s: %s", local, err)
+            return None
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
 
-    scheduler_config: dict[str, Any] = {
-        "kind": "masked_diffusion",
-        "mask_token_id": int(mask_token_id),
-    }
-    if temperature is not None:
-        scheduler_config["temperature"] = float(temperature)
-    if block_length is not None:
-        scheduler_config["block_length"] = int(block_length)
+            path = hf_hub_download(source, "vae/config.json", revision=revision)
+            with open(path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except Exception as err:
+            _LOGGER.info("no diffusers VAE config for %r (%s)", source, err)
+            return None
+    # ``AutoencoderKL`` defaults this to 0.18215, and diffusers checkpoints that
+    # accept the default omit the key entirely.
+    factor = (raw or {}).get("scaling_factor", 0.18215)
+    return float(factor) if factor else None
 
-    strategy: dict[str, Any] = {
-        "kind": "iterative",
-        "denoiser": "denoiser",
-        "num_steps": num_inference_steps,
-        "scheduler_config": scheduler_config,
-    }
-    if guidance_scale is not None and not math.isclose(guidance_scale, 1.0):
-        strategy["guidance_scale"] = guidance_scale
 
-    pipeline: dict[str, Any] = {
-        "models": {"denoiser": {"filename": model_filename, "type": "denoiser"}},
-        # Loop-carried self-edge: the emitted logits refine the token sequence.
-        "dataflow": [{"from": f"denoiser.{logits_port}", "to": f"denoiser.{input_ids_port}"}],
-        "strategy": strategy,
-    }
-    return {"pipeline": pipeline}
+#: Diffusion solvers mobius can materialize as an ONNX policy component, keyed
+#: by the scheduler ``kind`` a diffusers config or a ComfyUI sampler resolves
+#: to, with whether the solver consumes the latent pre-scaled by the current
+#: sigma. A stochastic sampler injects fresh noise every step and has no
+#: deterministic solver here, so it is rejected rather than silently lowered to
+#: the closest deterministic one.
+_SCHEDULER_SOLVERS: dict[str, tuple[str, bool]] = {
+    "ddim": ("ddim", False),
+    "euler": ("euler", True),
+    "dpmpp_2m": ("multistep", False),
+}
+
+#: Latent axis names shared by the solver, guidance and clamp policy components
+#: (``mobius.generation._policy_components._IMAGE_LATENT_DIMS``). The workflow's
+#: latent contract reuses them so a declared value and the component port it
+#: binds to can never disagree about an axis.
+_LATENT_DIMS: tuple[str, ...] = ("batch", "channels", "height", "width")
+
+_WORKFLOW_DTYPES: dict[str, str] = {
+    "fp32": "float32",
+    "fp16": "float16",
+    "bf16": "bfloat16",
+}
+
+
+def _diffusion_solver(scheduler: SchedulerConfig) -> tuple[str, bool]:
+    """Resolve the solver component and whether it pre-scales the model input."""
+    resolved = _SCHEDULER_SOLVERS.get(scheduler.kind)
+    if resolved is None:
+        raise ValueError(
+            f"Cannot publish a diffusion workflow for scheduler kind {scheduler.kind!r}. "
+            "Why: the runtime executes the sampler as a declared solver component, and "
+            f"only {sorted(_SCHEDULER_SOLVERS)} have one; a stochastic sampler injects "
+            "fresh noise per step and has no deterministic equivalent. How to fix: export "
+            "with a deterministic scheduler (DDIM, Euler or DPMSolverMultistep)."
+        )
+    return resolved
+
+
+def _diffusion_schedule_values(
+    scheduler: SchedulerConfig,
+    num_inference_steps: int,
+    timesteps: list[float] | None,
+    schedule: list[float] | None,
+    start_step: int | None,
+) -> tuple[list[float], list[float], int]:
+    """Resolve the solver schedule, the timestep table and the executed step count.
+
+    The schedule is what ``solver_step`` integrates: a variance-preserving DDIM
+    solver reads cumulative alphas, a sigma-space Euler / DPM-Solver++ one reads
+    sigmas. Both use the same diffusers-compatible derivations the package
+    exporter does, so a ComfyUI conversion and a package export of one
+    checkpoint describe the same dynamics.
+
+    ``start_step`` is img2img's "skip the noisiest steps", which diffusers
+    implements by starting from a later entry of the same table, so it lowers to
+    a sliced schedule plus a smaller loop bound.
+    """
+    from mobius.integrations.onnx_genai.auto_export import (
+        _ddim_alpha_schedule,
+        _diffusion_schedule,
+    )
+
+    if timesteps is not None and len(timesteps) != num_inference_steps:
+        raise ValueError(
+            f"timesteps has {len(timesteps)} entries but num_inference_steps is "
+            f"{num_inference_steps}"
+        )
+    if schedule is not None and len(schedule) != num_inference_steps + 1:
+        raise ValueError(
+            f"schedule has {len(schedule)} entries but num_inference_steps + 1 is "
+            f"{num_inference_steps + 1}"
+        )
+    derive = _ddim_alpha_schedule if scheduler.kind == "ddim" else _diffusion_schedule
+    derived_timesteps, derived_schedule = derive(scheduler, num_inference_steps)
+    schedule = (
+        [float(value) for value in schedule] if schedule is not None else derived_schedule
+    )
+    table = (
+        [float(value) for value in timesteps] if timesteps is not None else derived_timesteps
+    )
+    if start_step:
+        if not 0 < start_step < num_inference_steps:
+            raise ValueError(
+                f"start_step ({start_step}) must be in 1..{num_inference_steps - 1}"
+            )
+        schedule = schedule[start_step:]
+        table = table[start_step:]
+    return schedule, table, len(table)
 
 
 def build_diffusion_pipeline_metadata(
@@ -1940,115 +2579,466 @@ def build_diffusion_pipeline_metadata(
     denoiser_output: str = "noise_pred",
     scheduler: SchedulerConfig | None = None,
     timesteps: list[float] | None = None,
+    schedule: list[float] | None = None,
     guidance_scale: float | None = None,
     start_step: int | None = None,
     vae_filename: str | None = None,
     vae_latent_input: str = "latent",
+    vae_output: str = "sample",
     text_encoder_filename: str | None = None,
+    text_encoder_input: str = "input_ids",
     text_encoder_output: str = "last_hidden_state",
     text_encoder_edges: list[tuple[str, str]] | None = None,
+    vae_scaling_factor: float | None = None,
+    activation_dtype: str = "fp32",
+    package: Any | None = None,
 ) -> dict[str, Any]:
-    """Build the onnx-genai ``inference_metadata`` dict for a diffusion pipeline.
+    """Build the onnx-genai ``inference_metadata`` document for a diffusion pipeline.
 
-    The denoiser runs an iterative loop: its ``denoiser_output`` (a noise
-    prediction) is fed back to ``denoiser_sample_input`` each step (a
-    loop-carried self-edge), the scheduler combines it with the current latent,
-    the per-step timestep is injected into ``denoiser_timestep_input``, and the
-    conditioning is supplied on ``denoiser_conditioning_input``.
+    The denoise loop is emitted as an explicit ``pipeline.workflow``: the sigma
+    schedule and timestep table are constant components, the step index is the
+    loop induction value, and classifier-free guidance is two denoiser
+    invocations plus a combine component.
+
+    Only the ONNX components a caller *names* are described by artifact; their
+    graphs stay authoritative for which ports exist. The solver, schedule,
+    lookup, guidance and clamp components are built here from mobius's policy
+    library and are attached to ``package`` so a writer can save them next to
+    the metadata.
 
     Args:
-        num_inference_steps: Number of denoise steps (``strategy.num_steps``).
+        num_inference_steps: Number of denoise steps.
         denoiser_*: Denoiser component filename and I/O port names.
-        scheduler: Noise-schedule config (defaults to DDIM defaults).
-        guidance_scale: When set and != 1.0, enables classifier-free guidance
-            (the conditioning input is zeroed on the unconditional pass).
-        vae_filename: Optional VAE decoder; runs ``final_only`` on the final
-            latent (``denoiser_sample_input``).
-        vae_latent_input: VAE latent input port name.
-        text_encoder_filename: Optional text encoder; runs ``prompt_only`` and
-            feeds ``denoiser_conditioning_input``.
-        text_encoder_output: Text encoder output port name.
+        scheduler: Noise-schedule config (defaults to DDIM defaults). Its
+            ``kind`` selects the solver component.
+        timesteps: Explicit per-step timestep table; derived from ``scheduler``
+            otherwise.
+        schedule: Explicit solver schedule (``num_inference_steps + 1`` values);
+            derived from ``scheduler`` otherwise.
+        guidance_scale: When set and != 1.0, enables classifier-free guidance.
+        start_step: img2img skip count; lowered to a sliced schedule.
+        vae_filename: VAE decoder producing the image output.
+        text_encoder_filename: Optional text encoder feeding the conditioning.
+        text_encoder_edges: Every ``(encoder_output, denoiser_input)`` edge to
+            route; defaults to the single primary conditioning edge.
+        vae_scaling_factor: The diffusers ``scaling_factor`` the VAE latents are
+            normalized by; the decoder input is divided by it before decoding.
+        activation_dtype: Declared dtype of the latent and image values.
+        package: Optional :class:`~mobius._model_package.ModelPackage` the
+            generated policy components are attached to.
 
     Returns:
-        A dict with a top-level ``pipeline`` key, ready to serialize to
-        ``inference_metadata.yaml``.
+        A dict with ``schema_version`` and a top-level ``pipeline.workflow``.
     """
+    from mobius._model_package import ModelPackage
+    from mobius.generation import (
+        SOLVER_BUILDERS,
+        build_boolean_not,
+        build_euler_model_input,
+        build_guidance_combine,
+        build_scalar_constant,
+        build_schedule_constant,
+        build_schedule_lookup,
+        build_tensor_clamp,
+        build_tensor_scale,
+        build_zeros_like,
+    )
+    from mobius.integrations.onnx_genai.workflow_metadata import (
+        _invoke,
+        _publish_workflow_v1,
+        _request_aligned,
+    )
+
     if num_inference_steps < 1:
         raise ValueError("num_inference_steps must be >= 1")
+    if vae_filename is None:
+        raise ValueError(
+            "Cannot publish a diffusion workflow without a VAE decoder. Why: the "
+            "workflow terminates in a decoded image output, so a latent-only pipeline "
+            "has no executable result to declare. How to fix: pass vae_filename for the "
+            "decoder the package ships."
+        )
+    if activation_dtype not in _WORKFLOW_DTYPES:
+        raise ValueError(
+            f"unsupported diffusion activation dtype {activation_dtype!r}; "
+            f"expected one of {sorted(_WORKFLOW_DTYPES)}"
+        )
     scheduler = scheduler or SchedulerConfig()
+    solver, scales_model_input = _diffusion_solver(scheduler)
+    schedule_values, timestep_values, executed_steps = _diffusion_schedule_values(
+        scheduler, num_inference_steps, timesteps, schedule, start_step
+    )
+    conditioned = text_encoder_filename is not None
+    guided = guidance_scale is not None and not math.isclose(guidance_scale, 1.0)
+    if guided and not conditioned:
+        raise ValueError("classifier-free guidance requires a text encoder to condition on")
 
-    models: dict[str, Any] = {
-        "denoiser": {"filename": denoiser_filename, "type": "denoiser"},
+    dtype = _ir_dtype_for(activation_dtype)
+    pkg = package if package is not None else ModelPackage({})
+    solver_builder = SOLVER_BUILDERS[solver]
+    # A solver that fixes its own latent axis names takes only a dtype.
+    solver_component = (
+        solver_builder(dtype, _LATENT_DIMS)
+        if "latent_dims" in inspect.signature(solver_builder).parameters
+        else solver_builder(dtype)
+    )
+    # A multistep solver keeps the previous data estimate; a single-step one
+    # does not, so only then is a history cell part of the loop.
+    carries_history = "history" in {
+        value.name for value in solver_component.model.graph.inputs
     }
-    dataflow: list[dict[str, Any]] = [
-        # Loop-carried self-edge: previous step's prediction seeds the next.
-        {
-            "from": f"denoiser.{denoiser_output}",
-            "to": f"denoiser.{denoiser_sample_input}",
+    pkg.add_policy_component("solver_step", solver_component)
+    pkg.add_policy_component("diffusion_schedule", build_schedule_constant(schedule_values))
+    pkg.add_policy_component("diffusion_timesteps", build_schedule_constant(timestep_values))
+    pkg.add_policy_component("schedule_lookup", build_schedule_lookup(dtype))
+    pkg.add_policy_component("continue_predicate", build_boolean_not())
+    if scales_model_input:
+        pkg.add_policy_component(
+            "model_input_scale", build_euler_model_input(dtype, _LATENT_DIMS)
+        )
+    if carries_history:
+        pkg.add_policy_component("history_initializer", build_zeros_like(dtype))
+    if guided:
+        pkg.add_policy_component(
+            "guidance_combine", build_guidance_combine(dtype, _LATENT_DIMS)
+        )
+    pkg.add_policy_component(
+        "image_output_clamp",
+        build_tensor_clamp(dtype, _LATENT_DIMS, minimum=-1.0, maximum=1.0),
+    )
+    # A sigma-space sampler starts from noise scaled by the largest sigma; a
+    # variance-preserving one starts from the unit-variance draw itself. And a
+    # VAE whose latents are normalized needs them un-normalized before decoding.
+    # Only emit the constant and the multiply the pipeline actually performs.
+    initial_state_scale = schedule_values[0] if scales_model_input else 1.0
+    decoder_input_scale = 1.0 / vae_scaling_factor if vae_scaling_factor else 1.0
+    scales_initial_state = not math.isclose(initial_state_scale, 1.0)
+    scales_decoder_input = not math.isclose(decoder_input_scale, 1.0)
+    if scales_initial_state or scales_decoder_input:
+        pkg.add_policy_component("tensor_scale", build_tensor_scale(dtype))
+    if scales_initial_state:
+        pkg.add_policy_component(
+            "initial_state_scale", build_scalar_constant(initial_state_scale)
+        )
+    if scales_decoder_input:
+        pkg.add_policy_component(
+            "decoder_input_scale", build_scalar_constant(decoder_input_scale)
+        )
+
+    workflow_dtype = _WORKFLOW_DTYPES[activation_dtype]
+    latent_contract = _request_aligned(
+        {"dtype": workflow_dtype, "rank": 4, "shape": list(_LATENT_DIMS)}
+    )
+    row_float = _request_aligned({"dtype": "float32", "rank": 1, "shape": ["batch"]})
+    batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": ["batch"]})
+    prompt_contract = _request_aligned(
+        {"dtype": "int64", "rank": 2, "shape": ["batch", "prompt_sequence"]}
+    )
+
+    inputs: dict[str, Any] = {
+        "request.max_iterations": {
+            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+            "role": {"kind": "runtime", "version": "1.0", "role": "max_iterations"},
+            "source": {"kind": "request", "field": "max_iterations"},
+            "required": False,
+            "default": executed_steps,
         },
+        "package.false": {
+            "contract": batch_bool,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "literal"},
+            "required": False,
+            "default": False,
+        },
+        "request.noise": {
+            "contract": latent_contract,
+            "role": {"kind": "opaque"},
+            "source": {"kind": "application", "name": "noise"},
+            "required": True,
+            "externally_suppliable": True,
+        },
+    }
+    outputs: dict[str, Any] = {
+        "image": {
+            "contract": latent_contract,
+            "role": "image",
+            "value_range": "negative_one_to_one",
+            "stage": "pre_adapter",
+        },
+        "latent": {
+            "contract": latent_contract,
+            "role": "tensor",
+            "stage": "pre_adapter",
+        },
+    }
+
+    components: dict[str, Any] = {
+        "denoiser": {"implementation": {"kind": "onnx", "artifact": denoiser_filename}},
+        "vae": {"implementation": {"kind": "onnx", "artifact": vae_filename}},
+    }
+
+    setup_nodes: list[dict[str, Any]] = [
+        _invoke("diffusion_schedule", {}, {"schedule": "diffusion.schedule"}),
+        _invoke("diffusion_timesteps", {}, {"schedule": "diffusion.timesteps"}),
     ]
-    phases: dict[str, Any] = {}
-
-    if text_encoder_filename is not None:
-        models["text_encoder"] = {
-            "filename": text_encoder_filename,
-            "type": "encoder",
-        }
-        # Route each text-encoder output to its denoiser conditioning input. SD
-        # has one edge (hidden states -> encoder_hidden_states); SDXL has two
-        # (concatenated hidden states + pooled text_embeds). `time_ids` is not
-        # routed here — it is an external denoiser input the caller supplies.
-        edges = text_encoder_edges or [(text_encoder_output, denoiser_conditioning_input)]
-        for enc_out, denoiser_in in edges:
-            dataflow.append(
-                {"from": f"text_encoder.{enc_out}", "to": f"denoiser.{denoiser_in}"}
+    if scales_initial_state:
+        setup_nodes.append(
+            _invoke("initial_state_scale", {}, {"value": "diffusion.initial_scale"})
+        )
+    if scales_decoder_input:
+        setup_nodes.append(
+            _invoke("decoder_input_scale", {}, {"value": "diffusion.decoder_scale"})
+        )
+    initial_state_value = "request.noise"
+    if scales_initial_state:
+        initial_state_value = "diffusion.initial_state"
+        setup_nodes.append(
+            _invoke(
+                "tensor_scale",
+                {"tensor": "request.noise", "scale": "diffusion.initial_scale"},
+                {"scaled": initial_state_value},
             )
-        phases["text_encoder"] = {"run_on": "prompt_only"}
+        )
 
-    if vae_filename is not None:
-        models["vae"] = {"filename": vae_filename, "type": "vae"}
-        # The VAE decodes the final post-scheduler latent (the sample port).
-        dataflow.append(
+    # Each (encoder_output, denoiser_input) edge becomes one SSA value routed
+    # from the text encoder into the denoiser. SDXL routes two (concatenated
+    # hidden states + pooled text_embeds); SD routes one.
+    edges = list(text_encoder_edges or [(text_encoder_output, denoiser_conditioning_input)])
+    conditional_values: dict[str, str] = {}
+    unconditional_values: dict[str, str] = {}
+    if conditioned:
+        components["text_encoder"] = {
+            "implementation": {"kind": "onnx", "artifact": text_encoder_filename}
+        }
+        inputs["request.prompt_tokens"] = {
+            "contract": prompt_contract,
+            "role": {"kind": "runtime", "version": "1.0", "role": "prompt_tokens"},
+            "source": {"kind": "request", "field": "prompt_tokens"},
+            "required": True,
+            "externally_suppliable": True,
+        }
+        conditional_values = {
+            denoiser_in: f"conditioning.{denoiser_in}" for _, denoiser_in in edges
+        }
+        setup_nodes.append(
+            _invoke(
+                "text_encoder",
+                {text_encoder_input: "request.prompt_tokens"},
+                {
+                    encoder_out: conditional_values[denoiser_in]
+                    for encoder_out, denoiser_in in edges
+                },
+            )
+        )
+        if guided:
+            assert guidance_scale is not None
+            inputs["request.negative_prompt_tokens"] = {
+                "contract": prompt_contract,
+                "role": {
+                    "kind": "runtime",
+                    "version": "1.0",
+                    "role": "negative_prompt_tokens",
+                },
+                "source": {"kind": "request", "field": "negative_prompt_tokens"},
+                "required": True,
+                "externally_suppliable": True,
+            }
+            inputs["request.guidance_scale"] = {
+                "contract": row_float,
+                "role": {"kind": "runtime", "version": "1.0", "role": "guidance_scale"},
+                "source": {"kind": "request", "field": "guidance_scale"},
+                "required": False,
+                "default": float(guidance_scale),
+            }
+            unconditional_values = {
+                denoiser_in: f"conditioning.unconditional.{denoiser_in}"
+                for _, denoiser_in in edges
+            }
+            setup_nodes.append(
+                _invoke(
+                    "text_encoder",
+                    {text_encoder_input: "request.negative_prompt_tokens"},
+                    {
+                        encoder_out: unconditional_values[denoiser_in]
+                        for encoder_out, denoiser_in in edges
+                    },
+                )
+            )
+
+    state: dict[str, Any] = {
+        "latent": {
+            "contract": latent_contract,
+            "scope": "invocation",
+            "initializer": initial_state_value,
+            "recurrence": {"kind": "invariant"},
+        }
+    }
+    carried: list[dict[str, Any]] = [
+        {
+            "cell": "latent",
+            "current": initial_state_value,
+            "body_input": "state.latent.body",
+            "body_output": "latent.body",
+            "next": "latent.final",
+        }
+    ]
+    if carries_history:
+        setup_nodes.append(
+            _invoke(
+                "history_initializer",
+                {"reference": initial_state_value},
+                {"zeros": "diffusion.initial_history"},
+            )
+        )
+        state["history"] = {
+            "contract": latent_contract,
+            "scope": "invocation",
+            "initializer": "diffusion.initial_history",
+            "recurrence": {"kind": "invariant"},
+        }
+        carried.append(
             {
-                "from": f"denoiser.{denoiser_sample_input}",
-                "to": f"vae.{vae_latent_input}",
+                "cell": "history",
+                "current": "diffusion.initial_history",
+                "body_input": "state.history.body",
+                "body_output": "history.body",
+                "next": "history.final",
             }
         )
-        phases["vae"] = {"run_on": "final_only"}
+    setup_nodes.append(
+        _invoke(
+            "continue_predicate", {"done": "package.false"}, {"continue": "setup.continue"}
+        )
+    )
 
-    strategy: dict[str, Any] = {
-        "kind": "iterative",
-        "denoiser": "denoiser",
-        "num_steps": num_inference_steps,
-        "timestep_input": denoiser_timestep_input,
-        "scheduler_config": scheduler.to_metadata(),
-    }
-    if timesteps is not None:
-        if len(timesteps) != num_inference_steps:
-            raise ValueError(
-                f"timesteps has {len(timesteps)} entries but num_inference_steps is "
-                f"{num_inference_steps}"
+    body_nodes: list[dict[str, Any]] = [
+        _invoke(
+            "schedule_lookup",
+            {"schedule": "diffusion.timesteps", "step": "loop.iteration"},
+            {"timestep": "diffusion.timestep"},
+        )
+    ]
+    model_input_value = "state.latent.body"
+    if scales_model_input:
+        model_input_value = "diffusion.model_input"
+        body_nodes.append(
+            _invoke(
+                "model_input_scale",
+                {
+                    "sample": "state.latent.body",
+                    "step": "loop.iteration",
+                    "schedule": "diffusion.schedule",
+                },
+                {"model_input": model_input_value},
             )
-        strategy["timesteps"] = [float(t) for t in timesteps]
-    if guidance_scale is not None:
-        strategy["guidance_scale"] = guidance_scale
-        if not math.isclose(guidance_scale, 1.0):
-            strategy["cfg_conditioning_input"] = denoiser_conditioning_input
-    if start_step:
-        if not 0 < start_step < num_inference_steps:
-            raise ValueError(
-                f"start_step ({start_step}) must be in 1..{num_inference_steps - 1}"
-            )
-        strategy["start_step"] = start_step
+        )
 
-    pipeline: dict[str, Any] = {
-        "models": models,
-        "dataflow": dataflow,
-        "strategy": strategy,
+    def denoiser_call(conditioning: dict[str, str], estimate: str) -> dict[str, Any]:
+        call_inputs = {
+            denoiser_sample_input: model_input_value,
+            denoiser_timestep_input: "diffusion.timestep",
+            **conditioning,
+        }
+        return _invoke("denoiser", call_inputs, {denoiser_output: estimate})
+
+    if guided:
+        body_nodes.append(denoiser_call(unconditional_values, "denoiser.unconditional"))
+        body_nodes.append(denoiser_call(conditional_values, "denoiser.conditional"))
+        body_nodes.append(
+            _invoke(
+                "guidance_combine",
+                {
+                    "unconditional": "denoiser.unconditional",
+                    "conditional": "denoiser.conditional",
+                    "scale": "request.guidance_scale",
+                },
+                {"estimate": "denoiser.estimate"},
+            )
+        )
+    else:
+        body_nodes.append(denoiser_call(conditional_values, "denoiser.estimate"))
+
+    solver_inputs = {
+        "sample": "state.latent.body",
+        "step": "loop.iteration",
+        "schedule": "diffusion.schedule",
+        "estimate" if carries_history else "derivative": "denoiser.estimate",
     }
-    if phases:
-        pipeline["phases"] = phases
-    return {"pipeline": pipeline}
+    solver_outputs = {"next_state": "latent.body"}
+    if carries_history:
+        solver_inputs["history"] = "state.history.body"
+        solver_outputs["next_history"] = "history.body"
+    body_nodes.append(_invoke("solver_step", solver_inputs, solver_outputs))
+    body_nodes.append(
+        _invoke("continue_predicate", {"done": "package.false"}, {"continue": "loop.continue"})
+    )
+
+    decoder_input_value = "latent.final"
+    tail_nodes: list[dict[str, Any]] = []
+    if scales_decoder_input:
+        decoder_input_value = "diffusion.decoder_input"
+        tail_nodes.append(
+            _invoke(
+                "tensor_scale",
+                {"tensor": "latent.final", "scale": "diffusion.decoder_scale"},
+                {"scaled": decoder_input_value},
+            )
+        )
+    tail_nodes += [
+        _invoke("vae", {vae_latent_input: decoder_input_value}, {vae_output: "vae.raw_image"}),
+        _invoke("image_output_clamp", {"tensor": "vae.raw_image"}, {"clamped": "vae.image"}),
+        {"kind": "emit", "value": "latent.final", "output": "latent", "mode": "replace"},
+        {"kind": "emit", "value": "vae.image", "output": "image", "mode": "replace"},
+    ]
+
+    workflow = {
+        "manifest": {
+            "capabilities": [
+                "workflow_ssa",
+                "nested_control_flow",
+                "loop_induction_values",
+                "typed_emit",
+            ]
+        },
+        "inputs": inputs,
+        "outputs": outputs,
+        "components": components,
+        "state": state,
+        "graph": {
+            "kind": "sequence",
+            "nodes": [
+                {
+                    "kind": "loop",
+                    "setup": {"kind": "sequence", "nodes": setup_nodes},
+                    "body": {"kind": "sequence", "nodes": body_nodes},
+                    "condition": "loop.continue",
+                    "max_iterations": "request.max_iterations",
+                    "iteration": {
+                        "value": "loop.iteration",
+                        "contract": {"dtype": "int64", "rank": 1, "shape": ["batch"]},
+                    },
+                    "carried": carried,
+                },
+                *tail_nodes,
+            ],
+        },
+    }
+    metadata = {
+        "schema_version": "v1",
+        "pipeline": {"workflow": _publish_workflow_v1(workflow)},
+    }
+    add_policy_components_to_workflow(metadata, pkg)
+    return metadata
+
+
+def _ir_dtype_for(activation_dtype: str) -> Any:
+    import onnx_ir as ir
+
+    return {
+        "fp32": ir.DataType.FLOAT,
+        "fp16": ir.DataType.FLOAT16,
+        "bf16": ir.DataType.BFLOAT16,
+    }[activation_dtype]
 
 
 def build_multimodal_pipeline_metadata(
@@ -2108,7 +3098,6 @@ def build_multimodal_pipeline_metadata(
             {
                 "name": stage_name,
                 "strategy": {"kind": "single_pass", "model": name},
-                "run_on": "prompt_only",
             }
         )
         phases[name] = {"run_on": "prompt_only"}
@@ -2149,12 +3138,10 @@ def build_multimodal_pipeline_metadata(
             {
                 "name": "fuse_embeddings",
                 "strategy": {"kind": "single_pass", "model": "embedding"},
-                "run_on": "prompt_only",
             },
             {
                 "name": "decode",
                 "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-                "run_on": "every_step",
             },
         ]
     )
@@ -2166,7 +3153,6 @@ def build_multimodal_pipeline_metadata(
         "models": models,
         "dataflow": dataflow,
         "strategy": {"kind": "composite", "stages": stages},
-        "phases": phases,
     }
     return metadata
 
@@ -2251,18 +3237,12 @@ def build_speech_to_text_pipeline_metadata(
                 {
                     "name": "encode_audio",
                     "strategy": {"kind": "single_pass", "model": "encoder"},
-                    "run_on": "prompt_only",
                 },
                 {
                     "name": "decode_transcript",
                     "strategy": {"kind": "autoregressive", "decoder": "decoder"},
-                    "run_on": "every_step",
                 },
             ],
-        },
-        "phases": {
-            "encoder": {"run_on": "prompt_only"},
-            "decoder": {"run_on": "every_step"},
         },
     }
     return metadata
@@ -2283,241 +3263,6 @@ def write_speech_to_text_pipeline_metadata(
     return path
 
 
-def build_audio_codec_pipeline_metadata(
-    *,
-    encoder_filename: str = "encoder/model.onnx",
-    decoder_filename: str = "decoder/model.onnx",
-    codes_dtype: str = "int64",
-) -> dict[str, Any]:
-    """Build metadata for an audio-to-audio neural codec pipeline.
-
-    This is the pure single-pass composite shape (DESIGN.md §20): an audio
-    encoder maps a waveform to ``codes``, and a decoder reconstructs a waveform
-    from those codes. Both stages run once over the shared tensor pool (there is
-    no autoregressive decode and no tokenizer), wired ``encoder.codes ->
-    decoder.codes``.
-
-    Args:
-        encoder_filename: Waveform-to-codes encoder ONNX filename.
-        decoder_filename: Codes-to-waveform decoder ONNX filename.
-        codes_dtype: Metadata dtype of the ``codes`` tensor exchanged between the
-            two stages (neural codecs typically emit ``int64`` code indices).
-
-    Returns:
-        A dict with a top-level ``pipeline`` key. No decoder capabilities are
-        emitted because the pipeline produces tensors, not tokens.
-    """
-    return {
-        "pipeline": {
-            "models": {
-                "encoder": {"filename": encoder_filename, "type": "audio_encoder"},
-                "decoder": {"filename": decoder_filename, "type": "vocoder"},
-            },
-            "dataflow": [
-                {
-                    "from": "encoder.codes",
-                    "to": "decoder.codes",
-                    "dtype": codes_dtype,
-                    "device_transfer": False,
-                }
-            ],
-            "strategy": {
-                "kind": "composite",
-                "stages": [
-                    {
-                        "name": "encode_waveform",
-                        "strategy": {"kind": "single_pass", "model": "encoder"},
-                        "run_on": "prompt_only",
-                    },
-                    {
-                        "name": "decode_waveform",
-                        "strategy": {"kind": "single_pass", "model": "decoder"},
-                        "run_on": "prompt_only",
-                    },
-                ],
-            },
-            "phases": {
-                "encoder": {"run_on": "prompt_only"},
-                "decoder": {"run_on": "prompt_only"},
-            },
-        }
-    }
-
-
-def write_audio_codec_pipeline_metadata(
-    directory: str,
-    *,
-    filename: str = "inference_metadata.yaml",
-    **kwargs: Any,
-) -> str:
-    """Build and write composite audio-codec metadata into ``directory``."""
-    metadata = build_audio_codec_pipeline_metadata(**kwargs)
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, filename)
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
-    return path
-
-
-def build_tts_pipeline_metadata(
-    *,
-    num_code_groups: int,
-    max_frames: int = 2000,
-    talker_filename: str = "talker/model.onnx",
-    code_predictor_filename: str = "code_predictor/model.onnx",
-    pre_embedder_filename: str = "talker_step_embedder/model.onnx",
-    prefill_embedder_filename: str | None = "talker_prefill_embedder/model.onnx",
-    tokenizer_filename: str = "tokenizer.json",
-    activation_dtype: str = "fp32",
-    inner_embedding_output: str = "codec_embeddings",
-    decoder_metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build metadata for a pre-embedder-driven multi-decoder TTS pipeline.
-
-    This is the real Qwen3-TTS shape (DESIGN.md §20.3, ``nested_autoregressive``
-    with the optional ``pre_embedder`` extension): an OUTER ``talker`` AR loop
-    where each frame drives an INNER ``code_predictor`` AR loop of
-    ``num_code_groups`` steps (seeded by the talker's ``last_hidden_state``).
-    Unlike the plain nested shape, the talker is **not** driven by ``input_ids``:
-    each frame its ``inputs_embeds`` is materialized from the previous frame's
-    codes by the ``talker_step_embedder`` pre-embedder (``frame_codes
-    [+ text_embed] -> inputs_embeds``), keeping the engine generic.
-
-    When ``prefill_embedder_filename`` is set (the default), a
-    ``talker_prefill_embedder`` prompt-phase component is also emitted. It maps
-    the tokenized prompt ``text_ids -> prefill_embeds + trailing_text_embeds``:
-    the runtime feeds ``prefill_embeds`` to the talker on frame 0 and threads
-    ``trailing_text_embeds[:, k-1, :]`` as the pre-embedder's ``text_embed`` on
-    frames k>=1 (see the ``prefill_embedder`` field). Pass ``None`` to emit the
-    prefill-less shape (talker frame 0 + ``text_embed`` fed zeros).
-
-    The engine-driven components are emitted (``talker``, ``code_predictor``,
-    ``talker_step_embedder``, and ``talker_prefill_embedder`` when present). The
-    package's ``embedding`` and optional ``speaker_encoder`` models are internal
-    weight sources already folded into the pre-/prefill-embedders, so they are
-    not declared as pipeline models. There is **no in-package vocoder** — the
-    assembled ``talker.output_codes`` are decoded by a separate codec model.
-
-    Args:
-        num_code_groups: Codes collected per outer frame (RVQ residual count).
-        max_frames: Maximum number of outer talker frames to generate.
-        talker_filename: Outer decoder (talker) ONNX filename.
-        code_predictor_filename: Inner decoder ONNX filename.
-        pre_embedder_filename: ``talker_step_embedder`` ONNX filename.
-        prefill_embedder_filename: ``talker_prefill_embedder`` ONNX filename, or
-            ``None`` to omit the prefill/trailing-text path.
-        tokenizer_filename: Tokenizer filename used by the talker.
-        decoder_metadata: Optional output from
-            :func:`decoder_metadata_from_config`; its decoder capabilities are
-            retained at the document top level.
-
-    Returns:
-        A dict with a top-level ``pipeline`` key and any decoder capabilities.
-    """
-    if num_code_groups < 1:
-        raise ValueError("num_code_groups must be at least 1")
-    if max_frames < 1:
-        raise ValueError("max_frames must be at least 1")
-
-    models: dict[str, Any] = {
-        "talker": {
-            "filename": talker_filename,
-            "type": "decoder",
-            "tokenizer": tokenizer_filename,
-        },
-        "talker_step_embedder": {
-            "filename": pre_embedder_filename,
-            "type": "embedding",
-        },
-        "code_predictor": {
-            "filename": code_predictor_filename,
-            "type": "decoder",
-        },
-    }
-    dataflow: list[dict[str, Any]] = [
-        {
-            "from": "talker_step_embedder.inputs_embeds",
-            "to": "talker.inputs_embeds",
-            "dtype": activation_dtype,
-            "device_transfer": False,
-        },
-        {
-            "from": "talker.last_hidden_state",
-            "to": "code_predictor.inputs_embeds",
-            "dtype": activation_dtype,
-            "device_transfer": False,
-        },
-    ]
-    stage_strategy: dict[str, Any] = {
-        "kind": "nested_autoregressive",
-        "outer": "talker",
-        "inner": "code_predictor",
-        "inner_embedding_output": inner_embedding_output,
-        "pre_embedder": {
-            "component": "talker_step_embedder",
-            "frame_codes_input": "frame_codes",
-            "text_embed_input": "text_embed",
-        },
-        "num_code_groups": num_code_groups,
-        "max_tokens": max_frames,
-    }
-    phases: dict[str, Any] = {
-        "talker": {"run_on": "every_step"},
-        "talker_step_embedder": {"run_on": "on_demand"},
-        "code_predictor": {"run_on": "every_step"},
-    }
-
-    if prefill_embedder_filename is not None:
-        models["talker_prefill_embedder"] = {
-            "filename": prefill_embedder_filename,
-            "type": "embedding",
-        }
-        # Runs once in the prompt phase; the runtime seeds the declared
-        # `prompt_input` with the tokenized prompt and reads the two named
-        # outputs from the pool. Every port is declared explicitly (the engine
-        # never guesses tensor names).
-        stage_strategy["prefill_embedder"] = {
-            "component": "talker_prefill_embedder",
-            "prompt_input": "text_ids",
-            "prefill_output": "prefill_embeds",
-            "trailing_output": "trailing_text_embeds",
-        }
-        phases["talker_prefill_embedder"] = {"run_on": "prompt_only"}
-
-    metadata = dict(decoder_metadata or {})
-    metadata["pipeline"] = {
-        "models": models,
-        "dataflow": dataflow,
-        "strategy": {
-            "kind": "composite",
-            "stages": [
-                {
-                    "name": "generate_codes",
-                    "strategy": stage_strategy,
-                    "run_on": "every_step",
-                },
-            ],
-        },
-        "phases": phases,
-    }
-    return metadata
-
-
-def write_tts_pipeline_metadata(
-    directory: str,
-    *,
-    filename: str = "inference_metadata.yaml",
-    **kwargs: Any,
-) -> str:
-    """Build and write pre-embedder-driven TTS metadata into ``directory``."""
-    metadata = build_tts_pipeline_metadata(**kwargs)
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, filename)
-    with open(path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(metadata, handle, sort_keys=False)
-    return path
-
-
 def write_diffusion_pipeline_metadata(
     directory: str,
     *,
@@ -2526,12 +3271,200 @@ def write_diffusion_pipeline_metadata(
 ) -> str:
     """Build and write ``inference_metadata.yaml`` into ``directory``.
 
+    The generated sampler policy components (solver, schedule constants,
+    lookup, guidance, clamp) are saved alongside it, because the emitted
+    workflow references them as ONNX artifacts.
+
     Extra keyword arguments are forwarded to
     :func:`build_diffusion_pipeline_metadata`. Returns the written path.
     """
-    metadata = build_diffusion_pipeline_metadata(**kwargs)
+    from mobius._model_package import ModelPackage
+
+    package = ModelPackage({})
+    metadata = build_diffusion_pipeline_metadata(package=package, **kwargs)
     os.makedirs(directory, exist_ok=True)
+    package.save_policy_components(directory)
     path = os.path.join(directory, filename)
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(metadata, handle, sort_keys=False)
     return path
+
+
+#: ``SpeculativeContract.port_bindings`` role for the proposer input port that
+#: receives the target's per-token hidden state.
+_TARGET_HIDDEN_CONTEXT_ROLE = "target_hidden_context"
+
+#: Port roles the Qwen3.5/3.8 MTP sidecar exposes. The graph is authoritative
+#: for which ports exist and their contracts; only what a port *means* is
+#: declared here (see ``workflow_metadata._component``).
+_MTP_PROPOSER_PORT_ROLES: dict[str, str] = {
+    "inputs_embeds": "inputs_embeds",
+    "hidden_states": "hidden_states",
+    "attention_mask": "attention_mask",
+    "position_ids": "position_ids",
+    "mtp_hidden": "hidden_states",
+}
+
+
+def _speculative_target_candidates(workflow: dict[str, Any], exclude: str) -> list[str]:
+    """Workflow components that can verify a speculative proposal.
+
+    A verifier scores the next token, so it is selected by its declared
+    ``logits`` output role. Selecting on ``implementation.kind == "onnx"`` would
+    not narrow anything: the generated policy graphs a workflow ships (sampler,
+    termination predicate, state updates) are ONNX components too, and a real
+    decoder package declares about a dozen of them.
+    """
+    return [
+        name
+        for name, declaration in (workflow.get("components") or {}).items()
+        if name != exclude
+        and isinstance(declaration, dict)
+        and declaration.get("implementation", {}).get("kind") == "onnx"
+        and "logits" in (declaration.get("ports", {}).get("roles") or {}).values()
+    ]
+
+
+def write_mtp_speculator_metadata(
+    directory: str,
+    *,
+    backbone_config: Any | None = None,
+    filename: str = "inference_metadata.yaml",
+    model_path: str = "mtp/model.onnx",
+    num_speculative_tokens: int = 1,
+    embedding_weights: str = "model.embed_tokens.weight",
+    lm_head_weights: str = "lm_head.weight",
+    proposer_name: str = "mtp",
+) -> str | None:
+    """Declare the exported MTP head as the backbone's speculative proposer.
+
+    The Qwen3.5/3.8 MTP head is a self-speculative drafter saved next to the
+    backbone (``mtp/model.onnx``). It borrows the target's shared embedding /
+    LM head and is seeded by the backbone's final-layer hidden state.
+
+    ``SpeculativeContract`` is expressed in terms of the workflow — ``proposer``
+    and ``target`` are component names, ``rollback_state`` names state cells —
+    so this writer also registers the head as a workflow component and completes
+    the rollback capabilities the claim depends on. Notably:
+
+    - ``proposal_execution: block``, not ``chained``: a chained proposer must
+      expose a ``logits_output``, and this sidecar emits only ``mtp_hidden``.
+      The runtime obtains draft logits by decoding it through the target's LM
+      head, which is why that initializer is listed in ``shared_weights``.
+    - ``port_bindings.target_hidden_context`` names the proposer input port the
+      target's hidden state lands in; its source is declared as a
+      ``hidden_states`` port role on the target component.
+    - ``vocabulary: identical`` — sharing the target's LM head means scoring the
+      target's own vocabulary axis.
+
+    The backbone ``inference_metadata.yaml`` must already exist and declare a
+    ``pipeline.workflow`` to anchor against. Returns the metadata path, or
+    ``None`` when the file is missing.
+    """
+    if num_speculative_tokens < 1:
+        raise ValueError("num_speculative_tokens must be >= 1")
+    path = os.path.join(directory, filename)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        metadata = yaml.safe_load(handle) or {}
+
+    workflow = metadata.get("pipeline", {}).get("workflow")
+    if not isinstance(workflow, dict) or not workflow.get("components"):
+        raise ValueError(
+            "Cannot declare an MTP speculator: the backbone "
+            f"{filename!r} has no pipeline.workflow components. Why: a "
+            "SpeculativeContract names its proposer and target as workflow "
+            "components, so there is nothing to anchor the claim to. How to "
+            "fix: write the backbone workflow metadata (write_onnx_genai_config) "
+            "before attaching the MTP head."
+        )
+    candidates = _speculative_target_candidates(workflow, exclude=proposer_name)
+    if len(candidates) != 1:
+        raise ValueError(
+            "Cannot declare an MTP speculator: expected exactly one workflow "
+            "component declaring a 'logits' output role to verify proposals, found "
+            f"{sorted(candidates)}. Why: the speculative target must be unambiguous. "
+            "How to fix: pass a backbone package whose workflow declares a single "
+            "decoder component."
+        )
+    target_name = candidates[0]
+
+    # The head borrows the target's embedding + LM head, which live as
+    # initializers in the backbone ``model.onnx`` (borrowed, not duplicated).
+    shared_weights = sorted({embedding_weights, lm_head_weights})
+
+    components = workflow["components"]
+    components[proposer_name] = {
+        "implementation": {"kind": "onnx", "artifact": model_path},
+        "ports": {"roles": dict(_MTP_PROPOSER_PORT_ROLES)},
+    }
+    # Name the target output the head is seeded from. The backbone exposes its
+    # final-layer hidden state as ``hidden_states.<N-1>``; the role, not the
+    # spelling, is what the runtime resolves.
+    num_layers = getattr(backbone_config, "num_hidden_layers", None)
+    if num_layers is not None:
+        target_roles = components[target_name].setdefault("ports", {}).setdefault("roles", {})
+        target_roles[f"hidden_states.{int(num_layers) - 1}"] = "hidden_states"
+
+    # A rejected proposal must rewind every state cell the target advances.
+    rollback_cells = sorted(
+        cell
+        for cell, declaration in (workflow.get("state") or {}).items()
+        if isinstance(declaration, dict) and declaration.get("service_group")
+    )
+    _declare_rollback_capacity(workflow, rollback_cells, int(num_speculative_tokens))
+
+    metadata["speculative"] = {
+        "proposer": proposer_name,
+        "target": target_name,
+        # One invocation yields the whole k-token proposal.
+        "proposal_execution": {"kind": "block"},
+        "port_bindings": {_TARGET_HIDDEN_CONTEXT_ROLE: "hidden_states"},
+        "shared_weights": shared_weights,
+        # The head scores the target's own vocabulary through the shared LM head.
+        "vocabulary": {"kind": "identical"},
+        "max_proposal_width": int(num_speculative_tokens),
+        # Standard rejection sampling against the target keeps the target's
+        # output distribution exact.
+        "distribution_preserving": True,
+        **({"rollback_state": rollback_cells} if rollback_cells else {}),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(metadata, handle, sort_keys=False)
+    return path
+
+
+def _declare_rollback_capacity(
+    workflow: dict[str, Any],
+    cells: Sequence[str],
+    positions: int,
+) -> None:
+    """Guarantee every group reached by ``cells`` can rewind ``positions``.
+
+    A package is rejected when a rolled-back cell resolves to a group declaring
+    no ``rollback_positions``, or fewer than the maximum proposal width.
+    Attaching the speculator creates that requirement, so it also states the
+    bound.
+    """
+    groups = (workflow.get("serving") or {}).get("state_service", {}).get("groups", {})
+    state = workflow.get("state") or {}
+    pending = [
+        state[cell]["service_group"]
+        for cell in cells
+        if isinstance(state.get(cell), dict) and state[cell].get("service_group")
+    ]
+    seen: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        contract = groups.get(name)
+        if not isinstance(contract, dict):
+            continue
+        capabilities = contract.setdefault("capabilities", {})
+        declared = capabilities.get("rollback_positions")
+        if not isinstance(declared, int) or declared < positions:
+            capabilities["rollback_positions"] = positions
+        pending.extend(capabilities.get("cascade") or [])

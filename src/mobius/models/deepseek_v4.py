@@ -17,25 +17,77 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
+from mobius._build_context import ep_capabilities, get_build_dtype
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import (
+    pack_qmoe_expert_weights,
+    stack_per_expert_moe_weights,
+    supported_qmoe_quantization,
+)
 from mobius.components import (
     Embedding,
     Linear,
+    MoELayer,
     QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
 )
+from mobius.components._moe import _scatter_selected_to_full
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
 logger = logging.getLogger(__name__)
+
+
+def _use_fused_gqa() -> bool:
+    """Whether the active EP/build dtype supports direct ``GroupQueryAttention`` emission.
+
+    Mirrors ``TextModel.forward``'s ``use_gqa`` gate (``mobius/models/base.py``):
+    the active EP must declare GQA support for the current build dtype via
+    :func:`~mobius._build_context.ep_capabilities`. Unlike that generic path,
+    V4 always applies RoPE explicitly in-graph (``do_rotary=0``), so this
+    doesn't also need to check ``caps.supports_fused_rope`` -- V4's fused path
+    never asks ``GroupQueryAttention`` to rotate internally.
+
+    EPs such as ``"default"``, ``"onnx-standard"``, ``"qnn"``, and
+    ``"openvino"`` declare an empty ``gqa_dtypes`` specifically so their
+    exported graphs stay free of ``com.microsoft`` ops; V4 must fall back to
+    the portable decomposed attention path for those, exactly like every
+    other model in this codebase.
+    """
+    caps = ep_capabilities()
+    return get_build_dtype() in caps.gqa_dtypes
+
+
+def _gqa_kv_lengths(op: OpBuilder, attention_mask: ir.Value) -> tuple[ir.Value, ir.Value]:
+    """Derive ``GroupQueryAttention``'s required ``seqlens_k``/``total_sequence_length``.
+
+    Same formula ``TextModel`` uses to build a ``GQAContext``
+    (``mobius/models/base.py``): ``seqlens_k[b] = sum(attention_mask[b]) - 1``
+    (last valid KV index per batch entry) and
+    ``total_seq_len = attention_mask.shape[1]`` (past + current length).
+    Computed directly here (rather than via ``GQAContext``, which also
+    bundles ``cos_cache``/``sin_cache`` for the fused-rotary ``do_rotary=1``
+    path that V4 does not use -- RoPE is applied explicitly in-graph).
+    """
+    one_i32 = op.Constant(value_int=1)
+    seqlens_k = op.Cast(
+        op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i32),
+        to=ir.DataType.INT32,
+    )
+    total_seq_len = op.Cast(
+        op.Gather(op.Shape(attention_mask), 1),
+        to=ir.DataType.INT32,
+    )
+    return seqlens_k, total_seq_len
 
 
 def _projection_class(config: ArchitectureConfig):
@@ -123,6 +175,32 @@ class DeepSeekV4DeferredNorm(nn.Module):
         return _shape_anchor(op, [self.weight])
 
 
+def _validate_hash_routing_tables(state_dict: dict[str, torch.Tensor]) -> None:
+    """Fail fast if a hash-routing table names a duplicate expert for a token.
+
+    ``_scatter_selected_to_full`` (used by ``DeepSeekV4Gate.qmoe_routing`` to
+    drive QMoE) requires ``top_k`` *distinct* experts per token:
+    ``ScatterElements`` overwrites rather than accumulates duplicate indices,
+    so a repeated expert would silently drop one of its contributions instead
+    of raising an error. Real hash tables have no reason to route a token to
+    the same expert twice, but this checks the actual checkpoint data rather
+    than relying on that assumption alone.
+    """
+    for key, table in state_dict.items():
+        if not key.endswith(".mlp.moe.gate.tid2eid") or table.shape[-1] <= 1:
+            continue
+        sorted_table, _ = torch.sort(table, dim=-1)
+        duplicate_rows = torch.any(sorted_table[..., 1:] == sorted_table[..., :-1], dim=-1)
+        if duplicate_rows.any():
+            bad_tokens = torch.nonzero(duplicate_rows, as_tuple=False).flatten()[:5].tolist()
+            raise ValueError(
+                f"{key} routes token id(s) {bad_tokens} (showing up to 5 of "
+                f"{int(duplicate_rows.sum())}) to a duplicate expert; QMoE "
+                "export requires top_k distinct experts per token (see "
+                "mobius.components._moe._scatter_selected_to_full)."
+            )
+
+
 class DeepSeekV4Gate(nn.Module):
     """V4 sqrt-softplus router with hash routing for the first layers."""
 
@@ -183,6 +261,42 @@ class DeepSeekV4Gate(nn.Module):
             routing_weights = op.Mul(routing_weights, self.route_scale)
         return routing_weights, selected_experts
 
+    def qmoe_routing(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        input_ids: ir.Value,
+    ):
+        """Adapt the already-selected (routing_weights, selected_experts) pair for QMoE.
+
+        This does not alter their computation.
+
+        Hash routing (``tid2eid``) is not expressible as "top-k of a
+        per-expert score" (QMoE's only selection ABI), so this reuses
+        ``forward()`` verbatim -- covering both hash and learned top-k
+        routing identically -- and scatters its output into the
+        full-``num_experts``-width tensors QMoE requires. See
+        ``_scatter_selected_to_full`` for why this preserves the exact
+        selection and weights, and for why -- like V3's ``DeepSeekMoEGate``
+        -- this path is CPU-EP-correct only: CUDA QMoE ignores the gathered
+        ``router_weights`` this adapter relies on (learned layers select via
+        ``scores + bias`` but weight by ``scores`` alone, so raw-logit
+        passthrough can't make CUDA's forced internal recompute agree either).
+        """
+        routing_weights, selected_experts = self.forward(op, hidden_states, input_ids)
+        # QMoE's router_probs/router_weights share type constraint "T" with
+        # hidden_states; routing_weights is computed in float32 (matching the
+        # reference sqrt-softplus/softmax/sigmoid scoring), so cast back
+        # before scattering.
+        routing_weights = op.CastLike(routing_weights, hidden_states)
+        router_probs, router_weights = _scatter_selected_to_full(
+            op, routing_weights, selected_experts, self.num_experts
+        )
+        # route_scale (and, for non-softmax scoring, weight_sum renormalization)
+        # is already folded into routing_weights above, so QMoE must not
+        # renormalize or rescale again.
+        return router_probs, router_weights, False, 1.0
+
 
 class _DeepSeekV4Expert(nn.Module):
     def __init__(self, config: ArchitectureConfig, intermediate_size: int):
@@ -207,12 +321,22 @@ class DeepSeekV4MoE(nn.Module):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        self.gate = DeepSeekV4Gate(config, layer_id)
-        self.experts = nn.ModuleList(
-            [
-                _DeepSeekV4Expert(config, config.moe_intermediate_size)
-                for _ in range(config.num_local_experts)
-            ]
+        gate = DeepSeekV4Gate(config, layer_id)
+        # QMoE's clipped-SwiGLU maps exactly onto _DeepSeekV4Expert's
+        # activation (plain SiLU: alpha=1.0, beta=0.0). config.swiglu_limit<=0
+        # means "no clipping" in _DeepSeekV4Expert.forward, but QMoE treats
+        # swiglu_limit=0.0 as "clip to zero" -- math.inf is required to
+        # disable clipping at the op level.
+        swiglu_limit = config.swiglu_limit if config.swiglu_limit > 0 else math.inf
+        self.moe = MoELayer(
+            config,
+            gate=gate,
+            expert_factory=lambda expert_config, _linear_class: _DeepSeekV4Expert(
+                expert_config, expert_config.intermediate_size
+            ),
+            activation_alpha=1.0,
+            activation_beta=0.0,
+            swiglu_limit=swiglu_limit,
         )
         shared_size = config.moe_intermediate_size * (config.n_shared_experts or 1)
         self.shared_experts = _DeepSeekV4Expert(config, shared_size)
@@ -223,19 +347,8 @@ class DeepSeekV4MoE(nn.Module):
         hidden_states: ir.Value,
         input_ids: ir.Value,
     ):
-        routing_weights, selected_experts = self.gate(op, hidden_states, input_ids)
-        result = None
-        for expert_idx, expert in enumerate(self.experts):
-            expert_output = expert(op, hidden_states)
-            match = op.Equal(selected_experts, op.Constant(value_int=expert_idx))
-            weight = op.ReduceSum(
-                op.Mul(routing_weights, op.CastLike(match, routing_weights)),
-                [-1],
-                keepdims=True,
-            )
-            contribution = op.Mul(expert_output, weight)
-            result = contribution if result is None else op.Add(result, contribution)
-        return op.Add(result, self.shared_experts(op, hidden_states))
+        moe_output = self.moe(op, hidden_states, input_ids)
+        return op.Add(moe_output, self.shared_experts(op, hidden_states))
 
 
 class DeepSeekV4CompressorTensors(nn.Module):
@@ -330,6 +443,20 @@ class DeepSeekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
         self.rope_interleave = config.rope_interleave
+        # Official reference (`inference/model.py::Attention.forward`,
+        # `get_window_topk_idxs`) unconditionally restricts every layer -
+        # regardless of `compress_ratio` - to a circular-buffer local window
+        # of `config.sliding_window` (DeepSeek-V4-Flash: 128) most-recent
+        # positions; ratio>0 layers additionally union in compressed/indexed
+        # positions (not modeled here, see `DeepSeekV4CompressorTensors`/
+        # `DeepSeekV4IndexerTensors`), but the window restriction itself
+        # applies to every layer, not just ratio-0. `-1` is GQA's documented
+        # sentinel for "no local window" (matches `_gqa_local_window_size` in
+        # `models/base.py`), used only if the config genuinely has no window.
+        sliding_window = config.sliding_window
+        self.local_window_size = (
+            int(sliding_window) if sliding_window and sliding_window > 0 else -1
+        )
         ratios = config.compress_ratios or []
         self.compress_ratio = ratios[layer_id] if layer_id < len(ratios) else 0
         if self.compress_ratio not in (0, 4, 128):
@@ -377,6 +504,13 @@ class DeepSeekV4Attention(nn.Module):
         batch: ir.Value,
         sequence_length: ir.Value,
     ) -> ir.Value:
+        """Broadcast the single MQA key/value head across all query heads.
+
+        Only used by the portable decomposed path below (EPs whose
+        ``gqa_dtypes`` is empty). The fused ``GroupQueryAttention`` path does
+        this broadcast internally via its own ``kv_num_heads=1`` handling, so
+        it never calls this helper.
+        """
         value = op.Unsqueeze(value, [2])
         value = op.Expand(
             value,
@@ -403,9 +537,11 @@ class DeepSeekV4Attention(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        attention_bias: ir.Value,
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
+        attention_bias: ir.Value | None = None,
+        seqlens_k: ir.Value | None = None,
+        total_seq_len: ir.Value | None = None,
     ):
         query = self.q_b_proj(op, self.q_a_layernorm(op, self.q_a_proj(op, hidden_states)))
         query_4d = op.Reshape(query, [0, 0, self.num_heads, self.head_dim])
@@ -420,40 +556,112 @@ class DeepSeekV4Attention(nn.Module):
 
         kv = self.kv_layernorm(op, self.kv_proj(op, hidden_states))
         kv = self._rotate(op, kv, position_embeddings, 1)
-        batch = op.Shape(query, start=0, end=1)
-        query_length = op.Shape(query, start=1, end=2)
-        query = op.Transpose(
-            op.Reshape(query, [0, 0, self.num_heads, self.head_dim]),
-            perm=[0, 2, 1, 3],
-        )
-        key = op.Transpose(op.Reshape(kv, [0, 0, 1, self.head_dim]), perm=[0, 2, 1, 3])
-        value = key
-        if past_key_value is not None:
-            key = op.Concat(past_key_value[0], key, axis=2)
-            value = op.Concat(past_key_value[1], value, axis=2)
-        present_key, present_value = key, value
 
-        kv_length = op.Shape(key, start=2, end=3)
-        key = self._expand_kv(op, key, batch, kv_length)
-        value = self._expand_kv(op, value, batch, kv_length)
-        scores = op.Mul(
-            op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2])),
-            self.scale,
-        )
-        scores = op.Add(scores, attention_bias)
-        sinks = op.Expand(
-            op.Reshape(
-                op.CastLike(self.attn_sink, scores),
-                [1, self.num_heads, 1, 1],
-            ),
-            op.Concat(batch, [self.num_heads], query_length, [1], axis=0),
-        )
-        probabilities = op.Softmax(op.Concat(scores, sinks, axis=-1), axis=-1)
-        probabilities = op.Slice(probabilities, [0], [-1], [3])
-        output = op.Reshape(
-            op.Transpose(op.MatMul(probabilities, value), perm=[0, 2, 1, 3]),
-            [0, 0, -1],
-        )
+        if seqlens_k is not None:
+            # Fused causal attention core, used only when the active EP's
+            # `ep_capabilities().gqa_dtypes` includes the build dtype (see
+            # `_use_fused_gqa`). `query`/`kv` are already RoPE-rotated
+            # (trailing rope slice only, applied explicitly above via
+            # `_rotate`, the same convention V2/V3 MLA uses with the plain
+            # `Attention` op), so `GroupQueryAttention` only needs
+            # `do_rotary=0` (its default): cos_cache/sin_cache/position_ids
+            # stay unset. V4 is MQA (`kv_num_heads=1`): key and value are
+            # literally the same rotated `kv` tensor -- broadcasting
+            # `kv_num_heads=1` across all query heads is the fused op's own
+            # job, so `_expand_kv` isn't needed on this path. No explicit
+            # `attention_bias` is passed: causal + padding is carried by
+            # `seqlens_k`/`total_seq_len` (no KV-sharing across layers, no
+            # per-layer dual head_dim), same as the "direct GQA" convention
+            # `Attention._forward_gqa` (mobius/components/_attention.py)
+            # already uses for every other simple-causal model in this
+            # codebase (see the `attention-optimization` skill: "Use Contrib
+            # GQA when you don't need attention bias"). The official
+            # reference (`inference/model.py::Attention.forward`,
+            # `get_window_topk_idxs`) unconditionally restricts every layer
+            # to the most recent `local_window_size` positions -- this is
+            # NOT optional/ratio-dependent -- so `local_window_size` is
+            # passed as a first-class GQA attribute (`-1` sentinel when the
+            # config declares no window) instead of baking it into an
+            # explicit float bias as the decomposed path below does via
+            # `create_attention_bias(sliding_window=...)`. `head_sink`
+            # carries the learned per-head attention sink exactly as the
+            # decomposed path's `Concat(scores, sinks) -> Softmax -> slice`
+            # sequence does, now as a first-class op input instead of a
+            # manually broadcast Concat.
+            past_key = past_key_value[0] if past_key_value is not None else None
+            past_value = past_key_value[1] if past_key_value is not None else None
+            gqa_attrs: dict = {
+                "num_heads": self.num_heads,
+                "kv_num_heads": 1,
+                "scale": self.scale,
+            }
+            # Match the shared `Attention._forward_gqa` convention (see
+            # `mobius/components/_attention.py`): only emit the attribute
+            # when a window is actually configured, so a model with no
+            # window (local_window_size == -1) keeps a graph identical to
+            # before this attribute existed.
+            if self.local_window_size > 0:
+                gqa_attrs["local_window_size"] = self.local_window_size
+            output, present_key, present_value = op.GroupQueryAttention(
+                query,
+                kv,
+                kv,
+                past_key,
+                past_value,
+                seqlens_k,
+                total_seq_len,
+                None,  # cos_cache: unused, RoPE already applied above
+                None,  # sin_cache: unused, RoPE already applied above
+                None,  # position_ids: unused, do_rotary=0
+                None,  # attention_bias: unused, plain causal + seqlens_k suffices
+                op.CastLike(self.attn_sink, query),  # head_sink
+                _domain="com.microsoft",
+                _outputs=3,
+                **gqa_attrs,
+            )
+        else:
+            # Portable decomposed path: used whenever the active EP declares
+            # no GQA support for the build dtype (e.g. `"default"`,
+            # `"onnx-standard"`, `"qnn"`, `"openvino"` -- see
+            # `_use_fused_gqa`). Manually replicates the exact same
+            # sink-aware dense causal attention using only standard ONNX
+            # ops, so these EPs' exported graphs stay free of
+            # `com.microsoft` custom ops.
+            batch = op.Shape(query, start=0, end=1)
+            query_length = op.Shape(query, start=1, end=2)
+            query = op.Transpose(
+                op.Reshape(query, [0, 0, self.num_heads, self.head_dim]),
+                perm=[0, 2, 1, 3],
+            )
+            key = op.Transpose(op.Reshape(kv, [0, 0, 1, self.head_dim]), perm=[0, 2, 1, 3])
+            value = key
+            if past_key_value is not None:
+                key = op.Concat(past_key_value[0], key, axis=2)
+                value = op.Concat(past_key_value[1], value, axis=2)
+            present_key, present_value = key, value
+
+            kv_length = op.Shape(key, start=2, end=3)
+            key = self._expand_kv(op, key, batch, kv_length)
+            value = self._expand_kv(op, value, batch, kv_length)
+            scores = op.Mul(
+                op.MatMul(query, op.Transpose(key, perm=[0, 1, 3, 2])),
+                self.scale,
+            )
+            scores = op.Add(scores, attention_bias)
+            sinks = op.Expand(
+                op.Reshape(
+                    op.CastLike(self.attn_sink, scores),
+                    [1, self.num_heads, 1, 1],
+                ),
+                op.Concat(batch, [self.num_heads], query_length, [1], axis=0),
+            )
+            probabilities = op.Softmax(op.Concat(scores, sinks, axis=-1), axis=-1)
+            probabilities = op.Slice(probabilities, [0], [-1], [3])
+            output = op.Reshape(
+                op.Transpose(op.MatMul(probabilities, value), perm=[0, 2, 1, 3]),
+                [0, 0, -1],
+            )
+
         output = self._rotate(op, output, position_embeddings, self.num_heads, inverse=True)
 
         if self.compressor is not None:
@@ -561,9 +769,11 @@ class DeepSeekV4DecoderLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         input_ids: ir.Value,
-        attention_bias: ir.Value,
         position_embeddings: tuple,
         past_key_value: tuple | None = None,
+        attention_bias: ir.Value | None = None,
+        seqlens_k: ir.Value | None = None,
+        total_seq_len: ir.Value | None = None,
     ):
         residual = hidden_states
         value, post, comb = self._hc_pre(
@@ -576,9 +786,11 @@ class DeepSeekV4DecoderLayer(nn.Module):
         value, present = self.self_attn(
             op,
             self.input_layernorm(op, value),
-            attention_bias,
             position_embeddings,
             past_key_value,
+            attention_bias,
+            seqlens_k,
+            total_seq_len,
         )
         hidden_states = self._hc_post(op, value, residual, post, comb)
 
@@ -639,6 +851,10 @@ class DeepSeekV4TextModel(nn.Module):
             )
         )
         self._dtype = config.dtype
+        # See `DeepSeekV4Attention.local_window_size`: the reference always
+        # restricts attention to this window, so the decomposed path's
+        # shared bias (built once here for every layer) must bake it in too.
+        self.sliding_window = config.sliding_window
 
     def _hc_head(self, op, states):
         flat = op.Reshape(states, [0, 0, -1])
@@ -673,12 +889,18 @@ class DeepSeekV4TextModel(nn.Module):
         )
         position_embeddings = self.rotary_emb(op, position_ids)
         compressed_position_embeddings = self.compressed_rotary_emb(op, position_ids)
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=hidden_states if input_ids is None else input_ids,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
-        )
+        if _use_fused_gqa():
+            attention_bias = None
+            seqlens_k, total_seq_len = _gqa_kv_lengths(op, attention_mask)
+        else:
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=hidden_states if input_ids is None else input_ids,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                dtype=self._dtype,
+            )
+            seqlens_k, total_seq_len = None, None
         presents = []
         past_kvs = past_key_values or [None] * len(self.layers)
         for layer, past_kv in zip(self.layers, past_kvs):
@@ -691,9 +913,11 @@ class DeepSeekV4TextModel(nn.Module):
                 op,
                 hidden_states,
                 input_ids,
-                attention_bias,
                 layer_position_embeddings,
                 past_kv,
+                attention_bias,
+                seqlens_k,
+                total_seq_len,
             )
             presents.append(present)
         return self.norm(op, self._hc_head(op, hidden_states)), presents, hidden_states
@@ -726,6 +950,10 @@ class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
         )
         self.rotary_emb = initialize_rope(rope_config)
         self._dtype = config.dtype
+        # See `DeepSeekV4Attention.local_window_size`: the MTP layer is a
+        # regular ratio-0 (or configured-ratio) DeepSeekV4DecoderLayer, so it
+        # is bound by the same mandatory window as the backbone.
+        self.sliding_window = config.sliding_window
 
     def _hc_head(self, op: OpBuilder, states: ir.Value) -> ir.Value:
         flat = op.Reshape(states, [0, 0, -1])
@@ -751,19 +979,27 @@ class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
             self.h_proj(op, self.hnorm(op, hidden_states)),
         )
         position_embeddings = self.rotary_emb(op, position_ids)
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=inputs_embeds,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
-        )
+        if _use_fused_gqa():
+            attention_bias = None
+            seqlens_k, total_seq_len = _gqa_kv_lengths(op, attention_mask)
+        else:
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=inputs_embeds,
+                attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
+                dtype=self._dtype,
+            )
+            seqlens_k, total_seq_len = None, None
         hidden_states, present = super().forward(
             op,
             hidden_states,
             None,
-            attention_bias,
             position_embeddings,
             past_key_value,
+            attention_bias,
+            seqlens_k,
+            total_seq_len,
         )
         return self.norm(op, self._hc_head(op, hidden_states)), present
 
@@ -819,6 +1055,9 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Map the official DeepSeek checkpoint names to mobius modules."""
+        # Same predicate as MoELayer/_supported_qmoe_quantization so the
+        # repacked weights and the emitted graph never disagree.
+        use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None
         renamed: dict[str, torch.Tensor] = {}
         skipped = 0
         for key, value in state_dict.items():
@@ -860,7 +1099,9 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 new_key = new_key.replace(".attn.", ".self_attn.")
                 new_key = new_key.replace(".attn_norm.", ".input_layernorm.")
                 new_key = new_key.replace(".ffn_norm.", ".post_attention_layernorm.")
-                new_key = new_key.replace(".ffn.gate.", ".mlp.gate.")
+                # DeepSeekV4MoE composes the shared MoELayer, so the gate
+                # lives at mlp.moe.gate.* (see DeepSeekV4MoE.__init__).
+                new_key = new_key.replace(".ffn.gate.", ".mlp.moe.gate.")
                 new_key = new_key.replace(".ffn.experts.", ".mlp.experts.")
                 new_key = new_key.replace(".ffn.shared_experts.", ".mlp.shared_experts.")
                 new_key = new_key.replace(".w1.", ".gate_proj.")
@@ -868,6 +1109,13 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 new_key = new_key.replace(".w3.", ".up_proj.")
                 if ".hc_" in new_key and new_key.endswith("_fn"):
                     new_key = f"{new_key}.weight"
+                # Dense fallback (unquantized or non-QMoE-eligible): experts
+                # are a plain ModuleList under moe.experts.{i}.*. Skipped for
+                # the QMoE path -- stack_per_expert_moe_weights below expects
+                # this same per-index ".mlp.experts.{i}.*" layout as input,
+                # fusing it into the tensors pack_qmoe_expert_weights expects.
+                if not use_qmoe:
+                    new_key = new_key.replace(".mlp.experts.", ".mlp.moe.experts.")
             renamed[new_key] = value
         if skipped:
             logger.warning(
@@ -875,4 +1123,13 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 "num_nextn_predict_layers.",
                 skipped,
             )
-        return super().preprocess_weights(renamed)
+        processed = super().preprocess_weights(renamed)
+        if use_qmoe:
+            _validate_hash_routing_tables(processed)
+            # DeepSeek-V4 checkpoints store routed experts per-index
+            # (".mlp.experts.{i}.gate_proj/up_proj/down_proj.*"), unlike
+            # DeepSeek-V3's already-fused HF format. Bridge to the fused
+            # expert-major layout pack_qmoe_expert_weights expects.
+            processed = stack_per_expert_moe_weights(processed, qmoe_target_path=".mlp")
+            processed = pack_qmoe_expert_weights(processed)
+        return processed

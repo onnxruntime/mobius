@@ -5,6 +5,18 @@ from __future__ import annotations
 
 __all__ = [
     "ArchitectureConfig",
+    "AdapterApplication",
+    "AdapterArtifact",
+    "AdapterBatchSelection",
+    "AdapterSlotSelection",
+    "AdapterSelectionTensors",
+    "AdapterServiceOptions",
+    "AdapterSource",
+    "AdapterTarget",
+    "AdapterTargetDescriptor",
+    "AdapterTargetManifest",
+    "AdapterTargetSlice",
+    "AdapterWeights",
     "AudioConfig",
     "BaseModelConfig",
     "CausalLMConfig",
@@ -38,15 +50,21 @@ __all__ = [
     "WorldModelTask",
     "YolosConfig",
     "apply_weights",
+    "adapter_source_from_onnx_adapter",
+    "attach_peft_adapter",
     "build",
     "build_context",
     "build_diffusers_pipeline",
     "build_from_gguf",
     "build_from_module",
     "build_from_nemo",
+    "compose_adapter_deltas",
     "components",
     "ep_capabilities",
     "ep_registry",
+    "fingerprint_model_weights",
+    "load_peft_adapter",
+    "generation",
     "get_build_dtype",
     "get_ep",
     "inspect_components",
@@ -54,12 +72,13 @@ __all__ = [
     "optimize_model",
     "register_ep",
     "registry",
+    "stream_safetensors_to_model",
     "tasks",
 ]
 
 __version__ = "0.1.0"
 
-from mobius import components, models, tasks
+from mobius import components, generation, models, tasks
 from mobius._build_context import build_context, ep_capabilities, get_build_dtype
 from mobius._builder import build_from_module
 from mobius._configs import (
@@ -97,7 +116,28 @@ from mobius._registry import (
     ModelRegistry,
     registry,
 )
-from mobius.integrations._weight_loading import apply_weights
+from mobius.adapter_io import (
+    adapter_source_from_onnx_adapter,
+    attach_peft_adapter,
+    load_peft_adapter,
+)
+from mobius.adapters import (
+    AdapterApplication,
+    AdapterArtifact,
+    AdapterBatchSelection,
+    AdapterSelectionTensors,
+    AdapterServiceOptions,
+    AdapterSlotSelection,
+    AdapterSource,
+    AdapterTarget,
+    AdapterTargetDescriptor,
+    AdapterTargetManifest,
+    AdapterTargetSlice,
+    AdapterWeights,
+    compose_adapter_deltas,
+    fingerprint_model_weights,
+)
+from mobius.integrations._weight_loading import apply_weights, stream_safetensors_to_model
 from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo

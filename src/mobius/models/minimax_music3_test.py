@@ -157,6 +157,24 @@ def test_vocoder_runtime_decodes_stereo_and_upsamples():
     assert np.max(np.abs(output["waveform"])) <= 1.0
 
 
+def test_vocoder_snake_reciprocals_use_float32():
+    config = MiniMaxMusic3VocoderConfig(
+        latent_channels=8,
+        decoder_input_dim=16,
+        decoder_hidden_dim=32,
+        upsampling_ratios=(2,),
+        dtype=ir.DataType.FLOAT16,
+    )
+    model = build_from_module(MiniMaxMusic3Vocoder(config), config, "minimax-music3-vocoder")[
+        "model"
+    ]
+    snake_reciprocals = [
+        node for node in model.graph if node.op_type == "Reciprocal" and "snake" in node.name
+    ]
+    assert snake_reciprocals
+    assert all(node.inputs[0].dtype == ir.DataType.FLOAT for node in snake_reciprocals)
+
+
 def test_vocoder_preprocess_folds_checkpoint_weight_norm():
     module = MiniMaxMusic3Vocoder(
         MiniMaxMusic3VocoderConfig(
@@ -233,6 +251,54 @@ def test_language_model_reuses_qwen3_and_exposes_music_pipeline_outputs():
     output_names = {value.name for value in package["model"].graph.outputs}
     assert {"logits", "last_hidden_state"} <= output_names
     assert "model.embed_tokens.weight" in package["embedding"].graph.initializers
+
+
+def test_split_embedding_outputs_match_decoder_dtype():
+    language_config = MiniMaxMusic3LanguageConfig.from_diffusers(
+        {
+            "model_type": "qwen3",
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 32,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {"rope_theta": 1_000_000, "rope_type": "default"},
+            "tie_word_embeddings": False,
+            "hidden_act": "silu",
+        }
+    )
+    language_config.dtype = ir.DataType.FLOAT16
+    language = build_from_module(
+        MiniMaxMusic3LanguageModel(language_config),
+        language_config,
+        "minimax-music3-language",
+    )
+    rvq_config = MiniMaxMusic3RVQConfig(
+        hidden_size=32,
+        num_layers=1,
+        num_attention_heads=4,
+        intermediate_size=64,
+        audio_vocab_size=16,
+        num_codebooks=8,
+        max_position_embeddings=8,
+        dtype=ir.DataType.FLOAT16,
+    )
+    rvq = build_from_module(
+        MiniMaxMusic3RVQDepthDecoder(rvq_config),
+        rvq_config,
+        "minimax-music3-rvq",
+    )
+    for model in (
+        language["embedding"],
+        language["semantic_embedding"],
+        rvq["embedding"],
+        rvq["feedback_embedding"],
+    ):
+        assert model.graph.outputs[0].dtype == ir.DataType.FLOAT16
 
 
 def test_feedback_embedding_contract_uses_exact_offsets_and_scale():

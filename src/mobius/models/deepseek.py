@@ -108,7 +108,21 @@ class DeepSeekMoEGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return distinct expert-selection and aggregation scores for QMoE."""
+        """Return distinct expert-selection and aggregation scores for QMoE.
+
+        CPU-only correctness: selection uses ``scores_for_choice`` (bias
+        for V3, unbiased for V2) but aggregation weights come from the
+        separate, unbiased ``scores`` tensor via QMoE's ``router_weights``
+        input -- honored by CPU QMoE but ignored by CUDA QMoE, which always
+        derives weights by softmax-top-k over ``router_probs``
+        (``scores_for_choice``) itself. There is no ``router_probs``
+        encoding that reproduces the correct (unbiased) weights through
+        CUDA's forced internal recompute. Tracked upstream at
+        https://github.com/microsoft/onnxruntime/pull/31570 (adds CUDA
+        ``router_weights`` support); until that lands, this path is
+        CPU-EP-correct only. See ``_scatter_selected_to_full`` in
+        ``mobius.components._moe`` for the same limitation on DeepSeek-V4.
+        """
         scores, scores_for_choice = self._routing_scores(op, hidden_states)
         # QMoE's router_probs/router_weights inputs share type constraint "T"
         # with hidden_states (see contrib_defs.cc). _routing_scores computes
@@ -301,7 +315,14 @@ class _DeepSeekMoEFFN(nn.Module):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
-        self.moe = MoELayer(config, gate=gate)
+        # ``linear_class`` must reach the routed-expert dense-loop fallback
+        # too (not just the shared expert below): otherwise a quantized
+        # config quantizes every other linear in the model (attention,
+        # dense FFN, shared expert) but silently leaves the routed MoE
+        # experts as plain float `MatMul`, which both loses quantization
+        # and breaks the `fuse_dense_moe_to_qmoe` post-hoc rewrite (it
+        # only matches a quantized `MatMulNBits` dense-fallback pattern).
+        self.moe = MoELayer(config, gate=gate, linear_class=linear_class)
         # Shared expert uses moe_intermediate_size * n_shared_experts
         n_shared = config.n_shared_experts or 1
         shared_intermediate = config.moe_intermediate_size * n_shared

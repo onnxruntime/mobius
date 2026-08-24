@@ -201,8 +201,24 @@ TRT FusedRunner → MEA → Unfused
 
 ### Contrib GroupQueryAttention (`com.microsoft`)
 
-Cascade: XQA → Flash → MEA → Unfused. **Rejects `attention_bias`
-entirely.**
+Cascade: XQA → Flash → MEA → Unfused. **None of the CUDA fused kernels
+(XQA/Flash/MEA) accept `attention_bias`**, so supplying one on CUDA
+forces the Unfused fallback.
+
+> Correction (verified against stock ORT 1.29.0, CPU EP, 2026-08):
+> despite the above, GQA is **not** a blanket-reject op — the CPU EP
+> genuinely computes with both `attention_bias` and `head_sink` when
+> supplied (not silently ignored), confirmed by direct numerical probes
+> against the bundled library. "Rejects `attention_bias` entirely" was
+> inaccurate as a general statement about the op; it only holds for the
+> CUDA fused-kernel cascade below. Separately, onnx-genai's own native
+> CPU+CUDA kernels are a *stricter* subset of what stock ORT supports:
+> historically both rejected `attention_bias`, and only the CUDA kernel
+> implemented `head_sink` (see
+> `crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`,
+> which now also implements `head_sink` on CPU; `attention_bias` remains
+> unimplemented there by design, matching the CUDA fused-kernel
+> limitation above, not an oversight).
 
 | Kernel | Required conditions |
 |--------|---------------------|
@@ -297,8 +313,12 @@ use custom per-layer `GQAContext`s instead.
    `past_key`/`past_value` inputs (so it is prefill-only in the *growing*
    cache mode), but it is used at **every** step in the static-cache mode
    (full cache in the `key`/`value` slots).
-3. **GQA contrib op rejects `attention_bias`** — use standard ONNX
-   `Attention` if you need bias with GQA.
+3. **GQA's CUDA fused kernels reject `attention_bias`** (Unfused CUDA
+   still accepts it, and stock ORT's CPU EP genuinely supports it too —
+   see the correction above) — use standard ONNX `Attention` if you
+   need bias with a CUDA fused GQA kernel, or if targeting onnx-genai's
+   own native kernels (which don't implement `attention_bias` on GQA
+   either, CPU or CUDA).
 4. **SM≥8.0** (Ampere+) required for Flash on all paths.
 5. **Float bias is safer** than bool mask for complex attention patterns.
 6. **MEA requires alignment** — `total_kv % 4 == 0` for bias tensors.
