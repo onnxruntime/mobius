@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -14,40 +16,94 @@ from typing import Any
 from mobius._configs import DFlashConfig, Eagle3Config
 
 _DRAFT_ARCHITECTURES = frozenset({"dflash", "eagle3"})
+_MAX_CONFIG_JSON_BYTES = 4 * 1024 * 1024
+_MAX_TOKENIZER_JSON_BYTES = 64 * 1024 * 1024
+_MAX_TOKENIZER_VOCAB_SIZE = 2_000_000
 
 
 def is_draft_architecture(architecture: str) -> bool:
     return architecture in _DRAFT_ARCHITECTURES
 
 
-def _ordered_tokenizer_vocab(tokenizer_json: Mapping[str, Any]) -> list[str]:
+def _ordered_tokenizer_vocab(
+    tokenizer_json: Mapping[str, Any],
+    *,
+    expected_vocab_size: int,
+) -> list[str]:
+    if (
+        type(expected_vocab_size) is not int
+        or expected_vocab_size <= 0
+        or expected_vocab_size > _MAX_TOKENIZER_VOCAB_SIZE
+    ):
+        raise ValueError(
+            "target vocab_size must be a positive integer no greater than "
+            f"{_MAX_TOKENIZER_VOCAB_SIZE}, got {expected_vocab_size!r}"
+        )
     model = tokenizer_json.get("model")
     if not isinstance(model, Mapping):
-        raise ValueError("target tokenizer.json has no model object")
+        raise TypeError("target tokenizer.json has no model object")
     vocab = model.get("vocab")
     if isinstance(vocab, Mapping):
-        size = max((int(index) for index in vocab.values()), default=-1) + 1
-        tokens: list[str | None] = [None] * size
+        if any(not isinstance(token, str) for token in vocab):
+            raise ValueError("target tokenizer.json vocabulary keys must be strings")
+        if any(type(index) is not int or index < 0 for index in vocab.values()):
+            raise ValueError(
+                "target tokenizer.json vocabulary ids must be non-negative integers"
+            )
+        if any(index >= expected_vocab_size for index in vocab.values()):
+            raise ValueError(
+                "draft/target tokenizer size mismatch: tokenizer vocabulary id "
+                "exceeds target vocab_size"
+            )
+        tokens: list[str | None] = [None] * expected_vocab_size
         for token, index in vocab.items():
-            index = int(index)
-            if index < 0 or index >= size or tokens[index] is not None:
-                raise ValueError("target tokenizer.json has duplicate or invalid vocabulary ids")
-            tokens[index] = str(token)
+            if tokens[index] is not None:
+                raise ValueError(
+                    "target tokenizer.json has duplicate or invalid vocabulary ids"
+                )
+            tokens[index] = token
     elif isinstance(vocab, Sequence) and not isinstance(vocab, (str, bytes)):
-        tokens = [
-            str(entry[0] if isinstance(entry, Sequence) and not isinstance(entry, str) else entry)
-            for entry in vocab
-        ]
+        if len(vocab) > expected_vocab_size:
+            raise ValueError(
+                "draft/target tokenizer size mismatch: tokenizer vocabulary "
+                "exceeds target vocab_size"
+            )
+        tokens = [None] * expected_vocab_size
+        for index, entry in enumerate(vocab):
+            token = (
+                entry[0]
+                if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes))
+                else entry
+            )
+            if not isinstance(token, str):
+                raise TypeError(
+                    "target tokenizer.json vocabulary entries must contain strings"
+                )
+            tokens[index] = token
     else:
-        raise ValueError("target tokenizer.json has no supported ordered vocabulary")
+        raise TypeError("target tokenizer.json has no supported ordered vocabulary")
 
-    for added in tokenizer_json.get("added_tokens", ()):
-        if not isinstance(added, Mapping) or "id" not in added or "content" not in added:
-            continue
-        index = int(added["id"])
-        if index >= len(tokens):
-            tokens.extend([None] * (index + 1 - len(tokens)))
-        token = str(added["content"])
+    added_tokens = tokenizer_json.get("added_tokens", ())
+    if not isinstance(added_tokens, Sequence) or isinstance(added_tokens, (str, bytes)):
+        raise TypeError("target tokenizer.json added_tokens must be an array")
+    for added in added_tokens:
+        if not isinstance(added, Mapping):
+            raise TypeError("target tokenizer.json added_tokens entries must be objects")
+        if "id" not in added or "content" not in added:
+            raise ValueError(
+                "target tokenizer.json added_tokens entries require id and content"
+            )
+        index = added["id"]
+        token = added["content"]
+        if type(index) is not int or index < 0 or not isinstance(token, str):
+            raise ValueError(
+                "target tokenizer.json added token ids/content must be non-negative integers/strings"
+            )
+        if index >= expected_vocab_size:
+            raise ValueError(
+                "draft/target tokenizer size mismatch: added token id exceeds "
+                "target vocab_size"
+            )
         if tokens[index] not in (None, token):
             raise ValueError(f"target tokenizer id {index} has conflicting token values")
         tokens[index] = token
@@ -57,48 +113,175 @@ def _ordered_tokenizer_vocab(tokenizer_json: Mapping[str, Any]) -> list[str]:
     return [str(token) for token in tokens]
 
 
+def _canonical_json_bytes(value: Any, *, label: str, limit: int) -> bytes:
+    try:
+        payload = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label} is not canonical JSON: {error}") from error
+    if len(payload) > limit:
+        raise ValueError(f"{label} exceeds the {limit}-byte canonical JSON limit")
+    return payload
+
+
+def _read_bounded_json_at(
+    root_descriptor: int,
+    resource: str,
+    *,
+    label: str,
+    limit: int,
+) -> dict[str, Any]:
+    try:
+        descriptor = os.open(
+            resource,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_descriptor,
+        )
+    except OSError as error:
+        raise ValueError(
+            f"{label} could not be opened safely inside the target root: {error}"
+        ) from error
+    with os.fdopen(descriptor, "rb") as stream:
+        file_stat = os.fstat(stream.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"{label} is not a regular file")
+        if file_stat.st_size > limit:
+            raise ValueError(f"{label} exceeds the {limit}-byte file-size limit")
+        payload = stream.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"{label} exceeds the {limit}-byte read limit")
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is not valid UTF-8 JSON: {error}") from error
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{label} root must be a JSON object with string keys")
+    return value
+
+
+def _resource_exists_at(root_descriptor: int, resource: str) -> bool:
+    try:
+        os.stat(resource, dir_fd=root_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _load_target_resource_files(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        path_stat = path.lstat()
+    except FileNotFoundError as error:
+        raise ValueError(f"target config does not exist: {path}") from error
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise ValueError("target config path must not be a symlink")
+    if stat.S_ISDIR(path_stat.st_mode):
+        root = path
+    else:
+        if path.name != "config.json":
+            raise ValueError("target config file must be named config.json")
+        root = path.parent
+
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_descriptor = os.open(root, root_flags)
+    except OSError as error:
+        raise ValueError(f"target root could not be opened safely: {error}") from error
+    try:
+        if not _resource_exists_at(root_descriptor, "config.json"):
+            raise ValueError("target config.json does not exist inside the target root")
+        if not _resource_exists_at(root_descriptor, "tokenizer.json"):
+            alternatives = [
+                name
+                for name in (
+                    "tokenizer.model",
+                    "vocab.json",
+                    "merges.txt",
+                    "tokenizer_config.json",
+                )
+                if _resource_exists_at(root_descriptor, name)
+            ]
+            suffix = (
+                f"; found {alternatives}, but split tokenizer files cannot preserve the full "
+                "normalizer/pre-tokenizer/added-token contract"
+                if alternatives
+                else ""
+            )
+            raise ValueError(
+                "target tokenizer.json is required for exact draft pairing inside the "
+                f"target root{suffix}"
+            )
+        data = _read_bounded_json_at(
+            root_descriptor,
+            "config.json",
+            label="target config.json",
+            limit=_MAX_CONFIG_JSON_BYTES,
+        )
+        tokenizer = _read_bounded_json_at(
+            root_descriptor,
+            "tokenizer.json",
+            label="target tokenizer.json",
+            limit=_MAX_TOKENIZER_JSON_BYTES,
+        )
+    finally:
+        os.close(root_descriptor)
+    return data, tokenizer
+
+
 def _load_target(
     target_config: str | Path | Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[str], dict[str, str]]:
     if isinstance(target_config, Mapping):
         data = dict(target_config)
-        tokens = data.pop("tokenizer_tokens", None)
-        if not isinstance(tokens, Sequence) or isinstance(tokens, (str, bytes)):
-            raise ValueError(
-                "mapping target_config must include tokenizer_tokens for exact identity verification"
+        tokenizer = data.pop("tokenizer_json", None)
+        if not isinstance(tokenizer, Mapping):
+            raise TypeError(
+                "mapping target_config must include the complete tokenizer_json object; "
+                "tokenizer_tokens alone cannot verify merges, normalization, or pre-tokenization"
             )
-        config_payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
-        return (
-            data,
-            [str(token) for token in tokens],
-            {
-                "source": str(data.get("target_model_id", "explicit-mapping")),
-                "config_sha256": hashlib.sha256(config_payload).hexdigest(),
-            },
-        )
-
-    path = Path(target_config)
-    if path.is_dir():
-        config_path = path / "config.json"
-        tokenizer_path = path / "tokenizer.json"
+        if any(not isinstance(key, str) for key in data) or any(
+            not isinstance(key, str) for key in tokenizer
+        ):
+            raise ValueError("target config and tokenizer mappings must have string keys")
+        tokenizer = dict(tokenizer)
     else:
-        config_path = path
-        tokenizer_path = path.parent / "tokenizer.json"
-    if not config_path.is_file():
-        raise ValueError(f"target config does not exist: {config_path}")
-    if not tokenizer_path.is_file():
-        raise ValueError(
-            f"target tokenizer.json is required for exact draft pairing: {tokenizer_path}"
-        )
-    config_payload = config_path.read_bytes()
-    data = json.loads(config_payload)
-    tokenizer = json.loads(tokenizer_path.read_text(encoding="utf-8"))
+        data, tokenizer = _load_target_resource_files(Path(target_config))
+
+    config_payload = _canonical_json_bytes(
+        data,
+        label="target config",
+        limit=_MAX_CONFIG_JSON_BYTES,
+    )
+    tokenizer_payload = _canonical_json_bytes(
+        tokenizer,
+        label="target tokenizer",
+        limit=_MAX_TOKENIZER_JSON_BYTES,
+    )
+    target = _flatten_text_config(data)
+    ordered_vocab = _ordered_tokenizer_vocab(
+        tokenizer,
+        expected_vocab_size=target.get("vocab_size"),
+    )
+    from tokenizers import Tokenizer
+
+    # The Rust parser is the authoritative schema validator for normalizers,
+    # pre-tokenizers, models, post-processors, decoders, and added tokens.
+    try:
+        Tokenizer.from_str(tokenizer_payload.decode("utf-8"))
+    except Exception as error:
+        raise ValueError(f"target tokenizer.json has an invalid schema: {error}") from error
     return (
         data,
-        _ordered_tokenizer_vocab(tokenizer),
+        ordered_vocab,
         {
-            "source": str(config_path.resolve()),
+            "config_resource": "config.json",
+            "tokenizer_resource": "tokenizer.json",
             "config_sha256": hashlib.sha256(config_payload).hexdigest(),
+            "tokenizer_sha256": hashlib.sha256(tokenizer_payload).hexdigest(),
         },
     )
 
@@ -106,6 +289,8 @@ def _load_target(
 def _flatten_text_config(data: Mapping[str, Any]) -> dict[str, Any]:
     flattened = dict(data)
     text_config = data.get("text_config")
+    if text_config is not None and not isinstance(text_config, Mapping):
+        raise ValueError("target config text_config must be an object")
     if isinstance(text_config, Mapping):
         flattened.update(text_config)
     return flattened
@@ -140,9 +325,15 @@ def _validate_special_ids(metadata: Mapping[str, Any], target: Mapping[str, Any]
         if gguf_value is None or target_value is None:
             continue
         if isinstance(target_value, Sequence) and not isinstance(target_value, (str, bytes)):
-            matches = int(gguf_value) in {int(value) for value in target_value}
+            if any(type(value) is not int or value < 0 for value in target_value):
+                raise ValueError(
+                    f"target config {config_key} must contain non-negative integers"
+                )
+            matches = int(gguf_value) in set(target_value)
         else:
-            matches = int(gguf_value) == int(target_value)
+            if type(target_value) is not int or target_value < 0:
+                raise ValueError(f"target config {config_key} must be a non-negative integer")
+            matches = int(gguf_value) == target_value
         if not matches:
             raise ValueError(
                 f"draft/target {config_key} mismatch: GGUF={gguf_value!r}, "
@@ -168,11 +359,20 @@ def validate_draft_pairing(
     missing = [field for field in required if target.get(field) is None]
     if missing:
         raise ValueError(f"target config is missing required field(s): {missing}")
+    invalid_fields = [
+        field for field in required if type(target[field]) is not int or target[field] <= 0
+    ]
+    if invalid_fields:
+        raise ValueError(f"target config field(s) must be positive integers: {invalid_fields}")
+    if target.get("model_type") is not None and not isinstance(target["model_type"], str):
+        raise ValueError("target config model_type must be a string")
 
     target_hidden = int(target["hidden_size"])
     target_layers = int(target["num_hidden_layers"])
     target_vocab = int(target["vocab_size"])
-    gguf_tokens = [str(token) for token in gguf_model.metadata.get("tokenizer.ggml.tokens", ())]
+    gguf_tokens = [
+        str(token) for token in gguf_model.metadata.get("tokenizer.ggml.tokens", ())
+    ]
     if len(target_tokens) != target_vocab or len(gguf_tokens) != target_vocab:
         raise ValueError(
             "draft/target tokenizer size mismatch: "
@@ -240,7 +440,9 @@ def validate_draft_pairing(
     remap = _read_d2t(gguf_model)
     if remap is not None:
         if any(value < 0 or value >= target_vocab for value in remap):
-            raise ValueError(f"{architecture} d2t contains target ids outside [0, {target_vocab})")
+            raise ValueError(
+                f"{architecture} d2t contains target ids outside [0, {target_vocab})"
+            )
         if len(set(remap)) != len(remap):
             raise ValueError(f"{architecture} d2t contains duplicate target ids")
 
@@ -365,7 +567,9 @@ def validate_draft_tensor_contract(gguf_model: Any) -> None:
         if "output.weight" not in actual:
             raise ValueError(f"{architecture} reduced vocabulary requires output.weight")
     if architecture == "eagle3" and "output.weight" not in actual and "d2t" in actual:
-        raise ValueError("eagle3 cannot share a target lm_head with a reduced draft vocabulary")
+        raise ValueError(
+            "eagle3 cannot share a target lm_head with a reduced draft vocabulary"
+        )
     if "token_embd.weight" in actual:
         raise ValueError(
             f"{architecture} GGUF contains a draft-owned token_embd.weight, but the Mobius "
@@ -402,5 +606,7 @@ def validate_draft_tensor_contract(gguf_model: Any) -> None:
 
 def write_draft_manifest(manifest: Mapping[str, Any], output_dir: str | Path) -> str:
     path = Path(output_dir) / "draft_manifest.json"
-    path.write_text(json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(dict(manifest), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return str(path)

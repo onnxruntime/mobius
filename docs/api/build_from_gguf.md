@@ -40,7 +40,7 @@ def build_from_gguf(
 | `static_cache` | `bool` | `False` | Build a fixed-width KV cache when the architecture supports it. |
 | `max_seq_len` | `int \| None` | `None` | Static-cache sequence limit. |
 | `reuse_gguf_weights` | `bool` | `False` | Reuse byte-compatible F32/F16 and native IQ/MXFP4 tensor ranges from the original GGUF instead of copying them into ONNX external data. |
-| `target_config` | `str \| Path \| Mapping[str, object] \| None` | `None` | Exact target directory/config plus tokenizer, or an explicit config mapping with `tokenizer_tokens`. Required only for `dflash` and `eagle3`. |
+| `target_config` | `str \| Path \| Mapping[str, object] \| None` | `None` | Exact target directory/config plus `tokenizer.json`, or an explicit config mapping with the complete `tokenizer_json` object. Required only for `dflash` and `eagle3`. |
 
 ## Returns
 
@@ -222,10 +222,13 @@ llama.cpp does not emit but that mobius still accepts.
 standalone causal language models. Both the API and CLI require an explicit
 `target_config`; `task="text-generation"`, static cache, and standalone runtime
 packaging are rejected. A successful build emits `draft_manifest.json` beside
-the ONNX graph. The manifest records the target config SHA-256, ordered-token
-vocabulary SHA-256, hidden/layer/vocabulary sizes, selected target layers,
-draft depth/head/intermediate/block sizes, output ownership, and any
-draft-to-target (`d2t`) vocabulary map.
+the ONNX graph. The manifest records canonical JSON SHA-256 values for the
+target config and complete tokenizer, a separate ordered-token vocabulary
+SHA-256, hidden/layer/vocabulary sizes, selected target layers, draft
+depth/head/intermediate/block sizes, output ownership, and any draft-to-target
+(`d2t`) vocabulary map. Canonical hashes are identical for equivalent file and
+mapping inputs and remain stable when a target directory is relocated; absolute
+host paths are not embedded.
 
 The target tokenizer vocabulary must match the GGUF token list in exact ID
 order, and BOS/EOS/PAD IDs are checked when both sides declare them. This proves
@@ -234,6 +237,12 @@ or merge behavior. The manifest identifies the exact config file or explicit
 mapping used for validation, but Mobius cannot derive a target weight revision
 from GGUF metadata. The caller must pair that manifest with the attested target
 weights; runtime support therefore remains **deferred**.
+
+`config.json` and `tokenizer.json` are size-bounded, schema-checked UTF-8 JSON
+objects. Both resolved resources must remain in one target root; escaping or
+mixed-directory symlinks are rejected. Split `vocab.json`/`merges.txt` or
+`tokenizer.model` alternatives are not reconstructed because doing so would
+lose full normalizer, pre-tokenizer, and added-token semantics.
 
 EAGLE-3 requires exactly three valid `eagle3.target_layers` and matching
 `eagle3.target_hidden_size`; target and draft hidden widths must currently match

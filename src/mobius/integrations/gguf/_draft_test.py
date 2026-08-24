@@ -5,12 +5,28 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 gguf = pytest.importorskip("gguf")
+_I64_DTYPE = np.dtype(np.int64)
+
+
+def _tokenizer(tokens: list[str], *, merges: list[str] | None = None) -> dict:
+    return {
+        "version": "1.0",
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "Whitespace"},
+        "model": {
+            "type": "BPE",
+            "vocab": {token: index for index, token in enumerate(tokens)},
+            "merges": merges or [],
+        },
+        "added_tokens": [],
+    }
 
 
 def _target(tokens: list[str], **overrides):
@@ -23,10 +39,42 @@ def _target(tokens: list[str], **overrides):
         "bos_token_id": 1,
         "eos_token_id": 2,
         "pad_token_id": 0,
-        "tokenizer_tokens": tokens,
+        "tokenizer_json": _tokenizer(tokens),
     }
     target.update(overrides)
     return target
+
+
+def _write_target_dir(
+    path: Path,
+    tokens: list[str],
+    *,
+    config_overrides: dict | None = None,
+    tokenizer: dict | None = None,
+) -> tuple[dict, dict]:
+    path.mkdir(parents=True)
+    target = _target(tokens)
+    default_tokenizer = target.pop("tokenizer_json")
+    tokenizer_json = default_tokenizer if tokenizer is None else tokenizer
+    if config_overrides:
+        target.update(config_overrides)
+    (path / "config.json").write_text(
+        json.dumps(target, indent=2),
+        encoding="utf-8",
+    )
+    (path / "tokenizer.json").write_text(
+        json.dumps(tokenizer_json, indent=2),
+        encoding="utf-8",
+    )
+    return target, tokenizer_json
+
+
+def _directory_bytes(path: Path) -> dict[str, bytes]:
+    return {
+        str(file.relative_to(path)): file.read_bytes()
+        for file in path.rglob("*")
+        if file.is_file()
+    }
 
 
 def _write_draft(
@@ -39,10 +87,11 @@ def _write_draft(
     own_embedding: bool = False,
     target_hidden_size: int | None = None,
     target_layers: list[int] | None = None,
-    d2t_dtype: np.dtype = np.dtype(np.int64),
+    d2t_dtype: np.dtype = _I64_DTYPE,
+    tokens: list[str] | None = None,
 ) -> Path:
     hidden, intermediate, heads, kv_heads, layers = 64, 128, 4, 2, 1
-    tokens = [f"token-{index}" for index in range(64)]
+    tokens = tokens or [f"token-{index}" for index in range(64)]
     writer = gguf.GGUFWriter(str(path), architecture)
     writer.add_context_length(128)
     writer.add_embedding_length(hidden)
@@ -81,9 +130,9 @@ def _write_draft(
         for row in range(n_out):
             for block in range(k_in // 32):
                 offset = block * 18
-                raw[row, offset : offset + 2] = np.array(
-                    [0.01], dtype=np.float16
-                ).view(np.uint8)
+                raw[row, offset : offset + 2] = np.array([0.01], dtype=np.float16).view(
+                    np.uint8
+                )
                 raw[row, offset + 2 : offset + 18] = rng.integers(
                     0, 256, size=16, dtype=np.uint8
                 )
@@ -173,6 +222,217 @@ def test_target_mismatches_fail_before_graph_build(
         build_from_gguf(path, target_config=_target(tokens, **override))
 
 
+def test_target_resources_reject_symlink_escape(tmp_path: Path, monkeypatch) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    external = tmp_path / "external"
+    _write_target_dir(external, tokens)
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.json").symlink_to(external / "config.json")
+    (target / "tokenizer.json").write_bytes((external / "tokenizer.json").read_bytes())
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match="could not be opened safely"):
+        build_from_gguf(draft, target_config=target)
+
+
+def test_target_resources_do_not_mix_split_tokenizer_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = tmp_path / "target"
+    config, _ = _write_target_dir(target, tokens)
+    (target / "tokenizer.json").unlink()
+    (target / "vocab.json").write_text("{}", encoding="utf-8")
+    (target / "merges.txt").write_text("#version: 0.2\n", encoding="utf-8")
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match="split tokenizer files cannot preserve"):
+        build_from_gguf(draft, target_config=target)
+    assert config["vocab_size"] == len(tokens)
+
+
+def test_target_manifest_hashes_full_tokenizer_semantics(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = ["a", "b", "ab", *[f"token-{index}" for index in range(61)]]
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash", tokens=tokens)
+    first = _target(tokens)
+    second = _target(tokens)
+    second["tokenizer_json"]["model"]["merges"] = ["a b"]
+
+    first_target = build_from_gguf(draft, target_config=first).draft_manifest["target"]
+    second_target = build_from_gguf(draft, target_config=second).draft_manifest["target"]
+
+    assert first_target["config_sha256"] == second_target["config_sha256"]
+    assert first_target["tokenizer_tokens_sha256"] == second_target["tokenizer_tokens_sha256"]
+    assert first_target["tokenizer_sha256"] != second_target["tokenizer_sha256"]
+
+
+def test_target_manifest_is_stable_across_relocation_and_mapping(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    first_config, tokenizer = _write_target_dir(tmp_path / "first" / "target", tokens)
+    _write_target_dir(
+        tmp_path / "relocated" / "target",
+        tokens,
+        tokenizer=tokenizer,
+    )
+    mapping = {**first_config, "tokenizer_json": tokenizer}
+
+    path_target = build_from_gguf(
+        draft,
+        target_config=tmp_path / "first" / "target",
+    ).draft_manifest["target"]
+    relocated_target = build_from_gguf(
+        draft,
+        target_config=tmp_path / "relocated" / "target",
+    ).draft_manifest["target"]
+    mapping_target = build_from_gguf(
+        draft,
+        target_config=mapping,
+    ).draft_manifest["target"]
+
+    assert path_target == relocated_target == mapping_target
+    assert set(path_target).issuperset(
+        {"config_sha256", "tokenizer_sha256", "tokenizer_tokens_sha256"}
+    )
+    assert not any(str(tmp_path) in str(value) for value in path_target.values())
+
+
+@pytest.mark.parametrize(
+    ("resource", "payload", "message"),
+    [
+        ("config.json", b"{", "not valid UTF-8 JSON"),
+        ("config.json", b"[]", "root must be a JSON object"),
+        ("tokenizer.json", b"{", "not valid UTF-8 JSON"),
+    ],
+)
+def test_target_json_schema_errors_fail_before_graph(
+    tmp_path: Path,
+    monkeypatch,
+    resource: str,
+    payload: bytes,
+    message: str,
+) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = tmp_path / "target"
+    _write_target_dir(target, tokens)
+    (target / resource).write_bytes(payload)
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        build_from_gguf(draft, target_config=target)
+
+
+def test_target_config_file_size_is_bounded(tmp_path: Path, monkeypatch) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+    from mobius.integrations.gguf._draft import _MAX_CONFIG_JSON_BYTES
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = tmp_path / "target"
+    _write_target_dir(target, tokens)
+    (target / "config.json").write_bytes(b" " * (_MAX_CONFIG_JSON_BYTES + 1))
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match="file-size limit"):
+        build_from_gguf(draft, target_config=target)
+
+
+def test_sparse_tokenizer_ids_are_bounded_before_allocation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = _target(tokens)
+    target["tokenizer_json"]["model"]["vocab"]["sparse"] = 10**12
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match="tokenizer size mismatch"):
+        build_from_gguf(draft, target_config=target)
+
+
+def test_sparse_added_token_ids_are_bounded_before_allocation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = _target(tokens)
+    target["tokenizer_json"]["added_tokens"] = [
+        {"id": 10**12, "content": "sparse", "special": False}
+    ]
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match="tokenizer size mismatch"):
+        build_from_gguf(draft, target_config=target)
+
+
+def test_tokenizer_runtime_schema_is_validated_before_graph_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mobius import _builder as core_builder
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = _target(tokens)
+    target["tokenizer_json"]["normalizer"] = {"type": "not-a-normalizer"}
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(
+        core_builder,
+        "build_from_module",
+        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    )
+
+    with pytest.raises(ValueError, match=r"tokenizer\.json has an invalid schema"):
+        build_from_gguf(draft, target_config=target)
+
+
 def test_tokenizer_identity_and_remap_are_fail_closed(tmp_path: Path, monkeypatch) -> None:
     from mobius import _builder as core_builder
     from mobius.integrations.gguf import build_from_gguf
@@ -216,7 +476,9 @@ def test_d2t_requires_pinned_i64_storage(tmp_path: Path, monkeypatch) -> None:
         build_from_gguf(path, target_config=_target([f"token-{i}" for i in range(64)]))
 
 
-def test_suffix_closure_rejects_unknown_tensor_before_graph(tmp_path: Path, monkeypatch) -> None:
+def test_suffix_closure_rejects_unknown_tensor_before_graph(
+    tmp_path: Path, monkeypatch
+) -> None:
     from mobius import _builder as core_builder
     from mobius.integrations.gguf import build_from_gguf
 
@@ -230,7 +492,7 @@ def test_suffix_closure_rejects_unknown_tensor_before_graph(tmp_path: Path, monk
         "build_from_module",
         lambda *args, **kwargs: pytest.fail("graph construction must not start"),
     )
-    with pytest.raises(ValueError, match="pinned llama.cpp tensor creation sites"):
+    with pytest.raises(ValueError, match=r"pinned llama\.cpp tensor creation sites"):
         build_from_gguf(path, target_config=_target([f"token-{i}" for i in range(64)]))
 
 
@@ -294,9 +556,7 @@ def test_eagle3_rope_frequency_shape_is_exact(tmp_path: Path, monkeypatch) -> No
         build_from_gguf(path, target_config=_target([f"token-{i}" for i in range(64)]))
 
 
-def test_dflash_sliding_window_is_rejected_before_graph(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_dflash_sliding_window_is_rejected_before_graph(tmp_path: Path, monkeypatch) -> None:
     from mobius import _builder as core_builder
     from mobius.integrations.gguf import build_from_gguf
     from mobius.integrations.gguf._reader import GGUFModel
@@ -404,7 +664,9 @@ def test_synthetic_draft_runs_multiple_speculative_steps(
     from mobius._testing.ort_inference import OnnxModelSession
     from mobius.integrations.gguf import build_from_gguf
 
-    path = _write_draft(tmp_path / f"{architecture}-{quantized}.gguf", architecture, quantized=quantized)
+    path = _write_draft(
+        tmp_path / f"{architecture}-{quantized}.gguf", architecture, quantized=quantized
+    )
     tokens = [f"token-{index}" for index in range(64)]
     package = build_from_gguf(path, target_config=_target(tokens))
     assert package.draft_manifest["standalone"] is False
@@ -423,7 +685,9 @@ def test_synthetic_draft_runs_multiple_speculative_steps(
                         "noise_embedding": np.ones((1, 2, 64), np.float32),
                         "target_hidden": np.ones((1, accepted, 192), np.float32),
                         "position_ids": np.arange(accepted + 2, dtype=np.int64)[None, :],
-                        "q_position_ids": np.arange(accepted, accepted + 2, dtype=np.int64)[None, :],
+                        "q_position_ids": np.arange(accepted, accepted + 2, dtype=np.int64)[
+                            None, :
+                        ],
                         **state,
                     }
                 )
@@ -475,6 +739,79 @@ def test_cli_exposes_explicit_target_config() -> None:
         ]
     )
     assert args.target_config == "target/config.json"
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_cli_bad_target_never_mutates_output(tmp_path: Path, existing_output: bool) -> None:
+    from mobius.__main__ import main
+
+    tokens = [f"token-{index}" for index in range(64)]
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    target = tmp_path / "target"
+    _write_target_dir(target, tokens)
+    (target / "config.json").write_text("{", encoding="utf-8")
+    output = tmp_path / "output"
+    if existing_output:
+        output.mkdir()
+        (output / "sentinel.bin").write_bytes(b"unchanged")
+    before = _directory_bytes(output) if existing_output else None
+
+    with pytest.raises(ValueError, match="not valid UTF-8 JSON"):
+        main(
+            [
+                "build-gguf",
+                str(draft),
+                "--target-config",
+                str(target),
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert output.exists() is existing_output
+    if existing_output:
+        assert _directory_bytes(output) == before
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_cli_draft_runtime_rejection_never_mutates_output(
+    tmp_path: Path,
+    monkeypatch,
+    existing_output: bool,
+) -> None:
+    from mobius.__main__ import main
+
+    tokens = [f"token-{index}" for index in range(64)]
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    target = tmp_path / "target"
+    _write_target_dir(target, tokens)
+    output = tmp_path / "output"
+    if existing_output:
+        output.mkdir()
+        (output / "sentinel.bin").write_bytes(b"unchanged")
+    before = _directory_bytes(output) if existing_output else None
+    monkeypatch.setattr(
+        "mobius.integrations.gguf.build_from_gguf",
+        lambda *args, **kwargs: pytest.fail("build must not start"),
+    )
+
+    with pytest.raises(SystemExit, match="do not support standalone runtime packaging"):
+        main(
+            [
+                "build-gguf",
+                str(draft),
+                "--target-config",
+                str(target),
+                "--runtime",
+                "onnx-genai",
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert output.exists() is existing_output
+    if existing_output:
+        assert _directory_bytes(output) == before
 
 
 @pytest.mark.parametrize("architecture", ["dflash", "eagle3"])

@@ -620,7 +620,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
 
     gguf_path = args.gguf_path
     output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    target_config = getattr(args, "target_config", None)
+    runtime = getattr(args, "runtime", None)
 
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -630,6 +631,11 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
+    if target_config is not None and runtime is not None:
+        raise SystemExit(
+            "Error: dflash/eagle3 target-coupled drafts do not support standalone "
+            "runtime packaging; omit --runtime to save the auxiliary graph and manifest."
+        )
 
     pkg = build_from_gguf(
         gguf_path,
@@ -640,13 +646,14 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
         reuse_gguf_weights=reuse_gguf_weights,
-        target_config=getattr(args, "target_config", None),
+        target_config=target_config,
     )
 
     if args.release:
         for model in pkg.values():
             strip_debug_metadata(model)
 
+    os.makedirs(output_dir, exist_ok=True)
     pkg.save(
         output_dir,
         external_data=args.external_data,
@@ -680,7 +687,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         manifest_path = write_draft_manifest(draft_manifest, output_dir)
         print(f"Saved draft pairing manifest to {manifest_path}")
 
-    runtime = getattr(args, "runtime", None)
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
 

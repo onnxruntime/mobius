@@ -877,7 +877,7 @@ def build_from_gguf(
             written once to ``model.onnx.data``.
         target_config: Exact target model directory, config path, or explicit
             config mapping for a ``dflash``/``eagle3`` speculative draft. A
-            mapping must include ``tokenizer_tokens``. Required for draft GGUFs
+            mapping must include the complete ``tokenizer_json`` object. Required for draft GGUFs
             and rejected for standalone architectures.
 
     Returns:

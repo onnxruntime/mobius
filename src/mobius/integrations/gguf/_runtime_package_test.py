@@ -109,15 +109,22 @@ class TestWriteGgufRuntimePackage:
     def test_target_coupled_draft_runtime_package_is_rejected(self, tmp_path):
         pkg = _FakePackage()
         pkg.draft_manifest = {"architecture": "eagle3"}
+        out = tmp_path / "out"
+        out.mkdir()
+        sentinel = out / "sentinel.bin"
+        sentinel.write_bytes(b"unchanged")
 
         with pytest.raises(ValueError, match="target-coupled speculative draft"):
             write_gguf_runtime_package(
                 pkg,
                 tmp_path / "eagle3.gguf",
-                tmp_path / "out",
+                out,
             )
         assert pkg.saved_to is None
         assert pkg.saved_to is None
+        assert {path.name: path.read_bytes() for path in out.iterdir()} == {
+            "sentinel.bin": b"unchanged"
+        }
 
     def test_save_model_false_leaves_an_already_saved_graph_alone(self, tmp_path):
         """The CLI saves the graph itself, then asks only for runtime artifacts."""
