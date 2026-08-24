@@ -312,6 +312,56 @@ class TestSinkAttention:
         assert count_op_type(graph, "GroupQueryAttention") == 0
         assert count_op_type(graph, "Softmax") == config.num_hidden_layers
 
+    @pytest.mark.parametrize(
+        "dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16], ids=["f16", "bf16"]
+    )
+    def test_reduced_precision_upcasts_the_sink_softmax(self, dtype):
+        """Mirror upstream's forced-fp32 sink softmax for f16/bf16 builds.
+
+        HuggingFace computes ``logsumexp``/``sigmoid`` and the softmax in
+        float32 regardless of the compute dtype. The equivalent here is to
+        upcast the extended (scores + sink) logits before the softmax and cast
+        the probabilities back, which shows up as two extra Cast nodes per
+        layer around the Softmax.
+        """
+        config = _tiny_config(dtype=dtype)
+        module = GraniteSwaCausalLMModel(config)
+        graph = get_task("text-generation").build(module, config)["model"].graph
+
+        softmax_nodes = [node for node in graph if node.op_type == "Softmax"]
+        assert len(softmax_nodes) == config.num_hidden_layers
+        for softmax in softmax_nodes:
+            # Softmax <- Sub(row-max stabilise) <- Cast(to float32)
+            stabilise = softmax.inputs[0].producer()
+            assert stabilise is not None and stabilise.op_type == "Sub"
+            upcast = stabilise.inputs[0].producer()
+            assert upcast is not None and upcast.op_type == "Cast"
+            assert upcast.attributes["to"].as_int() == ir.DataType.FLOAT
+            # Softmax -> Slice(drop sink column) -> Cast(back to compute dtype)
+            (consumer, _), *_ = softmax.outputs[0].uses()
+            assert consumer.op_type == "Slice"
+            (downcast, _), *_ = consumer.outputs[0].uses()
+            assert downcast.op_type == "Cast"
+            assert downcast.attributes["to"].as_int() == dtype
+
+    def test_float32_build_has_no_sink_softmax_casts(self):
+        """float32 builds must stay Cast-free around the sink softmax."""
+        config = _tiny_config()
+        module = GraniteSwaCausalLMModel(config)
+        graph = get_task("text-generation").build(module, config)["model"].graph
+
+        softmax_nodes = [node for node in graph if node.op_type == "Softmax"]
+        assert len(softmax_nodes) == config.num_hidden_layers
+        for softmax in softmax_nodes:
+            stabilise = softmax.inputs[0].producer()
+            assert stabilise is not None and stabilise.op_type == "Sub"
+            # The stabilised logits come straight from the sink Concat.
+            producer = stabilise.inputs[0].producer()
+            assert producer is not None and producer.op_type == "Concat"
+            (consumer, _), *_ = softmax.outputs[0].uses()
+            assert consumer.op_type == "Slice"
+            assert all(use[0].op_type != "Cast" for use in consumer.outputs[0].uses())
+
     def test_matches_the_logsumexp_sigmoid_reference(self):
         """Run one SinkAttention layer in ORT against the upstream formula.
 
