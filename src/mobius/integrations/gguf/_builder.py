@@ -372,10 +372,10 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         tensor_names=gguf_model.tensor_names,
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
+    _raise_for_invalid_t5_tensor_contract(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
-    _raise_for_invalid_t5_tensor_contract(gguf_model)
 
 
 def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
@@ -550,6 +550,30 @@ def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:
         name: tuple(int(dim) for dim in shape) for name, _raw, _qtype, shape in actual_items
     }
     qtypes = {name: qtype for name, _raw, qtype, _shape in actual_items}
+    layer_limits = {"enc": encoder_layers, "dec": decoder_layers}
+    invalid_layer_indices = []
+    for name in actual:
+        match = re.match(r"^(enc|dec)\.blk\.([^.]+)\.", name)
+        if match is None:
+            continue
+        stack, raw_index = match.groups()
+        if not re.fullmatch(r"0|[1-9][0-9]*", raw_index):
+            invalid_layer_indices.append(
+                f"{name} (layer index {raw_index!r} is not canonical)"
+            )
+            continue
+        layer = int(raw_index)
+        if layer >= layer_limits[stack]:
+            invalid_layer_indices.append(
+                f"{name} (layer index {layer} is outside declared {stack} layer "
+                f"count {layer_limits[stack]})"
+            )
+    if invalid_layer_indices:
+        raise ValueError(
+            f"{architecture} GGUF has invalid T5 layer tensor index(es): "
+            f"{sorted(invalid_layer_indices)}"
+        )
+
     required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
         "enc.output_norm.weight": (hidden,),
@@ -624,12 +648,12 @@ def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:
             f"{architecture} GGUF relative-bias and norm tensors must remain float: "
             f"{sorted(small_non_float)}"
         )
-    ignored = sorted(
-        name
-        for name in actual
-        if (name == "output.weight" and architecture == "t5encoder")
-        or (name.endswith(".cross_attn_rel_b.weight"))
+    ignored_names = (
+        {"output.weight"}
+        if architecture == "t5encoder"
+        else {f"dec.blk.{layer}.cross_attn_rel_b.weight" for layer in range(decoder_layers)}
     )
+    ignored = sorted(set(actual) & ignored_names)
     if ignored:
         logger.warning(
             "Ignoring pinned llama.cpp T5 tensor(s) that do not participate in "

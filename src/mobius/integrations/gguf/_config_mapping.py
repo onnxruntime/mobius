@@ -1439,13 +1439,21 @@ def _t5_postprocess(
             "activation contract cannot represent that layout"
         )
     is_gated = bool(gated and gated[0])
+    if is_gated:
+        raise ValueError(
+            f"{arch} GGUF gated FFNs are ambiguous: the pinned converter does not "
+            "serialize feed_forward_proj or dense_act_fn, so identical metadata and "
+            "tensor shapes can represent gated-gelu, gated-silu, or other activations. "
+            "Pinned llama.cpp always executes these tensors as tanh-approximate GELU, "
+            "but Mobius cannot prove that this matches the source checkpoint."
+        )
     return dataclasses.replace(
         config,
         head_dim=key_length,
         num_key_value_heads=heads,
         num_decoder_layers=decoder_layers,
-        hidden_act="gelu" if is_gated else "relu",
-        is_gated_act=is_gated,
+        hidden_act="relu",
+        is_gated_act=False,
         scale_decoder_outputs=False,
         relative_attention_max_distance=128,
         encoder_relative_attention_bias_layers=encoder_bias_layers,

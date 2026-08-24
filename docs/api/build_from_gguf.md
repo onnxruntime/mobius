@@ -256,10 +256,13 @@ The importer preserves unequal encoder/decoder layer counts, head width,
 feed-forward width, RMS-norm epsilon, relative-position buckets, decoder start,
 EOS, and padding token IDs. Layer 0 must own each stack's relative-attention bias;
 later per-layer overrides remain attached to their source layer. Non-gated files
-use ReLU, while uniformly gated files use GELU. Mixed gated/non-gated layers,
-GQA, unequal key/value widths, fused projections, projection biases, malformed
-suffixes, and `.scale`/`.input_scale` sidecars are rejected before graph
-construction.
+use ReLU. Gated files are rejected as ambiguous: pinned llama.cpp executes any
+gate tensor through tanh-approximate `LLM_FFN_GELU`/`ggml_geglu_split`, but its
+converter does not serialize `feed_forward_proj` or `dense_act_fn`, so identical
+GGUF metadata and tensor shapes can originate from `gated-gelu`, `gated-silu`,
+or another gated activation. Mixed gated/non-gated layers, GQA, unequal key/value
+widths, fused projections, projection biases, malformed suffixes, and
+`.scale`/`.input_scale` sidecars are rejected before graph construction.
 
 Compatible quantized 2-D projections use `MatMulNBits`. Shared token embeddings
 explicitly dequantize to `Gather`, and relative bias, norms, and other small

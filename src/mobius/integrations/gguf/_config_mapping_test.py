@@ -79,7 +79,7 @@ class TestT5Config:
         assert config.pad_token_id == 0
         assert config.eos_token_id == 1
 
-    def test_unequal_decoder_count_start_token_and_gated_gelu_are_preserved(self) -> None:
+    def test_unequal_decoder_count_and_start_token_are_preserved(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 
         metadata = _t5_metadata("t5")
@@ -91,19 +91,34 @@ class TestT5Config:
                 "t5.attention.value_length": 8,
             }
         )
-        names = [
-            "enc.blk.0.attn_rel_b.weight",
-            "dec.blk.0.attn_rel_b.weight",
-            *(f"enc.blk.{i}.ffn_gate.weight" for i in range(2)),
-            *(f"dec.blk.{i}.ffn_gate.weight" for i in range(3)),
-        ]
+        names = ["enc.blk.0.attn_rel_b.weight", "dec.blk.0.attn_rel_b.weight"]
         config = gguf_to_config(_FakeDenseGGUF("t5", metadata, names))
 
         assert config.num_decoder_layers == 3
         assert config.decoder_start_token_id == 0
         assert config.head_dim == 8
-        assert config.hidden_act == "gelu"
-        assert config.is_gated_act is True
+        assert config.hidden_act == "relu"
+        assert config.is_gated_act is False
+
+    @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
+    def test_gated_activation_is_rejected_as_ambiguous(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        names = [
+            "enc.blk.0.attn_rel_b.weight",
+            "enc.blk.0.ffn_gate.weight",
+            "enc.blk.1.ffn_gate.weight",
+        ]
+        if architecture == "t5":
+            names.extend(
+                [
+                    "dec.blk.0.attn_rel_b.weight",
+                    "dec.blk.0.ffn_gate.weight",
+                    "dec.blk.1.ffn_gate.weight",
+                ]
+            )
+        with pytest.raises(ValueError, match=r"gated FFNs are ambiguous"):
+            gguf_to_config(_FakeDenseGGUF(architecture, _t5_metadata(architecture), names))
 
     @pytest.mark.parametrize(
         ("updates", "names", "message"),

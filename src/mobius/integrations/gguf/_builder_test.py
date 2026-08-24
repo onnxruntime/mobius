@@ -460,6 +460,8 @@ def _write_t5_gguf(
     omit: str | None = None,
     malformed: str | None = None,
     auxiliary_suffix: str | None = None,
+    extra_layer_tensor: str | None = None,
+    include_ignored_tensor: bool = False,
 ) -> None:
     """Write a tiny pinned-layout T5 or T5-encoder GGUF."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -527,6 +529,8 @@ def _write_t5_gguf(
 
     add_matrix("token_embd.weight", (vocab, hidden))
     add_float("enc.output_norm.weight", (hidden,))
+    if include_ignored_tensor and architecture == "t5encoder":
+        add_matrix("output.weight", (vocab, hidden))
 
     def add_stack(prefix: str, layers: int, *, decoder: bool) -> None:
         for layer in range(layers):
@@ -555,8 +559,12 @@ def _write_t5_gguf(
     if architecture == "t5":
         add_float("dec.output_norm.weight", (hidden,))
         add_stack("dec", decoder_layers, decoder=True)
+        if include_ignored_tensor:
+            add_float("dec.blk.0.cross_attn_rel_b.weight", (buckets, heads))
     if auxiliary_suffix is not None:
         add_float(f"enc.blk.0.attn_q.{auxiliary_suffix}", (1,))
+    if extra_layer_tensor is not None:
+        add_matrix(extra_layer_tensor, (hidden, hidden))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -2807,6 +2815,23 @@ class TestT5GGUFBuild:
             expected,
         )
 
+    @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
+    def test_gated_activation_ambiguity_fails_before_graph_build(
+        self, tmp_path: Path, architecture: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-gated.gguf"
+        _write_t5_gguf(path, architecture, gated=True)
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"gated FFNs are ambiguous"):
+            build_from_gguf(path)
+
     def test_t5_builds_distinct_encoder_and_decoder_contracts(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
@@ -2888,6 +2913,68 @@ class TestT5GGUFBuild:
             lambda *args, **kwargs: pytest.fail("graph construction must not start"),
         )
         with pytest.raises(ValueError, match=r"missing required|invalid T5 tensor shape"):
+            build_from_gguf(path)
+
+    @pytest.mark.parametrize(
+        ("architecture", "tensor_name"),
+        [
+            ("t5encoder", "enc.blk.1.attn_q.weight"),
+            ("t5", "dec.blk.1.cross_attn_q.weight"),
+            ("t5", "enc.blk.-1.attn_q.weight"),
+            ("t5", "dec.blk.+1.cross_attn_q.weight"),
+            ("t5encoder", "enc.blk.01.attn_q.weight"),
+            ("t5encoder", "enc.blk.1\u0660.attn_q.weight"),
+        ],
+    )
+    def test_invalid_layer_indices_fail_before_graph_build(
+        self,
+        tmp_path: Path,
+        architecture: str,
+        tensor_name: str,
+        monkeypatch,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-invalid-layer.gguf"
+        _write_t5_gguf(path, architecture, extra_layer_tensor=tensor_name)
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"invalid T5 layer tensor index"):
+            build_from_gguf(path)
+
+    @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
+    def test_exact_pinned_ignored_tensors_remain_accepted(
+        self, tmp_path: Path, architecture: str, caplog
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-ignored.gguf"
+        _write_t5_gguf(path, architecture, include_ignored_tensor=True)
+        build_from_gguf(path)
+        assert "Ignoring pinned llama.cpp T5 tensor" in caplog.text
+
+    def test_cross_relative_bias_ignore_is_not_a_suffix_wildcard(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "t5-broad-ignore.gguf"
+        _write_t5_gguf(
+            path,
+            "t5",
+            extra_layer_tensor="dec.blk.0.extra.cross_attn_rel_b.weight",
+        )
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"suffixes do not match"):
             build_from_gguf(path)
 
     @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
