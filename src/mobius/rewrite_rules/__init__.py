@@ -33,6 +33,7 @@ __all__ = [
     "clip_to_min_max_rules",
     "decompose_attention_pass",
     "decompose_rope_rules",
+    "fuse_block_quantized_moe",
     "fuse_dense_moe_to_qmoe",
     "gelu_fusion_rules",
     "group_query_attention_rules",
@@ -49,6 +50,7 @@ __all__ = [
 ]
 
 from mobius.rewrite_rules._bias_gelu import bias_gelu_rules
+from mobius.rewrite_rules._block_quantized_moe_fusion import fuse_block_quantized_moe
 from mobius.rewrite_rules._clip_to_min_max import clip_to_min_max_rules
 from mobius.rewrite_rules._decompose_attention import decompose_attention_pass
 from mobius.rewrite_rules._decompose_rope import decompose_rope_rules
