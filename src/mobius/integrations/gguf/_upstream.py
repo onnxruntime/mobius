@@ -77,6 +77,10 @@ class UpstreamArchitecture:
             by the pinned C++ generic loader pass.
         tensor_suffixes: Per-family suffix closure for architectures whose tensor
             families do not share one suffix set.
+        tensor_closure_status: Whether ``tensor_names`` is an exact direct-loader
+            closure or the strongest mechanically available converter-family inventory.
+        converter_inventory_status: Whether converter-only extras are exact or remain
+            unresolved because inherited/conditional converter hooks were not evaluated.
     """
 
     gguf_arch: str
@@ -88,6 +92,8 @@ class UpstreamArchitecture:
     converter_extra_tensor_names: tuple[str, ...] = ()
     expert_tensor_suffixes: tuple[str, ...] = ()
     tensor_suffixes: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    tensor_closure_status: str = ""
+    converter_inventory_status: str = ""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -152,6 +158,8 @@ def upstream_architectures() -> dict[str, UpstreamArchitecture]:
                 (family, tuple(suffixes))
                 for family, suffixes in fields.get("tensor_suffixes", {}).items()
             ),
+            tensor_closure_status=fields.get("tensor_closure_status", ""),
+            converter_inventory_status=fields.get("converter_inventory_status", ""),
         )
         for name, fields in _payload()["architectures"].items()
     }

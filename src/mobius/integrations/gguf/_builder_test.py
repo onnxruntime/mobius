@@ -4221,6 +4221,17 @@ class TestGGUFPreflightGuards:
             "grok",
             "grovemoe",
             "smallthinker",
+            "chameleon",
+            "cogvlm",
+            "deepseek2-ocr",
+            "gemma3n",
+            "hunyuan_vl",
+            "llama4",
+            "mistral3",
+            "paddleocr",
+            "qwen2vl",
+            "qwen3vl",
+            "qwen3vlmoe",
         ],
     )
     def test_deferred_audited_cohorts_fail_before_graph_construction(

@@ -31,6 +31,24 @@ from mobius.integrations.gguf._upstream import (
 )
 
 _UNCOVERED = sorted(set(upstream_architectures()) - {s.gguf_arch for s in iter_arch_specs()})
+_PINNED_VLM_TEXT_ARCHITECTURES = frozenset(
+    {
+        "chameleon",
+        "cogvlm",
+        "deepseek2-ocr",
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "hunyuan_vl",
+        "llama4",
+        "mistral3",
+        "muse-glimmer",
+        "paddleocr",
+        "qwen2vl",
+        "qwen3vl",
+        "qwen3vlmoe",
+    }
+)
 
 
 class TestPinIntegrity:
@@ -53,6 +71,14 @@ class TestPinIntegrity:
         # 47 architectures switch tensor shape on expert_count rather than on name.
         dual = [a for a in archs.values() if a.dual_moe]
         assert len(dual) == 47
+
+    def test_multimodal_text_census_is_explicit(self) -> None:
+        assert not (_PINNED_VLM_TEXT_ARCHITECTURES - upstream_architectures().keys())
+        assert {
+            architecture
+            for architecture in _PINNED_VLM_TEXT_ARCHITECTURES
+            if try_get_arch_spec(architecture) is None
+        } == set()
 
 
 class TestCoverageIsHonest:

@@ -150,6 +150,84 @@ _SMALLTHINKER_GGUF_GRAPH_REASON = (
     "the FFN norm with softmax/SwiGLU experts and has no matching per-layer RoPE schedule."
 )
 
+_CHAMELEON_GGUF_GRAPH_REASON = (
+    "The pinned Chameleon converter deliberately omits the VQ image tokenizer while the "
+    "text graph still requires bias-bearing Q/K norms, an additional swin_norm, and "
+    "image-vocabulary logit suppression. Mobius's similarly named Hugging Face VLM graph "
+    "does not prove that text-only GGUF contract, and full multimodal generation cannot be "
+    "reconstructed from the serialized file."
+)
+
+_COGVLM_GGUF_GRAPH_REASON = (
+    "The pinned CogVLM text graph has modality-routed visual-expert Q/K/V/output and FFN "
+    "banks in addition to the language projections. Its required cogvlm clip sidecar and "
+    "feature-selection contract are also deferred, so aliasing a generic LLaVA or Llama "
+    "graph would drop model-owned tensors and build the wrong package."
+)
+
+_DEEPSEEK2_OCR_GGUF_GRAPH_REASON = (
+    "DeepSeek-OCR2 is a paired text-plus-vision package, not a generic DeepSeek text model. "
+    "The text loader, deepseekocr/deepseekocr2 clip sidecars, SAM/projector stages, special "
+    "token mixing, and cache contract have no single suffix-exact Mobius ownership map. "
+    "Existing Hugging Face components therefore cannot justify partial GGUF construction."
+)
+
+_GEMMA3N_GGUF_GRAPH_REASON = (
+    "Gemma3n GGUF is the text member of a vision-and-audio package whose gemma3nv and "
+    "gemma3na clip companions carry distinct encoders and projectors. The text graph's "
+    "per-layer embeddings, multimodal token replacement, processor assumptions, and package "
+    "roles have not been validated against those pinned sidecar ABIs."
+)
+
+_HUNYUAN_VL_GGUF_GRAPH_REASON = (
+    "The pinned Hunyuan-VL decoder uses its own M-RoPE and Q/K-normalized text contract and "
+    "pairs with a hunyuanvl clip sidecar. Mobius's Hunyuan-VL-MoT registration is a different "
+    "dual-path architecture, so neither it nor the dense Hunyuan text model is a valid alias."
+)
+
+_LLAMA4_GGUF_GRAPH_REASON = (
+    "Llama4 GGUF is the text member of a paired multimodal package and may contain routed "
+    "experts and architecture-specific cross-modal layer scheduling. The llama4 clip vision "
+    "tower, token mixing, position IDs, and package ABI remain deferred; text-backbone "
+    "similarity is not evidence that the complete GGUF tensor closure is owned."
+)
+
+_MISTRAL3_GGUF_GRAPH_REASON = (
+    "The pinned Mistral3 loader selects dense or routed-expert text blocks from metadata and "
+    "applies architecture-specific output temperature scaling. A VLM package additionally "
+    "requires the deferred Pixtral clip sidecar and exact patch/merge/token contract. The "
+    "existing Hugging Face Mistral3 graph does not cover that conditional GGUF closure."
+)
+
+_PADDLEOCR_GGUF_GRAPH_REASON = (
+    "PaddleOCR-VL uses an ERNIE-derived GGUF loader with an optional bias on attention output "
+    "closure and a required paddleocr clip vision/projector sidecar. Its processor ranks, "
+    "image-token counts, offsets, and package identity have no pinned Mobius GGUF parity "
+    "evidence, so it cannot be accepted as an ordinary Qwen2 text file."
+)
+
+_QWEN2VL_GGUF_GRAPH_REASON = (
+    "The qwen2vl architecture is shared by Qwen2-VL, Qwen2.5-VL, and Qwen2.5-Omni converter "
+    "paths whose clip companions use different projector strings and modalities. Exact "
+    "M-RoPE sections, special tokens, merger dimensions, processor ordering, and target "
+    "identity must select one complete package; a generic Qwen2 alias would erase those "
+    "distinctions."
+)
+
+_QWEN3VL_GGUF_GRAPH_REASON = (
+    "Qwen3-VL text GGUF requires multimodal position IDs and an exact qwen3vl_merger clip "
+    "companion, including deep-stack vision features and architecture-specific token "
+    "placement. The existing Hugging Face text graph alone does not establish sidecar tensor "
+    "closure, processor parity, or a safe text-only fallback."
+)
+
+_QWEN3VLMOE_GGUF_GRAPH_REASON = (
+    "Qwen3-VL-MoE combines the Qwen3-VL multimodal position/token contract and merger "
+    "sidecar with routed experts in the text backbone. Generic Qwen3-MoE tensor similarity "
+    "does not cover the paired vision package, expert sidecars, effective tied head "
+    "ownership, or multimodal cache ABI."
+)
+
 _MINICPM3_GRAPH_REASON = (
     "The pinned MiniCPM3 graph uses MLA Q/KV LoRA projections, separate NoPE/RoPE "
     "query and key channels, and embedding, residual, and LM-head scales. The current "
@@ -960,6 +1038,95 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
         reason=_SMALLTHINKER_GGUF_GRAPH_REASON,
+    ),
+    # ------------------------------ Remaining multimodal text backbones (audited/deferred)
+    GGUFArchitectureSpec(
+        gguf_arch="chameleon",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_CHAMELEON_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="cogvlm",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_COGVLM_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="deepseek2-ocr",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_DEEPSEEK2_OCR_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="gemma3n",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_GEMMA3N_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="hunyuan_vl",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_HUNYUAN_VL_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="llama4",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_LLAMA4_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="mistral3",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_MISTRAL3_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="paddleocr",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_PADDLEOCR_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen2vl",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_QWEN2VL_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen3vl",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_QWEN3VL_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen3vlmoe",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_QWEN3VLMOE_GGUF_GRAPH_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="cohere2",

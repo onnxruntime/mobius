@@ -891,6 +891,331 @@ class TestPinnedRemainingConventionalMoECohort:
         assert try_get_arch_spec("gpt-oss").model_type is None
 
 
+class TestPinnedRemainingVLMTextCohort:
+    """Refuse incomplete text or paired packages for every remaining VLM identifier."""
+
+    _ARCHITECTURES = (
+        "chameleon",
+        "cogvlm",
+        "deepseek2-ocr",
+        "gemma3n",
+        "hunyuan_vl",
+        "llama4",
+        "mistral3",
+        "paddleocr",
+        "qwen2vl",
+        "qwen3vl",
+        "qwen3vlmoe",
+    )
+    _PAIRED_ARCHITECTURES = frozenset(_ARCHITECTURES) - {"chameleon"}
+    _EXPECTED_LOADER_COUNTS: ClassVar[dict[str, int]] = {
+        "chameleon": 21,
+        "cogvlm": 16,
+        "deepseek2-ocr": 21,
+        "gemma3n": 37,
+        "hunyuan_vl": 19,
+        "llama4": 25,
+        "mistral3": 31,
+        "qwen2vl": 18,
+        "qwen3vl": 20,
+        "qwen3vlmoe": 20,
+    }
+
+    @pytest.mark.parametrize("architecture", sorted(_EXPECTED_LOADER_COUNTS))
+    def test_direct_loader_inventory_and_projection_sidecars_are_suffix_exact(
+        self, architecture: str
+    ) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert upstream.tensor_closure_status == "exact-direct-loader-conditional-union"
+        assert len(upstream.tensor_names) == self._EXPECTED_LOADER_COUNTS[architecture]
+        assert all(name.endswith((".weight", ".bias")) for name in upstream.tensor_names)
+        suffixes = dict(upstream.tensor_suffixes)
+        assert suffixes["output"] in {
+            ("weight", "scale", "input_scale"),
+            ("weight", "bias", "scale", "input_scale"),
+        }
+        assert all(
+            "zero_point" not in suffix for values in suffixes.values() for suffix in values
+        )
+        for family, family_suffixes in suffixes.items():
+            assert family.endswith(
+                (
+                    "output",
+                    "attn_q",
+                    "attn_k",
+                    "attn_v",
+                    "attn_qkv",
+                    "attn_output",
+                    "ffn_gate",
+                    "ffn_down",
+                    "ffn_up",
+                    "ffn_gate_exps",
+                    "ffn_down_exps",
+                    "ffn_up_exps",
+                    "ffn_gate_up_exps",
+                    "ffn_gate_shexp",
+                    "ffn_down_shexp",
+                    "ffn_up_shexp",
+                    "vis_attn_qkv",
+                    "vis_attn_output",
+                    "vis_gate",
+                    "vis_down",
+                    "vis_up",
+                    "altup_proj",
+                    "altup_unembd_proj",
+                    "per_layer_model_proj",
+                    "inp_gate",
+                    ".proj",
+                    "altup_router",
+                    "laurel_l",
+                    "laurel_r",
+                    "cls.output",
+                )
+            ), family
+            assert family_suffixes[0] == "weight"
+
+    def test_paddleocr_records_only_the_mechanically_proven_converter_inventory(
+        self,
+    ) -> None:
+        upstream = upstream_architectures()["paddleocr"]
+        assert upstream.tensor_closure_status == (
+            "strongest-converter-family-inventory-loader-inherited-from-ernie4_5-with-"
+            "optional-attn-output-bias"
+        )
+        assert upstream.tensor_names == ()
+        assert set(upstream.tensor_families) == {
+            "token_embd",
+            "output_norm",
+            "output",
+            "blk.{bid}.attn_norm",
+            "blk.{bid}.attn_q",
+            "blk.{bid}.attn_k",
+            "blk.{bid}.attn_v",
+            "blk.{bid}.attn_output",
+            "blk.{bid}.ffn_norm",
+            "blk.{bid}.ffn_gate",
+            "blk.{bid}.ffn_down",
+            "blk.{bid}.ffn_up",
+        }
+
+    def test_custom_loader_tensors_do_not_inherit_generic_quant_sidecars(self) -> None:
+        expected_weight_only = {
+            "cogvlm": {
+                "blk.{bid}.vis_attn_qkv",
+                "blk.{bid}.vis_attn_output",
+                "blk.{bid}.vis_gate",
+                "blk.{bid}.vis_down",
+                "blk.{bid}.vis_up",
+            },
+            "deepseek2-ocr": {"blk.{bid}.ffn_gate_up_exps"},
+            "gemma3n": {
+                "altup_proj",
+                "altup_unembd_proj",
+                "per_layer_model_proj",
+                "blk.{bid}.inp_gate",
+                "blk.{bid}.proj",
+                "blk.{bid}.altup_router",
+                "blk.{bid}.laurel_l",
+                "blk.{bid}.laurel_r",
+            },
+            "qwen3vl": {"cls.output"},
+        }
+        for architecture, families in expected_weight_only.items():
+            suffixes = dict(upstream_architectures()[architecture].tensor_suffixes)
+            assert all(suffixes[family] == ("weight",) for family in families)
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "chameleon",
+            "gemma3n",
+            "hunyuan_vl",
+            "llama4",
+            "mistral3",
+            "qwen2vl",
+            "qwen3vl",
+            "qwen3vlmoe",
+        ],
+    )
+    def test_qkv_helper_loader_inventories_include_fused_and_split_branches(
+        self, architecture: str
+    ) -> None:
+        upstream = upstream_architectures()[architecture]
+        names = set(upstream.tensor_names)
+        suffixes = dict(upstream.tensor_suffixes)
+        for projection in ("qkv", "q", "k", "v"):
+            family = f"blk.{{bid}}.attn_{projection}"
+            assert {f"{family}.weight", f"{family}.bias"} <= names
+            assert suffixes[family] == ("weight", "bias", "scale", "input_scale")
+
+    def test_converter_inventory_status_does_not_turn_an_allowlist_into_a_claim(
+        self,
+    ) -> None:
+        chameleon = upstream_architectures()["chameleon"]
+        assert chameleon.converter_inventory_status == "exact-no-extra-tensors"
+        assert chameleon.converter_extra_tensor_names == ()
+        for architecture in self._PAIRED_ARCHITECTURES:
+            upstream = upstream_architectures()[architecture]
+            assert upstream.converter_inventory_status == (
+                "unresolved-inherited-conditional-converter-hooks"
+            )
+            assert upstream.converter_extra_tensor_names == ()
+
+    def test_conditional_tensor_representations_remain_distinct(self) -> None:
+        chameleon = set(upstream_architectures()["chameleon"].tensor_names)
+        cogvlm = set(upstream_architectures()["cogvlm"].tensor_names)
+        deepseek = set(upstream_architectures()["deepseek2-ocr"].tensor_names)
+        gemma3n = set(upstream_architectures()["gemma3n"].tensor_names)
+        llama4 = set(upstream_architectures()["llama4"].tensor_names)
+        mistral3 = set(upstream_architectures()["mistral3"].tensor_names)
+        qwen2vl = set(upstream_architectures()["qwen2vl"].tensor_names)
+        qwen3vl = set(upstream_architectures()["qwen3vl"].tensor_names)
+        qwen3vlmoe = set(upstream_architectures()["qwen3vlmoe"].tensor_names)
+
+        assert {
+            "blk.{bid}.attn_q_norm.bias",
+            "blk.{bid}.attn_k_norm.bias",
+        } <= chameleon
+        assert {
+            "blk.{bid}.vis_attn_qkv.weight",
+            "blk.{bid}.vis_gate.weight",
+        } <= cogvlm
+        assert {
+            "blk.{bid}.ffn_gate_up_exps.weight",
+            "blk.{bid}.exp_probs_b.bias",
+        } <= deepseek
+        assert {
+            "per_layer_token_embd.weight",
+            "blk.{bid}.altup_router.weight",
+            "blk.{bid}.laurel_l.weight",
+        } <= gemma3n
+        assert {
+            "blk.{bid}.ffn_gate.weight",
+            "blk.{bid}.ffn_gate_exps.weight",
+            "blk.{bid}.ffn_gate_shexp.weight",
+        } <= llama4
+        assert {
+            "rope_factors_long.weight",
+            "rope_factors_short.weight",
+            "blk.{bid}.ffn_gate.bias",
+            "blk.{bid}.ffn_gate_exps.weight",
+        } <= mistral3
+        assert "output.bias" in qwen2vl
+        assert "cls.output.weight" in qwen3vl
+        assert "cls.output.weight" not in qwen3vlmoe
+        assert "blk.{bid}.ffn_gate_exps.weight" in qwen3vlmoe
+        assert "blk.{bid}.ffn_gate.weight" not in qwen3vlmoe
+
+    def test_loader_global_rope_tensors_are_not_layer_qualified(self) -> None:
+        expected = {
+            "cogvlm": {"rope_freqs.weight"},
+            "llama4": {"rope_freqs.weight"},
+            "mistral3": {
+                "rope_freqs.weight",
+                "rope_factors_long.weight",
+                "rope_factors_short.weight",
+            },
+        }
+        for architecture, global_names in expected.items():
+            names = set(upstream_architectures()[architecture].tensor_names)
+            assert global_names <= names
+            assert not {f"blk.{{bid}}.{name}" for name in global_names} & names
+
+    @pytest.mark.parametrize(
+        "architecture", ["deepseek2-ocr", "llama4", "mistral3", "qwen3vlmoe"]
+    )
+    def test_generic_expert_sidecars_are_never_dropped(self, architecture: str) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert upstream.expert_tensor_suffixes == ("weight", "scale", "input_scale")
+        expert_families = [
+            family
+            for family in dict(upstream.tensor_suffixes)
+            if family.endswith(("_exps", "_shexp")) and not family.endswith("ffn_gate_up_exps")
+        ]
+        assert expert_families
+        for family in expert_families:
+            assert dict(upstream.tensor_suffixes)[family] == (
+                "weight",
+                "scale",
+                "input_scale",
+            )
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_no_false_alias_config_tensor_or_runtime_claim_is_reachable(
+        self, architecture: str
+    ) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None
+        assert not spec.aliases
+        assert spec.model_type is None
+        assert spec.config_key_map is None
+        assert spec.tensor_map_recipe == ()
+        assert spec.vlm_builder is None
+        assert all(verdict is Support.DEFERRED for verdict in spec.verdicts.values())
+        assert architecture not in GGUF_ARCH_TO_MODEL_TYPE
+
+    @pytest.mark.parametrize(
+        ("architecture", "reason_terms"),
+        [
+            ("chameleon", ("VQ image tokenizer", "swin_norm", "text-only")),
+            ("cogvlm", ("visual-expert", "cogvlm clip sidecar", "wrong package")),
+            ("deepseek2-ocr", ("text-plus-vision", "SAM/projector", "partial")),
+            ("gemma3n", ("vision-and-audio", "per-layer embeddings", "package roles")),
+            ("hunyuan_vl", ("M-RoPE", "Hunyuan-VL-MoT", "different")),
+            ("llama4", ("routed experts", "llama4 clip", "text-backbone")),
+            ("mistral3", ("dense or routed-expert", "temperature", "Pixtral")),
+            ("paddleocr", ("optional bias", "image-token", "ordinary Qwen2")),
+            ("qwen2vl", ("Qwen2.5-Omni", "projector strings", "target identity")),
+            ("qwen3vl", ("multimodal position IDs", "deep-stack", "text-only")),
+            ("qwen3vlmoe", ("routed experts", "effective tied head", "cache ABI")),
+        ],
+    )
+    def test_family_specific_blocker_is_explicit(
+        self, architecture: str, reason_terms: tuple[str, ...]
+    ) -> None:
+        reason = try_get_arch_spec(architecture).reason
+        assert reason is not None
+        for term in reason_terms:
+            assert term in reason
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_every_architecture_fails_before_config_or_graph_construction(
+        self, architecture: str
+    ) -> None:
+        with pytest.raises(UnsupportedGGUFArchitectureError, match=architecture):
+            get_arch_spec(architecture)
+
+    def test_standalone_text_and_paired_package_verdicts_are_not_conflated(self) -> None:
+        chameleon_reason = try_get_arch_spec("chameleon").reason
+        assert chameleon_reason is not None
+        assert "converter deliberately omits the VQ image tokenizer" in chameleon_reason
+        for architecture in self._PAIRED_ARCHITECTURES:
+            reason = try_get_arch_spec(architecture).reason
+            assert reason is not None
+            assert any(term in reason for term in ("clip", "sidecar", "vision-and-audio"))
+
+    def test_valid_hugging_face_registrations_are_not_reused_as_gguf_aliases(self) -> None:
+        assert {
+            "chameleon",
+            "gemma3n_text",
+            "llama4_text",
+            "mistral3",
+            "qwen2_vl_text",
+            "qwen3_vl_text",
+            "qwen3_vl_moe",
+        } <= set(_REGISTRATIONS)
+        for architecture in self._ARCHITECTURES:
+            assert try_get_arch_spec(architecture).model_type is None
+
+    def test_existing_exact_paired_builders_remain_the_only_supported_pairs(self) -> None:
+        exact = {
+            spec.gguf_arch: spec.vlm_builder
+            for spec in iter_arch_specs()
+            if spec.vlm_builder is not None
+        }
+        assert exact == {"gemma4": "gemma4", "muse-glimmer": "muse_glimmer"}
+
+
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
 
