@@ -721,10 +721,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             # Official reference unconditionally restricts every layer to
             # this many most-recent positions (`get_window_topk_idxs`),
             # regardless of `compress_ratios` -- see
-            # `DeepSeekV4Attention.local_window_size`. Deliberately smaller
-            # than the parity tests' sequence length so windowing is
-            # actually exercised (matches the `sliding_window: 8` tiny-config
-            # convention used by gemma/gemma4/muse-glimmer above).
+            # `DeepSeekV4Attention.local_window_size`. Matches the
+            # `sliding_window: 8` tiny-config convention used by
+            # gemma/gemma4/muse-glimmer above; exercised end-to-end by
+            # `deepseek_v4_flash_test.py`'s dedicated window tests (this
+            # entry's forward-executing consumers currently use a shorter
+            # sequence length and/or are skipped for deepseek_v4 for
+            # unrelated pre-existing reasons, so this value isn't itself
+            # numerically exercised by the generic parity/build/
+            # weight-alignment suites).
             "sliding_window": 8,
         },
         True,

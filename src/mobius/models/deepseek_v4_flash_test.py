@@ -209,14 +209,29 @@ def test_sliding_window_sets_local_window_size_on_fused_gqa_regardless_of_compre
     attention correctly here -- the additional compressed/indexer-selected
     positions those layers union in remain a separate, tracked gap (see
     ``docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md``, not addressed by this test.
+    The MTP sidecar (``DeepSeekV4Mtp``) is a regular ratio-0 decoder layer
+    bound by the same mandatory window, so it's checked here too (a plain
+    ``compress_ratios=[0]`` layer, since MTP doesn't schedule its own
+    ratios).
     """
-    config = _tiny_config(num_hidden_layers=3, compress_ratios=[0, 4, 128], sliding_window=8)
-    graph = build_from_module(
-        DeepSeekV4CausalLMModel(config), config, execution_provider="cpu"
-    )["model"].graph
+    config = _tiny_config(
+        num_hidden_layers=3,
+        compress_ratios=[0, 4, 128],
+        sliding_window=8,
+        num_nextn_predict_layers=1,
+    )
+    package = build_from_module(
+        DeepSeekV4CausalLMModel(config), config, task="deepseek-v4", execution_provider="cpu"
+    )
+
+    graph = package["model"].graph
     gqa_nodes = [node for node in graph if node.op_type == "GroupQueryAttention"]
     assert len(gqa_nodes) == config.num_hidden_layers
     assert all(node.attributes["local_window_size"].as_int() == 8 for node in gqa_nodes)
+
+    mtp_graph = package["mtp"].graph
+    (mtp_gqa_node,) = [node for node in mtp_graph if node.op_type == "GroupQueryAttention"]
+    assert mtp_gqa_node.attributes["local_window_size"].as_int() == 8
 
 
 def test_csa_schedule_exports_compressor_and_indexer_tensors_with_dense_attention():
