@@ -494,6 +494,17 @@ class ArchitectureConfig(BaseModelConfig):
     num_hash_layers: int = 0
     swiglu_limit: float = 0.0
     num_nextn_predict_layers: int = 0
+    # DeepSeek-V4 native compressed-sparse-attention export toggle. Not an
+    # upstream HF field -- a Mobius export-time opt-in (default False) that
+    # replaces the dense CSA/HCA correctness fallback with the frozen
+    # ``pkg.nxrt::CompressedSparseAttention`` v1 op for property-matching
+    # ratio-128 (HCA) layers. Off by default so every shipped graph stays
+    # byte-identical and ``pkg.nxrt``-free unless explicitly requested via
+    # ``config_overrides={"native_csa": True}``. When requested, layers that
+    # do not satisfy the frozen op contract raise a typed export error rather
+    # than silently emitting the dense fallback (see
+    # ``mobius.models._deepseek_v4_csa``).
+    native_csa: bool = False
 
     # GLM-5.2 (``glm_moe_dsa``) DeepSeek Sparse Attention (DSA).
     #
@@ -963,6 +974,11 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", 0.0),
             num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
+            # DeepSeek-V4 native CSA/HCA export opt-in. No HF equivalent --
+            # every checkpoint defaults to the dense correctness fallback;
+            # ``config_overrides={"native_csa": True}`` opts a build into the
+            # frozen ``pkg.nxrt::CompressedSparseAttention`` v1 ratio-128 path.
+            native_csa=getattr(config, "native_csa", False),
             # GLM-5.2 DSA. ``use_dsa`` has no HF equivalent -- every checkpoint
             # defaults to the sparse path; ``--glm-full-attention`` overrides
             # it afterwards via ``dataclasses.replace``/``config_overrides``.

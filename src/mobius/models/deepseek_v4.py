@@ -42,9 +42,26 @@ from mobius.components import (
 )
 from mobius.components._moe import _scatter_selected_to_full
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
+from mobius.models._deepseek_v4_csa import (
+    HcaLayerPlan,
+    NativeCsaExportError,
+    emit_hca_attention,
+    plan_native_csa,
+)
 from mobius.models.base import CausalLMModel
 
 logger = logging.getLogger(__name__)
+
+
+def _cast_to_f32(op: OpBuilder, value: ir.Value, model_dtype: ir.DataType) -> ir.Value:
+    """Cast a model-dtype activation to FLOAT for the f32-only CSA op inputs.
+
+    No-op when the build dtype is already FLOAT so the common f32 export
+    stays Cast-free (and byte-identical to the pre-CSA graph on that path).
+    """
+    if model_dtype == ir.DataType.FLOAT:
+        return value
+    return op.Cast(value, to=ir.DataType.FLOAT)
 
 
 def _use_fused_gqa() -> bool:
@@ -155,15 +172,41 @@ class DeepSeekV4DeferredProjection(nn.Module):
                 dtype=ir.DataType.UINT8,
             )
 
-    def forward(self, op: OpBuilder) -> ir.Value:
-        return _shape_anchor(
-            op,
-            [
-                value
-                for value in (self.weight, self.scales, self.zero_points)
-                if value is not None
-            ],
-        )
+    def forward(self, op: OpBuilder, x: ir.Value | None = None) -> ir.Value:
+        """Zero-valued shape anchor (dense fallback) or the real projection.
+
+        With ``x is None`` (the deferred dense-fallback path) this emits a
+        zero-valued shape anchor that keeps the projection weight live in the
+        graph without executing it. With ``x`` supplied (the native-CSA
+        dataflow) it computes the real ``x @ weight.T`` projection so the
+        compressor activations feeding ``pkg.nxrt::CompressedSparseAttention``
+        are genuine.
+
+        Both paths run through ``forward`` (invoked via ``Module.__call__``) on
+        purpose: ``__call__`` realizes this module's parameters -- qualifies
+        each name and registers it as a graph initializer -- *before* calling
+        ``forward``. A bare helper method that used ``self.weight`` directly
+        would leave the weight unrealized (dangling, unregistered) and break
+        graph serialization. Only the unquantized weight layout is supported
+        for the real projection; a quantized compressor weight raises so
+        native CSA never silently drops the quantization.
+        """
+        if x is None:
+            return _shape_anchor(
+                op,
+                [
+                    value
+                    for value in (self.weight, self.scales, self.zero_points)
+                    if value is not None
+                ],
+            )
+        if self._gguf_quantized_linear:
+            raise NativeCsaExportError(
+                "native CSA C1 cannot project a quantized compressor weight; "
+                "the frozen op consumes f32 compressor activations. Quantized "
+                "compressor dequant is a follow-up slice"
+            )
+        return op.MatMul(x, op.Transpose(self.weight, perm=[1, 0]))
 
 
 class DeepSeekV4DeferredNorm(nn.Module):
@@ -171,7 +214,16 @@ class DeepSeekV4DeferredNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter([hidden_size])
 
-    def forward(self, op: OpBuilder) -> ir.Value:
+    def forward(self, op: OpBuilder, *, raw: bool = False) -> ir.Value:
+        """Zero-valued shape anchor (dense fallback) or the realized weight.
+
+        ``__call__`` realizes ``self.weight`` before ``forward`` runs, so with
+        ``raw=True`` (native-CSA dataflow) the already-registered weight is
+        returned directly for the op's ``compressor_norm`` input; otherwise a
+        zero-valued shape anchor keeps the weight live without executing it.
+        """
+        if raw:
+            return self.weight
         return _shape_anchor(op, [self.weight])
 
 
@@ -366,16 +418,33 @@ class DeepSeekV4CompressorTensors(nn.Module):
         )
         self.norm = DeepSeekV4DeferredNorm(head_dim)
 
-    def forward(self, op: OpBuilder) -> ir.Value:
-        anchor = _shape_anchor(
-            op,
-            [
-                self.ape,
-            ],
-        )
-        anchor = op.Add(anchor, self.wkv(op))
-        anchor = op.Add(anchor, self.wgate(op))
-        return op.Add(anchor, self.norm(op))
+    def forward(self, op: OpBuilder, hidden_states: ir.Value | None = None):
+        """Zero-valued shape anchor (dense fallback) or live compressor tensors.
+
+        With ``hidden_states is None`` (deferred dense fallback) this emits the
+        zero-valued shape anchor that keeps ``ape``/``wkv``/``wgate``/``norm``
+        live in the graph. With ``hidden_states`` supplied (native-CSA
+        dataflow) it returns ``(compressor_kv, compressor_gate, ape,
+        norm_weight)``: ``compressor_kv``/``compressor_gate`` are the projected
+        ``W·x`` activations (``[B, S, overlap*head_dim]``) and ``ape``/the norm
+        weight are the learned parameters. Every parameter is realized here by
+        routing through each child's ``__call__`` (``self.wkv(op, ...)``,
+        ``self.norm(op, raw=True)``) and by ``__call__`` realizing ``self.ape``
+        before ``forward`` runs.
+        """
+        if hidden_states is None:
+            anchor = _shape_anchor(
+                op,
+                [
+                    self.ape,
+                ],
+            )
+            anchor = op.Add(anchor, self.wkv(op))
+            anchor = op.Add(anchor, self.wgate(op))
+            return op.Add(anchor, self.norm(op))
+        compressor_kv = self.wkv(op, hidden_states)
+        compressor_gate = self.wgate(op, hidden_states)
+        return compressor_kv, compressor_gate, self.ape, self.norm(op, raw=True)
 
 
 class DeepSeekV4IndexerTensors(nn.Module):
@@ -406,7 +475,7 @@ class DeepSeekV4IndexerTensors(nn.Module):
 class DeepSeekV4Attention(nn.Module):
     """V4 MQA projections using sink-aware dense causal attention."""
 
-    def __init__(self, config: ArchitectureConfig, layer_id: int):
+    def __init__(self, config: ArchitectureConfig, layer_id: int, *, is_mtp: bool = False):
         super().__init__()
         assert config.q_lora_rank is not None
         assert config.qk_rope_head_dim is not None
@@ -443,6 +512,7 @@ class DeepSeekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
         self.rope_interleave = config.rope_interleave
+        self._dtype = config.dtype
         # Official reference (`inference/model.py::Attention.forward`,
         # `get_window_topk_idxs`) unconditionally restricts every layer -
         # regardless of `compress_ratio` - to a circular-buffer local window
@@ -471,6 +541,12 @@ class DeepSeekV4Attention(nn.Module):
             else None
         )
         self.indexer = DeepSeekV4IndexerTensors(config) if self.compress_ratio == 4 else None
+        # Property gate (default off). Resolves to an HcaLayerPlan only for a
+        # ratio-128 layer whose config matches the frozen op contract, and
+        # raises NativeCsaExportError (never silent dense) for ratio-4/MTP/
+        # unsupported-quant when native CSA is requested. See
+        # mobius.models._deepseek_v4_csa.
+        self.csa_plan: HcaLayerPlan | None = plan_native_csa(config, layer_id, is_mtp=is_mtp)
 
     def _rotate(
         self,
@@ -533,6 +609,109 @@ class DeepSeekV4Attention(nn.Module):
             ),
         )
 
+    def _forward_native_hca(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        query: ir.Value,
+        kv: ir.Value,
+        past_key_value: tuple | None,
+        past_compressed: tuple | None,
+        csa_lengths: tuple | None,
+    ) -> tuple[ir.Value, ir.Value, ir.Value, tuple[ir.Value, ir.Value]]:
+        """Emit the frozen ratio-128 HCA op for this layer (native-CSA path).
+
+        ``query``/``kv`` arrive already RoPE-rotated (compressed rope theta) by
+        the caller, exactly as the dense paths receive them; the op has no
+        cos/sin/position inputs and only rotates its *compressed records*
+        internally, so the dense-window ``query``/``current_kv`` must be
+        pre-rotated here and the shared inverse ``_rotate`` still runs on the
+        op's ``Y`` after this returns. Builds:
+
+        * ``query`` as rank-4 BSND ``[B, S, num_heads, head_dim]``;
+        * ``current_kv`` ``[B, K, head_dim]`` -- the dense sliding-window ring
+          reuses the existing dense KV IO (``past_key_values.{i}`` ->
+          ``present.{i}``), stored BNSD ``[B, 1, K, head_dim]`` (MQA, one kv
+          head) like the decomposed path, then squeezed for the op;
+        * real, *unrotated* compressor activations (the op pools then rotates
+          the compressed records internally at their block positions);
+        * the threaded ``past_* -> present_*`` compressed state.
+
+        Returns ``(output, present_key, present_value, present_compressed)``
+        with ``output`` flattened ``[B, S, num_heads*head_dim]`` in the rotated
+        frame so the caller's shared inverse ``_rotate`` + output projection
+        apply unchanged.
+        """
+        plan = self.csa_plan
+        assert plan is not None
+        if csa_lengths is None:
+            raise NativeCsaExportError(
+                f"native CSA layer {plan.layer_id} requires seqlens_k/"
+                "total_sequence_length; csa_lengths was not threaded to the "
+                "attention layer"
+            )
+        if past_compressed is None:
+            raise NativeCsaExportError(
+                f"native CSA layer {plan.layer_id} requires past_compressed_kv/"
+                "past_compression_carry state; none was threaded to the layer"
+            )
+        seqlens_k, total_seq_len = csa_lengths
+        past_compressed_kv, past_compression_carry = past_compressed
+
+        query_4d = op.Reshape(query, [0, 0, self.num_heads, self.head_dim])
+
+        # Dense sliding-window ring: present KV stored BNSD [B, 1, K, head_dim]
+        # (one MQA kv head) exactly like the decomposed path -- key and value
+        # carry identical data (MQA) but must be *distinct* graph values so the
+        # present.{i}.key/value cache outputs don't collapse onto one tensor.
+        # ``current_kv`` squeezes the head axis to [B, K, head_dim] for the op.
+        new_kv = op.Transpose(op.Reshape(kv, [0, 0, 1, self.head_dim]), perm=[0, 2, 1, 3])
+        if past_key_value is not None:
+            present_key = op.Concat(past_key_value[0], new_kv, axis=2)
+            present_value = op.Concat(past_key_value[1], new_kv, axis=2)
+        else:
+            present_key = new_kv
+            present_value = op.Identity(new_kv)
+        current_kv = op.Reshape(present_key, [0, -1, self.head_dim])
+
+        # Real, unrotated compressor activations replace the zero-valued shape
+        # anchor: wkv/wgate are live W·x projections, ape/norm are the learned
+        # parameters. Routed through the compressor's ``__call__`` so every
+        # compressor parameter is realized (named + registered as an
+        # initializer) rather than left dangling.
+        compressor_kv, compressor_gate, ape, norm_weight = self.compressor(op, hidden_states)
+
+        y, present_compressed_kv, present_compression_carry = emit_hca_attention(
+            op,
+            plan,
+            query=_cast_to_f32(op, query_4d, self._dtype),
+            current_kv=_cast_to_f32(op, current_kv, self._dtype),
+            compressor_kv=_cast_to_f32(op, compressor_kv, self._dtype),
+            compressor_gate=_cast_to_f32(op, compressor_gate, self._dtype),
+            compressor_ape=_cast_to_f32(op, ape, self._dtype),
+            compressor_norm=_cast_to_f32(op, norm_weight, self._dtype),
+            past_compressed_kv=past_compressed_kv,
+            past_compression_carry=past_compression_carry,
+            seqlens_k=seqlens_k,
+            total_sequence_length=op.Cast(total_seq_len, to=ir.DataType.INT64),
+            # ``head_sink`` is declared FLOAT but ``_cast_module_dtype`` folds
+            # it to the model dtype in a non-float build; the frozen op's
+            # ``head_sink`` is f32, so cast it back up when needed.
+            head_sink=_cast_to_f32(op, self.attn_sink, self._dtype),
+        )
+
+        # ``Y`` is [B, S, N, D] FLOAT; flatten to [B, S, N*D] and cast back to
+        # the model dtype for the shared inverse-RoPE + output projection.
+        output = op.Reshape(y, [0, 0, -1])
+        if self._dtype != ir.DataType.FLOAT:
+            output = op.Cast(output, to=self._dtype)
+        return (
+            output,
+            present_key,
+            present_value,
+            (present_compressed_kv, present_compression_carry),
+        )
+
     def forward(
         self,
         op: OpBuilder,
@@ -542,6 +721,8 @@ class DeepSeekV4Attention(nn.Module):
         attention_bias: ir.Value | None = None,
         seqlens_k: ir.Value | None = None,
         total_seq_len: ir.Value | None = None,
+        past_compressed: tuple | None = None,
+        csa_lengths: tuple | None = None,
     ):
         query = self.q_b_proj(op, self.q_a_layernorm(op, self.q_a_proj(op, hidden_states)))
         query_4d = op.Reshape(query, [0, 0, self.num_heads, self.head_dim])
@@ -557,7 +738,25 @@ class DeepSeekV4Attention(nn.Module):
         kv = self.kv_layernorm(op, self.kv_proj(op, hidden_states))
         kv = self._rotate(op, kv, position_embeddings, 1)
 
-        if seqlens_k is not None:
+        present_compressed = None
+        if self.csa_plan is not None:
+            # Native CSA/HCA path (default-off ``config.native_csa`` opt-in).
+            # Emits the frozen ratio-128 ``pkg.nxrt::CompressedSparseAttention``
+            # op instead of the dense correctness fallback; the compressor
+            # tensors are consumed as real dataflow here rather than as a
+            # zero-valued shape anchor below. ``output`` comes back flattened
+            # in the rotated frame, so the shared inverse ``_rotate`` and the
+            # output projection run unchanged.
+            output, present_key, present_value, present_compressed = self._forward_native_hca(
+                op,
+                hidden_states,
+                query,
+                kv,
+                past_key_value,
+                past_compressed,
+                csa_lengths,
+            )
+        elif seqlens_k is not None:
             # Fused causal attention core, used only when the active EP's
             # `ep_capabilities().gqa_dtypes` includes the build dtype (see
             # `_use_fused_gqa`). `query`/`kv` are already RoPE-rotated
@@ -664,7 +863,12 @@ class DeepSeekV4Attention(nn.Module):
 
         output = self._rotate(op, output, position_embeddings, self.num_heads, inverse=True)
 
-        if self.compressor is not None:
+        if self.compressor is not None and self.csa_plan is None:
+            # Zero-valued shape anchor for the dense correctness fallback,
+            # keeping the deferred compressor/indexer weights live in the
+            # graph. Skipped on the native-CSA path, where those same weights
+            # are consumed as real dataflow inside ``_forward_native_hca`` --
+            # so a native-CSA layer emits no dead anchor arithmetic.
             anchor = self.compressor(op)
             if self.indexer is not None:
                 anchor = op.Add(anchor, self.indexer(op))
@@ -689,13 +893,13 @@ class DeepSeekV4Attention(nn.Module):
                 )
             )
         output = self.o_b_proj(op, op.Concat(*projected_groups, axis=-1))
-        return output, (present_key, present_value)
+        return output, (present_key, present_value), present_compressed
 
 
 class DeepSeekV4DecoderLayer(nn.Module):
-    def __init__(self, config: ArchitectureConfig, layer_id: int):
+    def __init__(self, config: ArchitectureConfig, layer_id: int, *, is_mtp: bool = False):
         super().__init__()
-        self.self_attn = DeepSeekV4Attention(config, layer_id)
+        self.self_attn = DeepSeekV4Attention(config, layer_id, is_mtp=is_mtp)
         self.mlp = DeepSeekV4MoE(config, layer_id)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -774,6 +978,8 @@ class DeepSeekV4DecoderLayer(nn.Module):
         attention_bias: ir.Value | None = None,
         seqlens_k: ir.Value | None = None,
         total_seq_len: ir.Value | None = None,
+        past_compressed: tuple | None = None,
+        csa_lengths: tuple | None = None,
     ):
         residual = hidden_states
         value, post, comb = self._hc_pre(
@@ -783,7 +989,7 @@ class DeepSeekV4DecoderLayer(nn.Module):
             self.hc_attn_scale,
             self.hc_attn_base,
         )
-        value, present = self.self_attn(
+        value, present, present_compressed = self.self_attn(
             op,
             self.input_layernorm(op, value),
             position_embeddings,
@@ -791,6 +997,8 @@ class DeepSeekV4DecoderLayer(nn.Module):
             attention_bias,
             seqlens_k,
             total_seq_len,
+            past_compressed,
+            csa_lengths,
         )
         hidden_states = self._hc_post(op, value, residual, post, comb)
 
@@ -804,7 +1012,7 @@ class DeepSeekV4DecoderLayer(nn.Module):
         )
         value = self.mlp(op, self.post_attention_layernorm(op, value), input_ids)
         hidden_states = self._hc_post(op, value, residual, post, comb)
-        return hidden_states, present
+        return hidden_states, present, present_compressed
 
 
 class DeepSeekV4TextModel(nn.Module):
@@ -851,6 +1059,7 @@ class DeepSeekV4TextModel(nn.Module):
             )
         )
         self._dtype = config.dtype
+        self.native_csa = config.native_csa
         # See `DeepSeekV4Attention.local_window_size`: the reference always
         # restricts attention to this window, so the decomposed path's
         # shared bias (built once here for every layer) must bake it in too.
@@ -879,6 +1088,7 @@ class DeepSeekV4TextModel(nn.Module):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        past_compressed_states: list | None = None,
     ):
         hidden_states = (
             inputs_embeds if inputs_embeds is not None else self.embed_tokens(op, input_ids)
@@ -901,15 +1111,30 @@ class DeepSeekV4TextModel(nn.Module):
                 dtype=self._dtype,
             )
             seqlens_k, total_seq_len = None, None
+        # The native-CSA op needs seqlens_k/total_sequence_length regardless of
+        # the dense path's fused-GQA gate. Compute them only when the feature
+        # is enabled, and reuse the fused-path lengths when that path already
+        # built them so a GQA-capable EP emits no duplicate length nodes. This
+        # intentionally does NOT feed the dense `seqlens_k` gate above: leaving
+        # it None on non-GQA EPs keeps non-CSA layers on the portable
+        # decomposed path (no stray `com.microsoft` ops on a `default` EP).
+        csa_lengths = None
+        if self.native_csa:
+            if seqlens_k is not None:
+                csa_lengths = (seqlens_k, total_seq_len)
+            else:
+                csa_lengths = _gqa_kv_lengths(op, attention_mask)
         presents = []
+        present_compressed_states = []
         past_kvs = past_key_values or [None] * len(self.layers)
-        for layer, past_kv in zip(self.layers, past_kvs):
+        past_compressed = past_compressed_states or [None] * len(self.layers)
+        for layer, past_kv, past_comp in zip(self.layers, past_kvs, past_compressed):
             layer_position_embeddings = (
                 compressed_position_embeddings
                 if layer.self_attn.compress_ratio
                 else position_embeddings
             )
-            hidden_states, present = layer(
+            hidden_states, present, present_compressed = layer(
                 op,
                 hidden_states,
                 input_ids,
@@ -918,16 +1143,24 @@ class DeepSeekV4TextModel(nn.Module):
                 attention_bias,
                 seqlens_k,
                 total_seq_len,
+                past_comp,
+                csa_lengths,
             )
             presents.append(present)
-        return self.norm(op, self._hc_head(op, hidden_states)), presents, hidden_states
+            present_compressed_states.append(present_compressed)
+        return (
+            self.norm(op, self._hc_head(op, hidden_states)),
+            presents,
+            present_compressed_states,
+            hidden_states,
+        )
 
 
 class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
     """Official single MTP block, sharing target embeddings and LM head externally."""
 
     def __init__(self, config: ArchitectureConfig, layer_id: int):
-        super().__init__(config, layer_id)
+        super().__init__(config, layer_id, is_mtp=True)
         projection = _projection_class(config)
         self.e_proj = projection(config.hidden_size, config.hidden_size, bias=False)
         self.h_proj = projection(config.hidden_size, config.hidden_size, bias=False)
@@ -991,7 +1224,7 @@ class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
                 dtype=self._dtype,
             )
             seqlens_k, total_seq_len = None, None
-        hidden_states, present = super().forward(
+        hidden_states, present, _present_compressed = super().forward(
             op,
             hidden_states,
             None,
@@ -1042,7 +1275,7 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        hidden_states, presents, _ = self.model(
+        hidden_states, presents, _present_compressed, _hc_states = self.model(
             op,
             input_ids,
             attention_mask,

@@ -22,6 +22,12 @@ from mobius.components import create_attention_bias
 from mobius.components._rotary_embedding import initialize_rope
 from mobius.integrations.ort_genai import export_package
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
+from mobius.models._deepseek_v4_csa import (
+    CSA_DOMAIN,
+    HCA_COMPRESSION_RATIO,
+    NativeCsaExportError,
+    plan_native_csa,
+)
 from mobius.models.deepseek_v4 import (
     DeepSeekV4Attention,
     DeepSeekV4CausalLMModel,
@@ -637,7 +643,7 @@ def _run_attention_graph(
         )
         seqlens_k, total_seq_len = None, None
 
-    output, _ = attn(
+    output, _, _ = attn(
         op, hidden_states, position_embeddings, None, attention_bias, seqlens_k, total_seq_len
     )
     output.name = "output"
@@ -740,3 +746,273 @@ def test_missing_sliding_window_regression_fused_gqa_matches_windowed_decomposed
             "restriction as the decomposed path's explicit windowed bias"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Slice C1: default-off native ``pkg.nxrt::CompressedSparseAttention`` (HCA
+# ratio-128) export. These are shape-faithful/structural tests only: the
+# frozen op has no Python shape inference and no ORT runtime in this env, so
+# we assert exact op attrs, input/output names/shapes/dtypes, threaded
+# compressed state IO, real dataflow (no dead shape anchor), typed rejects,
+# and a byte-identical disabled baseline.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_HCA_ATTRS = {
+    "num_heads": 2,
+    "head_dim": 16,
+    "qk_rope_head_dim": 4,
+    "compression_ratio": 128,
+    "index_num_heads": 0,
+    "index_head_dim": 0,
+    "index_topk": 0,
+    "causal": 1,
+    "cache_layout_version": 1,
+    "index_layout_version": 1,
+    "sink_mode": "logit_only",
+    "cache_format": "f32",
+    "scale": 0.0,
+}
+
+
+def _csa_nodes(graph):
+    return [n for n in graph if n.op_type == "CompressedSparseAttention"]
+
+
+def _named(values):
+    return {v.name: v for v in values}
+
+
+def test_native_csa_emits_hca_op_for_ratio128_layer_only():
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+
+    nodes = _csa_nodes(graph)
+    assert len(nodes) == 1, "exactly the ratio-128 layer emits the native op"
+    node = nodes[0]
+    assert node.domain == CSA_DOMAIN == "pkg.nxrt"
+    assert len(node.inputs) == 11
+    assert len(node.outputs) == 3
+    assert {k: node.attributes[k].value for k in node.attributes} == _EXPECTED_HCA_ATTRS
+    # The native op fully replaces dense/fused attention for its layer and must
+    # not silently coexist with a fused GQA/Attention path.
+    assert count_op_type(graph, "GroupQueryAttention") == 0
+    assert count_op_type(graph, "Attention") == 0
+
+
+def test_native_csa_threads_compressed_state_io():
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+
+    inputs = _named(graph.inputs)
+    outputs = _named(graph.outputs)
+
+    # Compressed state is threaded as ADDITIONAL parallel IO for the enabled
+    # layer only, with deterministic names and dynamic record axes.
+    assert "past_compressed_kv.1" in inputs
+    assert "past_compression_carry.1" in inputs
+    assert "present_compressed_kv.1" in outputs
+    assert "present_compression_carry.1" in outputs
+    assert "past_compressed_kv.0" not in inputs
+    assert "past_compression_carry.0" not in inputs
+
+    past_kv = inputs["past_compressed_kv.1"]
+    pres_kv = outputs["present_compressed_kv.1"]
+    assert past_kv.dtype == ir.DataType.FLOAT
+    assert pres_kv.dtype == ir.DataType.FLOAT
+    assert [str(d) for d in past_kv.shape] == ["batch", "past_compressed_records", "16"]
+    assert [str(d) for d in pres_kv.shape] == ["batch", "present_compressed_records", "16"]
+
+    past_carry = inputs["past_compression_carry.1"]
+    pres_carry = outputs["present_compression_carry.1"]
+    assert past_carry.dtype == ir.DataType.FLOAT
+    assert [int(d) for d in past_carry.shape[1:]] == [128, 2, 16]
+    # Fixed carry planes are stable across the step (chainable decode state).
+    assert [str(d) for d in past_carry.shape] == [str(d) for d in pres_carry.shape]
+
+    # Dense sliding-window KV IO stays present and DISTINCT alongside the
+    # compressed state (MQA data identical, but must be separate values).
+    assert outputs["present.1.key"] is not outputs["present.1.value"]
+
+
+def test_native_csa_present_state_is_chainable_for_decode():
+    # Shape-faithful prefill + >=16 decode: present_* record axis is dynamic
+    # and carry planes fixed, so present_* names/shapes chain back into past_*
+    # inputs for any decode length (no static per-step sizing).
+    config = _tiny_config(num_hidden_layers=2, compress_ratios=[0, 128], native_csa=True)
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    inputs = _named(graph.inputs)
+    outputs = _named(graph.outputs)
+
+    past_kv, pres_kv = inputs["past_compressed_kv.1"], outputs["present_compressed_kv.1"]
+    # Same rank + same trailing stored width => output can feed the input.
+    assert len(past_kv.shape) == len(pres_kv.shape) == 3
+    assert int(past_kv.shape[2]) == int(pres_kv.shape[2]) == 16
+    assert isinstance(past_kv.shape[1], ir.SymbolicDim)
+    assert isinstance(pres_kv.shape[1], ir.SymbolicDim)
+    past_carry, pres_carry = (
+        inputs["past_compression_carry.1"],
+        outputs["present_compression_carry.1"],
+    )
+    assert [int(d) for d in past_carry.shape[1:]] == [int(d) for d in pres_carry.shape[1:]]
+
+
+def test_native_csa_f32_inputs_under_fp16():
+    # Mirrors GLM DSA precedent: even when the model dtype is FLOAT16, the
+    # frozen op's float inputs must be explicitly cast to FLOAT (f32 cache
+    # format); integer length inputs keep their integer dtype.
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+        dtype=ir.DataType.FLOAT16,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    node = _csa_nodes(graph)[0]
+
+    float_input_positions = [0, 1, 2, 3, 4, 5, 6, 7, 10]
+    for pos in float_input_positions:
+        assert node.inputs[pos].dtype == ir.DataType.FLOAT, (
+            f"CSA input[{pos}] must be FLOAT under a FLOAT16 model dtype"
+        )
+    assert node.inputs[8].dtype == ir.DataType.INT32  # seqlens_k
+    assert node.inputs[9].dtype == ir.DataType.INT64  # total_sequence_length
+
+
+def test_native_csa_no_dead_anchor_for_hca_layer():
+    # The enabled layer's compressor weights must feed REAL dataflow into the
+    # native op (not be retained only as a zero-valued shape anchor).
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    node = _csa_nodes(graph)[0]
+    initializers = set(graph.initializers)
+
+    # compressor_kv / compressor_gate are produced by real MatMul projections.
+    assert node.inputs[2].producer() is not None
+    assert node.inputs[2].producer().op_type == "MatMul"
+    assert node.inputs[3].producer() is not None
+    assert node.inputs[3].producer().op_type == "MatMul"
+    # compressor_ape / compressor_norm are wired straight from the preserved
+    # initializers (not zero anchors).
+    assert node.inputs[4].name == "model.layers.1.self_attn.compressor.ape"
+    assert node.inputs[5].name == "model.layers.1.self_attn.compressor.norm.weight"
+    # Weights survive by actual dataflow, not a discarded shape anchor.
+    assert "model.layers.1.self_attn.compressor.wkv.weight" in initializers
+    assert "model.layers.1.self_attn.compressor.wgate.weight" in initializers
+    assert "model.layers.1.self_attn.compressor.ape" in initializers
+    assert "model.layers.1.self_attn.compressor.norm.weight" in initializers
+
+
+def _fill_and_serialize(model):
+    for name in list(model.graph.initializers):
+        value = model.graph.initializers[name]
+        if value.const_value is None:
+            shape = tuple(int(d) for d in value.shape)
+            dtype = value.dtype.numpy() if value.dtype is not None else np.float32
+            value.const_value = ir.tensor(np.zeros(shape, dtype=dtype), name=name)
+    return ir.to_proto(model).SerializeToString()
+
+
+def test_native_csa_disabled_is_byte_identical():
+    # Feature off => byte-identical to the existing dense correctness export,
+    # and no CSA node / no compressed IO leaks in.
+    ratios = [0, 0, 4, 128]
+    cfg_unset = _tiny_config(num_hidden_layers=4, compress_ratios=ratios)
+    cfg_false = _tiny_config(num_hidden_layers=4, compress_ratios=ratios, native_csa=False)
+    model_unset = build_from_module(
+        DeepSeekV4CausalLMModel(cfg_unset), cfg_unset, task="deepseek-v4"
+    )["model"]
+    model_false = build_from_module(
+        DeepSeekV4CausalLMModel(cfg_false), cfg_false, task="deepseek-v4"
+    )["model"]
+
+    assert cfg_unset.native_csa is False
+    assert count_op_type(model_unset.graph, "CompressedSparseAttention") == 0
+    assert not any("compress" in v.name for v in model_unset.graph.inputs)
+    assert not any("compress" in v.name for v in model_unset.graph.outputs)
+    assert _fill_and_serialize(model_unset) == _fill_and_serialize(model_false)
+
+
+def test_native_csa_defaults_off_and_opt_in():
+    assert _tiny_config().native_csa is False
+    assert _tiny_config(native_csa=True).native_csa is True
+
+
+def test_native_csa_rejects_ratio4():
+    # ratio-4 CSA (learned FP4 indexer + top-k) is out of C1 scope: requesting
+    # native export for it must fail closed at construction, never emit dense.
+    config = _tiny_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    with pytest.raises(NativeCsaExportError):
+        DeepSeekV4CausalLMModel(config)
+
+
+def test_native_csa_rejects_quantized():
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+        quantization=QuantizationConfig(bits=4, group_size=16, quant_method="gptq", sym=True),
+    )
+    with pytest.raises(NativeCsaExportError):
+        DeepSeekV4CausalLMModel(config)
+
+
+def test_plan_native_csa_rejects_mtp():
+    # MTP compressed-state recurrence is not modeled in C1.
+    config = _tiny_config(num_hidden_layers=1, compress_ratios=[128], native_csa=True)
+    with pytest.raises(NativeCsaExportError):
+        plan_native_csa(config, 0, is_mtp=True)
+
+
+def test_plan_native_csa_rejects_unknown_ratio():
+    # Unknown compression ratios cannot match the frozen v1 contract. Call the
+    # planner directly to exercise its branch (the model __init__ ValueError
+    # guard would otherwise reject an unknown ratio before planning).
+    config = _tiny_config(num_hidden_layers=1, compress_ratios=[0], native_csa=True)
+    object.__setattr__(config, "compress_ratios", [7])
+    with pytest.raises(NativeCsaExportError):
+        plan_native_csa(config, 0)
+
+
+def test_plan_native_csa_off_and_dense_layers_return_none():
+    # Fail-closed only when requested: feature off or a ratio-0 dense layer
+    # legitimately opts out (returns None), not a typed error.
+    off = _tiny_config(num_hidden_layers=1, compress_ratios=[128], native_csa=False)
+    assert plan_native_csa(off, 0) is None
+    dense = _tiny_config(num_hidden_layers=1, compress_ratios=[0], native_csa=True)
+    assert plan_native_csa(dense, 0) is None
+
+
+def test_plan_native_csa_ratio128_layer_matches_contract():
+    config = _tiny_config(num_hidden_layers=2, compress_ratios=[0, 128], native_csa=True)
+    plan = plan_native_csa(config, 1)
+    assert plan is not None
+    assert plan.layer_id == 1
+    assert plan.num_heads == 2
+    assert plan.head_dim == 16
+    assert plan.qk_rope_head_dim == 4
+    assert plan.compression_ratio == HCA_COMPRESSION_RATIO == 128
+    assert plan.cache_format == "f32"
+    assert plan.past_compressed_kv_name == "past_compressed_kv.1"
+    assert plan.present_compression_carry_name == "present_compression_carry.1"
