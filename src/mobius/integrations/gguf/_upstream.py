@@ -65,8 +65,9 @@ class UpstreamArchitecture:
         dual_moe: Whether tensor shapes switch on ``expert_count`` rather than
             on the architecture name. True for 47 architectures.
         tensor_families: Exact entries from the pinned
-            ``gguf-py/gguf/constants.py::MODEL_TENSORS`` table. Vendored only
-            for architectures whose tensor-map support mobius claims.
+            ``gguf-py/gguf/constants.py::MODEL_TENSORS`` table. Vendored for
+            architectures whose tensor-map support mobius claims and for audited
+            cohorts whose explicit deferral depends on proving the graph mismatch.
         tensor_names: Exact full tensor names, including suffixes, created by
             architecture-specific pinned C++ tensor creation sites.
         expert_tensor_suffixes: Exact suffixes created for routed expert tensors

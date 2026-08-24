@@ -194,12 +194,14 @@ reason.
 | `olmoe` | — | `olmoe` | runtime deferred | supported |
 | `phi3` | — | `phi3` | supported | supported |
 | `phimoe` | — | `phimoe` | runtime deferred | supported |
+| `pockettts` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `qwen2` | — | `qwen2` | supported | supported |
 | `qwen2moe` | `qwen2_moe` | `qwen2_moe` | runtime deferred | supported |
 | `qwen3` | — | `qwen3` | supported | supported |
 | `qwen35` | — | `qwen3_5_text` | supported | supported |
 | `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
 | `qwen3moe` | `qwen3_moe` | `qwen3_moe` | runtime deferred | supported |
+| `qwen3tts` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rnd1` | — | `llada` | runtime deferred | supported |
 | `rwkv6` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rwkv6qwen2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -209,12 +211,71 @@ reason.
 | `starcoder2` | — | `starcoder2` | supported | supported |
 | `t5` | — | `t5` | runtime deferred | supported |
 | `t5encoder` | — | `t5encoder` | runtime deferred | supported |
+| `talkie` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `wavtokenizer-dec` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 <!-- END GGUF SUPPORT MATRIX -->
 
 Canonical names are the strings llama.cpp writes into `general.architecture`,
 validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
+
+### Audio/TTS/codec cohort
+
+The four C09 architectures below were audited against llama.cpp commit
+`8d9af256337d1a501250f9bbf4c0859a654bddd6`. Their converter-produced primary
+tensor inventories are pinned in `llamacpp_pin.json`; being inventoried does not
+mean the graph is supported.
+
+| Architecture | Exact component and I/O | Pinned closure | Verdict |
+|---|---|---:|---|
+| `pockettts` | Causal CALM backbone: conditioned token/latent rows plus KV state → hidden state. It has no semantic LM head. The required mmproj performs 24-kHz voice encoding, continuous 32-D flow generation at 12.5 Hz, EOS scoring, and stateful Mimi waveform decoding. | `3 + 10L` primary tensors (`243` for the 24-layer variant); no codebook tensors. | Deferred. Current standalone use is refused before graph construction because omitting `pockettts_spkenc` and `pockettts_gen` would expose the wrong contract. |
+| `qwen3tts` | Transformed causal talker: combined text+codec token IDs plus KV state → a 3072-row codec head shifted into the combined vocabulary. The required mmproj owns speaker conditioning, the remaining 15 codebooks, and stateful 24-kHz code-to-wave decoding. | `3 + 11L` primary tensors (`311` for the 28-layer 1.7B talker). | Deferred. Current standalone use is refused before graph construction; it is neither `Qwen3TTSForConditionalGeneration` nor `Qwen3TTSTokenizerV2Model`. |
+| `talkie` | Text token IDs plus KV state → text logits. This is not an audio model: it uses weight-free RMSNorm, post-RoPE Q/K normalization, query/attention/MLP gains, and an embedding skip in every block. | `2 + 11L` canonical converter tensors (`442` for 40 layers), including mandatory `.scale` sidecars. | Deferred pending a dedicated graph, Q/K sign transform, quantization guards, and independent logit/state/generation parity. |
+| `wavtokenizer-dec` | One non-causal 4096-entry code stream → `T × 1282` magnitude/phase parameters. The GGUF does **not** emit waveform audio; the missing processor must split 641-bin log-magnitude/phase and perform the exact 24-kHz, hop-320 ISTFT. No recurrent/cache state exists. | `161` tensors for the exact six-layer PosNet and 12-layer ConvNeXt graph. | Deferred. Current use is refused before graph construction until a dedicated feature-decoder task and exact ISTFT processor exist. |
+
+The pinned loader/converter metadata contract is:
+
+| Architecture | Required/operational metadata | Optional defaults and converter transforms |
+|---|---|---|
+| `pockettts` | `context_length`, `embedding_length`, `block_count`, `feed_forward_length`, `attention.head_count`, and `attention.layer_norm_epsilon`. | KV heads default to attention heads, causal attention defaults true, and RoPE base defaults to 10000. The converter derives dimensions from checkpoint tensor shapes, assumes head size 64, folds learned audio-BOS conditioning into `token_embd.weight`, and fixes the cache bound at 4096. |
+| `qwen3tts` | Generic decoder geometry, `attention.layer_norm_rms_epsilon`, and the required four-entry `rope.dimension_sections`. | `n_deepstack_layers` defaults to zero. The converter folds the text projection MLP into the text embedding rows, appends codec embeddings, offsets codec token IDs by text vocabulary size, writes the shifted EOS ID, and suppresses non-semantic codec rows. |
+| `talkie` | Generic decoder geometry, `attention.layer_norm_rms_epsilon`, and `logit_scale`. | KV heads default to attention heads, head lengths default to `embedding_length / head_count`, causal attention defaults true, and RoPE base defaults to 10000 (the released model writes 1000000). The converter applies Talkie's half-RoPE Q/K sign transform and emits attention/MLP `.scale` sidecars. |
+| `wavtokenizer-dec` | `context_length`, `embedding_length`, `features_length`, `block_count`, `feed_forward_length`, both PosNet/ConvNeXt widths and counts, layer-norm epsilon, group-norm epsilon/groups, and `vocab_size`. | `attention.causal=false`; no KV or recurrent state. Training-only codebook EMA tensors are intentionally excluded, but the single 4096×512 embedding codebook is required. |
+
+`wavtokenizer-dec` deliberately overloads standard metadata. `features_length`
+is the 512-wide codebook feature input, `embedding_length` is the 1282-wide
+output (not the hidden width), and both `posnet.embedding_length` and
+`convnext.embedding_length` are the 768-wide hidden size. Exact files require
+`posnet.block_count=6`, `convnext.block_count=12`, matching hidden widths,
+non-causal centered kernel-3/kernel-7 convolutions, group-norm epsilon/groups,
+and `feed_forward_length=2304`. Treating `embedding_length` as the model hidden
+size is rejected as an ambiguous field interpretation.
+
+Quantized linear matrices may only use a supported `MatMulNBits` path after
+their architecture-specific transforms. Convolution kernels, codebooks,
+normalization parameters, biases, gamma, and `.scale`/`.input_scale` sidecars
+must be dequantized or rejected; they are never silently routed through
+quantized MatMul or dropped. In particular, the pinned Qwen3-TTS and PocketTTS
+converters force convolution families to F16/F32 according to the llama.cpp
+consumer ABI, and WavTokenizer's available Q5_1 artifact needs float convolution
+handling. No C09 runtime is marked supported because no pinned artifact has
+independent reference waveform/feature or full-logit parity.
+
+The smallest audited real files are in `ggml-org/WavTokenizer` at revision
+`0c97fdc098158ec9bf4e703cd5f81a5aa20520e6`:
+
+| File | Size | LFS SHA-256 | Census |
+|---|---:|---|---|
+| `WavTokenizer-Large-75-F16.gguf` | 130,186,688 bytes | `2356baa8631cc2995ea3465196a017a2733600d849a91180c0f97fa7fb375bbe` | 161 tensors; float reference candidate |
+| `WavTokenizer-Large-75-Q5_1.gguf` | 73,319,616 bytes | `ad182c884841444ce6b70e8a61a7d084d9731320364dc633c9ef42632fc63d25` | Same graph; quantized matrix candidate |
+
+That repository contains no independent processor/config bundle or reference
+feature/waveform vectors. The source WavTokenizer configuration supplies the
+24-kHz/75-Hz/hop-320 ISTFT semantics, but neither artifact has reproducible
+PyTorch↔llama.cpp↔ORT parity evidence; both therefore remain evidence candidates,
+not supported runtime fixtures. PocketTTS is gated, and the available Qwen3-TTS
+and Talkie checkpoints are not reasonably small cohort fixtures.
 
 ### Speculative draft GGUF contract
 
