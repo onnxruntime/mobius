@@ -916,6 +916,50 @@ class TestBuildGraphQuantized:
         layer = module.model.layers[0]
         assert type(layer.mlp.shared_expert.down_proj).__name__ == "QuantizedLinear"
 
+    def test_qwen3_moe_olive_int4_emits_qmoe_and_matmulnbits(self):
+        """Olive-int4 Qwen3-MoE fuses routed experts into QMoE, attention into MatMulNBits.
+
+        Graph/parameter-ABI check only — no weights are loaded and
+        ``preprocess_weights`` is not exercised here (see
+        ``src/mobius/models/moe_test.py`` for the state-dict side). It pins the
+        shapes the fused expert path *expects*: one ``com.microsoft::QMoE`` per
+        layer with expert-major ``[experts, 2*moe_inter, hidden*bits/8]``
+        weights, plus MatMulNBits for the four quantized attention projections.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=True)
+        config = self._shared_moe_config("qwen3_moe", qc)
+        module = registry.get("qwen3_moe")(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+
+        qmoe = [n for n in model.graph if n.op_type == "QMoE"]
+        nbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
+        assert len(qmoe) == 1, f"routed experts must fuse to one QMoE, got {len(qmoe)}"
+        assert len(nbits) == 4, f"attention q/k/v/o must emit 4 MatMulNBits, got {len(nbits)}"
+
+        initializers = model.graph.initializers
+        experts = config.num_local_experts
+        assert tuple(initializers["model.layers.0.mlp.fc1_experts_weights"].shape) == (
+            experts,
+            2 * config.moe_intermediate_size,
+            config.hidden_size * qc.bits // 8,
+        )
+        assert tuple(initializers["model.layers.0.mlp.fc2_experts_weights"].shape) == (
+            experts,
+            config.hidden_size,
+            config.moe_intermediate_size * qc.bits // 8,
+        )
+        assert tuple(initializers["model.layers.0.mlp.fc1_scales"].shape) == (
+            experts,
+            2 * config.moe_intermediate_size,
+            config.hidden_size // qc.group_size,
+        )
+        # Symmetric quantization carries no zero points for the routed experts.
+        moe_initializers = [n for n in initializers if n.startswith("model.layers.0.mlp.")]
+        assert not any("zero_point" in name for name in moe_initializers)
+
 
 class TestBuildGraphVisionLanguage:
     """Verify multimodal models build correctly."""

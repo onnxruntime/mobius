@@ -12,7 +12,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import preprocess_quantized_weights
+from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
 from mobius.components import (
     Attention,
     Embedding,
@@ -611,6 +611,22 @@ def _rename_moe_expert_weights(
        ``input_linear.weight [N, 2*inter, hidden]`` → per-expert gate_proj + up_proj
        ``output_linear.weight [N, hidden, inter]`` → per-expert down_proj
        ``router.layer.weight`` → ``gate.weight``
+
+    Packed quantized expert tensors (Olive ``…_qweight``/``_scales``/``_qzeros``,
+    GPTQ/AWQ ``….qweight``/``.scales``/``.qzeros`` — see
+    :func:`~mobius._weight_utils.is_packed_quant_key`) are **never** split.
+    Splitting them would reinterpret packed bytes as float rows *and* collapse
+    every sidecar of one projection onto the same per-expert ``.weight`` key,
+    keeping only the last one. Call sites that continue into
+    :func:`_preprocess_moe_weights` (the :class:`MoECausalLMModel` family) need
+    the fused expert-major layout intact for ``pack_qmoe_expert_weights``; for
+    every other call site this function simply leaves the packed keys alone.
+
+    Module-path renames still apply to packed keys under the Olive convention,
+    where the suffix hangs off a retained ``.weight`` component
+    (``…mlp.router.weight_qweight`` → ``…mlp.gate.weight_qweight``). Dotted
+    GPTQ/AWQ sidecars have no ``.weight`` component (``…mlp.router.qweight``),
+    so no rename pattern matches them and they pass through as-is.
     """
     # Step 0: GraniteMoE uses block_sparse_moe; rename to mlp to match our attribute.
     state_dict = {
@@ -632,6 +648,10 @@ def _rename_moe_expert_weights(
     # Second pass: split fused 3D expert weights and rename routers
     fused: dict[str, torch.Tensor] = {}
     for name, tensor in list(renamed.items()):
+        # Packed quantized sidecars are never split: they must stay fused for the
+        # downstream QMoE packer, and splitting also collides their keys. Only
+        # float fused tensors are split into per-expert ``.weight`` keys.
+        is_packed = is_packed_quant_key(name)
         # GraniteMoE: router.layer.weight → gate.weight
         if ".router.layer.weight" in name:
             new_name = name.replace(".router.layer.weight", ".gate.weight")
@@ -643,7 +663,7 @@ def _rename_moe_expert_weights(
             fused[new_name] = tensor
             del renamed[name]
         # GraniteMoE: input_linear.weight [N, 2*inter, hidden] → gate_proj + up_proj
-        elif ".input_linear.weight" in name and tensor.dim() == 3:
+        elif not is_packed and ".input_linear.weight" in name and tensor.dim() == 3:
             prefix = name.replace(".input_linear.weight", "")
             num_experts = tensor.shape[0]
             half = tensor.shape[1] // 2
@@ -654,7 +674,7 @@ def _rename_moe_expert_weights(
                 fused[f"{prefix}.experts.{i}.up_proj.weight"] = up_w
             del renamed[name]
         # GraniteMoE: output_linear.weight [N, hidden, inter] → down_proj
-        elif ".output_linear.weight" in name and tensor.dim() == 3:
+        elif not is_packed and ".output_linear.weight" in name and tensor.dim() == 3:
             prefix = name.replace(".output_linear.weight", "")
             num_experts = tensor.shape[0]
             for i in range(num_experts):
@@ -662,7 +682,7 @@ def _rename_moe_expert_weights(
             del renamed[name]
         # Fused gate_up_proj [N, 2*inter, hidden] → per-expert gate_proj + up_proj
         # (Mixtral, OLMoE, Qwen2-MoE, PhiMoE)
-        elif ".experts.gate_up_proj" in name and tensor.dim() == 3:
+        elif not is_packed and ".experts.gate_up_proj" in name and tensor.dim() == 3:
             prefix = name.split(".experts.gate_up_proj")[0]
             num_experts = tensor.shape[0]
             half = tensor.shape[1] // 2
@@ -674,7 +694,12 @@ def _rename_moe_expert_weights(
             del renamed[name]
         # Fused experts.down_proj [N, hidden, inter] → per-expert down_proj
         # Only match the fused format (3D tensor), not per-expert experts.{i}.down_proj
-        elif ".experts.down_proj" in name and tensor.dim() == 3 and "experts." in name:
+        elif (
+            not is_packed
+            and ".experts.down_proj" in name
+            and tensor.dim() == 3
+            and "experts." in name
+        ):
             parts = name.split(".experts.down_proj")
             if len(parts) == 2 and not parts[0].endswith(tuple("0123456789")):
                 prefix = parts[0]
