@@ -123,6 +123,7 @@ __all__ = [
     "MiniCPMCausalLMModel",
     "MiniCPMV46ForConditionalGeneration",
     "MoonshineForConditionalGeneration",
+    "MoonshineStreamingForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
     "MuseGlimmerTextCausalLMModel",
     "MimiModel",
@@ -352,6 +353,9 @@ from mobius.models.moe import (
     Qwen2MoECausalLMModel,
 )
 from mobius.models.moonshine import MoonshineForConditionalGeneration
+from mobius.models.moonshine_streaming import (
+    MoonshineStreamingForConditionalGeneration,
+)
 from mobius.models.moshi import (
     MoshiDepformerModel,
     MoshiTemporalModel,

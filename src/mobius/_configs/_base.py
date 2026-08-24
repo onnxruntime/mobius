@@ -4489,6 +4489,16 @@ class SpeechToTextConfig(ArchitectureConfig):
     decoder_start_token_id: int | None = None
     layer_norm_eps: float = 1e-5
 
+    @property
+    def encoder_output_size(self) -> int:
+        """Channel width of ``encoder_hidden_states``.
+
+        Defaults to the decoder width because most speech encoder-decoders share
+        one model dimension. Architectures whose encoder is narrower or wider
+        (e.g. Moonshine Streaming with a projection adapter) override this.
+        """
+        return self.hidden_size
+
 
 @dataclasses.dataclass
 class WhisperConfig(SpeechToTextConfig):
@@ -4626,6 +4636,172 @@ class MoonshineConfig(SpeechToTextConfig):
             decoder_start_token_id=getattr(config, "decoder_start_token_id", 1),
             layer_norm_eps=getattr(config, "layer_norm_eps", 1e-5),
             model_type="moonshine",
+            bos_token_id=getattr(config, "bos_token_id", 1),
+            eos_token_id=getattr(config, "eos_token_id", 2),
+        )
+        resolved = _resolve_dtype(config)
+        if resolved is not None:
+            options["dtype"] = resolved
+        return cls(**options)
+
+
+def _sub_config_get(config, name: str, default):
+    """Read ``name`` from a sub-config that may be an object or a plain dict."""
+    if isinstance(config, dict):
+        value = config.get(name, default)
+    else:
+        value = getattr(config, name, default)
+    return default if value is None else value
+
+
+@dataclasses.dataclass
+class MoonshineStreamingConfig(SpeechToTextConfig):
+    """Configuration for Moonshine Streaming raw-waveform encoder-decoder ASR.
+
+    Moonshine Streaming replaces the offline Moonshine convolutional stem with a
+    fixed-length framing front end (``frame_ms`` frames of raw samples), per-frame
+    CMVN, learned asinh compression, and two *causal* strided convolutions. Its
+    encoder carries no rotary embedding; position information comes from the
+    causal stem plus per-layer asymmetric ``(left, right)`` sliding windows, which
+    bound the streaming lookahead. The decoder adds an absolute learned position
+    table (``pos_emb``) to the encoder output before cross-attention.
+    """
+
+    encoder_input_name: str = "input_values"
+    encoder_input_channels: int | None = None
+    encoder_uses_attention_mask: bool = True
+    decoder_uses_encoder_attention_mask: bool = True
+    encoder_hidden_size: int = DEFAULT_INT
+    encoder_intermediate_size: int = DEFAULT_INT
+    encoder_num_hidden_layers: int = DEFAULT_INT
+    encoder_num_attention_heads: int = DEFAULT_INT
+    encoder_num_key_value_heads: int = DEFAULT_INT
+    encoder_head_dim: int = DEFAULT_INT
+    encoder_hidden_act: str = "gelu"
+    decoder_hidden_act: str = "silu"
+    #: Q/K/V and output projection bias of the encoder attention. Upstream
+    #: gates all four encoder projections on the encoder sub-config's
+    #: ``attention_bias`` (the decoder's output projection stays bias-free).
+    encoder_attention_bias: bool = False
+    #: Per-layer ``(left_window, right_window)`` attention spans of the encoder.
+    #: ``left`` counts the query position itself; ``right`` is the strict
+    #: lookahead. ``right == 0`` means the layer is fully causal.
+    encoder_sliding_windows: tuple[tuple[int, int], ...] = ((16, 4),)
+    encoder_sample_rate: int = 16_000
+    encoder_frame_ms: float = 5.0
+    #: Epsilon of the per-frame cepstral mean/variance normalisation.
+    encoder_cmvn_eps: float = 1e-6
+    def __post_init__(self):
+        # A tuple keeps the config hashable and prevents accidental mutation of
+        # the per-layer window schedule shared by every encoder layer.
+        self.encoder_sliding_windows = tuple(
+            (int(left), int(right)) for left, right in self.encoder_sliding_windows
+        )
+        if self.encoder_hidden_size == DEFAULT_INT:
+            self.encoder_hidden_size = self.hidden_size
+        if self.encoder_intermediate_size == DEFAULT_INT:
+            self.encoder_intermediate_size = self.intermediate_size
+        if self.encoder_num_attention_heads == DEFAULT_INT:
+            self.encoder_num_attention_heads = self.num_attention_heads
+        if self.encoder_num_key_value_heads == DEFAULT_INT:
+            self.encoder_num_key_value_heads = self.encoder_num_attention_heads
+        if self.encoder_num_hidden_layers == DEFAULT_INT:
+            self.encoder_num_hidden_layers = len(self.encoder_sliding_windows)
+        if self.encoder_head_dim == DEFAULT_INT:
+            self.encoder_head_dim = (
+                self.encoder_hidden_size // self.encoder_num_attention_heads
+            )
+        if len(self.encoder_sliding_windows) != self.encoder_num_hidden_layers:
+            raise ValueError(
+                "MoonshineStreamingConfig: encoder_sliding_windows has "
+                f"{len(self.encoder_sliding_windows)} entries but the encoder has "
+                f"{self.encoder_num_hidden_layers} layers."
+            )
+
+    @property
+    def encoder_output_size(self) -> int:
+        """Encoder width; the decoder projects it when it differs from its own."""
+        return self.encoder_hidden_size
+
+    @property
+    def frame_length(self) -> int:
+        """Raw samples per encoder frame (``sample_rate * frame_ms / 1000``).
+
+        Upstream rounds to the nearest integer, so the audio length fed to the
+        encoder must be a multiple of this value; the processor's
+        ``pad_to_multiple_of`` enforces that.
+        """
+        return round(self.encoder_sample_rate * self.encoder_frame_ms / 1000.0)
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MoonshineStreamingConfig:
+        if config.model_type != "moonshine_streaming":
+            raise ValueError(
+                "MoonshineStreamingConfig expects model_type='moonshine_streaming', "
+                f"got '{config.model_type}'"
+            )
+
+        hidden_size = config.hidden_size
+        decoder_heads = config.num_attention_heads
+        # ``encoder_config`` is a nested MoonshineStreamingEncoderConfig on a
+        # trusted config object and a plain dict when the JSON is read directly.
+        encoder_config = getattr(config, "encoder_config", None) or {}
+        encoder_hidden_size = _sub_config_get(encoder_config, "hidden_size", hidden_size)
+        encoder_heads = _sub_config_get(encoder_config, "num_attention_heads", decoder_heads)
+        rope_parameters = getattr(config, "rope_parameters", None) or getattr(
+            config, "rope_scaling", None
+        )
+        rope_parameters = rope_parameters or {}
+        windows = _sub_config_get(
+            encoder_config,
+            "sliding_windows",
+            ((16, 4), (16, 4), (16, 0), (16, 0), (16, 4), (16, 4)),
+        )
+
+        options = dict(
+            vocab_size=config.vocab_size,
+            hidden_size=hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=decoder_heads,
+            num_key_value_heads=getattr(config, "num_key_value_heads", decoder_heads),
+            head_dim=getattr(config, "head_dim", None) or hidden_size // decoder_heads,
+            hidden_act=getattr(config, "hidden_act", "silu"),
+            pad_token_id=getattr(config, "pad_token_id", 0),
+            tie_word_embeddings=getattr(config, "tie_word_embeddings", False),
+            attn_qkv_bias=getattr(config, "attention_bias", False),
+            attn_o_bias=False,
+            max_position_embeddings=getattr(config, "max_position_embeddings", 4096),
+            rope_type=rope_parameters.get("rope_type", "default"),
+            rope_theta=rope_parameters.get("rope_theta", 10_000.0),
+            rope_scaling=rope_parameters or None,
+            partial_rotary_factor=rope_parameters.get("partial_rotary_factor", 1.0),
+            rope_interleave=True,
+            mlp_bias=True,
+            encoder_hidden_size=encoder_hidden_size,
+            encoder_intermediate_size=_sub_config_get(
+                encoder_config, "intermediate_size", config.intermediate_size
+            ),
+            encoder_num_hidden_layers=_sub_config_get(
+                encoder_config, "num_hidden_layers", config.num_hidden_layers
+            ),
+            encoder_num_attention_heads=encoder_heads,
+            encoder_num_key_value_heads=_sub_config_get(
+                encoder_config, "num_key_value_heads", encoder_heads
+            ),
+            encoder_head_dim=_sub_config_get(encoder_config, "head_dim", None)
+            or encoder_hidden_size // encoder_heads,
+            encoder_hidden_act=_sub_config_get(encoder_config, "hidden_act", "gelu"),
+            encoder_attention_bias=bool(
+                _sub_config_get(encoder_config, "attention_bias", False)
+            ),
+            decoder_hidden_act=getattr(config, "hidden_act", "silu"),
+            encoder_sliding_windows=tuple(tuple(window) for window in windows),
+            encoder_sample_rate=_sub_config_get(encoder_config, "sample_rate", 16_000),
+            encoder_frame_ms=_sub_config_get(encoder_config, "frame_ms", 5.0),
+            decoder_start_token_id=getattr(config, "decoder_start_token_id", 1),
+            layer_norm_eps=getattr(config, "layer_norm_eps", 1e-5),
+            model_type="moonshine_streaming",
             bos_token_id=getattr(config, "bos_token_id", 1),
             eos_token_id=getattr(config, "eos_token_id", 2),
         )

@@ -690,12 +690,15 @@ def _generate_speech_to_text(case: TestCase, json_path: Path, device: str) -> No
 
     model = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
         case.model_id,
+        revision=case.revision,
         device_map=device,
         trust_remote_code=case.trust_remote_code,
     )
     model.eval()
     processor = transformers.AutoProcessor.from_pretrained(
-        case.model_id, trust_remote_code=case.trust_remote_code
+        case.model_id,
+        revision=case.revision,
+        trust_remote_code=case.trust_remote_code,
     )
 
     # Load and preprocess audio

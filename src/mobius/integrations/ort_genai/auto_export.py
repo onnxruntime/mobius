@@ -1913,7 +1913,7 @@ def _runtime_capability_warnings(pkg: ModelPackage) -> tuple[str, ...]:
             "onnxruntime-genai 0.15.2 does not support Mage-VL's patch_positions "
             "vision input and 1D decoder position_ids contract."
         )
-    if getattr(config, "model_type", None) == "moonshine":
+    if getattr(config, "model_type", None) in ("moonshine", "moonshine_streaming"):
         warnings.append(
             "onnxruntime-genai 0.15.2 does not support Moonshine's variable-length "
             "raw-waveform encoder."
