@@ -43,9 +43,9 @@ from mobius.components import (
 from mobius.components._moe import _scatter_selected_to_full
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models._deepseek_v4_csa import (
-    HcaLayerPlan,
+    CsaLayerPlan,
     NativeCsaExportError,
-    emit_hca_attention,
+    emit_csa_attention,
     plan_native_csa,
 )
 from mobius.models.base import CausalLMModel
@@ -455,6 +455,8 @@ class DeepSeekV4IndexerTensors(nn.Module):
         assert config.q_lora_rank is not None
         assert config.index_n_heads is not None
         assert config.index_head_dim is not None
+        self.index_n_heads = config.index_n_heads
+        self.index_head_dim = config.index_head_dim
         self.wq_b = DeepSeekV4DeferredProjection(
             config,
             config.q_lora_rank,
@@ -467,9 +469,58 @@ class DeepSeekV4IndexerTensors(nn.Module):
             config, compress_ratio=4, head_dim=config.index_head_dim
         )
 
-    def forward(self, op: OpBuilder) -> ir.Value:
-        own = op.Add(self.wq_b(op), self.weights_proj(op))
-        return op.Add(own, self.compressor(op))
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value | None = None,
+        query_lora: ir.Value | None = None,
+    ):
+        """Zero-valued shape anchor (dense fallback) or live indexer tensors.
+
+        With ``hidden_states``/``query_lora`` both ``None`` (deferred dense
+        fallback) this emits the zero-valued shape anchor that keeps the
+        indexer weights live. With both supplied (native-CSA ratio-4 dataflow)
+        it returns the six frozen-op index inputs:
+        ``(index_query, index_weight, index_compressor_kv,
+        index_compressor_gate, index_compressor_ape, index_compressor_norm)``.
+
+        ``index_query`` is the *raw* ``wq_b(query_lora)`` projection reshaped to
+        ``[B, S, index_n_heads, index_head_dim]`` -- the frozen op applies the
+        compressed RoPE + Hadamard + FP4 round-trip internally
+        (``finalize_index_query``), so no rotation happens here. ``index_weight``
+        is the raw ``weights_proj(hidden_states)`` projection
+        ``[B, S, index_n_heads]``; the index compressor mirrors the attention
+        compressor (raw ``W·x`` activations + learned ``ape``/norm).
+        """
+        if hidden_states is None and query_lora is None:
+            own = op.Add(self.wq_b(op), self.weights_proj(op))
+            return op.Add(own, self.compressor(op))
+        if hidden_states is None or query_lora is None:
+            raise NativeCsaExportError(
+                "native CSA ratio-4 indexer requires both hidden_states and "
+                "query_lora for its live dataflow; got "
+                f"hidden_states={'set' if hidden_states is not None else 'None'}, "
+                f"query_lora={'set' if query_lora is not None else 'None'}"
+            )
+        index_query = op.Reshape(
+            self.wq_b(op, query_lora),
+            [0, 0, self.index_n_heads, self.index_head_dim],
+        )
+        index_weight = self.weights_proj(op, hidden_states)
+        (
+            index_compressor_kv,
+            index_compressor_gate,
+            index_ape,
+            index_norm,
+        ) = self.compressor(op, hidden_states)
+        return (
+            index_query,
+            index_weight,
+            index_compressor_kv,
+            index_compressor_gate,
+            index_ape,
+            index_norm,
+        )
 
 
 class DeepSeekV4Attention(nn.Module):
@@ -541,12 +592,12 @@ class DeepSeekV4Attention(nn.Module):
             else None
         )
         self.indexer = DeepSeekV4IndexerTensors(config) if self.compress_ratio == 4 else None
-        # Property gate (default off). Resolves to an HcaLayerPlan only for a
-        # ratio-128 layer whose config matches the frozen op contract, and
-        # raises NativeCsaExportError (never silent dense) for ratio-4/MTP/
-        # unsupported-quant when native CSA is requested. See
-        # mobius.models._deepseek_v4_csa.
-        self.csa_plan: HcaLayerPlan | None = plan_native_csa(config, layer_id, is_mtp=is_mtp)
+        # Property gate (default off). Resolves to a CsaLayerPlan for a
+        # ratio-128 (HCA) or ratio-4 (CSA) layer whose config matches the
+        # frozen op contract, and raises NativeCsaExportError (never silent
+        # dense) for MTP/unknown-ratio/unsupported-quant when native CSA is
+        # requested. See mobius.models._deepseek_v4_csa.
+        self.csa_plan: CsaLayerPlan | None = plan_native_csa(config, layer_id, is_mtp=is_mtp)
 
     def _rotate(
         self,
@@ -609,21 +660,25 @@ class DeepSeekV4Attention(nn.Module):
             ),
         )
 
-    def _forward_native_hca(
+    def _forward_native_csa(
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
         query: ir.Value,
+        query_lora: ir.Value,
         kv: ir.Value,
         past_key_value: tuple | None,
         past_compressed: tuple | None,
         csa_lengths: tuple | None,
-    ) -> tuple[ir.Value, ir.Value, ir.Value, tuple[ir.Value, ir.Value]]:
-        """Emit the frozen ratio-128 HCA op for this layer (native-CSA path).
+    ) -> tuple[ir.Value, ir.Value, ir.Value, tuple[ir.Value, ...]]:
+        """Emit the frozen CSA/HCA op for this layer (native-CSA path).
 
-        ``query``/``kv`` arrive already RoPE-rotated (compressed rope theta) by
-        the caller, exactly as the dense paths receive them; the op has no
-        cos/sin/position inputs and only rotates its *compressed records*
+        Handles both ratios the schedule interleaves: ratio-128 (HCA,
+        compressor-only, 11-in/3-out) and ratio-4 (CSA, compressor + learned
+        FP4 indexer, 19-in/6-out). ``query``/``kv`` arrive already RoPE-rotated
+        (compressed rope theta) by the caller, exactly as the dense paths
+        receive them; the op has no cos/sin/position inputs and only rotates
+        its *compressed records* (and, for ratio-4, its index query/records)
         internally, so the dense-window ``query``/``current_kv`` must be
         pre-rotated here and the shared inverse ``_rotate`` still runs on the
         op's ``Y`` after this returns. Builds:
@@ -635,12 +690,19 @@ class DeepSeekV4Attention(nn.Module):
           head) like the decomposed path, then squeezed for the op;
         * real, *unrotated* compressor activations (the op pools then rotates
           the compressed records internally at their block positions);
-        * the threaded ``past_* -> present_*`` compressed state.
+        * for ratio-4, the raw learned-indexer activations (``index_query`` from
+          ``wq_b(query_lora)``, ``index_weight``, and the index compressor) --
+          the op applies the index RoPE/Hadamard/FP4 internally;
+        * the threaded ``past_* -> present_*`` compressed (and, for ratio-4,
+          index) state.
 
         Returns ``(output, present_key, present_value, present_compressed)``
         with ``output`` flattened ``[B, S, num_heads*head_dim]`` in the rotated
         frame so the caller's shared inverse ``_rotate`` + output projection
-        apply unchanged.
+        apply unchanged. ``present_compressed`` is the ratio-shaped state tuple:
+        ``(present_compressed_kv, present_compression_carry)`` for ratio-128, or
+        ``(present_compressed_kv, present_compression_carry, present_index_key,
+        present_index_carry, selected_indices)`` for ratio-4.
         """
         plan = self.csa_plan
         assert plan is not None
@@ -656,7 +718,13 @@ class DeepSeekV4Attention(nn.Module):
                 "past_compression_carry state; none was threaded to the layer"
             )
         seqlens_k, total_seq_len = csa_lengths
-        past_compressed_kv, past_compression_carry = past_compressed
+        expected_state = 4 if plan.is_ratio4 else 2
+        if len(past_compressed) != expected_state:
+            raise NativeCsaExportError(
+                f"native CSA layer {plan.layer_id} (ratio "
+                f"{plan.compression_ratio}) requires {expected_state} threaded "
+                f"past-state tensors, got {len(past_compressed)}"
+            )
 
         query_4d = op.Reshape(query, [0, 0, self.num_heads, self.head_dim])
 
@@ -681,17 +749,15 @@ class DeepSeekV4Attention(nn.Module):
         # initializer) rather than left dangling.
         compressor_kv, compressor_gate, ape, norm_weight = self.compressor(op, hidden_states)
 
-        y, present_compressed_kv, present_compression_carry = emit_hca_attention(
-            op,
-            plan,
+        common = dict(
             query=_cast_to_f32(op, query_4d, self._dtype),
             current_kv=_cast_to_f32(op, current_kv, self._dtype),
             compressor_kv=_cast_to_f32(op, compressor_kv, self._dtype),
             compressor_gate=_cast_to_f32(op, compressor_gate, self._dtype),
             compressor_ape=_cast_to_f32(op, ape, self._dtype),
             compressor_norm=_cast_to_f32(op, norm_weight, self._dtype),
-            past_compressed_kv=past_compressed_kv,
-            past_compression_carry=past_compression_carry,
+            past_compressed_kv=past_compressed[0],
+            past_compression_carry=past_compressed[1],
             seqlens_k=seqlens_k,
             total_sequence_length=op.Cast(total_seq_len, to=ir.DataType.INT64),
             # ``head_sink`` is declared FLOAT but ``_cast_module_dtype`` folds
@@ -699,6 +765,53 @@ class DeepSeekV4Attention(nn.Module):
             # ``head_sink`` is f32, so cast it back up when needed.
             head_sink=_cast_to_f32(op, self.attn_sink, self._dtype),
         )
+
+        if plan.is_ratio4:
+            assert self.indexer is not None
+            # Raw learned-indexer activations (op rotates/packs internally).
+            (
+                index_query,
+                index_weight,
+                index_compressor_kv,
+                index_compressor_gate,
+                index_ape,
+                index_norm,
+            ) = self.indexer(op, hidden_states, query_lora)
+            # ``past_index_key`` is packed uint8 state -- passed through as-is;
+            # the index carry and all index activations are f32.
+            outputs = emit_csa_attention(
+                op,
+                plan,
+                index_query=_cast_to_f32(op, index_query, self._dtype),
+                index_weight=_cast_to_f32(op, index_weight, self._dtype),
+                index_compressor_kv=_cast_to_f32(op, index_compressor_kv, self._dtype),
+                index_compressor_gate=_cast_to_f32(op, index_compressor_gate, self._dtype),
+                index_compressor_ape=_cast_to_f32(op, index_ape, self._dtype),
+                index_compressor_norm=_cast_to_f32(op, index_norm, self._dtype),
+                past_index_key=past_compressed[2],
+                past_index_carry=past_compressed[3],
+                **common,
+            )
+            (
+                y,
+                present_compressed_kv,
+                present_compression_carry,
+                present_index_key,
+                present_index_carry,
+                selected_indices,
+            ) = outputs
+            present_compressed = (
+                present_compressed_kv,
+                present_compression_carry,
+                present_index_key,
+                present_index_carry,
+                selected_indices,
+            )
+        else:
+            y, present_compressed_kv, present_compression_carry = emit_csa_attention(
+                op, plan, **common
+            )
+            present_compressed = (present_compressed_kv, present_compression_carry)
 
         # ``Y`` is [B, S, N, D] FLOAT; flatten to [B, S, N*D] and cast back to
         # the model dtype for the shared inverse-RoPE + output projection.
@@ -709,7 +822,7 @@ class DeepSeekV4Attention(nn.Module):
             output,
             present_key,
             present_value,
-            (present_compressed_kv, present_compression_carry),
+            present_compressed,
         )
 
     def forward(
@@ -724,7 +837,8 @@ class DeepSeekV4Attention(nn.Module):
         past_compressed: tuple | None = None,
         csa_lengths: tuple | None = None,
     ):
-        query = self.q_b_proj(op, self.q_a_layernorm(op, self.q_a_proj(op, hidden_states)))
+        query_lora = self.q_a_layernorm(op, self.q_a_proj(op, hidden_states))
+        query = self.q_b_proj(op, query_lora)
         query_4d = op.Reshape(query, [0, 0, self.num_heads, self.head_dim])
         query_rms = op.Sqrt(
             op.Add(
@@ -741,16 +855,17 @@ class DeepSeekV4Attention(nn.Module):
         present_compressed = None
         if self.csa_plan is not None:
             # Native CSA/HCA path (default-off ``config.native_csa`` opt-in).
-            # Emits the frozen ratio-128 ``pkg.nxrt::CompressedSparseAttention``
-            # op instead of the dense correctness fallback; the compressor
-            # tensors are consumed as real dataflow here rather than as a
-            # zero-valued shape anchor below. ``output`` comes back flattened
-            # in the rotated frame, so the shared inverse ``_rotate`` and the
-            # output projection run unchanged.
-            output, present_key, present_value, present_compressed = self._forward_native_hca(
+            # Emits the frozen ``pkg.nxrt::CompressedSparseAttention`` op
+            # (ratio-128 HCA or ratio-4 CSA) instead of the dense correctness
+            # fallback; the compressor/indexer tensors are consumed as real
+            # dataflow here rather than as a zero-valued shape anchor below.
+            # ``output`` comes back flattened in the rotated frame, so the
+            # shared inverse ``_rotate`` and the output projection run unchanged.
+            output, present_key, present_value, present_compressed = self._forward_native_csa(
                 op,
                 hidden_states,
                 query,
+                query_lora,
                 kv,
                 past_key_value,
                 past_compressed,
@@ -867,7 +982,7 @@ class DeepSeekV4Attention(nn.Module):
             # Zero-valued shape anchor for the dense correctness fallback,
             # keeping the deferred compressor/indexer weights live in the
             # graph. Skipped on the native-CSA path, where those same weights
-            # are consumed as real dataflow inside ``_forward_native_hca`` --
+            # are consumed as real dataflow inside ``_forward_native_csa`` --
             # so a native-CSA layer emits no dead anchor arithmetic.
             anchor = self.compressor(op)
             if self.indexer is not None:

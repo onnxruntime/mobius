@@ -23,6 +23,7 @@ from mobius.components._rotary_embedding import initialize_rope
 from mobius.integrations.ort_genai import export_package
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.models._deepseek_v4_csa import (
+    CSA_COMPRESSION_RATIO,
     CSA_DOMAIN,
     HCA_COMPRESSION_RATIO,
     NativeCsaExportError,
@@ -64,6 +65,29 @@ def _tiny_config(**overrides):
     )
     values.update(overrides)
     return make_config(**values)
+
+
+def _ratio4_config(**overrides):
+    """A tiny config whose head/index dims satisfy the ratio-4 fp8/fp4 packing.
+
+    Ratio-4 CSA packs its attention cache as ``fp8_e4m3_block64`` -- requiring
+    ``(head_dim - qk_rope_head_dim)`` divisible by 64 -- and its index cache as
+    ``fp4_e2m1_block32`` -- requiring ``index_head_dim`` divisible by 32. The
+    ratio-128 ``_tiny_config`` dims (head_dim=16, index_head_dim=8) cannot
+    satisfy either. These are the smallest valid dims and give
+    ``stored_width=193`` (fp8) and ``index_stored_width=17`` (fp4). A ratio-128
+    layer under the same config is unconstrained, so a mixed schedule can share
+    one config.
+    """
+    values = dict(
+        head_dim=128,
+        qk_rope_head_dim=64,
+        index_n_heads=2,
+        index_head_dim=32,
+        index_topk=4,
+    )
+    values.update(overrides)
+    return _tiny_config(**values)
 
 
 def test_real_config_fields_extract():
@@ -749,12 +773,17 @@ def test_missing_sliding_window_regression_fused_gqa_matches_windowed_decomposed
 
 
 # ---------------------------------------------------------------------------
-# Slice C1: default-off native ``pkg.nxrt::CompressedSparseAttention`` (HCA
-# ratio-128) export. These are shape-faithful/structural tests only: the
-# frozen op has no Python shape inference and no ORT runtime in this env, so
-# we assert exact op attrs, input/output names/shapes/dtypes, threaded
-# compressed state IO, real dataflow (no dead shape anchor), typed rejects,
-# and a byte-identical disabled baseline.
+# Native ``pkg.nxrt::CompressedSparseAttention`` export (default-off
+# ``config.native_csa``). The official DeepSeek-V4-Flash schedule interleaves
+# two compression ratios and both emit the frozen op: ratio-128 "Heavily
+# Compressed Attention" (HCA, compressor-only, 11-in/3-out, f32 cache) and
+# ratio-4 CSA (compressor + a learned FP4 indexer with top-k, 19-in/6-out,
+# fp8_e4m3_block64 + fp4_e2m1_block32 caches). These are shape-faithful/
+# structural tests only: the frozen op has no Python shape inference and no
+# ORT runtime in this env, so we assert exact op attrs, input/output
+# names/shapes/dtypes, threaded compressed (and, for ratio-4, index) state IO,
+# real dataflow (no dead shape anchor), typed rejects, and a byte-identical
+# disabled baseline.
 # ---------------------------------------------------------------------------
 
 _EXPECTED_HCA_ATTRS = {
@@ -770,6 +799,22 @@ _EXPECTED_HCA_ATTRS = {
     "index_layout_version": 1,
     "sink_mode": "logit_only",
     "cache_format": "f32",
+    "scale": 0.0,
+}
+
+_EXPECTED_CSA_RATIO4_ATTRS = {
+    "num_heads": 2,
+    "head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "compression_ratio": 4,
+    "index_num_heads": 2,
+    "index_head_dim": 32,
+    "index_topk": 4,
+    "causal": 1,
+    "cache_layout_version": 1,
+    "index_layout_version": 1,
+    "sink_mode": "logit_only",
+    "cache_format": "fp8_e4m3_block64",
     "scale": 0.0,
 }
 
@@ -959,10 +1004,178 @@ def test_native_csa_defaults_off_and_opt_in():
     assert _tiny_config(native_csa=True).native_csa is True
 
 
-def test_native_csa_rejects_ratio4():
-    # ratio-4 CSA (learned FP4 indexer + top-k) is out of C1 scope: requesting
-    # native export for it must fail closed at construction, never emit dense.
+def test_native_csa_emits_ratio4_op_for_ratio4_layer():
+    # ratio-4 CSA (compressor + learned FP4 indexer + top-k) now emits the
+    # frozen op with the full 19-input / 6-output learned-indexer contract.
+    config = _ratio4_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 4],
+        native_csa=True,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+
+    nodes = _csa_nodes(graph)
+    assert len(nodes) == 1
+    node = nodes[0]
+    assert node.domain == CSA_DOMAIN == "pkg.nxrt"
+    assert len(node.inputs) == 19
+    assert len(node.outputs) == 6
+    assert {k: node.attributes[k].value for k in node.attributes} == _EXPECTED_CSA_RATIO4_ATTRS
+    # The native op fully replaces dense/fused attention for its layer.
+    assert count_op_type(graph, "GroupQueryAttention") == 0
+    assert count_op_type(graph, "Attention") == 0
+
+
+def test_native_csa_emits_both_ratios_for_interleaved_schedule():
+    # The official schedule interleaves ratio-4 CSA and ratio-128 HCA layers; a
+    # full ``native_csa=True`` export must emit BOTH frozen-op variants (never
+    # partial-native + silent dense), each with its own input/output arity.
+    config = _ratio4_config(
+        num_hidden_layers=3,
+        compress_ratios=[0, 4, 128],
+        native_csa=True,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+
+    nodes = _csa_nodes(graph)
+    assert len(nodes) == 2
+    by_ratio = {n.attributes["compression_ratio"].value: n for n in nodes}
+    assert set(by_ratio) == {CSA_COMPRESSION_RATIO, HCA_COMPRESSION_RATIO} == {4, 128}
+    ratio4, ratio128 = by_ratio[4], by_ratio[128]
+    assert (len(ratio4.inputs), len(ratio4.outputs)) == (19, 6)
+    assert (len(ratio128.inputs), len(ratio128.outputs)) == (11, 3)
+    # ratio-128 keeps the compressor-only f32 contract; ratio-4 the packed one.
+    assert ratio128.attributes["cache_format"].value == "f32"
+    assert ratio4.attributes["cache_format"].value == "fp8_e4m3_block64"
+    assert ratio128.attributes["index_topk"].value == 0
+    assert ratio4.attributes["index_topk"].value == 4
+
+
+def test_native_csa_ratio4_threads_index_state_io():
+    # ratio-4 threads the packed uint8 attention/index caches, the f32 carries,
+    # and the transient int32 top-k ``selected_indices`` output, all with
+    # deterministic names and dynamic record axes.
+    config = _ratio4_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    inputs = _named(graph.inputs)
+    outputs = _named(graph.outputs)
+
+    # Packed attention cache: uint8, fp8_e4m3_block64 stored width 193.
+    past_kv, pres_kv = inputs["past_compressed_kv.1"], outputs["present_compressed_kv.1"]
+    assert past_kv.dtype == pres_kv.dtype == ir.DataType.UINT8
+    assert int(past_kv.shape[2]) == int(pres_kv.shape[2]) == 193
+    # Attention carry: f32 [batch, 8 slots, 2 planes, 2*head_dim=256].
+    past_carry = inputs["past_compression_carry.1"]
+    assert past_carry.dtype == ir.DataType.FLOAT
+    assert [int(d) for d in past_carry.shape[1:]] == [8, 2, 256]
+
+    # Packed index cache: uint8, fp4_e2m1_block32 stored width 17.
+    past_ik, pres_ik = inputs["past_index_key.1"], outputs["present_index_key.1"]
+    assert past_ik.dtype == pres_ik.dtype == ir.DataType.UINT8
+    assert int(past_ik.shape[2]) == int(pres_ik.shape[2]) == 17
+    # Index carry: f32 [batch, 8 slots, 2 planes, 2*index_head_dim=64].
+    past_ic = inputs["past_index_carry.1"]
+    assert past_ic.dtype == ir.DataType.FLOAT
+    assert [int(d) for d in past_ic.shape[1:]] == [8, 2, 64]
+
+    # selected_indices is an inspection-only int32 output (not threaded back as
+    # a past_* input) shaped [batch, index_num_heads, sequence, selected].
+    assert "past_selected_indices.1" not in inputs
+    sel = outputs["selected_indices.1"]
+    assert sel.dtype == ir.DataType.INT32
+    assert int(sel.shape[1]) == 2  # index_num_heads
+    assert isinstance(sel.shape[3], ir.SymbolicDim)
+
+
+def test_native_csa_ratio4_wires_learned_indexer():
+    # The learned-indexer inputs must be REAL dataflow: index_query is the
+    # reshaped wq_b projection, index_weight the weights_proj projection, and
+    # the index compressor mirrors the attention compressor.
+    config = _ratio4_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    node = _csa_nodes(graph)[0]
+
+    # Positions 11-18 are the learned-indexer inputs (order-exact).
+    index_query = node.inputs[11]
+    assert index_query.producer().op_type == "Reshape"
+    assert index_query.producer().inputs[0].producer().op_type == "MatMul"
+    assert node.inputs[12].producer().op_type == "MatMul"  # index_weight
+    assert node.inputs[13].producer().op_type == "MatMul"  # index_compressor_kv
+    assert node.inputs[14].producer().op_type == "MatMul"  # index_compressor_gate
+    # index_compressor_ape / index_compressor_norm are the learned parameters.
+    assert node.inputs[15].name == "model.layers.1.self_attn.indexer.compressor.ape"
+    assert node.inputs[16].name == "model.layers.1.self_attn.indexer.compressor.norm.weight"
+
+
+def test_native_csa_ratio4_no_dead_index_anchor():
+    # The ratio-4 indexer weights must survive by real dataflow, not as a
+    # zero-valued shape anchor.
+    config = _ratio4_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    initializers = set(graph.initializers)
+    for name in (
+        "model.layers.1.self_attn.indexer.wq_b.weight",
+        "model.layers.1.self_attn.indexer.weights_proj.weight",
+        "model.layers.1.self_attn.indexer.compressor.wkv.weight",
+        "model.layers.1.self_attn.indexer.compressor.wgate.weight",
+        "model.layers.1.self_attn.indexer.compressor.ape",
+        "model.layers.1.self_attn.indexer.compressor.norm.weight",
+    ):
+        assert name in initializers
+
+
+def test_native_csa_ratio4_present_state_is_chainable_for_decode():
+    # prefill + >=16 decode: both the attention and index present record axes
+    # are dynamic and every carry is fixed-shape, so present_* names/shapes
+    # chain back into past_* inputs for any decode length.
+    config = _ratio4_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    inputs = _named(graph.inputs)
+    outputs = _named(graph.outputs)
+
+    for base, width in (("compressed_kv", 193), ("index_key", 17)):
+        past = inputs[f"past_{base}.1"]
+        pres = outputs[f"present_{base}.1"]
+        assert len(past.shape) == len(pres.shape) == 3
+        assert int(past.shape[2]) == int(pres.shape[2]) == width
+        assert isinstance(past.shape[1], ir.SymbolicDim)
+        assert isinstance(pres.shape[1], ir.SymbolicDim)
+    for base in ("compression_carry", "index_carry"):
+        past = inputs[f"past_{base}.1"]
+        pres = outputs[f"present_{base}.1"]
+        assert [int(d) for d in past.shape[1:]] == [int(d) for d in pres.shape[1:]]
+
+
+def test_native_csa_rejects_ratio4_invalid_packing_dims():
+    # Fail-closed at construction when the head/index dims cannot satisfy the
+    # frozen op's fp8/fp4 packing (never a silent dense fallback). The
+    # ratio-128 ``_tiny_config`` dims (head_dim=16) violate fp8_e4m3_block64.
     config = _tiny_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    with pytest.raises(NativeCsaExportError):
+        DeepSeekV4CausalLMModel(config)
+
+
+def test_native_csa_rejects_ratio4_missing_index_config():
+    # A ratio-4 layer requires positive index_n_heads/index_head_dim/index_topk
+    # to wire the learned indexer; a missing one fails closed.
+    config = _ratio4_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 4],
+        native_csa=True,
+        index_topk=0,
+    )
     with pytest.raises(NativeCsaExportError):
         DeepSeekV4CausalLMModel(config)
 
@@ -1016,3 +1229,33 @@ def test_plan_native_csa_ratio128_layer_matches_contract():
     assert plan.cache_format == "f32"
     assert plan.past_compressed_kv_name == "past_compressed_kv.1"
     assert plan.present_compression_carry_name == "present_compression_carry.1"
+
+
+def test_plan_native_csa_ratio4_layer_matches_contract():
+    config = _ratio4_config(num_hidden_layers=2, compress_ratios=[0, 4], native_csa=True)
+    plan = plan_native_csa(config, 1)
+    assert plan is not None
+    assert plan.is_ratio4
+    assert plan.compression_ratio == CSA_COMPRESSION_RATIO == 4
+    assert plan.head_dim == 128
+    assert plan.qk_rope_head_dim == 64
+    # fp8_e4m3_block64 attention record: (128-64)/64*65 + 64*2 = 193.
+    assert plan.cache_format == "fp8_e4m3_block64"
+    assert plan.cache_dtype == ir.DataType.UINT8
+    assert plan.stored_width == 193
+    # ratio-4 pools overlapping key+value records: carry width = 2*head_dim,
+    # and a fixed 8-slot overlap window (not ``ratio`` slots).
+    assert plan.compressor_width == 256
+    assert plan.carry_slots == 8
+    # Learned FP4 indexer: fp4_e2m1_block32 record 32/32*17 = 17, carry 2*32=64.
+    assert plan.index_num_heads == 2
+    assert plan.index_head_dim == 32
+    assert plan.index_topk == 4
+    assert plan.index_cache_format == "fp4_e2m1_block32"
+    assert plan.index_key_dtype == ir.DataType.UINT8
+    assert plan.index_stored_width == 17
+    assert plan.index_compressor_width == 64
+    # ratio-4 state IO names include the index tensors.
+    assert plan.past_index_key_name == "past_index_key.1"
+    assert plan.present_index_carry_name == "present_index_carry.1"
+    assert plan.selected_indices_name == "selected_indices.1"
