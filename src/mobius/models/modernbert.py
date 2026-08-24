@@ -37,7 +37,7 @@ from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, linear_class_for_config
 from mobius.models.base import TextModel as _TextModel
 
 if TYPE_CHECKING:
@@ -56,13 +56,20 @@ class _ModernBertAttention(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        linear_class = linear_class_for_config(config) or Linear
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
 
-        self.q_proj = Linear(config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias)
-        self.k_proj = Linear(config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias)
-        self.v_proj = Linear(config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias)
-        self.Wo = Linear(config.hidden_size, config.hidden_size, bias=config.attn_o_bias)
+        self.q_proj = linear_class(
+            config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.k_proj = linear_class(
+            config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.v_proj = linear_class(
+            config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.Wo = linear_class(config.hidden_size, config.hidden_size, bias=config.attn_o_bias)
 
     def forward(
         self,
@@ -113,13 +120,16 @@ class _ModernBertMLP(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.gate_proj = Linear(
+        linear_class = linear_class_for_config(config) or Linear
+        self.gate_proj = linear_class(
             config.hidden_size, config.intermediate_size, bias=config.mlp_bias
         )
-        self.up_proj = Linear(
+        self.up_proj = linear_class(
             config.hidden_size, config.intermediate_size, bias=config.mlp_bias
         )
-        self.Wo = Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.Wo = linear_class(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
         self._act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -286,6 +296,11 @@ def _rename_modernbert_weight(
             out[f"{prefix}.v_proj.{param_type}"] = v
             return None  # Already added to out
 
+        # Quantized GGUF loading splits fused projections before this model-level
+        # rename so each MatMulNBits module receives its packed companions.
+        if remainder.startswith(("attn.q_proj.", "attn.k_proj.", "attn.v_proj.")):
+            return name
+
         # Output proj: attn.Wo now matches directly
         if remainder.startswith("attn.Wo."):
             return name
@@ -299,6 +314,9 @@ def _rename_modernbert_weight(
             out[f"{prefix}.gate_proj.{param_type}"] = gate
             out[f"{prefix}.up_proj.{param_type}"] = up
             return None
+
+        if remainder.startswith(("mlp.gate_proj.", "mlp.up_proj.")):
+            return name
 
         # MLP output: mlp.Wo now matches directly
         if remainder.startswith("mlp.Wo."):

@@ -328,6 +328,10 @@ def _write_encoder_gguf(
     architecture: str,
     *,
     quantized: bool = False,
+    fused_qkv: bool = False,
+    fused_qkv_float: bool = False,
+    fused_width_delta: int = 0,
+    kv_heads: int | None = 4,
     pooling_type: int = 0,
     include_head: bool = False,
     omit: str | None = None,
@@ -347,7 +351,8 @@ def _write_encoder_gguf(
     writer.add_feed_forward_length(intermediate)
     writer.add_block_count(1)
     writer.add_head_count(4)
-    writer.add_head_count_kv(4)
+    if kv_heads is not None:
+        writer.add_head_count_kv(kv_heads)
     writer.add_vocab_size(vocab)
     writer.add_causal_attention(False)
     writer.add_pooling_type(PoolingType(pooling_type))
@@ -393,13 +398,23 @@ def _write_encoder_gguf(
         else:
             add_float(name, shape)
 
-    add_float("token_embd.weight", (vocab, hidden))
+    add_matrix("token_embd.weight", (vocab, hidden))
     if architecture == "bert":
         add_float("token_types.weight", (2, hidden))
         add_float("position_embd.weight", (context, hidden))
         add_float("token_embd_norm.weight", (hidden,))
         add_float("token_embd_norm.bias", (hidden,))
-        for projection in ("attn_q", "attn_k", "attn_v", "attn_output"):
+        if fused_qkv:
+            fused_shape = (3 * hidden + fused_width_delta, hidden)
+            if fused_qkv_float:
+                add_float("blk.0.attn_qkv.weight", fused_shape)
+            else:
+                add_matrix("blk.0.attn_qkv.weight", fused_shape)
+            add_float("blk.0.attn_qkv.bias", (3 * hidden + fused_width_delta,))
+            projections = ("attn_output",)
+        else:
+            projections = ("attn_q", "attn_k", "attn_v", "attn_output")
+        for projection in projections:
             add_matrix(f"blk.0.{projection}.weight", (hidden, hidden))
             add_float(f"blk.0.{projection}.bias", (hidden,))
         for norm in ("attn_output_norm", "layer_output_norm"):
@@ -2302,20 +2317,173 @@ class TestEncoderGGUFBuild:
             assert np.isfinite(output).all()
 
     @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
-    def test_quantized_source_dequantizes_without_output_corruption(
+    def test_quantized_source_preserves_linears_but_dequantizes_embedding(
         self, tmp_path: Path, architecture: str
     ) -> None:
+        from gguf import GGMLQuantizationType
+
         from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
 
         path = tmp_path / f"{architecture}-q4.gguf"
         _write_encoder_gguf(path, architecture, quantized=True)
+        source = GGUFModel(path)
+        token_qtype = next(
+            qtype
+            for name, _raw, qtype, _shape in source.tensor_items_raw()
+            if name == "token_embd.weight"
+        )
+        assert token_qtype == GGMLQuantizationType.Q4_0
+
         preserved = build_from_gguf(path, keep_quantized=True)["model"]
         explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
 
-        assert "MatMulNBits" not in {node.op_type for node in preserved.graph}
+        op_types = {node.op_type for node in preserved.graph}
+        assert "MatMulNBits" in op_types
+        assert "GatherBlockQuantized" not in op_types
         actual = self._run(preserved, 5, masked=True)
         expected = self._run(explicit_float, 5, masked=True)
-        np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-2)
+
+    def test_float_fused_bert_qkv_splits_losslessly_and_runs(self, tmp_path: Path) -> None:
+        import torch
+
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._builder import (
+            _load_dequantized_state_dict,
+            _normalize_gguf_weights,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "bert-fused-qkv.gguf"
+        _write_encoder_gguf(path, "bert", fused_qkv=True)
+        source = GGUFModel(path)
+        mapped = _load_dequantized_state_dict(source, "bert")
+        fused_weight = mapped["bert.encoder.layer.0.attention.self.qkv.weight"]
+        fused_bias = mapped["bert.encoder.layer.0.attention.self.qkv.bias"]
+        normalized = _normalize_gguf_weights(
+            mapped,
+            "bert",
+            SimpleNamespace(hidden_size=64),
+        )
+
+        for index, projection in enumerate(("query", "key", "value")):
+            stem = f"bert.encoder.layer.0.attention.self.{projection}"
+            assert torch.equal(
+                normalized[f"{stem}.weight"],
+                fused_weight[index * 64 : (index + 1) * 64],
+            )
+            assert torch.equal(
+                normalized[f"{stem}.bias"],
+                fused_bias[index * 64 : (index + 1) * 64],
+            )
+        assert not any(".qkv." in name for name in normalized)
+
+        model = build_from_gguf(path)["model"]
+        output = self._run(model, 5, masked=True)
+        assert output.shape == (1, 5, 64)
+        assert np.isfinite(output).all()
+
+    def test_float_fused_bert_qkv_repacks_in_mixed_quantized_file(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "bert-fused-qkv-mixed.gguf"
+        _write_encoder_gguf(
+            path,
+            "bert",
+            quantized=True,
+            fused_qkv=True,
+            fused_qkv_float=True,
+        )
+        preserved = build_from_gguf(path, keep_quantized=True)["model"]
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+
+        assert "MatMulNBits" in {node.op_type for node in preserved.graph}
+        actual = self._run(preserved, 5, masked=True)
+        expected = self._run(explicit_float, 5, masked=True)
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-2)
+
+    @pytest.mark.parametrize(
+        ("quantized", "width_delta", "message"),
+        [
+            (False, 1, "invalid encoder tensor shape"),
+            (True, 0, "cannot be split losslessly"),
+        ],
+    )
+    def test_invalid_fused_bert_qkv_fails_before_graph_build(
+        self,
+        tmp_path: Path,
+        quantized: bool,
+        width_delta: int,
+        message: str,
+        monkeypatch,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "bert-invalid-fused-qkv.gguf"
+        _write_encoder_gguf(
+            path,
+            "bert",
+            quantized=quantized,
+            fused_qkv=True,
+            fused_width_delta=width_delta,
+        )
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=message):
+            build_from_gguf(path)
+
+    def test_fused_bert_qkv_requires_matching_bias(self, tmp_path: Path, monkeypatch) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "bert-fused-qkv-missing-bias.gguf"
+        _write_encoder_gguf(
+            path,
+            "bert",
+            fused_qkv=True,
+            omit="blk.0.attn_qkv.bias",
+        )
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"attn_qkv.bias"):
+            build_from_gguf(path)
+
+    @pytest.mark.parametrize("kv_heads", [None, 4])
+    def test_bert_kv_heads_default_to_query_heads_or_accept_equality(
+        self, tmp_path: Path, kv_heads: int | None
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / f"bert-kv-{kv_heads}.gguf"
+        _write_encoder_gguf(path, "bert", kv_heads=kv_heads)
+        config = gguf_to_config(GGUFModel(path))
+        assert config.num_attention_heads == 4
+        assert config.num_key_value_heads == 4
+
+    def test_bert_gqa_rejected_before_graph_build(self, tmp_path: Path, monkeypatch) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "bert-gqa.gguf"
+        _write_encoder_gguf(path, "bert", kv_heads=2)
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match="grouped-query attention is not supported"):
+            build_from_gguf(path)
 
     @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
     def test_pooling_classifier_and_task_overrides_are_rejected(

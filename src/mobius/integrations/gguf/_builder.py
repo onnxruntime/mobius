@@ -395,6 +395,8 @@ def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
 
 def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
     """Validate required encoder tensors and their exact logical ranks/shapes."""
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
     architecture = gguf_model.architecture
     if architecture not in {"bert", "modern-bert"}:
         return
@@ -403,6 +405,13 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
     hidden = int(metadata[f"{architecture}.embedding_length"])
     intermediate = int(metadata[f"{architecture}.feed_forward_length"])
     layers = int(metadata[f"{architecture}.block_count"])
+    num_heads = int(metadata[f"{architecture}.attention.head_count"])
+    num_kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", num_heads))
+    if architecture == "bert" and num_kv_heads != num_heads:
+        raise ValueError(
+            "BERT GGUF grouped-query attention is not supported: "
+            f"attention.head_count={num_heads}, attention.head_count_kv={num_kv_heads}"
+        )
     vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
     if not vocab:
         vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
@@ -422,12 +431,6 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
             }
         )
         layer_shapes = {
-            "attn_q.weight": (hidden, hidden),
-            "attn_q.bias": (hidden,),
-            "attn_k.weight": (hidden, hidden),
-            "attn_k.bias": (hidden,),
-            "attn_v.weight": (hidden, hidden),
-            "attn_v.bias": (hidden,),
             "attn_output.weight": (hidden, hidden),
             "attn_output.bias": (hidden,),
             "attn_output_norm.weight": (hidden,),
@@ -454,16 +457,47 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
             "ffn_norm.weight": (hidden,),
         }
 
+    actual_items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dim) for dim in shape) for name, _raw, _qtype, shape in actual_items
+    }
+    qtypes = {name: qtype for name, _raw, qtype, _shape in actual_items}
+
     for layer in range(layers):
         for suffix, shape in layer_shapes.items():
             required[f"blk.{layer}.{suffix}"] = shape
+        if architecture == "bert":
+            fused_weight = f"blk.{layer}.attn_qkv.weight"
+            fused_bias = f"blk.{layer}.attn_qkv.bias"
+            split_names = {
+                f"blk.{layer}.attn_{projection}.{suffix}"
+                for projection in ("q", "k", "v")
+                for suffix in ("weight", "bias")
+            }
+            has_fused = fused_weight in actual or fused_bias in actual
+            has_split = bool(split_names & set(actual))
+            if has_fused and has_split:
+                raise ValueError(
+                    f"bert GGUF layer {layer} contains both fused and split Q/K/V tensors; "
+                    "the import contract requires one unambiguous representation"
+                )
+            if has_fused:
+                required[fused_weight] = (3 * hidden, hidden)
+                required[fused_bias] = (3 * hidden,)
+                qtype = qtypes.get(fused_weight)
+                qtype_id = getattr(qtype, "value", qtype)
+                if qtype is not None and qtype_id not in float_storage_type_ids():
+                    raise ValueError(
+                        "Quantized fused BERT attn_qkv.weight cannot be split losslessly; "
+                        "use a GGUF with split Q/K/V tensors or float fused QKV"
+                    )
+            else:
+                for projection in ("q", "k", "v"):
+                    required[f"blk.{layer}.attn_{projection}.weight"] = (hidden, hidden)
+                    required[f"blk.{layer}.attn_{projection}.bias"] = (hidden,)
         if architecture == "modern-bert" and layer > 0:
             required[f"blk.{layer}.attn_norm.weight"] = (hidden,)
 
-    actual = {
-        name: tuple(int(dim) for dim in shape)
-        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
-    }
     missing = sorted(set(required) - set(actual))
     if missing:
         raise ValueError(
@@ -1163,12 +1197,22 @@ def _native_block_target_stems(
     return []
 
 
-def _fused_qkv_target_stems(hf_name: str, available_stems: set[str]) -> list[str]:
-    """Return separate Q/K/V targets for a fused GGUF attention projection."""
-    if not hf_name.endswith(".qkv_proj.weight"):
+def _fused_projection_target_stems(hf_name: str, available_stems: set[str]) -> list[str]:
+    """Return separate quantized targets for a fused GGUF projection."""
+    if hf_name.endswith(".qkv_proj.weight"):
+        stem = hf_name[: -len(".qkv_proj.weight")]
+        candidates = [f"{stem}.{projection}_proj" for projection in ("q", "k", "v")]
+    elif hf_name.endswith(".attn.Wqkv.weight"):
+        stem = hf_name[: -len(".Wqkv.weight")]
+        candidates = [f"{stem}.{projection}_proj" for projection in ("q", "k", "v")]
+    elif hf_name.endswith(".attention.self.qkv.weight"):
+        stem = hf_name[: -len(".qkv.weight")]
+        candidates = [f"{stem}.{projection}" for projection in ("query", "key", "value")]
+    elif hf_name.endswith(".mlp.Wi.weight"):
+        stem = hf_name[: -len(".Wi.weight")]
+        candidates = [f"{stem}.{projection}_proj" for projection in ("gate", "up")]
+    else:
         return []
-    stem = hf_name[: -len(".qkv_proj.weight")]
-    candidates = [f"{stem}.{projection}_proj" for projection in ("q", "k", "v")]
     return candidates if all(candidate in available_stems for candidate in candidates) else []
 
 
@@ -1309,6 +1353,20 @@ def _normalize_gguf_weights(
     for key, value in state_dict.items():
         if config is not None:
             _validate_moe_weight_shape(key, tuple(value.shape), config)
+        if gguf_arch == "bert" and ".attention.self.qkv." in key:
+            suffix = key.rsplit(".", 1)[-1]
+            expected_width = 3 * int(config.hidden_size)
+            if value.shape[0] != expected_width:
+                raise ValueError(
+                    f"Invalid fused BERT QKV {suffix} width: expected {expected_width}, "
+                    f"got {value.shape[0]}"
+                )
+            query, key_value, value_projection = value.chunk(3, dim=0)
+            stem = key.rsplit(".qkv.", 1)[0]
+            result[f"{stem}.query.{suffix}"] = query
+            result[f"{stem}.key.{suffix}"] = key_value
+            result[f"{stem}.value.{suffix}"] = value_projection
+            continue
         # Stacked expert weights [num_experts, out, in] → per-expert
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -1728,6 +1786,12 @@ def _can_quantize_embedding(
     from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
+    # Encoder modules currently expose plain Embedding parameters. Keep their
+    # token tables explicitly dequantized until they have a QuantizedEmbedding
+    # factory and a validated GatherBlockQuantized ABI.
+    if gguf_arch in {"bert", "modern-bert"}:
+        return False
+
     # Tencent files reuse the Q1_0 type id for a custom layout that gguf-py
     # cannot size correctly. Embeddings from those files must stay dequantized.
     if is_tencent_q1_0_layout(gguf_model):
@@ -2033,6 +2097,11 @@ def _load_quantized_state_dict(
                 logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
             continue
         _validate_moe_weight_shape(hf_name, tuple(int(dim) for dim in np_shape), config)
+        module_hf_name = hf_name
+        if gguf_arch == "bert" and module_hf_name.startswith("bert."):
+            module_hf_name = module_hf_name[len("bert.") :]
+        elif gguf_arch == "modern-bert" and module_hf_name.startswith("model."):
+            module_hf_name = module_hf_name[len("model.") :]
 
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
@@ -2041,10 +2110,15 @@ def _load_quantized_state_dict(
         # otherwise leave unsupported source types as full float matrices,
         # which cannot fit the graph's packed MatMulNBits initializer shape.
         stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
+        module_stem = (
+            module_hf_name[: -len(".weight")] if module_hf_name.endswith(".weight") else None
+        )
         is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
-        is_quantized_embedding = stem is not None and stem in quantized_embedding_stems
-        should_repack = stem is not None and (
-            stem in quantized_stems or is_quantized_embedding
+        is_quantized_embedding = (
+            module_stem is not None and module_stem in quantized_embedding_stems
+        )
+        should_repack = module_stem is not None and (
+            module_stem in quantized_stems or is_quantized_embedding
         )
 
         native_targets = _native_block_target_stems(
@@ -2053,14 +2127,16 @@ def _load_quantized_state_dict(
             set(native_block_stems),
         )
         affine_targets = _native_block_target_stems(
-            hf_name,
+            module_hf_name,
             np_shape,
             quantized_stems,
         )
-        fused_qkv_targets = _fused_qkv_target_stems(hf_name, quantized_stems)
+        fused_projection_targets = _fused_projection_target_stems(
+            module_hf_name, quantized_stems
+        )
         native_spec = _native_block_spec(qtype)
         quant_spec = get_quant_spec(qtype)
-        is_embedding_tensor = stem is not None and stem in embedding_stems
+        is_embedding_tensor = module_stem is not None and module_stem in embedding_stems
         tensor_role = (
             TensorRole.EMBEDDING
             if is_embedding_tensor
@@ -2069,11 +2145,11 @@ def _load_quantized_state_dict(
             else TensorRole.OUTPUT
             if hf_name == "lm_head.weight"
             else TensorRole.PROJECTION
-            if stem is not None
+            if module_stem is not None
             and (
-                stem in quantized_stems
-                or stem in native_block_stems
-                or stem in float_linear_stems
+                module_stem in quantized_stems
+                or module_stem in native_block_stems
+                or module_stem in float_linear_stems
             )
             else TensorRole.NON_MATMUL
         )
@@ -2114,17 +2190,17 @@ def _load_quantized_state_dict(
                     QuantImportRoute.DEQUANTIZE_REQUANTIZE,
                 }
                 and not should_repack
-                and not fused_qkv_targets
+                and not fused_projection_targets
             ):
                 raise ValueError(
                     f"Cannot keep {quant_spec.name} {tensor_role.value} {hf_name} "
                     "quantized: the model graph does not expose MatMulNBits. Use "
                     "keep_quantized=False for explicit float import."
                 )
-        if fused_qkv_targets:
+        if fused_projection_targets:
             values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
             offset = 0
-            for target_stem in fused_qkv_targets:
+            for target_stem in fused_projection_targets:
                 n_out = quantized_output_sizes[target_stem]
                 target_values = values[offset : offset + n_out]
                 offset += n_out
@@ -2145,7 +2221,7 @@ def _load_quantized_state_dict(
                     f"Fused QKV tensor {hf_name!r} has {np_shape[0]} rows, "
                     f"but Q/K/V targets require {offset}"
                 )
-            n_repacked += len(fused_qkv_targets)
+            n_repacked += len(fused_projection_targets)
             n_requantized += 1
         elif native_targets and native_spec is not None:
             n_out = int(np_shape[-2])

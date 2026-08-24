@@ -195,6 +195,44 @@ validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
 
+### Encoder-only GGUF contract
+
+`bert` and `modern-bert` import only backbone files whose metadata requests
+non-causal, unpooled token embeddings. They produce one `model` component with
+`input_ids`, `attention_mask`, and `token_type_ids` inputs and one
+`last_hidden_state` output shaped `[batch, sequence, hidden]`. They never emit
+causal logits, KV cache, or recurrent state. `task` overrides other than
+`feature-extraction`, static cache, non-`NONE` pooling, classifier labels,
+`cls*` tensors, and ModernBERT sliding-window attention are rejected rather than
+ignored.
+
+Pinned BERT files may use either split Q/K/V tensors or float fused
+`attn_qkv.{weight,bias}` tensors; fused rows are split losslessly before weight
+application. Quantized fused QKV is rejected because splitting packed blocks is
+not lossless. BERT `attention.head_count_kv` defaults to `attention.head_count`;
+different values are rejected until the encoder graph supports GQA-sized K/V.
+
+Compatible 2-D encoder projection matrices use `MatMulNBits`, while a quantized
+`token_embd.weight` explicitly dequantizes: encoder modules do not yet expose the
+`QuantizedEmbedding`/`GatherBlockQuantized` ABI. This is intentionally not a
+packed-embedding preservation claim. Token-position, token-type, normalization,
+and bias tensors remain float; GGUF
+`.scale`/`.input_scale` sidecars are rejected before graph construction.
+
+Runtime remains **deferred**. Header-range inspection pinned these representative
+artifacts before any payload use:
+
+| GGUF artifact | Revision / file | Size / LFS SHA-256 | Header evidence |
+|---|---|---|---|
+| `PierreMesure/sentence-bert-swedish-cased-gguf` | `f737e1c3fa76176845a1a9dfc3fd8aee82e8f159` / `sentence-bert-swedish-cased.F32.gguf` | 497,449,376 bytes / `9ee1505b22d4bc8d192095f924ddb62bc4783a48fbd411252310933e879930f8` | `bert`, 12x768, F32 closure; rejected because `pooling_type=MEAN`. Source config/tokenizer: `KBLab/sentence-bert-swedish-cased@6b5e83cd29c03729cfdc33d13b1423399b0efb5c`. |
+| `keisuke-miyako/modernbert-ja-30m-gguf-q8_0` | `b51053917455553a61b5319560dbd00b7d53323d` / `modernbert-ja-30m-Q8_0.gguf` | 41,466,080 bytes / `b56a63b0adc5942dbc949153b071bd90557380fa32ca190cc833e85fb1529932` | `modern-bert`, 10x256, Q8_0 matrices/F32 norms; rejected because it declares symmetric sliding-window attention. Source config/tokenizer: `sbintuitions/modernbert-ja-30m@8cb03f54cb9e30e72459e5f1cedc6d89c7d8dcb5`. |
+
+Neither artifact is runtime evidence: both are deliberately rejected before
+weight loading, so no independent embedding or reranker-logit parity is claimed.
+EuroBERT, JinaBERT v2/v3, NeoBERT, NomicBERT, and NomicBERT-MoE remain deferred
+because their pinned normalization, ALiBi/RoPE, gated FFN, Q/K norm, or routed
+expert semantics do not match the existing encoder graphs.
+
 ### Pure recurrent Mamba evidence
 
 `mamba` and `mamba2` have config, suffix-exact C++ tensor-name closure,

@@ -1373,6 +1373,12 @@ def _bert_encoder_postprocess(
 ) -> ArchitectureConfig:
     """Apply pinned BERT defaults and tokenizer-owned token-type metadata."""
     _validate_encoder_metadata(config, metadata, "bert")
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(
+            "BERT GGUF grouped-query attention is not supported: "
+            f"attention.head_count={config.num_attention_heads}, "
+            f"attention.head_count_kv={config.num_key_value_heads}"
+        )
     token_types = metadata.get("tokenizer.ggml.token_type_count")
     if token_types is None or int(token_types) <= 0:
         raise ValueError(

@@ -337,6 +337,7 @@ class TestPinnedTensorClosure:
         ("architecture", "mapping_key"),
         [
             ("bert", "blk.{bid}.attn_q"),
+            ("bert", "blk.{bid}.attn_qkv"),
             ("modern-bert", "blk.{bid}.attn_qkv"),
         ],
     )

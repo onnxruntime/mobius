@@ -252,6 +252,7 @@ _BERT_MAPPING: dict[str, str] = {
     "token_embd_norm": "bert.embeddings.LayerNorm",
     "cls": "bert.pooler.dense",
     "cls_out": "classifier",
+    "blk.{bid}.attn_qkv": "bert.encoder.layer.{bid}.attention.self.qkv",
     "blk.{bid}.attn_q": "bert.encoder.layer.{bid}.attention.self.query",
     "blk.{bid}.attn_k": "bert.encoder.layer.{bid}.attention.self.key",
     "blk.{bid}.attn_v": "bert.encoder.layer.{bid}.attention.self.value",
