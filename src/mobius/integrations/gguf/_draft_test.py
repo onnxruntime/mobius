@@ -277,6 +277,31 @@ def test_safe_path_open_rejects_symlink_without_dir_fd(tmp_path: Path, monkeypat
         build_from_gguf(draft, target_config=target)
 
 
+def test_safe_path_open_rejects_root_swap_between_resources(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mobius.integrations.gguf import _draft, build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    target = tmp_path / "target"
+    _write_target_dir(target, tokens)
+    draft = _write_draft(tmp_path / "dflash.gguf", "dflash")
+    monkeypatch.setattr(_draft, "_supports_secure_dir_fd", lambda: False)
+    original_read = _draft._read_bounded_json_at
+
+    def swap_root_after_config(*args, **kwargs):
+        value = original_read(*args, **kwargs)
+        if args[3] == "config.json":
+            target.rename(tmp_path / "displaced-target")
+            _write_target_dir(target, list(reversed(tokens)))
+        return value
+
+    monkeypatch.setattr(_draft, "_read_bounded_json_at", swap_root_after_config)
+
+    with pytest.raises(ValueError, match="target root changed"):
+        build_from_gguf(draft, target_config=target)
+
+
 def test_target_resources_do_not_mix_split_tokenizer_files(
     tmp_path: Path, monkeypatch
 ) -> None:
