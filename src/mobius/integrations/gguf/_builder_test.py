@@ -122,6 +122,8 @@ def _write_quantized_gguf(
         writer.add_sliding_window(128)
         writer.add_logit_scale(0.0625)
         writer.add_rope_dimension_count(head_dim := hidden_size // num_heads)
+    elif architecture == "granitemoe":
+        writer.add_logit_scale(16.0)
     writer.add_vocab_size(vocab_size)
 
     head_dim = hidden_size // num_heads
@@ -314,6 +316,154 @@ def _write_quantized_gguf(
             _add_q8_0("output.weight", vocab_size, hidden_size)
         else:
             add_float("output.weight", (vocab_size, hidden_size))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def _write_moe_gguf(
+    path: Path,
+    architecture: str,
+    projection_quantization: str,
+    *,
+    phi_fused_qkv: bool = False,
+    quantize_tied_embedding: bool = False,
+) -> None:
+    """Write a one-layer conventional-attention MoE GGUF with exact families."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden_size = 64
+    intermediate_size = 128
+    expert_size = 64 if architecture in {"qwen2moe", "qwen3moe"} else 128
+    shared_size = 128 if architecture == "qwen2moe" else 32
+    num_experts = 4
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 16
+    vocab_size = 256
+
+    writer = GGUFWriter(str(path), architecture)
+    writer.add_context_length(512)
+    writer.add_embedding_length(hidden_size)
+    writer.add_feed_forward_length(intermediate_size)
+    writer.add_block_count(1)
+    writer.add_head_count(num_heads)
+    writer.add_head_count_kv(num_kv_heads)
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_rope_dimension_count(head_dim)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab_size)
+    writer.add_expert_count(num_experts)
+    writer.add_expert_used_count(2)
+    if architecture in {"qwen2moe", "qwen3moe"}:
+        writer.add_expert_feed_forward_length(expert_size)
+    if architecture == "qwen2moe":
+        writer.add_expert_shared_feed_forward_length(shared_size)
+    if architecture == "granitemoe":
+        writer.add_logit_scale(16.0)
+        writer.add_embedding_scale(12.0)
+        writer.add_residual_scale(0.5)
+        writer.add_attention_scale(0.125)
+        writer.add_expert_shared_feed_forward_length(shared_size)
+
+    rng = np.random.default_rng(0)
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, rng.normal(size=shape).astype(np.float32))
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        rows = int(np.prod(shape[:-1]))
+        k_in = shape[-1]
+        assert k_in % 32 == 0
+        byte_shape = (*shape[:-1], (k_in // 32) * 18)
+        raw = np.zeros((rows, byte_shape[-1]), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(k_in // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.1)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(
+            name,
+            raw.reshape(byte_shape),
+            raw_dtype=GGMLQuantizationType.Q4_0,
+        )
+
+    add_projection = add_q4 if projection_quantization == "q4_0" else add_float
+
+    if quantize_tied_embedding:
+        assert architecture in {"qwen3moe", "granitemoe"}
+        add_q4("token_embd.weight", (vocab_size, hidden_size))
+    else:
+        add_float("token_embd.weight", (vocab_size, hidden_size))
+    if architecture == "phimoe" and phi_fused_qkv:
+        add_projection(
+            "blk.0.attn_qkv.weight",
+            ((num_heads + 2 * num_kv_heads) * head_dim, hidden_size),
+        )
+    else:
+        add_projection("blk.0.attn_q.weight", (num_heads * head_dim, hidden_size))
+        add_projection("blk.0.attn_k.weight", (num_kv_heads * head_dim, hidden_size))
+        add_projection("blk.0.attn_v.weight", (num_kv_heads * head_dim, hidden_size))
+    add_projection("blk.0.attn_output.weight", (hidden_size, num_heads * head_dim))
+    add_float("blk.0.attn_norm.weight", (hidden_size,))
+    add_float("blk.0.ffn_norm.weight", (hidden_size,))
+    add_float("blk.0.ffn_gate_inp.weight", (num_experts, hidden_size))
+    add_projection(
+        "blk.0.ffn_gate_exps.weight",
+        (num_experts, expert_size, hidden_size),
+    )
+    add_projection(
+        "blk.0.ffn_up_exps.weight",
+        (num_experts, expert_size, hidden_size),
+    )
+    add_projection(
+        "blk.0.ffn_down_exps.weight",
+        (num_experts, hidden_size, expert_size),
+    )
+
+    if architecture == "olmoe":
+        add_float("blk.0.attn_q_norm.weight", (num_heads * head_dim,))
+        add_float("blk.0.attn_k_norm.weight", (num_kv_heads * head_dim,))
+    elif architecture == "qwen3moe":
+        add_float("blk.0.attn_q_norm.weight", (head_dim,))
+        add_float("blk.0.attn_k_norm.weight", (head_dim,))
+    elif architecture == "qwen2moe":
+        add_float("blk.0.ffn_gate_inp_shexp.weight", (hidden_size,))
+        add_projection("blk.0.ffn_gate_shexp.weight", (shared_size, hidden_size))
+        add_projection("blk.0.ffn_up_shexp.weight", (shared_size, hidden_size))
+        add_projection("blk.0.ffn_down_shexp.weight", (hidden_size, shared_size))
+    elif architecture == "granitemoe":
+        add_projection("blk.0.ffn_gate_shexp.weight", (shared_size, hidden_size))
+        add_projection("blk.0.ffn_up_shexp.weight", (shared_size, hidden_size))
+        add_projection("blk.0.ffn_down_shexp.weight", (hidden_size, shared_size))
+    elif architecture == "phimoe":
+        attention_biases = (
+            (("attn_qkv", (num_heads + 2 * num_kv_heads) * head_dim),)
+            if phi_fused_qkv
+            else (
+                ("attn_q", num_heads * head_dim),
+                ("attn_k", num_kv_heads * head_dim),
+                ("attn_v", num_kv_heads * head_dim),
+            )
+        )
+        for name, size in (*attention_biases, ("attn_output", hidden_size)):
+            add_float(f"blk.0.{name}.bias", (size,))
+        add_float("blk.0.attn_norm.bias", (hidden_size,))
+        add_float("blk.0.ffn_norm.bias", (hidden_size,))
+
+    add_float("output_norm.weight", (hidden_size,))
+    if architecture == "phimoe":
+        add_float("output_norm.bias", (hidden_size,))
+    if architecture not in {"qwen3moe", "granitemoe"}:
+        add_projection("output.weight", (vocab_size, hidden_size))
+        if architecture == "phimoe":
+            add_float("output.bias", (vocab_size,))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -1195,6 +1345,146 @@ class TestBuildQuantizedGguf:
         assert np.isfinite(first).all()
         np.testing.assert_array_equal(first, second)
 
+    @pytest.mark.parametrize(
+        "architecture", ["olmoe", "phimoe", "qwen2moe", "qwen3moe", "granitemoe"]
+    )
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_moe_cohort_builds_complete_graphs(
+        self,
+        architecture: str,
+        projection_quantization: str,
+        tmp_path: Path,
+    ) -> None:
+        """All routed/shared expert tensors survive build, save, load, and ORT."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-{projection_quantization}.gguf"
+        _write_moe_gguf(path, architecture, projection_quantization)
+        package = build_from_gguf(path)
+        model = package["model"]
+        initializer_names = set(model.graph.initializers)
+
+        def has_weight(stem: str) -> bool:
+            return (
+                f"{stem}.weight" in initializer_names
+                or f"{stem}.weight_t" in initializer_names
+            )
+
+        for expert in range(4):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                assert has_weight(f"model.layers.0.mlp.experts.{expert}.{projection}")
+        assert has_weight("model.layers.0.mlp.gate")
+        if architecture in {"qwen2moe", "granitemoe"}:
+            assert has_weight("model.layers.0.mlp.shared_expert.gate_proj")
+            assert has_weight("model.layers.0.mlp.shared_expert.up_proj")
+            assert has_weight("model.layers.0.mlp.shared_expert.down_proj")
+
+        op_types = {node.op_type for node in model.graph}
+        if projection_quantization == "q4_0":
+            assert "MatMulNBits" in op_types
+            assert not any("fc1_experts" in name for name in initializer_names)
+        else:
+            assert "MatMulNBits" not in op_types
+
+        output_dir = tmp_path / f"{architecture}-{projection_quantization}-onnx"
+        package.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        feeds = {
+            "input_ids": np.array([[1, 2]], dtype=np.int64),
+            "attention_mask": np.ones((1, 2), dtype=np.int64),
+            "position_ids": np.array([[0, 1]], dtype=np.int64),
+            "past_key_values.0.key": np.empty((1, 2, 0, 16), dtype=np.float32),
+            "past_key_values.0.value": np.empty((1, 2, 0, 16), dtype=np.float32),
+        }
+        first = session.run(["logits"], feeds)[0]
+        second = session.run(["logits"], feeds)[0]
+        assert first.shape == (1, 2, 256)
+        assert np.isfinite(first).all()
+        np.testing.assert_array_equal(first, second)
+
+    def test_granitemoe_zero_experts_selects_dense_graph(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitemoe-dense.gguf"
+        _write_quantized_gguf(
+            path,
+            architecture="granitemoe",
+            projection_quantization="q4_0",
+            tie_embeddings=True,
+            quantize_embedding=True,
+        )
+        model = build_from_gguf(path)["model"]
+        names = set(model.graph.initializers)
+        assert any(".mlp.gate_proj.weight" in name for name in names)
+        assert not any(".mlp.experts." in name for name in names)
+        assert not any(".mlp.gate.weight" in name for name in names)
+        assert "model.embed_tokens.qweight" in names
+        assert not any(name.startswith("lm_head.") for name in names)
+
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_phimoe_fused_qkv_is_split_without_loss(
+        self, projection_quantization: str, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"phimoe-fused-{projection_quantization}.gguf"
+        _write_moe_gguf(
+            path,
+            "phimoe",
+            projection_quantization,
+            phi_fused_qkv=True,
+        )
+        model = build_from_gguf(path)["model"]
+        names = set(model.graph.initializers)
+        for projection in ("q_proj", "k_proj", "v_proj"):
+            assert any(
+                f"model.layers.0.self_attn.{projection}.weight" in name for name in names
+            )
+            assert any(f"model.layers.0.self_attn.{projection}.bias" in name for name in names)
+        assert not any("qkv_proj" in name for name in names)
+
+    @pytest.mark.parametrize("architecture", ["qwen3moe", "granitemoe"])
+    def test_tied_quantized_embedding_is_shared_with_output_head(
+        self, architecture: str, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-tied-q4.gguf"
+        _write_moe_gguf(
+            path,
+            architecture,
+            "q4_0",
+            quantize_tied_embedding=True,
+        )
+        package = build_from_gguf(path)
+        model = package["model"]
+        op_types = [node.op_type for node in model.graph]
+        assert op_types.count("GatherBlockQuantized") == 1
+        assert "MatMulNBits" in op_types
+        assert "model.embed_tokens.qweight" in model.graph.initializers
+        assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
+        output_dir = tmp_path / f"{architecture}-tied-q4-onnx"
+        package.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        logits = session.run(
+            ["logits"],
+            {
+                "input_ids": np.array([[1, 2]], dtype=np.int64),
+                "attention_mask": np.ones((1, 2), dtype=np.int64),
+                "position_ids": np.array([[0, 1]], dtype=np.int64),
+                "past_key_values.0.key": np.empty((1, 2, 0, 16), dtype=np.float32),
+                "past_key_values.0.value": np.empty((1, 2, 0, 16), dtype=np.float32),
+            },
+        )[0]
+        assert logits.shape == (1, 2, 256)
+        assert np.isfinite(logits).all()
+
     def test_q4_0_matmulnbits_has_explicit_zero_points(self, q4_0_gguf: Path):
         """GGUF Q4_0 projections explicitly encode zp=8 instead of EP defaults."""
         from mobius.integrations.gguf import build_from_gguf
@@ -1622,6 +1912,44 @@ class TestBuildQuantizedGguf:
             (3, 64, 64),
             available,
         ) == sorted(available, key=lambda name: int(name.split(".")[-2]))
+
+    def test_float_moe_tensor_preserves_expert_order_and_rejects_bad_shape(self):
+        import torch
+
+        from mobius._configs import ArchitectureConfig
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        config = ArchitectureConfig(
+            vocab_size=32,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_local_experts=3,
+            num_experts_per_tok=2,
+            moe_intermediate_size=6,
+        )
+        key = "model.layers.0.mlp.experts.gate_proj.weight"
+        stacked = torch.arange(3 * 6 * 4, dtype=torch.float32).reshape(3, 6, 4)
+        normalized = _normalize_gguf_weights({key: stacked}, config=config)
+
+        assert key not in normalized
+        for expert in range(3):
+            target = f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+            assert torch.equal(normalized[target], stacked[expert])
+
+        with pytest.raises(ValueError, match="Invalid stacked expert shape"):
+            _normalize_gguf_weights({key: stacked[:, :-1]}, config=config)
+        with pytest.raises(ValueError, match="Invalid stacked expert shape"):
+            _normalize_gguf_weights({key: stacked.reshape(18, 4)}, config=config)
+
+        router_key = "model.layers.0.mlp.gate.weight"
+        with pytest.raises(ValueError, match="Invalid router shape"):
+            _normalize_gguf_weights(
+                {router_key: torch.empty(2, 4)},
+                config=config,
+            )
 
 
 class TestBuildGgufStaticCache:

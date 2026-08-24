@@ -136,10 +136,18 @@ class TopKGate(nn.Module):
     with softmax over the selected experts.
     """
 
-    def __init__(self, hidden_size: int, num_experts: int, top_k: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        *,
+        routed_scaling_factor: float = 1.0,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.routed_scaling_factor = routed_scaling_factor
         self.weight = nn.Parameter([num_experts, hidden_size])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -148,6 +156,8 @@ class TopKGate(nn.Module):
         k = op.Constant(value_ints=[self.top_k])
         routing_weights, selected_experts = op.TopK(router_logits, k, axis=-1, _outputs=2)
         routing_weights = op.Softmax(routing_weights, axis=-1)
+        if self.routed_scaling_factor != 1.0:  # noqa: RUF069
+            routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
@@ -174,7 +184,7 @@ class TopKGate(nn.Module):
         # ``input`` (see contrib_defs.cc), so it must match hidden_states'
         # dtype rather than a fixed float32.
         router_logits = op.CastLike(router_logits, hidden_states)
-        return router_logits, None, True, 1.0
+        return router_logits, None, True, self.routed_scaling_factor
 
 
 class SoftmaxTopKGate(nn.Module):
@@ -185,12 +195,19 @@ class SoftmaxTopKGate(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, num_experts: int, top_k: int, *, norm_topk_prob: bool = True
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        *,
+        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
+        self.routed_scaling_factor = routed_scaling_factor
         self.weight = nn.Parameter([num_experts, hidden_size])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -204,6 +221,8 @@ class SoftmaxTopKGate(nn.Module):
             # Renormalize selected weights to sum to 1
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
             routing_weights = op.Div(routing_weights, weight_sum)
+        if self.routed_scaling_factor != 1.0:  # noqa: RUF069
+            routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
@@ -227,7 +246,12 @@ class SoftmaxTopKGate(nn.Module):
         # dtype rather than a fixed float32.
         router_logits = op.CastLike(router_logits, hidden_states)
         routing_probs = op.Softmax(router_logits, axis=-1)
-        return router_logits, routing_probs, self.norm_topk_prob, 1.0
+        return (
+            router_logits,
+            routing_probs,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
+        )
 
 
 class SigmoidTopKGate(nn.Module):

@@ -118,6 +118,151 @@ class TestDenseCohortConfig:
         ]
         assert config.no_rope_layers == [1, 1, 1, 0]
 
+
+class TestConventionalMoEConfig:
+    @staticmethod
+    def _metadata(architecture: str) -> dict:
+        metadata = _dense_metadata(architecture)
+        metadata[f"{architecture}.attention.layer_norm_rms_epsilon"] = 1e-5
+        metadata[f"{architecture}.expert_count"] = 4
+        metadata[f"{architecture}.expert_used_count"] = 2
+        return metadata
+
+    @pytest.mark.parametrize("architecture", ["olmoe", "phimoe"])
+    def test_fixed_width_moe_config(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                architecture,
+                self._metadata(architecture),
+                ["token_embd.weight", "output.weight", "blk.0.ffn_gate_inp.weight"],
+            )
+        )
+
+        assert config.model_type == architecture
+        assert config.num_local_experts == 4
+        assert config.num_experts_per_tok == 2
+        assert config.routed_scaling_factor == pytest.approx(1.0)
+        if architecture == "olmoe":
+            assert config.attn_qk_norm is True
+            assert config.attn_qk_norm_full is True
+            assert config.norm_topk_prob is False
+
+    @pytest.mark.parametrize(
+        ("architecture", "norm_topk_prob", "qk_norm"),
+        [("qwen2moe", False, False), ("qwen3moe", True, True)],
+    )
+    def test_qwen_moe_width_fallbacks(
+        self, architecture: str, norm_topk_prob: bool, qk_norm: bool
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                architecture,
+                self._metadata(architecture),
+                ["token_embd.weight", "output.weight", "blk.0.ffn_gate_inp.weight"],
+            )
+        )
+
+        assert config.model_type == (
+            "qwen2_moe" if architecture == "qwen2moe" else "qwen3_moe"
+        )
+        assert config.moe_intermediate_size == 64
+        assert config.norm_topk_prob is norm_topk_prob
+        assert config.attn_qk_norm is qk_norm
+        if architecture == "qwen2moe":
+            assert config.shared_expert_intermediate_size == 128
+
+    def test_granitemoe_scaling_and_dense_dispatch(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("granitemoe")
+        metadata.update(
+            {
+                "granitemoe.logit_scale": 16.0,
+                "granitemoe.embedding_scale": 12.0,
+                "granitemoe.residual_scale": 0.5,
+                "granitemoe.attention.scale": 0.125,
+                "granitemoe.expert_shared_feed_forward_length": 32,
+            }
+        )
+        moe = gguf_to_config(
+            _FakeDenseGGUF(
+                "granitemoe",
+                metadata,
+                ["token_embd.weight", "blk.0.ffn_gate_inp.weight"],
+            )
+        )
+        assert moe.model_type == "granitemoe"
+        assert moe.logits_scaling == pytest.approx(16.0)
+        assert moe.embedding_multiplier == pytest.approx(12.0)
+        assert moe.residual_multiplier == pytest.approx(0.5)
+        assert moe.attention_multiplier == pytest.approx(0.125)
+        assert moe.shared_expert_intermediate_size == 32
+
+        metadata.pop("granitemoe.expert_count")
+        metadata.pop("granitemoe.expert_used_count")
+        dense = gguf_to_config(
+            _FakeDenseGGUF(
+                "granitemoe",
+                metadata,
+                ["token_embd.weight", "blk.0.ffn_gate.weight"],
+            )
+        )
+        assert dense.model_type == "granite"
+        assert dense.num_local_experts is None
+        assert dense.num_experts_per_tok is None
+
+    @pytest.mark.parametrize("architecture", ["olmoe", "phimoe", "qwen2moe", "qwen3moe"])
+    def test_fixed_moe_rejects_zero_experts(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata[f"{architecture}.expert_count"] = 0
+        with pytest.raises(ValueError, match="expert_count"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+
+    def test_moe_rejects_invalid_top_k(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("qwen3moe")
+        metadata["qwen3moe.expert_used_count"] = 5
+        with pytest.raises(ValueError, match="expert_used_count"):
+            gguf_to_config(_FakeDenseGGUF("qwen3moe", metadata, ["token_embd.weight"]))
+
+    def test_phimoe_reads_tensor_backed_longrope_factors(self) -> None:
+        import numpy as np
+
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        class _PhiGGUF(_FakeDenseGGUF):
+            def get_tensor(self, name: str):
+                return {
+                    "rope_factors_long.weight": np.array([2.0] * 8, dtype=np.float32),
+                    "rope_factors_short.weight": np.array([1.0] * 8, dtype=np.float32),
+                }[name]
+
+        metadata = self._metadata("phimoe")
+        metadata["phimoe.rope.scaling.original_context_length"] = 4096
+        config = gguf_to_config(
+            _PhiGGUF(
+                "phimoe",
+                metadata,
+                ["rope_factors_long.weight", "rope_factors_short.weight"],
+            )
+        )
+
+        assert config.rope_type == "longrope"
+        assert config.rope_scaling == {
+            "long_factor": [2.0] * 8,
+            "short_factor": [1.0] * 8,
+        }
+        assert config.original_max_position_embeddings == 4096
+
+
+class TestDenseCohortConfigContinued:
     def test_smollm3_reconstructs_fixed_no_rope_schedule(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 

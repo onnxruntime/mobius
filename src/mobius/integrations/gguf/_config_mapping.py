@@ -80,6 +80,10 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "expert_used_count": "num_experts_per_tok",
     "expert_feed_forward_length": "moe_intermediate_size",
     "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
+    "expert_weights_scale": "routed_scaling_factor",
+    "expert_weights_norm": "norm_topk_prob",
+    "expert_group_count": "n_group",
+    "expert_group_used_count": "topk_group",
     # Hybrid (DeltaNet / Mamba + Attention) fields
     "full_attention_interval": "full_attention_interval",
     # SSM/DeltaNet fields (used for linear attention in hybrid models)
@@ -578,6 +582,7 @@ def gguf_to_config(
     if postprocessor_name is not None:
         postprocessor = _CONFIG_POSTPROCESSORS[postprocessor_name]
         config = postprocessor(config, metadata, model)
+        model_type = config.model_type or model_type
         config._gguf_arch = spec.gguf_arch
         config._gguf_model_type = model_type
         config.model_type = model_type
@@ -653,6 +658,143 @@ def _gemma2_postprocess(
         query_pre_attn_scalar=float(query_pre_attn_scalar)
         if query_pre_attn_scalar is not None
         else None,
+    )
+
+
+def _moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Validate and complete conventional-attention MoE metadata."""
+    del model
+    arch = getattr(config, "_gguf_arch", config.model_type)
+    num_experts = config.num_local_experts
+    top_k = config.num_experts_per_tok
+    if num_experts is None or int(num_experts) <= 0:
+        raise ValueError(f"{arch}.expert_count must be greater than zero")
+    if top_k is None or int(top_k) <= 0 or int(top_k) > int(num_experts):
+        raise ValueError(
+            f"{arch}.expert_used_count must be in [1, {num_experts}], got {top_k}"
+        )
+    if config.intermediate_size <= 0:
+        raise ValueError(f"{arch}.feed_forward_length must be greater than zero")
+    if config.moe_intermediate_size is not None and config.moe_intermediate_size <= 0:
+        raise ValueError(f"{arch}.expert_feed_forward_length must be greater than zero")
+    if (
+        config.shared_expert_intermediate_size is not None
+        and config.shared_expert_intermediate_size <= 0
+    ):
+        raise ValueError(f"{arch}.expert_shared_feed_forward_length must be greater than zero")
+
+    updates: dict[str, Any] = {}
+    if arch in ("qwen2moe", "qwen3moe"):
+        if config.moe_intermediate_size is None:
+            if config.intermediate_size % int(top_k):
+                raise ValueError(
+                    f"{arch}.feed_forward_length ({config.intermediate_size}) must be "
+                    f"divisible by expert_used_count ({top_k}) when "
+                    "expert_feed_forward_length is absent"
+                )
+            updates["moe_intermediate_size"] = config.intermediate_size // int(top_k)
+    if arch == "qwen2moe":
+        updates["norm_topk_prob"] = False
+        if config.shared_expert_intermediate_size is None:
+            updates["shared_expert_intermediate_size"] = config.intermediate_size
+    elif arch == "qwen3moe":
+        updates["attn_qk_norm"] = True
+        updates["attn_qk_norm_full"] = False
+        updates["norm_topk_prob"] = True
+    elif arch == "olmoe":
+        updates["attn_qk_norm"] = True
+        updates["attn_qk_norm_full"] = True
+        updates["norm_topk_prob"] = False
+
+    return dataclasses.replace(config, **updates)
+
+
+def _granitemoe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Apply Granite scaling and select its dense or MoE graph exactly."""
+    del model
+    arch = "granitemoe"
+    num_experts = config.num_local_experts
+    top_k = config.num_experts_per_tok
+    if config.intermediate_size <= 0:
+        raise ValueError("granitemoe.feed_forward_length must be greater than zero")
+    if num_experts is None or int(num_experts) == 0:
+        if top_k not in (None, 0):
+            raise ValueError(
+                "granitemoe.expert_used_count must be absent or zero when expert_count is zero"
+            )
+        model_type = "granite"
+        num_experts = None
+        top_k = None
+    else:
+        if int(num_experts) < 0:
+            raise ValueError("granitemoe.expert_count must not be negative")
+        if top_k is None or int(top_k) <= 0 or int(top_k) > int(num_experts):
+            raise ValueError(
+                f"granitemoe.expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        model_type = "granitemoe"
+
+    logit_scale = float(metadata[f"{arch}.logit_scale"])
+    if not logit_scale:
+        raise ValueError("granitemoe.logit_scale must be nonzero")
+    return dataclasses.replace(
+        config,
+        model_type=model_type,
+        num_local_experts=num_experts,
+        num_experts_per_tok=top_k,
+        embedding_multiplier=float(metadata.get(f"{arch}.embedding_scale", 1.0)),
+        attention_multiplier=(
+            float(metadata[f"{arch}.attention.scale"])
+            if f"{arch}.attention.scale" in metadata
+            else None
+        ),
+        logits_scaling=logit_scale,
+        residual_multiplier=float(metadata.get(f"{arch}.residual_scale", 1.0)),
+        norm_topk_prob=True,
+    )
+
+
+def _phimoe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Complete PhiMoE metadata, including tensor-backed LongRoPE factors."""
+    config = _moe_postprocess(config, metadata, model)
+    tensor_names = set(getattr(model, "tensor_names", ()) or ())
+    long_name = "rope_factors_long.weight"
+    short_name = "rope_factors_short.weight"
+    if long_name not in tensor_names and short_name not in tensor_names:
+        return config
+    if long_name not in tensor_names or short_name not in tensor_names:
+        raise ValueError(
+            "phimoe LongRoPE requires both rope_factors_long.weight and "
+            "rope_factors_short.weight"
+        )
+    if model is None or not hasattr(model, "get_tensor"):
+        raise ValueError("phimoe LongRoPE factors could not be read from the GGUF model")
+
+    original_context = metadata.get("phimoe.rope.scaling.original_context_length")
+    if original_context is None:
+        raise ValueError(
+            "phimoe.rope.scaling.original_context_length is required with LongRoPE factors"
+        )
+    return dataclasses.replace(
+        config,
+        rope_type="longrope",
+        rope_scaling={
+            "long_factor": model.get_tensor(long_name).reshape(-1).tolist(),
+            "short_factor": model.get_tensor(short_name).reshape(-1).tolist(),
+        },
+        original_max_position_embeddings=int(original_context),
     )
 
 
@@ -1116,6 +1258,9 @@ def _muse_glimmer_qk_scale_factor(model: Any, default: float) -> float:
 # when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "olmo": _olmo_postprocess,
+    "moe": _moe_postprocess,
+    "granitemoe": _granitemoe_postprocess,
+    "phimoe": _phimoe_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
     "gemma2": _gemma2_postprocess,
     "gemma3": _gemma3_postprocess,

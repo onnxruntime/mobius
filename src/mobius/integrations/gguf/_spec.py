@@ -205,6 +205,8 @@ class GGUFArchitectureSpec:
         aliases: Additional strings accepted for this architecture. Used for
             defensive spellings that llama.cpp does not currently emit.
         model_type: The mobius registry ``model_type`` this maps to.
+        module_type: Optional internal registry key when the GGUF runtime graph
+            intentionally differs from the HuggingFace graph for ``model_type``.
         config: Whether GGUF metadata can be turned into a config.
         tensor_map: Whether GGUF tensor names can be mapped to HuggingFace names.
         graph: Whether mobius can build the graph for ``model_type``.
@@ -235,6 +237,7 @@ class GGUFArchitectureSpec:
 
     gguf_arch: str
     model_type: str | None = None
+    module_type: str | None = None
     aliases: frozenset[str] = frozenset()
     config: Support = Support.SUPPORTED
     tensor_map: Support = Support.SUPPORTED
@@ -265,6 +268,8 @@ class GGUFArchitectureSpec:
             raise ValueError(
                 f"{self.gguf_arch!r}: graph=SUPPORTED requires a model_type to build with"
             )
+        if self.module_type is not None and self.graph is not Support.SUPPORTED:
+            raise ValueError(f"{self.gguf_arch!r}: module_type requires graph=SUPPORTED")
         if self.tensor_map is Support.SUPPORTED and not self.tensor_map_recipe:
             raise ValueError(
                 f"{self.gguf_arch!r}: tensor_map=SUPPORTED requires a non-empty "

@@ -312,6 +312,24 @@ class TestMapGGUFToHFNames:
         assert map_gguf_to_hf_names("blk.0.ffn_gate_exps.weight", "qwen2moe") == (
             "model.layers.0.mlp.experts.gate_proj.weight"
         )
+        assert map_gguf_to_hf_names("blk.1.ffn_down_exps.weight", "granitemoe") == (
+            "model.layers.1.mlp.experts.down_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.1.ffn_gate_shexp.weight", "granitemoe") == (
+            "model.layers.1.mlp.shared_expert.gate_proj.weight"
+        )
+        assert map_gguf_to_hf_names("blk.0.attn_q_norm.weight", "qwen3moe") == (
+            "model.layers.0.self_attn.q_norm.weight"
+        )
+        assert map_gguf_to_hf_names("blk.0.attn_k_norm.weight", "olmoe") == (
+            "model.layers.0.self_attn.k_norm.weight"
+        )
+
+    @pytest.mark.parametrize("architecture", ["qwen2_moe", "qwen3_moe"])
+    def test_moe_aliases_map_to_canonical_recipe(self, architecture: str) -> None:
+        assert map_gguf_to_hf_names("blk.0.ffn_up_exps.weight", architecture) == (
+            "model.layers.0.mlp.experts.up_proj.weight"
+        )
 
     def test_deepseek4_mapping(self) -> None:
         expected = {
