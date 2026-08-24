@@ -98,6 +98,8 @@ def _write_quantized_gguf(
     output_quantization: str | None = None,
     tie_embeddings: bool = False,
     float_type: str = "f32",
+    fused_qkv: bool = False,
+    fused_qkv_float: bool = False,
 ) -> None:
     """Write a GGUF file with quantized projection weights.
 
@@ -274,21 +276,28 @@ def _write_quantized_gguf(
     )
 
     for i in range(num_layers):
-        add_projection(
-            f"blk.{i}.attn_q.weight",
-            num_heads * head_dim,
-            hidden_size,
-        )
-        add_projection(
-            f"blk.{i}.attn_k.weight",
-            num_kv_heads * head_dim,
-            hidden_size,
-        )
-        add_value_projection(
-            f"blk.{i}.attn_v.weight",
-            num_kv_heads * head_dim,
-            hidden_size,
-        )
+        if fused_qkv:
+            fused_rows = (num_heads + 2 * num_kv_heads) * head_dim
+            if fused_qkv_float:
+                add_float(f"blk.{i}.attn_qkv.weight", (fused_rows, hidden_size))
+            else:
+                add_projection(f"blk.{i}.attn_qkv.weight", fused_rows, hidden_size)
+        else:
+            add_projection(
+                f"blk.{i}.attn_q.weight",
+                num_heads * head_dim,
+                hidden_size,
+            )
+            add_projection(
+                f"blk.{i}.attn_k.weight",
+                num_kv_heads * head_dim,
+                hidden_size,
+            )
+            add_value_projection(
+                f"blk.{i}.attn_v.weight",
+                num_kv_heads * head_dim,
+                hidden_size,
+            )
         add_projection(
             f"blk.{i}.attn_output.weight",
             hidden_size,
@@ -683,6 +692,8 @@ def _write_moe_gguf(
     projection_quantization: str,
     *,
     phi_fused_qkv: bool = False,
+    diffusion_fused_qkv: bool = False,
+    fused_qkv_float: bool = False,
     quantize_tied_embedding: bool = False,
     expert_scale_suffix: str | None = None,
     malformed_expert_scale: bool = False,
@@ -754,7 +765,20 @@ def _write_moe_gguf(
             raw_dtype=GGMLQuantizationType.Q4_0,
         )
 
-    add_projection = add_q4 if projection_quantization == "q4_0" else add_float
+    def add_mxfp4(name: str, shape: tuple[int, ...]) -> None:
+        assert shape[-1] % 32 == 0
+        byte_shape = (*shape[:-1], (shape[-1] // 32) * 17)
+        writer.add_tensor(
+            name,
+            np.zeros(byte_shape, dtype=np.uint8),
+            raw_dtype=GGMLQuantizationType.MXFP4,
+        )
+
+    add_projection = {
+        "f32": add_float,
+        "mxfp4": add_mxfp4,
+        "q4_0": add_q4,
+    }[projection_quantization]
 
     if quantize_tied_embedding:
         assert architecture in {"qwen3moe", "granitemoe"}
@@ -763,6 +787,12 @@ def _write_moe_gguf(
         add_float("token_embd.weight", (vocab_size, hidden_size))
     if architecture == "phimoe" and phi_fused_qkv:
         add_projection(
+            "blk.0.attn_qkv.weight",
+            ((num_heads + 2 * num_kv_heads) * head_dim, hidden_size),
+        )
+    elif architecture in {"llada-moe", "rnd1"} and diffusion_fused_qkv:
+        add = add_float if fused_qkv_float else add_projection
+        add(
             "blk.0.attn_qkv.weight",
             ((num_heads + 2 * num_kv_heads) * head_dim, hidden_size),
         )
@@ -1763,6 +1793,110 @@ class TestBuildQuantizedGguf:
                 ["logits"], {"input_ids": np.array([[1, 2, 255]], dtype=np.int64)}
             )[0]
             np.testing.assert_allclose(logits, float_logits, rtol=0, atol=2e-2)
+
+    @pytest.mark.parametrize("architecture", ["dream", "llada-moe", "rnd1"])
+    @pytest.mark.parametrize(
+        ("source_kind", "writer_kwargs"),
+        [
+            ("affine", {"projection_quantization": "q4_0"}),
+            (
+                "native",
+                {"projection_quantization": "mxfp4"},
+            ),
+            (
+                "mixed_float_fused",
+                {
+                    "projection_quantization": "q4_0",
+                    "fused_qkv_float": True,
+                },
+            ),
+        ],
+    )
+    def test_quantized_diffusion_fused_qkv_rejects_before_graph_build(
+        self,
+        architecture: str,
+        source_kind: str,
+        writer_kwargs: dict,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        import mobius._builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-fused-{source_kind}.gguf"
+        if architecture == "dream":
+            _write_quantized_gguf(
+                path,
+                architecture=architecture,
+                fused_qkv=True,
+                **writer_kwargs,
+            )
+        else:
+            _write_moe_gguf(
+                path,
+                architecture,
+                writer_kwargs["projection_quantization"],
+                diffusion_fused_qkv=True,
+                fused_qkv_float=writer_kwargs.get("fused_qkv_float", False),
+            )
+        monkeypatch.setattr(
+            mobius._builder,
+            "build_from_module",
+            lambda *_args, **_kwargs: pytest.fail("graph construction must not run"),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=rf"Quantization-preserving import of fused QKV.*{architecture}",
+        ) as error:
+            build_from_gguf(path)
+        assert "keep_quantized=False" in str(error.value)
+
+    @pytest.mark.parametrize("architecture", ["dream", "llada-moe", "rnd1"])
+    @pytest.mark.parametrize(
+        ("projection_quantization", "keep_quantized"),
+        [("f32", True), ("q4_0", False)],
+    )
+    def test_float_diffusion_fused_qkv_still_builds_and_runs(
+        self,
+        architecture: str,
+        projection_quantization: str,
+        keep_quantized: bool,
+        tmp_path: Path,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-fused-{projection_quantization}.gguf"
+        if architecture == "dream":
+            _write_quantized_gguf(
+                path,
+                architecture=architecture,
+                projection_quantization=projection_quantization,
+                fused_qkv=True,
+            )
+        else:
+            _write_moe_gguf(
+                path,
+                architecture,
+                projection_quantization,
+                diffusion_fused_qkv=True,
+                fused_qkv_float=projection_quantization == "f32",
+            )
+
+        package = build_from_gguf(path, keep_quantized=keep_quantized)
+        model = package["model"]
+        assert "MatMulNBits" not in {node.op_type for node in model.graph}
+        output_dir = tmp_path / f"{architecture}-fused-{projection_quantization}-onnx"
+        package.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        logits, proposed = session.run(
+            None, {"input_ids": np.array([[1, 2, 255]], dtype=np.int64)}
+        )
+        assert logits.shape == (1, 3, 256)
+        np.testing.assert_array_equal(proposed, np.argmax(logits, axis=-1))
 
     @pytest.mark.parametrize(
         "architecture", ["olmoe", "phimoe", "qwen2moe", "qwen3moe", "granitemoe"]

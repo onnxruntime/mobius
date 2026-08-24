@@ -225,12 +225,21 @@ cache is rejected before graph construction. Dense LLaDA alone reverses the
 llama.cpp interleaved-RoPE Q/K row permutation; Dream, LLaDA-MoE, and RND1 keep
 their Q/K rows in converter order. LLaDA-MoE retains raw selected softmax router
 weights, while RND1 renormalizes the selected weights. Fused QKV, when admitted
-by the pinned loader, is split as `[Q heads, KV heads, KV heads]`.
+by the pinned loader, is split as `[Q heads, KV heads, KV heads]` on the
+float-only path.
 
 Compatible 2-D projections and routed experts retain supported native/affine
 quantization. Embeddings, norms, routers, and auxiliary tensors follow their
 actual consumer ABI; unrecognized sidecars, neural timestep tensors, and noise
 schedule tensors fail suffix-exact closure instead of being dropped.
+A fused QKV tensor is rejected whenever any mapped tensor activates
+quantization preservation, including a float fused tensor in an otherwise
+quantized file. The packed diffusion graph owns separate Q/K/V targets, so
+post-load splitting would leave those targets uninitialized. Use
+`keep_quantized=False` or `--dequantize` for such files; split-QKV quantized
+files remain supported. The pinned diffusion MoE family uses separate stacked
+gate, up, and down expert tensors rather than a fused gate-up tensor, and those
+tensors map directly to the graph's expert targets.
 
 Runtime remains **deferred**. These immutable artifacts were pinned before
 payload download; only the 88.8 MB LLaDA file was downloaded. Its SHA-256,

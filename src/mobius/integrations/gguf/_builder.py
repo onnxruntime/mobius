@@ -965,6 +965,11 @@ def build_from_gguf(
         )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
+    _reject_quantized_diffusion_fused_qkv(
+        gguf_model,
+        gguf_arch,
+        preserve_quantization=preserve_quantization,
+    )
 
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
@@ -1812,6 +1817,39 @@ def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
         ):
             return True
     return False
+
+
+def _reject_quantized_diffusion_fused_qkv(
+    gguf_model,
+    gguf_arch: str,
+    *,
+    preserve_quantization: bool,
+) -> None:
+    """Reject fused diffusion QKV before a quantized graph can be constructed.
+
+    The diffusion graph owns separate QuantizedLinear Q/K/V modules, while the
+    fused GGUF family maps to a synthetic ``qkv_proj`` stem that is not a graph
+    target. The quantized loader therefore cannot attach packed blocks to it.
+    Dequantizing the fused tensor and splitting it later is also invalid because
+    the graph still expects packed parameters. This applies even when the fused
+    tensor itself is float: any other quantized mapped tensor selects the packed
+    graph, so the split Q/K/V targets remain quantized.
+    """
+    if not preserve_quantization or gguf_arch not in {"dream", "llada-moe", "rnd1"}:
+        return
+
+    fused = sorted(
+        name
+        for name in gguf_model.tensor_names
+        if re.fullmatch(r"blk\.\d+\.attn_qkv\.weight", name)
+    )
+    if fused:
+        raise ValueError(
+            f"Quantization-preserving import of fused QKV is not supported for "
+            f"{gguf_arch} GGUF ({fused[0]}). The graph has separate packed Q/K/V "
+            "targets, so splitting after weight loading would leave them uninitialized. "
+            "Use keep_quantized=False (or --dequantize) for a float import."
+        )
 
 
 def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
