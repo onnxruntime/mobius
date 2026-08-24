@@ -34,6 +34,7 @@ from mobius._configs import (
     GraniteMoeHybridConfig,
     GrokGGUFConfig,
     GroveMoEGGUFConfig,
+    GraniteSwaConfig,
     HyV3Config,
     JambaConfig,
     JetMoeConfig,
@@ -544,6 +545,31 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # (Gemma3nMultiModalModel), so its entry lives in VL_CONFIGS.  The text
     # decoder is covered by the two "gemma3n_text" entries.
     ("granite", {}, True),
+    # granite_swa: mixed full/sliding layers, learnable per-head attention
+    # sinks, and a per-layer RoPE base (0 = NoPE) on top of Granite's scaling
+    # multipliers.  4 layers so the tiny config can carry two distinct
+    # non-zero thetas plus a NoPE layer and still alternate attention spans.
+    (
+        "granite_swa",
+        {
+            "_config_cls": GraniteSwaConfig,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "layer_rope_theta": [10_000.0, 10_000.0, 0, 500_000.0],
+            "sliding_window": 8,
+            "tie_word_embeddings": True,
+            "embedding_multiplier": 12.0,
+            "attention_multiplier": 0.0625,
+            "logits_scaling": 10.0,
+            "residual_multiplier": 0.28,
+        },
+        True,
+    ),
     ("olmo", {}, False),
     ("internlm2", {"attn_qkv_bias": True}, True),
     (

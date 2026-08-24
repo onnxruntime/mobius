@@ -123,6 +123,7 @@ __all__ = [
     "Siglip2NaFlexVisionEmbeddings",
     "Siglip2NaFlexVisionModel",
     "SigmoidTopKGate",
+    "SinkAttention",
     "SnakeBeta",
     "SoftmaxTopKGate",
     "SparseMixerGate",
@@ -169,6 +170,7 @@ from mobius.components._attention import (
     Attention,
     FusedQKVAttention,
     GQAContext,
+    SinkAttention,
     StaticCacheState,
 )
 from mobius.components._attention import (

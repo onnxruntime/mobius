@@ -18,7 +18,6 @@ HuggingFace reference: ``GptOssForCausalLM``.
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,10 +28,10 @@ from mobius.components import (
     Embedding,
     Linear,
     RMSNorm,
+    SinkAttention,
     create_attention_bias,
     initialize_rope,
 )
-from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel
 
 if TYPE_CHECKING:
@@ -146,208 +145,16 @@ class _GptOssMoELayer(nn.Module):
         return result
 
 
-class _GptOssAttention(nn.Module):
+class _GptOssAttention(SinkAttention):
     """GQA attention with learned per-head sinks for GPT-OSS.
 
-    HF ``eager_attention_forward`` appends one extra logit per token per head
-    (the learnable ``sinks`` value) to the attention scores before softmax.
-    This lets each head "discard" a token's weight into a virtual null position:
-
-        combined = cat([attn_weights, sinks_expanded], dim=-1)  # [B, H, S, S_kv+1]
-        combined = combined - max(combined)                      # numerical stability
-        probs    = softmax(combined, dim=-1)[..., :-1]           # drop sink, [B, H, S, S_kv]
-        out      = probs @ V
-
-    Implements this manually (cannot use fused op.Attention with sinks).
+    HF ``GptOssAttention``'s ``eager_attention_forward`` appends one extra logit
+    per token per head (the learnable ``sinks`` value) to the attention scores
+    before the softmax, letting each head "discard" weight into a virtual null
+    position.  That is exactly the shared
+    :class:`~mobius.components.SinkAttention` behaviour; GPT-OSS keeps the
+    default ``1/sqrt(head_dim)`` scale.
     """
-
-    def __init__(self, config: ArchitectureConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.head_dim = config.head_dim
-        self.num_attention_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_kv_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scale = config.head_dim**-0.5
-        self._rotary_embedding_dim = (
-            0
-            if math.isclose(config.partial_rotary_factor, 1.0)
-            else int(self.head_dim * config.partial_rotary_factor)
-        )
-        self._rope_interleave = config.rope_interleave
-
-        # QKV projections with bias (attention_bias=True for GPT-OSS)
-        self.q_proj = Linear(
-            config.hidden_size,
-            config.num_attention_heads * config.head_dim,
-            bias=config.attn_qkv_bias,
-        )
-        self.k_proj = Linear(
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-            bias=config.attn_qkv_bias,
-        )
-        self.v_proj = Linear(
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-            bias=config.attn_qkv_bias,
-        )
-        self.o_proj = Linear(
-            config.num_attention_heads * config.head_dim,
-            config.hidden_size,
-            bias=config.attn_o_bias,
-        )
-
-        # Learnable sink logit: one scalar per attention head [num_heads]
-        self.sinks = nn.Parameter([config.num_attention_heads])
-
-    def _expand_kv_for_gqa(
-        self,
-        op: OpBuilder,
-        kv: ir.Value,
-        batch_1d: ir.Value,
-        kv_len_1d: ir.Value,
-    ) -> ir.Value:
-        """Expand KV from [B, kv_heads, S, d] to [B, q_heads, S, d] for GQA.
-
-        Uses unsqueeze+expand+reshape to replicate each KV head ``num_kv_groups``
-        times consecutively: [kv0]*g, [kv1]*g, ..., which is what ``repeat_kv`` does.
-        """
-        # [B, kv_heads, S, d] → [B, kv_heads, 1, S, d]
-        kv_5d = op.Unsqueeze(kv, [2])
-        # Expand to [B, kv_heads, num_kv_groups, S, d]
-        expand_shape = op.Concat(
-            batch_1d,
-            [self.num_key_value_heads, self.num_kv_groups],
-            kv_len_1d,
-            [self.head_dim],
-            axis=0,
-        )
-        kv_exp = op.Expand(kv_5d, expand_shape)
-        # Flatten to [B, q_heads, S, d]
-        flat_shape = op.Concat(
-            batch_1d,
-            [self.num_attention_heads],
-            kv_len_1d,
-            [self.head_dim],
-            axis=0,
-        )
-        return op.Reshape(kv_exp, flat_shape)
-
-    def forward(
-        self,
-        op: OpBuilder,
-        hidden_states: ir.Value,
-        attention_bias: ir.Value | None,
-        position_embeddings: tuple | None = None,
-        past_key_value: tuple | None = None,
-    ):
-        # hidden_states: [B, S, H]
-        batch_1d = op.Shape(hidden_states, start=0, end=1)  # 1D tensor containing B
-        seq_1d = op.Shape(hidden_states, start=1, end=2)  # 1D tensor containing S
-
-        # QKV projections: [B, S, heads * d]
-        query = self.q_proj(op, hidden_states)
-        key = self.k_proj(op, hidden_states)
-        value = self.v_proj(op, hidden_states)
-
-        # Apply RoPE on 3D packed format [B, S, heads * d]
-        if position_embeddings is not None:
-            query = apply_rotary_pos_emb(
-                op,
-                x=query,
-                position_embeddings=position_embeddings,
-                num_heads=self.num_attention_heads,
-                rotary_embedding_dim=self._rotary_embedding_dim,
-                interleaved=self._rope_interleave,
-            )
-            key = apply_rotary_pos_emb(
-                op,
-                x=key,
-                position_embeddings=position_embeddings,
-                num_heads=self.num_key_value_heads,
-                rotary_embedding_dim=self._rotary_embedding_dim,
-                interleaved=self._rope_interleave,
-            )
-
-        # Reshape to 4D and transpose: [B, S, heads, d] → [B, heads, S, d]
-        query = op.Transpose(
-            op.Reshape(query, [0, 0, self.num_attention_heads, self.head_dim]),
-            perm=[0, 2, 1, 3],
-        )  # [B, q_heads, S, d]
-        key = op.Transpose(
-            op.Reshape(key, [0, 0, self.num_key_value_heads, self.head_dim]),
-            perm=[0, 2, 1, 3],
-        )  # [B, kv_heads, S, d]
-        value = op.Transpose(
-            op.Reshape(value, [0, 0, self.num_key_value_heads, self.head_dim]),
-            perm=[0, 2, 1, 3],
-        )  # [B, kv_heads, S, d]
-
-        # KV cache: prepend past tokens
-        if past_key_value is not None:
-            key = op.Concat(past_key_value[0], key, axis=2)  # [B, kv_heads, past+S, d]
-            value = op.Concat(past_key_value[1], value, axis=2)  # [B, kv_heads, past+S, d]
-        present_key_value = (key, value)
-
-        # Total KV sequence length (after cache concatenation)
-        kv_len_1d = op.Shape(key, start=2, end=3)  # [total_S]
-
-        # GQA: expand key/value from kv_heads to q_heads
-        if self.num_kv_groups > 1:
-            key_exp = self._expand_kv_for_gqa(op, key, batch_1d, kv_len_1d)
-            value_exp = self._expand_kv_for_gqa(op, value, batch_1d, kv_len_1d)
-        else:
-            key_exp = key
-            value_exp = value
-
-        # Attention scores: [B, q_heads, S_q, S_kv]
-        # query @ key.T: [B, q_heads, S_q, d] @ [B, q_heads, d, S_kv]
-        key_t = op.Transpose(key_exp, perm=[0, 1, 3, 2])  # [B, q_heads, d, S_kv]
-        attn_scores = op.MatMul(query, key_t)  # [B, q_heads, S_q, S_kv]
-        attn_scores = op.Mul(attn_scores, self.scale)
-
-        # Add causal+sliding_window+padding mask (float additive bias)
-        if attention_bias is not None:
-            # attention_bias: [B, 1, S_q, S_kv] — broadcasts over q_heads
-            attn_scores = op.Add(attn_scores, attention_bias)
-
-        # Append sinks column: [q_heads] → [B, q_heads, S_q, 1]
-        sinks_4d = op.Reshape(
-            self.sinks,
-            [1, self.num_attention_heads, 1, 1],
-        )
-        expand_shape = op.Concat(
-            batch_1d,
-            [self.num_attention_heads],
-            seq_1d,
-            [1],
-            axis=0,
-        )
-        sinks_expanded = op.Expand(sinks_4d, expand_shape)  # [B, q_heads, S_q, 1]
-        # combined: [B, q_heads, S_q, S_kv+1]
-        combined = op.Concat(attn_scores, sinks_expanded, axis=-1)
-
-        # Numerical stability: subtract per-row max before softmax
-        row_max = op.ReduceMax(combined, [-1], keepdims=True)  # [B, q_heads, S_q, 1]
-        combined = op.Sub(combined, row_max)
-
-        # Softmax over the extended sequence (S_kv + 1) dimension
-        probs = op.Softmax(combined, axis=-1)  # [B, q_heads, S_q, S_kv+1]
-
-        # Drop sink column: slice axis=3 from 0 to -1 (all but last)
-        scores = op.Slice(probs, [0], [-1], [3])  # [B, q_heads, S_q, S_kv]
-
-        # Weighted sum with value: [B, q_heads, S_q, d]
-        attn_out = op.MatMul(scores, value_exp)
-
-        # Transpose and flatten heads: [B, q_heads, S_q, d] → [B, S_q, q_heads*d]
-        attn_out = op.Transpose(attn_out, perm=[0, 2, 1, 3])  # [B, S_q, q_heads, d]
-        attn_out = op.Reshape(attn_out, [0, 0, -1])  # [B, S_q, q_heads*d]
-
-        # Output projection
-        attn_out = self.o_proj(op, attn_out)
-        return attn_out, present_key_value
 
 
 class _GptOssDecoderLayer(nn.Module):

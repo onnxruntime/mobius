@@ -30,6 +30,7 @@ from mobius._configs import (
     Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    GraniteSwaConfig,
     HyV3Config,
     Jais2Config,
     KimiK3Config,
@@ -194,6 +195,7 @@ from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel, ScaledEmbeddingGPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
+from mobius.models.granite_swa import GraniteSwaCausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
@@ -598,6 +600,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
     "gptj": ModelRegistration(GPTJCausalLMModel),
     "granite": ModelRegistration(GraniteCausalLMModel),
+    "granite_swa": ModelRegistration(GraniteSwaCausalLMModel, config_class=GraniteSwaConfig),
+    "granite_swa": ModelRegistration(GraniteSwaCausalLMModel, config_class=GraniteSwaConfig),
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
     "hy_v3": ModelRegistration(
         HyV3CausalLMModel,
@@ -1217,6 +1221,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma3n_text": "google/gemma-3n-E2B-it",
     "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
+    "granite_swa": "ibm-granite/granite-swash-2b",
+    "granite_swa": "ibm-granite/granite-swash-2b",
     "internlm2": "internlm/internlm2_5-7b-chat",
     "llama_embed_gguf": "mradermacher/llama-embed-nemotron-8b-GGUF",
     "nemotron": "nvidia/Nemotron-Mini-4B-Instruct",

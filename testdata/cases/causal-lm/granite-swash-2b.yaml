@@ -1,0 +1,23 @@
+model_id: "ibm-granite/granite-swash-2b"
+model_type: "granite_swa"
+revision: "af1e3227100b61088eead48389ab5409b5d0e39c"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: >
+  Granite SWA 2B (GraniteSWAForCausalLM). Mixed full/sliding-window attention
+  layers, learnable per-head attention sinks, per-layer RoPE theta, and the
+  Granite embedding/attention/residual/logit scaling multipliers. The HF
+  reference is pinned to eager attention because the sink is an extra logit in
+  the softmax denominator, which SDPA cannot express
+  (upstream sets ``GraniteSWAPreTrainedModel._supports_sdpa = False``).

@@ -467,6 +467,10 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
         "head_dim": TINY_HEAD_DIM,
         "layer_types": ["sliding_attention", "full_attention"],
     },
+    # GraniteSWA: HF defaults bos/eos to 100257 (the granite-swash tokenizer),
+    # which is outside the tiny 256-token vocab.  Pin them in range so the
+    # reference config is self-consistent.
+    "granite_swa": {"bos_token_id": 1, "eos_token_id": 2},
     # VL MoE text sub-models: need same HF extras as their base model types.
     # qwen3_vl_moe, qwen3_omni_moe → qwen3_moe (needs head_dim + moe_intermediate_size)
     "qwen3_vl_moe": {"head_dim": TINY_HEAD_DIM, "moe_intermediate_size": TINY_INTERMEDIATE},
@@ -803,8 +807,27 @@ def _create_softcapped_backbone_causal_lm(hf_config):
     return _SoftcappedBackboneCausalLM()
 
 
+def _create_eager_causal_lm(hf_config):
+    """Build an HF causal LM pinned to the eager attention kernel.
+
+    Required for attention-sink models (GraniteSWA): the sink is an extra logit
+    inside the softmax denominator, which SDPA cannot express.  Upstream marks
+    ``GraniteSWAPreTrainedModel._supports_sdpa = False`` for exactly this
+    reason, but pin it explicitly here so the reference can never silently
+    drift onto a non-sink kernel.
+    """
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_config(hf_config, attn_implementation="eager")
+    assert model.config._attn_implementation == "eager", (
+        f"expected eager attention, got {model.config._attn_implementation!r}"
+    )
+    return model
+
+
 _HF_MODEL_FACTORIES = {
     "muse_glimmer_text": _create_softcapped_backbone_causal_lm,
+    "granite_swa": _create_eager_causal_lm,
 }
 
 
