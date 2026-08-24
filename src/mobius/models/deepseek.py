@@ -221,7 +221,7 @@ class DeepSeekMLADecoderLayer(nn.Module):
     def __init__(self, config: ArchitectureConfig, is_moe: bool = False):
         super().__init__()
         linear_class = _linear_factory(config)
-        if getattr(config, "export_paged_attention", False):
+        if config.export_paged_attention:
             # Feature-on: emit LATENT PagedAttention. An ineligible geometry
             # raises here (typed reason) rather than silently falling back.
             self.self_attn = PagedLatentMLA(config, linear_class=linear_class)
@@ -408,7 +408,7 @@ class DeepSeekV3TextModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self._export_paged_attention = getattr(config, "export_paged_attention", False)
+        self._export_paged_attention = config.export_paged_attention
 
         # For MLA, RoPE applies only to the qk_rope_head_dim portion of Q and K,
         # not the full head_dim. Create a modified config so the cos/sin cache
@@ -561,7 +561,7 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
 
         # Absorb kv_b_proj into the query/output projections for the opt-in
         # LATENT PagedAttention export (feature-off leaves weights untouched).
-        if getattr(self.config, "export_paged_attention", False):
+        if self.config.export_paged_attention:
             renamed = self._absorb_paged_mla_weights(renamed)
 
         # Handle weight tying and GPTQ/AWQ conversion before flattening the

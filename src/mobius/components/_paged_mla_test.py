@@ -277,6 +277,18 @@ class TestEligibility:
     def test_mtp_rejected(self):
         assert paged_attention_rejection(_cfg(num_nextn_predict_layers=1)) is not None
 
+    def test_qk_norm_rejected(self):
+        # Per-head QK-norm resolves into attn_qk_norm / attn_qk_norm_full; a
+        # qk-norm MLA would need the operator's q_norm/k_norm inputs, which this
+        # slice does not claim. The dense-MLA targets leave both False.
+        assert paged_attention_rejection(_cfg(attn_qk_norm=True)) is not None
+        assert paged_attention_rejection(_cfg(attn_qk_norm_full=True)) is not None
+        assert paged_attention_rejection(_cfg()) is None
+
+    def test_window_rejected(self):
+        assert paged_attention_rejection(_cfg(sliding_window=64)) is not None
+        assert paged_attention_rejection(_cfg(sliding_window=None)) is None
+
     def test_quant_and_dtype_rejected(self):
         assert paged_attention_rejection(_cfg(dtype=ir.DataType.FLOAT)) is not None
         assert paged_attention_rejection(_cfg(dtype=ir.DataType.INT8)) is not None

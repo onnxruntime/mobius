@@ -187,41 +187,51 @@ def paged_attention_rejection(config: ArchitectureConfig) -> str | None:
         _has("index_n_heads")
         or _has("index_head_dim")
         or _has("index_topk")
-        or bool(getattr(config, "indexer_types", None))
+        or bool(config.indexer_types)
     )
-    if getattr(config, "use_dsa", False) and _indexer_configured:
+    if config.use_dsa and _indexer_configured:
         return (
             "PagedAttention LATENT cannot express GLM DeepSeek Sparse Attention "
             "(DSA/IndexShare): query-dependent sparse indices have no operator "
             "input. Export dense MLA (--glm-full-attention) to opt in."
         )
-    if getattr(config, "compress_ratios", None):
+    if config.compress_ratios:
         return (
             "PagedAttention LATENT cannot express DeepSeek-V4 compressed sparse "
             "attention (CSA/HCA): query-dependent compression is not an operator "
             "input."
         )
-    if getattr(config, "o_lora_rank", None) or getattr(config, "o_groups", 1) not in (0, 1):
+    if config.o_lora_rank or config.o_groups not in (0, 1):
         return (
             "PagedAttention LATENT cannot express DeepSeek-V4 grouped/low-rank "
             "output projection (o_groups/o_lora_rank)."
         )
-    if getattr(config, "hc_mult", 1) not in (0, 1):
+    if config.hc_mult not in (0, 1):
         return "PagedAttention LATENT cannot express Hyper-Connections (hc_mult > 1)."
 
     # --- Multi-token prediction is out of scope. ---
-    if getattr(config, "num_nextn_predict_layers", 0) > 0:
+    if config.num_nextn_predict_layers > 0:
         return (
             "PagedAttention LATENT export does not cover Multi-Token Prediction "
             "(num_nextn_predict_layers > 0)."
         )
 
     # --- Optional operator modes not implemented in this slice. ---
-    if getattr(config, "attention_sink", False) or getattr(config, "head_sink", False):
-        return "PagedAttention LATENT slice does not implement the head_sink input."
-    if getattr(config, "use_qk_norm", False) or getattr(config, "qk_layernorm", False):
+    # Per-head QK-norm resolves into the canonical ``attn_qk_norm`` /
+    # ``attn_qk_norm_full`` fields (the HF ``use_qk_norm`` / ``qk_layernorm``
+    # passthrough is consumed there at extraction time), so reject on those.
+    # The dense-MLA targets (DeepSeek-V2/V3, GLM full-attention) leave both
+    # False; a qk-norm MLA would need the operator's q_norm/k_norm inputs, which
+    # this slice does not claim.
+    if config.attn_qk_norm or config.attn_qk_norm_full:
         return "PagedAttention LATENT slice does not implement q_norm/k_norm inputs."
-    window = getattr(config, "sliding_window", None)
+    # Learned attention sinks (the operator's head_sink input) have no
+    # ArchitectureConfig representation for dense MLA: the only sink-bearing MLA
+    # family is DeepSeek-V4, already rejected above by its CSA/HCA fields, and a
+    # non-MLA sink model (e.g. gpt-oss) is rejected by the MLA-geometry check.
+    # PagedLatentMLA structurally never emits a head_sink input, so there is no
+    # config knob to probe here.
+    window = config.sliding_window
     if window is not None and window > 0:
         return (
             "PagedAttention LATENT slice does not implement windowed attention "

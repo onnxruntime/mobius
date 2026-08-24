@@ -13,7 +13,7 @@ through ``CausalLMTask(paged_cache=True)`` with ``export_paged_attention=True``:
   in-place-aliased latent cache IO;
 * feature-on with an inexpressible geometry or an *active* query-dependent
   sparse selection (GLM DSA, DeepSeek-V4 CSA/HCA, MTP, quantized cache,
-  head_sink, qk-norm, sliding window) is a typed error at model construction /
+  qk-norm, sliding window) is a typed error at model construction /
   build, never a silent dense fallback.
 
 There is no CPU ``PagedAttention`` kernel and the base onnx checker does not
@@ -185,7 +185,7 @@ class TestFeatureOnStructure:
         # DeepSeek-V3 has no indexer configured, so DSA is not active and the
         # paged export must still qualify (eligibility is property-based, not
         # gated on the vestigial use_dsa flag or the model name).
-        assert getattr(config, "use_dsa", True) is True
+        assert config.use_dsa is True
         graph = self._graph(config, model_cls=DeepSeekV3CausalLMModel)
         assert len(_paged_nodes(graph)) == config.num_hidden_layers
 
@@ -284,10 +284,14 @@ class TestFeatureOnRejects:
                 DeepSeekV3CausalLMModel(config)
 
     def test_optional_modes_rejected_at_construction(self):
-        """MTP / sliding-window are typed-rejected, not silently miscomputed."""
+        """MTP / qk-norm / sliding-window are typed-rejected, not miscomputed."""
         with pytest.raises(ValueError, match=r"Multi-Token|num_nextn"):
             DeepSeekV3CausalLMModel(
                 _deepseek_config(export_paged_attention=True, num_nextn_predict_layers=1)
+            )
+        with pytest.raises(ValueError, match=r"q_norm|k_norm"):
+            DeepSeekV3CausalLMModel(
+                _deepseek_config(export_paged_attention=True, attn_qk_norm=True)
             )
         with pytest.raises(ValueError, match="window"):
             DeepSeekV3CausalLMModel(
