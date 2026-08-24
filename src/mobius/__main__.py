@@ -1263,9 +1263,10 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument(
         "--target-dtype-bytes",
         type=float,
-        default=2.0,
-        help="Bytes/param of the resident runtime weights for the VRAM estimate "
-        "(2.0=fp16/bf16, 0.5=int4).",
+        default=None,
+        help="Bytes/param of the resident runtime weights for the VRAM estimate. "
+        "Default: derived from the export (int4-qmoe ~0.5, fp16/passthrough 2.0). "
+        "Override to model a runtime dtype that differs from the export.",
     )
     preflight_parser.add_argument(
         "--gpu-total-bytes",

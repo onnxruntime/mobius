@@ -359,10 +359,16 @@ def estimate_budget(
     export_mode: ExportMode = ExportMode.PASSTHROUGH,
     loader: LoaderMode = LoaderMode.STREAM,
     group_size: int = 32,
-    target_dtype_bytes: float = 2.0,
+    target_dtype_bytes: float | None = None,
     vram_headroom_frac: float = 0.15,
 ) -> Budget:
-    """Compute the storage / RAM / VRAM budget for an export."""
+    """Compute the storage / RAM / VRAM budget for an export.
+
+    When *target_dtype_bytes* is None the runtime weight footprint is taken from
+    the exported artifact size (``output_bytes``), so an int4-qmoe export is
+    sized at ~0.5 byte/param rather than the source dtype. Pass an explicit
+    value to model a runtime load dtype that differs from the export.
+    """
     param_count, dtype_bytes, source_bytes = _params_and_dtype_bytes(
         shards, index, safetensors_meta
     )
@@ -386,7 +392,11 @@ def estimate_budget(
 
     peak_ram = peak_ram_eager if loader == LoaderMode.EAGER else peak_ram_stream
 
-    vram_weights = int(param_count * target_dtype_bytes * (1 + vram_headroom_frac))
+    # The weights loaded at runtime are the weights that were exported, so the
+    # exported artifact size is the right default VRAM footprint (an int4-qmoe
+    # export loads int4, not the bf16 source).
+    vram_base = output_bytes if target_dtype_bytes is None else int(param_count * target_dtype_bytes)
+    vram_weights = int(vram_base * (1 + vram_headroom_frac))
 
     return Budget(
         param_count=param_count,
@@ -527,7 +537,7 @@ def run_preflight(
     export_mode: ExportMode = ExportMode.PASSTHROUGH,
     loader: LoaderMode = LoaderMode.STREAM,
     group_size: int = 32,
-    target_dtype_bytes: float = 2.0,
+    target_dtype_bytes: float | None = None,
     gpu_total_bytes: int | None = None,
     margin_frac: float = 0.05,
     state_path: str | os.PathLike | None = None,

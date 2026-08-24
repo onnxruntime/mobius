@@ -147,6 +147,26 @@ class TestBudget:
         # data is 2 bytes/param, not the 1 byte/param it was stored at.
         assert estimate_output_bytes(params, dtype_bytes, ExportMode.PASSTHROUGH) == params * 2
 
+    def test_vram_default_tracks_export_artifact(self):
+        params = 1_000_000
+        shards = [ShardMeta("s0", size=params * 2)]
+        meta = {"parameters": {"BF16": params}, "total": params}
+        bf16 = estimate_budget(shards, {}, meta, export_mode=ExportMode.PASSTHROUGH)
+        int4 = estimate_budget(
+            shards, {}, meta, export_mode=ExportMode.INT4_QMOE, group_size=32
+        )
+        # Passthrough loads bf16 (2 B/param); int4-qmoe loads the packed artifact
+        # (~0.5 B/param), so its VRAM footprint must be far smaller — not the
+        # source dtype.
+        assert bf16.vram_weights_bytes == int(params * 2 * 1.15)
+        assert int4.vram_weights_bytes == int(int4.output_bytes * 1.15)
+        assert int4.vram_weights_bytes < bf16.vram_weights_bytes
+        # An explicit runtime dtype override is still honored.
+        forced = estimate_budget(
+            shards, {}, meta, export_mode=ExportMode.INT4_QMOE, target_dtype_bytes=0.5
+        )
+        assert forced.vram_weights_bytes == int(params * 0.5 * 1.15)
+
     def test_eager_peak_exceeds_stream_peak(self):
         shards = [ShardMeta(f"s{i}", size=5 * 1000**3) for i in range(10)]
         index = {"metadata": {"total_size": 50 * 1000**3}}
