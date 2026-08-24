@@ -127,7 +127,19 @@ def test_tiny_graph_builds_v4_backbone():
     graph = build_from_module(DeepSeekV4CausalLMModel(config), config)["model"].graph
     assert graph.num_nodes() > 0
     assert count_op_type(graph, "Attention") == 0
-    assert count_op_type(graph, "Softmax") >= config.num_hidden_layers
+    gqa_nodes = [node for node in graph if node.op_type == "GroupQueryAttention"]
+    assert len(gqa_nodes) == config.num_hidden_layers
+    assert all(node.domain == "com.microsoft" for node in gqa_nodes)
+    # head_sink (12th positional input) carries the learned attention sink;
+    # attention_bias (11th) is intentionally omitted -- GQA's implicit
+    # causal mask + seqlens_k/total_seq_len already covers plain causal
+    # decoding, matching every other direct-GQA model in this codebase.
+    assert all(len(node.inputs) == 12 and node.inputs[10] is None for node in gqa_nodes)
+    assert all(node.inputs[11] is not None for node in gqa_nodes)
+    # Only the Hyper-Connection combination softmax (2 per layer) remains;
+    # the old manual Concat(scores, sink) -> Softmax -> slice attention
+    # softmax is gone now that GQA computes it internally.
+    assert count_op_type(graph, "Softmax") == 2 * config.num_hidden_layers
     assert count_op_type(graph, "ScatterElements") == 0
     assert count_op_type(graph, "Softplus") >= config.num_hidden_layers
     assert count_op_type(graph, "TopK") >= 1
@@ -157,8 +169,15 @@ def test_csa_schedule_exports_compressor_and_indexer_tensors_with_dense_attentio
     assert "model.layers.3.self_attn.compressor.wkv.weight" in names
     assert not any("model.layers.3.self_attn.indexer" in name for name in names)
     assert count_op_type(graph, "Attention") == 0
+    # Dense-CSA schedule attention is still a single fused GQA call per
+    # layer regardless of compress_ratio: the compressor/indexer tensors
+    # above are retained as a zero-valued shape anchor (see
+    # `_shape_anchor`/`DeepSeekV4CompressorTensors.forward`) for future
+    # sparse-runtime handoff, they do not participate in the dense
+    # attention computation this graph actually executes.
+    assert count_op_type(graph, "GroupQueryAttention") == config.num_hidden_layers
     assert count_op_type(graph, "ScatterElements") == 0
-    assert count_op_type(graph, "Softmax") >= config.num_hidden_layers
+    assert count_op_type(graph, "Softmax") == 2 * config.num_hidden_layers
 
 
 def test_mtp_sidecar_exports_official_block_and_hyper_connection_state():
@@ -176,6 +195,7 @@ def test_mtp_sidecar_exports_official_block_and_hyper_connection_state():
     assert "mtp.0.h_proj.weight" in names
     assert "mtp.0.hc_head_fn.weight" in names
     assert "mtp.0.self_attn.attn_sink" in names
+    assert count_op_type(mtp_graph, "GroupQueryAttention") == 1
     assert count_op_type(mtp_graph, "Softmax") >= 1
     assert {value.name for value in mtp_graph.outputs} == {
         "mtp_hidden",
