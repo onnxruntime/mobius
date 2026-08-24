@@ -686,6 +686,31 @@ def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
         print(f"  prompt: {wf.prompt!r}")
 
 
+def _cmd_preflight_gguf(args: argparse.Namespace) -> None:
+    """Execute the 'preflight-gguf' subcommand (metadata only)."""
+    try:
+        from mobius.integrations.gguf import preflight_gguf
+    except ImportError:
+        print(
+            "GGUF support requires the gguf package. Install with: pip install mobius-onnx[gguf]"
+        )
+        raise SystemExit(1)
+
+    report = preflight_gguf(
+        args.source,
+        filename=getattr(args, "filename", None),
+        revision=getattr(args, "revision", None),
+        verify_checksums=getattr(args, "verify_checksums", False),
+        cache_path=getattr(args, "cache", None),
+    )
+    if getattr(args, "json", False):
+        print(report.to_json())
+    else:
+        print(report.render())
+    if report.blockers:
+        raise SystemExit(2)
+
+
 def _cmd_info(args: argparse.Namespace) -> None:
     """Execute the 'info' subcommand."""
     from mobius.integrations.diffusers._builder import (
@@ -1135,6 +1160,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Target an SDXL pipeline (routes the dual text-encoder conditioning edges).",
     )
     comfy_parser.set_defaults(func=_cmd_convert_comfyui)
+
+    # --- preflight-gguf ---
+    preflight_parser = subparsers.add_parser(
+        "preflight-gguf",
+        help="Metadata-only preflight of a GGUF file or split set (local path "
+        "or Hugging Face 'owner/repo[:file]'). Reports exact files, bytes, "
+        "checksums, resolved architecture, and export blockers (notably the "
+        "sparse-MoE fusion blocker) WITHOUT downloading tensor payloads.",
+    )
+    preflight_parser.add_argument(
+        "source",
+        help="Local .gguf path / split-set shard / directory, or a Hugging "
+        "Face reference 'owner/repo' or 'owner/repo:filename.gguf'.",
+    )
+    preflight_parser.add_argument(
+        "--filename",
+        default=None,
+        help="Specific shard filename when SOURCE is a bare 'owner/repo'.",
+    )
+    preflight_parser.add_argument(
+        "--revision",
+        default=None,
+        help="Pinned Hugging Face revision (sha/branch/tag).",
+    )
+    preflight_parser.add_argument(
+        "--verify-checksums",
+        action="store_true",
+        help="Compute per-shard sha256 for a local set (reads file bytes, not "
+        "tensor payloads via the model API).",
+    )
+    preflight_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the report as JSON instead of the human-readable summary.",
+    )
+    preflight_parser.add_argument(
+        "--cache",
+        default=None,
+        help="Optional JSON cache path; a resumable, idempotent preflight reads "
+        "from it when present and writes to it otherwise.",
+    )
+    preflight_parser.set_defaults(func=_cmd_preflight_gguf)
 
     return parser
 
