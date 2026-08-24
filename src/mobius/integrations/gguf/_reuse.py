@@ -11,8 +11,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, TypedDict
@@ -23,11 +25,19 @@ import onnx_ir as ir
 if TYPE_CHECKING:
     from mobius._model_package import ModelPackage
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 _MANIFEST_NAME = "gguf-reuse.json"
 _SIDECAR_NAME = "model.onnx.data"
 _TRANSACTION_NAME = ".gguf-reuse.transaction.json"
+_LOCK_NAME = ".gguf-reuse.lock"
 _EXTERNAL_WEIGHT_THRESHOLD = 256
-_GENERATED_NAMES = frozenset({"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME, _TRANSACTION_NAME})
+_GENERATED_NAMES = frozenset(
+    {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME, _TRANSACTION_NAME, _LOCK_NAME}
+)
 _FLOAT_QTYPE_DTYPES = {
     "F32": ir.DataType.FLOAT,
     "F16": ir.DataType.FLOAT16,
@@ -41,6 +51,7 @@ class _TransactionEntry(TypedDict):
 
 
 class _TransactionJournal(TypedDict):
+    phase: str
     managed: list[_TransactionEntry]
     staged: list[str]
 
@@ -387,10 +398,141 @@ def _manifest_payload(
     }
 
 
-def _write_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    with path.open("rb") as stream:
-        os.fsync(stream.fileno())
+def _open_exclusive(path: Path) -> int:
+    """Create a regular file without following a pre-existing link."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(path, flags, 0o600)
+
+
+def _open_lock_path(path: Path) -> int:
+    """Open or create the persistent lock without accepting an entry swap."""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags, 0o600)
+    except FileExistsError:
+        entry_identity = path.lstat()
+        if not stat.S_ISREG(entry_identity.st_mode):
+            raise ValueError(f"Unsafe GGUF lock artifact: {path}")
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened_identity = os.fstat(descriptor)
+        current_identity = path.lstat()
+        identities = (
+            (entry_identity.st_dev, entry_identity.st_ino),
+            (opened_identity.st_dev, opened_identity.st_ino),
+            (current_identity.st_dev, current_identity.st_ino),
+        )
+        if len(set(identities)) != 1 or not stat.S_ISREG(opened_identity.st_mode):
+            os.close(descriptor)
+            raise ValueError(f"Unsafe GGUF lock artifact: {path}")
+        return descriptor
+
+
+def _write_json_exclusive(path: Path, payload: Mapping[str, object]) -> None:
+    encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    descriptor = _open_exclusive(path)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+
+
+def _require_regular_or_missing(path: Path, *, artifact: str) -> None:
+    """Reject links, directories, devices, and sockets at generated paths."""
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"Unsafe GGUF {artifact} artifact: {path}")
+
+
+def _acquire_file_lock(descriptor: int, *, shared: bool = False) -> None:
+    try:
+        if os.name == "nt":
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            mode = msvcrt.LK_NBRLCK if shared else msvcrt.LK_NBLCK
+            msvcrt.locking(descriptor, mode, 1)
+        else:
+            mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+    except OSError as error:
+        raise ValueError("GGUF package is locked by active writer.") from error
+
+
+def _release_file_lock(descriptor: int) -> None:
+    if os.name == "nt":
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _package_lock(root: Path) -> Iterator[None]:
+    """Serialize package verification, recovery, and replacement."""
+    lock_path = root / _LOCK_NAME
+    _require_regular_or_missing(lock_path, artifact="lock")
+    descriptor = _open_lock_path(lock_path)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"Unsafe GGUF lock artifact: {lock_path}")
+        # Windows byte-range locks require the byte to exist.
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"\n")
+            os.fsync(descriptor)
+        _acquire_file_lock(descriptor)
+        _fsync_directory(root)
+        try:
+            yield
+        finally:
+            _release_file_lock(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _verification_lock(root: Path) -> Iterator[None]:
+    """Hold a non-mutating shared lock while reading an installed package."""
+    lock_path = root / _LOCK_NAME
+    _require_regular_or_missing(lock_path, artifact="lock")
+    if not lock_path.exists():
+        try:
+            descriptor = _open_lock_path(lock_path)
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\n")
+                os.fsync(descriptor)
+        except PermissionError:
+            # A read-only legacy package cannot admit a writer either.
+            yield
+            return
+    else:
+        entry_identity = lock_path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags)
+        opened_identity = os.fstat(descriptor)
+        current_identity = lock_path.lstat()
+        identities = (
+            (entry_identity.st_dev, entry_identity.st_ino),
+            (opened_identity.st_dev, opened_identity.st_ino),
+            (current_identity.st_dev, current_identity.st_ino),
+        )
+        if len(set(identities)) != 1 or not stat.S_ISREG(opened_identity.st_mode):
+            os.close(descriptor)
+            raise ValueError(f"Unsafe GGUF lock artifact: {lock_path}")
+    try:
+        _acquire_file_lock(descriptor, shared=True)
+        try:
+            yield
+        finally:
+            _release_file_lock(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _fsync_file(path: Path) -> None:
@@ -414,13 +556,34 @@ def _replace_artifacts(
 ) -> None:
     """Install staged files with a durable rollback journal."""
     root = managed_paths[0].parent
-    _recover_transaction(root)
+    with _package_lock(root):
+        _recover_transaction_locked(root, preserve=frozenset(replacements.values()))
+        _replace_artifacts_locked(replacements, managed_paths)
+
+
+def _replace_artifacts_locked(
+    replacements: dict[Path, Path],
+    managed_paths: tuple[Path, ...],
+) -> None:
+    """Install staged files while the caller owns the package lock."""
+    root = managed_paths[0].parent
     _require_hard_link_backups(root, managed_paths)
     token = uuid.uuid4().hex
     backups: dict[Path, Path] = {}
     installed: list[Path] = []
     transaction_path = root / _TRANSACTION_NAME
+    committed_path = root / f".{_TRANSACTION_NAME}.{token}.tmp"
+    _require_regular_or_missing(transaction_path, artifact="transaction journal")
+    if transaction_path.exists():
+        raise ValueError(f"Unexpected GGUF transaction journal: {transaction_path}")
+    for final_path in managed_paths:
+        _require_regular_or_missing(final_path, artifact="managed")
+    for staged_path in replacements.values():
+        _require_regular_or_missing(staged_path, artifact="staged")
+        if not staged_path.is_file():
+            raise ValueError(f"Missing GGUF staged artifact: {staged_path}")
     journal: _TransactionJournal = {
+        "phase": "replacing",
         "managed": [
             {
                 "final": path.name,
@@ -431,12 +594,12 @@ def _replace_artifacts(
         ],
         "staged": [path.name for path in replacements.values()],
     }
-    _write_json(transaction_path, journal)
-    _fsync_directory(root)
+    _publish_json(transaction_path, journal, token)
     try:
         for entry, final_path in zip(journal["managed"], managed_paths, strict=True):
             if final_path.exists():
                 backup = root / entry["backup"]
+                _require_regular_or_missing(backup, artifact="backup")
                 os.link(final_path, backup)
                 backups[final_path] = backup
         _fsync_directory(root)
@@ -448,6 +611,11 @@ def _replace_artifacts(
             os.replace(staged_path, final_path)
             installed.append(final_path)
         _fsync_directory(root)
+        committed_journal = dict(journal)
+        committed_journal["phase"] = "committed"
+        _write_json_exclusive(committed_path, committed_journal)
+        os.replace(committed_path, transaction_path)
+        _fsync_directory(root)
     except Exception:
         for final_path in reversed(installed):
             final_path.unlink(missing_ok=True)
@@ -455,13 +623,15 @@ def _replace_artifacts(
             os.replace(backup, final_path)
             backup.unlink(missing_ok=True)
         transaction_path.unlink(missing_ok=True)
+        committed_path.unlink(missing_ok=True)
         _fsync_directory(root)
         raise
     else:
-        transaction_path.unlink()
-        _fsync_directory(root)
         for backup in backups.values():
             backup.unlink(missing_ok=True)
+        _fsync_directory(root)
+        transaction_path.unlink()
+        _fsync_directory(root)
 
 
 def _require_hard_link_backups(root: Path, managed_paths: tuple[Path, ...]) -> None:
@@ -472,7 +642,11 @@ def _require_hard_link_backups(root: Path, managed_paths: tuple[Path, ...]) -> N
     probe = root / f".gguf-reuse.{token}.link-probe"
     linked = root / f".gguf-reuse.{token}.link-probe-copy"
     try:
-        probe.write_bytes(b"probe")
+        descriptor = _open_exclusive(probe)
+        os.write(descriptor, b"probe")
+        os.fsync(descriptor)
+        os.close(descriptor)
+        _require_regular_or_missing(linked, artifact="link probe")
         _fsync_file(probe)
         os.link(probe, linked)
         _fsync_directory(root)
@@ -489,21 +663,79 @@ def _require_hard_link_backups(root: Path, managed_paths: tuple[Path, ...]) -> N
 
 def _recover_transaction(root: Path) -> None:
     """Roll back an interrupted artifact replacement before using the package."""
+    with _package_lock(root):
+        _recover_transaction_locked(root)
+
+
+def _recover_transaction_locked(
+    root: Path, *, preserve: frozenset[Path] = frozenset()
+) -> None:
+    """Roll back an interrupted replacement while owning the package lock."""
     transaction_path = root / _TRANSACTION_NAME
-    if not transaction_path.is_file():
+    _require_regular_or_missing(transaction_path, artifact="transaction journal")
+    if not transaction_path.exists():
+        _cleanup_stale_temporary_artifacts_locked(root, preserve=preserve)
         return
     journal = _validated_transaction_journal(transaction_path)
+    if journal["phase"] == "committed":
+        for entry in journal["managed"]:
+            backup = root / entry["backup"]
+            _require_regular_or_missing(backup, artifact="backup")
+            backup.unlink(missing_ok=True)
+        for staged_name in journal["staged"]:
+            staged_path = root / staged_name
+            _require_regular_or_missing(staged_path, artifact="staged")
+            staged_path.unlink(missing_ok=True)
+        transaction_path.unlink()
+        _fsync_directory(root)
+        _cleanup_stale_temporary_artifacts_locked(root)
+        return
     for entry in journal["managed"]:
         final_path = root / entry["final"]
         backup = root / entry["backup"]
+        _require_regular_or_missing(final_path, artifact="managed")
+        _require_regular_or_missing(backup, artifact="backup")
         if backup.exists():
             os.replace(backup, final_path)
             backup.unlink(missing_ok=True)
         elif not entry["had_existing"]:
             final_path.unlink(missing_ok=True)
     for staged_name in journal["staged"]:
-        (root / staged_name).unlink(missing_ok=True)
+        staged_path = root / staged_name
+        _require_regular_or_missing(staged_path, artifact="staged")
+        staged_path.unlink(missing_ok=True)
     transaction_path.unlink(missing_ok=True)
+    _fsync_directory(root)
+    _cleanup_stale_temporary_artifacts_locked(root)
+
+
+def _publish_json(path: Path, payload: Mapping[str, object], token: str) -> None:
+    """Durably publish JSON without exposing an empty or partial final file."""
+    temporary = path.with_name(f".{path.name}.{token}.tmp")
+    _require_regular_or_missing(temporary, artifact="transaction journal temporary")
+    try:
+        _write_json_exclusive(temporary, payload)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _cleanup_stale_temporary_artifacts_locked(
+    root: Path, *, preserve: frozenset[Path] = frozenset()
+) -> None:
+    """Remove only generated temporary files while no writer can be active."""
+    final_names = {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME, _TRANSACTION_NAME}
+    for path in root.iterdir():
+        if path in preserve:
+            continue
+        if not any(
+            re.fullmatch(rf"\.{re.escape(name)}\.[0-9a-f]{{32}}\.tmp", path.name)
+            for name in final_names
+        ):
+            continue
+        _require_regular_or_missing(path, artifact="stale temporary")
+        path.unlink()
     _fsync_directory(root)
 
 
@@ -514,8 +746,13 @@ def _validated_transaction_journal(path: Path) -> _TransactionJournal:
         raise TypeError("Invalid GGUF transaction journal.")
     managed = journal.get("managed")
     staged = journal.get("staged")
+    phase = journal.get("phase", "replacing")
     expected_finals = {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME}
-    if not isinstance(managed, list) or not isinstance(staged, list):
+    if (
+        phase not in {"replacing", "committed"}
+        or not isinstance(managed, list)
+        or not isinstance(staged, list)
+    ):
         raise TypeError("Invalid GGUF transaction journal.")
     if len(managed) != len(expected_finals):
         raise ValueError("Invalid GGUF transaction journal managed artifact set.")
@@ -570,7 +807,7 @@ def _validated_transaction_journal(path: Path) -> _TransactionJournal:
         validated_staged.append(staged_name)
     if not {"model.onnx", _MANIFEST_NAME}.issubset(staged_finals):
         raise ValueError("GGUF transaction journal omits required staged artifacts.")
-    return {"managed": validated_managed, "staged": validated_staged}
+    return {"phase": phase, "managed": validated_managed, "staged": validated_staged}
 
 
 def save_reuse_package(
@@ -582,72 +819,78 @@ def save_reuse_package(
 ) -> tuple[str, ...]:
     """Transactionally save mixed GGUF references plus a converted sidecar."""
     path = Path(path)
-    _recover_transaction(path.parent)
-    _validate_source(plan, path.parent)
-    token = uuid.uuid4().hex
-    staged_model = path.with_name(f".{path.name}.{token}.tmp")
-    staged_sidecar = path.with_name(f".{_SIDECAR_NAME}.{token}.tmp")
-    staged_manifest = path.with_name(f".{_MANIFEST_NAME}.{token}.tmp")
-    final_sidecar = path.parent / _SIDECAR_NAME
-    final_manifest = path.parent / _MANIFEST_NAME
+    with _package_lock(path.parent):
+        _recover_transaction_locked(path.parent)
+        _validate_source(plan, path.parent)
+        token = uuid.uuid4().hex
+        staged_model = path.with_name(f".{path.name}.{token}.tmp")
+        staged_sidecar = path.with_name(f".{_SIDECAR_NAME}.{token}.tmp")
+        staged_manifest = path.with_name(f".{_MANIFEST_NAME}.{token}.tmp")
+        final_sidecar = path.parent / _SIDECAR_NAME
+        final_manifest = path.parent / _MANIFEST_NAME
+        for staged_path in (staged_model, staged_sidecar, staged_manifest):
+            _require_regular_or_missing(staged_path, artifact="staged")
+            if staged_path.exists():
+                raise ValueError(f"Unexpected GGUF staged artifact: {staged_path}")
 
-    memory_initializers = [
-        value
-        for graph in model.graphs()
-        for value in graph.initializers.values()
-        if value.const_value is not None
-        and not isinstance(value.const_value, ir.ExternalTensor)
-        and value.const_value.nbytes > _EXTERNAL_WEIGHT_THRESHOLD
-    ]
-    original_tensors = [value.const_value for value in memory_initializers]
-    converted_names = tuple(sorted(value.name for value in memory_initializers))
+        memory_initializers = [
+            value
+            for graph in model.graphs()
+            for value in graph.initializers.values()
+            if value.const_value is not None
+            and not isinstance(value.const_value, ir.ExternalTensor)
+            and value.const_value.nbytes > _EXTERNAL_WEIGHT_THRESHOLD
+        ]
+        original_tensors = [value.const_value for value in memory_initializers]
+        converted_names = tuple(sorted(value.name for value in memory_initializers))
 
-    try:
-        if memory_initializers:
-            external_tensors = ir.external_data.convert_tensors_to_external(
-                original_tensors,
-                base_dir=path.parent,
-                relative_path=staged_sidecar.name,
-                callback=callback,
-            )
-            for value, external_tensor in zip(
-                memory_initializers, external_tensors, strict=True
-            ):
-                value.const_value = ir.ExternalTensor(
-                    _SIDECAR_NAME,
-                    external_tensor.offset,
-                    external_tensor.length,
-                    external_tensor.dtype,
-                    shape=external_tensor.shape,
-                    name=external_tensor.name,
+        try:
+            if memory_initializers:
+                external_tensors = ir.external_data.convert_tensors_to_external(
+                    original_tensors,
                     base_dir=path.parent,
+                    relative_path=staged_sidecar.name,
+                    callback=callback,
                 )
-            _fsync_file(staged_sidecar)
-        ir.save(model, staged_model)
-        _fsync_file(staged_model)
-        _write_json(staged_manifest, _manifest_payload(plan, converted_names))
-        verify_gguf_reuse_manifest(
-            path.parent,
-            model_path=staged_model,
-            manifest_path=staged_manifest,
-            sidecar_path=staged_sidecar if memory_initializers else None,
-        )
-        replacements = {
-            path: staged_model,
-            final_manifest: staged_manifest,
-        }
-        if memory_initializers:
-            replacements[final_sidecar] = staged_sidecar
-        _replace_artifacts(
-            replacements,
-            (path, final_sidecar, final_manifest),
-        )
-    finally:
-        for value, tensor in zip(memory_initializers, original_tensors, strict=True):
-            value.const_value = tensor
-        staged_model.unlink(missing_ok=True)
-        staged_sidecar.unlink(missing_ok=True)
-        staged_manifest.unlink(missing_ok=True)
+                for value, external_tensor in zip(
+                    memory_initializers, external_tensors, strict=True
+                ):
+                    value.const_value = ir.ExternalTensor(
+                        _SIDECAR_NAME,
+                        external_tensor.offset,
+                        external_tensor.length,
+                        external_tensor.dtype,
+                        shape=external_tensor.shape,
+                        name=external_tensor.name,
+                        base_dir=path.parent,
+                    )
+                _fsync_file(staged_sidecar)
+            ir.save(model, staged_model)
+            _fsync_file(staged_model)
+            _write_json_exclusive(staged_manifest, _manifest_payload(plan, converted_names))
+            verify_gguf_reuse_manifest(
+                path.parent,
+                model_path=staged_model,
+                manifest_path=staged_manifest,
+                sidecar_path=staged_sidecar if memory_initializers else None,
+                _lock_held=True,
+            )
+            replacements = {
+                path: staged_model,
+                final_manifest: staged_manifest,
+            }
+            if memory_initializers:
+                replacements[final_sidecar] = staged_sidecar
+            _replace_artifacts_locked(
+                replacements,
+                (path, final_sidecar, final_manifest),
+            )
+        finally:
+            for value, tensor in zip(memory_initializers, original_tensors, strict=True):
+                value.const_value = tensor
+            for staged_path in (staged_model, staged_sidecar, staged_manifest):
+                _require_regular_or_missing(staged_path, artifact="staged")
+                staged_path.unlink(missing_ok=True)
 
     return converted_names
 
@@ -671,12 +914,40 @@ def verify_gguf_reuse_manifest(
     model_path: str | Path | None = None,
     manifest_path: str | Path | None = None,
     sidecar_path: str | Path | None = None,
+    _lock_held: bool = False,
 ) -> None:
     """Verify the packaged GGUF's size, digest, and pinned tensor ranges."""
     root = Path(directory)
-    if model_path is None and manifest_path is None and sidecar_path is None:
+    if not _lock_held:
+        recover = False
+        with _verification_lock(root):
+            transaction_path = root / _TRANSACTION_NAME
+            _require_regular_or_missing(transaction_path, artifact="transaction journal")
+            recover = (
+                model_path is None
+                and manifest_path is None
+                and sidecar_path is None
+                and transaction_path.exists()
+            )
+            if not recover:
+                return verify_gguf_reuse_manifest(
+                    root,
+                    model_path=model_path,
+                    manifest_path=manifest_path,
+                    sidecar_path=sidecar_path,
+                    _lock_held=True,
+                )
         _recover_transaction(root)
+        return verify_gguf_reuse_manifest(
+            root,
+            model_path=model_path,
+            manifest_path=manifest_path,
+            sidecar_path=sidecar_path,
+        )
     manifest_file = Path(manifest_path) if manifest_path is not None else root / _MANIFEST_NAME
+    _require_regular_or_missing(manifest_file, artifact="manifest")
+    if not manifest_file.is_file():
+        raise ValueError(f"GGUF reuse manifest is missing: {manifest_file}")
     manifest = json.loads(manifest_file.read_text())
     source_info = manifest["source"]
     location = source_info["location"]
@@ -723,6 +994,9 @@ def verify_gguf_reuse_manifest(
             )
 
     model_file = Path(model_path) if model_path is not None else root / "model.onnx"
+    _require_regular_or_missing(model_file, artifact="model")
+    if not model_file.is_file():
+        raise ValueError(f"GGUF reuse model is missing: {model_file}")
     model = ir.load(model_file)
     external_by_name: dict[str, ir.ExternalTensor] = {}
     external_values_by_name: dict[str, ir.Value] = {}
@@ -747,6 +1021,7 @@ def verify_gguf_reuse_manifest(
                 )
 
     sidecar_file = Path(sidecar_path) if sidecar_path is not None else root / _SIDECAR_NAME
+    _require_regular_or_missing(sidecar_file, artifact="sidecar")
     sidecar_size = sidecar_file.stat().st_size if sidecar_file.is_file() else None
     sidecar_ranges: list[tuple[int, int, str]] = []
     for name, external in external_by_name.items():
@@ -775,15 +1050,29 @@ def verify_gguf_reuse_manifest(
         elif external.location == _SIDECAR_NAME:
             if name not in converted_names:
                 raise ValueError(f"Unmanifested sidecar initializer {name!r}.")
+            shape = tuple(external.shape)
+            if any(not isinstance(dim, int) or dim < 0 for dim in shape):
+                raise ValueError(
+                    f"Unsupported sidecar dtype or shape for initializer {name!r}."
+                )
+            try:
+                expected_nbytes = external.nbytes
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Unsupported sidecar dtype or shape for initializer {name!r}."
+                ) from error
             if (
                 sidecar_size is None
                 or external.offset is None
                 or external.length is None
                 or external.offset < 0
                 or external.length <= 0
+                or external.length != expected_nbytes
                 or external.offset + external.length > sidecar_size
             ):
-                raise ValueError(f"Invalid sidecar range for initializer {name!r}.")
+                raise ValueError(
+                    f"Invalid sidecar range or byte length for initializer {name!r}."
+                )
             sidecar_ranges.append((external.offset, external.offset + external.length, name))
         else:
             raise ValueError(
