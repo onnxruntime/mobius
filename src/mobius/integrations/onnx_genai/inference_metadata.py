@@ -3298,11 +3298,9 @@ _TARGET_HIDDEN_CONTEXT_ROLE = "target_hidden_context"
 #: for which ports exist and their contracts; only what a port *means* is
 #: declared here (see ``workflow_metadata._component``).
 _MTP_PROPOSER_PORT_ROLES: dict[str, str] = {
-    "inputs_embeds": "inputs_embeds",
     "hidden_states": "hidden_states",
     "attention_mask": "attention_mask",
     "position_ids": "position_ids",
-    "mtp_hidden": "hidden_states",
 }
 
 
@@ -3329,18 +3327,20 @@ def write_mtp_speculator_metadata(
     directory: str,
     *,
     backbone_config: Any | None = None,
+    proposer_config: Any | None = None,
     filename: str = "inference_metadata.yaml",
     model_path: str = "mtp/model.onnx",
     num_speculative_tokens: int = 1,
     embedding_weights: str = "model.embed_tokens.weight",
-    lm_head_weights: str = "lm_head.weight",
+    lm_head_weights: str | None = None,
     proposer_name: str = "mtp",
 ) -> str | None:
     """Declare the exported MTP head as the backbone's speculative proposer.
 
     The Qwen3.5/3.8 MTP head is a self-speculative drafter saved next to the
-    backbone (``mtp/model.onnx``). It borrows the target's shared embedding /
-    LM head and is seeded by the backbone's final-layer hidden state.
+    backbone (``mtp/model.onnx``). It borrows target embedding / LM-head weights
+    only when the GGUF omits dedicated tables, and is seeded by the backbone's
+    dedicated post-final-norm ``mtp_seed`` output.
 
     ``SpeculativeContract`` is expressed in terms of the workflow — ``proposer``
     and ``target`` are component names, ``rollback_state`` names state cells —
@@ -3390,22 +3390,66 @@ def write_mtp_speculator_metadata(
         )
     target_name = candidates[0]
 
-    # The head borrows the target's embedding + LM head, which live as
-    # initializers in the backbone ``model.onnx`` (borrowed, not duplicated).
-    shared_weights = sorted({embedding_weights, lm_head_weights})
+    dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
+    dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
+    quantization = getattr(backbone_config, "quantization", None)
+    quantized_embedding = bool(
+        quantization is not None and getattr(quantization, "quantize_embeddings", False)
+    )
+    quantized_lm_head = bool(
+        quantization is not None and getattr(quantization, "quantize_lm_head", False)
+    )
+    tied_quantized_head = bool(
+        quantized_embedding
+        and quantized_lm_head
+        and (
+            getattr(backbone_config, "tie_word_embeddings", False)
+            or getattr(quantization, "tie_word_embeddings", False)
+        )
+    )
+    has_zero_point = bool(quantization is not None and not getattr(quantization, "sym", True))
+    embedding_initializers = [embedding_weights]
+    if quantized_embedding:
+        embedding_stem = embedding_weights.removesuffix(".weight")
+        embedding_initializers = [
+            f"{embedding_stem}.qweight",
+            f"{embedding_stem}.scales",
+            *([f"{embedding_stem}.zero_points"] if has_zero_point else []),
+        ]
+    if lm_head_weights is not None:
+        lm_head_initializers = [lm_head_weights]
+    elif quantized_lm_head:
+        lm_head_initializers = [
+            "lm_head.qweight" if tied_quantized_head else "lm_head.weight",
+            "lm_head.scales",
+            *(["lm_head.zero_points"] if has_zero_point else []),
+        ]
+    else:
+        lm_head_initializers = ["lm_head.weight_t"]
+    shared_weights: list[str] = []
+    if not dedicated_embeddings:
+        shared_weights.extend(embedding_initializers)
+    if not dedicated_lm_head:
+        shared_weights.extend(lm_head_initializers)
+    shared_weights = sorted(set(shared_weights))
+
+    proposer_roles = dict(_MTP_PROPOSER_PORT_ROLES)
+    proposer_roles["input_ids" if dedicated_embeddings else "inputs_embeds"] = (
+        "token_ids" if dedicated_embeddings else "inputs_embeds"
+    )
+    proposer_roles["logits" if dedicated_lm_head else "mtp_hidden"] = (
+        "logits" if dedicated_lm_head else "hidden_states"
+    )
 
     components = workflow["components"]
     components[proposer_name] = {
         "implementation": {"kind": "onnx", "artifact": model_path},
-        "ports": {"roles": dict(_MTP_PROPOSER_PORT_ROLES)},
+        "ports": {"roles": proposer_roles},
     }
-    # Name the target output the head is seeded from. The backbone exposes its
-    # final-layer hidden state as ``hidden_states.<N-1>``; the role, not the
-    # spelling, is what the runtime resolves.
-    num_layers = getattr(backbone_config, "num_hidden_layers", None)
-    if num_layers is not None:
-        target_roles = components[target_name].setdefault("ports", {}).setdefault("roles", {})
-        target_roles[f"hidden_states.{int(num_layers) - 1}"] = "hidden_states"
+    # The target seed is explicitly post-final-norm. Per-layer hidden_states.N
+    # remain pre-final-norm and must never receive this runtime role.
+    target_roles = components[target_name].setdefault("ports", {}).setdefault("roles", {})
+    target_roles["mtp_seed"] = "hidden_states"
 
     # A rejected proposal must rewind every state cell the target advances.
     rollback_cells = sorted(
@@ -3421,7 +3465,7 @@ def write_mtp_speculator_metadata(
         # One invocation yields the whole k-token proposal.
         "proposal_execution": {"kind": "block"},
         "port_bindings": {_TARGET_HIDDEN_CONTEXT_ROLE: "hidden_states"},
-        "shared_weights": shared_weights,
+        **({"shared_weights": shared_weights} if shared_weights else {}),
         # The head scores the target's own vocabulary through the shared LM head.
         "vocabulary": {"kind": "identical"},
         "max_proposal_width": int(num_speculative_tokens),

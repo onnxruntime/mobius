@@ -457,14 +457,19 @@ class CausalLMModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        emit_final_hidden = self.config.output_final_hidden_state
         if len(result) == 3:
             hidden_states, present_key_values, intermediate_hidden_states = result
             hidden_states = _retain_last_sequence_token(op, hidden_states)
             logits = self.lm_head(op, hidden_states)
+            if emit_final_hidden:
+                return logits, present_key_values, intermediate_hidden_states, hidden_states
             return logits, present_key_values, intermediate_hidden_states
         hidden_states, present_key_values = result
         hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
+        if emit_final_hidden:
+            return logits, present_key_values, None, hidden_states
         return logits, present_key_values
 
     def preprocess_weights(

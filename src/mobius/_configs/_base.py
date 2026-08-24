@@ -678,6 +678,9 @@ class ArchitectureConfig(BaseModelConfig):
     # ``model(..., output_hidden_states=True).hidden_states[k + 1]`` in
     # transformers (where index 0 is the embedding output).
     output_layer_indices: list[int] | None = None
+    # Emit the post-final-norm state as ``mtp_seed``. This is separate from
+    # output_layer_indices, whose hidden_states.N outputs remain pre-final-norm.
+    output_final_hidden_state: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
@@ -1715,6 +1718,9 @@ class Qwen35MtpConfig(CausalLMConfig):
     ``layer_types`` to ``["full_attention"]`` regardless of the parent's
     (64-layer, hybrid) stack — the MTP head has exactly one layer.
     """
+
+    use_dedicated_embeddings: bool = False
+    use_dedicated_lm_head: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Qwen35MtpConfig:

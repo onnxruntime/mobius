@@ -524,9 +524,14 @@ full-logit parity and deterministic stateful generation parity. Mobius exposes
 only the latest recurrent state, not llama.cpp's optional bounded rollback
 snapshot planes; rollback/reorder-capable runtime packaging must remain
 disabled until that ABI is represented explicitly. Dense Qwen3.5 MTP sidecars
-are supported, but Qwen3.5-MoE and Qwen3-Next MTP blocks are rejected because
-the current sidecar builder cannot represent routed experts without dropping
-tensors. Separate MTP-only files are outside this cohort.
+use the post-final-norm `mtp_seed` output while preserving pre-norm
+`hidden_states.N` captures. Optional dedicated `nextn.embed_tokens`,
+`nextn.shared_head_norm`, and `nextn.shared_head_head` tensors are consumed
+when present; otherwise the sidecar explicitly falls back to the backbone
+embedding, final norm, and tied or untied output head. Qwen3.5-MoE and
+Qwen3-Next MTP blocks are rejected because the current sidecar builder cannot
+represent routed experts without dropping tensors. Separate MTP-only files
+are outside this cohort.
 
 ### Pure recurrent Mamba evidence
 

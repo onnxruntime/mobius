@@ -813,6 +813,24 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
                 f"{architecture} GGUF declares an MTP block but is missing tensor(s): "
                 f"{missing_mtp}"
             )
+        known_nextn = {
+            "nextn.eh_proj.weight",
+            "nextn.enorm.weight",
+            "nextn.hnorm.weight",
+            "nextn.embed_tokens.weight",
+            "nextn.shared_head_norm.weight",
+            "nextn.shared_head_head.weight",
+        }
+        unknown_nextn = sorted(
+            name
+            for name in layer_names
+            if name.startswith("nextn.") and name not in known_nextn
+        )
+        if unknown_nextn:
+            raise ValueError(
+                f"{architecture} MTP block contains unsupported nextn tensor(s): "
+                f"{unknown_nextn}"
+            )
 
 
 def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
@@ -1621,9 +1639,10 @@ def build_from_gguf(
     # ``blk.<N>.nextn.*`` tensors), always emit the MTP sidecar — it is a purely
     # additive artifact that text-only consumers ignore. No opt-in flag: the
     # decision is driven entirely by presence in the source. When present, expose
-    # the backbone's final-layer hidden state as a graph output so the
-    # orchestrator can seed the head with it (must be set before the graph is
-    # built). Direct field assignment (not dataclasses.replace) preserves the
+    # the post-final-norm ``mtp_seed`` output consumed by the orchestrator. Keep
+    # the final layer's ordinary ``hidden_states.N`` capture as the distinct
+    # pre-final-norm ABI; neither output may stand in for the other. These fields
+    # must be set before graph construction. Direct assignment preserves the
     # ``_gguf_*`` metadata attributes on the config. Skipped under static_cache
     # (the head needs the dynamic concat-grow cache), leaving those exports
     # byte-identical to today.
@@ -1647,14 +1666,15 @@ def build_from_gguf(
         )
 
     if emit_mtp_head:
+        config.output_final_hidden_state = True
         seed_index = int(config.num_hidden_layers) - 1
         existing = list(config.output_layer_indices or [])
         if seed_index not in existing:
             existing.append(seed_index)
         config.output_layer_indices = existing
         logger.info(
-            "MTP head detected in source: exposing backbone hidden-state seed "
-            "output hidden_states.%d",
+            "MTP head detected in source: exposing post-final-norm mtp_seed and "
+            "pre-final-norm hidden_states.%d",
             seed_index,
         )
 
