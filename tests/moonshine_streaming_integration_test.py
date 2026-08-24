@@ -136,15 +136,18 @@ def _decoder_feeds(
     position_offset=0,
     dtype: np.dtype | type = np.float32,
 ):
-    sequence_length = decoder_input_ids.shape[1]
+    batch_size, sequence_length = decoder_input_ids.shape
+    position_ids = np.arange(
+        position_offset, position_offset + sequence_length, dtype=np.int64
+    )
     return {
         "decoder_input_ids": decoder_input_ids.astype(np.int64),
         "encoder_hidden_states": encoder_hidden_states.astype(dtype),
         "encoder_attention_mask": encoder_attention_mask.astype(np.int64),
-        "position_ids": np.arange(
-            position_offset, position_offset + sequence_length, dtype=np.int64
-        )[None, :],
-        **(past_key_values or _empty_cache_feeds(config, dtype=dtype)),
+        "position_ids": np.broadcast_to(
+            position_ids[None, :], (batch_size, sequence_length)
+        ).copy(),
+        **(past_key_values or _empty_cache_feeds(config, batch_size, dtype=dtype)),
     }
 
 
@@ -362,6 +365,65 @@ class TestMoonshineStreamingSyntheticParity:
             rtol=1e-3,
             atol=1e-3,
         )
+
+    def test_batched_ragged_padding_matches_huggingface(self, synthetic_models):
+        """Two rows of different real length: mask, encoder and decoder all agree."""
+        hf_model, package, config = synthetic_models
+        rng = np.random.default_rng(21)
+        input_values = (rng.standard_normal((3, 80 * 150)) * 0.05).astype(np.float32)
+        attention_mask = np.ones_like(input_values, dtype=np.int64)
+        # Ragged: 150, 90 and 40 valid frames.
+        attention_mask[1, 80 * 90 :] = 0
+        attention_mask[2, 80 * 40 :] = 0
+
+        with torch.no_grad():
+            expected = hf_model.get_encoder()(
+                input_values=torch.from_numpy(input_values),
+                attention_mask=torch.from_numpy(attention_mask),
+            )
+        actual = _run_encoder(package, input_values, attention_mask)
+
+        expected_mask = expected.attention_mask.numpy()
+        np.testing.assert_array_equal(
+            actual["encoder_attention_mask"].astype(bool), expected_mask
+        )
+        assert len(set(expected_mask.sum(axis=-1).tolist())) == 3, (
+            "each row should keep a different number of valid frames"
+        )
+        expected_hidden = expected.last_hidden_state.numpy()
+        for row in range(input_values.shape[0]):
+            valid = expected_mask[row].astype(bool)
+            assert_logits_close(
+                actual["encoder_hidden_states"][row][valid],
+                expected_hidden[row][valid],
+                rtol=1e-3,
+                atol=1e-3,
+            )
+
+        decoder_input_ids = np.array([[1, 5], [1, 9], [1, 13]], dtype=np.int64)
+        with torch.no_grad():
+            prefill = hf_model.model.decoder(
+                input_ids=torch.from_numpy(decoder_input_ids),
+                encoder_hidden_states=expected.last_hidden_state.clone(),
+                encoder_attention_mask=expected.attention_mask,
+                use_cache=True,
+            )
+            expected_logits = hf_model.proj_out(prefill.last_hidden_state).numpy()
+
+        session = OnnxModelSession(package["decoder"])
+        try:
+            actual_logits = session.run(
+                _decoder_feeds(
+                    config,
+                    decoder_input_ids,
+                    expected_hidden,
+                    expected_mask.astype(np.int64),
+                    past_key_values=_empty_cache_feeds(config, batch_size=3),
+                )
+            )["logits"]
+        finally:
+            session.close()
+        assert_logits_close(actual_logits, expected_logits, rtol=1e-3, atol=1e-3)
 
     def test_decoder_prefill_and_cached_decode(self, synthetic_models):
         hf_model, package, config = synthetic_models
