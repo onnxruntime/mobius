@@ -140,6 +140,13 @@ class TestBudget:
         # 0.5 + 2/32 + 0.5/32 = 0.578125 bytes/param
         assert int4 == int(params * 0.578125)
 
+    def test_passthrough_fp8_output_is_dequantized_size(self):
+        params = 1000
+        dtype_bytes = {"F8_E4M3": params}  # fp8 stores 1 byte/param
+        # A passthrough export dequantizes fp8 -> bf16, so the output external
+        # data is 2 bytes/param, not the 1 byte/param it was stored at.
+        assert estimate_output_bytes(params, dtype_bytes, ExportMode.PASSTHROUGH) == params * 2
+
     def test_eager_peak_exceeds_stream_peak(self):
         shards = [ShardMeta(f"s{i}", size=5 * 1000**3) for i in range(10)]
         index = {"metadata": {"total_size": 50 * 1000**3}}
@@ -221,6 +228,45 @@ class TestRunPreflight:
         )
         assert result.ok is False
         assert any("VRAM" in b for b in result.blockers)
+
+    def test_same_device_disk_check_sums_download_and_output(self, tmp_path, monkeypatch):
+        # Hub source (not present locally) so a real download is required.
+        weight_map = {
+            "w0": "model-00001-of-00002.safetensors",
+            "w1": "model-00002-of-00002.safetensors",
+        }
+        _fake_hub(tmp_path, monkeypatch, weight_map)
+        info = types.SimpleNamespace(
+            sha="deadbeef",
+            siblings=[
+                _sibling("model-00001-of-00002.safetensors", 100, "aa"),
+                _sibling("model-00002-of-00002.safetensors", 100, "bb"),
+            ],
+            safetensors=types.SimpleNamespace(parameters={"BF16": 100}, total=100),
+        )
+        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        # Free space (240) fits the 200B download or the 200B output alone, but
+        # not both (400B combined) on one filesystem. Independent checks would
+        # each pass; the combined check must refuse.
+        monkeypatch.setattr(preflight, "_free_bytes", lambda p: 240)
+        result = run_preflight(
+            "org/model",
+            output_dir=str(tmp_path / "out"),
+            download_dir=str(tmp_path),  # same filesystem as the output dir
+            hf_api=_FakeApi(info),
+        )
+        assert result.ok is False
+        assert any("download+output" in b for b in result.blockers)
+
+    def test_ram_unverifiable_refuses(self, tmp_path, monkeypatch):
+        _write_sharded(tmp_path, n_shards=2)
+        monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
+        # MemAvailable can't be read -> the RAM budget is unverifiable and must
+        # not produce a success-shaped pass.
+        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: None)
+        result = run_preflight(str(tmp_path), output_dir=str(tmp_path / "out"))
+        assert result.ok is False
+        assert any("RAM budget could not be verified" in b for b in result.blockers)
 
 
 # ===========================================================================

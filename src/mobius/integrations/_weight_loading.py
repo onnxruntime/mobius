@@ -484,20 +484,44 @@ def stream_safetensors_to_model(
 
     This is a *pass-through* loader: it maps each ONNX initializer 1:1 to a
     checkpoint tensor and only casts dtype. It deliberately does **not** perform
-    weight fusion, qkv splitting, or quantization. When *require_passthrough* is
-    True (the default) and the graph has an initializer with no matching
-    checkpoint tensor — the signature of a model that needs preprocessing — it
-    raises rather than silently emitting an under-specified graph. Such models
-    must use the eager :func:`apply_weights` path.
+    weight fusion, qkv splitting, or quantization/dequantization. When
+    *require_passthrough* is True (the default) it refuses two kinds of
+    non-passthrough sources rather than silently emitting a wrong graph: (1) a
+    quantized checkpoint (fp8 weights or ``*_scale_inv``/``*_scale`` tensors),
+    which needs the eager dequant path, and (2) a graph with an initializer that
+    has no matching checkpoint tensor — the signature of a model that needs
+    preprocessing. Such models must use the eager :func:`apply_weights` path.
 
     Returns the set of initializer names that were bound.
 
     Raises:
-        ValueError: on a shape mismatch, or (in pass-through mode) when a graph
-            initializer has no corresponding checkpoint tensor.
+        ValueError: on a shape mismatch; when the checkpoint is quantized; or
+            (in pass-through mode) when a graph initializer has no corresponding
+            checkpoint tensor.
     """
     paths = _resolve_shard_paths(model_id, revision)
     key_index = _shard_key_index(paths)
+
+    if require_passthrough:
+        # An fp8 checkpoint stores raw float8 weights under the same name the
+        # graph expects for bf16, plus separate ``*_scale_inv``/``*_scale``
+        # tensors. Casting fp8 -> bf16 without multiplying by the scale silently
+        # produces wrong weights, and the scale keys never map to an
+        # initializer (so the missing-tensor guard below never fires). Refuse
+        # such quantized sources up front; they must use the eager
+        # apply_weights path, which applies the scale.
+        quant_signals = sorted(
+            k
+            for k, (_p, _s, dt) in key_index.items()
+            if dt.startswith("F8") or k.endswith(("_scale_inv", "weight_scale"))
+        )
+        if quant_signals:
+            raise ValueError(
+                f"Checkpoint appears quantized (fp8 / scaled weights, e.g. "
+                f"{quant_signals[:5]}); the pass-through streaming loader cannot "
+                f"dequantize it and would drop the weight scale. Use the eager "
+                f"apply_weights path (which applies weight_scale_inv)."
+            )
 
     assigned: set[str] = set()
     missing: list[str] = []

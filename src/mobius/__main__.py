@@ -1237,8 +1237,10 @@ def build_parser() -> argparse.ArgumentParser:
     preflight_parser.add_argument(
         "--download-dir",
         default=None,
-        help="Directory the shards will download into (default: output dir). "
-        "Its filesystem is checked for the source-download budget.",
+        help="Filesystem checked for the source-download budget. Default: the "
+        "Hugging Face cache (HF_HUB_CACHE), where hf_hub_download actually "
+        "writes shards. Set this (or HF_HOME) to a large volume to relocate the "
+        "download.",
     )
     preflight_parser.add_argument(
         "--export-mode",

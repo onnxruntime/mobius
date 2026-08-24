@@ -332,7 +332,12 @@ def estimate_output_bytes(
     """Estimate the ONNX external-data output size for an export mode."""
     source_bytes = sum(dtype_bytes.values())
     if export_mode == ExportMode.PASSTHROUGH:
-        return source_bytes
+        # A passthrough export dequantizes an fp8 checkpoint to bf16 (2 bytes)
+        # on the eager path, so fp8 external data is written at 2x its stored
+        # width. Size fp8 params at their dequantized width to avoid a false OK
+        # on the output-disk check.
+        fp8_extra = sum(v for k, v in dtype_bytes.items() if k.startswith("F8"))
+        return source_bytes + fp8_extra
     if export_mode == ExportMode.FP16:
         return param_count * 2
     if export_mode == ExportMode.INT4_QMOE:
@@ -403,13 +408,45 @@ def estimate_budget(
 # ---------------------------------------------------------------------------
 
 
-def _free_bytes(path: pathlib.Path) -> int:
+def _existing_ancestor(path: pathlib.Path) -> pathlib.Path:
     probe = path
     while not probe.exists():
         if probe.parent == probe:
             break
         probe = probe.parent
-    return shutil.disk_usage(probe).free
+    return probe
+
+
+def _free_bytes(path: pathlib.Path) -> int:
+    return shutil.disk_usage(_existing_ancestor(path)).free
+
+
+def _same_device(a: pathlib.Path, b: pathlib.Path) -> bool:
+    """True when two paths resolve to the same filesystem (shared free space)."""
+    try:
+        return (
+            os.stat(_existing_ancestor(a)).st_dev == os.stat(_existing_ancestor(b)).st_dev
+        )
+    except OSError:
+        return False
+
+
+def _default_download_dir() -> pathlib.Path:
+    """Where ``hf_hub_download`` actually writes shards (the HF cache).
+
+    The real loader calls ``hf_hub_download`` without ``local_dir``, so shards
+    land in the Hugging Face cache regardless of the export output directory.
+    Budgeting the download against that filesystem — not the output dir — is
+    what keeps the "refuse before a large download" promise honest. Point the
+    cache at a large volume with ``HF_HOME``/``HF_HUB_CACHE`` (or pass an
+    explicit ``download_dir``) to change it.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        return pathlib.Path(HF_HUB_CACHE)
+    except Exception:
+        return pathlib.Path.home() / ".cache" / "huggingface" / "hub"
 
 
 def _available_ram_bytes() -> int | None:
@@ -439,7 +476,9 @@ def check_disk(
 
 def check_ram(required: int, margin_frac: float) -> SpaceCheck:
     free = _available_ram_bytes()
-    ok = free is None or free * (1 - margin_frac) >= required
+    # If MemAvailable can't be read we cannot verify the RAM budget; refuse
+    # rather than emit a success-shaped pass.
+    ok = free is not None and free * (1 - margin_frac) >= required
     return SpaceCheck(
         kind="ram",
         path="/proc/meminfo:MemAvailable",
@@ -501,7 +540,7 @@ def run_preflight(
     """
     blockers: list[str] = []
     output_path = pathlib.Path(output_dir)
-    download_path = pathlib.Path(download_dir) if download_dir else output_path
+    download_path = pathlib.Path(download_dir) if download_dir else _default_download_dir()
     state_file = pathlib.Path(state_path) if state_path else None
 
     # 1) Resolve + validate metadata. A failure here is terminal, never a pass.
@@ -571,16 +610,40 @@ def run_preflight(
         int(s.size) for s in shards if s.present_local and s.size is not None
     )
     download_required = max(budget.source_bytes - already_present, 0)
-    checks.append(check_disk("disk:download", download_path, download_required, margin_frac))
-    checks.append(check_disk("disk:output", output_path, budget.output_bytes, margin_frac))
+    if _same_device(download_path, output_path):
+        # Downloaded shards must stay resident while the streaming loader reads
+        # them to write the ONNX output, so on a shared filesystem the source
+        # and output requirements coexist and must be summed against one pool of
+        # free space (checking them independently hides a combined shortfall).
+        checks.append(
+            check_disk(
+                "disk:download+output",
+                output_path,
+                download_required + budget.output_bytes,
+                margin_frac,
+            )
+        )
+    else:
+        checks.append(
+            check_disk("disk:download", download_path, download_required, margin_frac)
+        )
+        checks.append(
+            check_disk("disk:output", output_path, budget.output_bytes, margin_frac)
+        )
     checks.append(check_ram(budget.peak_ram_bytes, margin_frac))
 
     for chk in checks:
         if not chk.ok:
-            blockers.append(
-                f"insufficient {chk.kind}: need {_h(chk.required_bytes)} at "
-                f"{chk.path}, free {_h(chk.free_bytes)} (margin {chk.margin_frac:.0%})"
-            )
+            if chk.kind == "ram" and chk.free_bytes < 0:
+                blockers.append(
+                    "host RAM budget could not be verified: failed to read "
+                    f"{chk.path} (need {_h(chk.required_bytes)}); refusing"
+                )
+            else:
+                blockers.append(
+                    f"insufficient {chk.kind}: need {_h(chk.required_bytes)} at "
+                    f"{chk.path}, free {_h(chk.free_bytes)} (margin {chk.margin_frac:.0%})"
+                )
 
     # 6) VRAM advisory (single-GPU fit is common blocker for full checkpoints).
     if gpu_total_bytes is not None and budget.vram_weights_bytes > gpu_total_bytes:

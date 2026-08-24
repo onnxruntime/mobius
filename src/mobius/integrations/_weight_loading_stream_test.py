@@ -177,6 +177,32 @@ class TestStreamingRefusals:
         )
         assert dropped not in assigned
 
+    def test_fp8_checkpoint_refuses_rather_than_dropping_scale(self, tmp_path):
+        model = _fresh_model()
+        state = _make_checkpoint_state(model)
+        # Store one weight as raw fp8 (the way DeepSeek/GLM fp8 checkpoints ship)
+        # plus a companion scale. A pass-through cast fp8 -> bf16 would silently
+        # drop the scale and emit wrong weights, so the loader must refuse.
+        target = next(iter(state))
+        state[target] = (state[target].float() * 0.1).to(torch.float8_e4m3fn)
+        state[f"{target}_scale_inv"] = torch.ones(1, dtype=torch.float32)
+        _save_single(state, tmp_path)
+
+        with pytest.raises(ValueError, match="quantized"):
+            stream_safetensors_to_model(model, str(tmp_path))
+
+    def test_scale_key_alone_signals_quantized_source(self, tmp_path):
+        model = _fresh_model()
+        state = _make_checkpoint_state(model)
+        # Even with every real weight present, a leftover *_scale_inv tensor is
+        # the signature of a quantized checkpoint the pass-through loader can't
+        # honor; it must refuse instead of silently ignoring the scale.
+        state["extra.weight_scale_inv"] = torch.ones(4, dtype=torch.float32)
+        _save_single(state, tmp_path)
+
+        with pytest.raises(ValueError, match="quantized"):
+            stream_safetensors_to_model(model, str(tmp_path))
+
 
 class TestExternalDataChecksums:
     def test_checksums_are_deterministic_across_exports(self, tmp_path):
