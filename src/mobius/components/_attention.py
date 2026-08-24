@@ -525,6 +525,12 @@ class SinkAttention(Attention):
     float additive bias that already bakes in causality, any sliding window,
     and padding (see :func:`~mobius.components._common.create_attention_bias`).
 
+    This class reproduces the GPT-OSS precision contract: the stabilised
+    softmax runs in the *compute* dtype, matching upstream's explicit
+    ``F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)``.  Models
+    whose upstream kernel forces float32 instead must use
+    :class:`Float32SinkAttention`.
+
     Args:
         config: Architecture configuration.
         rms_norm_class: Norm class for optional Q/K normalization.
@@ -532,6 +538,11 @@ class SinkAttention(Attention):
             Granite-family models pass ``config.attention_multiplier``.
         linear_class: Factory callable for the projection layers.
     """
+
+    #: Whether the sink softmax is evaluated in float32 regardless of the
+    #: model compute dtype.  ``False`` keeps the graph in the compute dtype
+    #: (GPT-OSS); :class:`Float32SinkAttention` flips it to ``True``.
+    upcast_sink_softmax: bool = False
 
     def __init__(
         self,
@@ -699,10 +710,11 @@ class SinkAttention(Attention):
         # combined: [B, q_heads, S_q, S_kv + 1]
         combined = op.Concat(attn_scores, sinks_expanded, axis=-1)
 
-        # HuggingFace forces the sink softmax to float32 for stability.  Mirror
-        # that for reduced-precision builds; for float32 builds the graph is
-        # unchanged (no Cast nodes at all).
-        upcast = self._dtype != ir.DataType.FLOAT
+        # HuggingFace's precision contract differs per model: GPT-OSS softmaxes
+        # in the compute dtype, GraniteSWA forces float32.  ``upcast_sink_softmax``
+        # selects between them; for float32 builds both are identical and the
+        # graph carries no Cast nodes at all.
+        upcast = self.upcast_sink_softmax and self._dtype != ir.DataType.FLOAT
         if upcast:
             combined = op.Cast(combined, to=ir.DataType.FLOAT)
 
@@ -732,14 +744,34 @@ class SinkAttention(Attention):
         return attn_out, present_key_value
 
 
-class FusedQKVAttention(Attention):
-    """Attention whose checkpoint stores one contiguous Q/K/V projection.
+class Float32SinkAttention(SinkAttention):
+    """Sink attention whose sink scaling and softmax are forced to float32.
 
-    The projection rows are ordered ``[Q | K | V]``. An optional symmetric
-    activation clamp is applied to the fused output before it is split, so
-    callers can represent architectures where clipping is part of the fused
-    projection contract rather than an independent per-projection transform.
+    Some upstream sink kernels deliberately leave the compute dtype for the
+    softmax.  GraniteSWA's ``eager_attention_forward`` is one of them::
+
+        lse = torch.logsumexp(attn_weights, dim=-1)
+        sink_scale = (lse - sinks).to(torch.float32).sigmoid()   # forced fp32
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+
+    In the extra-column formulation, the ``logsumexp``/``sigmoid`` pair and the
+    softmax are the same reduction, so forcing that one softmax to float32
+    reproduces both upstream upcasts at once.
+
+    This is deliberately a separate class rather than a constructor flag: it is
+    a precision *contract* tied to the architecture, not a tuning knob, and
+    keeping it in the type means a model cannot silently acquire (or lose) the
+    upcast.  GPT-OSS, whose upstream kernel softmaxes in
+    ``combined_logits.dtype``, must keep using :class:`SinkAttention`.
+
+    For float32 builds this class emits exactly the same graph as
+    :class:`SinkAttention` — the upcast would be a no-op, so no Cast is added.
     """
+    upcast_sink_softmax: bool = True
+
+
+class FusedQKVAttention(Attention):
+    """Attention whose checkpoint stores one contiguous Q/K/V projection."""
 
     def __init__(
         self,

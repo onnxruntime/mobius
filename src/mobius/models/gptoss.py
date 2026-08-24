@@ -154,6 +154,13 @@ class _GptOssAttention(SinkAttention):
     position.  That is exactly the shared
     :class:`~mobius.components.SinkAttention` behaviour; GPT-OSS keeps the
     default ``1/sqrt(head_dim)`` scale.
+
+    It also keeps the *base* precision contract on purpose. Upstream softmaxes
+    in the compute dtype (``F.softmax(combined_logits, dim=-1,
+    dtype=combined_logits.dtype)``), unlike GraniteSWA which forces float32, so
+    GPT-OSS must NOT use :class:`~mobius.components.Float32SinkAttention` —
+    doing so would change f16/bf16 numerics and double the size of the largest
+    score tensor.
     """
 
 

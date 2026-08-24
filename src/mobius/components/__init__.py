@@ -41,6 +41,7 @@ __all__ = [
     "EncoderDecoderAttention",
     "EncoderLayer",
     "FCMLP",
+    "Float32SinkAttention",
     "FusedGateUpMLP",
     "GatedDeltaNet",
     "GatedMLP",
@@ -169,6 +170,7 @@ from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
     FusedQKVAttention,
+    Float32SinkAttention,
     GQAContext,
     SinkAttention,
     StaticCacheState,

@@ -33,8 +33,8 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig, GraniteSwaConfig
 from mobius.components import (
     Embedding,
+    Float32SinkAttention,
     RMSNorm,
-    SinkAttention,
     create_attention_bias,
     create_decoder_layer,
     initialize_rope,
@@ -91,7 +91,9 @@ class GraniteSwaTextModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                create_decoder_layer(config, attention_class=SinkAttention)
+                # Float32SinkAttention, not SinkAttention: GraniteSWA's eager
+                # kernel forces the sink scaling and the softmax to float32.
+                create_decoder_layer(config, attention_class=Float32SinkAttention)
                 for _ in range(config.num_hidden_layers)
             ]
         )

@@ -23,7 +23,7 @@ from mobius._configs import ArchitectureConfig, GraniteSwaConfig
 from mobius._registry import registry
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.components import SinkAttention
+from mobius.components import Float32SinkAttention, SinkAttention
 from mobius.components._attention import GQAContext
 from mobius.models.granite_swa import (
     GraniteSwaCausalLMModel,
@@ -242,7 +242,11 @@ class TestModuleStructure:
         config = _tiny_config()
         module = GraniteSwaCausalLMModel(config)
         for layer in module.model.layers:
-            assert isinstance(layer.self_attn, SinkAttention)
+            # Float32SinkAttention, not the base SinkAttention: GraniteSWA's
+            # eager kernel forces the sink scaling and softmax to float32,
+            # whereas GPT-OSS deliberately stays in the compute dtype.
+            assert isinstance(layer.self_attn, Float32SinkAttention)
+            assert layer.self_attn.upcast_sink_softmax is True
             assert layer.self_attn.scaling == pytest.approx(config.attention_multiplier)
 
     def test_nope_layer_skips_rotary_embedding(self):
@@ -381,7 +385,7 @@ class TestSinkAttention:
         hidden_size = config.hidden_size
         batch, seq_len = 1, 5
 
-        attn = SinkAttention(config, scale=config.attention_multiplier)
+        attn = Float32SinkAttention(config, scale=config.attention_multiplier)
         builder, op, graph = create_test_builder()
         hidden = create_test_input(builder, "hidden", [batch, seq_len, hidden_size])
         bias = create_test_input(builder, "bias", [batch, 1, seq_len, seq_len])
