@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -19,6 +20,31 @@ import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 from huggingface_hub.utils import OfflineModeIsEnabled
+
+
+def _gguf_header_prefix(*architectures: str) -> bytes:
+    key = b"general.architecture"
+    entries: list[bytes] = []
+    for architecture in architectures:
+        value = architecture.encode("utf-8")
+        entries.extend(
+            [
+                struct.pack("<Q", len(key)),
+                key,
+                struct.pack("<I", 8),
+                struct.pack("<Q", len(value)),
+                value,
+            ]
+        )
+    return b"".join(
+        [
+            b"GGUF",
+            struct.pack("<I", 3),
+            struct.pack("<Q", 0),
+            struct.pack("<Q", len(architectures)),
+            *entries,
+        ]
+    )
 
 
 def _run_gather_block_quantized(
@@ -3911,6 +3937,225 @@ class TestGGUFPreflightGuards:
             "example/mmproj", expand=["gguf"]
         )
         download.assert_not_called()
+
+    def test_exact_selected_clip_header_returns_immutable_revision(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _GGUF_HEADER_RANGE_BYTES,
+            _preflight_hf_mmproj_companion_file,
+        )
+
+        response = mock.MagicMock()
+        response.iter_bytes.return_value = [_gguf_header_prefix("clip")]
+        response_context = mock.MagicMock()
+        response_context.__enter__.return_value = response
+        session = mock.MagicMock()
+        session.stream.return_value = response_context
+        commit_hash = "c" * 40
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_url",
+                return_value="https://huggingface.co/exact-file",
+            ) as hub_url,
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash=commit_hash,
+                    location="https://huggingface.co/mmproj.gguf",
+                ),
+            ) as file_metadata,
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.build_hf_headers",
+                return_value={"authorization": "Bearer test-token"},
+            ),
+        ):
+            actual = _preflight_hf_mmproj_companion_file(
+                "example/gemma4",
+                "nested/mmproj-F16.gguf",
+                revision="pinned-revision",
+            )
+
+        assert actual == commit_hash
+        hub_url.assert_called_once_with(
+            "example/gemma4",
+            "nested/mmproj-F16.gguf",
+            revision="pinned-revision",
+        )
+        file_metadata.assert_called_once_with("https://huggingface.co/exact-file")
+        session.stream.assert_called_once()
+        stream_args = session.stream.call_args
+        assert stream_args.args == ("GET", "https://huggingface.co/mmproj.gguf")
+        assert stream_args.kwargs["headers"]["Range"] == (
+            f"bytes=0-{_GGUF_HEADER_RANGE_BYTES - 1}"
+        )
+        assert stream_args.kwargs["headers"]["authorization"] == "Bearer test-token"
+        response.raise_for_status.assert_called_once_with()
+
+    def test_exact_selected_non_clip_header_rejects_without_payload(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _preflight_hf_mmproj_companion_file,
+        )
+
+        response = mock.MagicMock()
+        response.iter_bytes.return_value = [_gguf_header_prefix("gemma4")]
+        response_context = mock.MagicMock()
+        response_context.__enter__.return_value = response
+        session = mock.MagicMock()
+        session.stream.return_value = response_context
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_url",
+                return_value="https://huggingface.co/selected-text-file",
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash="d" * 40,
+                    location="https://cdn.example/model.gguf",
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.build_hf_headers",
+                return_value={"authorization": "Bearer must-not-leak"},
+            ),
+            pytest.raises(
+                ValueError,
+                match=r"Expected a 'clip' mmproj.*architecture 'gemma4'.*No payload",
+            ),
+        ):
+            _preflight_hf_mmproj_companion_file(
+                "example/mixed-repo",
+                "selected-text.gguf",
+                revision="exact-revision",
+            )
+
+        assert "authorization" not in session.stream.call_args.kwargs["headers"]
+
+    def test_structural_header_parser_rejects_duplicate_architecture_entries(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _gguf_architecture_from_header_prefix,
+        )
+
+        with pytest.raises(ValueError, match=r"exactly one.*found 2"):
+            _gguf_architecture_from_header_prefix(
+                _gguf_header_prefix("clip", "llama"),
+                source="duplicate.gguf",
+            )
+
+    def test_exact_companion_preflight_falls_back_for_offline_cache(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _preflight_hf_mmproj_companion_file,
+        )
+
+        with mock.patch(
+            "mobius.integrations.gguf._builder.get_hf_file_metadata",
+            side_effect=OfflineModeIsEnabled("offline"),
+        ):
+            assert (
+                _preflight_hf_mmproj_companion_file(
+                    "example/offline",
+                    "mmproj.gguf",
+                    revision="main",
+                )
+                is None
+            )
+
+    def test_exact_companion_range_read_supports_requests_hub_sessions(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _preflight_hf_mmproj_companion_file,
+        )
+
+        class RequestsResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, *, chunk_size: int):
+                assert chunk_size == 64 * 1024
+                yield _gguf_header_prefix("clip")
+
+        session = mock.Mock()
+        session.stream = False
+        session.get.return_value = RequestsResponse()
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash="e" * 40,
+                    location="https://cdn.example/mmproj.gguf",
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+        ):
+            assert (
+                _preflight_hf_mmproj_companion_file(
+                    "example/legacy-hub",
+                    "mmproj.gguf",
+                    revision="main",
+                )
+                == "e" * 40
+            )
+
+        session.get.assert_called_once()
+        assert session.get.call_args.kwargs["stream"] is True
+
+    def test_exact_companion_http_status_falls_back_to_pinned_download(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _preflight_hf_mmproj_companion_file,
+        )
+
+        request = httpx.Request("GET", "https://cdn.example/mmproj.gguf")
+        failed_response = httpx.Response(403, request=request)
+        response = mock.MagicMock()
+        response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "forbidden",
+            request=request,
+            response=failed_response,
+        )
+        response_context = mock.MagicMock()
+        response_context.__enter__.return_value = response
+        session = mock.MagicMock()
+        session.stream.return_value = response_context
+        commit_hash = "f" * 40
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash=commit_hash,
+                    location="https://cdn.example/mmproj.gguf",
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+        ):
+            assert (
+                _preflight_hf_mmproj_companion_file(
+                    "example/status-fallback",
+                    "mmproj.gguf",
+                    revision="main",
+                )
+                == commit_hash
+            )
 
     @pytest.mark.parametrize(
         "preflight_error",

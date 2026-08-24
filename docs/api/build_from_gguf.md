@@ -543,6 +543,12 @@ An architecture outside this table is refused with a message naming its
 upstream cohort, so an unsupported input is never mistaken for a broken one.
 `clip` files are multimodal projector sidecars: pass them as
 `build_from_gguf(text_gguf, mmproj=...)` rather than on their own.
+For a Hub companion reference, Mobius range-reads only the bounded metadata
+header of the exact selected filename, verifies that file is `clip`, resolves
+the repository ref to an immutable commit, and downloads that same revision.
+Repository-level GGUF metadata is not used because mixed text+mmproj repositories
+describe the text architecture there. The downloaded local header is validated
+again before multimodal builder dispatch.
 
 ### Multimodal projector sidecars
 

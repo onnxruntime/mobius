@@ -1442,9 +1442,14 @@ class TestVlmRouting:
             _write_muse_glimmer_mmproj_gguf(mmproj_path)
         remote_ref = f"example/{architecture}:mmproj.gguf"
         package = mock.sentinel.package
+        resolved_revision = "a" * 40
 
         with (
             mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_mmproj_companion_file",
+                return_value=resolved_revision,
+            ) as selected_file_preflight,
             mock.patch(
                 "mobius.integrations.gguf._builder.hf_hub_download",
                 return_value=str(mmproj_path),
@@ -1455,13 +1460,21 @@ class TestVlmRouting:
             ) as builder,
         ):
             api_type.return_value.model_info.return_value = SimpleNamespace(
-                gguf={"architecture": "clip"}
+                gguf={"architecture": architecture}
             )
             actual = build_vlm_from_gguf(text_path, remote_ref, keep_quantized=False)
 
         assert actual is package
+        api_type.return_value.model_info.assert_not_called()
+        selected_file_preflight.assert_called_once_with(
+            f"example/{architecture}",
+            "mmproj.gguf",
+            revision="main",
+        )
         download.assert_called_once_with(
-            repo_id=f"example/{architecture}", filename="mmproj.gguf"
+            repo_id=f"example/{architecture}",
+            filename="mmproj.gguf",
+            revision=resolved_revision,
         )
         builder.assert_called_once_with(
             text_path,
@@ -1482,6 +1495,12 @@ class TestVlmRouting:
 
         with (
             mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_mmproj_companion_file",
+                side_effect=ValueError(
+                    "Expected a 'clip' mmproj GGUF, got architecture 'llama'."
+                ),
+            ) as selected_file_preflight,
             mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
             mock.patch(
                 "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf"
@@ -1489,11 +1508,46 @@ class TestVlmRouting:
             pytest.raises(ValueError, match=r"Expected a 'clip' mmproj.*architecture 'llama'"),
         ):
             api_type.return_value.model_info.return_value = SimpleNamespace(
-                gguf={"architecture": "llama"}
+                gguf={"architecture": "clip"}
             )
             build_vlm_from_gguf(text_path, remote_ref)
 
+        api_type.return_value.model_info.assert_not_called()
+        selected_file_preflight.assert_called_once_with(
+            "example/wrong-companion",
+            "model.gguf",
+            revision="main",
+        )
         download.assert_not_called()
+        builder.assert_not_called()
+
+    def test_downloaded_mmproj_header_is_revalidated_before_builder(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
+
+        text_path = tmp_path / "text.gguf"
+        downloaded_path = tmp_path / "selected-file.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_minimal_gguf(downloaded_path, "llama")
+        remote_ref = "example/toctou:mmproj.gguf"
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_mmproj_companion_file",
+                return_value="b" * 40,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value=str(downloaded_path),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf"
+            ) as builder,
+            pytest.raises(ValueError, match=r"Expected a 'clip' mmproj.*architecture 'llama'"),
+        ):
+            build_vlm_from_gguf(text_path, remote_ref)
+
         builder.assert_not_called()
 
 
