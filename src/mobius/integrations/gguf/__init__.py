@@ -40,6 +40,7 @@ from mobius.integrations.gguf._config_mapping import (
 from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
 from mobius.integrations.gguf._preflight import (
     GgufPreflightReport,
+    GgufTypeStat,
     preflight_gguf,
     preflight_hf_gguf,
     preflight_local_gguf,
@@ -75,4 +76,5 @@ __all__ = [
     "preflight_local_gguf",
     "preflight_hf_gguf",
     "GgufPreflightReport",
+    "GgufTypeStat",
 ]
