@@ -35,6 +35,7 @@ from __future__ import annotations
 
 __all__ = [
     "GgufFileMeta",
+    "GgufTypeStat",
     "GgufPreflightReport",
     "preflight_gguf",
     "preflight_local_gguf",
@@ -43,6 +44,7 @@ __all__ = [
 
 import json
 import logging
+import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -82,6 +84,9 @@ _NATIVE_BLOCK_QUANT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ggml block layouts Mobius passes through unquantized (norms, biases, ids).
+_FLOAT_PASSTHROUGH_TYPES = frozenset({"F32", "F16", "BF16", "F64"})
+
 
 @dataclass
 class GgufFileMeta:
@@ -92,6 +97,33 @@ class GgufFileMeta:
     sha256: str | None
     shard_index: int | None
     shard_count: int | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class GgufTypeStat:
+    """Per-quant-type accounting and how Mobius would losslessly emit it.
+
+    ``disposition`` is derived from Mobius' *real* repacker support sets
+    (:func:`._repacker.native_block_spec` / :func:`._repacker.repack_quant_params`)
+    plus the float passthrough set — never a model-name allowlist:
+
+    * ``passthrough`` — a float block kept as-is (F32/F16/BF16).
+    * ``native-preserve`` — byte-for-byte ``pkg.nxrt::BlockQuantizedMatMul``.
+    * ``repack`` — repacked to ``com.microsoft::MatMulNBits``.
+    * ``unsupported`` — no lossless path; a build would have to dequantize to
+      float, so the export refuses rather than silently widen it.
+    """
+
+    type_name: str
+    ggml_type: int
+    count: int
+    source_bytes: int
+    output_bytes: int
+    disposition: str
+    detail: str
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +156,14 @@ class GgufPreflightReport:
         files: Per-file metadata (sizes + checksums).
         blockers: Hard export blockers (each is a human-readable reason).
         warnings: Non-fatal advisories.
+        type_stats: Per-quant-type lossless-conversion accounting (populated for
+            a local header read; empty when only remote metadata is available).
+        output_bytes: Estimated ONNX external-data size of the block-preserving
+            export (``None`` when the per-tensor types were not read).
+        vram_weights_bytes: Weight footprint that must fit in device memory,
+            derived from the export artifact (``None`` when unknown). This is a
+            weights-only figure — no inference/activation speculation.
+        unsupported_types: Quant types with no lossless repack/preserve path.
     """
 
     source: str
@@ -142,6 +182,10 @@ class GgufPreflightReport:
     files: list[GgufFileMeta] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    type_stats: list[GgufTypeStat] = field(default_factory=list)
+    output_bytes: int | None = None
+    vram_weights_bytes: int | None = None
+    unsupported_types: list[str] = field(default_factory=list)
 
     @property
     def exportable(self) -> bool:
@@ -185,6 +229,30 @@ class GgufPreflightReport:
             "  sparse MoE   : "
             + ("supported" if self.sparse_moe_fusion_supported else "NOT supported")
         )
+        if self.output_bytes is not None:
+            lines.append(
+                "  budget (real artifacts, direct random-access — no merged copy):"
+            )
+            lines.append(
+                f"    download   : {_gib(self.total_bytes):.3f} GiB "
+                f"(shard set, read in place)"
+            )
+            lines.append(
+                f"    onnx output: {_gib(self.output_bytes):.3f} GiB "
+                f"(block-preserving external data)"
+            )
+            if self.vram_weights_bytes is not None:
+                lines.append(
+                    f"    weights VRAM: {_gib(self.vram_weights_bytes):.3f} GiB"
+                )
+        if self.type_stats:
+            lines.append("  tensor types (lossless disposition vs. the real repacker):")
+            for stat in self.type_stats:
+                lines.append(
+                    f"    {stat.type_name:8s} x{stat.count:<5d} "
+                    f"{_gib(stat.source_bytes):7.3f} GiB  {stat.disposition:15s} "
+                    f"{stat.detail}"
+                )
         lines.append("  files:")
         for f in self.files:
             sha = (f.sha256[:12] + "…") if f.sha256 else "(no sha256)"
@@ -264,6 +332,110 @@ def _assess_sparse_moe(
     return False, [blocker]
 
 
+def _matmulnbits_output_bytes(np_shape: tuple[int, ...], bits: int, block_size: int) -> int:
+    """Estimate ``com.microsoft::MatMulNBits`` external-data bytes for a repack.
+
+    Sizes the ``[N, blocks_per_row, blob]`` weight, ``[N, blocks_per_row]`` fp16
+    scales and ``[N, ceil(blocks_per_row*bits/8)]`` bit-packed zero points with
+    per-row block rounding, matching the operator layout (K is padded up to a
+    whole block per row, not across the flattened tensor).
+    """
+    if not np_shape or not block_size:
+        return 0
+    k = np_shape[-1]
+    rows = 1
+    for dim in np_shape[:-1]:
+        rows *= dim
+    blocks_per_row = math.ceil(k / block_size)
+    weight = rows * blocks_per_row * (block_size * bits // 8)
+    scales = rows * blocks_per_row * 2  # fp16 per block
+    zero_points = rows * math.ceil(blocks_per_row * bits / 8)  # bit-packed per row
+    return int(weight + scales + zero_points)
+
+
+def _classify_tensor_type(
+    type_id: int, type_name: str, np_shape: tuple[int, ...], source_bytes: int
+) -> tuple[str, int, str]:
+    """Return ``(disposition, output_bytes, detail)`` for one tensor.
+
+    Uses Mobius' *real* repacker support sets — ``native_block_spec``
+    (byte-for-byte preserve) and ``repack_quant_params`` (repack to
+    ``MatMulNBits``) — plus a float passthrough set. Anything else is
+    ``unsupported`` and contributes zero output bytes (the export refuses rather
+    than dequantizing it to float). No model-name allowlist is consulted.
+    """
+    from mobius.integrations.gguf import _repacker
+
+    if type_name in _FLOAT_PASSTHROUGH_TYPES:
+        return "passthrough", source_bytes, f"float {type_name} kept as-is"
+
+    native = _repacker.native_block_spec(type_id)
+    if native is not None:
+        return (
+            "native-preserve",
+            source_bytes,
+            f"BlockQuantizedMatMul {native.format} ({native.bytes}B/blk)",
+        )
+
+    params = _repacker.repack_quant_params(type_id)
+    if params is not None:
+        bits, block_size = params
+        out = _matmulnbits_output_bytes(np_shape, bits, block_size)
+        return "repack", out, f"MatMulNBits {bits}-bit/{block_size}"
+
+    return "unsupported", 0, f"no lossless repack/preserve for {type_name}"
+
+
+def _classify_reader_tensors(reader_tensors: list[Any]) -> tuple[list[GgufTypeStat], int]:
+    """Aggregate per-type dispositions/bytes from GGUF header records.
+
+    Reads only header-derived fields (``tensor_type``/``shape``/``n_bytes``) of
+    each ``gguf.ReaderTensor`` — never the tensor payload. Returns the sorted
+    per-type stats and the total block-preserving ONNX output byte estimate.
+    """
+    acc: dict[str, GgufTypeStat] = {}
+    for tensor in reader_tensors:
+        qtype = tensor.tensor_type
+        type_id = int(getattr(qtype, "value", qtype))
+        type_name = getattr(qtype, "name", str(qtype))
+        np_shape = tuple(int(dim) for dim in reversed(tuple(tensor.shape)))
+        source_bytes = int(tensor.n_bytes)
+        disposition, out_bytes, detail = _classify_tensor_type(
+            type_id, type_name, np_shape, source_bytes
+        )
+        stat = acc.get(type_name)
+        if stat is None:
+            acc[type_name] = GgufTypeStat(
+                type_name=type_name,
+                ggml_type=type_id,
+                count=1,
+                source_bytes=source_bytes,
+                output_bytes=out_bytes,
+                disposition=disposition,
+                detail=detail,
+            )
+        else:
+            stat.count += 1
+            stat.source_bytes += source_bytes
+            stat.output_bytes += out_bytes
+    stats = sorted(acc.values(), key=lambda s: -s.source_bytes)
+    output_bytes = sum(s.output_bytes for s in stats)
+    return stats, output_bytes
+
+
+def _classification_blocker(unsupported: list[GgufTypeStat]) -> str:
+    detail = ", ".join(
+        f"{s.type_name}({s.count} tensors, {_gib(s.source_bytes):.1f} GiB)"
+        for s in unsupported
+    )
+    return (
+        f"{len(unsupported)} quant type(s) cannot be preserved losslessly "
+        f"(would require a dequantize-to-float copy): {detail}. These are the "
+        "exact unsupported native qtypes; supporting them (native block import "
+        "or repack) is the remaining code gap, not architecture or sharding."
+    )
+
+
 def preflight_local_gguf(
     path: str | Path,
     *,
@@ -336,6 +508,13 @@ def preflight_local_gguf(
     if architecture is None:
         warnings.append("architecture metadata missing from primary shard")
 
+    type_stats, output_bytes = _classify_reader_tensors(model.reader_tensors())
+    unsupported = [s for s in type_stats if s.disposition == "unsupported"]
+    unsupported_types = [s.type_name for s in unsupported]
+    if unsupported:
+        blockers.append(_classification_blocker(unsupported))
+    vram_weights_bytes = output_bytes
+
     return GgufPreflightReport(
         source=str(path),
         location="local",
@@ -353,6 +532,10 @@ def preflight_local_gguf(
         files=files,
         blockers=blockers,
         warnings=warnings,
+        type_stats=type_stats,
+        output_bytes=output_bytes,
+        vram_weights_bytes=vram_weights_bytes,
+        unsupported_types=unsupported_types,
     )
 
 
@@ -636,6 +819,7 @@ def _read_expert_count(model: Any, architecture: str | None) -> int | None:
 
 def _report_from_dict(data: dict[str, Any]) -> GgufPreflightReport:
     files = [GgufFileMeta(**f) for f in data.get("files", [])]
+    type_stats = [GgufTypeStat(**t) for t in data.get("type_stats", [])]
     known = {
         "source",
         "location",
@@ -652,6 +836,9 @@ def _report_from_dict(data: dict[str, Any]) -> GgufPreflightReport:
         "sparse_moe_fusion_supported",
         "blockers",
         "warnings",
+        "output_bytes",
+        "vram_weights_bytes",
+        "unsupported_types",
     }
     kwargs = {k: data[k] for k in known if k in data}
-    return GgufPreflightReport(files=files, **kwargs)
+    return GgufPreflightReport(files=files, type_stats=type_stats, **kwargs)

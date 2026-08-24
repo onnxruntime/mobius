@@ -11,6 +11,7 @@ touching the network.
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -19,7 +20,9 @@ import pytest
 
 from mobius.integrations.gguf._preflight import (
     _assess_sparse_moe,
+    _classify_tensor_type,
     _detect_quantization,
+    _matmulnbits_output_bytes,
     _select_shard_files,
     preflight_gguf,
     preflight_local_gguf,
@@ -58,6 +61,70 @@ def _write_sharded_gguf(
     names.append("output.weight")
     for name in names:
         writer.add_tensor(name, rng.standard_normal((8, 16)).astype(np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return sorted(directory.glob(f"{stem}-*.gguf"))
+
+
+def _raw_quant_rows(qtype, n_rows: int, k: int) -> np.ndarray:
+    """Zeroed raw-block bytes shaped ``(n_rows, bytes_per_row)`` for *qtype*."""
+    from gguf import GGML_QUANT_SIZES
+
+    block_elems, block_bytes = GGML_QUANT_SIZES[qtype]
+    bytes_per_row = (k // block_elems) * block_bytes
+    return np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
+
+
+def _write_quant_sharded_gguf(
+    directory: Path,
+    *,
+    architecture: str = "llama",
+    stem: str = "q",
+    split_max_tensors: int = 2,
+    include_unsupported: bool = False,
+    num_experts: int | None = None,
+) -> list[Path]:
+    """Write a shape-faithful multi-shard GGUF with mixed real quant types.
+
+    F32 (passthrough), Q8_0 (repack), IQ1_S (native-preserve), and — when
+    *include_unsupported* — Q5_K (no lossless path). Bodies are zeroed; only the
+    headers (types/dims) matter to the metadata-only preflight.
+    """
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    directory.mkdir(parents=True, exist_ok=True)
+    writer = GGUFWriter(
+        str(directory / stem), architecture, split_max_tensors=split_max_tensors
+    )
+    writer.add_context_length(128)
+    writer.add_embedding_length(256)
+    writer.add_block_count(2)
+    writer.add_head_count(4)
+    writer.add_head_count_kv(2)
+    writer.add_vocab_size(32)
+    if num_experts is not None:
+        writer.add_expert_count(num_experts)
+
+    k = 256
+    writer.add_tensor("token_embd.weight", np.zeros((8, k), np.float32))
+    writer.add_tensor(
+        "blk.0.attn_q.weight",
+        _raw_quant_rows(GGMLQuantizationType.Q8_0, 8, k),
+        raw_dtype=GGMLQuantizationType.Q8_0,
+    )
+    writer.add_tensor(
+        "blk.0.ffn_up.weight",
+        _raw_quant_rows(GGMLQuantizationType.IQ1_S, 8, k),
+        raw_dtype=GGMLQuantizationType.IQ1_S,
+    )
+    if include_unsupported:
+        writer.add_tensor(
+            "blk.1.ffn_down.weight",
+            _raw_quant_rows(GGMLQuantizationType.Q5_K, 8, k),
+            raw_dtype=GGMLQuantizationType.Q5_K,
+        )
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -284,3 +351,153 @@ def test_hf_preflight_metadata_only(monkeypatch):
     assert any("sparse-MoE" in b for b in report.blockers)
     # And nothing was downloaded.
     assert fake.downloaded == []
+
+
+# --------------------------------------------------------------------------- #
+# Block-preserving lossless classification + real-artifact budget (folded from
+# the superseded standalone GGUF export preflight; validated vs. the real
+# repacker, not a model-name allowlist).
+# --------------------------------------------------------------------------- #
+
+
+def test_type_classification_matches_the_real_repacker():
+    from gguf import GGMLQuantizationType as T
+
+    # Float -> passthrough; int4/int8 K-quants -> repack; IQ blocks -> preserve;
+    # a type with no lossless path -> unsupported (zero output bytes).
+    passthrough = _classify_tensor_type(T.F32.value, "F32", (8, 256), 8192)
+    assert passthrough[0] == "passthrough"
+    assert passthrough[1] == 8192
+
+    repack = _classify_tensor_type(T.Q8_0.value, "Q8_0", (8, 256), 2176)
+    assert repack[0] == "repack"
+    assert repack[1] == _matmulnbits_output_bytes((8, 256), 8, 32) > 0
+
+    native = _classify_tensor_type(T.IQ1_S.value, "IQ1_S", (8, 256), 400)
+    assert native[0] == "native-preserve"
+    assert native[1] == 400  # byte-for-byte preserved
+
+    unsupported = _classify_tensor_type(T.Q5_K.value, "Q5_K", (8, 256), 1408)
+    assert unsupported[0] == "unsupported"
+    assert unsupported[1] == 0
+
+
+def test_local_preflight_supported_sharded_set_passes_shard_and_arch_gates(tmp_path):
+    # Regression for the removed hardcoded ``split.count > 1`` refusal: a
+    # supported *sharded* set must clear the shard and arch gates. Direct
+    # multi-shard import (GgufShardSet) means being sharded is never a blocker.
+    shards = _write_quant_sharded_gguf(tmp_path, split_max_tensors=2)
+    assert len(shards) > 1
+    report = preflight_local_gguf(shards[0])
+
+    assert report.is_sharded
+    assert report.split_count == len(shards)
+    # Architecture resolves dynamically (no per-model code).
+    assert report.architecture == "llama"
+    assert report.resolved_model_type == "llama"
+    # No blocker mentions sharding / split / merge / double-copy.
+    joined = " ".join(report.blockers).lower()
+    for forbidden in ("shard", "split", "merge", "double-copy", "second"):
+        assert forbidden not in joined, report.blockers
+    # Every type is on a lossless path, so the set is exportable.
+    assert report.unsupported_types == []
+    assert report.exportable
+    assert {s.disposition for s in report.type_stats} <= {
+        "passthrough",
+        "repack",
+        "native-preserve",
+    }
+    assert report.output_bytes and report.output_bytes > 0
+
+
+def test_local_preflight_flags_exact_unsupported_native_qtypes(tmp_path):
+    shards = _write_quant_sharded_gguf(
+        tmp_path, split_max_tensors=2, include_unsupported=True
+    )
+    report = preflight_local_gguf(shards[0])
+
+    # Being sharded is still not a blocker; the ONLY blocker is the exact
+    # unsupported qtype (Q5_K here), never arch/sharding.
+    assert report.is_sharded
+    assert report.unsupported_types == ["Q5_K"]
+    assert len(report.blockers) == 1
+    assert "cannot be preserved losslessly" in report.blockers[0]
+    assert "Q5_K" in report.blockers[0]
+    # Unsupported tensors contribute zero output bytes (no dequantize widening).
+    q5k = next(s for s in report.type_stats if s.type_name == "Q5_K")
+    assert q5k.disposition == "unsupported"
+    assert q5k.output_bytes == 0
+
+
+def test_budget_reflects_real_artifacts_only_no_second_copy(tmp_path):
+    shards = _write_quant_sharded_gguf(tmp_path, split_max_tensors=2)
+    report = preflight_local_gguf(shards[0])
+
+    # No merged/second-copy disk budget exists anymore.
+    field_names = set(report.as_dict())
+    assert not any(
+        "merge" in name or "second" in name or "double" in name for name in field_names
+    )
+    # Download budget == the shard set itself (read in place, random access).
+    assert report.total_bytes == sum(s.stat().st_size for s in shards)
+    # VRAM is derived from the export artifact, not the source dtype bytes.
+    assert report.vram_weights_bytes == report.output_bytes
+    assert report.output_bytes <= report.total_bytes  # block-preserving, not widened
+    # The report (including repacked int-quant types) must be JSON-serialisable
+    # for the resumable cache — no stray numpy scalars from the header reader.
+    import json as _json
+
+    assert _json.loads(report.to_json())["output_bytes"] == report.output_bytes
+
+
+def test_sparse_iq1_moe_is_the_remaining_blocker_not_sharding(tmp_path):
+    # A sharded IQ1 MoE: the honesty blocker is sparse-MoE fusion, and sharding
+    # is not a blocker. This mirrors the flagship GLM-5.2 UD-IQ1_S case.
+    shards = _write_quant_sharded_gguf(
+        tmp_path, architecture="llama", split_max_tensors=2, num_experts=8
+    )
+    report = preflight_local_gguf(shards[0])
+    # The set is sharded and the arch resolves; the only honesty concern is the
+    # sparse-MoE fusion of the IQ1_S experts (quantization detected from name).
+    assert report.is_sharded
+    joined = " ".join(report.blockers).lower()
+    assert "shard" not in joined and "split" not in joined
+
+
+# --------------------------------------------------------------------------- #
+# CLI de-duplication: exactly one ``preflight-gguf`` owner (parser must build on
+# Python 3.12) and no parallel top-level module.
+# --------------------------------------------------------------------------- #
+
+
+def test_single_preflight_gguf_cli_registration():
+    # build_parser() raises argparse.ArgumentError at construction time if a
+    # subcommand is registered twice, so a clean build proves de-duplication.
+    from mobius.__main__ import build_parser
+
+    parser = build_parser()
+    subparsers = [
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+    assert subparsers, "no subparsers found"
+    choices = subparsers[0].choices
+    assert "preflight-gguf" in choices
+    # A dict of choices can only hold one entry per key; assert the whole action
+    # set registers the name exactly once.
+    registered = [
+        name
+        for action in subparsers
+        for name in getattr(action, "choices", {})
+        if name == "preflight-gguf"
+    ]
+    assert registered == ["preflight-gguf"]
+
+
+def test_no_parallel_preflight_gguf_module():
+    # The superseded standalone module must not be reintroduced.
+    import importlib
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("mobius.preflight_gguf")
