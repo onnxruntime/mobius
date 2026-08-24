@@ -3,20 +3,30 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 import torch
+from onnxscript import GraphBuilder
 
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig, QuantizationConfig
+from mobius._constants import OPSET_VERSION
 from mobius._testing import count_op_type, make_config
+from mobius.components import create_attention_bias
+from mobius.components._rotary_embedding import initialize_rope
 from mobius.integrations.ort_genai import export_package
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
-from mobius.models.deepseek_v4 import DeepSeekV4CausalLMModel
+from mobius.models.deepseek_v4 import (
+    DeepSeekV4Attention,
+    DeepSeekV4CausalLMModel,
+    _gqa_kv_lengths,
+)
 
 
 def _tiny_config(**overrides):
@@ -167,6 +177,11 @@ def test_tiny_graph_builds_v4_backbone_fused_gqa_on_cpu_ep():
     # decoding, matching every other direct-GQA model in this codebase.
     assert all(len(node.inputs) == 12 and node.inputs[10] is None for node in gqa_nodes)
     assert all(node.inputs[11] is not None for node in gqa_nodes)
+    # `_tiny_config()` sets no `sliding_window`, so `local_window_size` must
+    # be entirely absent (the `Attention._forward_gqa` convention -- see
+    # `mobius/components/_attention_test.py::test_gqa_context_no_local_window_size_when_default`)
+    # rather than present with the -1 "disabled" sentinel value.
+    assert all("local_window_size" not in node.attributes for node in gqa_nodes)
     # Only the Hyper-Connection combination softmax (2 per layer) remains;
     # the manual Concat(scores, sink) -> Softmax -> slice attention softmax
     # the decomposed path uses is gone now that GQA computes it internally.
@@ -178,6 +193,30 @@ def test_tiny_graph_builds_v4_backbone_fused_gqa_on_cpu_ep():
     assert count_op_type(graph, "RMSNormalization") >= 1
     assert sum("attn_sink" in name for name in graph.initializers) == config.num_hidden_layers
     assert "hidden_states" not in {value.name for value in graph.outputs}
+
+
+def test_sliding_window_sets_local_window_size_on_fused_gqa_regardless_of_compress_ratio():
+    """The reference's mandatory per-layer window must reach GQA as an attribute.
+
+    Official DeepSeek-V4 (``inference/model.py::Attention.forward``,
+    ``get_window_topk_idxs``) unconditionally restricts *every* layer --
+    regardless of ``compress_ratio`` -- to a circular-buffer window of the
+    most recent ``sliding_window`` positions. Regression test for the bug
+    where ``DeepSeekV4Attention`` never read ``config.sliding_window`` at
+    all (see ``DeepSeekV4Attention.local_window_size``), silently computing
+    unbounded causal attention on both the fused-GQA and decomposed paths.
+    Ratio>0 layers still only get the *local* component of the reference's
+    attention correctly here -- the additional compressed/indexer-selected
+    positions those layers union in remain a separate, tracked gap (see
+    ``docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md``, not addressed by this test.
+    """
+    config = _tiny_config(num_hidden_layers=3, compress_ratios=[0, 4, 128], sliding_window=8)
+    graph = build_from_module(
+        DeepSeekV4CausalLMModel(config), config, execution_provider="cpu"
+    )["model"].graph
+    gqa_nodes = [node for node in graph if node.op_type == "GroupQueryAttention"]
+    assert len(gqa_nodes) == config.num_hidden_layers
+    assert all(node.attributes["local_window_size"].as_int() == 8 for node in gqa_nodes)
 
 
 def test_csa_schedule_exports_compressor_and_indexer_tensors_with_dense_attention():
@@ -475,3 +514,214 @@ def test_preprocess_weights_accepts_hash_table_with_distinct_experts_per_token()
     weights = {"layers.0.ffn.gate.tid2eid": tid2eid}
     result = model.preprocess_weights(weights)
     assert torch.equal(result["model.layers.0.mlp.moe.gate.tid2eid"], tid2eid)
+
+
+def _attention_only_config(**overrides):
+    """A ``DeepSeekV4Attention``-sized config with a RoPE-capable ``rope_type``.
+
+    Deliberately smaller/simpler than ``_tiny_config`` (no MoE/HC fields
+    needed): only what ``DeepSeekV4Attention.__init__`` and its own
+    ``rotary_emb`` construction (mirroring ``DeepSeekV4TextModel.__init__``)
+    require.
+    """
+    values = dict(
+        model_type="deepseek_v4",
+        hidden_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        q_lora_rank=8,
+        qk_rope_head_dim=4,
+        o_groups=2,
+        o_lora_rank=8,
+        rope_interleave=True,
+        rope_type="default",
+    )
+    values.update(overrides)
+    return make_config(**values)
+
+
+def _run_attention_graph(
+    config,
+    *,
+    hidden_values,
+    attention_mask_values,
+    state,
+    fused_gqa,
+    decomposed_sliding_window,
+):
+    """Build and execute a standalone ``DeepSeekV4Attention`` prefill graph.
+
+    A fresh ``DeepSeekV4Attention``/rotary-embedding pair is constructed
+    *inside* this call (rather than reused across invocations) because
+    ``onnxscript.nn.Parameter._realize`` is a one-shot, per-parameter-object
+    flag: reusing the same module/rotary instance across more than one
+    ``GraphBuilder``/graph would silently skip re-registering its
+    initializers (e.g. ``cos_cache``) on the second and later graphs. ``state``
+    (a ``name -> ir.tensor`` dict of fixed random weight values, built once
+    by the caller from one throwaway probe instance) is reapplied via
+    ``load_state_dict`` so every call sees byte-identical weights.
+
+    ``decomposed_sliding_window`` is the caller's explicit choice for the
+    decomposed path's bias (ignored when ``fused_gqa=True``, which instead
+    reads ``config.sliding_window`` via ``attn.local_window_size``) -- this
+    lets one attention module built with a fixed ``config.sliding_window``
+    (so the fused-GQA case is representative of that config) also produce
+    an "unbounded" decomposed baseline for comparison.
+    """
+    attn = DeepSeekV4Attention(config, layer_id=0)
+    attn.load_state_dict(state)
+    rope_config = dataclasses.replace(config, head_dim=config.qk_rope_head_dim)
+    rotary_emb = initialize_rope(
+        dataclasses.replace(
+            rope_config,
+            rope_type="default",
+            rope_scaling=None,
+            original_max_position_embeddings=None,
+        )
+    )
+
+    batch, seq_len, hidden_size = hidden_values.shape
+    graph = ir.Graph(
+        inputs=[],
+        outputs=[],
+        nodes=[],
+        name="deepseek_v4_attention_window_fixture",
+        opset_imports={"": OPSET_VERSION, "com.microsoft": 1},
+    )
+    builder = GraphBuilder(graph)
+    op = builder.op
+    hidden_states = ir.Value(
+        name="hidden_states",
+        shape=ir.Shape([batch, seq_len, hidden_size]),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    attention_mask = ir.Value(
+        name="attention_mask",
+        shape=ir.Shape([batch, seq_len]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    position_ids = ir.Value(
+        name="position_ids",
+        shape=ir.Shape([batch, seq_len]),
+        type=ir.TensorType(ir.DataType.INT64),
+    )
+    graph.inputs.extend([hidden_states, attention_mask, position_ids])
+
+    position_embeddings = rotary_emb(op, position_ids)
+    if fused_gqa:
+        attention_bias = None
+        seqlens_k, total_seq_len = _gqa_kv_lengths(op, attention_mask)
+    else:
+        attention_bias = create_attention_bias(
+            op,
+            input_ids=hidden_states,
+            attention_mask=attention_mask,
+            sliding_window=decomposed_sliding_window,
+            dtype=ir.DataType.FLOAT,
+        )
+        seqlens_k, total_seq_len = None, None
+
+    output, _ = attn(
+        op, hidden_states, position_embeddings, None, attention_bias, seqlens_k, total_seq_len
+    )
+    output.name = "output"
+    graph.outputs.append(output)
+
+    model = ir.Model(graph, ir_version=11)
+    proto = ir.to_proto(model)
+    session = ort.InferenceSession(
+        proto.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    (actual,) = session.run(
+        None,
+        {
+            "hidden_states": hidden_values,
+            "attention_mask": attention_mask_values,
+            "position_ids": np.arange(seq_len, dtype=np.int64)[None, :].repeat(batch, axis=0),
+        },
+    )
+    return actual
+
+
+def test_missing_sliding_window_regression_fused_gqa_matches_windowed_decomposed():
+    """Regression test for the missing mandatory sliding-window bug.
+
+    Official DeepSeek-V4 (``inference/model.py::Attention.forward``,
+    ``get_window_topk_idxs``) restricts every layer, regardless of
+    ``compress_ratio``, to a circular-buffer window of the ``sliding_window``
+    (128 in the real checkpoint) most-recent positions. Before this fix,
+    *neither* the decomposed (``create_attention_bias``) nor the fused-GQA
+    (``GroupQueryAttention.local_window_size``) path applied this
+    restriction: both silently computed full/unbounded causal attention.
+
+    This builds byte-identical weights/inputs (seq_len=6) through a module
+    configured with ``sliding_window=2`` (smaller than seq_len, so the
+    restriction actually bites), then executes three graphs:
+
+    * "unbounded": decomposed path, no window applied to the bias
+      (``create_attention_bias(sliding_window=None)``) -- the pre-fix
+      behavior for every layer, window-configured or not.
+    * "windowed": same decomposed path, but with the module's own
+      ``sliding_window=2`` baked into the bias.
+    * "fused": the fused-``GroupQueryAttention`` path, built from the same
+      module (``config.sliding_window=2``, so ``local_window_size=2`` per
+      ``DeepSeekV4Attention.__init__``).
+
+    Assertions:
+    1. unbounded vs. windowed must DIFFER -- proves ``sliding_window``
+       actually changes the decomposed path's output (sanity check that the
+       fixture is exercising the window at all).
+    2. windowed vs. fused must MATCH -- proves the fused-GQA
+       ``local_window_size`` attribute reproduces the *exact* same
+       restriction as the decomposed path's explicit float bias. This is
+       the decisive assertion: on the pre-fix code, ``local_window_size``
+       was never wired into the ``GroupQueryAttention`` call at all, so
+       "fused" would equal "unbounded", not "windowed", and this assertion
+       would fail.
+    """
+    window = 2
+    seq_len = 6  # > window, so the restriction actually bites.
+    config = _attention_only_config(sliding_window=window)
+
+    rng = np.random.default_rng(0)
+    probe = DeepSeekV4Attention(config, layer_id=0)
+    state = {}
+    for name, param in probe.named_parameters():
+        shape = [int(d) for d in param.shape]
+        state[name] = ir.tensor((rng.standard_normal(shape) * 0.1).astype(np.float32))
+
+    batch, hidden_size = 1, config.hidden_size
+    hidden_values = (
+        np.random.default_rng(1).standard_normal((batch, seq_len, hidden_size)) * 0.1
+    ).astype(np.float32)
+    attention_mask_values = np.ones((batch, seq_len), dtype=np.int64)
+
+    def _run(*, fused_gqa, decomposed_sliding_window):
+        return _run_attention_graph(
+            config,
+            hidden_values=hidden_values,
+            attention_mask_values=attention_mask_values,
+            state=state,
+            fused_gqa=fused_gqa,
+            decomposed_sliding_window=decomposed_sliding_window,
+        )
+
+    unbounded = _run(fused_gqa=False, decomposed_sliding_window=None)
+    windowed = _run(fused_gqa=False, decomposed_sliding_window=window)
+    fused = _run(fused_gqa=True, decomposed_sliding_window=None)
+
+    assert not np.allclose(unbounded, windowed, atol=1e-4), (
+        "sliding_window=2 must change the decomposed path's output for "
+        "seq_len=6 > window -- if this passes, the fixture isn't "
+        "exercising the window at all"
+    )
+    np.testing.assert_allclose(
+        windowed,
+        fused,
+        atol=1e-4,
+        err_msg=(
+            "fused-GQA local_window_size must reproduce the exact same "
+            "restriction as the decomposed path's explicit windowed bias"
+        ),
+    )

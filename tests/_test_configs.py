@@ -718,6 +718,14 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
                 "beta_slow": 1,
                 "original_max_position_embeddings": 128,
             },
+            # Official reference unconditionally restricts every layer to
+            # this many most-recent positions (`get_window_topk_idxs`),
+            # regardless of `compress_ratios` -- see
+            # `DeepSeekV4Attention.local_window_size`. Deliberately smaller
+            # than the parity tests' sequence length so windowing is
+            # actually exercised (matches the `sliding_window: 8` tiny-config
+            # convention used by gemma/gemma4/muse-glimmer above).
+            "sliding_window": 8,
         },
         True,
     ),
