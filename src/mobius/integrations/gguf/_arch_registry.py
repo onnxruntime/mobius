@@ -258,7 +258,6 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.inner_size",
             "ssm.state_size",
             "ssm.time_step_rank",
-            "ssm.dt_b_c_rms",
         ),
         runtime=Support.DEFERRED,
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,

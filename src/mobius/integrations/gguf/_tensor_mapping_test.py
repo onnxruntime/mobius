@@ -295,10 +295,7 @@ class TestMapGGUFToHFNames:
             map_gguf_to_hf_names("blk.0.ssm_conv1d.weight", "mamba")
             == "model.layers.0.mixer.conv1d.weight"
         )
-        assert (
-            map_gguf_to_hf_names("blk.0.ssm_a.weight", "mamba")
-            == "model.layers.0.mixer.A_log.weight"
-        )
+        assert map_gguf_to_hf_names("blk.0.ssm_a", "mamba") == "model.layers.0.mixer.A_log"
 
     def test_mamba2_mapping_and_bare_parameters(self) -> None:
         assert (

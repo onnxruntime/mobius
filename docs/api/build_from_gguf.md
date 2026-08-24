@@ -192,12 +192,18 @@ llama.cpp does not emit but that mobius still accepts.
 
 ### Pure recurrent Mamba evidence
 
-`mamba` and `mamba2` have config, exact tensor-map, graph-build, save/load,
+`mamba` and `mamba2` have config, suffix-exact C++ tensor-name closure,
+graph-build, save/load,
 quantized-source dequantization, and recurrent prompt/decode state-threading
 coverage. Mamba1 ingests prompts as single-token recurrent steps; Mamba2 also
 supports multi-token prefill. Their runtime verdict remains **deferred**: no pinned real GGUF has
 yet passed an independent full-logit comparison plus deterministic multi-token
 generation against its source implementation.
+
+The optional Mamba `ssm.dt_b_c_rms` metadata defaults to `false`, matching the
+pinned loader. Files that explicitly set it to `true` are rejected because they
+require FalconMamba's additional B/C/dt norms, which the pure Mamba graph does
+not implement.
 
 The real-file audit was completed from HTTP range metadata before any payload
 download:

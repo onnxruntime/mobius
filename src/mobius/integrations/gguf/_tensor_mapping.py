@@ -245,6 +245,35 @@ _MAMBA2_MAPPING: dict[str, str] = {
     "blk.{bid}.ssm_norm": "backbone.layers.{bid}.mixer.norm",
 }
 
+_RECURRENT_SUFFIXES: dict[str, dict[str, frozenset[str]]] = {
+    "mamba": {
+        "token_embd": frozenset({".weight", ".scale", ".input_scale"}),
+        "output": frozenset({".weight", ".scale", ".input_scale"}),
+        "output_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.attn_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_in": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_conv1d": frozenset({".weight", ".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_x": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_dt": frozenset({".weight", ".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_a": frozenset({""}),
+        "blk.{bid}.ssm_d": frozenset({""}),
+        "blk.{bid}.ssm_out": frozenset({".weight", ".scale", ".input_scale"}),
+    },
+    "mamba2": {
+        "token_embd": frozenset({".weight", ".scale", ".input_scale"}),
+        "output": frozenset({".weight", ".scale", ".input_scale"}),
+        "output_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.attn_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_in": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_conv1d": frozenset({".weight", ".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_dt": frozenset({".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_a": frozenset({""}),
+        "blk.{bid}.ssm_d": frozenset({""}),
+        "blk.{bid}.ssm_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_out": frozenset({".weight", ".scale", ".input_scale"}),
+    },
+}
+
 # MoE extensions for Qwen2MoE/Qwen3MoE/DeepSeek.
 _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_gate_inp": ("model.layers.{bid}.mlp.gate"),
@@ -519,6 +548,9 @@ def map_gguf_to_hf_names(
     if blk_match:
         bid = blk_match.group(1)
         lookup = _BLK_PATTERN.sub(_BLK_TEMPLATE, stem)
+        allowed_suffixes = _RECURRENT_SUFFIXES.get(architecture, {}).get(lookup)
+        if allowed_suffixes is not None and suffix not in allowed_suffixes:
+            return None
         hf_pattern = mapping.get(lookup)
         if hf_pattern is not None:
             hf_pattern = hf_pattern.replace("{bid}", bid)
@@ -526,6 +558,9 @@ def map_gguf_to_hf_names(
                 return hf_pattern[:-1]
             return hf_pattern + suffix
     else:
+        allowed_suffixes = _RECURRENT_SUFFIXES.get(architecture, {}).get(stem)
+        if allowed_suffixes is not None and suffix not in allowed_suffixes:
+            return None
         hf_stem = mapping.get(stem)
         if hf_stem is not None:
             if hf_stem.endswith("@"):

@@ -290,10 +290,15 @@ class TestPinnedTensorClosure:
     def _unmapped(architecture: str) -> list[str]:
         upstream = upstream_architectures()[architecture]
         unmapped = []
-        for family in upstream.tensor_families:
-            name = family.replace("{bid}", "0") + ".weight"
+        names = (
+            tuple((name, name) for name in upstream.tensor_names)
+            if upstream.tensor_names
+            else tuple((family + ".weight", family) for family in upstream.tensor_families)
+        )
+        for pinned_name, label in names:
+            name = pinned_name.replace("{bid}", "0")
             if map_gguf_to_hf_names(name, architecture) is None and not is_known_skip(name):
-                unmapped.append(family)
+                unmapped.append(label)
         return unmapped
 
     @pytest.mark.parametrize("architecture", _NEW_ARCHITECTURES)
@@ -336,47 +341,63 @@ class TestPinnedTensorClosure:
             moe_mapping["blk.{bid}.ffn_gate_exps"] = removed
             _build_mapping.cache_clear()
 
+    _RECURRENT_TENSOR_NAMES: ClassVar[dict[str, set[str]]] = {
+        "mamba": {
+            "token_embd.weight",
+            "output_norm.weight",
+            "output.weight",
+            "blk.{bid}.attn_norm.weight",
+            "blk.{bid}.ssm_in.weight",
+            "blk.{bid}.ssm_conv1d.weight",
+            "blk.{bid}.ssm_conv1d.bias",
+            "blk.{bid}.ssm_x.weight",
+            "blk.{bid}.ssm_dt.weight",
+            "blk.{bid}.ssm_dt.bias",
+            "blk.{bid}.ssm_a",
+            "blk.{bid}.ssm_d",
+            "blk.{bid}.ssm_out.weight",
+        },
+        "mamba2": {
+            "token_embd.weight",
+            "output_norm.weight",
+            "output.weight",
+            "blk.{bid}.attn_norm.weight",
+            "blk.{bid}.ssm_in.weight",
+            "blk.{bid}.ssm_conv1d.weight",
+            "blk.{bid}.ssm_conv1d.bias",
+            "blk.{bid}.ssm_dt.bias",
+            "blk.{bid}.ssm_a",
+            "blk.{bid}.ssm_d",
+            "blk.{bid}.ssm_norm.weight",
+            "blk.{bid}.ssm_out.weight",
+        },
+    }
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_pure_recurrent_pinned_tensor_names_are_suffix_exact(
+        self, architecture: str
+    ) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert set(upstream.tensor_names) == self._RECURRENT_TENSOR_NAMES[architecture]
+        for pinned_name in upstream.tensor_names:
+            name = pinned_name.replace("{bid}", "7")
+            assert map_gguf_to_hf_names(name, architecture) is not None, name
+
     @pytest.mark.parametrize(
-        ("architecture", "expected"),
+        ("architecture", "malformed"),
         [
-            (
-                "mamba",
-                {
-                    "token_embd",
-                    "output_norm",
-                    "output",
-                    "blk.{bid}.attn_norm",
-                    "blk.{bid}.ssm_in",
-                    "blk.{bid}.ssm_conv1d",
-                    "blk.{bid}.ssm_x",
-                    "blk.{bid}.ssm_dt",
-                    "blk.{bid}.ssm_a",
-                    "blk.{bid}.ssm_d",
-                    "blk.{bid}.ssm_out",
-                },
-            ),
-            (
-                "mamba2",
-                {
-                    "token_embd",
-                    "output_norm",
-                    "output",
-                    "blk.{bid}.attn_norm",
-                    "blk.{bid}.ssm_in",
-                    "blk.{bid}.ssm_conv1d",
-                    "blk.{bid}.ssm_dt",
-                    "blk.{bid}.ssm_a",
-                    "blk.{bid}.ssm_d",
-                    "blk.{bid}.ssm_norm",
-                    "blk.{bid}.ssm_out",
-                },
-            ),
+            ("mamba", "blk.0.ssm_a.weight"),
+            ("mamba", "blk.0.ssm_d.bias"),
+            ("mamba", "blk.0.ssm_in.bias"),
+            ("mamba2", "blk.0.ssm_dt.weight"),
+            ("mamba2", "blk.0.ssm_a.bias"),
+            ("mamba2", "blk.0.ssm_norm.bias"),
         ],
     )
-    def test_pure_recurrent_pinned_tensor_sets_are_exact(
-        self, architecture: str, expected: set[str]
+    def test_pure_recurrent_malformed_suffixes_do_not_map(
+        self, architecture: str, malformed: str
     ) -> None:
-        assert set(upstream_architectures()[architecture].tensor_families) == expected
+        assert map_gguf_to_hf_names(malformed, architecture) is None
 
     @pytest.mark.parametrize(
         ("architecture", "mapping_key"),
@@ -392,7 +413,7 @@ class TestPinnedTensorClosure:
         removed = mapping.pop(mapping_key)
         _build_mapping.cache_clear()
         try:
-            assert mapping_key in self._unmapped(architecture)
+            assert any(name.startswith(mapping_key) for name in self._unmapped(architecture))
         finally:
             mapping[mapping_key] = removed
             _build_mapping.cache_clear()

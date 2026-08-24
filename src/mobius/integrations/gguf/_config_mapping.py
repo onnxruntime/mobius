@@ -1283,7 +1283,7 @@ def _mamba_postprocess(
     """Build the Mamba config from llama.cpp's SSM metadata."""
     del model
     arch = "mamba"
-    if bool(metadata[f"{arch}.ssm.dt_b_c_rms"]):
+    if bool(metadata.get(f"{arch}.ssm.dt_b_c_rms")):
         raise ValueError(
             "mamba.ssm.dt_b_c_rms=true requires FalconMamba's extra B/C/dt norms, "
             "which the pure Mamba graph does not implement"

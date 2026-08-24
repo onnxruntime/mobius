@@ -330,6 +330,7 @@ def _write_recurrent_gguf(
     quantized: bool,
     malformed_conv: bool = False,
     auxiliary_scale: bool = False,
+    malformed_suffix: bool = False,
 ) -> None:
     """Write an exact one-layer Mamba/Mamba2 GGUF tensor set."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -415,6 +416,8 @@ def _write_recurrent_gguf(
     add_projection("blk.0.ssm_out.weight", (hidden_size, inner_size))
     if auxiliary_scale:
         add_float("blk.0.ssm_in.scale", (1,))
+    if malformed_suffix:
+        add_float("blk.0.ssm_a.weight", (dt_rank_or_heads,))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -2263,6 +2266,33 @@ class TestRecurrentGGUFBuild:
         _write_recurrent_gguf(path, architecture, quantized=False, malformed_conv=True)
         with pytest.raises(ValueError, match="shape"):
             build_from_gguf(path)
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_malformed_recurrent_suffix_is_rejected_before_graph_build(
+        self, tmp_path: Path, architecture: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-bad-suffix.gguf"
+        _write_recurrent_gguf(
+            path,
+            architecture,
+            quantized=False,
+            malformed_suffix=True,
+        )
+
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match="suffixes do not match"):
+            build_from_gguf(path)
+        assert not graph_build_started
 
     @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
     def test_auxiliary_quantization_sidecar_is_rejected_before_graph_build(

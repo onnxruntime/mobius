@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 
@@ -134,7 +136,6 @@ class TestPureRecurrentConfig:
             f"{architecture}.ssm.inner_size": 128,
             f"{architecture}.ssm.state_size": 8,
             f"{architecture}.ssm.time_step_rank": 8,
-            f"{architecture}.ssm.dt_b_c_rms": False,
         }
 
     def test_mamba_config_uses_ssm_metadata_not_attention_placeholders(self) -> None:
@@ -156,6 +157,14 @@ class TestPureRecurrentConfig:
         assert config.conv_kernel == 4
         assert config.expand == 2
         assert config.tie_word_embeddings is True
+
+    def test_mamba_optional_dt_b_c_norm_false_is_accepted(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("mamba")
+        metadata["mamba.ssm.dt_b_c_rms"] = False
+        config = gguf_to_config(_FakeDenseGGUF("mamba", metadata, ["token_embd.weight"]))
+        assert config.model_type == "mamba"
 
     def test_mamba2_config_derives_head_geometry(self) -> None:
         from mobius._configs import Mamba2Config
@@ -194,6 +203,52 @@ class TestPureRecurrentConfig:
         metadata["mamba.ssm.dt_b_c_rms"] = True
         with pytest.raises(ValueError, match="extra B/C/dt norms"):
             gguf_to_config(_FakeDenseGGUF("mamba", metadata, ["token_embd.weight"]))
+
+    def test_mamba_optional_dt_b_c_norm_cannot_become_required(self) -> None:
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
+
+        assert "ssm.dt_b_c_rms" not in get_arch_spec("mamba").required_metadata
+
+    def test_recurrent_required_metadata_matches_pinned_loader(self) -> None:
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
+
+        assert set(get_arch_spec("mamba").required_metadata) == {
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        }
+        assert set(get_arch_spec("mamba2").required_metadata) == {
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        }
+
+    def test_absent_optional_dt_b_c_norm_falsifies_required_metadata_mutation(
+        self, monkeypatch
+    ) -> None:
+        from mobius.integrations.gguf import _config_mapping
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
+
+        spec = get_arch_spec("mamba")
+        mutated = dataclasses.replace(
+            spec,
+            required_metadata=(*spec.required_metadata, "ssm.dt_b_c_rms"),
+        )
+        monkeypatch.setattr(_config_mapping, "try_get_arch_spec", lambda architecture: mutated)
+
+        with pytest.raises(ValueError, match=r"ssm\.dt_b_c_rms"):
+            _config_mapping.gguf_to_config(
+                _FakeDenseGGUF(
+                    "mamba",
+                    self._metadata("mamba"),
+                    ["token_embd.weight"],
+                )
+            )
 
     def test_mamba2_rejects_group_count_that_does_not_divide_heads(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config

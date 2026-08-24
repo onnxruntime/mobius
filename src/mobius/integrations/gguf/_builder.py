@@ -372,6 +372,28 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         tensor_names=gguf_model.tensor_names,
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
+    _raise_for_malformed_recurrent_tensors(gguf_model)
+
+
+def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
+    """Reject recurrent tensor suffixes not created by the pinned C++ loaders."""
+    from mobius.integrations.gguf._upstream import upstream_architecture
+
+    upstream = upstream_architecture(gguf_model.architecture)
+    if upstream is None or not upstream.tensor_names:
+        return
+
+    expected = set(upstream.tensor_names)
+    malformed = []
+    for name in gguf_model.tensor_names:
+        template = re.sub(r"^blk\.\d+\.", "blk.{bid}.", name)
+        if template not in expected:
+            malformed.append(name)
+    if malformed:
+        raise ValueError(
+            f"Malformed {gguf_model.architecture} GGUF tensor name(s): {malformed}. "
+            "The suffixes do not match the pinned llama.cpp tensor creation sites."
+        )
 
 
 def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
