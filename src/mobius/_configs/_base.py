@@ -503,6 +503,12 @@ class ArchitectureConfig(BaseModelConfig):
     # (reusing ``DeepSeekV3TextModel`` unchanged) on runtimes that cannot yet
     # execute ``pkg.nxrt::IndexShare``.
     use_dsa: bool = True
+    # Opt-in export of ``com.microsoft::PagedAttention`` (LATENT / absorbed-MLA
+    # mode) for property-compatible dense MLA. Default off. When off, exports are
+    # byte-identical to the current dense-MLA graph. Eligibility is decided from
+    # semantic geometry (see ``mobius.components._paged_mla``), never model names;
+    # an incompatible geometry raises rather than silently falling back.
+    export_paged_attention: bool = False
     # Per-layer indexer schedule ("full" runs the indexer; "shared" reuses the
     # top-k selection from the closest preceding "full" layer). When the
     # checkpoint config omits this list, it is derived from
