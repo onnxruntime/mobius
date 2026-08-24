@@ -247,7 +247,14 @@ def _build_t5_package(config):
     from mobius.models.t5 import T5ForConditionalGeneration
 
     module = T5ForConditionalGeneration(config)
-    pkg = build_from_module(module, config, task=Seq2SeqTask())
+    pkg = build_from_module(
+        module,
+        config,
+        task=Seq2SeqTask(
+            use_cross_attention_cache=True,
+            use_attention_masks=True,
+        ),
+    )
 
     state_dict = _download_weights(_T5_MODEL_ID)
     state_dict = module.preprocess_weights(state_dict)

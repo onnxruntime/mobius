@@ -34,6 +34,15 @@ class Seq2SeqTask(ModelTask):
     model_roles: ClassVar[dict[str, str]] = {"encoder": "encoder", "decoder": "decoder"}
     components: ClassVar[ComponentSpec] = ComponentSpec(encoder="encoder", decoder="decoder")
 
+    def __init__(
+        self,
+        *,
+        use_cross_attention_cache: bool = False,
+        use_attention_masks: bool = False,
+    ):
+        self.use_cross_attention_cache = use_cross_attention_cache
+        self.use_attention_masks = use_attention_masks
+
     def build(
         self,
         module: nn.Module,
@@ -100,7 +109,7 @@ class Seq2SeqTask(ModelTask):
             shape=[batch, "past_seq_len + dec_seq_len"],
         )
         encoder_attention_mask = None
-        if getattr(module, "uses_encoder_attention_mask", False):
+        if self.use_attention_masks:
             encoder_attention_mask = builder.input(
                 "encoder_attention_mask",
                 dtype=ir.DataType.INT64,
@@ -128,16 +137,21 @@ class Seq2SeqTask(ModelTask):
 
         # Cross-attention KV cache (named past_key_values.{i}.cross.key/value)
         cross_past_kvs: list[tuple[ir.Value, ir.Value]] = []
+        cross_past_seq_len = (
+            ir.SymbolicDim("cross_past_sequence_len")
+            if self.use_cross_attention_cache
+            else enc_seq_len
+        )
         for i in range(num_decoder_layers):
             past_key = builder.input(
                 f"past_key_values.{i}.cross.key",
                 dtype=config.dtype,
-                shape=[batch, num_heads, "cross_past_sequence_len", head_dim],
+                shape=[batch, num_heads, cross_past_seq_len, head_dim],
             )
             past_value = builder.input(
                 f"past_key_values.{i}.cross.value",
                 dtype=config.dtype,
-                shape=[batch, num_heads, "cross_past_sequence_len", head_dim],
+                shape=[batch, num_heads, cross_past_seq_len, head_dim],
             )
             cross_past_kvs.append((past_key, past_value))
 
@@ -150,6 +164,9 @@ class Seq2SeqTask(ModelTask):
         )
         if encoder_attention_mask is not None:
             decoder_kwargs["encoder_attention_mask"] = encoder_attention_mask
+            decoder_kwargs["use_attention_masks"] = True
+        if self.use_cross_attention_cache:
+            decoder_kwargs["use_cross_attention_cache"] = True
         logits, present_self_kvs, present_cross_kvs = module.decoder(
             op,
             **decoder_kwargs,

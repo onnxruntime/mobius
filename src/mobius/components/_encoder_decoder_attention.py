@@ -46,7 +46,6 @@ class EncoderDecoderAttention(nn.Module):
         bias: bool = True,
         scale: float | None = None,
         linear_class: type | None = None,
-        use_cross_attention_cache: bool = False,
     ):
         super().__init__()
         if linear_class is None:
@@ -55,7 +54,6 @@ class EncoderDecoderAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.is_causal = is_causal
-        self.use_cross_attention_cache = use_cross_attention_cache
         self._scale = scale if scale is not None else float(self.head_dim**-0.5)
 
         self.q_proj = linear_class(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
@@ -79,6 +77,7 @@ class EncoderDecoderAttention(nn.Module):
         key_value_states: ir.Value | None = None,
         attention_bias: ir.Value | None = None,
         past_key_value: tuple | None = None,
+        use_cross_attention_cache: bool = False,
     ):
         """Forward pass.
 
@@ -103,7 +102,7 @@ class EncoderDecoderAttention(nn.Module):
             value_states = self.v_proj(op, key_value_states)
             if past_key_value is not None:
                 past_key, past_value = past_key_value
-                if self.use_cross_attention_cache:
+                if use_cross_attention_cache:
                     # Attention requires a non-empty current K/V sequence even
                     # when past is supplied. Flatten the cached head layout and
                     # concatenate it with the newly projected encoder suffix.
@@ -151,7 +150,7 @@ class EncoderDecoderAttention(nn.Module):
             is_causal=1 if self.is_causal else 0,
             _outputs=3,
         )
-        if key_value_states is not None:
+        if key_value_states is not None and use_cross_attention_cache:
             present_shape = op.Concat(
                 op.Shape(key_states, start=0, end=1),
                 op.Constant(value_ints=[self.num_heads]),

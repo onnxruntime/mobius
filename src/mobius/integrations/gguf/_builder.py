@@ -1063,7 +1063,14 @@ def build_from_gguf(
     module_type = spec.module_type or model_type
     module_class = registry.get(module_type)
     resolved_task: str | ModelTask
-    if static_cache:
+    if model_type == "t5":
+        from mobius.tasks import Seq2SeqTask
+
+        resolved_task = Seq2SeqTask(
+            use_cross_attention_cache=True,
+            use_attention_masks=True,
+        )
+    elif static_cache:
         from mobius.tasks import CausalLMTask
 
         resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)

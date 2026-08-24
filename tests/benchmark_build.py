@@ -488,6 +488,28 @@ def run_benchmarks(
     return results
 
 
+def test_standard_t5_graph_contract_is_stable():
+    """Ordinary T5 keeps the pre-GGUF deterministic graph size and cache shape."""
+    entry = next(entry for entry in BENCHMARK_MODELS if entry.model_type == "t5")
+    result = _run_single(entry)
+
+    assert result.num_nodes == 176
+
+    from mobius._registry import registry
+    from mobius.tasks import get_task
+
+    config = _base_config(**entry.config_overrides)
+    package = get_task(entry.task_name).build(registry.get("t5")(config), config)
+    decoder = package["decoder"]
+    assert len(list(package["encoder"].graph)) == 81
+    assert len(list(decoder.graph)) == 95
+    decoder_inputs = {value.name: value for value in decoder.graph.inputs}
+    assert "encoder_attention_mask" not in decoder_inputs
+    assert str(decoder_inputs["past_key_values.0.cross.key"].shape) == (
+        "[batch,4,encoder_sequence_len,16]"
+    )
+
+
 def print_table(
     results: list[tuple[str, float, float, int, int, float, int]],
 ) -> None:

@@ -247,7 +247,6 @@ class T5DecoderBlock(nn.Module):
             bias=False,
             scale=1.0,
             linear_class=linear_class,
-            use_cross_attention_cache=True,
         )
         self.cross_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn = _T5FFN(config, linear_class=linear_class)
@@ -274,6 +273,7 @@ class T5DecoderBlock(nn.Module):
         key_length: ir.Value | None = None,
         query_offset: ir.Value | None = None,
         attention_mask: ir.Value | None = None,
+        use_cross_attention_cache: bool = False,
     ):
         if self.relative_attention_bias is not None:
             if query_length is None or key_length is None:
@@ -311,6 +311,7 @@ class T5DecoderBlock(nn.Module):
             key_value_states=encoder_hidden_states,
             attention_bias=cross_attention_bias,
             past_key_value=cross_past_key_value,
+            use_cross_attention_cache=use_cross_attention_cache,
         )
         hidden_states = op.Add(residual, hidden_states)
 
@@ -439,6 +440,8 @@ class T5Decoder(nn.Module):
         encoder_attention_mask: ir.Value | None = None,
         past_key_values: list | None = None,
         cross_past_key_values: ir.Value | None = None,
+        use_cross_attention_cache: bool = False,
+        use_attention_masks: bool = False,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
 
@@ -461,7 +464,7 @@ class T5Decoder(nn.Module):
         fallback_position_bias = None
         for block, past_kv, cross_kv in zip(self.block, past_kvs, cross_past_kvs):
             cross_attention_bias = None
-            if encoder_attention_mask is not None:
+            if use_attention_masks and encoder_attention_mask is not None:
                 cross_attention_bias = _padding_bias(
                     op,
                     hidden_states,
@@ -483,7 +486,8 @@ class T5Decoder(nn.Module):
                 query_length=query_length,
                 key_length=key_length,
                 query_offset=past_len,
-                attention_mask=attention_mask,
+                attention_mask=attention_mask if use_attention_masks else None,
+                use_cross_attention_cache=use_cross_attention_cache,
             )
             if fallback_position_bias is None:
                 fallback_position_bias = position_bias
@@ -518,7 +522,6 @@ class T5ForConditionalGeneration(nn.Module):
 
     default_task = "seq2seq"
     category = "encoder-decoder"
-    uses_encoder_attention_mask = True
 
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.
     HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
