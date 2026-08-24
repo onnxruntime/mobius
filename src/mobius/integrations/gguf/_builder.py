@@ -474,12 +474,14 @@ def _gguf_architecture_from_header_prefix(data: bytes, *, source: str) -> str:
         raise ValueError(f"{source!r} has a non-UTF-8 general.architecture value.") from error
 
 
-def _preflight_hf_mmproj_companion_file(
+def _preflight_hf_gguf_file(
     repo_id: str,
     filename: str,
     *,
     revision: str = "main",
-) -> str | None:
+    allow_mmproj_companion: bool = False,
+    expected_architecture: str | None = None,
+) -> str:
     """Validate the exact selected Hub file header and return its immutable revision."""
     source = f"{repo_id}@{revision}:{filename}"
     _raise_for_sharded_gguf(source=source, filename=filename)
@@ -487,17 +489,18 @@ def _preflight_hf_mmproj_companion_file(
     try:
         metadata = get_hf_file_metadata(url)
     except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
-        logger.warning(
-            "Exact-file mmproj header preflight failed for %s (%s); continuing to "
-            "hf_hub_download so a cached file can still be used. The downloaded "
-            "local header will be validated before builder dispatch.",
-            source,
-            error,
-        )
-        return None
+        raise RuntimeError(
+            f"Cannot resolve the exact selected GGUF file {source!r} to an immutable "
+            "revision; refusing repository-level metadata or mutable-revision fallback"
+        ) from error
     commit_hash = metadata.commit_hash
-    if not commit_hash:
-        raise ValueError(f"Hub did not resolve an immutable revision for {source!r}.")
+    if (
+        not isinstance(commit_hash, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", commit_hash) is None
+    ):
+        raise ValueError(
+            f"Hub did not resolve a 40-character immutable commit SHA for {source!r}."
+        )
 
     headers = build_hf_headers()
     if urlparse(url).netloc != urlparse(metadata.location).netloc:
@@ -534,22 +537,53 @@ def _preflight_hf_mmproj_companion_file(
                 chunks = read_response(response)
     except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
         logger.warning(
-            "Bounded mmproj header range read failed for %s (%s); downloading the "
+            "Bounded GGUF header range read failed for %s (%s); downloading the "
             "same immutable revision and validating its local header before dispatch.",
             source,
             error,
         )
         return commit_hash
-    architecture = _gguf_architecture_from_header_prefix(
-        b"".join(chunks),
-        source=source,
-    )
-    if architecture != MMPROJ_ARCHITECTURE:
+    try:
+        architecture = _gguf_architecture_from_header_prefix(
+            b"".join(chunks),
+            source=source,
+        )
+    except ValueError as error:
+        if "truncated GGUF metadata" not in str(error):
+            raise
+        logger.warning(
+            "The selected GGUF metadata header for %s exceeds the bounded range; "
+            "downloading the same immutable revision for full local validation.",
+            source,
+        )
+        return commit_hash
+    if expected_architecture is not None and architecture != expected_architecture:
         raise ValueError(
-            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF for {source!r}, "
+            f"Expected a {expected_architecture!r} mmproj GGUF for {source!r}, "
             f"got architecture {architecture!r}. No payload was downloaded."
         )
+    _raise_for_unsupported_gguf_architecture(
+        architecture,
+        source=source,
+        allow_mmproj_companion=allow_mmproj_companion,
+    )
     return commit_hash
+
+
+def _preflight_hf_mmproj_companion_file(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str = "main",
+) -> str:
+    """Validate one exact Hub mmproj file and pin its immutable revision."""
+    return _preflight_hf_gguf_file(
+        repo_id,
+        filename,
+        revision=revision,
+        allow_mmproj_companion=True,
+        expected_architecture=MMPROJ_ARCHITECTURE,
+    )
 
 
 def _validate_gguf_model(
@@ -564,6 +598,9 @@ def _validate_gguf_model(
     if not isinstance(gguf_model, GgufShardSet):
         split_count = int(gguf_model.get_metadata("split.count", 1))
         _raise_for_sharded_gguf(source=source, split_count=split_count)
+    from mobius.integrations.gguf._mtp import validate_mtp_tensor_contract
+
+    validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_gguf_architecture(
         gguf_model.architecture,
         source=source,
@@ -1047,6 +1084,12 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
         mtp_layer = trunk_layers
         prefix = f"blk.{mtp_layer}."
         layer_names = {name[len(prefix) :] for name in actual if name.startswith(prefix)}
+        wrong_mixer = sorted(layer_names & recurrent_suffixes)
+        if wrong_mixer:
+            raise ValueError(
+                f"{architecture} MTP block contains recurrent-mixer tensor(s) "
+                f"{wrong_mixer}; appended MTP blocks must be full attention"
+            )
         required_block = set(common_suffixes) | set(full_suffixes)
         if architecture in {"qwen35moe", "qwen3next"}:
             fused = "ffn_gate_up_exps.weight" in layer_names
@@ -1702,7 +1745,7 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
             )
         filename = files[0]
 
-    resolved_revision: str | None = None
+    resolved_revision: str | None
     if allow_mmproj_companion:
         resolved_revision = _preflight_hf_mmproj_companion_file(
             repo_id,
@@ -1710,15 +1753,21 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
             revision="main",
         )
     else:
-        _preflight_hf_gguf(api, repo_id, filename)
-    logger.info("Downloading %s from %s", filename, repo_id)
-    if resolved_revision is not None:
-        return hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=resolved_revision,
+        resolved_revision = _preflight_hf_gguf_file(
+            repo_id,
+            filename,
+            revision="main",
         )
-    return hf_hub_download(repo_id=repo_id, filename=filename)
+    logger.info("Downloading %s from %s", filename, repo_id)
+    if resolved_revision is None:
+        raise RuntimeError(
+            f"Hub did not resolve an immutable revision for {repo_id}:{filename}"
+        )
+    return hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        revision=resolved_revision,
+    )
 
 
 def _resolve_gguf_path(gguf_path: str | Path) -> str:
@@ -1898,6 +1947,11 @@ def build_from_gguf(
             "Build without reuse to convert this file."
         )
     gguf_arch = gguf_model.architecture
+    if static_cache and int(gguf_model.metadata.get(f"{gguf_arch}.nextn_predict_layers", 0)):
+        raise ValueError(
+            "static_cache=True cannot represent the GGUF MTP head's independent "
+            "dynamic concat-grow KV cache; refusing to silently omit the sidecar"
+        )
     logger.info("Loaded GGUF model: %s (arch=%s)", gguf_path, gguf_arch)
     preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
     arch_spec = try_get_arch_spec(gguf_arch)
@@ -2109,9 +2163,8 @@ def build_from_gguf(
     # the final layer's ordinary ``hidden_states.N`` capture as the distinct
     # pre-final-norm ABI; neither output may stand in for the other. These fields
     # must be set before graph construction. Direct assignment preserves the
-    # ``_gguf_*`` metadata attributes on the config. Skipped under static_cache
-    # (the head needs the dynamic concat-grow cache), leaving those exports
-    # byte-identical to today.
+    # ``_gguf_*`` metadata attributes on the config. Static-cache requests fail
+    # closed because the sidecar requires its own dynamic concat-grow cache.
     from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
 
     # Re-attach the GGUF metadata dropped by the dtype/quantization
@@ -2124,11 +2177,11 @@ def build_from_gguf(
     config._gguf_model_type = model_type
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices
-    emit_mtp_head = has_mtp_head(config) and not static_cache
+    emit_mtp_head = has_mtp_head(config)
     if has_mtp_head(config) and static_cache:
-        logger.info(
-            "GGUF ships an MTP/nextn head but static_cache=True is incompatible "
-            "with the head's dynamic cache; skipping the self-speculative sidecar."
+        raise ValueError(
+            "static_cache=True cannot represent the GGUF MTP head's independent "
+            "dynamic concat-grow KV cache; refusing to silently omit the sidecar"
         )
 
     if emit_mtp_head:

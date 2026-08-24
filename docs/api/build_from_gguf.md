@@ -616,15 +616,60 @@ covered synthetically, but publication still requires independent real-weight
 full-logit parity and deterministic stateful generation parity. Mobius exposes
 only the latest recurrent state, not llama.cpp's optional bounded rollback
 snapshot planes; rollback/reorder-capable runtime packaging must remain
-disabled until that ABI is represented explicitly. Dense Qwen3.5 MTP sidecars
-use the post-final-norm `mtp_seed` output while preserving pre-norm
-`hidden_states.N` captures. Optional dedicated `nextn.embed_tokens`,
-`nextn.shared_head_norm`, and `nextn.shared_head_head` tensors are consumed
-when present; otherwise the sidecar explicitly falls back to the backbone
-embedding, final norm, and tied or untied output head. Qwen3.5-MoE and
-Qwen3-Next MTP blocks are rejected because the current sidecar builder cannot
-represent routed experts without dropping tensors. Separate MTP-only files
-are outside this cohort.
+disabled until that ABI is represented explicitly. The pinned NextN metadata key is exactly
+`{general.architecture}.nextn_predict_layers` (GGUF `UINT32`). `block_count`
+includes the appended heads, whose indices are
+`[block_count-nextn_predict_layers, block_count)`. Mobius represents exactly
+one head and rejects larger counts rather than truncating them.
+
+The modern tensor namespace is:
+
+- required: `blk.N.nextn.{eh_proj,enorm,hnorm}.weight`
+- optional dedicated ownership:
+  `blk.N.nextn.{embed_tokens,shared_head_norm,shared_head_head}.weight`
+- decoder-block weights: the architecture's ordinary attention, norm, and FFN
+  tensors at the same `blk.N`
+
+The generic loader can additionally consume `.scale` and `.input_scale`
+sidecars for MTP projections. Mobius rejects those sidecars before graph
+construction because its MTP quantization ABI cannot represent them.
+`nextn.pre_projection.weight` and `nextn.post_projection.weight` are the
+distinct legacy/global namespace of `gemma4-assistant`; they are never accepted
+as Qwen-style appended-head tensors. Unknown `nextn.*`/`mtp.*`, dotted
+`nextn.predict_layers` metadata, mismatched architecture namespaces, missing
+required tensors, non-trailing or out-of-range block indices, recurrent MTP
+markers, and mixed routed-expert forms also fail closed.
+
+The pinned loader/converter census is closed as follows:
+
+| Mobius verdict | Pinned architectures | Reason |
+|---|---|---|
+| Export supported | `qwen35` | One dense, full-attention Qwen3.5 decoder block exactly matches the existing text block |
+| Rejected, executable upstream sidecar | `bailingmoe3`, `cohere2moe`, `deepseek2`, `deepseek32`, `deepseek4`, `glm-dsa`, `hy_v3`, `mimo2`, `nemotron_h_moe`, `qwen35moe`, `qwen3next`, `step35` | Routed experts, MLA/DSA/KDA, hyper-connections, compressed state, or hybrid recurrent state are not represented |
+| Rejected, preserved/skipped upstream | `bailingmoe2`, `dots3note`, `exaone-moe`, `exaone4`, `glm4`, `glm4moe` | The pinned loader consumes or preserves metadata/tensors but has no executable MTP graph |
+| Rejected special cases | `gemma4-assistant`, `nemotron_h`, `graniteswitch` | Standalone legacy assistant; converter-conditional MoE ownership; or non-MTP router-layer metadata re-emission |
+
+Dense Qwen3.5 uses the target's dedicated post-final-norm `mtp_seed`; ordinary
+`hidden_states.N` remains the distinct pre-final-norm layer capture. The
+sidecar normalizes the next-token embedding and seed independently,
+concatenates them, projects `2H -> H`, runs one full-attention Qwen3.5 decoder
+layer with its own dynamic KV cache, applies the dedicated or target final
+norm, and scores through a dedicated head or the target's tied/untied head.
+Dedicated embeddings consume `input_ids`; shared embeddings consume
+`inputs_embeds`. Static-cache exports are rejected because silently dropping
+the sidecar or its independent state is invalid. Packed target embedding/head
+ownership remains with the target graph; dedicated sidecar tables are
+dequantized to mathematically ordinary MatMul weights, so no target/MTP
+initializer is duplicated. `ModelPackage.save()` persists the sidecar under
+`mtp/` with weight checks, and `ModelPackage.load()` restores it as
+`package.mtp_head`; ordinary API saves cannot silently lose the auxiliary head.
+
+**MTP runtime status: DEFERRED.** The emitted graph and workflow metadata are
+an export contract, not evidence that a downstream runtime executes it.
+Runtime support requires a pinned real artifact, independent full-vocabulary
+logit parity, and deterministic end-to-end speculative/MTP generation with
+correct proposal rejection and cache rollback. None has yet been established,
+so no runtime-support claim is made.
 
 ### Pure recurrent Mamba evidence
 

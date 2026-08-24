@@ -364,6 +364,34 @@ class TestModelPackageSaveLoad:
         loaded = ModelPackage.load(str(tmp_path))
         assert sorted(loaded) == ["a", "b"]
 
+    def test_mtp_head_roundtrip_with_flat_target(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("mtp")})
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["model"]
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["model"]
+        assert (tmp_path / "mtp" / "model.onnx").exists()
+
+    def test_mtp_head_roundtrip_with_multicomponent_target(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("mtp")})
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["decoder", "embedding"]
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["model"]
+
     def test_save_creates_directory(self, tmp_path):
         outdir = tmp_path / "nested" / "dir"
         pkg = ModelPackage({"m": _make_simple_model()})

@@ -4316,18 +4316,16 @@ class TestGGUFPreflightGuards:
 
         filename = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
         with (
-            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
+                side_effect=NotImplementedError("nemotron_h_moe"),
+            ) as preflight,
             mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
             pytest.raises(NotImplementedError, match="nemotron_h_moe"),
         ):
-            api_type.return_value.model_info.return_value = SimpleNamespace(
-                gguf={"architecture": "nemotron_h_moe"}
-            )
             _resolve_gguf_path(f"unsloth/nemotron:{filename}")
 
-        api_type.return_value.model_info.assert_called_once_with(
-            "unsloth/nemotron", expand=["gguf"]
-        )
+        preflight.assert_called_once_with("unsloth/nemotron", filename, revision="main")
         download.assert_not_called()
 
     def test_remote_deferred_audio_architecture_fails_before_download(self):
@@ -4336,21 +4334,20 @@ class TestGGUFPreflightGuards:
 
         filename = "talkie-f16.gguf"
         with (
-            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
+                side_effect=UnsupportedGGUFArchitectureError(
+                    "talkie before config extraction"
+                ),
+            ),
             mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
             pytest.raises(
                 UnsupportedGGUFArchitectureError,
                 match=r"talkie.*before config extraction",
             ),
         ):
-            api_type.return_value.model_info.return_value = SimpleNamespace(
-                gguf={"architecture": "talkie"}
-            )
             _resolve_gguf_path(f"example/talkie:{filename}")
 
-        api_type.return_value.model_info.assert_called_once_with(
-            "example/talkie", expand=["gguf"]
-        )
         download.assert_not_called()
 
     def test_remote_standalone_clip_fails_before_download(self):
@@ -4359,21 +4356,18 @@ class TestGGUFPreflightGuards:
 
         filename = "mmproj-f16.gguf"
         with (
-            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
+                side_effect=DisabledGGUFArchitectureError("clip intentionally disabled"),
+            ),
             mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
             pytest.raises(
                 DisabledGGUFArchitectureError,
                 match=r"clip.*intentionally disabled",
             ),
         ):
-            api_type.return_value.model_info.return_value = SimpleNamespace(
-                gguf={"architecture": "clip"}
-            )
             _resolve_gguf_path(f"example/mmproj:{filename}")
 
-        api_type.return_value.model_info.assert_called_once_with(
-            "example/mmproj", expand=["gguf"]
-        )
         download.assert_not_called()
 
     def test_exact_selected_clip_header_returns_immutable_revision(self) -> None:
@@ -4433,6 +4427,62 @@ class TestGGUFPreflightGuards:
         assert stream_args.kwargs["headers"]["authorization"] == "Bearer test-token"
         response.raise_for_status.assert_called_once_with()
 
+    def test_exact_selected_primary_header_pins_download_revision(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _preflight_hf_gguf_file,
+            _resolve_gguf_path,
+        )
+
+        response = mock.MagicMock()
+        response.iter_bytes.return_value = [_gguf_header_prefix("qwen35")]
+        response_context = mock.MagicMock()
+        response_context.__enter__.return_value = response
+        session = mock.MagicMock()
+        session.stream.return_value = response_context
+        commit_hash = "a" * 40
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_url",
+                return_value="https://huggingface.co/exact-primary",
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash=commit_hash,
+                    location="https://huggingface.co/model.gguf",
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+        ):
+            assert (
+                _preflight_hf_gguf_file(
+                    "example/qwen35",
+                    "model.gguf",
+                    revision="requested-revision",
+                )
+                == commit_hash
+            )
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
+                return_value=commit_hash,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value="cached-model.gguf",
+            ) as download,
+        ):
+            assert _resolve_gguf_path("example/qwen35:model.gguf") == "cached-model.gguf"
+        download.assert_called_once_with(
+            repo_id="example/qwen35",
+            filename="model.gguf",
+            revision=commit_hash,
+        )
+
     def test_exact_selected_non_clip_header_rejects_without_payload(self) -> None:
         from mobius.integrations.gguf._builder import (
             _preflight_hf_mmproj_companion_file,
@@ -4489,22 +4539,24 @@ class TestGGUFPreflightGuards:
                 source="duplicate.gguf",
             )
 
-    def test_exact_companion_preflight_falls_back_for_offline_cache(self) -> None:
+    def test_exact_companion_preflight_rejects_unresolved_mutable_revision(self) -> None:
         from mobius.integrations.gguf._builder import (
             _preflight_hf_mmproj_companion_file,
         )
 
-        with mock.patch(
-            "mobius.integrations.gguf._builder.get_hf_file_metadata",
-            side_effect=OfflineModeIsEnabled("offline"),
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                side_effect=OfflineModeIsEnabled("offline"),
+            ),
+            pytest.raises(RuntimeError, match="immutable revision"),
         ):
-            assert (
+            (
                 _preflight_hf_mmproj_companion_file(
                     "example/offline",
                     "mmproj.gguf",
                     revision="main",
                 )
-                is None
             )
 
     def test_exact_companion_range_read_supports_requests_hub_sessions(self) -> None:
@@ -4598,35 +4650,27 @@ class TestGGUFPreflightGuards:
     @pytest.mark.parametrize(
         "preflight_error",
         [
-            pytest.param(
-                OfflineModeIsEnabled("offline"),
-                id="offline-cache",
-            ),
-            pytest.param(
-                TypeError("model_info() got an unexpected keyword argument 'expand'"),
-                id="older-huggingface-hub",
-            ),
-            pytest.param(
-                httpx.ConnectError("disconnected"),
-                id="transport-error",
-            ),
+            pytest.param(OfflineModeIsEnabled("offline"), id="offline-cache"),
+            pytest.param(httpx.ConnectError("disconnected"), id="transport-error"),
         ],
     )
-    def test_unavailable_hub_preflight_falls_back_to_download(self, preflight_error):
+    def test_unavailable_exact_file_preflight_rejects_mutable_download(self, preflight_error):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
 
         with (
-            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                side_effect=preflight_error,
+            ),
             mock.patch(
                 "mobius.integrations.gguf._builder.hf_hub_download",
                 return_value="cached-model.gguf",
             ) as download,
+            pytest.raises(RuntimeError, match="immutable revision"),
         ):
-            api_type.return_value.model_info.side_effect = preflight_error
-            result = _resolve_gguf_path("owner/repo:model.gguf")
+            _resolve_gguf_path("owner/repo:model.gguf")
 
-        assert result == "cached-model.gguf"
-        download.assert_called_once_with(repo_id="owner/repo", filename="model.gguf")
+        download.assert_not_called()
 
     def test_remote_shard_fails_before_hub_calls(self):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
