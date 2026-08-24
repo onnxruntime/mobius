@@ -376,6 +376,9 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
     _raise_for_malformed_recurrent_tensors(gguf_model)
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
+    from mobius.integrations.gguf._draft import validate_draft_tensor_contract
+
+    validate_draft_tensor_contract(gguf_model)
 
 
 def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
@@ -801,6 +804,7 @@ def build_from_gguf(
     max_seq_len: int | None = None,
     allow_dense_moe: bool | None = None,
     reuse_gguf_weights: bool = False,
+    target_config: str | Path | Mapping[str, object] | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -871,6 +875,10 @@ def build_from_gguf(
             original GGUF via ONNX external-data ranges. The GGUF must be a real
             file in the final flat output directory. Converted tensors are
             written once to ``model.onnx.data``.
+        target_config: Exact target model directory, config path, or explicit
+            config mapping for a ``dflash``/``eagle3`` speculative draft. A
+            mapping must include ``tokenizer_tokens``. Required for draft GGUFs
+            and rejected for standalone architectures.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -974,6 +982,20 @@ def build_from_gguf(
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
     spec = get_arch_spec(gguf_arch)
+    from mobius.integrations.gguf._draft import (
+        is_draft_architecture,
+        validate_draft_pairing,
+    )
+
+    if target_config is not None and not is_draft_architecture(gguf_arch):
+        raise ValueError(
+            f"target_config is only valid for dflash/eagle3 draft GGUFs, got {gguf_arch!r}"
+        )
+    draft_manifest = (
+        validate_draft_pairing(gguf_model, config, target_config)
+        if is_draft_architecture(gguf_arch)
+        else None
+    )
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
@@ -1016,6 +1038,14 @@ def build_from_gguf(
             )
         if task is not None and task != "seq2seq":
             raise ValueError(f"t5 GGUF only supports task='seq2seq', got {task!r}")
+    if is_draft_architecture(gguf_arch):
+        if static_cache:
+            raise ValueError(f"static_cache=True is not supported for {gguf_arch} drafts")
+        expected_task = f"{gguf_arch}-draft"
+        if task is not None and task != expected_task:
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports task={expected_task!r}, got {task!r}"
+            )
 
     # 2b. Architecture-resolution safety rail. When the GGUF architecture string
     # bridges to a specialised registry key, verify the metadata-derived config
@@ -1234,6 +1264,8 @@ def build_from_gguf(
     # 8. Run model-specific preprocess_weights (HF → ONNX names)
     if hasattr(module, "preprocess_weights"):
         state_dict = module.preprocess_weights(state_dict)
+    if is_draft_architecture(gguf_arch):
+        state_dict.pop("d2t", None)
 
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
@@ -1278,6 +1310,9 @@ def build_from_gguf(
         )
         if mtp_pkg is not None:
             pkg.mtp_head = mtp_pkg
+
+    if draft_manifest is not None:
+        pkg.draft_manifest = draft_manifest
 
     return pkg
 
@@ -2193,9 +2228,21 @@ def _load_dequantized_state_dict(
     if name_mapper is None:
         name_mapper = map_gguf_to_hf_names
 
+    if gguf_arch in {"dflash", "eagle3"}:
+        # d2t is an integer orchestration table, not an ONNX initializer. The
+        # gguf package intentionally has no I64 "dequantizer", so exclude it
+        # before asking the reader to materialize neural tensors.
+        tensors = (
+            (name, gguf_model.dequantize_raw_tensor(raw, qtype, shape))
+            for name, raw, qtype, shape in gguf_model.tensor_items_raw()
+            if name != "d2t"
+        )
+    else:
+        tensors = gguf_model.tensor_items()
+
     state_dict = {}
     for gguf_name, np_array in tqdm.tqdm(
-        gguf_model.tensor_items(),
+        tensors,
         desc="Dequantizing tensors",
         total=gguf_model.num_tensors,
     ):
@@ -2335,6 +2382,8 @@ def _load_quantized_state_dict(
         desc="Repacking tensors",
         total=gguf_model.num_tensors,
     ):
+        if gguf_arch in {"dflash", "eagle3"} and gguf_name == "d2t":
+            continue
         hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
             if warn_unmapped:

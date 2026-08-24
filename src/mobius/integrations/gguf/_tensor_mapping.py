@@ -71,6 +71,43 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+_DFLASH_MAPPING: dict[str, str] = {
+    "fc": "fc",
+    "enc.output_norm": "hidden_norm",
+    "output_norm": "norm",
+    "output": "lm_head",
+    "d2t": "d2t",
+    "blk.{bid}.attn_q": "layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_norm": "layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_norm": "layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "layers.{bid}.self_attn.k_norm",
+    "blk.{bid}.ffn_gate": "layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_norm": "layers.{bid}.post_attention_layernorm",
+}
+
+_EAGLE3_MAPPING: dict[str, str] = {
+    "fc": "fc",
+    "enc.output_norm": "input_norm",
+    "output_norm": "norm",
+    "output": "lm_head",
+    "d2t": "d2t",
+    "blk.{bid}.attn_q": "self_attn.q_proj",
+    "blk.{bid}.attn_k": "self_attn.k_proj",
+    "blk.{bid}.attn_v": "self_attn.v_proj",
+    "blk.{bid}.attn_output": "self_attn.o_proj",
+    "blk.{bid}.attn_norm": "input_layernorm",
+    "blk.{bid}.attn_norm_2": "hidden_norm",
+    "blk.{bid}.ffn_gate": "mlp.gate_proj",
+    "blk.{bid}.ffn_up": "mlp.up_proj",
+    "blk.{bid}.ffn_down": "mlp.down_proj",
+    "blk.{bid}.ffn_norm": "post_attention_layernorm",
+}
+
 # OLMo 1 uses weight-free LayerNorm throughout. Its GGUF therefore has no
 # normalization tensors: using the broader Llama recipe would obscure that
 # architectural invariant even though no extra source tensors happen to arrive.
@@ -558,6 +595,8 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "dflash": _DFLASH_MAPPING,
+        "eagle3": _EAGLE3_MAPPING,
         "olmo": _OLMO_MAPPING,
         "arcee": _ARCEE_MAPPING,
         "olmo2_extras": _OLMO2_EXTRAS,

@@ -1669,6 +1669,8 @@ class DFlashConfig(CausalLMConfig):
     block_size: int | None = None
     mask_token_id: int | None = None
     num_target_layers: int | None = None
+    draft_vocab_size: int | None = None
+    use_draft_lm_head: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> DFlashConfig:
@@ -1766,6 +1768,8 @@ class Eagle3Config(CausalLMConfig):
     fc_norm: bool = False
     target_hidden_size: int | None = None
     eagle_aux_hidden_state_layer_ids: list[int] | None = None
+    target_layer_ids: list[int] | None = None
+    use_target_lm_head: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Eagle3Config:

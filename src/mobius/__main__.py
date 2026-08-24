@@ -640,6 +640,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
         reuse_gguf_weights=reuse_gguf_weights,
+        target_config=getattr(args, "target_config", None),
     )
 
     if args.release:
@@ -671,6 +672,13 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
         )
         print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
+
+    draft_manifest = getattr(pkg, "draft_manifest", None)
+    if draft_manifest is not None:
+        from mobius.integrations.gguf._draft import write_draft_manifest
+
+        manifest_path = write_draft_manifest(draft_manifest, output_dir)
+        print(f"Saved draft pairing manifest to {manifest_path}")
 
     runtime = getattr(args, "runtime", None)
     if runtime in ("onnx-genai", "ort-genai"):
@@ -1198,6 +1206,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Reuse compatible tensor byte ranges directly from the original GGUF. "
             "The GGUF must be a real file in the flat output directory; converted "
             "weights are written to model.onnx.data."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--target-config",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Exact target model directory or config.json for a dflash/eagle3 "
+            "speculative draft. The adjacent tokenizer.json is required and its "
+            "ordered vocabulary must exactly match the GGUF tokenizer."
         ),
     )
     gguf_parser.add_argument(

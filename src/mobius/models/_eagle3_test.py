@@ -194,9 +194,9 @@ class TestEagle3SpeculatorsConfig:
         out_names = [v.name for v in pkg["model"].graph.outputs]
         assert "draft_logits" in out_names and "next_hidden" in out_names
 
-    def test_unsupported_options_raise(self):
-        with pytest.raises(NotImplementedError):
-            Eagle3DraftModel(_eagle3_config(target_hidden_size=128))
+    def test_distinct_target_hidden_width_sizes_fc_input(self):
+        model = Eagle3DraftModel(_eagle3_config(target_hidden_size=128))
+        assert model.fc.weight.shape == (64, 3 * 128)
 
 
 class TestEagle3TaskGraph:
