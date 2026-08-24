@@ -14,10 +14,12 @@ than a HuggingFace intermediate.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import librosa
 import numpy as np
+import onnx_ir as ir
 import pytest
 import torch
 import transformers
@@ -203,6 +205,47 @@ def synthetic_models():
     return hf_model, package, config
 
 
+def _nonmutating_hf_greedy(hf_model, encoder_hidden_states, encoder_attention_mask, steps):
+    """Greedy decode with a pristine encoder context handed to every step.
+
+    HuggingFace's ``MoonshineStreamingDecoder`` adds its absolute position table
+    to ``encoder_hidden_states`` with ``+=``, mutating the caller's tensor. With
+    cached cross-attention the mutated tensor is never read again, so the result
+    is unaffected — but the reference this test compares against must not depend
+    on that, so each step gets a fresh clone. This is the same semantics the
+    exported ONNX decoder implements: encoder context is added exactly once.
+
+    Returns ``(tokens, per_step_logits)``.
+    """
+    from transformers.cache_utils import DynamicCache, EncoderDecoderCache
+
+    cache = EncoderDecoderCache(
+        DynamicCache(config=hf_model.config), DynamicCache(config=hf_model.config)
+    )
+    current = torch.tensor([[hf_model.config.decoder_start_token_id]], dtype=torch.long)
+    tokens: list[int] = []
+    per_step: list[np.ndarray] = []
+    for step in range(steps):
+        with torch.no_grad():
+            output = hf_model.model.decoder(
+                input_ids=current,
+                encoder_hidden_states=encoder_hidden_states.clone(),
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_values=cache,
+                position_ids=torch.tensor([[step]], dtype=torch.long),
+                use_cache=True,
+            )
+            logits = hf_model.proj_out(output.last_hidden_state)
+        cache = output.past_key_values
+        per_step.append(logits[0, -1].float().numpy())
+        token = int(logits[0, -1].argmax())
+        tokens.append(token)
+        if token == _EOS_TOKEN_ID:
+            break
+        current = torch.tensor([[token]], dtype=torch.long)
+    return tokens, per_step
+
+
 @pytest.fixture(scope="module")
 def real_models():
     package = build(_MODEL_ID, dtype="f32", load_weights=True, revision=_REVISION)
@@ -257,6 +300,31 @@ class TestMoonshineStreamingConfigExtraction:
         assert config.encoder_head_dim == 40
         assert config.vocab_size == 32_768
         assert config.decoder_start_token_id == 1
+
+    def test_rejects_float16_on_cuda(self):
+        """An inaccurate dtype/EP target fails loudly instead of downgrading."""
+        import onnx_ir as ir
+
+        config = MoonshineStreamingConfig.from_transformers(_tiny_hf_config())
+        config.dtype = ir.DataType.FLOAT16
+        with pytest.raises(ValueError, match="float16 with the CUDA"):
+            config.validate_execution_provider("cuda")
+
+        # Everything else this model actually supports stays allowed.
+        config.validate_execution_provider("cpu")
+        for dtype in (ir.DataType.FLOAT, ir.DataType.BFLOAT16):
+            config.dtype = dtype
+            config.validate_execution_provider("cuda")
+
+    def test_build_rejects_float16_on_cuda(self):
+        """The rejection is wired into the builder, not just the config."""
+        config = MoonshineStreamingConfig.from_transformers(_tiny_hf_config())
+        config = dataclasses.replace(config, dtype=ir.DataType.FLOAT16)
+        module = MoonshineStreamingForConditionalGeneration(config)
+        with pytest.raises(ValueError, match="float16 with the CUDA"):
+            build_from_module(
+                module, config, task=SpeechToTextTask(), execution_provider="cuda"
+            )
 
     def test_rejects_other_model_types(self):
         config = _tiny_hf_config()
@@ -581,6 +649,180 @@ class TestMoonshineStreamingRealWeightParity:
             encoder_outputs["encoder_attention_mask"],
         )
         assert_logits_close(actual["logits"], expected.logits.numpy(), rtol=1e-3, atol=1e-3)
+
+    def test_golden_reference_guard_blocks_encoder_mutation(self, real_models):
+        """The golden generator's guard really stops the in-place ``+=``.
+
+        Without it the reference decoder rewrites the caller's encoder context
+        on every step, so this asserts the unguarded mutation exists (otherwise
+        the guard would be silently vacuous) and that the guard removes it.
+        """
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+        try:
+            from generate_golden import non_mutating_encoder_context
+        finally:
+            sys.path.pop(0)
+
+        hf_model, _processor, _package, _config = real_models
+        with torch.no_grad():
+            encoder = hf_model.get_encoder()(
+                input_values=torch.from_numpy(np.zeros((1, 80 * 40), dtype=np.float32) + 0.01),
+                attention_mask=torch.ones((1, 80 * 40), dtype=torch.long),
+            )
+        pristine = encoder.last_hidden_state.clone()
+
+        def decode_once(states):
+            with torch.no_grad():
+                hf_model.model.decoder(
+                    input_ids=torch.tensor([[1]], dtype=torch.long),
+                    encoder_hidden_states=states,
+                    encoder_attention_mask=encoder.attention_mask,
+                    use_cache=True,
+                )
+
+        unguarded = pristine.clone()
+        decode_once(unguarded)
+        assert not torch.equal(unguarded, pristine), (
+            "upstream decoder is expected to mutate encoder_hidden_states in place"
+        )
+
+        guarded = pristine.clone()
+        with non_mutating_encoder_context(hf_model):
+            decode_once(guarded)
+        assert torch.equal(guarded, pristine)
+
+    def test_decoder_adds_encoder_context_exactly_once(self, real_models, real_audio_inputs):
+        """The ONNX decoder must not accumulate encoder context across steps.
+
+        HuggingFace's decoder adds ``pos_emb`` to ``encoder_hidden_states`` in
+        place, so a decoder that re-used a mutated buffer would drift. The
+        exported graph takes the encoder output as a read-only input and adds
+        the position table on every call, so replaying step 0 after a full
+        decode must reproduce the original step-0 logits bit for bit, and the
+        input buffer must come back untouched.
+        """
+        _hf_model, _processor, package, config = real_models
+        encoder_outputs = _run_encoder(
+            package,
+            real_audio_inputs["input_values"],
+            real_audio_inputs["attention_mask"],
+        )
+        encoder_hidden_states = encoder_outputs["encoder_hidden_states"]
+        pristine = encoder_hidden_states.copy()
+
+        def step_zero_logits():
+            session = OnnxModelSession(package["decoder"])
+            try:
+                return session.run(
+                    _decoder_feeds(
+                        config,
+                        np.array([[config.decoder_start_token_id]], dtype=np.int64),
+                        encoder_hidden_states,
+                        encoder_outputs["encoder_attention_mask"],
+                    )
+                )["logits"]
+            finally:
+                session.close()
+
+        first = step_zero_logits()
+        _onnx_greedy_generate(
+            package,
+            config,
+            encoder_outputs,
+            max_new_tokens=20,
+            start_id=config.decoder_start_token_id,
+        )
+        replayed = step_zero_logits()
+
+        np.testing.assert_array_equal(encoder_hidden_states, pristine)
+        np.testing.assert_array_equal(replayed, first)
+
+    def test_stepwise_logit_parity_with_nonmutating_reference(
+        self, real_models, real_audio_inputs
+    ):
+        """Every decode step matches a non-mutating HuggingFace reference.
+
+        Token-level agreement can hide logit drift, so this compares the full
+        vocabulary distribution at every step against a reference that is
+        handed a pristine encoder context each call.
+        """
+        hf_model, processor, package, config = real_models
+        encoder_outputs = _run_encoder(
+            package,
+            real_audio_inputs["input_values"],
+            real_audio_inputs["attention_mask"],
+        )
+
+        with torch.no_grad():
+            expected_encoder = hf_model.get_encoder()(
+                input_values=torch.from_numpy(real_audio_inputs["input_values"]),
+                attention_mask=torch.from_numpy(
+                    real_audio_inputs["attention_mask"].astype(np.int64)
+                ),
+            )
+        expected_tokens, expected_logits = _nonmutating_hf_greedy(
+            hf_model,
+            expected_encoder.last_hidden_state,
+            expected_encoder.attention_mask,
+            steps=50,
+        )
+
+        session = OnnxModelSession(package["decoder"])
+        try:
+            cache = _empty_cache_feeds(config)
+            current = np.array([[config.decoder_start_token_id]], dtype=np.int64)
+            actual_tokens: list[int] = []
+            for step in range(len(expected_logits)):
+                outputs = session.run(
+                    _decoder_feeds(
+                        config,
+                        current,
+                        encoder_outputs["encoder_hidden_states"],
+                        encoder_outputs["encoder_attention_mask"],
+                        past_key_values=cache,
+                        position_offset=step,
+                    )
+                )
+                assert_logits_close(
+                    outputs["logits"][0, -1],
+                    expected_logits[step],
+                    rtol=1e-3,
+                    atol=1e-3,
+                )
+                token = int(outputs["logits"][0, -1].argmax())
+                actual_tokens.append(token)
+                if token == _EOS_TOKEN_ID:
+                    break
+                current = np.array([[token]], dtype=np.int64)
+                cache = {
+                    f"past_key_values.{layer_idx}.{kind}": outputs[
+                        f"present.{layer_idx}.{kind}"
+                    ]
+                    for layer_idx in range(config.num_hidden_layers)
+                    for kind in ("key", "value")
+                }
+        finally:
+            session.close()
+
+        assert len(actual_tokens) == len(expected_tokens)
+        assert actual_tokens == expected_tokens
+
+        # The committed L5 golden must describe this same non-mutating decode.
+        content = (
+            expected_tokens[:-1]
+            if expected_tokens and expected_tokens[-1] == _EOS_TOKEN_ID
+            else expected_tokens
+        )
+        golden = load_generation_golden(
+            next(
+                case for case in discover_test_cases(level="L5") if case.model_id == _MODEL_ID
+            )
+        )
+        assert len(content) == len(golden)
+        assert content == golden
+        assert processor.decode(content, skip_special_tokens=True)
 
     def test_float16_cpu_parity_and_transcript(self, real_audio_inputs, real_models):
         """fp16 keeps full-logit parity and an identical transcript on ORT CPU.

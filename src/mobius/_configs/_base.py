@@ -1620,6 +1620,22 @@ class ArchitectureConfig(BaseModelConfig):
                 "Invalid ArchitectureConfig:\n" + "\n".join(f"  - {e}" for e in errors)
             )
 
+    def validate_execution_provider(self, execution_provider: str) -> None:
+        """Reject build targets this architecture cannot execute accurately.
+
+        Called by the builder with the requested execution provider once the
+        dtype is known. The default accepts everything; architectures with a
+        known-bad dtype/EP combination override this and raise, so an
+        inaccurate target fails loudly instead of silently producing a package
+        whose output cannot be trusted.
+
+        Args:
+            execution_provider: Target EP name, e.g. ``"cuda"`` or ``"cpu"``.
+
+        Raises:
+            ValueError: If the dtype/EP combination is known to be inaccurate.
+        """
+
 
 def _as_attribute_config(value: object) -> object:
     """Recursively give a plain ``dict`` HF sub-config attribute access.
@@ -4722,6 +4738,29 @@ class MoonshineStreamingConfig(SpeechToTextConfig):
     def encoder_output_size(self) -> int:
         """Encoder width; the decoder projects it when it differs from its own."""
         return self.encoder_hidden_size
+
+    def validate_execution_provider(self, execution_provider: str) -> None:
+        """Reject float16 on CUDA, where ORT computes this encoder incorrectly.
+
+        ORT's CUDA float16 fused attention kernel mishandles the sparsest
+        masked query row. Encoder frame 0 sees only ``left`` keys of the whole
+        sequence under the per-layer window (4 of 456 on the reference
+        checkpoint), and ORT returns that frame as exactly zero, while the same
+        graph is accurate on CPU float16 and on CUDA in float32/bfloat16.
+
+        Refusing the combination is deliberate: the defect belongs to the
+        execution provider, so compensating for it inside the graph would hide
+        it and diverge from upstream. float32 (the default) and bfloat16 are
+        unaffected on CUDA, and float16 is supported on CPU.
+        """
+        super().validate_execution_provider(execution_provider)
+        if self.dtype == ir.DataType.FLOAT16 and execution_provider == "cuda":
+            raise ValueError(
+                "moonshine_streaming does not support dtype float16 with the "
+                "CUDA execution provider: ORT's CUDA float16 attention kernel "
+                "returns encoder frame 0 as zero for this model's sliding-window "
+                "mask. Use dtype float32 or bfloat16 on CUDA, or float16 on CPU."
+            )
 
     @property
     def frame_length(self) -> int:

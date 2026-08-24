@@ -158,6 +158,8 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
+    if hasattr(config, "validate_execution_provider"):
+        config.validate_execution_provider(execution_provider)
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
