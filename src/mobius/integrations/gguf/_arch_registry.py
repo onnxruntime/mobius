@@ -104,6 +104,52 @@ _NO_QUANTIZED_PROJECTION_REASON = (
     "weights. Use keep_quantized=False for explicit float import."
 )
 
+_ARCTIC_GGUF_GRAPH_REASON = (
+    "The pinned Arctic graph is not a standard pre-norm MoE block: every layer runs a "
+    "dense parallel SwiGLU branch, then adds a separately normalized routed-expert branch "
+    "computed from the pre-attention residual. Mobius's generic MoE graph replaces the "
+    "dense FFN instead, so aliasing the existing Hugging Face 'arctic' registration would "
+    "change residual topology and normalization."
+)
+
+_DBRX_GGUF_GRAPH_REASON = (
+    "The pinned DBRX graph requires LayerNorm, a fused QKV projection, Q/K/V projection "
+    "clamping from attention.clamp_kqv, and a second LayerNorm before its routed experts. "
+    "Mobius's generic MoE graph uses RMSNorm, separate Q/K/V projections, and no K/Q/V "
+    "clamp; the existing Hugging Face 'dbrx' registration is therefore not GGUF-compatible."
+)
+
+_GPT_OSS_GGUF_GRAPH_REASON = (
+    "The pinned GPT-OSS converter splits interleaved gate/up expert rows and repacks "
+    "checkpoint block+scale tensors into expert-major MXFP4 values. Its loader additionally "
+    "consumes expert biases, router bias, attention sinks, output bias, post-attention RMSNorm, "
+    "and sliding-window RoPE metadata. Mobius does not yet own that complete GGUF transform "
+    "and packed-expert ABI, so partial float or MXFP4 import is deferred."
+)
+
+_GROK_GGUF_GRAPH_REASON = (
+    "The pinned Grok graph applies embedding, attention-output, and logit scales; attention, "
+    "and optional final-logit softcaps; post-attention and post-FFN norms; and a "
+    "dense-plus-routed expert residual scaled by sqrt(2)/2. Mobius's generic MoE graph has "
+    "none of that combined topology, so the Hugging Face-style expert names are not evidence "
+    "that a GGUF alias is safe."
+)
+
+_GROVEMOE_GGUF_GRAPH_REASON = (
+    "The pinned GroveMoE graph shares router logits across two distinct expert banks but "
+    "performs separate selections for normal and grouped chunk experts, then scales the "
+    "adjugate contribution independently. It also applies per-head Q/K RMSNorm. Mobius has "
+    "no graph or quantized ownership contract for the chunk-expert tensors, and silently "
+    "treating them as ordinary experts would drop a required branch."
+)
+
+_SMALLTHINKER_GGUF_GRAPH_REASON = (
+    "The pinned SmallThinker graph computes router logits from the unnormalized layer input, "
+    "uses ReLU experts with metadata-selected sigmoid or softmax gating, and can disable RoPE "
+    "or select sliding-window attention per layer. Mobius's generic MoE graph routes after "
+    "the FFN norm with softmax/SwiGLU experts and has no matching per-layer RoPE schedule."
+)
+
 _MINICPM3_GRAPH_REASON = (
     "The pinned MiniCPM3 graph uses MLA Q/KV LoRA projections, separate NoPE/RoPE "
     "query and key channels, and embedding, residual, and LM-head scales. The current "
@@ -865,6 +911,55 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         llama_qk_permute=True,
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    # ------------------------- Remaining conventional-attention MoE (audited/deferred)
+    GGUFArchitectureSpec(
+        gguf_arch="arctic",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_ARCTIC_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="dbrx",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_DBRX_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="gpt-oss",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_GPT_OSS_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="grok",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_GROK_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="grovemoe",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_GROVEMOE_GGUF_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="smallthinker",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_SMALLTHINKER_GGUF_GRAPH_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="cohere2",

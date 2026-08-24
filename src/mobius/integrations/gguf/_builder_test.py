@@ -4215,9 +4215,15 @@ class TestGGUFPreflightGuards:
             "kimi-k3",
             "kimi-linear",
             "lfm2moe",
+            "arctic",
+            "dbrx",
+            "gpt-oss",
+            "grok",
+            "grovemoe",
+            "smallthinker",
         ],
     )
-    def test_deferred_second_hybrid_cohort_fails_before_graph_construction(
+    def test_deferred_audited_cohorts_fail_before_graph_construction(
         self, architecture: str, tmp_path: Path
     ) -> None:
         from mobius import _builder as core_builder

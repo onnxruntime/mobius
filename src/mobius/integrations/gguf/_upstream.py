@@ -75,6 +75,8 @@ class UpstreamArchitecture:
             These are semantic sidecars, not part of the loader-required closure.
         expert_tensor_suffixes: Exact suffixes created for routed expert tensors
             by the pinned C++ generic loader pass.
+        tensor_suffixes: Per-family suffix closure for architectures whose tensor
+            families do not share one suffix set.
     """
 
     gguf_arch: str
@@ -85,6 +87,7 @@ class UpstreamArchitecture:
     tensor_names: tuple[str, ...] = ()
     converter_extra_tensor_names: tuple[str, ...] = ()
     expert_tensor_suffixes: tuple[str, ...] = ()
+    tensor_suffixes: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -145,6 +148,10 @@ def upstream_architectures() -> dict[str, UpstreamArchitecture]:
             tensor_names=tuple(fields.get("tensor_names", ())),
             converter_extra_tensor_names=tuple(fields.get("converter_extra_tensor_names", ())),
             expert_tensor_suffixes=tuple(fields.get("expert_tensor_suffixes", ())),
+            tensor_suffixes=tuple(
+                (family, tuple(suffixes))
+                for family, suffixes in fields.get("tensor_suffixes", {}).items()
+            ),
         )
         for name, fields in _payload()["architectures"].items()
     }
