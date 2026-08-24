@@ -230,21 +230,16 @@ class GgufPreflightReport:
             + ("supported" if self.sparse_moe_fusion_supported else "NOT supported")
         )
         if self.output_bytes is not None:
+            lines.append("  budget (real artifacts, direct random-access — no merged copy):")
             lines.append(
-                "  budget (real artifacts, direct random-access — no merged copy):"
-            )
-            lines.append(
-                f"    download   : {_gib(self.total_bytes):.3f} GiB "
-                f"(shard set, read in place)"
+                f"    download   : {_gib(self.total_bytes):.3f} GiB (shard set, read in place)"
             )
             lines.append(
                 f"    onnx output: {_gib(self.output_bytes):.3f} GiB "
                 f"(block-preserving external data)"
             )
             if self.vram_weights_bytes is not None:
-                lines.append(
-                    f"    weights VRAM: {_gib(self.vram_weights_bytes):.3f} GiB"
-                )
+                lines.append(f"    weights VRAM: {_gib(self.vram_weights_bytes):.3f} GiB")
         if self.type_stats:
             lines.append("  tensor types (lossless disposition vs. the real repacker):")
             for stat in self.type_stats:

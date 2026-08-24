@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -77,6 +78,20 @@ def _raw_quant_rows(qtype, n_rows: int, k: int) -> np.ndarray:
     return np.zeros((n_rows, bytes_per_row), dtype=np.uint8)
 
 
+def _raw_quant_expert_rows(qtype, n_expert: int, n_rows: int, k: int) -> np.ndarray:
+    """Zeroed raw-block bytes for a 3D routed-expert tensor.
+
+    Shaped ``(n_expert, n_rows, bytes_per_row)`` — the layout of a real GGUF
+    ``blk.i.ffn_*_exps.weight`` fused-expert tensor whose rows are *qtype*
+    native blocks.
+    """
+    from gguf import GGML_QUANT_SIZES
+
+    block_elems, block_bytes = GGML_QUANT_SIZES[qtype]
+    bytes_per_row = (k // block_elems) * block_bytes
+    return np.zeros((n_expert, n_rows, bytes_per_row), dtype=np.uint8)
+
+
 def _write_quant_sharded_gguf(
     directory: Path,
     *,
@@ -130,6 +145,84 @@ def _write_quant_sharded_gguf(
     writer.write_tensors_to_file()
     writer.close()
     return sorted(directory.glob(f"{stem}-*.gguf"))
+
+
+def _write_glm_moe_iq1_sharded_gguf(
+    directory: Path,
+    *,
+    real_prefix: str = "GLM-5.2-UD-IQ1_S",
+    num_experts: int = 8,
+    split_max_tensors: int = 2,
+) -> list[Path]:
+    """Write a sharded MoE GGUF faithful to the flagship GLM-5.2 UD-IQ1_S set.
+
+    Independently mirrors the three signals production preflight actually
+    consumes for the sparse-MoE honesty gate (see ``preflight_local_gguf`` /
+    ``_detect_quantization`` / ``_assess_sparse_moe``):
+
+    * the shard **filenames** carry the exact real
+      ``GLM-5.2-UD-IQ1_S-000i-of-000N.gguf`` quant tag that
+      ``_detect_quantization`` reads from ``path.name`` (candidate #2);
+    * ``general.architecture='glm-dsa'`` resolves to the MoE model type
+      ``glm_moe_dsa`` and ``glm-dsa.expert_count`` marks it as routed-expert
+      MoE (``_is_moe`` via ``num_experts``);
+    * the routed experts are **real per-projection**
+      ``blk.i.ffn_{gate,up,down}_exps.weight`` tensors physically stored as
+      ``IQ1_S`` native blocks (3D ``[n_expert, n_ff, k]``), so the detected
+      quant tag is consistent with the actual tensor payload.
+
+    ``gguf.GGUFWriter`` derives split filenames from the output stem and
+    truncates a dotted stem (``GLM-5.2`` -> ``GLM-5``), so the shards are first
+    written under a dot-free stem and then renamed to the exact real dotted
+    filename. Only the on-disk names change — the embedded split metadata
+    (``split.no``/``split.count``) is written by ``GGUFWriter`` and left
+    untouched, and shard discovery is filename-prefix based
+    (``discover_gguf_shards``), so the renamed set enumerates correctly.
+    """
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    directory.mkdir(parents=True, exist_ok=True)
+    writer = GGUFWriter(
+        str(directory / "iq1moe"), "glm-dsa", split_max_tensors=split_max_tensors
+    )
+    writer.add_context_length(128)
+    writer.add_embedding_length(256)
+    writer.add_block_count(1)
+    writer.add_head_count(4)
+    writer.add_head_count_kv(2)
+    writer.add_vocab_size(32)
+    writer.add_expert_count(num_experts)
+
+    k = 256
+    n_ff = 8
+    # F32 embedding (passthrough) + one repackable attention projection (Q8_0).
+    writer.add_tensor("token_embd.weight", np.zeros((8, k), np.float32))
+    writer.add_tensor(
+        "blk.0.attn_q.weight",
+        _raw_quant_rows(GGMLQuantizationType.Q8_0, 8, k),
+        raw_dtype=GGMLQuantizationType.Q8_0,
+    )
+    # Real per-projection routed-expert weights, physically IQ1_S native blocks.
+    for projection in ("gate", "up", "down"):
+        writer.add_tensor(
+            f"blk.0.ffn_{projection}_exps.weight",
+            _raw_quant_expert_rows(GGMLQuantizationType.IQ1_S, num_experts, n_ff, k),
+            raw_dtype=GGMLQuantizationType.IQ1_S,
+        )
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    renamed: list[Path] = []
+    for shard in sorted(directory.glob("iq1moe-*.gguf")):
+        match = re.match(r"^iq1moe-(\d{5})-of-(\d{5})\.gguf$", shard.name)
+        assert match is not None, shard.name
+        index, count = match.group(1), match.group(2)
+        target = directory / f"{real_prefix}-{index}-of-{count}.gguf"
+        shard.rename(target)
+        renamed.append(target)
+    return sorted(renamed)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,9 +504,7 @@ def test_local_preflight_supported_sharded_set_passes_shard_and_arch_gates(tmp_p
 
 
 def test_local_preflight_flags_exact_unsupported_native_qtypes(tmp_path):
-    shards = _write_quant_sharded_gguf(
-        tmp_path, split_max_tensors=2, include_unsupported=True
-    )
+    shards = _write_quant_sharded_gguf(tmp_path, split_max_tensors=2, include_unsupported=True)
     report = preflight_local_gguf(shards[0])
 
     # Being sharded is still not a blocker; the ONLY blocker is the exact
@@ -451,17 +542,57 @@ def test_budget_reflects_real_artifacts_only_no_second_copy(tmp_path):
 
 
 def test_sparse_iq1_moe_is_the_remaining_blocker_not_sharding(tmp_path):
-    # A sharded IQ1 MoE: the honesty blocker is sparse-MoE fusion, and sharding
-    # is not a blocker. This mirrors the flagship GLM-5.2 UD-IQ1_S case.
-    shards = _write_quant_sharded_gguf(
-        tmp_path, architecture="llama", split_max_tensors=2, num_experts=8
-    )
+    # Flagship GLM-5.2 UD-IQ1_S composition: a *sharded*, MoE, IQ1_S set whose
+    # ONLY honesty blocker must be sparse-MoE fusion — never sharding or the
+    # architecture. The fixture is faithful to the three signals production
+    # actually consumes, so the gate is exercised end-to-end and the positive
+    # assertions below fail if either filename quant detection or the
+    # sparse-MoE gate is bypassed (a fixture that put IQ1_S into no
+    # production-consumed candidate — the prior bug — leaves quantization=None,
+    # fusion_supported=True and no blocker, failing this test).
+    shards = _write_glm_moe_iq1_sharded_gguf(tmp_path, num_experts=8)
+
+    # -- Preconditions, proved explicitly (not assumed) ----------------------
+    assert len(shards) > 1
+    # The exact real GLM-5.2 shard filename is what production reads for the
+    # quant tag; prove filename detection independently before building.
+    first_name = shards[0].name
+    assert first_name.startswith("GLM-5.2-UD-IQ1_S-00001-of-000")
+    assert first_name.endswith(".gguf")
+    assert _detect_quantization(first_name) == "IQ1_S"
+
     report = preflight_local_gguf(shards[0])
-    # The set is sharded and the arch resolves; the only honesty concern is the
-    # sparse-MoE fusion of the IQ1_S experts (quantization detected from name).
-    assert report.is_sharded
+
+    # Sharded set + architecture resolves => neither is (or causes) a blocker.
+    assert report.is_sharded is True
+    assert report.split_count == len(shards)
+    assert report.architecture == "glm-dsa"
+    assert report.resolved_model_type == "glm_moe_dsa"
+    assert "architecture metadata missing" not in " ".join(report.warnings)
+    # MoE + IQ1_S quant are detected from the real metadata/filename.
+    assert report.num_experts == 8
+    assert report.quantization == "IQ1_S"
+    # The routed experts are physically IQ1_S and losslessly preserved, so the
+    # only remaining concern is fusion — not a lossy/unsupported-qtype blocker.
+    iq1_stats = [s for s in report.type_stats if s.type_name == "IQ1_S"]
+    assert iq1_stats, report.type_stats
+    assert all(s.disposition == "native-preserve" for s in iq1_stats)
+    assert report.unsupported_types == []
+
+    # -- The gate under test: sparse-MoE fusion is the remaining blocker ------
+    assert report.sparse_moe_fusion_supported is False
+    assert len(report.blockers) == 1
+    blocker = report.blockers[0]
+    assert "sparse-MoE fusion blocker" in blocker
+    assert "dense-all-expert" in blocker
+    assert "BlockQuantizedMoE" in blocker
+    assert "glm_moe_dsa" in blocker
+    assert "IQ1_S" in blocker
+
+    # -- Sharding is explicitly NOT the blocker ------------------------------
     joined = " ".join(report.blockers).lower()
-    assert "shard" not in joined and "split" not in joined
+    for forbidden in ("shard", "split", "merge", "double-copy", "second"):
+        assert forbidden not in joined, report.blockers
 
 
 # --------------------------------------------------------------------------- #
@@ -477,9 +608,7 @@ def test_single_preflight_gguf_cli_registration():
 
     parser = build_parser()
     subparsers = [
-        action
-        for action in parser._actions
-        if isinstance(action, argparse._SubParsersAction)
+        action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
     ]
     assert subparsers, "no subparsers found"
     choices = subparsers[0].choices
