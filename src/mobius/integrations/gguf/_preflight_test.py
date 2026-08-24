@@ -99,13 +99,14 @@ def _write_quant_sharded_gguf(
     stem: str = "q",
     split_max_tensors: int = 2,
     include_unsupported: bool = False,
-    num_experts: int | None = None,
 ) -> list[Path]:
     """Write a shape-faithful multi-shard GGUF with mixed real quant types.
 
     F32 (passthrough), Q8_0 (repack), IQ1_S (native-preserve), and — when
     *include_unsupported* — Q5_K (no lossless path). Bodies are zeroed; only the
-    headers (types/dims) matter to the metadata-only preflight.
+    headers (types/dims) matter to the metadata-only preflight. This dense
+    (non-MoE) fixture is deliberately expert-free; sparse routed-expert coverage
+    lives in :func:`_write_glm_moe_iq1_sharded_gguf`.
     """
     from gguf import GGMLQuantizationType, GGUFWriter
 
@@ -119,8 +120,6 @@ def _write_quant_sharded_gguf(
     writer.add_head_count(4)
     writer.add_head_count_kv(2)
     writer.add_vocab_size(32)
-    if num_experts is not None:
-        writer.add_expert_count(num_experts)
 
     k = 256
     writer.add_tensor("token_embd.weight", np.zeros((8, k), np.float32))
