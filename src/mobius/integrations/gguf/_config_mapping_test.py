@@ -34,6 +34,117 @@ def _dense_metadata(architecture: str) -> dict:
     }
 
 
+def _t5_metadata(architecture: str) -> dict:
+    return {
+        f"{architecture}.context_length": 512,
+        f"{architecture}.embedding_length": 64,
+        f"{architecture}.feed_forward_length": 128,
+        f"{architecture}.block_count": 2,
+        f"{architecture}.attention.head_count": 4,
+        f"{architecture}.attention.layer_norm_rms_epsilon": 1e-6,
+        f"{architecture}.attention.relative_buckets_count": 32,
+        f"{architecture}.vocab_size": 256,
+        "tokenizer.ggml.padding_token_id": 0,
+        "tokenizer.ggml.eos_token_id": 1,
+    }
+
+
+class TestT5Config:
+    @pytest.mark.parametrize(
+        ("architecture", "model_type"),
+        [("t5", "t5"), ("t5encoder", "t5encoder")],
+    )
+    def test_pinned_defaults_and_token_metadata(
+        self, architecture: str, model_type: str
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        names = ["enc.blk.0.attn_rel_b.weight"]
+        if architecture == "t5":
+            names.append("dec.blk.0.attn_rel_b.weight")
+        config = gguf_to_config(
+            _FakeDenseGGUF(architecture, _t5_metadata(architecture), names)
+        )
+
+        assert config.model_type == model_type
+        assert config.head_dim == 16
+        assert config.num_key_value_heads == 4
+        assert config.num_decoder_layers == (2 if architecture == "t5" else None)
+        assert config.decoder_start_token_id is None
+        assert config.relative_attention_num_buckets == 32
+        assert config.relative_attention_max_distance == 128
+        assert config.rms_norm_eps == pytest.approx(1e-6)
+        assert config.hidden_act == "relu"
+        assert config.is_gated_act is False
+        assert config.pad_token_id == 0
+        assert config.eos_token_id == 1
+
+    def test_unequal_decoder_count_start_token_and_gated_gelu_are_preserved(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _t5_metadata("t5")
+        metadata.update(
+            {
+                "t5.decoder_block_count": 3,
+                "t5.decoder_start_token_id": 0,
+                "t5.attention.key_length": 8,
+                "t5.attention.value_length": 8,
+            }
+        )
+        names = [
+            "enc.blk.0.attn_rel_b.weight",
+            "dec.blk.0.attn_rel_b.weight",
+            *(f"enc.blk.{i}.ffn_gate.weight" for i in range(2)),
+            *(f"dec.blk.{i}.ffn_gate.weight" for i in range(3)),
+        ]
+        config = gguf_to_config(_FakeDenseGGUF("t5", metadata, names))
+
+        assert config.num_decoder_layers == 3
+        assert config.decoder_start_token_id == 0
+        assert config.head_dim == 8
+        assert config.hidden_act == "gelu"
+        assert config.is_gated_act is True
+
+    @pytest.mark.parametrize(
+        ("updates", "names", "message"),
+        [
+            ({"t5.attention.head_count_kv": 2}, None, "head_count_kv"),
+            (
+                {
+                    "t5.attention.key_length": 8,
+                    "t5.attention.value_length": 16,
+                },
+                None,
+                "equal positive",
+            ),
+            ({}, ["dec.blk.0.attn_rel_b.weight"], "enc.blk.0.attn_rel_b"),
+            (
+                {},
+                [
+                    "enc.blk.0.attn_rel_b.weight",
+                    "dec.blk.0.attn_rel_b.weight",
+                    "enc.blk.0.ffn_gate.weight",
+                ],
+                "mixes gated and non-gated",
+            ),
+        ],
+    )
+    def test_unsupported_variants_are_rejected(
+        self, updates: dict, names: list[str] | None, message: str
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _t5_metadata("t5")
+        metadata.update(updates)
+        if names is None:
+            names = [
+                "enc.blk.0.attn_rel_b.weight",
+                "dec.blk.0.attn_rel_b.weight",
+            ]
+        with pytest.raises(ValueError, match=message):
+            gguf_to_config(_FakeDenseGGUF("t5", metadata, names))
+
+
 class TestDenseCohortConfig:
     @pytest.mark.parametrize("architecture", ["arcee", "smollm3", "exaone"])
     def test_rmsnorm_dense_configs(self, architecture: str) -> None:

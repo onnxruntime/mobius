@@ -375,6 +375,7 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
     _raise_for_malformed_recurrent_tensors(gguf_model)
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
+    _raise_for_invalid_t5_tensor_contract(gguf_model)
 
 
 def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
@@ -519,6 +520,124 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
         )
 
 
+def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:
+    """Validate the pinned T5/T5-encoder tensor closure and logical shapes."""
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    architecture = gguf_model.architecture
+    if architecture not in {"t5", "t5encoder"}:
+        return
+
+    metadata = gguf_model.metadata
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    encoder_layers = int(metadata[f"{architecture}.block_count"])
+    decoder_layers = (
+        int(metadata.get("t5.decoder_block_count", encoder_layers))
+        if architecture == "t5"
+        else 0
+    )
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    key_length = int(metadata.get(f"{architecture}.attention.key_length", hidden // heads))
+    value_length = int(metadata.get(f"{architecture}.attention.value_length", hidden // heads))
+    buckets = int(metadata[f"{architecture}.attention.relative_buckets_count"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+
+    actual_items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dim) for dim in shape) for name, _raw, _qtype, shape in actual_items
+    }
+    qtypes = {name: qtype for name, _raw, qtype, _shape in actual_items}
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "enc.output_norm.weight": (hidden,),
+        "enc.blk.0.attn_rel_b.weight": (buckets, heads),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (vocab, hidden),
+    }
+    if architecture == "t5":
+        required.update(
+            {
+                "dec.output_norm.weight": (hidden,),
+                "dec.blk.0.attn_rel_b.weight": (buckets, heads),
+            }
+        )
+
+    def add_stack(prefix: str, layers: int, *, decoder: bool) -> None:
+        for layer in range(layers):
+            base = f"{prefix}.blk.{layer}"
+            required.update(
+                {
+                    f"{base}.attn_norm.weight": (hidden,),
+                    f"{base}.attn_q.weight": (heads * key_length, hidden),
+                    f"{base}.attn_k.weight": (heads * key_length, hidden),
+                    f"{base}.attn_v.weight": (heads * value_length, hidden),
+                    f"{base}.attn_o.weight": (hidden, heads * value_length),
+                    f"{base}.ffn_norm.weight": (hidden,),
+                    f"{base}.ffn_up.weight": (intermediate, hidden),
+                    f"{base}.ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional[f"{base}.attn_rel_b.weight"] = (buckets, heads)
+            optional[f"{base}.ffn_gate.weight"] = (intermediate, hidden)
+            if decoder:
+                required.update(
+                    {
+                        f"{base}.cross_attn_norm.weight": (hidden,),
+                        f"{base}.cross_attn_q.weight": (heads * key_length, hidden),
+                        f"{base}.cross_attn_k.weight": (heads * key_length, hidden),
+                        f"{base}.cross_attn_v.weight": (heads * value_length, hidden),
+                        f"{base}.cross_attn_o.weight": (hidden, heads * value_length),
+                    }
+                )
+                # llama.cpp loads this tensor but deliberately does not consume
+                # it in the cross-attention graph.
+                optional[f"{base}.cross_attn_rel_b.weight"] = (buckets, heads)
+
+    add_stack("enc", encoder_layers, decoder=False)
+    add_stack("dec", decoder_layers, decoder=True)
+
+    missing = sorted(set(required) - set(actual))
+    if missing:
+        raise ValueError(f"{architecture} GGUF is missing required T5 tensor(s): {missing}")
+    expected = {**optional, **required}
+    malformed = {
+        name: (expected[name], actual[name])
+        for name in actual
+        if name in expected and actual[name] != expected[name]
+    }
+    if malformed:
+        raise ValueError(f"{architecture} GGUF has invalid T5 tensor shape(s): {malformed}")
+
+    float_type_ids = float_storage_type_ids()
+    small_non_float = []
+    for name, qtype in qtypes.items():
+        if name.endswith(("_norm.weight", "attn_rel_b.weight")):
+            qtype_id = getattr(qtype, "value", qtype)
+            if qtype_id not in float_type_ids:
+                small_non_float.append(name)
+    if small_non_float:
+        raise ValueError(
+            f"{architecture} GGUF relative-bias and norm tensors must remain float: "
+            f"{sorted(small_non_float)}"
+        )
+    ignored = sorted(
+        name
+        for name in actual
+        if (name == "output.weight" and architecture == "t5encoder")
+        or (name.endswith(".cross_attn_rel_b.weight"))
+    )
+    if ignored:
+        logger.warning(
+            "Ignoring pinned llama.cpp T5 tensor(s) that do not participate in "
+            "the architecture's output graph: %s",
+            ignored,
+        )
+
+
 def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
     """Reject recurrent tensor suffixes not created by the pinned C++ loaders."""
     from mobius.integrations.gguf._upstream import upstream_architecture
@@ -530,7 +649,11 @@ def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
     expected = set(upstream.tensor_names)
     malformed = []
     for name in gguf_model.tensor_names:
-        template = re.sub(r"^blk\.\d+\.", "blk.{bid}.", name)
+        template = re.sub(
+            r"^((?:enc\.|dec\.)?blk)\.\d+\.",
+            r"\1.{bid}.",
+            name,
+        )
         if template not in expected:
             malformed.append(name)
     if malformed:
@@ -826,13 +949,24 @@ def build_from_gguf(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
             "they carry per-layer conv_state and ssm_state rather than a KV cache."
         )
-    if model_type in {"bert", "modernbert"}:
+    if model_type in {"bert", "modernbert", "t5encoder"}:
         if static_cache:
             raise ValueError("static_cache is not valid for encoder-only GGUF architectures")
-        if task is not None and task != "feature-extraction":
+        expected_task = (
+            "t5-text-encoding" if model_type == "t5encoder" else "feature-extraction"
+        )
+        if task is not None and task != expected_task:
             raise ValueError(
-                f"{gguf_arch} GGUF only supports task='feature-extraction', got {task!r}"
+                f"{gguf_arch} GGUF only supports task={expected_task!r}, got {task!r}"
             )
+    if model_type == "t5":
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not valid for T5 seq2seq GGUF; use the "
+                "encoder/decoder cache contract"
+            )
+        if task is not None and task != "seq2seq":
+            raise ValueError(f"t5 GGUF only supports task='seq2seq', got {task!r}")
 
     # 2b. Architecture-resolution safety rail. When the GGUF architecture string
     # bridges to a specialised registry key, verify the metadata-derived config
@@ -1789,7 +1923,7 @@ def _can_quantize_embedding(
     # Encoder modules currently expose plain Embedding parameters. Keep their
     # token tables explicitly dequantized until they have a QuantizedEmbedding
     # factory and a validated GatherBlockQuantized ABI.
-    if gguf_arch in {"bert", "modern-bert"}:
+    if gguf_arch in {"bert", "modern-bert", "t5", "t5encoder"}:
         return False
 
     # Tencent files reuse the Q1_0 type id for a custom layout that gguf-py
@@ -1798,7 +1932,10 @@ def _can_quantize_embedding(
         return False
 
     for tensor in gguf_model.reader_tensors():
-        if map_gguf_to_hf_names(tensor.name, gguf_arch) != "model.embed_tokens.weight":
+        mapped_name = map_gguf_to_hf_names(tensor.name, gguf_arch)
+        if mapped_name is None or not mapped_name.endswith(
+            ("model.embed_tokens.weight", "shared.weight")
+        ):
             continue
         shape = tuple(reversed(tensor.shape))
         if len(shape) != 2:
@@ -1824,7 +1961,8 @@ def _can_quantize_lm_head(gguf_model, gguf_arch: str) -> bool:
 
     supported_types = lm_head_preserve_type_names()
     for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
-        if map_gguf_to_hf_names(name, gguf_arch) != "lm_head.weight":
+        mapped = map_gguf_to_hf_names(name, gguf_arch)
+        if mapped is None or not mapped.endswith("lm_head.weight"):
             continue
         return len(shape) == 2 and getattr(qtype, "name", None) in supported_types
     return False
@@ -2102,6 +2240,15 @@ def _load_quantized_state_dict(
             module_hf_name = module_hf_name[len("bert.") :]
         elif gguf_arch == "modern-bert" and module_hf_name.startswith("model."):
             module_hf_name = module_hf_name[len("model.") :]
+        elif gguf_arch in {"t5", "t5encoder"}:
+            from mobius.models.t5 import _rename_t5_weight
+
+            renamed = _rename_t5_weight(
+                module_hf_name,
+                is_gated_act=bool(getattr(config, "is_gated_act", False)),
+            )
+            if renamed is not None:
+                module_hf_name = renamed
 
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype

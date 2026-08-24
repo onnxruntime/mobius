@@ -9,6 +9,7 @@ import math
 
 import numpy as np
 import pytest
+import torch
 
 from mobius.models.t5 import _rename_t5_weight
 
@@ -117,20 +118,90 @@ class TestRelativePositionBucket:
 class TestT5WeightRename:
     """Test weight name mapping from HuggingFace to ONNX."""
 
-    def test_relative_attention_bias_lifted_to_encoder(self):
-        """Block 0's relative_attention_bias maps to encoder level."""
+    def test_relative_attention_bias_keeps_encoder_layer_index(self):
+        """Relative bias remains attached to its source encoder layer."""
         hf = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        assert _rename_t5_weight(hf) == "encoder.relative_attention_bias.weight"
+        assert _rename_t5_weight(hf) == "encoder.block.0.relative_attention_bias.weight"
 
-    def test_relative_attention_bias_lifted_to_decoder(self):
-        """Block 0's relative_attention_bias maps to decoder level."""
+    def test_relative_attention_bias_keeps_decoder_layer_index(self):
+        """Relative bias remains attached to its source decoder layer."""
         hf = "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        assert _rename_t5_weight(hf) == "decoder.relative_attention_bias.weight"
+        assert _rename_t5_weight(hf) == "decoder.block.0.relative_attention_bias.weight"
 
     def test_self_attention_projections(self):
         """Self-attention projections rename correctly."""
         hf = "encoder.block.2.layer.0.SelfAttention.q.weight"
         assert _rename_t5_weight(hf) == "encoder.block.2.self_attn.q_proj.weight"
+
+    def test_preprocess_preserves_values_and_ties_shared_weights(self):
+        from mobius._configs import ArchitectureConfig
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config = ArchitectureConfig(
+            vocab_size=8,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_decoder_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+            hidden_act="relu",
+            tie_word_embeddings=True,
+        )
+        model = T5ForConditionalGeneration(config)
+        shared = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        projection = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        relative_bias = torch.arange(64, dtype=torch.float32).reshape(32, 2)
+        transformed = model.preprocess_weights(
+            {
+                "shared.weight": shared,
+                "encoder.block.0.layer.0.SelfAttention.q.weight": projection,
+                "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight": (
+                    relative_bias
+                ),
+            }
+        )
+
+        assert transformed["encoder.block.0.self_attn.q_proj.weight"] is projection
+        assert transformed["encoder.block.0.relative_attention_bias.weight"] is relative_bias
+        assert transformed["encoder.embed_tokens.weight"] is shared
+        assert transformed["decoder.embed_tokens.weight"] is shared
+        assert transformed["decoder.lm_head.weight"] is shared
+
+    @pytest.mark.parametrize("bias_layers", [[0], [0, 1]])
+    def test_relative_bias_initializer_ownership_matches_source_layers(
+        self, bias_layers: list[int]
+    ):
+        from mobius import build_from_module
+        from mobius._configs import ArchitectureConfig
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config = ArchitectureConfig(
+            vocab_size=8,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=2,
+            num_decoder_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+            hidden_act="relu",
+            encoder_relative_attention_bias_layers=bias_layers,
+            decoder_relative_attention_bias_layers=bias_layers,
+        )
+        package = build_from_module(T5ForConditionalGeneration(config), config, task="seq2seq")
+
+        encoder_names = set(package["encoder"].graph.initializers)
+        decoder_names = set(package["decoder"].graph.initializers)
+        assert "encoder.block.0.relative_attention_bias.weight" in encoder_names
+        assert "decoder.block.0.relative_attention_bias.weight" in decoder_names
+        assert ("encoder.block.1.relative_attention_bias.weight" in encoder_names) == (
+            1 in bias_layers
+        )
+        assert ("decoder.block.1.relative_attention_bias.weight" in decoder_names) == (
+            1 in bias_layers
+        )
 
     def test_cross_attention_projections(self):
         """Cross-attention projections rename correctly."""

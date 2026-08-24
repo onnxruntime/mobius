@@ -68,8 +68,10 @@ def _make_decoder_feeds(
     feeds: dict[str, np.ndarray] = {
         "input_ids": decoder_input_ids,
         "encoder_hidden_states": encoder_hidden_states,
-        "attention_mask": attention_mask,
+        "attention_mask": np.ones_like(decoder_input_ids),
     }
+    if config.model_type in {"t5", "mt5"}:
+        feeds["encoder_attention_mask"] = attention_mask
     for i in range(num_layers):
         for prefix in ("self", "cross"):
             feeds[f"past_key_values.{i}.{prefix}.key"] = np.zeros(
@@ -205,7 +207,7 @@ class TestBartDecoderForward:
         decode_feeds: dict[str, np.ndarray] = {
             "input_ids": decode_ids,
             "encoder_hidden_states": encoder_hidden_states,
-            "attention_mask": attention_mask,
+            "attention_mask": np.ones((1, decoder_input_ids.shape[1] + 1), dtype=np.int64),
         }
         for i in range(num_layers):
             decode_feeds[f"past_key_values.{i}.self.key"] = onnx_out_1[f"present.{i}.self.key"]
@@ -327,6 +329,68 @@ class TestT5DecoderForward:
         assert_logits_close(
             onnx_out["logits"],
             torch_logits,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_decoder_cached_step_logits_match(self):
+        """Decoder reuses self/cross caches without re-projecting encoder states."""
+        config = _load_t5_config()
+        pkg = _build_t5_package(config)
+        torch_model = _load_torch_t5()
+
+        input_ids = np.array([[13959, 1566, 12, 2968, 10, 8774, 296, 1]], dtype=np.int64)
+        encoder_attention_mask = np.ones_like(input_ids)
+        encoder_hidden_states = torch_seq2seq_encoder_forward(
+            torch_model, input_ids, encoder_attention_mask
+        )
+        decoder_input_ids = np.array([[0, 1, 2]], dtype=np.int64)
+        torch_logits_1, torch_kv = torch_seq2seq_decoder_forward(
+            torch_model,
+            decoder_input_ids,
+            encoder_hidden_states,
+            encoder_attention_mask,
+        )
+
+        decoder_session = OnnxModelSession(pkg["decoder"])
+        prefill_feeds = _make_decoder_feeds(
+            config,
+            decoder_input_ids,
+            encoder_hidden_states,
+            encoder_attention_mask,
+        )
+        onnx_out_1 = decoder_session.run(prefill_feeds)
+        next_token = np.argmax(torch_logits_1[:, -1, :], axis=-1, keepdims=True).astype(
+            np.int64
+        )
+        torch_logits_2, _ = torch_seq2seq_decoder_forward(
+            torch_model,
+            next_token,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            past_key_values=torch_kv,
+        )
+
+        decode_feeds: dict[str, np.ndarray] = {
+            "input_ids": next_token,
+            "encoder_hidden_states": np.zeros(
+                (1, 0, config.hidden_size), dtype=encoder_hidden_states.dtype
+            ),
+            "attention_mask": np.ones((1, decoder_input_ids.shape[1] + 1), dtype=np.int64),
+            "encoder_attention_mask": encoder_attention_mask,
+        }
+        for i in range(config.num_decoder_layers):
+            for attention in ("self", "cross"):
+                for kind in ("key", "value"):
+                    decode_feeds[f"past_key_values.{i}.{attention}.{kind}"] = onnx_out_1[
+                        f"present.{i}.{attention}.{kind}"
+                    ]
+        onnx_out_2 = decoder_session.run(decode_feeds)
+        decoder_session.close()
+
+        assert_logits_close(
+            onnx_out_2["logits"],
+            torch_logits_2,
             rtol=1e-3,
             atol=1e-3,
         )

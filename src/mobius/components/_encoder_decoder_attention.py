@@ -45,18 +45,25 @@ class EncoderDecoderAttention(nn.Module):
         has_relative_attention_bias: bool = False,
         bias: bool = True,
         scale: float | None = None,
+        linear_class: type | None = None,
+        use_cross_attention_cache: bool = False,
     ):
         super().__init__()
+        if linear_class is None:
+            linear_class = Linear
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.is_causal = is_causal
+        self.use_cross_attention_cache = use_cross_attention_cache
         self._scale = scale if scale is not None else float(self.head_dim**-0.5)
 
-        self.q_proj = Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
-        self.k_proj = Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
-        self.v_proj = Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
-        self.out_proj = Linear(self.num_heads * self.head_dim, self.hidden_size, bias=bias)
+        self.q_proj = linear_class(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
+        self.k_proj = linear_class(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
+        self.v_proj = linear_class(self.hidden_size, self.num_heads * self.head_dim, bias=bias)
+        self.out_proj = linear_class(
+            self.num_heads * self.head_dim, self.hidden_size, bias=bias
+        )
 
         if has_relative_attention_bias:
             self.relative_attention_bias = Embedding(
@@ -89,15 +96,39 @@ class EncoderDecoderAttention(nn.Module):
         query_states = self.q_proj(op, hidden_states)
 
         if key_value_states is not None:
-            # Cross-attention: K/V projected from encoder hidden states.
-            # Encoder output is constant across decode steps, so we
-            # recompute the same projections each step and never
-            # concatenate with past — concatenation would incorrectly
-            # double the cross-attention sequence length.
+            # Cache-enabled cross-attention accepts an empty encoder sequence
+            # during decode; other callers continue to project full encoder
+            # states on every step.
             key_states = self.k_proj(op, key_value_states)
             value_states = self.v_proj(op, key_value_states)
-            past_key = None
-            past_value = None
+            if past_key_value is not None:
+                past_key, past_value = past_key_value
+                if self.use_cross_attention_cache:
+                    # Attention requires a non-empty current K/V sequence even
+                    # when past is supplied. Flatten the cached head layout and
+                    # concatenate it with the newly projected encoder suffix.
+                    flat_shape = op.Concat(
+                        op.Shape(past_key, start=0, end=1),
+                        op.Shape(past_key, start=2, end=3),
+                        op.Constant(value_ints=[self.num_heads * self.head_dim]),
+                        axis=0,
+                    )
+                    flat_past_key = op.Reshape(
+                        op.Transpose(past_key, perm=[0, 2, 1, 3]), flat_shape
+                    )
+                    flat_past_value = op.Reshape(
+                        op.Transpose(past_value, perm=[0, 2, 1, 3]), flat_shape
+                    )
+                    key_states = op.Concat(flat_past_key, key_states, axis=1)
+                    value_states = op.Concat(flat_past_value, value_states, axis=1)
+                # Cross-attention presents the complete K/V sequence as current
+                # input. Non-caching callers keep the historical behavior of
+                # recomputing it from full encoder states.
+                past_key = None
+                past_value = None
+            else:
+                past_key = None
+                past_value = None
         else:
             key_states = self.k_proj(op, hidden_states)
             value_states = self.v_proj(op, hidden_states)
@@ -120,6 +151,16 @@ class EncoderDecoderAttention(nn.Module):
             is_causal=1 if self.is_causal else 0,
             _outputs=3,
         )
+        if key_value_states is not None:
+            present_shape = op.Concat(
+                op.Shape(key_states, start=0, end=1),
+                op.Constant(value_ints=[self.num_heads]),
+                op.Shape(key_states, start=1, end=2),
+                op.Constant(value_ints=[self.head_dim]),
+                axis=0,
+            )
+            present_key = op.Reshape(present_key, present_shape)
+            present_value = op.Reshape(present_value, present_shape)
 
         output = self.out_proj(op, attn_output)
         return output, (present_key, present_value)

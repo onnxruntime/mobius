@@ -278,6 +278,61 @@ _MODERN_BERT_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": "model.layers.{bid}.mlp_norm",
 }
 
+_T5_MAPPING: dict[str, str] = {
+    "token_embd": "shared",
+    "output": "lm_head",
+    "enc.output_norm": "encoder.final_layer_norm",
+    "dec.output_norm": "decoder.final_layer_norm",
+    "enc.blk.{bid}.attn_norm": "encoder.block.{bid}.layer.0.layer_norm",
+    "enc.blk.{bid}.attn_rel_b": (
+        "encoder.block.{bid}.layer.0.SelfAttention.relative_attention_bias"
+    ),
+    "enc.blk.{bid}.attn_q": "encoder.block.{bid}.layer.0.SelfAttention.q",
+    "enc.blk.{bid}.attn_k": "encoder.block.{bid}.layer.0.SelfAttention.k",
+    "enc.blk.{bid}.attn_v": "encoder.block.{bid}.layer.0.SelfAttention.v",
+    "enc.blk.{bid}.attn_o": "encoder.block.{bid}.layer.0.SelfAttention.o",
+    "enc.blk.{bid}.ffn_norm": "encoder.block.{bid}.layer.1.layer_norm",
+    "enc.blk.{bid}.ffn_gate": "encoder.block.{bid}.layer.1.DenseReluDense.wi_0",
+    "enc.blk.{bid}.ffn_up": "encoder.block.{bid}.layer.1.DenseReluDense.wi_1",
+    "enc.blk.{bid}.ffn_down": "encoder.block.{bid}.layer.1.DenseReluDense.wo",
+    "dec.blk.{bid}.attn_norm": "decoder.block.{bid}.layer.0.layer_norm",
+    "dec.blk.{bid}.attn_rel_b": (
+        "decoder.block.{bid}.layer.0.SelfAttention.relative_attention_bias"
+    ),
+    "dec.blk.{bid}.attn_q": "decoder.block.{bid}.layer.0.SelfAttention.q",
+    "dec.blk.{bid}.attn_k": "decoder.block.{bid}.layer.0.SelfAttention.k",
+    "dec.blk.{bid}.attn_v": "decoder.block.{bid}.layer.0.SelfAttention.v",
+    "dec.blk.{bid}.attn_o": "decoder.block.{bid}.layer.0.SelfAttention.o",
+    "dec.blk.{bid}.cross_attn_norm": "decoder.block.{bid}.layer.1.layer_norm",
+    "dec.blk.{bid}.cross_attn_rel_b": (
+        "decoder.block.{bid}.layer.1.EncDecAttention.relative_attention_bias"
+    ),
+    "dec.blk.{bid}.cross_attn_q": "decoder.block.{bid}.layer.1.EncDecAttention.q",
+    "dec.blk.{bid}.cross_attn_k": "decoder.block.{bid}.layer.1.EncDecAttention.k",
+    "dec.blk.{bid}.cross_attn_v": "decoder.block.{bid}.layer.1.EncDecAttention.v",
+    "dec.blk.{bid}.cross_attn_o": "decoder.block.{bid}.layer.1.EncDecAttention.o",
+    "dec.blk.{bid}.ffn_norm": "decoder.block.{bid}.layer.2.layer_norm",
+    "dec.blk.{bid}.ffn_gate": "decoder.block.{bid}.layer.2.DenseReluDense.wi_0",
+    "dec.blk.{bid}.ffn_up": "decoder.block.{bid}.layer.2.DenseReluDense.wi_1",
+    "dec.blk.{bid}.ffn_down": "decoder.block.{bid}.layer.2.DenseReluDense.wo",
+}
+
+_T5_PROJECTION_STEMS = frozenset(
+    stem
+    for stem in _T5_MAPPING
+    if stem.endswith(
+        (
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_o",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        )
+    )
+)
+
 _RECURRENT_SUFFIXES: dict[str, dict[str, frozenset[str]]] = {
     "mamba": {
         "token_embd": frozenset({".weight", ".scale", ".input_scale"}),
@@ -460,6 +515,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "mamba2": _MAMBA2_MAPPING,
         "bert": _BERT_MAPPING,
         "modern_bert": _MODERN_BERT_MAPPING,
+        "t5": _T5_MAPPING,
         "deepseek4": _DEEPSEEK4_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,
@@ -538,6 +594,7 @@ def _build_mapping(
 # Regex to extract the block index from "blk.0.attn_q" etc.
 _BLK_PATTERN = re.compile(r"blk\.(\d+)\.")
 _BLK_TEMPLATE = "blk.{bid}."
+_T5_BLOCK_PATTERN = re.compile(r"((?:enc|dec)\.blk)\.(\d+)\.")
 
 
 def _split_suffix(name: str) -> tuple[str, str]:
@@ -577,6 +634,21 @@ def map_gguf_to_hf_names(
 
     stem, suffix = _split_suffix(gguf_name)
     mapping = _build_mapping(architecture)
+
+    if architecture in {"t5", "t5encoder"}:
+        match = _T5_BLOCK_PATTERN.match(stem)
+        lookup = _T5_BLOCK_PATTERN.sub(r"\1.{bid}.", stem) if match else stem
+        allowed = {".weight"}
+        if lookup in _T5_PROJECTION_STEMS:
+            allowed.update({".scale", ".input_scale"})
+        if suffix not in allowed:
+            return None
+        hf_pattern = mapping.get(lookup)
+        if hf_pattern is None:
+            return None
+        if match:
+            hf_pattern = hf_pattern.replace("{bid}", match.group(2))
+        return hf_pattern + suffix
 
     # Block-indexed tensors: blk.{N}.xxx → model.layers.{N}.xxx
     blk_match = _BLK_PATTERN.match(stem)

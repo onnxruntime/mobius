@@ -375,7 +375,12 @@ def _write_encoder_gguf(
             return
         if name == malformed:
             shape = (*shape, 1)
-        writer.add_tensor(name, rng.normal(0, 0.02, shape).astype(np.float32))
+        values = (
+            np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+            if name.endswith("attn_rel_b.weight")
+            else rng.normal(0, 0.02, shape).astype(np.float32)
+        )
+        writer.add_tensor(name, values)
 
     def add_q4(name: str, n_out: int, k_in: int) -> None:
         if name == omit:
@@ -437,6 +442,121 @@ def _write_encoder_gguf(
         add_float("cls.weight", (hidden, hidden))
     if auxiliary_suffix is not None:
         add_float(f"blk.0.attn_output.{auxiliary_suffix}", (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
+    writer.close()
+
+
+def _write_t5_gguf(
+    path: Path,
+    architecture: str,
+    *,
+    quantized: bool = False,
+    gated: bool = False,
+    encoder_layers: int = 1,
+    decoder_layers: int = 1,
+    omit: str | None = None,
+    malformed: str | None = None,
+    auxiliary_suffix: str | None = None,
+) -> None:
+    """Write a tiny pinned-layout T5 or T5-encoder GGUF."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    vocab = 64
+    heads = 4
+    head_dim = hidden // heads
+    buckets = 8
+    writer = GGUFWriter(str(path), architecture)
+    writer.add_context_length(32)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(encoder_layers)
+    writer.add_head_count(heads)
+    writer.add_key_length(head_dim)
+    writer.add_value_length(head_dim)
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_relative_attn_buckets_count(buckets)
+    writer.add_vocab_size(vocab)
+    writer.add_tokenizer_model("t5")
+    writer.add_token_list([f"token-{index}" for index in range(vocab)])
+    writer.add_pad_token_id(0)
+    writer.add_eos_token_id(1)
+    if architecture == "t5":
+        writer.add_decoder_block_count(decoder_layers)
+        writer.add_decoder_start_token_id(0)
+
+    rng = np.random.default_rng(0)
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        if name == malformed:
+            shape = (*shape, 1)
+        values = (
+            np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+            if name.endswith("attn_rel_b.weight")
+            else rng.normal(0, 0.02, shape).astype(np.float32)
+        )
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, int]) -> None:
+        if name == omit:
+            return
+        n_out, k_in = shape
+        if name == malformed:
+            n_out += 1
+        raw = np.zeros((n_out, (k_in // 32) * 18), dtype=np.uint8)
+        for block in range(k_in // 32):
+            offset = block * 18
+            raw[:, offset] = 0
+            raw[:, offset + 1] = 60
+            raw[:, offset + 2 : offset + 18] = rng.integers(
+                0, 256, (n_out, 16), dtype=np.uint8
+            )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    def add_matrix(name: str, shape: tuple[int, int]) -> None:
+        if quantized:
+            add_q4(name, shape)
+        else:
+            add_float(name, shape)
+
+    add_matrix("token_embd.weight", (vocab, hidden))
+    add_float("enc.output_norm.weight", (hidden,))
+
+    def add_stack(prefix: str, layers: int, *, decoder: bool) -> None:
+        for layer in range(layers):
+            base = f"{prefix}.blk.{layer}"
+            add_float(f"{base}.attn_norm.weight", (hidden,))
+            for projection in ("q", "k", "v"):
+                add_matrix(f"{base}.attn_{projection}.weight", (hidden, hidden))
+            add_matrix(f"{base}.attn_o.weight", (hidden, hidden))
+            add_float(f"{base}.ffn_norm.weight", (hidden,))
+            if gated:
+                add_matrix(f"{base}.ffn_gate.weight", (intermediate, hidden))
+            add_matrix(f"{base}.ffn_up.weight", (intermediate, hidden))
+            add_matrix(f"{base}.ffn_down.weight", (hidden, intermediate))
+            if layer == 0:
+                add_float(f"{base}.attn_rel_b.weight", (buckets, heads))
+            if decoder:
+                add_float(f"{base}.cross_attn_norm.weight", (hidden,))
+                for projection in ("q", "k", "v"):
+                    add_matrix(
+                        f"{base}.cross_attn_{projection}.weight",
+                        (hidden, hidden),
+                    )
+                add_matrix(f"{base}.cross_attn_o.weight", (hidden, hidden))
+
+    add_stack("enc", encoder_layers, decoder=False)
+    if architecture == "t5":
+        add_float("dec.output_norm.weight", (hidden,))
+        add_stack("dec", decoder_layers, decoder=True)
+    if auxiliary_suffix is not None:
+        add_float(f"enc.blk.0.attn_q.{auxiliary_suffix}", (1,))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -2546,6 +2666,240 @@ class TestEncoderGGUFBuild:
 
         path = tmp_path / f"{architecture}-{suffix}.gguf"
         _write_encoder_gguf(path, architecture, auxiliary_suffix=suffix)
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"scale/input_scale"):
+            build_from_gguf(path)
+
+
+class TestT5GGUFBuild:
+    """T5 GGUFs preserve encoder-only and seq2seq task contracts."""
+
+    @staticmethod
+    def _run_encoder(model, sequence_length: int, masked: bool = False) -> np.ndarray:
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        mask = np.ones((1, sequence_length), dtype=np.int64)
+        if masked:
+            mask[0, -1] = 0
+        session = OnnxModelSession(model)
+        try:
+            outputs = session.run(
+                {
+                    "input_ids": np.arange(sequence_length, dtype=np.int64)[None, :],
+                    "attention_mask": mask,
+                }
+            )
+        finally:
+            session.close()
+        assert set(outputs) == {"last_hidden_state"}
+        return outputs["last_hidden_state"]
+
+    @staticmethod
+    def _run_seq2seq(package) -> tuple[np.ndarray, np.ndarray]:
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        encoder = OnnxModelSession(package["encoder"])
+        decoder = OnnxModelSession(package["decoder"])
+        try:
+            encoder_mask = np.array([[1, 1, 0]], dtype=np.int64)
+            encoder_outputs = encoder.run(
+                {
+                    "input_ids": np.array([[2, 3, 0]], dtype=np.int64),
+                    "attention_mask": encoder_mask,
+                }
+            )
+            hidden = encoder_outputs["last_hidden_state"]
+            prefill_feeds = {
+                "input_ids": np.array([[0]], dtype=np.int64),
+                "encoder_hidden_states": hidden,
+                "attention_mask": np.ones((1, 1), dtype=np.int64),
+                "encoder_attention_mask": encoder_mask,
+            }
+            for layer in range(2):
+                for attention in ("self", "cross"):
+                    for kind in ("key", "value"):
+                        prefill_feeds[f"past_key_values.{layer}.{attention}.{kind}"] = (
+                            np.zeros((1, 4, 0, 8), dtype=np.float32)
+                        )
+            prefill = decoder.run(prefill_feeds)
+
+            decode_feeds = {
+                "input_ids": np.array([[1]], dtype=np.int64),
+                "encoder_hidden_states": np.zeros((1, 0, 32), dtype=np.float32),
+                "attention_mask": np.ones((1, 2), dtype=np.int64),
+                "encoder_attention_mask": encoder_mask,
+            }
+            for layer in range(2):
+                for attention in ("self", "cross"):
+                    for kind in ("key", "value"):
+                        decode_feeds[f"past_key_values.{layer}.{attention}.{kind}"] = prefill[
+                            f"present.{layer}.{attention}.{kind}"
+                        ]
+            decode = decoder.run(decode_feeds)
+        finally:
+            encoder.close()
+            decoder.close()
+
+        assert prefill["present.1.self.key"].shape == (1, 4, 1, 8)
+        assert prefill["present.1.cross.key"].shape == (1, 4, 3, 8)
+        assert decode["present.1.self.key"].shape == (1, 4, 2, 8)
+        assert decode["present.1.cross.key"].shape == (1, 4, 3, 8)
+        return prefill["logits"], decode["logits"]
+
+    def test_t5encoder_float_save_load_and_variable_masks(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "t5encoder-f32.gguf"
+        _write_t5_gguf(path, "t5encoder")
+        package = build_from_gguf(path)
+        assert set(package) == {"model"}
+        assert {value.name for value in package["model"].graph.outputs} == {
+            "last_hidden_state"
+        }
+        assert not any(
+            marker in value.name
+            for value in (*package["model"].graph.inputs, *package["model"].graph.outputs)
+            for marker in ("past_key_values", "present", "logits")
+        )
+
+        saved = tmp_path / "t5encoder-saved"
+        package.save(saved, progress_bar=False)
+        reloaded = ModelPackage.load(saved)
+        for sequence_length in (1, 3, 7):
+            output = self._run_encoder(
+                reloaded["model"], sequence_length, masked=sequence_length > 1
+            )
+            assert output.shape == (1, sequence_length, 32)
+            assert np.isfinite(output).all()
+
+    def test_t5encoder_quantized_projection_matches_dequantized(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "t5encoder-q4.gguf"
+        _write_t5_gguf(path, "t5encoder", quantized=True)
+        preserved = build_from_gguf(path, keep_quantized=True)["model"]
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+
+        op_types = {node.op_type for node in preserved.graph}
+        assert "MatMulNBits" in op_types
+        assert "GatherBlockQuantized" not in op_types
+        actual = self._run_encoder(preserved, 5, masked=True)
+        expected = self._run_encoder(explicit_float, 5, masked=True)
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-2)
+
+    def test_relative_bias_values_keep_bucket_head_orientation(self, tmp_path: Path) -> None:
+        import torch
+
+        from mobius.integrations.gguf._builder import _load_dequantized_state_dict
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "t5encoder-relative-bias.gguf"
+        _write_t5_gguf(path, "t5encoder")
+        state_dict = _load_dequantized_state_dict(GGUFModel(path), "t5encoder")
+        expected = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        assert torch.equal(
+            state_dict["encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"],
+            expected,
+        )
+
+    def test_t5_builds_distinct_encoder_and_decoder_contracts(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "t5-f32.gguf"
+        _write_t5_gguf(path, "t5", encoder_layers=1, decoder_layers=2)
+        package = build_from_gguf(path)
+        assert set(package) == {"encoder", "decoder"}
+        decoder_inputs = {value.name for value in package["decoder"].graph.inputs}
+        assert {"encoder_hidden_states", "encoder_attention_mask"} <= decoder_inputs
+        assert "past_key_values.1.cross.key" in decoder_inputs
+        assert {value.name for value in package["decoder"].graph.outputs} >= {
+            "logits",
+            "present.1.self.key",
+            "present.1.cross.key",
+        }
+        prefill_logits, decode_logits = self._run_seq2seq(package)
+        assert prefill_logits.shape == decode_logits.shape == (1, 1, 64)
+        assert np.isfinite(prefill_logits).all()
+        assert np.isfinite(decode_logits).all()
+
+    def test_t5_quantized_prefill_and_decode_match_dequantized(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "t5-q4.gguf"
+        _write_t5_gguf(
+            path,
+            "t5",
+            quantized=True,
+            encoder_layers=1,
+            decoder_layers=2,
+        )
+        preserved = build_from_gguf(path, keep_quantized=True)
+        explicit_float = build_from_gguf(path, keep_quantized=False)
+        assert "MatMulNBits" in {
+            node.op_type for model in preserved.values() for node in model.graph
+        }
+
+        actual_prefill, actual_decode = self._run_seq2seq(preserved)
+        expected_prefill, expected_decode = self._run_seq2seq(explicit_float)
+        np.testing.assert_allclose(actual_prefill, expected_prefill, rtol=0, atol=1e-2)
+        np.testing.assert_allclose(actual_decode, expected_decode, rtol=0, atol=1e-2)
+
+    @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
+    def test_task_and_static_cache_misdispatch_is_rejected(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-task.gguf"
+        _write_t5_gguf(path, architecture)
+        with pytest.raises(ValueError, match="only supports task"):
+            build_from_gguf(path, task="text-generation")
+        with pytest.raises(ValueError, match="static_cache"):
+            build_from_gguf(path, static_cache=True)
+
+    @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
+    @pytest.mark.parametrize("failure", ["missing", "rank"])
+    def test_missing_and_malformed_tensors_fail_before_graph_build(
+        self,
+        tmp_path: Path,
+        architecture: str,
+        failure: str,
+        monkeypatch,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        target = "enc.blk.0.attn_q.weight"
+        path = tmp_path / f"{architecture}-{failure}.gguf"
+        _write_t5_gguf(
+            path,
+            architecture,
+            omit=target if failure == "missing" else None,
+            malformed=target if failure == "rank" else None,
+        )
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"missing required|invalid T5 tensor shape"):
+            build_from_gguf(path)
+
+    @pytest.mark.parametrize("architecture", ["t5", "t5encoder"])
+    @pytest.mark.parametrize("suffix", ["scale", "input_scale"])
+    def test_auxiliary_quantization_sidecars_are_never_dropped(
+        self, tmp_path: Path, architecture: str, suffix: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-{suffix}.gguf"
+        _write_t5_gguf(path, architecture, auxiliary_suffix=suffix)
         monkeypatch.setattr(
             core_builder,
             "build_from_module",
