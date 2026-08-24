@@ -396,7 +396,7 @@ def test_fuses_expert_storm_into_single_bqmoe() -> None:
     # E experts x 3 projections + 3 shared projections.
     assert _count(graph, _MATMUL_OP) == E * 3 + 3
 
-    fused = fuse_block_quantized_moe(model)
+    fused = fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
 
     assert fused == 1
     assert _count(graph, "BlockQuantizedMoE") == 1
@@ -413,7 +413,7 @@ def test_fuses_expert_storm_into_single_bqmoe() -> None:
 
 def test_domain_and_opset_registered() -> None:
     model, _ = _build_dense_graph()
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     assert moe.domain == _NXRT
     assert model.graph.opset_imports[_NXRT] == 1
@@ -421,7 +421,7 @@ def test_domain_and_opset_registered() -> None:
 
 def test_input_wiring_matches_runtime_abi() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     # 9-input BlockQuantizedMoE ABI order (fused SwiGLU: no fc3).
     assert len(moe.inputs) == 9
@@ -442,7 +442,7 @@ def test_input_wiring_matches_runtime_abi() -> None:
 def test_fused_swiglu_weights_are_byte_identical() -> None:
     """gate_fmt == up_fmt -> fc1 = concat(gate, up) rows; bytes untouched."""
     model, w = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     fc1 = moe.inputs[2].const_value.numpy()
     fc2 = moe.inputs[4].const_value.numpy()
@@ -456,7 +456,7 @@ def test_fused_swiglu_weights_are_byte_identical() -> None:
 def test_unfused_swiglu_weights_are_byte_identical() -> None:
     """gate_fmt != up_fmt -> fc1 = gate, fc3 = up, fc2 = down; bytes untouched."""
     model, w = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq3_xxs", down_fmt="iq4_xs")
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     fc1 = moe.inputs[2].const_value.numpy()
     fc2 = moe.inputs[4].const_value.numpy()
@@ -470,7 +470,7 @@ def test_unfused_swiglu_weights_are_byte_identical() -> None:
 
 def test_expert_major_bank_dtype_is_uint8() -> None:
     model, _ = _build_dense_graph()
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     assert moe.inputs[2].dtype == ir.DataType.UINT8
     assert moe.inputs[4].dtype == ir.DataType.UINT8
@@ -493,7 +493,7 @@ def test_uniform_format_stays_layout_version_1() -> None:
 
 def test_fused_mixed_format_emits_layout_version_2() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     attrs = moe.attributes
     assert attrs["block_layout_version"].value == 2
@@ -506,7 +506,7 @@ def test_fused_mixed_format_emits_layout_version_2() -> None:
 
 def test_unfused_mixed_format_emits_all_projection_formats() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq3_xxs", down_fmt="iq4_xs")
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     attrs = moe.attributes
     assert attrs["block_layout_version"].value == 2
@@ -518,7 +518,7 @@ def test_unfused_mixed_format_emits_all_projection_formats() -> None:
 
 def test_core_attributes_match_bqmoe_abi() -> None:
     model, _ = _build_dense_graph()
-    fuse_block_quantized_moe(model)
+    fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     attrs = _moe(model.graph).attributes
     assert attrs["k"].value == K
     assert attrs["activation_type"].value == "swiglu"
@@ -526,39 +526,47 @@ def test_core_attributes_match_bqmoe_abi() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Per-projection (block_layout_version=2) runtime-capability gate             #
+# Per-projection (block_layout_version=2): fail-closed default + schema hook   #
 # --------------------------------------------------------------------------- #
-def test_mixed_format_without_v2_runtime_fails_closed() -> None:
-    """A mixed-format layer needs v2; if the runtime lacks it, fail closed.
+def test_mixed_format_rejects_v2_by_default() -> None:
+    """A direct public call rejects a mixed-format (v2-only) layer by default.
 
-    The export authority passes ``perproj_v2_runtime=False`` when the deployed
-    runtime has not shipped the ``block_layout_version=2`` per-projection ABI.
-    Emitting a v2 node then would be an unrunnable overclaim, so the layer must
-    fail closed atomically with the dense graph left untouched.
+    No shipped onnx-genai runtime executes the ``block_layout_version=2``
+    per-projection ABI, so ``fuse_block_quantized_moe`` fails closed for a
+    mixed-format layer with no opt-in of any kind. The reject is atomic: the
+    dense graph is left untouched.
     """
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
     graph = model.graph
     with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        fuse_block_quantized_moe(model, perproj_v2_runtime=False)
+        fuse_block_quantized_moe(model)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E  # dense graph left untouched
 
 
-def test_uniform_format_fuses_without_v2_runtime() -> None:
-    """A uniform-format layer is a v1 node, so it fuses even without v2 support."""
+def test_uniform_format_still_fuses_to_v1() -> None:
+    """A uniform-format layer is a v1 node, so it fuses under the fail-closed default."""
     model, _ = _build_dense_graph(gate_fmt="iq4_xs", up_fmt="iq4_xs", down_fmt="iq4_xs")
-    assert fuse_block_quantized_moe(model, perproj_v2_runtime=False) == 1
+    assert fuse_block_quantized_moe(model) == 1
     attrs = _moe(model.graph).attributes
     assert "block_layout_version" not in attrs  # v1
     assert attrs["format"].value == "iq4_xs"
 
 
-def test_mixed_format_with_v2_runtime_emits_v2() -> None:
-    """With v2 runtime support, a mixed-format layer emits one v2 node."""
+def test_perproj_v2_schema_hook_is_test_only() -> None:
+    """The private ``_allow_perproj_v2_schema`` hook builds the v2 node shape.
+
+    This is the schema-construction test path only: the emitted v2 node is not
+    runnable on any shipped runtime and is unreachable from the production
+    builder, the CLI, or an environment variable. It exists so the per-projection
+    v2 schema stays covered until a real typed runtime-capability handshake ships.
+    """
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    assert fuse_block_quantized_moe(model, perproj_v2_runtime=True) == 1
+    assert fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True) == 1
     attrs = _moe(model.graph).attributes
     assert attrs["block_layout_version"].value == 2
+    assert attrs["fc1_format"].value == "iq1_s"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
 # --------------------------------------------------------------------------- #
@@ -567,7 +575,7 @@ def test_mixed_format_with_v2_runtime_emits_v2() -> None:
 def test_fuses_legacy_gate_sigmoid_activation() -> None:
     """The legacy ``gate * Sigmoid(gate)`` SwiGLU decomposition still fuses."""
     model, _ = _build_dense_graph(activation="legacy")
-    fused = fuse_block_quantized_moe(model)
+    fused = fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     assert fused == 1
     assert _count(model.graph, "BlockQuantizedMoE") == 1
 
@@ -576,7 +584,7 @@ def test_fuses_f16_graph_with_cast_wrapped_projections() -> None:
     """f16 exports wrap every projection in Cast; the trace and cast-back work."""
     model, _ = _build_dense_graph(dtype=ir.DataType.FLOAT16)
     graph = model.graph
-    fused = fuse_block_quantized_moe(model)
+    fused = fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     assert fused == 1
     moe = _moe(graph)
     # BlockQuantizedMoE output is FLOAT; a Cast restores the f16 routed dtype.

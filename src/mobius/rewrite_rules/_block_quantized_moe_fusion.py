@@ -604,15 +604,19 @@ class _FusionPlan:
     experts: int
 
 
-def _plan_layer(layer: _DenseMoELayer, index: int, *, perproj_v2_runtime: bool) -> _FusionPlan:
+def _plan_layer(
+    layer: _DenseMoELayer, index: int, *, allow_perproj_v2_schema: bool
+) -> _FusionPlan:
     """Validate and byte-stack one native MoE layer without touching the graph.
 
-    ``perproj_v2_runtime`` declares whether the target runtime implements the
-    ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI. When a
-    layer mixes native formats across its fc1/fc2/fc3 banks it can only be
-    expressed as a v2 node; if the runtime cannot execute v2, planning fails
-    closed here (before any graph mutation) rather than emitting an unrunnable
-    node.
+    ``allow_perproj_v2_schema`` is a private, test-only switch. A layer that
+    mixes native formats across its fc1/fc2/fc3 banks can only be expressed as a
+    ``block_layout_version=2`` per-projection node, and no shipped onnx-genai
+    runtime executes that ABI yet. It therefore defaults off on every production,
+    CLI, and environment path, and planning fails closed for such a layer (before
+    any graph mutation) rather than emitting an unrunnable node. It is set
+    ``True`` only by schema-construction tests that assert the v2 node's shape;
+    the node they build is not runnable and must never be shipped.
     """
     ids = sorted(layer.experts)
     gate_nodes = [layer.experts[i].gate for i in ids]
@@ -668,14 +672,16 @@ def _plan_layer(layer: _DenseMoELayer, index: int, *, perproj_v2_runtime: bool) 
     if len(distinct) == 1:
         attributes["format"] = next(iter(distinct))
     else:
-        if not perproj_v2_runtime:
+        if not allow_perproj_v2_schema:
             raise _UnfusableError(
                 "mixed per-projection native formats "
                 f"{sorted(distinct)} can only be expressed with the "
                 "block_layout_version=2 per-projection BlockQuantizedMoE ABI, "
-                "which the target runtime does not implement -- emitting a v2 "
-                "node would build an unrunnable graph (overclaim). Set "
-                "MOBIUS_ENABLE_BQMOE_PERPROJ_V2=1 only once the runtime ships it"
+                "which no shipped onnx-genai runtime implements -- emitting a v2 "
+                "node would build an unrunnable graph (overclaim), so export "
+                "fails closed. There is no production, CLI, or environment opt-in; "
+                "v2 stays a schema-construction test path until a typed runtime "
+                "capability handshake ships"
             )
         attributes["block_layout_version"] = 2
         # ``format`` is the required base/fallback; per-projection attributes
@@ -829,7 +835,7 @@ def fuse_block_quantized_moe(
     model: ir.Model,
     *,
     allow_dense_moe: bool | None = None,
-    perproj_v2_runtime: bool = True,
+    _allow_perproj_v2_schema: bool = False,
 ) -> int:
     """Fuse every dense-fallback native-block MoE subgraph into ``BlockQuantizedMoE``.
 
@@ -858,14 +864,17 @@ def fuse_block_quantized_moe(
             ``allow_dense_moe_experts`` flag / ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``
             environment variable is used. This is a research/correctness path
             only and makes no throughput claim.
-        perproj_v2_runtime: Whether the target runtime implements the
-            ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI
-            (mixed native formats across a layer's fc1/fc2/fc3 banks, e.g.
-            GLM-5.2 UD-IQ1 with an iq1 gate/up and a higher-bit down). This is a
-            pure graph transform, so it defaults to ``True`` (v2 is always
-            representable); the GGUF export authority passes the actual runtime
-            capability so a mixed-format layer fails closed rather than emitting
-            an unrunnable v2 node when the runtime has not shipped v2 yet.
+        _allow_perproj_v2_schema: Private, test-only switch. A layer that mixes
+            native formats across its fc1/fc2/fc3 banks (e.g. GLM-5.2 UD-IQ1 with
+            an iq1 gate/up and a higher-bit down) can only be expressed with the
+            ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI.
+            No shipped onnx-genai runtime implements that ABI, so this defaults to
+            ``False`` (fail closed): the production ``build_from_gguf`` path never
+            sets it, and a mixed-format layer typed-rejects rather than emitting an
+            unrunnable v2 node. It is ``True`` only in schema-construction tests
+            that assert the v2 node's shape; that node is not runnable and must
+            never be shipped. Until a real typed runtime-capability handshake
+            exists there is no production, CLI, or environment path to v2.
 
     Returns:
         The number of MoE layers fused.
@@ -893,7 +902,9 @@ def fuse_block_quantized_moe(
             continue
         try:
             layer.check_fusable()
-            plans.append(_plan_layer(layer, index, perproj_v2_runtime=perproj_v2_runtime))
+            plans.append(
+                _plan_layer(layer, index, allow_perproj_v2_schema=_allow_perproj_v2_schema)
+            )
         except _UnfusableError as reason:
             _fail_closed(layer, reason, allow_dense=allow_dense_moe)
 

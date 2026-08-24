@@ -19,7 +19,6 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
-import os
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
@@ -226,46 +225,33 @@ def _assert_sparse_moe_capability(module, config, *, source: str, allow_dense: b
     )
 
 
-def _perproj_bqmoe_v2_runtime_available() -> bool:
-    """Whether the deployed pkg.nxrt runtime implements the v2 BlockQuantizedMoE ABI.
-
-    A layer that mixes native block formats across its fc1/fc2/fc3 banks (e.g.
-    GLM-5.2 UD-IQ1 with an iq1 gate/up and a higher-bit down projection) can only
-    be expressed with the ``block_layout_version=2`` per-projection
-    ``BlockQuantizedMoE`` ABI. That ABI is not yet merged/released in the
-    onnx-genai runtime, so emitting a v2 node here would build an ONNX graph the
-    current runtime cannot execute -- an overclaim. Default ``False`` makes such
-    mixed-format layers fail closed (typed reject) until the runtime ships v2;
-    set ``MOBIUS_ENABLE_BQMOE_PERPROJ_V2=1`` only once it does.
-    """
-    return os.environ.get("MOBIUS_ENABLE_BQMOE_PERPROJ_V2", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def _fuse_native_block_moe(pkg, *, allow_dense: bool) -> int:
     """Collapse routed native-block expert storms into sparse ``BlockQuantizedMoE``.
 
     Runs on the final, fully-weighted graph so the fusion can stack each layer's
     per-expert native blocks byte-for-byte into one expert-major bank. Every
     candidate layer is validated before any node is emitted, so an unfusable
-    layer (mixed format with no v2 runtime, per-expert bias, ragged/incomplete
-    group) raises :class:`SparseMoEExportError` atomically with the graph
-    untouched, unless ``allow_dense`` downgrades it to a warning + dense keep.
+    layer (per-expert bias, ragged/incomplete group, ...) raises
+    :class:`SparseMoEExportError` atomically with the graph untouched, unless
+    ``allow_dense`` downgrades it to a warning + dense keep.
+
+    A layer that mixes native formats across its fc1/fc2/fc3 banks (GLM-5.2
+    UD-IQ1) can only be expressed with the ``block_layout_version=2``
+    per-projection ABI, which no shipped onnx-genai runtime executes yet. The
+    production builder therefore never enables v2: such layers always
+    typed-reject here rather than emit an unrunnable node. There is no
+    environment or CLI opt-in -- v2 stays a schema-construction test path until a
+    real typed runtime-capability handshake exists.
     """
     # Imported lazily: the generic rewrite lives in the rewrite_rules package and
     # must not be pulled into the GGUF import graph at module load time.
     from mobius.rewrite_rules import fuse_block_quantized_moe
 
-    perproj_v2 = _perproj_bqmoe_v2_runtime_available()
     fused = 0
     for model in pkg.values():
-        fused += fuse_block_quantized_moe(
-            model, allow_dense_moe=allow_dense, perproj_v2_runtime=perproj_v2
-        )
+        # No ``_allow_perproj_v2_schema`` argument: the production authority path
+        # always fails closed for mixed-format v2 (fail-safe default).
+        fused += fuse_block_quantized_moe(model, allow_dense_moe=allow_dense)
     return fused
 
 
