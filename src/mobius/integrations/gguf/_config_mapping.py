@@ -96,6 +96,9 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.group_count": "linear_num_key_heads",
     "ssm.time_step_rank": "linear_num_value_heads",
     "ssm.conv_kernel": "linear_conv_kernel_dim",
+    "ssm.inner_size": "linear_inner_size",
+    "ssm.state_size": "linear_key_head_dim",
+    "shortconv.l_cache": "short_conv_kernel",
 }
 
 _DRAFT_KEY_MAP = {
@@ -290,6 +293,100 @@ def _extract_config_fields(
     return hf_fields
 
 
+_DELTA_NET_ARCHITECTURES = frozenset({"qwen35", "qwen35moe", "qwen3next"})
+
+
+def _nextn_predict_layers(gguf_arch: str, metadata: dict[str, Any]) -> int:
+    """Read the exact nextn spelling from pinned llama.cpp."""
+    dotted_key = f"{gguf_arch}.nextn.predict_layers"
+    if dotted_key in metadata:
+        raise ValueError(
+            f"Unsupported non-pinned MTP metadata key {dotted_key!r}; expected "
+            f"{gguf_arch}.nextn_predict_layers"
+        )
+    key = f"{gguf_arch}.nextn_predict_layers"
+    if key not in metadata:
+        return 0
+    count = int(metadata[key])
+    if count < 0:
+        raise ValueError(f"{key} must be non-negative, got {count}")
+    return count
+
+
+def _derive_hybrid_layout(
+    gguf_arch: str,
+    metadata: dict[str, Any],
+) -> tuple[int, list[str] | None, int]:
+    """Derive the trunk layer count and exact mixer schedule from GGUF metadata."""
+    total_layers = int(metadata[f"{gguf_arch}.block_count"])
+    mtp_count = _nextn_predict_layers(gguf_arch, metadata)
+    trunk_layers = total_layers - mtp_count
+    if trunk_layers <= 0:
+        raise ValueError(
+            f"GGUF metadata inconsistent: block_count ({total_layers}) <= "
+            f"nextn predict layers ({mtp_count}) for architecture {gguf_arch}."
+        )
+
+    if gguf_arch == "lfm2":
+        raw_kv_heads = metadata.get(f"{gguf_arch}.attention.head_count_kv")
+        if not isinstance(raw_kv_heads, (list, tuple, np.ndarray)):
+            raise ValueError(
+                "lfm2.attention.head_count_kv must be a per-layer array; "
+                "a scalar cannot reconstruct the hybrid attention/conv schedule"
+            )
+        kv_heads = [int(value) for value in raw_kv_heads]
+        if len(kv_heads) != total_layers:
+            raise ValueError(
+                "lfm2.attention.head_count_kv must contain exactly "
+                f"{total_layers} entries, got {len(kv_heads)}"
+            )
+        if any(value < 0 for value in kv_heads):
+            raise ValueError("lfm2.attention.head_count_kv entries must be non-negative")
+        return (
+            trunk_layers,
+            ["conv" if value == 0 else "full_attention" for value in kv_heads[:trunk_layers]],
+            mtp_count,
+        )
+
+    if gguf_arch not in _DELTA_NET_ARCHITECTURES:
+        return trunk_layers, None, mtp_count
+
+    recurrent_key = f"{gguf_arch}.attention.recurrent_layers"
+    recurrent = metadata.get(recurrent_key)
+    if recurrent is not None:
+        if isinstance(recurrent, (list, tuple, np.ndarray)):
+            recurrent_layers = [bool(value) for value in recurrent]
+            if len(recurrent_layers) != total_layers:
+                raise ValueError(
+                    f"{recurrent_key} must contain exactly {total_layers} entries, "
+                    f"got {len(recurrent_layers)}"
+                )
+        elif isinstance(recurrent, (bool, np.bool_)):
+            recurrent_layers = [bool(recurrent)] * total_layers
+        else:
+            raise ValueError(f"{recurrent_key} must be a boolean or boolean array")
+        if any(recurrent_layers[trunk_layers:]):
+            raise ValueError(f"{recurrent_key} marks an appended MTP block as recurrent")
+    else:
+        interval = int(metadata.get(f"{gguf_arch}.full_attention_interval", 4))
+        if interval <= 0:
+            raise ValueError(
+                f"{gguf_arch}.full_attention_interval must be positive, got {interval}"
+            )
+        recurrent_layers = [
+            i < trunk_layers and (i + 1) % interval != 0 for i in range(total_layers)
+        ]
+
+    return (
+        trunk_layers,
+        [
+            "linear_attention" if value else "full_attention"
+            for value in recurrent_layers[:trunk_layers]
+        ],
+        mtp_count,
+    )
+
+
 def gguf_to_config(
     model: Any,  # GGUFModel — typed as Any to avoid circular import
 ) -> ArchitectureConfig:
@@ -354,11 +451,11 @@ def gguf_to_config(
     # during tensor mapping. Without this correction the builder would create
     # an extra decoder layer whose linear-attention / GQA initializers have no
     # backing GGUF weights and fail the ``_check_weights`` invariant on save.
-    nextn_layers = metadata.get(f"{gguf_arch}.nextn_predict_layers")
+    nextn_layers = _nextn_predict_layers(gguf_arch, metadata)
     mtp_predict_layers = 0
     mtp_block_indices: list[int] = []
-    if nextn_layers is not None and int(nextn_layers) > 0:
-        mtp_count = int(nextn_layers)
+    if nextn_layers > 0:
+        mtp_count = nextn_layers
         if mtp_count > 1:
             raise ValueError(
                 f"GGUF architecture {gguf_arch!r} declares nextn_predict_layers="
@@ -409,9 +506,20 @@ def gguf_to_config(
     # most common (mode) value as the scalar config value.
     num_kv_heads = hf_fields.get("num_key_value_heads", num_attention_heads)
     if isinstance(num_kv_heads, (list, np.ndarray)):
-        # Per-layer array → pick the majority value (sliding layers dominate)
-        values = list(num_kv_heads)
-        num_kv_heads = max(set(values), key=values.count)
+        values = [int(value) for value in num_kv_heads]
+        if canonical_arch == "lfm2":
+            nonzero = {value for value in values if value}
+            if len(nonzero) != 1:
+                raise ValueError(
+                    "lfm2 attention layers must use one consistent non-zero KV-head count, "
+                    f"got {sorted(nonzero)}"
+                )
+            if not nonzero:
+                raise ValueError("lfm2 GGUF has no attention layer KV-head count")
+            num_kv_heads = nonzero.pop()
+        else:
+            # Per-layer array → pick the majority value (sliding layers dominate)
+            num_kv_heads = max(set(values), key=values.count)
 
     # Map activation function
     hidden_act = hf_fields.get("hidden_act")
@@ -424,21 +532,52 @@ def gguf_to_config(
             # Default activation by architecture
             hidden_act = _default_activation(model_type)
 
-    # Derive layer_types from full_attention_interval for hybrid models
+    # Derive the exact hybrid schedule from the same serialized metadata used
+    # by pinned llama.cpp. Explicit recurrent arrays always win over intervals.
     full_attention_interval = hf_fields.get("full_attention_interval")
     num_hidden_layers = hf_fields["num_hidden_layers"]
     layer_types: list[str] | None = None
-    if full_attention_interval is not None:
-        layer_types = [
-            "full_attention" if (i + 1) % full_attention_interval == 0 else "linear_attention"
-            for i in range(num_hidden_layers)
-        ]
+    if canonical_arch == "lfm2" or canonical_arch in _DELTA_NET_ARCHITECTURES:
+        derived_layers, layer_types, derived_mtp_count = _derive_hybrid_layout(
+            canonical_arch, metadata
+        )
+        if derived_layers != int(num_hidden_layers) or derived_mtp_count != mtp_predict_layers:
+            raise ValueError("Hybrid schedule and decoder layer metadata disagree")
+        if canonical_arch in _DELTA_NET_ARCHITECTURES:
+            full_attention_interval = int(
+                metadata.get(f"{canonical_arch}.full_attention_interval", 4)
+            )
 
     # Derive DeltaNet head dimensions from SSM metadata.
-    # ssm.state_size = head dimension for both K and V heads.
+    # Key width comes from state_size. Value width is independently derived from
+    # inner_size / time_step_rank and must not be guessed from key width.
     ssm_state_size = metadata.get(f"{gguf_arch}.ssm.state_size")
     linear_key_head_dim = int(ssm_state_size) if ssm_state_size else None
-    linear_value_head_dim = int(ssm_state_size) if ssm_state_size else None
+    linear_value_head_dim = None
+    if canonical_arch in _DELTA_NET_ARCHITECTURES:
+        inner_size = int(metadata[f"{gguf_arch}.ssm.inner_size"])
+        value_heads = int(metadata[f"{gguf_arch}.ssm.time_step_rank"])
+        key_heads = int(metadata[f"{gguf_arch}.ssm.group_count"])
+        conv_kernel = int(metadata[f"{gguf_arch}.ssm.conv_kernel"])
+        if min(inner_size, value_heads, key_heads, conv_kernel, int(ssm_state_size)) <= 0:
+            raise ValueError(f"{gguf_arch} DeltaNet dimensions must all be positive")
+        if inner_size % value_heads:
+            raise ValueError(
+                f"{gguf_arch}.ssm.inner_size ({inner_size}) must be divisible by "
+                f"ssm.time_step_rank ({value_heads})"
+            )
+        if inner_size != int(ssm_state_size) * value_heads:
+            raise ValueError(
+                f"{gguf_arch}.ssm.inner_size ({inner_size}) must equal "
+                f"ssm.state_size * ssm.time_step_rank "
+                f"({int(ssm_state_size) * value_heads}) for the pinned DeltaNet loader"
+            )
+        if value_heads % key_heads:
+            raise ValueError(
+                f"{gguf_arch}.ssm.time_step_rank ({value_heads}) must be divisible by "
+                f"ssm.group_count ({key_heads})"
+            )
+        linear_value_head_dim = inner_size // value_heads
 
     # Derive partial_rotary_factor from rope.dimension_count / head_dim.
     rope_dim = metadata.get(f"{gguf_arch}.rope.dimension_count")
@@ -499,6 +638,28 @@ def gguf_to_config(
             "beta_fast": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_fast", 32.0),
             "beta_slow": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_slow", 1.0),
         }
+
+    if canonical_arch in {"qwen35", "qwen35moe"}:
+        mrope_section = metadata[f"{gguf_arch}.rope.dimension_sections"]
+        if not isinstance(mrope_section, (list, tuple, np.ndarray)) or len(mrope_section) != 4:
+            raise ValueError(
+                f"{gguf_arch}.rope.dimension_sections must contain exactly four entries"
+            )
+        mrope_section = [int(value) for value in mrope_section]
+    else:
+        mrope_section = None
+
+    if canonical_arch in {"qwen35moe", "qwen3next"}:
+        top_k = int(hf_fields["num_experts_per_tok"])
+        experts = int(hf_fields["num_local_experts"])
+        intermediate = int(hf_fields.get("intermediate_size", 4 * hidden_size))
+        if min(top_k, experts) <= 0 or top_k > experts:
+            raise ValueError(
+                f"{gguf_arch} expert counts are invalid: expert_count={experts}, "
+                f"expert_used_count={top_k}"
+            )
+        hf_fields.setdefault("moe_intermediate_size", intermediate // top_k)
+        hf_fields.setdefault("shared_expert_intermediate_size", intermediate)
 
     # HunYuan-V1-Dense: HF runs dynamic-NTK RoPE with rope_theta=10000 and
     # alpha=1000. The Tencent quantization pipeline bakes those into a
@@ -561,6 +722,7 @@ def gguf_to_config(
         mlp_bias=_infer_mlp_bias(model),
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
+        mrope_section=mrope_section,
         num_decoder_layers=hf_fields.get("num_decoder_layers"),
         decoder_start_token_id=hf_fields.get("decoder_start_token_id"),
         relative_attention_num_buckets=hf_fields.get("relative_attention_num_buckets", 32),
@@ -607,6 +769,7 @@ def gguf_to_config(
         linear_key_head_dim=linear_key_head_dim,
         linear_value_head_dim=linear_value_head_dim,
         linear_conv_kernel_dim=(hf_fields.get("linear_conv_kernel_dim") or 4),
+        short_conv_kernel=(hf_fields.get("short_conv_kernel") or 3),
     )
 
     # Store the source architecture and model_type for registry lookup and for

@@ -454,6 +454,7 @@ _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_gate_exps": ("model.layers.{bid}.mlp.experts.gate_proj"),
     "blk.{bid}.ffn_up_exps": ("model.layers.{bid}.mlp.experts.up_proj"),
     "blk.{bid}.ffn_down_exps": ("model.layers.{bid}.mlp.experts.down_proj"),
+    "blk.{bid}.ffn_gate_up_exps": ("model.layers.{bid}.mlp.experts.gate_up_proj"),
     "blk.{bid}.ffn_gate_inp_shexp": ("model.layers.{bid}.mlp.shared_expert_gate"),
     "blk.{bid}.ffn_gate_shexp": ("model.layers.{bid}.mlp.shared_expert.gate_proj"),
     "blk.{bid}.ffn_up_shexp": ("model.layers.{bid}.mlp.shared_expert.up_proj"),
@@ -491,6 +492,35 @@ _QWEN35_HYBRID_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
     # Both layer types — post-attention layernorm
     "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+}
+
+_QWEN3NEXT_HYBRID_EXTRAS: dict[str, str] = {
+    **_QWEN35_HYBRID_EXTRAS,
+    # Legacy grouped QKVZ and fused beta/alpha representations are unpacked by
+    # Qwen3NextCausalLMModel.preprocess_weights.
+    "blk.{bid}.ssm_in": "model.layers.{bid}.linear_attn.in_proj_qkvz",
+    "blk.{bid}.ssm_ba": "model.layers.{bid}.linear_attn.in_proj_ba",
+    "blk.{bid}.attn_post_norm": ("model.layers.{bid}.post_attention_layernorm"),
+}
+
+_LFM2_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "token_embd_norm": "model.embedding_norm",
+    "output": "lm_head",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.operator_norm",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.ffn_norm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.feed_forward.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.feed_forward.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.feed_forward.down_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+    "blk.{bid}.shortconv.conv": "model.layers.{bid}.conv.conv",
+    "blk.{bid}.shortconv.in_proj": "model.layers.{bid}.conv.in_proj",
+    "blk.{bid}.shortconv.out_proj": "model.layers.{bid}.conv.out_proj",
 }
 
 _DEEPSEEK4_MAPPING: dict[str, str] = {
@@ -595,6 +625,7 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "lfm2": _LFM2_MAPPING,
         "dflash": _DFLASH_MAPPING,
         "eagle3": _EAGLE3_MAPPING,
         "olmo": _OLMO_MAPPING,
@@ -616,6 +647,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
         "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
         "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
+        "qwen3next_hybrid_extras": _QWEN3NEXT_HYBRID_EXTRAS,
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
     }

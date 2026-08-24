@@ -54,6 +54,13 @@ def _write_qwen35_mtp_gguf(
     # UINT32 == GGUFValueType 4.
     writer.add_key_value(f"{architecture}.nextn_predict_layers", mtp_count, 4)
     writer.add_key_value(f"{architecture}.attention.key_length", _HD, 4)
+    writer.add_array(f"{architecture}.attention.recurrent_layers", [False, False])
+    writer.add_array(f"{architecture}.rope.dimension_sections", [4, 4, 0, 0])
+    writer.add_ssm_conv_kernel(3)
+    writer.add_ssm_inner_size(32)
+    writer.add_ssm_state_size(16)
+    writer.add_ssm_time_step_rank(2)
+    writer.add_ssm_group_count(2)
 
     def f32(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
@@ -341,6 +348,21 @@ class TestMtpAutoDetect:
         seed = pkg.config.num_hidden_layers - 1
         main_outputs = {v.name for v in pkg["model"].graph.outputs}
         assert f"hidden_states.{seed}" in main_outputs
+
+    def test_moe_mtp_is_rejected_before_graph_build(self, tmp_path: Path, monkeypatch):
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen35moe-mtp.gguf"
+        _write_qwen35_mtp_gguf(path, architecture="qwen35moe")
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *_args, **_kwargs: pytest.fail("graph construction must not run"),
+        )
+
+        with pytest.raises(NotImplementedError, match="MTP blocks use routed experts"):
+            build_from_gguf(path)
 
     def test_mtp_survives_dtype_replace(self, qwen35_mtp_gguf: Path):
         # Regression: an explicit dtype triggers dataclasses.replace on the

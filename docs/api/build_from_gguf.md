@@ -177,6 +177,7 @@ reason.
 | `internlm2` | — | `internlm2` | supported | rejected |
 | `jina-bert-v2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `jina-bert-v3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `lfm2` | — | `lfm2` | runtime deferred | supported |
 | `llada` | — | `llada` | runtime deferred | supported |
 | `llada-moe` | — | `llada` | runtime deferred | supported |
 | `llama` | `mistral` | `llama` | supported | supported |
@@ -198,9 +199,10 @@ reason.
 | `qwen2` | — | `qwen2` | supported | supported |
 | `qwen2moe` | `qwen2_moe` | `qwen2_moe` | runtime deferred | supported |
 | `qwen3` | — | `qwen3` | supported | supported |
-| `qwen35` | — | `qwen3_5_text` | supported | supported |
-| `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
+| `qwen35` | — | `qwen3_5_text` | runtime deferred | supported |
+| `qwen35moe` | — | `qwen3_5_moe` | runtime deferred | supported |
 | `qwen3moe` | `qwen3_moe` | `qwen3_moe` | runtime deferred | supported |
+| `qwen3next` | — | `qwen3_next` | runtime deferred | supported |
 | `qwen3tts` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rnd1` | — | `llada` | runtime deferred | supported |
 | `rwkv6` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -480,6 +482,51 @@ parity. They are not independent HuggingFace parity. Full-logit and generated-to
 parity are still required for T5, and independently sourced full encoder-hidden
 parity is still required for T5 encoder, before either runtime verdict can become
 supported.
+
+### Hybrid attention/recurrent GGUF contract
+
+`lfm2`, `qwen35`, `qwen35moe`, and `qwen3next` use a mixed-state ABI. Full
+attention layers alone expose `past_key_values.N.key/value`; LFM2 convolution
+layers expose one `conv_state`, and gated-DeltaNet layers expose
+`conv_state` plus `recurrent_state`. Inputs and matching `present.N.*` outputs
+are ordered by decoder layer index. Generic/static KV cache tasks are rejected.
+
+The schedule is reconstructed exactly as pinned llama.cpp does. LFM2 requires a
+per-layer `attention.head_count_kv` array (`0` means short convolution).
+Qwen hybrids prefer the explicit `attention.recurrent_layers` array; otherwise
+they use `full_attention_interval`, whose upstream default is 4. Appended MTP
+blocks are excluded from the trunk and must be full attention. Invalid lengths,
+zero intervals, recurrent MTP entries, wrong-mixer tensors, extra layers, and
+incomplete fused/legacy representations fail before graph construction.
+
+DeltaNet key width is `ssm.state_size`; value-head width is
+`ssm.inner_size / ssm.time_step_rank`. The importer validates positive,
+divisible head/group/state/conv dimensions and preserves Qwen3.5's M-RoPE
+sections. Qwen3.5 reverses llama.cpp's V-head tiling; Qwen3-Next deliberately
+does not. No architecture in this cohort applies a Llama Q/K rotary
+permutation. Fused experts are gate-then-up in ascending expert order.
+Quantization scale/input-scale sidecars are rejected rather than dropped when
+Mobius cannot express them, and recurrent convolution/state roles use the float
+path.
+
+Pinned pre-download artifact census:
+
+| Architecture | GGUF revision and file | Size / LFS SHA-256 | Header census |
+|---|---|---|---|
+| LFM2 | `LiquidAI/LFM2.5-350M-GGUF@d86ad5aad24b8bd87a7c4821439e63e7ba589bc3` / `LFM2.5-350M-Q4_K_M.gguf` | 229,312,224 bytes / `7e6f72643caafc9a68256686638c4d7916f2cec76d1df478d4c3ddcd95a6aed4` | Bundled tokenizer/config metadata; 148 tensors, 16 layers, KV schedule `[0,0,8,0,0,8,0,0,8,0,8,0,8,0,8,0]`; F32/Q4_K/Q6_K |
+| Qwen3.5 dense | `ggml-org/Qwen3.5-0.8B-GGUF@8fea620810c4afa23dd6443f999a48574c1611a3` / `Qwen3.5-0.8B-Q4_0.gguf` | 563,036,064 bytes / `57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf` | Bundled tokenizer/config metadata; 320 tensors, 24 layers, interval 4 with no explicit recurrent array; F32/Q4_0/Q8_0 |
+
+No reasonably sized, immutable Qwen3.5-MoE artifact is active in the pinned
+llama.cpp corpus, and official Qwen3-Next GGUFs are split 80B artifacts. All
+four runtime verdicts therefore remain **deferred**. Graph/state threading is
+covered synthetically, but publication still requires independent real-weight
+full-logit parity and deterministic stateful generation parity. Mobius exposes
+only the latest recurrent state, not llama.cpp's optional bounded rollback
+snapshot planes; rollback/reorder-capable runtime packaging must remain
+disabled until that ABI is represented explicitly. Dense Qwen3.5 MTP sidecars
+are supported, but Qwen3.5-MoE and Qwen3-Next MTP blocks are rejected because
+the current sidecar builder cannot represent routed experts without dropping
+tensors. Separate MTP-only files are outside this cohort.
 
 ### Pure recurrent Mamba evidence
 
