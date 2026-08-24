@@ -3804,6 +3804,49 @@ class TestGGUFPreflightGuards:
         module_lookup.assert_not_called()
         graph_build.assert_not_called()
 
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_standalone_clip_fails_before_all_downstream_stages(
+        self, projection_quantization: str, tmp_path: Path
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius import _registry as core_registry
+        from mobius.integrations.gguf import _builder as gguf_builder
+        from mobius.integrations.gguf import _config_mapping, build_from_gguf
+        from mobius.integrations.gguf._errors import DisabledGGUFArchitectureError
+
+        path = tmp_path / f"standalone-clip-{projection_quantization}.gguf"
+        _write_quantized_gguf(
+            path,
+            architecture="clip",
+            projection_quantization=projection_quantization,
+        )
+
+        downstream = AssertionError("standalone clip reached a downstream stage")
+        with (
+            mock.patch.object(
+                gguf_builder, "_has_quantized_weights", side_effect=downstream
+            ) as quantization_probe,
+            mock.patch.object(
+                _config_mapping, "gguf_to_config", side_effect=downstream
+            ) as config_extraction,
+            mock.patch.object(
+                core_registry.registry, "get", side_effect=downstream
+            ) as module_lookup,
+            mock.patch.object(
+                core_builder, "build_from_module", side_effect=downstream
+            ) as graph_build,
+            pytest.raises(
+                DisabledGGUFArchitectureError,
+                match=r"clip.*intentionally disabled",
+            ),
+        ):
+            build_from_gguf(path)
+
+        quantization_probe.assert_not_called()
+        config_extraction.assert_not_called()
+        module_lookup.assert_not_called()
+        graph_build.assert_not_called()
+
     def test_remote_nemotron_h_moe_fails_before_download(self):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
 
@@ -3843,6 +3886,29 @@ class TestGGUFPreflightGuards:
 
         api_type.return_value.model_info.assert_called_once_with(
             "example/talkie", expand=["gguf"]
+        )
+        download.assert_not_called()
+
+    def test_remote_standalone_clip_fails_before_download(self):
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+        from mobius.integrations.gguf._errors import DisabledGGUFArchitectureError
+
+        filename = "mmproj-f16.gguf"
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
+            pytest.raises(
+                DisabledGGUFArchitectureError,
+                match=r"clip.*intentionally disabled",
+            ),
+        ):
+            api_type.return_value.model_info.return_value = SimpleNamespace(
+                gguf={"architecture": "clip"}
+            )
+            _resolve_gguf_path(f"example/mmproj:{filename}")
+
+        api_type.return_value.model_info.assert_called_once_with(
+            "example/mmproj", expand=["gguf"]
         )
         download.assert_not_called()
 

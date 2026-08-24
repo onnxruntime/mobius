@@ -22,11 +22,11 @@ import pytest
 from mobius.__main__ import _save_package, main
 
 
-def _write_deferred_talkie_gguf(path: Path, *, quantized: bool) -> None:
-    """Write just enough of a Talkie GGUF to exercise the header architecture gate."""
+def _write_gated_gguf(path: Path, *, architecture: str, quantized: bool) -> None:
+    """Write just enough of a GGUF to exercise the header architecture gate."""
     from gguf import GGMLQuantizationType, GGUFWriter
 
-    writer = GGUFWriter(str(path), "talkie")
+    writer = GGUFWriter(str(path), architecture)
     if quantized:
         writer.add_tensor(
             "token_embd.weight",
@@ -1059,7 +1059,7 @@ class TestCLIBuildGGUF:
 
         gguf_path = tmp_path / "talkie.gguf"
         output_dir = tmp_path / "must-not-exist"
-        _write_deferred_talkie_gguf(gguf_path, quantized=quantized)
+        _write_gated_gguf(gguf_path, architecture="talkie", quantized=quantized)
 
         with pytest.raises(
             UnsupportedGGUFArchitectureError,
@@ -1072,6 +1072,28 @@ class TestCLIBuildGGUF:
                     "--output",
                     str(output_dir),
                     *options,
+                ]
+            )
+
+        assert not output_dir.exists()
+
+    def test_standalone_clip_rejects_before_output_creation(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf._errors import DisabledGGUFArchitectureError
+
+        gguf_path = tmp_path / "mmproj.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="clip", quantized=True)
+
+        with pytest.raises(
+            DisabledGGUFArchitectureError,
+            match=r"clip.*intentionally disabled",
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
                 ]
             )
 

@@ -311,6 +311,23 @@ class TestMultimodalPreflightGuards:
 
         return GGUFModel(str(text_path)), GGUFModel(str(mmproj_path))
 
+    def test_clip_is_allowed_only_in_mmproj_companion_context(
+        self, clip_mmproj_gguf: Path
+    ) -> None:
+        from mobius.integrations.gguf._builder import _validate_gguf_model
+        from mobius.integrations.gguf._errors import DisabledGGUFArchitectureError
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        mmproj = GGUFModel(str(clip_mmproj_gguf))
+        with pytest.raises(DisabledGGUFArchitectureError, match="intentionally disabled"):
+            _validate_gguf_model(mmproj, source=str(clip_mmproj_gguf))
+
+        _validate_gguf_model(
+            mmproj,
+            source=str(clip_mmproj_gguf),
+            allow_mmproj_companion=True,
+        )
+
     def test_rejects_unsupported_text_architecture_before_config(
         self,
         tmp_path: Path,

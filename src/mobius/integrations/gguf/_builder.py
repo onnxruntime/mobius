@@ -99,6 +99,7 @@ def _raise_for_unsupported_gguf_architecture(
     *,
     source: str,
     tensor_names: Iterable[str] | None = None,
+    allow_mmproj_companion: bool = False,
 ) -> None:
     """Reject known architectures whose config, tensor map, or graph is unavailable.
 
@@ -110,11 +111,9 @@ def _raise_for_unsupported_gguf_architecture(
     spec = try_get_arch_spec(architecture)
     if spec is None:
         return
-    if spec.gguf_arch == MMPROJ_ARCHITECTURE:
+    if spec.gguf_arch == MMPROJ_ARCHITECTURE and allow_mmproj_companion:
         # mmproj sidecars are opened deliberately by the multimodal path, which
-        # pairs them with a text backbone. They are rejected only when someone
-        # passes one as the model itself, and the tensor-mapping gate already
-        # produces that message.
+        # pairs them with a text backbone and applies role-specific validation.
         return
     import_verdicts = {
         name: verdict
@@ -371,7 +370,9 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
         )
 
 
-def _validate_gguf_model(gguf_model, *, source: str) -> None:
+def _validate_gguf_model(
+    gguf_model, *, source: str, allow_mmproj_companion: bool = False
+) -> None:
     """Validate a parsed GGUF before config extraction or graph construction."""
     from mobius.integrations.gguf._shard_set import GgufShardSet
 
@@ -385,6 +386,7 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         gguf_model.architecture,
         source=source,
         tensor_names=gguf_model.tensor_names,
+        allow_mmproj_companion=allow_mmproj_companion,
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
