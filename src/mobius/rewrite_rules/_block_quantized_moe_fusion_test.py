@@ -526,6 +526,42 @@ def test_core_attributes_match_bqmoe_abi() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Per-projection (block_layout_version=2) runtime-capability gate             #
+# --------------------------------------------------------------------------- #
+def test_mixed_format_without_v2_runtime_fails_closed() -> None:
+    """A mixed-format layer needs v2; if the runtime lacks it, fail closed.
+
+    The export authority passes ``perproj_v2_runtime=False`` when the deployed
+    runtime has not shipped the ``block_layout_version=2`` per-projection ABI.
+    Emitting a v2 node then would be an unrunnable overclaim, so the layer must
+    fail closed atomically with the dense graph left untouched.
+    """
+    model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
+    graph = model.graph
+    with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
+        fuse_block_quantized_moe(model, perproj_v2_runtime=False)
+    assert _count(graph, "BlockQuantizedMoE") == 0
+    assert _count(graph, "Equal") == E  # dense graph left untouched
+
+
+def test_uniform_format_fuses_without_v2_runtime() -> None:
+    """A uniform-format layer is a v1 node, so it fuses even without v2 support."""
+    model, _ = _build_dense_graph(gate_fmt="iq4_xs", up_fmt="iq4_xs", down_fmt="iq4_xs")
+    assert fuse_block_quantized_moe(model, perproj_v2_runtime=False) == 1
+    attrs = _moe(model.graph).attributes
+    assert "block_layout_version" not in attrs  # v1
+    assert attrs["format"].value == "iq4_xs"
+
+
+def test_mixed_format_with_v2_runtime_emits_v2() -> None:
+    """With v2 runtime support, a mixed-format layer emits one v2 node."""
+    model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
+    assert fuse_block_quantized_moe(model, perproj_v2_runtime=True) == 1
+    attrs = _moe(model.graph).attributes
+    assert attrs["block_layout_version"].value == 2
+
+
+# --------------------------------------------------------------------------- #
 # Gate-agnostic routing + activation variants                                 #
 # --------------------------------------------------------------------------- #
 def test_fuses_legacy_gate_sigmoid_activation() -> None:

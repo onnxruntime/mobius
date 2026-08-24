@@ -604,8 +604,16 @@ class _FusionPlan:
     experts: int
 
 
-def _plan_layer(layer: _DenseMoELayer, index: int) -> _FusionPlan:
-    """Validate and byte-stack one native MoE layer without touching the graph."""
+def _plan_layer(layer: _DenseMoELayer, index: int, *, perproj_v2_runtime: bool) -> _FusionPlan:
+    """Validate and byte-stack one native MoE layer without touching the graph.
+
+    ``perproj_v2_runtime`` declares whether the target runtime implements the
+    ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI. When a
+    layer mixes native formats across its fc1/fc2/fc3 banks it can only be
+    expressed as a v2 node; if the runtime cannot execute v2, planning fails
+    closed here (before any graph mutation) rather than emitting an unrunnable
+    node.
+    """
     ids = sorted(layer.experts)
     gate_nodes = [layer.experts[i].gate for i in ids]
     up_nodes = [layer.experts[i].up for i in ids]
@@ -660,6 +668,15 @@ def _plan_layer(layer: _DenseMoELayer, index: int) -> _FusionPlan:
     if len(distinct) == 1:
         attributes["format"] = next(iter(distinct))
     else:
+        if not perproj_v2_runtime:
+            raise _UnfusableError(
+                "mixed per-projection native formats "
+                f"{sorted(distinct)} can only be expressed with the "
+                "block_layout_version=2 per-projection BlockQuantizedMoE ABI, "
+                "which the target runtime does not implement -- emitting a v2 "
+                "node would build an unrunnable graph (overclaim). Set "
+                "MOBIUS_ENABLE_BQMOE_PERPROJ_V2=1 only once the runtime ships it"
+            )
         attributes["block_layout_version"] = 2
         # ``format`` is the required base/fallback; per-projection attributes
         # override it where a projection uses a different native format.
@@ -808,7 +825,12 @@ def _fail_closed(layer: _DenseMoELayer, reason: _UnfusableError, *, allow_dense:
     ) from reason
 
 
-def fuse_block_quantized_moe(model: ir.Model, *, allow_dense_moe: bool | None = None) -> int:
+def fuse_block_quantized_moe(
+    model: ir.Model,
+    *,
+    allow_dense_moe: bool | None = None,
+    perproj_v2_runtime: bool = True,
+) -> int:
     """Fuse every dense-fallback native-block MoE subgraph into ``BlockQuantizedMoE``.
 
     Reuses the existing ``BlockQuantizedMatMul`` native blocks byte-for-byte
@@ -836,6 +858,14 @@ def fuse_block_quantized_moe(model: ir.Model, *, allow_dense_moe: bool | None = 
             ``allow_dense_moe_experts`` flag / ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``
             environment variable is used. This is a research/correctness path
             only and makes no throughput claim.
+        perproj_v2_runtime: Whether the target runtime implements the
+            ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI
+            (mixed native formats across a layer's fc1/fc2/fc3 banks, e.g.
+            GLM-5.2 UD-IQ1 with an iq1 gate/up and a higher-bit down). This is a
+            pure graph transform, so it defaults to ``True`` (v2 is always
+            representable); the GGUF export authority passes the actual runtime
+            capability so a mixed-format layer fails closed rather than emitting
+            an unrunnable v2 node when the runtime has not shipped v2 yet.
 
     Returns:
         The number of MoE layers fused.
@@ -863,7 +893,7 @@ def fuse_block_quantized_moe(model: ir.Model, *, allow_dense_moe: bool | None = 
             continue
         try:
             layer.check_fusable()
-            plans.append(_plan_layer(layer, index))
+            plans.append(_plan_layer(layer, index, perproj_v2_runtime=perproj_v2_runtime))
         except _UnfusableError as reason:
             _fail_closed(layer, reason, allow_dense=allow_dense_moe)
 

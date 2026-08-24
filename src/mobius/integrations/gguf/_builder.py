@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
+import os
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
@@ -222,6 +223,96 @@ def _assert_sparse_moe_capability(module, config, *, source: str, allow_dense: b
         "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim. "
         "The supported fix is a sparse IQ-block BlockQuantizedMoE fusion "
         "(top-k gather over native-block expert weights)."
+    )
+
+
+def _perproj_bqmoe_v2_runtime_available() -> bool:
+    """Whether the deployed pkg.nxrt runtime implements the v2 BlockQuantizedMoE ABI.
+
+    A layer that mixes native block formats across its fc1/fc2/fc3 banks (e.g.
+    GLM-5.2 UD-IQ1 with an iq1 gate/up and a higher-bit down projection) can only
+    be expressed with the ``block_layout_version=2`` per-projection
+    ``BlockQuantizedMoE`` ABI. That ABI is not yet merged/released in the
+    onnx-genai runtime, so emitting a v2 node here would build an ONNX graph the
+    current runtime cannot execute -- an overclaim. Default ``False`` makes such
+    mixed-format layers fail closed (typed reject) until the runtime ships v2;
+    set ``MOBIUS_ENABLE_BQMOE_PERPROJ_V2=1`` only once it does.
+    """
+    return os.environ.get("MOBIUS_ENABLE_BQMOE_PERPROJ_V2", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _fuse_native_block_moe(pkg, *, allow_dense: bool) -> int:
+    """Collapse routed native-block expert storms into sparse ``BlockQuantizedMoE``.
+
+    Runs on the final, fully-weighted graph so the fusion can stack each layer's
+    per-expert native blocks byte-for-byte into one expert-major bank. Every
+    candidate layer is validated before any node is emitted, so an unfusable
+    layer (mixed format with no v2 runtime, per-expert bias, ragged/incomplete
+    group) raises :class:`SparseMoEExportError` atomically with the graph
+    untouched, unless ``allow_dense`` downgrades it to a warning + dense keep.
+    """
+    # Imported lazily: the generic rewrite lives in the rewrite_rules package and
+    # must not be pulled into the GGUF import graph at module load time.
+    from mobius.rewrite_rules import fuse_block_quantized_moe
+
+    perproj_v2 = _perproj_bqmoe_v2_runtime_available()
+    fused = 0
+    for model in pkg.values():
+        fused += fuse_block_quantized_moe(
+            model, allow_dense_moe=allow_dense, perproj_v2_runtime=perproj_v2
+        )
+    return fused
+
+
+def _routed_dense_block_matmul_nodes(model) -> list:
+    """Routed per-expert ``BlockQuantizedMatMul`` nodes surviving in a graph.
+
+    A routed expert projection is a ``pkg.nxrt::BlockQuantizedMatMul`` whose
+    packed-weight initializer path carries an ``.experts.`` segment and is not a
+    ``shared_expert``. After :func:`_fuse_native_block_moe` runs, any that remain
+    are an un-collapsed dense-all-expert storm.
+    """
+    hits = []
+    for node in model.graph:
+        if node.op_type != "BlockQuantizedMatMul":
+            continue
+        weight = node.inputs[1] if len(node.inputs) > 1 else None
+        name = getattr(weight, "name", None) or ""
+        if ".experts." in name and "shared_expert" not in name:
+            hits.append(node)
+    return hits
+
+
+def _assert_sparse_moe_graph(pkg, *, source: str, allow_dense: bool) -> None:
+    """Sparse-MoE honesty gate over the final (post-fusion) graph state.
+
+    :func:`_fuse_native_block_moe` already fails closed with a precise reason for
+    every routed native-block storm it recognises. This backstop catches any
+    routed per-expert ``BlockQuantizedMatMul`` storm that survived fusion (e.g. a
+    dispatch shape the rewrite did not recognise): shipping it silently would be
+    a dense-all-expert graph with no throughput guarantee. Opting into the dense
+    fallback (``allow_dense``) is already warned about by the fusion, so this
+    gate only enforces the fail-closed default.
+    """
+    if allow_dense:
+        return
+    storm = [n for model in pkg.values() for n in _routed_dense_block_matmul_nodes(model)]
+    if not storm:
+        return
+    raise SparseMoEExportError(
+        "Sparse-MoE export blocker: "
+        f"{len(storm)} routed expert projection(s) in {source!r} remain as "
+        "per-expert pkg.nxrt::BlockQuantizedMatMul nodes after native-block MoE "
+        "fusion (no sparse top-k BlockQuantizedMoE was applied). Exporting anyway "
+        "would build a dense-all-expert graph (every expert evaluated for every "
+        "token) with no performance guarantee, so the build fails closed. To "
+        "study the dense fallback, re-run with allow_dense_moe=True (or set "
+        "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim."
     )
 
 
@@ -601,13 +692,12 @@ def build_from_gguf(
     module = module_class(config)
     if preserve_quantization:
         _replace_native_block_linears(module, gguf_model, gguf_arch)
-        # Sparse-MoE honesty gate: routed experts lowered as native
-        # BlockQuantizedMatMul nodes have no sparse top-k fusion yet, so the
-        # exported graph would recompute every expert for every token. Fail
-        # closed here (before export) unless the caller explicitly opts in.
-        _assert_sparse_moe_capability(
-            module, config, source=str(gguf_path), allow_dense=allow_dense_moe
-        )
+        # The sparse-MoE honesty gate runs post-export on the final graph state
+        # (see step 9b): routed native-block experts are first collapsed into a
+        # sparse top-k pkg.nxrt::BlockQuantizedMoE by fuse_block_quantized_moe,
+        # then the gate fails closed if any per-expert dense storm survives.
+        # Enforcing here (pre-export, module level) would reject the very layers
+        # the fusion can now collapse, so the authority moved to the graph.
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
     )
@@ -662,6 +752,15 @@ def build_from_gguf(
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
     pkg.apply_weights(state_dict, prefix_map=prefix_map)
+
+    # 9b. Sparse-MoE fusion + honesty gate (final graph state).
+    # Now that every native block carries its real packed bytes, collapse the
+    # routed per-expert BlockQuantizedMatMul storm into one sparse top-k
+    # pkg.nxrt::BlockQuantizedMoE per layer (byte-for-byte, no requantization),
+    # then fail closed if any dense-all-expert storm still survives.
+    if preserve_quantization:
+        _fuse_native_block_moe(pkg, allow_dense=allow_dense_moe)
+        _assert_sparse_moe_graph(pkg, source=str(gguf_path), allow_dense=allow_dense_moe)
 
     # 10. Build the trailing MTP / "nextn" self-speculative head sidecar from
     # the GGUF's ``blk.<nextn>.*`` tensors (dropped by the backbone build) and
