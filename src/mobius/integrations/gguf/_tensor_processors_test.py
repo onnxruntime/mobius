@@ -128,7 +128,7 @@ class TestProcessTensorsLlama:
             needs_llama_qk_permute,
         )
 
-        for model_type in ("olmo", "arcee", "smollm3", "internlm2"):
+        for model_type in ("olmo", "arcee", "smollm3", "internlm2", "granitemoe"):
             assert needs_llama_qk_permute(model_type)
         for model_type in ("olmo2", "cohere2", "exaone"):
             assert not needs_llama_qk_permute(model_type)
@@ -235,6 +235,7 @@ class TestBuilderNeedsQkPermute:
         name = "model.layers.0.self_attn.q_proj.weight"
         assert _needs_qk_permute(name, 32, 32, "llama") is True
         assert _needs_qk_permute(name, 32, 32, "mistral") is True
+        assert _needs_qk_permute(name, 32, 8, "granitemoe") is True
 
     def test_non_qk_tensor_never_permuted(self) -> None:
         from mobius.integrations.gguf._builder import _needs_qk_permute

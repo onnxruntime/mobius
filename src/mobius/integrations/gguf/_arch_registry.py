@@ -309,6 +309,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "attention.layer_norm_rms_epsilon",
             "logit_scale",
         ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="cohere2",

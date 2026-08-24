@@ -330,6 +330,8 @@ def _write_moe_gguf(
     *,
     phi_fused_qkv: bool = False,
     quantize_tied_embedding: bool = False,
+    expert_scale_suffix: str | None = None,
+    malformed_expert_scale: bool = False,
 ) -> None:
     """Write a one-layer conventional-attention MoE GGUF with exact families."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -426,6 +428,10 @@ def _write_moe_gguf(
         "blk.0.ffn_down_exps.weight",
         (num_experts, hidden_size, expert_size),
     )
+    if expert_scale_suffix is not None:
+        assert expert_scale_suffix in {"scale", "input_scale"}
+        scale_count = num_experts - 1 if malformed_expert_scale else num_experts
+        add_float(f"blk.0.ffn_gate_exps.{expert_scale_suffix}", (scale_count,))
 
     if architecture == "olmoe":
         add_float("blk.0.attn_q_norm.weight", (num_heads * head_dim,))
@@ -1405,6 +1411,49 @@ class TestBuildQuantizedGguf:
         assert np.isfinite(first).all()
         np.testing.assert_array_equal(first, second)
 
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_granitemoe_qk_rows_are_reverse_permuted_by_value(
+        self, projection_quantization: str, tmp_path: Path
+    ) -> None:
+        import torch
+
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._repacker import repack_gguf_tensor
+        from mobius.integrations.gguf._tensor_processors import _reverse_permute
+
+        path = tmp_path / f"granitemoe-qk-{projection_quantization}.gguf"
+        _write_moe_gguf(path, "granitemoe", projection_quantization)
+        source = GGUFModel(path)
+        model = build_from_gguf(path)["model"]
+
+        raw_tensors = {
+            name: (raw, qtype, tuple(int(dim) for dim in shape))
+            for name, raw, qtype, shape in source.tensor_items_raw()
+        }
+        for gguf_name, projection, heads in (
+            ("blk.0.attn_q.weight", "q_proj", 4),
+            ("blk.0.attn_k.weight", "k_proj", 2),
+        ):
+            raw, qtype, shape = raw_tensors[gguf_name]
+            if projection_quantization == "f32":
+                unpermuted = torch.from_numpy(np.array(source.get_tensor(gguf_name)))
+            else:
+                packed = repack_gguf_tensor(
+                    raw.ravel().view(np.uint8),
+                    qtype.value,
+                    shape,
+                )
+                unpermuted = torch.from_numpy(packed.weight)
+            expected = _reverse_permute(unpermuted, heads)
+            stem = f"model.layers.0.self_attn.{projection}"
+            if projection_quantization == "f32":
+                actual = model.graph.initializers[f"{stem}.weight_t"].const_value.numpy().T
+            else:
+                actual = model.graph.initializers[f"{stem}.weight"].const_value.numpy()
+            np.testing.assert_array_equal(actual, expected.numpy())
+            assert not torch.equal(expected, unpermuted)
+
     def test_granitemoe_zero_experts_selects_dense_graph(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
@@ -1484,6 +1533,49 @@ class TestBuildQuantizedGguf:
         )[0]
         assert logits.shape == (1, 2, 256)
         assert np.isfinite(logits).all()
+
+    @pytest.mark.parametrize("suffix", ["scale", "input_scale"])
+    def test_qwen3moe_auxiliary_expert_scales_are_rejected_before_build(
+        self, suffix: str, tmp_path: Path, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"qwen3moe-{suffix}.gguf"
+        _write_moe_gguf(path, "qwen3moe", "q4_0", expert_scale_suffix=suffix)
+
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match="cannot represent GGUF scale/input_scale"):
+            build_from_gguf(path)
+        assert not graph_build_started
+
+    def test_malformed_qwen3moe_expert_scale_is_rejected(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen3moe-malformed-scale.gguf"
+        _write_moe_gguf(
+            path,
+            "qwen3moe",
+            "q4_0",
+            expert_scale_suffix="scale",
+            malformed_expert_scale=True,
+        )
+        with pytest.raises(ValueError, match=r"expected shape \(4,\), got \(3,\)"):
+            build_from_gguf(path)
+
+    def test_qwen3moe_optional_expert_scales_may_be_absent(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen3moe-no-scale.gguf"
+        _write_moe_gguf(path, "qwen3moe", "q4_0")
+        assert build_from_gguf(path)["model"].graph.num_nodes() > 0
 
     def test_q4_0_matmulnbits_has_explicit_zero_points(self, q4_0_gguf: Path):
         """GGUF Q4_0 projections explicitly encode zp=8 instead of EP defaults."""

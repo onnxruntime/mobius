@@ -371,6 +371,45 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         source=source,
         tensor_names=gguf_model.tensor_names,
     )
+    _raise_for_unsupported_auxiliary_quantization(gguf_model)
+
+
+def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
+    """Reject scale sidecars whose semantics the target quantization ABI cannot express."""
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    architecture = gguf_model.architecture
+    expert_count = gguf_model.get_metadata(f"{architecture}.expert_count")
+    for gguf_name, _raw, _qtype, shape in gguf_model.tensor_items_raw():
+        suffix = next(
+            (
+                candidate
+                for candidate in (".input_scale", ".scale")
+                if gguf_name.endswith(candidate)
+            ),
+            None,
+        )
+        if suffix is None:
+            continue
+        hf_name = map_gguf_to_hf_names(gguf_name, architecture)
+        if hf_name is None:
+            continue
+
+        is_expert_scale = ".mlp.experts." in hf_name
+        expected = (int(expert_count),) if is_expert_scale and expert_count else (1,)
+        actual = tuple(int(dim) for dim in shape)
+        if actual != expected:
+            raise ValueError(
+                f"Invalid GGUF auxiliary quantization tensor {gguf_name!r}: "
+                f"expected shape {expected}, got {actual}"
+            )
+        raise ValueError(
+            f"GGUF auxiliary quantization tensor {gguf_name!r} maps to {hf_name!r}, "
+            "but Mobius cannot represent GGUF scale/input_scale sidecars "
+            "(including NVFP4 scale2) in its expert/projection quantization ABI. "
+            "This file is rejected before graph construction to avoid silently "
+            "dropping required quantization data."
+        )
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -2053,16 +2092,30 @@ def _load_quantized_state_dict(
                 else None
             )
             for index, target_stem in enumerate(affine_targets):
-                state_dict[f"{target_stem}.weight"] = torch.from_numpy(
-                    np.array(packed[index], copy=True)
+                target_name = f"{target_stem}.weight"
+                weight = torch.from_numpy(np.array(packed[index], copy=True))
+                scale = torch.from_numpy(np.array(scales[index], copy=True))
+                zero_point = (
+                    torch.from_numpy(np.array(zero_points[index], copy=True))
+                    if zero_points is not None
+                    else None
                 )
-                state_dict[f"{target_stem}.scales"] = torch.from_numpy(
-                    np.array(scales[index], copy=True)
-                )
+                if _needs_qk_permute(
+                    target_name,
+                    num_heads,
+                    num_kv_heads,
+                    model_type,
+                ):
+                    n_head = num_heads if ".q_proj." in target_name else num_kv_heads
+                    weight = _reverse_permute(weight, n_head)
+                    scale = _reverse_permute(scale, n_head)
+                    if zero_point is not None:
+                        zero_point = _reverse_permute(zero_point, n_head)
+                state_dict[target_name] = weight
+                state_dict[f"{target_stem}.scales"] = scale
                 if zero_points is not None:
-                    state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
-                        np.array(zero_points[index], copy=True)
-                    )
+                    assert zero_point is not None
+                    state_dict[f"{target_stem}.zero_points"] = zero_point
             n_repacked += num_experts
         elif should_repack:
             if is_tencent_q1_0_tensor:

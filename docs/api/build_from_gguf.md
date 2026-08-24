@@ -187,7 +187,7 @@ validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
 
-GraniteMoE has real-weight runtime evidence from
+GraniteMoE has real-weight import and deterministic ORT execution coverage from
 `bartowski/granite-3.0-1b-a400m-instruct-GGUF` revision
 `0e1c3cecaa6e49ac0721be91ef441ec72eae62d4`,
 `granite-3.0-1b-a400m-instruct-Q4_K_M.gguf` (821,845,024 bytes, SHA-256
@@ -196,9 +196,12 @@ Its base config and tokenizer are pinned to
 `ibm-granite/granite-3.0-1b-a400m-instruct` revision
 `ffec3c35bdfd97a06f0b4cd5fcc92cd9b1584445`. The integration test checks all
 24 routers and 2,304 expert projections, mixed F32/Q4_K/Q6_K routing, full
-49,155-token logits, and deterministic three-token cached decoding.
+49,155-token logits, and deterministic three-token cached decoding. This is not
+independent cross-runtime parity evidence, so GraniteMoE runtime support remains
+deferred.
 
-Runtime remains deferred for OLMoE, PhiMoE, Qwen2MoE, and Qwen3MoE. The only
+Runtime remains deferred for OLMoE, PhiMoE, Qwen2MoE, Qwen3MoE, and GraniteMoE.
+The only
 compatible Phi-tiny-MoE GGUF found was
 `tripathyShaswata/Phi-tiny-MoE-instruct-GGUF` revision
 `873ccb08cd3380ee2c08573d45267fac9a6cc81b`,

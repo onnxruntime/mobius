@@ -315,6 +315,12 @@ class TestMapGGUFToHFNames:
         assert map_gguf_to_hf_names("blk.1.ffn_down_exps.weight", "granitemoe") == (
             "model.layers.1.mlp.experts.down_proj.weight"
         )
+        assert map_gguf_to_hf_names("blk.2.ffn_gate_exps.scale", "qwen3moe") == (
+            "model.layers.2.mlp.experts.gate_proj.scale"
+        )
+        assert map_gguf_to_hf_names("blk.2.ffn_up_exps.input_scale", "qwen3moe") == (
+            "model.layers.2.mlp.experts.up_proj.input_scale"
+        )
         assert map_gguf_to_hf_names("blk.1.ffn_gate_shexp.weight", "granitemoe") == (
             "model.layers.1.mlp.shared_expert.gate_proj.weight"
         )

@@ -465,7 +465,10 @@ def _split_suffix(name: str) -> tuple[str, str]:
 
     Returns ``("blk.0.attn_q", "")`` if no suffix is found.
     """
-    for suffix in (".weight", ".bias"):
+    # llama.cpp's generic model loader accepts sidecar quantization scales for
+    # every projection family. Keep these names visible to pre-build validation
+    # rather than silently treating them as unknown tensors.
+    for suffix in (".input_scale", ".weight", ".scale", ".bias"):
         if name.endswith(suffix):
             return name[: -len(suffix)], suffix
     return name, ""
