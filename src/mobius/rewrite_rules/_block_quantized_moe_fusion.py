@@ -41,10 +41,15 @@ storm and its router/mask are fused, and the final ``Add(routed_sum, shared)``
 is rewired to consume the ``BlockQuantizedMoE`` output.
 
 The rewrite is **property-gated and fails closed**: a layer that is not a native
-dense-expert storm, or whose experts use a mix of native formats that a single
-expert-major bank cannot express, is left as the runnable dense fallback with a
-typed reason logged. It never silently emits a node that would dense-evaluate
-every expert.
+dense-expert storm is skipped, and a *routed native-block* storm whose experts
+cannot be expressed as one expert-major bank (mixed native formats, per-expert
+bias, an incomplete/untraceable expert group, ...) raises
+:class:`~mobius.integrations.gguf.SparseMoEExportError` -- the same typed
+capability error the GGUF builder's sparse-MoE honesty gate raises -- so export
+fails closed rather than silently shipping a dense-all-expert graph. Pass
+``allow_dense_moe=True`` (or set ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1``) to instead
+log the reason and leave the runnable dense fallback in place for
+research/correctness study; this makes no throughput claim.
 
 Example::
 
@@ -59,6 +64,7 @@ Example::
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import numpy as np
@@ -348,18 +354,40 @@ class _DenseMoELayer:
         self.routed_out = cur
 
     @property
-    def is_candidate(self) -> bool:
+    def has_native_experts(self) -> bool:
+        """Whether any routed expert traced as a native ``BlockQuantizedMatMul`` MLP.
+
+        A selector with no native-block experts is not our storm (it may be an
+        int4 ``MatMulNBits`` MoE handled by :func:`fuse_dense_moe_to_qmoe`, a
+        float MoE, or an unrelated ``Equal`` pattern) and is skipped silently.
+        """
+        return bool(self.experts)
+
+    def check_fusable(self) -> None:
+        """Raise :class:`_UnfusableError` if this native storm cannot fully fuse.
+
+        Only called for layers with native experts. A routed native-block MoE
+        that reaches here but cannot be collapsed into a single expert-major
+        bank is a fail-closed condition, not a silent skip.
+        """
         if self.routing_weights is None or self.routed_out is None:
-            return False
-        if not self.experts:
-            return False
+            raise _UnfusableError(
+                "could not trace the router mask / weighted-sum accumulation"
+            )
         # Fail closed unless *every* declared expert was fully traced. Checking
         # only for gap-freeness (``ids == range(len(ids))``) would miss a dropped
         # highest-id expert, whose survivors ``0..E-2`` still look contiguous.
-        if set(self.experts) != self.declared_ids:
-            return False
-        ids = sorted(self.declared_ids)
-        return ids == list(range(len(ids)))
+        missing = sorted(self.declared_ids - set(self.experts))
+        if missing:
+            raise _UnfusableError(
+                f"experts {missing} did not trace as native BlockQuantizedMatMul "
+                "MLPs sharing the router (incomplete routed-expert group)"
+            )
+        ids = sorted(self.experts)
+        if ids != list(range(len(ids))):
+            raise _UnfusableError(f"routed expert ids are not contiguous 0..E-1: {ids}")
+        if self.k is None or self.k < 1:
+            raise _UnfusableError("could not determine the router top-k")
 
 
 def _projection_format(node: ir.Node, role: str) -> str:
@@ -557,7 +585,27 @@ def _build_routing(
     return nodes, logits.outputs[0], weights.outputs[0]
 
 
-def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
+@dataclasses.dataclass
+class _FusionPlan:
+    """A fully-validated, graph-independent plan to emit one ``BlockQuantizedMoE``.
+
+    Building a plan performs *all* fail-closed validation and byte-stacking with
+    no graph mutation, so the driver can validate every layer before emitting any
+    node -- a fail-closed layer never leaves the graph half-rewritten.
+    """
+
+    layer: _DenseMoELayer
+    prefix: str
+    moe_input: ir.Value
+    fc1_w: np.ndarray
+    fc2_w: np.ndarray
+    fc3_w: np.ndarray | None
+    attributes: dict[str, object]
+    experts: int
+
+
+def _plan_layer(layer: _DenseMoELayer, index: int) -> _FusionPlan:
+    """Validate and byte-stack one native MoE layer without touching the graph."""
     ids = sorted(layer.experts)
     gate_nodes = [layer.experts[i].gate for i in ids]
     up_nodes = [layer.experts[i].up for i in ids]
@@ -584,8 +632,7 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
     up_w = _stack_weights(up_nodes, inter, "up")
     down_w = _stack_weights(down_nodes, hidden, "down")
 
-    prefix = f"bqmoe.layer{index}"
-    fc3_w_v: ir.Value | None = None
+    fc3_w: np.ndarray | None = None
     projection_formats: dict[str, str] = {"fc2": down_fmt}
     if gate_fmt == up_fmt:
         # Fused SwiGLU: FC1 = concat(gate_rows, up_rows) in one native format.
@@ -599,24 +646,9 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
         # and FC3 (up); the kernel computes ``swiglu(fc1(x), fc3(x))``.
         swiglu_fusion = 0
         fc1_w = gate_w
-        fc3_w_v = _make_initializer(
-            graph, f"{prefix}.fc3_experts_weights", up_w, ir.DataType.UINT8
-        )
+        fc3_w = up_w
         projection_formats["fc1"] = gate_fmt
         projection_formats["fc3"] = up_fmt
-
-    fc1_w_v = _make_initializer(
-        graph, f"{prefix}.fc1_experts_weights", fc1_w, ir.DataType.UINT8
-    )
-    fc2_w_v = _make_initializer(
-        graph, f"{prefix}.fc2_experts_weights", down_w, ir.DataType.UINT8
-    )
-
-    routing_nodes, router_logits, router_weights = _build_routing(
-        graph, layer, experts, prefix
-    )
-
-    moe_input = gate_nodes[0].inputs[0]
 
     attributes: dict[str, object] = {
         "k": layer.k,
@@ -637,6 +669,41 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
         if "fc3" in projection_formats:
             attributes["fc3_format"] = projection_formats["fc3"]
 
+    return _FusionPlan(
+        layer=layer,
+        prefix=f"bqmoe.layer{index}",
+        moe_input=gate_nodes[0].inputs[0],
+        fc1_w=fc1_w,
+        fc2_w=down_w,
+        fc3_w=fc3_w,
+        attributes=attributes,
+        experts=experts,
+    )
+
+
+def _emit_layer(graph: ir.Graph, plan: _FusionPlan) -> None:
+    """Materialise a validated :class:`_FusionPlan` into the graph."""
+    prefix = plan.prefix
+    layer = plan.layer
+
+    fc3_w_v: ir.Value | None = None
+    if plan.fc3_w is not None:
+        fc3_w_v = _make_initializer(
+            graph, f"{prefix}.fc3_experts_weights", plan.fc3_w, ir.DataType.UINT8
+        )
+    fc1_w_v = _make_initializer(
+        graph, f"{prefix}.fc1_experts_weights", plan.fc1_w, ir.DataType.UINT8
+    )
+    fc2_w_v = _make_initializer(
+        graph, f"{prefix}.fc2_experts_weights", plan.fc2_w, ir.DataType.UINT8
+    )
+
+    routing_nodes, router_logits, router_weights = _build_routing(
+        graph, layer, plan.experts, prefix
+    )
+
+    moe_input = plan.moe_input
+
     moe = ir.node(
         _MOE,
         inputs=[
@@ -650,7 +717,7 @@ def _fuse_layer(graph: ir.Graph, layer: _DenseMoELayer, index: int) -> None:
             None,
             router_weights,
         ],
-        attributes=attributes,
+        attributes=plan.attributes,
         domain=_NXRT_DOMAIN,
         num_outputs=1,
         name=f"{prefix}.bqmoe",
@@ -705,7 +772,43 @@ def _remove_dead_nodes(graph: ir.Graph) -> None:
             del graph.initializers[name]
 
 
-def fuse_block_quantized_moe(model: ir.Model) -> int:
+def _fail_closed(layer: _DenseMoELayer, reason: _UnfusableError, *, allow_dense: bool) -> None:
+    """Fail closed (or, when opted in, keep the dense fallback) for one layer.
+
+    Raises :class:`~mobius.integrations.gguf.SparseMoEExportError` -- the same
+    typed capability error the GGUF builder's sparse-MoE honesty gate uses -- so
+    a routed native-block MoE that cannot be sparse-fused aborts export instead
+    of silently shipping a dense-all-expert graph. ``allow_dense`` downgrades the
+    abort to a loud warning that leaves the runnable dense fallback in place.
+    """
+    detail = (
+        f"routed native-block MoE at {layer.selected_experts.name!r} cannot be "
+        f"expressed as one sparse pkg.nxrt::BlockQuantizedMoE node: {reason}"
+    )
+    if allow_dense:
+        logger.warning(
+            "allow_dense_moe: %s. Keeping the per-expert BlockQuantizedMatMul "
+            "dense fallback (every expert runs for every token; not a "
+            "performance path, no throughput claim).",
+            detail,
+        )
+        return
+    # Imported lazily: the typed error lives in the GGUF export layer, and this
+    # generic rewrite must not pull that (huggingface_hub/gguf) stack in at
+    # import time -- only when it actually has to fail an export closed.
+    from mobius.integrations.gguf import SparseMoEExportError
+
+    raise SparseMoEExportError(
+        f"Sparse-MoE export blocker: {detail}. No sparse top-k BlockQuantizedMoE "
+        "fusion was applied, so exporting would build a dense-all-expert graph "
+        "(every expert evaluated for every token) with no performance guarantee, "
+        "so the build fails closed. To study the dense fallback, re-run with "
+        "allow_dense_moe=True (or set MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this "
+        "makes no throughput claim."
+    ) from reason
+
+
+def fuse_block_quantized_moe(model: ir.Model, *, allow_dense_moe: bool | None = None) -> int:
     """Fuse every dense-fallback native-block MoE subgraph into ``BlockQuantizedMoE``.
 
     Reuses the existing ``BlockQuantizedMatMul`` native blocks byte-for-byte
@@ -713,44 +816,61 @@ def fuse_block_quantized_moe(model: ir.Model) -> int:
     gate-agnostically from the graph's ``selected_experts`` / ``routing_weights``
     tensors, so softmax, sigmoid+bias+scaling, and other top-k gates all fuse.
     Mixed per-projection native formats are expressed with
-    ``block_layout_version=2``. A layer whose experts cannot be expressed as a
-    single expert-major bank is left as the runnable dense fallback with a typed
-    reason logged -- the fusion never silently dense-evaluates every expert.
+    ``block_layout_version=2``.
+
+    Every candidate layer is fully validated and byte-stacked *before* any node
+    is emitted, so a fail-closed layer never leaves the graph half-rewritten. A
+    selector with no native-block experts (e.g. an int4 ``MatMulNBits`` MoE, or
+    an unrelated ``Equal`` pattern) is skipped silently. A *routed native-block*
+    storm that cannot be collapsed into one expert-major bank -- mixed native
+    formats across experts, a per-expert bias, an incomplete/untraceable expert
+    group, ragged packed shapes -- fails closed by raising
+    :class:`~mobius.integrations.gguf.SparseMoEExportError`, matching the GGUF
+    builder's sparse-MoE honesty gate.
 
     Args:
         model: The IR model to rewrite in place.
+        allow_dense_moe: When ``True``, an unfusable routed native-block layer is
+            left as the runnable dense fallback (with a loud warning) instead of
+            failing closed. When ``None`` (default), the value of the
+            ``allow_dense_moe_experts`` flag / ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``
+            environment variable is used. This is a research/correctness path
+            only and makes no throughput claim.
 
     Returns:
         The number of MoE layers fused.
+
+    Raises:
+        SparseMoEExportError: A routed native-block MoE layer cannot be sparse
+            fused and ``allow_dense_moe`` is not set.
     """
+    if allow_dense_moe is None:
+        from mobius._flags import flags
+
+        allow_dense_moe = flags.allow_dense_moe_experts
+
     graph = model.graph
     selectors = _find_moe_selectors(graph)
-    layers = [_DenseMoELayer(selected) for selected in selectors]
-    fused = 0
-    for index, layer in enumerate(layers):
-        if not layer.is_candidate:
-            logger.warning(
-                "skipping native MoE at %s: unrecognised dense-fallback structure",
-                layer.selected_experts.name,
-            )
-            continue
-        if layer.k is None or layer.k < 1:
-            logger.warning(
-                "skipping native MoE at %s: could not determine top-k",
+
+    # Pass 1: validate + byte-stack every native storm without mutating the graph.
+    plans: list[_FusionPlan] = []
+    for index, layer in enumerate(_DenseMoELayer(selected) for selected in selectors):
+        if not layer.has_native_experts:
+            logger.debug(
+                "skipping selector %s: no native BlockQuantizedMatMul experts",
                 layer.selected_experts.name,
             )
             continue
         try:
-            _fuse_layer(graph, layer, index)
+            layer.check_fusable()
+            plans.append(_plan_layer(layer, index))
         except _UnfusableError as reason:
-            logger.warning(
-                "skipping native MoE at %s: %s; keeping dense fallback",
-                layer.selected_experts.name,
-                reason,
-            )
-            continue
-        fused += 1
-    if fused:
+            _fail_closed(layer, reason, allow_dense=allow_dense_moe)
+
+    # Pass 2: emit only after every candidate validated (all-or-fail-closed).
+    for plan in plans:
+        _emit_layer(graph, plan)
+    if plans:
         _remove_dead_nodes(graph)
         graph.sort()
-    return fused
+    return len(plans)

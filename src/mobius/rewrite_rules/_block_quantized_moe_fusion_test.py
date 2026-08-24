@@ -18,6 +18,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius._constants import OPSET_VERSION
+from mobius.integrations.gguf import SparseMoEExportError
 from mobius.rewrite_rules import fuse_block_quantized_moe
 from mobius.rewrite_rules._block_quantized_moe_fusion import _NATIVE_BLOCK_FORMATS
 
@@ -549,23 +550,23 @@ def test_fuses_f16_graph_with_cast_wrapped_projections() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Fail-closed (typed reason, dense fallback preserved)                        #
+# Fail-closed (typed SparseMoEExportError, graph left untouched)              #
 # --------------------------------------------------------------------------- #
 def test_mixed_format_across_experts_fails_closed() -> None:
     """One expert with a different gate format cannot form one expert-major bank."""
     model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
     graph = model.graph
-    fused = fuse_block_quantized_moe(model)
-    assert fused == 0
+    with pytest.raises(SparseMoEExportError):
+        fuse_block_quantized_moe(model)
     assert _count(graph, "BlockQuantizedMoE") == 0
-    assert _count(graph, "Equal") == E  # dense fallback preserved
+    assert _count(graph, "Equal") == E  # dense graph left untouched
 
 
 def test_biased_expert_fails_closed() -> None:
     model, _ = _build_dense_graph(bias_expert=2)
     graph = model.graph
-    fused = fuse_block_quantized_moe(model)
-    assert fused == 0
+    with pytest.raises(SparseMoEExportError):
+        fuse_block_quantized_moe(model)
     assert _count(graph, "BlockQuantizedMoE") == 0
     assert _count(graph, "Equal") == E
 
@@ -574,8 +575,8 @@ def test_incomplete_expert_group_fails_closed() -> None:
     """A non-native (untraceable) expert leaves an incomplete 0..E-1 set."""
     model, _ = _build_dense_graph(break_expert=2)
     graph = model.graph
-    fused = fuse_block_quantized_moe(model)
-    assert fused == 0
+    with pytest.raises(SparseMoEExportError):
+        fuse_block_quantized_moe(model)
     assert _count(graph, "BlockQuantizedMoE") == 0
 
 
@@ -585,24 +586,38 @@ def test_dropped_trailing_expert_fails_closed() -> None:
     The survivors ``0..E-2`` still look contiguous, so a gap-only check would
     silently fuse an expert bank narrower than the router actually selects over
     (leaving ``ScatterElements`` to index out of bounds). The declared-id set
-    from the ``Equal`` masks is the authority, so this must stay a dense graph.
+    from the ``Equal`` masks is the authority, so this must fail closed.
     """
     model, _ = _build_dense_graph(break_expert=E - 1)
     graph = model.graph
-    fused = fuse_block_quantized_moe(model)
-    assert fused == 0
+    with pytest.raises(SparseMoEExportError):
+        fuse_block_quantized_moe(model)
     assert _count(graph, "BlockQuantizedMoE") == 0
-    assert _count(graph, "Equal") == E  # dense fallback fully preserved
+    assert _count(graph, "Equal") == E  # dense graph left untouched
 
 
 def test_alien_routing_weights_expert_fails_closed() -> None:
     """An expert wired to a non-shared routing-weights tensor must fail closed."""
     model, _ = _build_dense_graph(alien_routing_expert=E - 1)
     graph = model.graph
-    fused = fuse_block_quantized_moe(model)
+    with pytest.raises(SparseMoEExportError):
+        fuse_block_quantized_moe(model)
+    assert _count(graph, "BlockQuantizedMoE") == 0
+    assert _count(graph, "Equal") == E  # dense graph left untouched
+
+
+def test_allow_dense_moe_opt_in_keeps_dense_fallback() -> None:
+    """``allow_dense_moe=True`` downgrades a fail-closed layer to a dense keep.
+
+    The honesty opt-in (mirroring ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``) must not
+    raise and must leave the runnable per-expert dense fallback intact.
+    """
+    model, _ = _build_dense_graph(corrupt_expert_gate_fmt=(1, "iq1_m"))
+    graph = model.graph
+    fused = fuse_block_quantized_moe(model, allow_dense_moe=True)
     assert fused == 0
     assert _count(graph, "BlockQuantizedMoE") == 0
-    assert _count(graph, "Equal") == E  # dense fallback fully preserved
+    assert _count(graph, "Equal") == E  # dense fallback preserved, not fused
 
 
 def test_no_moe_is_a_noop() -> None:
