@@ -663,7 +663,8 @@ def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:
 
 
 def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
-    """Reject recurrent tensor suffixes not created by the pinned C++ loaders."""
+    """Reject suffixes not created by the pinned C++ tensor loaders."""
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
     from mobius.integrations.gguf._upstream import upstream_architecture
 
     upstream = upstream_architecture(gguf_model.architecture)
@@ -678,7 +679,10 @@ def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
             r"\1.{bid}.",
             name,
         )
-        if template not in expected:
+        mapped_sidecar = name.endswith((".scale", ".input_scale")) and (
+            map_gguf_to_hf_names(name, gguf_model.architecture) is not None
+        )
+        if template not in expected and not mapped_sidecar:
             malformed.append(name)
     if malformed:
         raise ValueError(
@@ -968,6 +972,22 @@ def build_from_gguf(
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
+    if gguf_arch in {"dream", "llada", "llada-moe", "rnd1"}:
+        from mobius.tasks import MaskedDiffusionTask
+
+        if static_cache:
+            raise ValueError(
+                f"static_cache=True is not valid for masked-diffusion {gguf_arch} GGUF; "
+                "the model is bidirectional and has no KV cache"
+            )
+        if (
+            task is not None
+            and task != "masked-diffusion"
+            and not isinstance(task, MaskedDiffusionTask)
+        ):
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports task='masked-diffusion', got {task!r}"
+            )
     if static_cache and model_type in {"mamba", "mamba2"}:
         raise ValueError(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
@@ -1103,7 +1123,6 @@ def build_from_gguf(
     config._gguf_model_type = model_type
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices
-
     emit_mtp_head = has_mtp_head(config) and not static_cache
     if has_mtp_head(config) and static_cache:
         logger.info(
@@ -1518,6 +1537,24 @@ def _normalize_gguf_weights(
     for key, value in state_dict.items():
         if config is not None:
             _validate_moe_weight_shape(key, tuple(value.shape), config)
+        if gguf_arch in {"dream", "llada-moe", "rnd1"} and ".self_attn.qkv_proj." in key:
+            suffix = key.rsplit(".", 1)[-1]
+            q_width = int(config.num_attention_heads) * int(config.head_dim)
+            kv_width = int(config.num_key_value_heads) * int(config.head_dim)
+            expected_width = q_width + 2 * kv_width
+            if value.shape[0] != expected_width:
+                raise ValueError(
+                    f"Invalid fused {gguf_arch} QKV {suffix} width: expected "
+                    f"{expected_width}, got {value.shape[0]}"
+                )
+            query, key_projection, value_projection = value.split(
+                [q_width, kv_width, kv_width], dim=0
+            )
+            stem = key.rsplit(".qkv_proj.", 1)[0]
+            result[f"{stem}.q_proj.{suffix}"] = query
+            result[f"{stem}.k_proj.{suffix}"] = key_projection
+            result[f"{stem}.v_proj.{suffix}"] = value_projection
+            continue
         if gguf_arch == "bert" and ".attention.self.qkv." in key:
             suffix = key.rsplit(".", 1)[-1]
             expected_width = 3 * int(config.hidden_size)
@@ -2428,6 +2465,7 @@ def _load_quantized_state_dict(
                     num_heads,
                     num_kv_heads,
                     model_type,
+                    gguf_arch,
                 )
                 if needs_permute:
                     n_head = (
@@ -2521,6 +2559,7 @@ def _load_quantized_state_dict(
                     num_heads,
                     num_kv_heads,
                     model_type,
+                    gguf_arch,
                 ):
                     n_head = num_heads if ".q_proj." in target_name else num_kv_heads
                     weight = _reverse_permute(weight, n_head)
@@ -2582,7 +2621,7 @@ def _load_quantized_state_dict(
             # (same transform as _process_llama, on all arrays). Only
             # llama-family archs use the interleaved-rope permute; Qwen
             # and others must NOT be permuted.
-            if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
+            if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type, gguf_arch):
                 n_head = (
                     num_heads
                     if ".q_proj." in hf_name or ".qkv_proj." in hf_name
@@ -2598,7 +2637,7 @@ def _load_quantized_state_dict(
             state_dict[f"{stem}.scales"] = s
             if repacked.zero_points is not None:
                 zp = torch.from_numpy(repacked.zero_points)
-                if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
+                if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type, gguf_arch):
                     zp = _reverse_permute(zp, n_head)
                 state_dict[f"{stem}.zero_points"] = zp
             n_repacked += 1
@@ -2677,6 +2716,7 @@ def _needs_qk_permute(
     num_heads: int | None,
     num_kv_heads: int | None,
     model_type: str | None = None,
+    gguf_arch: str | None = None,
 ) -> bool:
     """Check if this tensor needs Q/K reverse-permutation.
 
@@ -2687,13 +2727,14 @@ def _needs_qk_permute(
     plain HF order (NEOX rope) and must NOT be permuted, or their
     attention heads get scrambled and the model emits garbage.
     """
-    from mobius.integrations.gguf._tensor_processors import (
-        needs_llama_qk_permute,
-    )
+    from mobius.integrations.gguf._arch_registry import try_get_arch_spec
+    from mobius.integrations.gguf._tensor_processors import needs_llama_qk_permute
 
     if num_heads is None or num_kv_heads is None:
         return False
-    if not needs_llama_qk_permute(model_type):
+    spec = try_get_arch_spec(gguf_arch) if gguf_arch is not None else None
+    permute = spec.llama_qk_permute if spec is not None else needs_llama_qk_permute(model_type)
+    if not permute:
         return False
     return (
         ".q_proj." in hf_name or ".k_proj." in hf_name or ".qkv_proj." in hf_name

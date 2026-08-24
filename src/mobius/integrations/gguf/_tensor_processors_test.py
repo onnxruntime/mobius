@@ -129,9 +129,16 @@ class TestProcessTensorsLlama:
             needs_llama_qk_permute,
         )
 
-        for model_type in ("olmo", "arcee", "smollm3", "internlm2", "granitemoe"):
+        for model_type in (
+            "olmo",
+            "arcee",
+            "smollm3",
+            "internlm2",
+            "granitemoe",
+            "llada",
+        ):
             assert needs_llama_qk_permute(model_type)
-        for model_type in ("olmo2", "cohere2", "exaone"):
+        for model_type in ("olmo2", "cohere2", "exaone", "dream"):
             assert not needs_llama_qk_permute(model_type)
 
     def test_reverse_matches_hf_reference_head_dim_64(self) -> None:
@@ -237,6 +244,14 @@ class TestBuilderNeedsQkPermute:
         assert _needs_qk_permute(name, 32, 32, "llama") is True
         assert _needs_qk_permute(name, 32, 32, "mistral") is True
         assert _needs_qk_permute(name, 32, 8, "granitemoe") is True
+        assert _needs_qk_permute(name, 32, 32, "llada", "llada") is True
+
+    def test_diffusion_moe_quantized_qk_is_not_permuted(self) -> None:
+        from mobius.integrations.gguf._builder import _needs_qk_permute
+
+        name = "model.layers.0.self_attn.q_proj.weight"
+        assert _needs_qk_permute(name, 32, 8, "llada", "llada-moe") is False
+        assert _needs_qk_permute(name, 32, 8, "llada", "rnd1") is False
 
     def test_non_qk_tensor_never_permuted(self) -> None:
         from mobius.integrations.gguf._builder import _needs_qk_permute

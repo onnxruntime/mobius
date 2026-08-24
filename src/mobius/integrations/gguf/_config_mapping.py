@@ -744,6 +744,186 @@ def _moe_postprocess(
     return dataclasses.replace(config, **updates)
 
 
+def _diffusion_common_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Validate the common no-cache masked-diffusion contract."""
+    arch = model.architecture
+    mask_token_id = metadata.get("tokenizer.ggml.mask_token_id")
+    if mask_token_id is None:
+        raise ValueError(
+            "tokenizer.ggml.mask_token_id is required for masked-diffusion generation"
+        )
+    mask_token_id = int(mask_token_id)
+    if not 0 <= mask_token_id < config.vocab_size:
+        raise ValueError(
+            f"tokenizer.ggml.mask_token_id must be in [0, {config.vocab_size}), "
+            f"got {mask_token_id}"
+        )
+    if config.hidden_act not in (None, "silu"):
+        raise ValueError(f"{arch}.hidden_activation must be silu, got {config.hidden_act!r}")
+
+    result = dataclasses.replace(
+        config,
+        hidden_act="silu",
+        rope_type="default",
+        mlp_bias=False,
+        mask_token_id=mask_token_id,
+        diffusion_shift_logits=bool(
+            metadata.get("diffusion.shift_logits", arch in {"dream", "rnd1"})
+        ),
+    )
+    return result
+
+
+def _dense_diffusion_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+    *,
+    dream: bool,
+) -> ArchitectureConfig:
+    result = _diffusion_common_postprocess(config, metadata, model)
+    names = set(model.tensor_names)
+    output_present = "output.weight" in names
+    qkv_bias = _diffusion_qkv_bias(config, names, allow_fused=dream)
+    if qkv_bias and not dream:
+        raise ValueError("llada GGUF does not support Q/K/V projection biases")
+    return dataclasses.replace(
+        result,
+        attn_qkv_bias=qkv_bias,
+        attn_o_bias=False,
+        tie_word_embeddings=not output_present,
+    )
+
+
+def _diffusion_qkv_bias(
+    config: ArchitectureConfig,
+    names: set[str],
+    *,
+    allow_fused: bool,
+) -> bool:
+    """Validate per-layer fused/separate QKV alternatives and bias consistency."""
+    layer_biases: list[bool] = []
+    for layer in range(config.num_hidden_layers):
+        fused_weight = f"blk.{layer}.attn_qkv.weight"
+        fused_bias = f"blk.{layer}.attn_qkv.bias"
+        separate_weights = {
+            f"blk.{layer}.attn_{projection}.weight" for projection in ("q", "k", "v")
+        }
+        separate_biases = {
+            f"blk.{layer}.attn_{projection}.bias" for projection in ("q", "k", "v")
+        }
+        has_fused = fused_weight in names
+        present_weights = separate_weights & names
+        if has_fused and not allow_fused:
+            raise ValueError(f"llada does not support fused QKV tensor {fused_weight!r}")
+        if has_fused and present_weights:
+            raise ValueError(
+                f"layer {layer} provides both fused and separate QKV projection weights"
+            )
+        if not has_fused and present_weights != separate_weights:
+            missing = sorted(separate_weights - present_weights)
+            raise ValueError(f"masked-diffusion GGUF is missing {missing[0]!r}")
+
+        if has_fused:
+            if separate_biases & names:
+                raise ValueError(
+                    f"layer {layer} mixes a fused QKV weight with separate Q/K/V biases"
+                )
+            layer_biases.append(fused_bias in names)
+        else:
+            present_biases = separate_biases & names
+            if present_biases and present_biases != separate_biases:
+                missing = sorted(separate_biases - present_biases)
+                raise ValueError(
+                    f"Q/K/V bias must be present consistently; missing {missing[0]!r}"
+                )
+            if fused_bias in names:
+                raise ValueError(
+                    f"layer {layer} provides fused QKV bias without a fused weight"
+                )
+            layer_biases.append(bool(present_biases))
+    if len(set(layer_biases)) > 1:
+        raise ValueError("Q/K/V bias presence must be consistent across every layer")
+    return layer_biases[0] if layer_biases else False
+
+
+def _dream_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _dense_diffusion_postprocess(config, metadata, model, dream=True)
+
+
+def _llada_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _dense_diffusion_postprocess(config, metadata, model, dream=False)
+
+
+def _diffusion_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+    *,
+    normalize_topk: bool,
+    require_output: bool,
+) -> ArchitectureConfig:
+    result = _diffusion_common_postprocess(config, metadata, model)
+    result = _moe_postprocess(result, metadata, model)
+    assert result.num_experts_per_tok is not None
+    if result.moe_intermediate_size is None:
+        if result.intermediate_size % result.num_experts_per_tok:
+            raise ValueError(
+                f"{model.architecture}.feed_forward_length ({result.intermediate_size}) "
+                "must be divisible by expert_used_count "
+                f"({result.num_experts_per_tok}) when expert_feed_forward_length is absent"
+            )
+        expert_width = result.intermediate_size // result.num_experts_per_tok
+    else:
+        expert_width = result.moe_intermediate_size
+
+    output_present = "output.weight" in set(model.tensor_names)
+    if require_output and not output_present:
+        raise ValueError(f"{model.architecture} requires output.weight")
+    return dataclasses.replace(
+        result,
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        attn_qkv_bias=_diffusion_qkv_bias(config, set(model.tensor_names), allow_fused=True),
+        attn_o_bias=False,
+        moe_intermediate_size=expert_width,
+        norm_topk_prob=normalize_topk,
+        tie_word_embeddings=not output_present,
+    )
+
+
+def _llada_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _diffusion_moe_postprocess(
+        config, metadata, model, normalize_topk=False, require_output=True
+    )
+
+
+def _rnd1_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _diffusion_moe_postprocess(
+        config, metadata, model, normalize_topk=True, require_output=False
+    )
+
+
 def _granitemoe_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -1512,6 +1692,10 @@ def _modern_bert_encoder_postprocess(
 # model_type keying is what let the Gemma weight processor drift out of reach
 # when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "dream": _dream_postprocess,
+    "llada": _llada_postprocess,
+    "llada_moe": _llada_moe_postprocess,
+    "rnd1": _rnd1_postprocess,
     "olmo": _olmo_postprocess,
     "moe": _moe_postprocess,
     "granitemoe": _granitemoe_postprocess,

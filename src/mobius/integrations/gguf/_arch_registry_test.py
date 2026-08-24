@@ -56,7 +56,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 37
+_EXPECTED_SUPPORTED_COUNT = 41
 
 # Quantized reachability is separately pinned from float importability. A new
 # architecture must explicitly prove that its graph exposes packed projection
@@ -292,6 +292,10 @@ class TestPinnedTensorClosure:
         "modern-bert",
         "t5",
         "t5encoder",
+        "dream",
+        "llada",
+        "llada-moe",
+        "rnd1",
     )
 
     @staticmethod
@@ -314,7 +318,16 @@ class TestPinnedTensorClosure:
         assert not self._unmapped(architecture)
 
     @pytest.mark.parametrize(
-        "architecture", ["olmoe", "phimoe", "qwen2moe", "qwen3moe", "granitemoe"]
+        "architecture",
+        [
+            "olmoe",
+            "phimoe",
+            "qwen2moe",
+            "qwen3moe",
+            "granitemoe",
+            "llada-moe",
+            "rnd1",
+        ],
     )
     def test_pinned_expert_suffixes_close_without_drops(self, architecture: str) -> None:
         upstream = upstream_architectures()[architecture]
@@ -327,6 +340,38 @@ class TestPinnedTensorClosure:
             for suffix in upstream.expert_tensor_suffixes:
                 name = family.replace("{bid}", "0") + f".{suffix}"
                 assert map_gguf_to_hf_names(name, architecture) is not None, name
+
+    @pytest.mark.parametrize("architecture", ["dream", "llada", "llada-moe", "rnd1"])
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            "token_embd.scale",
+            "blk.0.attn_q.weight.extra",
+            "blk.0.diffusion_timestep.weight",
+            "blk.0.noise_schedule.weight",
+        ],
+    )
+    def test_diffusion_tensor_closure_rejects_unpinned_suffixes(
+        self, architecture: str, malformed: str
+    ) -> None:
+        assert map_gguf_to_hf_names(malformed, architecture) is None
+
+    @pytest.mark.parametrize("architecture", ["llada-moe", "rnd1"])
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            "blk.0.ffn_gate_inp.scale",
+            "blk.0.ffn_gate_exps.scales",
+            "blk.0.ffn_down_exps.zero_point",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+        ],
+    )
+    def test_diffusion_moe_rejects_invalid_expert_sidecars(
+        self, architecture: str, malformed: str
+    ) -> None:
+        assert map_gguf_to_hf_names(malformed, architecture) is None
 
     def test_deleting_one_mapping_breaks_closure(self) -> None:
         """Falsify the support claim rather than only testing the happy path."""

@@ -49,6 +49,152 @@ def _t5_metadata(architecture: str) -> dict:
     }
 
 
+def _diffusion_names(architecture: str, *, output: bool = True) -> list[str]:
+    names = ["token_embd.weight", "output_norm.weight"]
+    if output:
+        names.append("output.weight")
+    for layer in range(2):
+        names.extend(
+            [
+                f"blk.{layer}.attn_norm.weight",
+                f"blk.{layer}.attn_q.weight",
+                f"blk.{layer}.attn_k.weight",
+                f"blk.{layer}.attn_v.weight",
+                f"blk.{layer}.attn_output.weight",
+                f"blk.{layer}.ffn_norm.weight",
+            ]
+        )
+        if architecture in {"llada-moe", "rnd1"}:
+            names.extend(
+                [
+                    f"blk.{layer}.attn_q_norm.weight",
+                    f"blk.{layer}.attn_k_norm.weight",
+                    f"blk.{layer}.ffn_gate_inp.weight",
+                    f"blk.{layer}.ffn_gate_exps.weight",
+                    f"blk.{layer}.ffn_down_exps.weight",
+                    f"blk.{layer}.ffn_up_exps.weight",
+                ]
+            )
+        else:
+            names.extend(
+                [
+                    f"blk.{layer}.ffn_gate.weight",
+                    f"blk.{layer}.ffn_down.weight",
+                    f"blk.{layer}.ffn_up.weight",
+                ]
+            )
+    return names
+
+
+def _diffusion_metadata(architecture: str) -> dict:
+    metadata = _dense_metadata(architecture)
+    metadata.update(
+        {
+            f"{architecture}.attention.layer_norm_rms_epsilon": 1e-5,
+            f"{architecture}.attention.causal": True,
+            "tokenizer.ggml.mask_token_id": 255,
+        }
+    )
+    if architecture in {"llada-moe", "rnd1"}:
+        metadata.update(
+            {
+                f"{architecture}.expert_count": 8,
+                f"{architecture}.expert_used_count": 2,
+            }
+        )
+    if architecture in {"llada", "llada-moe"}:
+        metadata["diffusion.shift_logits"] = False
+    return metadata
+
+
+class TestLanguageDiffusionConfig:
+    @pytest.mark.parametrize(
+        ("architecture", "output", "normalized", "shifted"),
+        [
+            ("dream", False, None, True),
+            ("llada", True, None, False),
+            ("llada-moe", True, False, False),
+            ("rnd1", False, True, True),
+        ],
+    )
+    def test_pinned_defaults_and_architecture_differences(
+        self,
+        architecture: str,
+        output: bool,
+        normalized: bool | None,
+        shifted: bool,
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                architecture,
+                _diffusion_metadata(architecture),
+                _diffusion_names(architecture, output=output),
+            )
+        )
+
+        assert config.model_type == ("dream" if architecture == "dream" else "llada")
+        assert config.tie_word_embeddings is not output
+        assert config.hidden_act == "silu"
+        assert config.rope_type == "default"
+        assert config.mask_token_id == 255
+        assert config.diffusion_shift_logits is shifted
+        if normalized is not None:
+            assert config.attn_qk_norm is True
+            assert config.moe_intermediate_size == 64
+            assert config.norm_topk_prob is normalized
+
+    def test_dream_qkv_bias_and_fused_alternative(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        names = _diffusion_names("dream")
+        for layer in range(2):
+            for projection in ("q", "k", "v"):
+                names.append(f"blk.{layer}.attn_{projection}.bias")
+        separate = gguf_to_config(_FakeDenseGGUF("dream", _diffusion_metadata("dream"), names))
+        assert separate.attn_qkv_bias is True
+
+        fused_names = [
+            name
+            for name in _diffusion_names("dream")
+            if not any(f".attn_{projection}.weight" in name for projection in ("q", "k", "v"))
+        ]
+        for layer in range(2):
+            fused_names.extend([f"blk.{layer}.attn_qkv.weight", f"blk.{layer}.attn_qkv.bias"])
+        fused = gguf_to_config(
+            _FakeDenseGGUF("dream", _diffusion_metadata("dream"), fused_names)
+        )
+        assert fused.attn_qkv_bias is True
+
+    def test_missing_mask_token_fails_closed(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = _diffusion_metadata("llada")
+        metadata.pop("tokenizer.ggml.mask_token_id")
+        with pytest.raises(ValueError, match="mask_token_id is required"):
+            gguf_to_config(_FakeDenseGGUF("llada", metadata, _diffusion_names("llada")))
+
+    def test_partial_qkv_bias_is_rejected(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        names = [*_diffusion_names("dream"), "blk.0.attn_q.bias"]
+        with pytest.raises(ValueError, match="bias must be present consistently"):
+            gguf_to_config(_FakeDenseGGUF("dream", _diffusion_metadata("dream"), names))
+
+    def test_llada_moe_requires_untied_output(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        with pytest.raises(ValueError, match=r"requires output\.weight"):
+            gguf_to_config(
+                _FakeDenseGGUF(
+                    "llada-moe",
+                    _diffusion_metadata("llada-moe"),
+                    _diffusion_names("llada-moe", output=False),
+                )
+            )
+
+
 class TestT5Config:
     @pytest.mark.parametrize(
         ("architecture", "model_type"),

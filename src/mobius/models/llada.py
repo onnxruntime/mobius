@@ -28,24 +28,73 @@ reused Mobius component tree.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import dataclasses
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, CausalLMConfig
-from mobius.components import (
-    Embedding,
-    Linear,
-    RMSNorm,
-    initialize_rope,
-)
+from mobius.components import Linear, RMSNorm, initialize_rope
 from mobius.components._attention import Attention, _apply_attention
 from mobius.components._decoder import DecoderLayer
+from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rotary_embedding import apply_rotary_pos_emb
+from mobius.models.base import CausalLMModel, TiedQuantizedLMHead, embedding_for_config
+from mobius.models.moe import (
+    MoEDecoderLayer,
+    MoETextModel,
+    _preprocess_moe_weights,
+    _quantized_linear_class,
+)
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
+
+@dataclasses.dataclass
+class DreamConfig(CausalLMConfig):
+    """Normalize the official Dream remote-code config into Mobius fields."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> DreamConfig:
+        base = super().from_transformers(config, parent_config)
+        return dataclasses.replace(
+            base,
+            attn_qkv_bias=True,
+            attn_o_bias=False,
+            mlp_bias=False,
+            diffusion_shift_logits=True,
+        )
+
+
+@dataclasses.dataclass
+class LLaDAMoEConfig(CausalLMConfig):
+    """Normalize the official LLaDA-MoE config and raw-top-k routing semantics."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> LLaDAMoEConfig:
+        base = super().from_transformers(config, parent_config)
+        expert_size = getattr(config, "expert_intermediate_size", None)
+        return dataclasses.replace(
+            base,
+            attn_qk_norm=True,
+            attn_qk_norm_full=False,
+            moe_intermediate_size=expert_size or base.moe_intermediate_size,
+            norm_topk_prob=False,
+        )
+
+
+@dataclasses.dataclass
+class RND1Config(CausalLMConfig):
+    """Normalize RND1's per-head Q/K norms and renormalized top-k routing."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> RND1Config:
+        base = super().from_transformers(config, parent_config)
+        return dataclasses.replace(
+            base,
+            attn_qk_norm=True,
+            attn_qk_norm_full=False,
+            norm_topk_prob=True,
+        )
 
 
 class _LLaDAAttention(Attention):
@@ -71,6 +120,18 @@ class _LLaDAAttention(Attention):
         query_states = self.q_proj(op, hidden_states)
         key_states = self.k_proj(op, hidden_states)
         value_states = self.v_proj(op, hidden_states)
+
+        if self.q_norm is not None and self.k_norm is not None:
+            if self._qk_norm_full:
+                query_states = self.q_norm(op, query_states)
+                key_states = self.k_norm(op, key_states)
+            else:
+                query_states = op.Reshape(query_states, [0, 0, -1, self.head_dim])
+                key_states = op.Reshape(key_states, [0, 0, -1, self.head_dim])
+                query_states = self.q_norm(op, query_states)
+                key_states = self.k_norm(op, key_states)
+                query_states = op.Reshape(query_states, [0, 0, -1])
+                key_states = op.Reshape(key_states, [0, 0, -1])
 
         if position_embeddings is not None:
             query_states = apply_rotary_pos_emb(
@@ -120,7 +181,7 @@ class _LLaDADecoderLayer(DecoderLayer):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.self_attn = _LLaDAAttention(config)
+        self.self_attn = _LLaDAAttention(config, linear_class=_quantized_linear_class(config))
 
 
 class LLaDATextModel(nn.Module):
@@ -135,9 +196,7 @@ class LLaDATextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self.config = config
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [_LLaDADecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -171,19 +230,14 @@ class LLaDATextModel(nn.Module):
         return self.norm(op, hidden_states)
 
 
-class LLaDAModel(nn.Module):
-    """LLaDA masked-diffusion language model.
+class DiffusionLMModel(CausalLMModel):
+    """Dense masked-diffusion language model.
 
-    A Llama backbone run bidirectionally with a separate (untied) language
-    modelling head. The forward pass maps ``input_ids [batch, sequence_len]``
+    A Llama/Qwen-style backbone run bidirectionally. The forward pass maps
+    ``input_ids [batch, sequence_len]``
     (int64) to ``logits [batch, sequence_len, vocab_size]`` (float) in a
     single full-sequence pass. The task also exposes greedy token proposals for
     the onnx-genai generic masked-update workflow.
-
-    Replicates the ``LLaDALlamaBlock`` architecture of HuggingFace's
-    ``LLaDAModelLM`` (``block_type: "llama"``, ``layer_norm_type: "rms"``,
-    ``rope: true``, ``activation_type: "silu"``, full MHA, ``weight_tying:
-    false``).
     """
 
     default_task: str = "masked-diffusion"
@@ -191,15 +245,30 @@ class LLaDAModel(nn.Module):
     config_class: type = CausalLMConfig
 
     def __init__(self, config: ArchitectureConfig):
-        super().__init__()
-        self.config = config
-        self.model = LLaDATextModel(config)
-        # LLaDA sets weight_tying=false, so the head is a distinct matrix.
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        _initialize_diffusion_model(self, config, LLaDATextModel(config))
 
     def forward(self, op: OpBuilder, input_ids: ir.Value):
         hidden_states = self.model(op, input_ids)
         return self.lm_head(op, hidden_states)
+
+
+class DreamModel(DiffusionLMModel):
+    """Dream dense masked-diffusion transformer.
+
+    Dream uses Qwen2-style GQA with biased Q/K/V projections, bias-free output
+    and SwiGLU projections, RMSNorm, RoPE, and full bidirectional attention.
+    """
+
+    config_class = DreamConfig
+
+
+class LLaDAModel(DiffusionLMModel):
+    """LLaDA dense masked-diffusion transformer.
+
+    Replicates the ``LLaDALlamaBlock`` architecture of HuggingFace's
+    ``LLaDAModelLM`` (``block_type: "llama"``, ``layer_norm_type: "rms"``,
+    ``rope: true``, ``activation_type: "silu"``, full MHA).
+    """
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -224,10 +293,117 @@ class LLaDAModel(nn.Module):
         """
         new_state_dict: dict[str, torch.Tensor] = {}
         for name, tensor in state_dict.items():
+            if name.startswith(
+                ("model.embed_tokens.", "model.layers.", "model.norm.", "lm_head.")
+            ):
+                new_state_dict[name] = tensor
+                continue
             new_name = _rename_llada_weight(name)
             if new_name is not None:
                 new_state_dict[new_name] = tensor
-        return new_state_dict
+        return super().preprocess_weights(new_state_dict)
+
+
+class _DiffusionMoEDecoderLayer(MoEDecoderLayer):
+    """QK-normalized MoE block with bidirectional, cache-free attention."""
+
+    def __init__(self, config: ArchitectureConfig, gate=None, norm_class=RMSNorm):
+        super().__init__(config, gate=gate, norm_class=norm_class)
+        self.self_attn = _LLaDAAttention(config, linear_class=_quantized_linear_class(config))
+
+
+class DiffusionMoETextModel(MoETextModel):
+    """Qwen3-style MoE backbone with full-sequence bidirectional attention."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config, layer_class=_DiffusionMoEDecoderLayer)
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
+        hidden_states = self.embed_tokens(op, input_ids)
+        seq_len = op.Shape(input_ids, start=1, end=2)
+        position_ids = op.Range(
+            op.Constant(value_int=0),
+            op.Squeeze(seq_len),
+            op.Constant(value_int=1),
+        )
+        position_ids = op.Cast(position_ids, to=7)  # INT64
+        position_embeddings = self.rotary_emb(op, op.Unsqueeze(position_ids, [0]))
+
+        for layer in self.layers:
+            hidden_states, _ = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=None,
+                position_embeddings=position_embeddings,
+                past_key_value=None,
+            )
+        return self.norm(op, hidden_states)
+
+
+class DiffusionMoEModel(CausalLMModel):
+    """Masked-diffusion MoE denoiser with no causal mask or KV cache."""
+
+    default_task: str = "masked-diffusion"
+    category: str = "Mixture of Experts"
+    config_class: type = CausalLMConfig
+
+    def __init__(self, config: ArchitectureConfig):
+        _initialize_diffusion_model(self, config, DiffusionMoETextModel(config))
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
+        return self.lm_head(op, self.model(op, input_ids))
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
+
+
+class LLaDAMoEModel(DiffusionMoEModel):
+    """LLaDA-MoE denoiser with raw selected softmax routing weights."""
+
+    config_class = LLaDAMoEConfig
+
+
+class RND1Model(DiffusionMoEModel):
+    """RND1 denoiser with selected softmax routing weights renormalized to one."""
+
+    config_class = RND1Config
+
+
+def _initialize_diffusion_model(
+    module: CausalLMModel,
+    config: ArchitectureConfig,
+    text_model: nn.Module,
+) -> None:
+    """Initialize a no-cache model while retaining quantized embedding/head ABI."""
+    nn.Module.__init__(module)
+    module.config = config
+    module.model = text_model
+
+    quantization = getattr(config, "quantization", None)
+    quantize_head = quantization is not None and quantization.quantize_lm_head
+    quantize_embedding = quantization is not None and quantization.quantize_embeddings
+    tie = config.tie_word_embeddings or (
+        quantization is not None and quantization.tie_word_embeddings
+    )
+    if quantize_head and quantize_embedding and tie:
+        module.lm_head = TiedQuantizedLMHead(
+            module.model.embed_tokens, config.hidden_size, config.vocab_size
+        )
+    elif quantize_head:
+        zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
+        head_class = make_quantized_linear_factory(
+            bits=quantization.bits,
+            block_size=quantization.group_size,
+            has_zero_point=not quantization.sym,
+            zero_point_dtype=zero_point_dtype,
+        )
+        module.lm_head = head_class(config.hidden_size, config.vocab_size, bias=False)
+    else:
+        module.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        if config.tie_word_embeddings and not quantize_embedding:
+            module.lm_head.weight = module.model.embed_tokens.weight
 
 
 # Block-level attribute renames (HF LLaDA -> Mobius component tree).

@@ -124,6 +124,13 @@ _ENCODER_RUNTIME_VALIDATION_PENDING = (
     "exists."
 )
 
+_DIFFUSION_RUNTIME_VALIDATION_PENDING = (
+    "Config extraction, suffix-exact tensor closure, masked-diffusion task dispatch, "
+    "and synthetic full-sequence execution are covered, but no pinned real GGUF has "
+    "passed independent Hugging Face/llama.cpp masked-step logit parity and deterministic "
+    "multi-step generation parity. Runtime packaging remains deferred until both exist."
+)
+
 _ENCODER_GRAPH_MISMATCH = {
     "eurobert": (
         "EuroBERT uses pre-norm RMSNorm, RoPE, bias-free split Q/K/V attention, and a "
@@ -215,6 +222,65 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    # ----------------------------------------- Masked/diffusion language models
+    GGUFArchitectureSpec(
+        gguf_arch="dream",
+        model_type="dream",
+        tensor_map_recipe=("llama", "diffusion_fused_qkv"),
+        config_postprocessor="dream",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_DIFFUSION_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="llada",
+        model_type="llada",
+        tensor_map_recipe=("llama",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        config_postprocessor="llada",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_DIFFUSION_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="llada-moe",
+        model_type="llada",
+        module_type="llada_moe",
+        tensor_map_recipe=(
+            "llama",
+            "diffusion_fused_qkv",
+            "moe_qk_norm_extras",
+            "moe_extras",
+        ),
+        config_postprocessor="llada_moe",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_DIFFUSION_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="rnd1",
+        model_type="llada",
+        module_type="rnd1",
+        tensor_map_recipe=(
+            "llama",
+            "diffusion_fused_qkv",
+            "moe_qk_norm_extras",
+            "moe_extras",
+        ),
+        config_postprocessor="rnd1",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_DIFFUSION_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen35",

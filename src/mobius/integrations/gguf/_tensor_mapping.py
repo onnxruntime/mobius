@@ -362,6 +362,55 @@ _RECURRENT_SUFFIXES: dict[str, dict[str, frozenset[str]]] = {
     },
 }
 
+_WEIGHT = frozenset({".weight"})
+_PROJECTION = frozenset({".weight", ".scale", ".input_scale"})
+_BIASED_PROJECTION = frozenset({".weight", ".bias", ".scale", ".input_scale"})
+
+_DENSE_DIFFUSION_SUFFIXES = {
+    "token_embd": _WEIGHT,
+    "output": _PROJECTION,
+    "output_norm": _WEIGHT,
+    "blk.{bid}.attn_norm": _WEIGHT,
+    "blk.{bid}.attn_q": _PROJECTION,
+    "blk.{bid}.attn_k": _PROJECTION,
+    "blk.{bid}.attn_v": _PROJECTION,
+    "blk.{bid}.attn_output": _PROJECTION,
+    "blk.{bid}.ffn_norm": _WEIGHT,
+    "blk.{bid}.ffn_gate": _PROJECTION,
+    "blk.{bid}.ffn_down": _PROJECTION,
+    "blk.{bid}.ffn_up": _PROJECTION,
+}
+_DIFFUSION_COMMON_SUFFIXES = {
+    key: suffixes
+    for key, suffixes in _DENSE_DIFFUSION_SUFFIXES.items()
+    if not key.startswith("blk.{bid}.ffn_") or key == "blk.{bid}.ffn_norm"
+}
+_DREAM_SUFFIXES = {
+    **_DENSE_DIFFUSION_SUFFIXES,
+    "blk.{bid}.attn_qkv": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q": _BIASED_PROJECTION,
+    "blk.{bid}.attn_k": _BIASED_PROJECTION,
+    "blk.{bid}.attn_v": _BIASED_PROJECTION,
+}
+_DIFFUSION_MOE_SUFFIXES = {
+    **_DIFFUSION_COMMON_SUFFIXES,
+    "blk.{bid}.attn_qkv": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q_norm": _WEIGHT,
+    "blk.{bid}.attn_k_norm": _WEIGHT,
+    "blk.{bid}.ffn_gate_inp": _WEIGHT,
+    "blk.{bid}.ffn_gate_exps": _PROJECTION,
+    "blk.{bid}.ffn_down_exps": _PROJECTION,
+    "blk.{bid}.ffn_up_exps": _PROJECTION,
+}
+_RECURRENT_SUFFIXES.update(
+    {
+        "dream": _DREAM_SUFFIXES,
+        "llada": _DENSE_DIFFUSION_SUFFIXES,
+        "llada-moe": _DIFFUSION_MOE_SUFFIXES,
+        "rnd1": _DIFFUSION_MOE_SUFFIXES,
+    }
+)
+
 # MoE extensions for Qwen2MoE/Qwen3MoE/DeepSeek.
 _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_gate_inp": ("model.layers.{bid}.mlp.gate"),
@@ -380,6 +429,10 @@ _MOE_EXTRAS: dict[str, str] = {
 _MOE_QK_NORM_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
+_DIFFUSION_FUSED_QKV: dict[str, str] = {
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
 }
 
 # Qwen3.5 hybrid extensions: DeltaNet (SSM) + full-attention.
@@ -522,6 +575,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "gemma4_extras": _GEMMA4_EXTRAS,
         "moe_extras": _MOE_EXTRAS,
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
+        "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
         "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
@@ -655,9 +709,11 @@ def map_gguf_to_hf_names(
     if blk_match:
         bid = blk_match.group(1)
         lookup = _BLK_PATTERN.sub(_BLK_TEMPLATE, stem)
-        allowed_suffixes = _RECURRENT_SUFFIXES.get(architecture, {}).get(lookup)
-        if allowed_suffixes is not None and suffix not in allowed_suffixes:
-            return None
+        architecture_suffixes = _RECURRENT_SUFFIXES.get(architecture)
+        if architecture_suffixes is not None:
+            allowed_suffixes = architecture_suffixes.get(lookup)
+            if allowed_suffixes is None or suffix not in allowed_suffixes:
+                return None
         hf_pattern = mapping.get(lookup)
         if hf_pattern is not None:
             hf_pattern = hf_pattern.replace("{bid}", bid)
@@ -665,9 +721,11 @@ def map_gguf_to_hf_names(
                 return hf_pattern[:-1]
             return hf_pattern + suffix
     else:
-        allowed_suffixes = _RECURRENT_SUFFIXES.get(architecture, {}).get(stem)
-        if allowed_suffixes is not None and suffix not in allowed_suffixes:
-            return None
+        architecture_suffixes = _RECURRENT_SUFFIXES.get(architecture)
+        if architecture_suffixes is not None:
+            allowed_suffixes = architecture_suffixes.get(stem)
+            if allowed_suffixes is None or suffix not in allowed_suffixes:
+                return None
         hf_stem = mapping.get(stem)
         if hf_stem is not None:
             if hf_stem.endswith("@"):
