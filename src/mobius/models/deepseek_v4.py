@@ -443,6 +443,20 @@ class DeepSeekV4Attention(nn.Module):
         self.eps = config.rms_norm_eps
         self.scale = self.head_dim**-0.5
         self.rope_interleave = config.rope_interleave
+        # Official reference (`inference/model.py::Attention.forward`,
+        # `get_window_topk_idxs`) unconditionally restricts every layer -
+        # regardless of `compress_ratio` - to a circular-buffer local window
+        # of `config.sliding_window` (DeepSeek-V4-Flash: 128) most-recent
+        # positions; ratio>0 layers additionally union in compressed/indexed
+        # positions (not modeled here, see `DeepSeekV4CompressorTensors`/
+        # `DeepSeekV4IndexerTensors`), but the window restriction itself
+        # applies to every layer, not just ratio-0. `-1` is GQA's documented
+        # sentinel for "no local window" (matches `_gqa_local_window_size` in
+        # `models/base.py`), used only if the config genuinely has no window.
+        sliding_window = config.sliding_window
+        self.local_window_size = (
+            int(sliding_window) if sliding_window and sliding_window > 0 else -1
+        )
         ratios = config.compress_ratios or []
         self.compress_ratio = ratios[layer_id] if layer_id < len(ratios) else 0
         if self.compress_ratio not in (0, 4, 128):
@@ -555,23 +569,39 @@ class DeepSeekV4Attention(nn.Module):
             # literally the same rotated `kv` tensor -- broadcasting
             # `kv_num_heads=1` across all query heads is the fused op's own
             # job, so `_expand_kv` isn't needed on this path. No explicit
-            # `attention_bias` is passed: this is a plain causal decoder
-            # attention (no sliding window, no KV-sharing across layers, no
-            # per-layer dual head_dim), so GQA's own implicit causal masking
-            # plus `seqlens_k`/`total_seq_len` already carries the exact same
-            # causal+padding semantics `create_attention_bias` bakes into an
-            # explicit float bias on the decomposed path below -- this is the
-            # same "direct GQA" convention `Attention._forward_gqa`
-            # (mobius/components/_attention.py) already uses for every other
-            # simple-causal model in this codebase (see the
-            # `attention-optimization` skill: "Use Contrib GQA when you don't
-            # need attention bias"). `head_sink` carries the learned per-head
-            # attention sink exactly as the decomposed path's
-            # `Concat(scores, sinks) -> Softmax -> slice` sequence does, now
-            # as a first-class op input instead of a manually broadcast
-            # Concat.
+            # `attention_bias` is passed: causal + padding is carried by
+            # `seqlens_k`/`total_seq_len` (no KV-sharing across layers, no
+            # per-layer dual head_dim), same as the "direct GQA" convention
+            # `Attention._forward_gqa` (mobius/components/_attention.py)
+            # already uses for every other simple-causal model in this
+            # codebase (see the `attention-optimization` skill: "Use Contrib
+            # GQA when you don't need attention bias"). The official
+            # reference (`inference/model.py::Attention.forward`,
+            # `get_window_topk_idxs`) unconditionally restricts every layer
+            # to the most recent `local_window_size` positions -- this is
+            # NOT optional/ratio-dependent -- so `local_window_size` is
+            # passed as a first-class GQA attribute (`-1` sentinel when the
+            # config declares no window) instead of baking it into an
+            # explicit float bias as the decomposed path below does via
+            # `create_attention_bias(sliding_window=...)`. `head_sink`
+            # carries the learned per-head attention sink exactly as the
+            # decomposed path's `Concat(scores, sinks) -> Softmax -> slice`
+            # sequence does, now as a first-class op input instead of a
+            # manually broadcast Concat.
             past_key = past_key_value[0] if past_key_value is not None else None
             past_value = past_key_value[1] if past_key_value is not None else None
+            gqa_attrs: dict = {
+                "num_heads": self.num_heads,
+                "kv_num_heads": 1,
+                "scale": self.scale,
+            }
+            # Match the shared `Attention._forward_gqa` convention (see
+            # `mobius/components/_attention.py`): only emit the attribute
+            # when a window is actually configured, so a model with no
+            # window (local_window_size == -1) keeps a graph identical to
+            # before this attribute existed.
+            if self.local_window_size > 0:
+                gqa_attrs["local_window_size"] = self.local_window_size
             output, present_key, present_value = op.GroupQueryAttention(
                 query,
                 kv,
@@ -585,11 +615,9 @@ class DeepSeekV4Attention(nn.Module):
                 None,  # position_ids: unused, do_rotary=0
                 None,  # attention_bias: unused, plain causal + seqlens_k suffices
                 op.CastLike(self.attn_sink, query),  # head_sink
-                num_heads=self.num_heads,
-                kv_num_heads=1,
-                scale=self.scale,
                 _domain="com.microsoft",
                 _outputs=3,
+                **gqa_attrs,
             )
         else:
             # Portable decomposed path: used whenever the active EP declares
@@ -823,6 +851,10 @@ class DeepSeekV4TextModel(nn.Module):
             )
         )
         self._dtype = config.dtype
+        # See `DeepSeekV4Attention.local_window_size`: the reference always
+        # restricts attention to this window, so the decomposed path's
+        # shared bias (built once here for every layer) must bake it in too.
+        self.sliding_window = config.sliding_window
 
     def _hc_head(self, op, states):
         flat = op.Reshape(states, [0, 0, -1])
@@ -865,6 +897,7 @@ class DeepSeekV4TextModel(nn.Module):
                 op,
                 input_ids=hidden_states if input_ids is None else input_ids,
                 attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
                 dtype=self._dtype,
             )
             seqlens_k, total_seq_len = None, None
@@ -917,6 +950,10 @@ class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
         )
         self.rotary_emb = initialize_rope(rope_config)
         self._dtype = config.dtype
+        # See `DeepSeekV4Attention.local_window_size`: the MTP layer is a
+        # regular ratio-0 (or configured-ratio) DeepSeekV4DecoderLayer, so it
+        # is bound by the same mandatory window as the backbone.
+        self.sliding_window = config.sliding_window
 
     def _hc_head(self, op: OpBuilder, states: ir.Value) -> ir.Value:
         flat = op.Reshape(states, [0, 0, -1])
@@ -950,6 +987,7 @@ class DeepSeekV4Mtp(DeepSeekV4DecoderLayer):
                 op,
                 input_ids=inputs_embeds,
                 attention_mask=attention_mask,
+                sliding_window=self.sliding_window,
                 dtype=self._dtype,
             )
             seqlens_k, total_seq_len = None, None
