@@ -9,6 +9,104 @@ from mobius import build_from_gguf
 > **Note**: Requires the optional `gguf` package:
 > `pip install mobius-onnx[gguf]`
 
+## Tokenizer truthfulness
+
+Graph import and runtime-package emission are separate capabilities. GGUF
+normally stores only an opaque `tokenizer.ggml.pre` identifier, not the full
+normalizer, pre-tokenizer, added-token, decoder, and post-processor pipeline.
+Mobius never substitutes a generic BPE/SentencePiece tokenizer.
+
+The only materialized route is `copy`: the GGUF must contain
+`tokenizer.huggingface.json`, and its loadable ordered vocabulary must exactly
+match `tokenizer.ggml.tokens`. Mobius copies that tokenizer pipeline verbatim
+rather than claiming to reconstruct its opaque `pre` semantics, then writes
+`tokenizer_config.json`, `special_tokens_map.json`, and a provenance manifest.
+Otherwise the route is `deferred`: graph-only import remains available, while
+runtime packaging rejects incomplete metadata before durable output. Unknown
+identifiers and malformed or contradictory complete tokenizer tables reject
+before graph construction.
+
+The graph package records a canonical digest of every tokenizer metadata field.
+Runtime packaging rechecks that digest before writing, so replacing a local
+GGUF between graph construction and package emission cannot mix tokenizer
+identity. The manifest reports ORT tokenizer compatibility as delegated to the
+embedded tokenizer JSON rather than claiming independent algorithm parity.
+
+This generated policy table is pinned to llama.cpp commit
+`8d9af256337d1a501250f9bbf4c0859a654bddd6`. It enumerates all 87 accepted
+identifiers. Aliases share a row only where the pinned pre-type and hard-coded
+overrides are identical; every policy defaults to `deferred`.
+
+| Canonical | Exact identifiers |
+|---|---|
+| `default` | `default` |
+| `minicpm5` | `minicpm5` |
+| `llama3` | `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano` |
+| `deepseek-llm` | `deepseek-llm` |
+| `deepseek-coder` | `deepseek-coder` |
+| `deepseek-v3` | `deepseek-v3` |
+| `youtu` | `youtu` |
+| `falcon` | `falcon` |
+| `mpt` | `mpt` |
+| `starcoder` | `starcoder` |
+| `gpt-2` | `gpt-2`, `phi-2`, `jina-es`, `jina-de`, `gigachat`, `jina-v2-es`, `jina-v2-de`, `a.x-4.0`, `mellum`, `modern-bert`, `exaone4` |
+| `jais-2` | `jais-2` |
+| `gemma4` | `gemma4`, `granite-embed-multi-311m` |
+| `sarvam-moe` | `sarvam-moe` |
+| `jina-v1-en` | `jina-v1-en`, `jina-v2-code`, `roberta-bpe` |
+| `whitespace` | `whitespace` |
+| `refact` | `refact` |
+| `command-r` | `command-r` |
+| `qwen2` | `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2` |
+| `qwen35` | `qwen35` |
+| `stablelm2` | `stablelm2` |
+| `olmo` | `olmo` |
+| `dbrx` | `dbrx` |
+| `smaug-bpe` | `smaug-bpe` |
+| `poro-chat` | `poro-chat` |
+| `glm4` | `glm4`, `chatglm-bpe` |
+| `viking` | `viking` |
+| `jais` | `jais` |
+| `tekken` | `tekken` |
+| `smollm` | `smollm` |
+| `codeshell` | `codeshell` |
+| `bloom` | `bloom` |
+| `gpt3-finnish` | `gpt3-finnish` |
+| `exaone` | `exaone` |
+| `exaone-moe` | `exaone-moe` |
+| `chameleon` | `chameleon` |
+| `minerva-7b` | `minerva-7b` |
+| `megrez` | `megrez` |
+| `gpt-4o` | `gpt-4o`, `llama4`, `kanana2`, `talkie` |
+| `granite-embed-multi-97m` | `granite-embed-multi-97m` |
+| `tiny_aya` | `tiny_aya`, `cohere2moe` |
+| `superbpe` | `superbpe` |
+| `trillion` | `trillion` |
+| `granite-docling` | `granite-docling` |
+| `bailingmoe` | `bailingmoe`, `bailingmoe2`, `llada-moe` |
+| `seed-coder` | `seed-coder` |
+| `hunyuan` | `hunyuan` |
+| `hunyuan-dense` | `hunyuan-dense` |
+| `joyai-llm` | `joyai-llm` |
+| `kimi-k2` | `kimi-k2` |
+| `grok-2` | `grok-2` |
+| `afmoe` | `afmoe` |
+| `laguna` | `laguna` |
+| `minimax-m2` | `minimax-m2` |
+| `solar-open` | `solar-open` |
+| `mellum2` | `mellum2` |
+
+### Metadata audit
+
+The pinned loader consumes tokenizer model/pre, token strings/types/count,
+scores, merges, BOS/EOS/EOT/EOM/UNK/PAD/SEP/mask/FIM IDs, add-token and
+whitespace/normalizer flags, suppression IDs, precompiled charsmap, and
+default/named chat templates. `tokenizer.chat_templates` is the converter's
+named-template inventory. `tokenizer.huggingface.json` and
+`tokenizer.rwkv.world` are declared extension keys but are not consumed by the
+pinned vocabulary loader. There is no pinned GGUF `byte_fallback` field;
+byte-fallback behavior is implicit in the complete tokenizer pipeline.
+
 ## Signature
 
 ```python

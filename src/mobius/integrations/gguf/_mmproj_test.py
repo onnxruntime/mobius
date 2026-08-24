@@ -1414,11 +1414,13 @@ class TestVlmRouting:
 
         assert actual is package
         builder.assert_called_once_with(
-            text_path,
-            mmproj_path,
+            str(text_path),
+            str(mmproj_path),
             dtype=None,
             execution_provider="default",
             keep_quantized=False,
+            _text_gguf_model=mock.ANY,
+            _mmproj_gguf_model=mock.ANY,
         )
 
     @pytest.mark.parametrize(
@@ -1477,11 +1479,13 @@ class TestVlmRouting:
             revision=resolved_revision,
         )
         builder.assert_called_once_with(
-            text_path,
-            remote_ref,
+            str(text_path),
+            str(mmproj_path),
             dtype=None,
             execution_provider="default",
             keep_quantized=False,
+            _text_gguf_model=mock.ANY,
+            _mmproj_gguf_model=mock.ANY,
         )
 
     def test_remote_non_clip_companion_rejects_before_download_or_builder(

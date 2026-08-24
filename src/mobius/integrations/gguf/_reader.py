@@ -98,12 +98,7 @@ def _parse_array(data: list[int], parts: list, element_type) -> list[Any]:
         result = []
         for idx in data:
             part = parts[idx]
-            try:
-                result.append(array("B", list(part)).tobytes().decode())
-            except UnicodeDecodeError:
-                result.append(
-                    array("B", list(part)).tobytes().decode("utf-8", errors="replace")
-                )
+            result.append(array("B", list(part)).tobytes().decode("utf-8"))
         return result
 
     # Numeric arrays: data indices point into the parts list
@@ -186,7 +181,11 @@ class GGUFModel:
             for key, field in self._reader.fields.items():
                 try:
                     self._metadata[key] = _parse_field_value(field)
-                except Exception:
+                except Exception as error:
+                    if key.startswith("tokenizer."):
+                        raise ValueError(
+                            f"Failed to parse GGUF tokenizer metadata field {key!r}"
+                        ) from error
                     logger.debug("Failed to parse GGUF field '%s'", key)
         return self._metadata
 
