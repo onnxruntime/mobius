@@ -145,6 +145,86 @@ def _raise_for_sharded_gguf(
     )
 
 
+class SparseMoEExportError(NotImplementedError):
+    """Routed MoE experts have no sparse fusion for their quantization.
+
+    Raised before export when a checkpoint's routed experts lower to per-expert
+    native ``pkg.nxrt::BlockQuantizedMatMul`` nodes (e.g. GLM-5.2 UD-IQ1_{S,M})
+    for which no sparse top-k ``BlockQuantizedMoE`` fusion exists — exporting
+    anyway would recompute every expert for every token (dense-all-expert
+    compute) with no performance guarantee.
+    """
+
+
+def _routed_dense_block_expert_paths(module) -> list[str]:
+    """Return module paths of routed experts lowered as native block linears.
+
+    A routed expert is a :class:`BlockQuantizedLinear` whose qualified name
+    contains a ``.moe.experts.`` (or bare ``.experts.``) segment but is *not* a
+    ``shared_expert``. These are the modules that, absent a sparse top-k MoE
+    fusion, force a dense loop over all experts.
+    """
+    from mobius.components import BlockQuantizedLinear
+
+    paths: list[str] = []
+    for name, mod in module.named_modules():
+        if not isinstance(mod, BlockQuantizedLinear):
+            continue
+        if "shared_expert" in name:
+            continue
+        if ".experts." not in name:
+            continue
+        paths.append(name)
+    return paths
+
+
+def _assert_sparse_moe_capability(module, config, *, source: str, allow_dense: bool) -> None:
+    """Fail closed when routed IQ-block experts have no sparse MoE fusion.
+
+    The int4 ``MatMulNBits`` dense-fallback → ``com.microsoft::QMoE`` rewrite is
+    the only sparse MoE path today; native IQ/MXFP4 block experts stay as
+    per-expert ``BlockQuantizedMatMul`` nodes. Exporting those yields a graph
+    that evaluates every expert for every token. Refuse by default; only proceed
+    (with a loud warning) when the caller explicitly opts in.
+    """
+    num_experts = int(getattr(config, "num_local_experts", 0) or 0)
+    if num_experts <= 0:
+        return
+    dense_paths = _routed_dense_block_expert_paths(module)
+    if not dense_paths:
+        return
+
+    example = ", ".join(sorted(dense_paths)[:3])
+    detail = (
+        f"{len(dense_paths)} routed expert projections (e.g. {example}) in "
+        f"{source!r} lower to per-expert native BlockQuantizedMatMul nodes."
+    )
+    if allow_dense:
+        logger.warning(
+            "allow_dense_moe: exporting %d routed MoE expert(s) as independent "
+            "BlockQuantizedMatMul nodes for %s. This recomputes EVERY expert for "
+            "every token (dense-all-expert compute); it is NOT a performance path "
+            "and makes no throughput claim. %s",
+            len(dense_paths),
+            source,
+            detail,
+        )
+        return
+
+    raise SparseMoEExportError(
+        "Sparse-MoE export blocker: "
+        f"{detail} No sparse top-k BlockQuantizedMoE fusion exists for these "
+        "block formats — only int4 MatMulNBits experts are fused into "
+        "com.microsoft::QMoE. Exporting anyway would build a dense-all-expert "
+        "graph (every expert evaluated for every token) with no performance "
+        "guarantee, so the build fails closed. To study the dense fallback, "
+        "re-run with allow_dense_moe=True (or set "
+        "MOBIUS_ALLOW_DENSE_MOE_EXPERTS=1); this makes no throughput claim. "
+        "The supported fix is a sparse IQ-block BlockQuantizedMoE fusion "
+        "(top-k gather over native-block expert weights)."
+    )
+
+
 def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
     """Use Hub metadata to reject known-bad inputs before a multi-GB download."""
     source = f"{repo_id}:{filename}"
@@ -184,8 +264,14 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
 
 def _validate_gguf_model(gguf_model, *, source: str) -> None:
     """Validate a parsed GGUF before config extraction or graph construction."""
-    split_count = int(gguf_model.get_metadata("split.count", 1))
-    _raise_for_sharded_gguf(source=source, split_count=split_count)
+    from mobius.integrations.gguf._shard_set import GgufShardSet
+
+    # A GgufShardSet has already assembled and structurally validated the whole
+    # split set, so the single-file "sharded input is unsupported" guard must
+    # not fire for it. Plain single-file GGUFModels still reject a lone shard.
+    if not isinstance(gguf_model, GgufShardSet):
+        split_count = int(gguf_model.get_metadata("split.count", 1))
+        _raise_for_sharded_gguf(source=source, split_count=split_count)
     _raise_for_unsupported_gguf_architecture(
         gguf_model.architecture,
         source=source,
@@ -250,6 +336,7 @@ def build_from_gguf(
     mmproj: str | Path | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
+    allow_dense_moe: bool | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -308,6 +395,14 @@ def build_from_gguf(
         max_seq_len: Maximum sequence length for the static cache buffers.
             Only used when ``static_cache=True``. Defaults to the model's
             ``max_position_embeddings``.
+        allow_dense_moe: Opt in to exporting routed MoE experts that have no
+            sparse top-k fusion (they lower to per-expert native
+            ``BlockQuantizedMatMul`` nodes, i.e. dense-all-expert compute with
+            no performance guarantee). When ``None`` (default), the value of
+            the ``allow_dense_moe_experts`` flag is used, which defaults to
+            ``False`` — the build fails closed with a typed capability error
+            rather than silently shipping a dense graph. This is a research /
+            correctness knob and makes no throughput claim.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -346,7 +441,7 @@ def build_from_gguf(
         GGUF_ARCH_TO_MODEL_TYPE,
         gguf_to_config,
     )
-    from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.integrations.gguf._shard_set import open_gguf_model
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
@@ -360,12 +455,19 @@ def build_from_gguf(
             "override; the static cache is wired through CausalLMTask."
         )
 
-    # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]")
+    from mobius._flags import flags as _mobius_flags
+
+    if allow_dense_moe is None:
+        allow_dense_moe = _mobius_flags.allow_dense_moe_experts
+
+    # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]").
+    #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
+    #    (never merged into a second on-disk GGUF); a plain file opens as before.
     gguf_path = _resolve_gguf_path(gguf_path)
-    gguf_model = GGUFModel(gguf_path)
+    gguf_model = open_gguf_model(gguf_path)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
-    logger.info("Loaded GGUF file: %s (arch=%s)", gguf_path, gguf_arch)
+    logger.info("Loaded GGUF model: %s (arch=%s)", gguf_path, gguf_arch)
     preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
@@ -375,6 +477,16 @@ def build_from_gguf(
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
+
+    # 2b. Architecture-resolution safety rail. When the GGUF architecture string
+    # bridges to a specialised registry key, verify the metadata-derived config
+    # actually describes that architecture before selecting its model class, so
+    # a mislabelled or incomplete GGUF fails closed with precise reasons instead
+    # of silently building the wrong graph.
+    if model_type == "glm_moe_dsa":
+        from mobius.integrations.gguf._config_mapping import assert_glm_moe_dsa_resolvable
+
+        assert_glm_moe_dsa_resolvable(config, gguf_arch, source=str(gguf_path))
 
     # ``dataclasses.replace`` below (dtype / quantization) returns a fresh
     # instance that does NOT carry the private ``_gguf_*`` attributes set by
@@ -489,6 +601,13 @@ def build_from_gguf(
     module = module_class(config)
     if preserve_quantization:
         _replace_native_block_linears(module, gguf_model, gguf_arch)
+        # Sparse-MoE honesty gate: routed experts lowered as native
+        # BlockQuantizedMatMul nodes have no sparse top-k fusion yet, so the
+        # exported graph would recompute every expert for every token. Fail
+        # closed here (before export) unless the caller explicitly opts in.
+        _assert_sparse_moe_capability(
+            module, config, source=str(gguf_path), allow_dense=allow_dense_moe
+        )
     pkg = build_from_module(
         module, config, resolved_task, execution_provider=execution_provider
     )
@@ -1164,7 +1283,7 @@ def _can_quantize_embedding(
     if is_tencent_q1_0_layout(gguf_model):
         return False
 
-    for tensor in gguf_model._reader.tensors:
+    for tensor in gguf_model.reader_tensors():
         if map_gguf_to_hf_names(tensor.name, gguf_arch) != "model.embed_tokens.weight":
             continue
         shape = tuple(reversed(tensor.shape))
@@ -1314,7 +1433,7 @@ def _load_dequantized_state_dict(
     for gguf_name, np_array in tqdm.tqdm(
         gguf_model.tensor_items(),
         desc="Dequantizing tensors",
-        total=len(gguf_model._tensor_index),
+        total=gguf_model.num_tensors,
     ):
         hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is not None:
@@ -1415,7 +1534,7 @@ def _load_quantized_state_dict(
     for gguf_name, raw, qtype, np_shape in tqdm.tqdm(
         gguf_model.tensor_items_raw(),
         desc="Repacking tensors",
-        total=len(gguf_model._tensor_index),
+        total=gguf_model.num_tensors,
     ):
         hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:

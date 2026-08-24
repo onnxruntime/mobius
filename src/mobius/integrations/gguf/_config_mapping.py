@@ -20,7 +20,7 @@ Example::
 
 from __future__ import annotations
 
-__all__ = ["gguf_to_config"]
+__all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvable"]
 
 import dataclasses
 import logging
@@ -66,6 +66,14 @@ GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "t5": "t5",
     "hunyuan-dense": "hunyuan_v1_dense",
     "deepseek4": "deepseek_v4",
+    # GLM-5.2 GGUFs (e.g. unsloth/GLM-5.2-GGUF) tag the architecture 'glm-dsa'
+    # (MLA + DeepSeek Sparse Attention + MoE). Mobius's canonical registry key
+    # is 'glm_moe_dsa'. This is an explicit format-bridge mapping keyed on the
+    # authoritative GGUF architecture string, never on the filename or model
+    # name. ``assert_glm_moe_dsa_resolvable`` verifies the head/layer/expert/DSA
+    # properties before the builder selects GlmMoeDsaCausalLMModel.
+    "glm-dsa": "glm_moe_dsa",
+    "glm_dsa": "glm_moe_dsa",
     "deci": "llama",  # DeciLM uses Llama architecture
     "muse-glimmer": "muse_glimmer_text",
     "muse_glimmer": "muse_glimmer_text",
@@ -134,6 +142,30 @@ _ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
         "hash_layer_count": "num_hash_layers",
     },
 }
+
+# GLM-5.2 ('glm-dsa') shares DeepSeek's MLA + MoE + DSA-indexer metadata layout
+# but omits the DeepSeek-V4-only hyper-connection / hash-routing / output-group
+# extensions. Keep the map to the discriminating MLA/MoE/DSA keys only, so the
+# extracted config matches what GlmMoeDsaCausalLMModel (a DeepSeek-V3 subclass)
+# consumes. Both spellings of the architecture string are accepted.
+_GLM_DSA_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "rope.dimension_count": "qk_rope_head_dim",
+    "attention.q_lora_rank": "q_lora_rank",
+    "attention.kv_lora_rank": "kv_lora_rank",
+    "attention.sliding_window": "sliding_window",
+    "expert_count": "num_local_experts",
+    "expert_used_count": "num_experts_per_tok",
+    "expert_feed_forward_length": "moe_intermediate_size",
+    "expert_shared_count": "n_shared_experts",
+    "expert_weights_scale": "routed_scaling_factor",
+    "expert_weights_norm": "norm_topk_prob",
+    "attention.indexer.head_count": "index_n_heads",
+    "attention.indexer.key_length": "index_head_dim",
+    "attention.indexer.top_k": "index_topk",
+}
+_ARCH_KEY_MAPS["glm-dsa"] = _GLM_DSA_KEY_MAP
+_ARCH_KEY_MAPS["glm_dsa"] = _GLM_DSA_KEY_MAP
 
 
 # GGUF hidden_act values → HuggingFace activation function names
@@ -1027,3 +1059,111 @@ def _infer_mlp_bias(model: Any) -> bool:
         n.endswith(("ffn_up.bias", "ffn_down.bias", "ffn_gate.bias"))
         for n in model.tensor_names
     )
+
+
+class GgufArchResolutionError(ValueError):
+    """A GGUF architecture could not be resolved to a buildable model type.
+
+    Raised when the GGUF architecture string maps to a canonical registry key
+    (e.g. ``glm-dsa`` → ``glm_moe_dsa``) but the metadata-derived config is
+    missing the head/layer/expert/attention properties that model requires, so
+    dispatching to it would build the wrong graph. The message lists every
+    failed property (precise rejection reasons) rather than the first one.
+    """
+
+
+def resolve_model_type(gguf_arch: str) -> str:
+    """Resolve a GGUF architecture string to a canonical registry model type.
+
+    This is the single, explicit format-bridge lookup. It is driven purely by
+    the authoritative ``general.architecture`` metadata value — never by the
+    filename or ``general.name`` — so an arbitrarily-named GGUF cannot be
+    coerced into a different architecture. Unknown architectures fall through
+    unchanged, matching the pre-existing default behaviour.
+    """
+    return GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
+
+
+def _positive(value: Any) -> bool:
+    try:
+        return value is not None and int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def assert_glm_moe_dsa_resolvable(
+    config: ArchitectureConfig,
+    gguf_arch: str,
+    *,
+    source: str,
+) -> None:
+    """Verify a ``glm-dsa`` GGUF really is a buildable GLM-5.2 ``glm_moe_dsa``.
+
+    GLM-5.2 (``glm_moe_dsa``) is MLA + DeepSeek Sparse Attention (DSA) + MoE.
+    Before the builder selects :class:`GlmMoeDsaCausalLMModel`, confirm the
+    metadata-derived config carries the discriminating head/layer/expert/DSA
+    properties. A bare decoder GGUF mislabelled ``glm-dsa`` (or one whose DSA /
+    MoE keys use unexpected suffixes) is rejected with the exact list of missing
+    properties instead of silently building an incorrect graph.
+
+    Only invoked for the ``glm-dsa`` → ``glm_moe_dsa`` bridge; other
+    architectures are unaffected.
+    """
+    reasons: list[str] = []
+
+    if not _positive(config.num_hidden_layers):
+        reasons.append(f"num_hidden_layers must be > 0 (got {config.num_hidden_layers!r})")
+    if not _positive(config.num_attention_heads):
+        reasons.append(f"num_attention_heads must be > 0 (got {config.num_attention_heads!r})")
+    if not _positive(config.hidden_size):
+        reasons.append(f"hidden_size must be > 0 (got {config.hidden_size!r})")
+
+    # MoE expert stack.
+    if not _positive(config.num_local_experts):
+        reasons.append(
+            "missing routed-expert count (GGUF '<arch>.expert_count'); "
+            f"num_local_experts={config.num_local_experts!r}"
+        )
+    if not _positive(config.num_experts_per_tok):
+        reasons.append(
+            "missing experts-per-token (GGUF '<arch>.expert_used_count'); "
+            f"num_experts_per_tok={config.num_experts_per_tok!r}"
+        )
+    if not _positive(config.moe_intermediate_size):
+        reasons.append(
+            "missing expert FFN width (GGUF '<arch>.expert_feed_forward_length'); "
+            f"moe_intermediate_size={config.moe_intermediate_size!r}"
+        )
+
+    # MLA (latent attention) evidence: GLM-5.2 uses low-rank Q/KV projections.
+    if not (_positive(config.q_lora_rank) or _positive(config.kv_lora_rank)):
+        reasons.append(
+            "no MLA low-rank projection found (GGUF '<arch>.attention.q_lora_rank' "
+            "or '<arch>.attention.kv_lora_rank'); GLM-5.2 requires latent attention"
+        )
+
+    # DSA indexer — only required on the default sparse-attention export path.
+    if getattr(config, "use_dsa", True):
+        for field_name, gguf_key in (
+            ("index_n_heads", "attention.indexer.head_count"),
+            ("index_head_dim", "attention.indexer.key_length"),
+            ("index_topk", "attention.indexer.top_k"),
+        ):
+            if not _positive(getattr(config, field_name, None)):
+                reasons.append(
+                    f"missing DSA indexer property {field_name} "
+                    f"(GGUF '<arch>.{gguf_key}'); required for use_dsa=True "
+                    "(pass use_dsa=False / --glm-full-attention for dense MLA)"
+                )
+
+    if reasons:
+        joined = "\n  - ".join(reasons)
+        raise GgufArchResolutionError(
+            f"GGUF architecture {gguf_arch!r} in {source!r} resolves to the "
+            "canonical model type 'glm_moe_dsa' (GLM-5.2), but the metadata does "
+            "not describe a complete MLA + DSA + MoE model:\n  - "
+            f"{joined}\n"
+            "No ONNX artifacts were emitted. Re-export the GGUF from an "
+            "authoritative GLM-5.2 checkpoint, or if this file is a different "
+            "architecture, do not tag it 'glm-dsa'."
+        )

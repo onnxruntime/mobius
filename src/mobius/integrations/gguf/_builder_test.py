@@ -661,7 +661,10 @@ class TestBuildQuantizedGguf:
             tensor_type=GGMLQuantizationType.Q4_0,
             shape=(64, 256),
         )
-        model = SimpleNamespace(_reader=SimpleNamespace(tensors=[tensor]))
+        model = SimpleNamespace(
+            _reader=SimpleNamespace(tensors=[tensor]),
+            reader_tensors=lambda: [tensor],
+        )
 
         assert _can_quantize_embedding(model, "llama", bits=4, block_size=32)
 
