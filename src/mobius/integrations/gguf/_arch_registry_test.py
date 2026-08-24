@@ -153,7 +153,7 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 6
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 10
 
     def test_falcon_h1_is_not_a_generic_falcon_alias(self) -> None:
         """Falcon-H1 must fail before constructing the incompatible Falcon graph."""
@@ -318,6 +318,10 @@ class TestPinnedTensorClosure:
         "llada",
         "llada-moe",
         "rnd1",
+        "baichuan",
+        "chatglm",
+        "phi2",
+        "seed_oss",
     )
 
     @staticmethod

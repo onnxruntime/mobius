@@ -576,9 +576,240 @@ def _validate_gguf_model(
     _raise_for_malformed_recurrent_tensors(gguf_model)
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
+    _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
+
+
+def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
+    """Validate the exact pinned C01 dense profiles before config extraction."""
+    import numpy as np
+
+    architecture = gguf_model.architecture
+    if architecture not in {"baichuan", "chatglm", "phi2", "seed_oss"}:
+        return
+
+    metadata = gguf_model.metadata
+    required_geometry = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    missing_geometry = [
+        f"{architecture}.{suffix}"
+        for suffix in required_geometry
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_geometry:
+        raise ValueError(
+            f"{architecture} GGUF is missing required dense metadata: {missing_geometry}"
+        )
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    context = int(metadata[f"{architecture}.context_length"])
+    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+    if (
+        context <= 0
+        or hidden <= 0
+        or intermediate <= 0
+        or layers <= 0
+        or heads <= 0
+        or hidden % heads
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid dense model geometry")
+    default_head_dim = hidden // heads
+    key_head_dim = int(metadata.get(f"{architecture}.attention.key_length", default_head_dim))
+    value_head_dim = int(metadata.get(f"{architecture}.attention.value_length", key_head_dim))
+    if key_head_dim <= 0 or value_head_dim <= 0 or key_head_dim != value_head_dim:
+        raise ValueError(
+            f"{architecture} GGUF requires equal positive key/value head widths, got "
+            f"key_length={key_head_dim}, value_length={value_head_dim}"
+        )
+    head_dim = key_head_dim
+    rope_dim = int(metadata.get(f"{architecture}.rope.dimension_count", head_dim))
+    if kv_heads <= 0 or heads % kv_heads:
+        raise ValueError(
+            f"{architecture} GGUF has invalid grouped-query geometry: "
+            f"head_count={heads}, head_count_kv={kv_heads}"
+        )
+    if architecture in {"baichuan", "chatglm", "phi2"} and heads * head_dim != hidden:
+        raise ValueError(
+            f"{architecture} requires attention key width * head_count == "
+            f"embedding_length, got {head_dim} * {heads} != {hidden}"
+        )
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+        raise ValueError(
+            f"{architecture} GGUF has invalid rope.dimension_count={rope_dim} "
+            f"for head_dim={head_dim}"
+        )
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if vocab <= 0:
+        raise ValueError(f"{architecture} GGUF has no positive vocabulary size")
+
+    if architecture == "baichuan":
+        if layers != 32:
+            raise ValueError(
+                "Baichuan GGUF import supports only block_count=32 (the pinned 7B RoPE "
+                f"profile), got {layers}; block_count=40 uses unsupported hardcoded ALiBi."
+            )
+        if kv_heads != heads or rope_dim != head_dim:
+            raise ValueError(
+                "Baichuan 7B requires full MHA and full-head RoPE: "
+                f"head_count={heads}, head_count_kv={kv_heads}, "
+                f"rope.dimension_count={rope_dim}, head_dim={head_dim}"
+            )
+        if float(metadata.get("baichuan.attention.max_alibi_bias", 0.0)):
+            raise ValueError("Baichuan 7B RoPE metadata contradicts a nonzero ALiBi bias")
+    elif architecture == "phi2":
+        if kv_heads != heads or intermediate != 4 * hidden:
+            raise ValueError(
+                "Phi-2 requires full MHA and feed_forward_length == 4 * embedding_length"
+            )
+    elif architecture == "seed_oss":
+        if layers != 64:
+            raise ValueError(f"Seed-OSS pinned profile requires block_count=64, got {layers}")
+        if kv_heads <= 0 or heads % kv_heads or rope_dim != head_dim:
+            raise ValueError(
+                "Seed-OSS requires valid grouped-query geometry and full-head RoPE"
+            )
+
+    items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in items
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {}
+    if architecture in {"baichuan", "phi2"}:
+        required["output.weight"] = (vocab, hidden)
+    elif architecture in {"chatglm", "seed_oss"}:
+        optional["output.weight"] = (vocab, hidden)
+    if architecture == "phi2":
+        required.update(
+            {
+                "output_norm.bias": (hidden,),
+                "output.bias": (vocab,),
+            }
+        )
+
+    q_dim = heads * head_dim
+    kv_dim = kv_heads * head_dim
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        if architecture == "chatglm":
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_qkv.weight": (q_dim + 2 * kv_dim, hidden),
+                    prefix + "attn_output.weight": (hidden, q_dim),
+                    prefix + "ffn_norm.weight": (hidden,),
+                    prefix + "ffn_up.weight": (2 * intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional[prefix + "attn_qkv.bias"] = (q_dim + 2 * kv_dim,)
+        else:
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_q.weight": (q_dim, hidden),
+                    prefix + "attn_k.weight": (kv_dim, hidden),
+                    prefix + "attn_v.weight": (kv_dim, hidden),
+                    prefix + "attn_output.weight": (hidden, q_dim),
+                }
+            )
+            if architecture != "phi2":
+                required.update(
+                    {
+                        prefix + "ffn_up.weight": (intermediate, hidden),
+                        prefix + "ffn_down.weight": (hidden, intermediate),
+                    }
+                )
+        if architecture == "baichuan":
+            required[prefix + "ffn_norm.weight"] = (hidden,)
+        if architecture in {"baichuan", "seed_oss"}:
+            required[prefix + "ffn_gate.weight"] = (intermediate, hidden)
+        if architecture == "phi2":
+            required.update(
+                {
+                    prefix + "attn_norm.bias": (hidden,),
+                    prefix + "attn_q.bias": (q_dim,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                    prefix + "attn_output.bias": (hidden,),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_up.bias": (intermediate,),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                    prefix + "ffn_down.bias": (hidden,),
+                }
+            )
+        elif architecture == "seed_oss":
+            required.update(
+                {
+                    prefix + "post_attention_norm.weight": (hidden,),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional.update(
+                {
+                    prefix + "attn_q.bias": (q_dim,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                }
+            )
+
+    if architecture == "seed_oss":
+        attention_scale = float(metadata.get("seed_oss.attention.scale", 0.0))
+        if not np.isfinite(attention_scale):
+            raise ValueError("seed_oss.attention.scale must be finite")
+        if attention_scale:
+            raise ValueError(
+                f"seed_oss.attention.scale={attention_scale} is not consumed by the "
+                "pinned llama.cpp loader for this architecture"
+            )
+        qkv_biases = {
+            f"blk.{layer}.attn_{projection}.bias"
+            for layer in range(layers)
+            for projection in ("q", "k", "v")
+        }
+        present_qkv_biases = qkv_biases & set(actual)
+        if present_qkv_biases and present_qkv_biases != qkv_biases:
+            raise ValueError(
+                "Seed-OSS Q/K/V bias tensors must be present for every projection "
+                "in every layer or absent entirely"
+            )
+
+    if architecture == "chatglm":
+        fused_biases = [f"blk.{layer}.attn_qkv.bias" for layer in range(layers)]
+        present_biases = set(fused_biases) & set(actual)
+        if present_biases and len(present_biases) != layers:
+            raise ValueError("ChatGLM fused QKV bias must be present in every layer or none")
+
+    allowed = set(required) | set(optional)
+    shape_checked = set(allowed)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in shape_checked & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
+        )
 
 
 def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
@@ -1643,7 +1874,7 @@ def build_from_gguf(
         )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
-    _reject_quantized_diffusion_fused_qkv(
+    _reject_unsupported_quantization_preservation(
         gguf_model,
         gguf_arch,
         preserve_quantization=preserve_quantization,
@@ -2571,13 +2802,13 @@ def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
     return False
 
 
-def _reject_quantized_diffusion_fused_qkv(
+def _reject_unsupported_quantization_preservation(
     gguf_model,
     gguf_arch: str,
     *,
     preserve_quantization: bool,
 ) -> None:
-    """Reject fused diffusion QKV before a quantized graph can be constructed.
+    """Reject architectures that cannot preserve all compatible quantized weights.
 
     The diffusion graph owns separate QuantizedLinear Q/K/V modules, while the
     fused GGUF family maps to a synthetic ``qkv_proj`` stem that is not a graph
@@ -2587,7 +2818,24 @@ def _reject_quantized_diffusion_fused_qkv(
     tensor itself is float: any other quantized mapped tensor selects the packed
     graph, so the split Q/K/V targets remain quantized.
     """
-    if not preserve_quantization or gguf_arch not in {"dream", "llada-moe", "rnd1"}:
+    if not preserve_quantization:
+        return
+    if gguf_arch in {"chatglm", "phi2"}:
+        reason = {
+            "chatglm": (
+                "its fused QKV and gate/up tensors must be split into separate packed "
+                "graph targets"
+            ),
+            "phi2": (
+                "the Phi-2 attention, MLP, and output graph currently uses float-only "
+                "linear modules"
+            ),
+        }[gguf_arch]
+        raise ValueError(
+            f"Quantization-preserving {gguf_arch} import is unsupported because {reason}. "
+            "Use keep_quantized=False (or --dequantize) for a float import."
+        )
+    if gguf_arch not in {"dream", "llada-moe", "rnd1"}:
         return
 
     fused = sorted(

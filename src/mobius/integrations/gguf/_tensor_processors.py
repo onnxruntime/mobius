@@ -158,7 +158,6 @@ def _process_llama(
             "num_attention_heads or num_key_value_heads not in config"
         )
         return state_dict
-
     for name, tensor in state_dict.items():
         if ".q_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_heads)

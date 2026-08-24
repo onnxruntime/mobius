@@ -104,6 +104,31 @@ _NO_QUANTIZED_PROJECTION_REASON = (
     "weights. Use keep_quantized=False for explicit float import."
 )
 
+_MINICPM3_GRAPH_REASON = (
+    "The pinned MiniCPM3 graph uses MLA Q/KV LoRA projections, separate NoPE/RoPE "
+    "query and key channels, and embedding, residual, and LM-head scales. The current "
+    "Mobius MiniCPM graph does not represent that exact topology or its scales."
+)
+
+_OPENELM_GRAPH_REASON = (
+    "The pinned OpenELM graph requires per-layer Q/KV-head and feed-forward-width "
+    "arrays, fused QKV with Q/K normalization, and mandatory tied embeddings. Those "
+    "per-layer contracts cannot be scalarized into the current generic graph."
+)
+
+_MPT_GRAPH_REASON = (
+    "The pinned MPT graph permits learned positions, Q/K LayerNorm, KQV clipping, AWQ "
+    "FFN scales, and several optional bias families. Mobius does not represent that "
+    "whole closure safely, and the current MPT preprocessing overwrites norm biases."
+)
+
+_APERTUS_GRAPH_REASON = (
+    "The pinned Apertus converter emits a serialized Llama-3 rope_freqs tensor that "
+    "the pinned loader consumes as per-dimension RoPE factors. The current Mobius "
+    "Apertus graph computes RoPE frequencies from scalar config and cannot represent "
+    "that tensor without changing attention semantics."
+)
+
 _RECURRENT_RUNTIME_VALIDATION_PENDING = (
     "Config extraction, exact pinned tensor-name closure, GGUF value transforms, and "
     "synthetic recurrent-state execution are covered, but no representative real-weight "
@@ -509,6 +534,45 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("phi3",),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="baichuan",
+        model_type="baichuan",
+        tensor_map_recipe=("llama",),
+        config_postprocessor="baichuan",
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="chatglm",
+        model_type="chatglm",
+        tensor_map_recipe=("chatglm",),
+        config_postprocessor="chatglm",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        rope_interleave=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="phi2",
+        model_type="phi",
+        tensor_map_recipe=("phi2",),
+        config_postprocessor="phi2",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="seed_oss",
+        model_type="seed_oss",
+        tensor_map_recipe=("llama", "seed_oss_extras"),
+        config_postprocessor="seed_oss",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="falcon",
         model_type="falcon",
         tensor_map_recipe=("falcon",),
@@ -881,6 +945,38 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "MLA + DSA-indexer tensor families yet, so weights cannot be routed "
             "into the graph. " + _NO_TENSOR_MAP
         ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="apertus",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_APERTUS_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="minicpm3",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_MINICPM3_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="openelm",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_OPENELM_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="mpt",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_MPT_GRAPH_REASON,
     ),
     # ------------------------------------------------ known but not importable
     GGUFArchitectureSpec(
