@@ -4201,7 +4201,19 @@ class TestGGUFPreflightGuards:
         module_lookup.assert_not_called()
         graph_build.assert_not_called()
 
-    @pytest.mark.parametrize("architecture", ["minimax-01", "plamo2", "falcon-h1"])
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "minimax-01",
+            "plamo2",
+            "falcon-h1",
+            "bailingmoe3",
+            "deepseek4",
+            "kimi-k3",
+            "kimi-linear",
+            "lfm2moe",
+        ],
+    )
     def test_deferred_second_hybrid_cohort_fails_before_graph_construction(
         self, architecture: str, tmp_path: Path
     ) -> None:
