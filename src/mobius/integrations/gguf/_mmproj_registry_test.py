@@ -174,7 +174,6 @@ def test_documented_projector_matrix_is_generated_from_registry() -> None:
             or "Exact registry-backed graph, tensor closure, target pairing, and component parity."
         )
         expected.append(
-            f"| `{spec.projector_type}` | {modalities} | {targets} | "
-            f"{status} | {limitation} |"
+            f"| `{spec.projector_type}` | {modalities} | {targets} | {status} | {limitation} |"
         )
     assert documented == expected

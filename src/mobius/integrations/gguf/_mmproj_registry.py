@@ -21,6 +21,7 @@ __all__ = [
     "LLAMA_CPP_MMPROJ_SHA",
     "MMPROJ_ARTIFACT_PINS",
     "ClipMetadataField",
+    "CompanionTensorSpec",
     "MMProjArtifactPin",
     "MMProjModality",
     "MMProjTensorRole",
@@ -33,8 +34,9 @@ __all__ = [
 
 import dataclasses
 import enum
+from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from mobius.integrations.gguf._spec import Support
 
@@ -68,6 +70,18 @@ class ClipMetadataField:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class CompanionTensorSpec:
+    """Exact tensor closure for a deferred modality sharing a supported sidecar."""
+
+    modality: MMProjModality
+    projector_type: str
+    required_metadata: tuple[str, ...]
+    required_top_tensors: tuple[str, ...]
+    block_prefix: str
+    block_suffixes: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class ProjectorSpec:
     """Capabilities and exact loader closure for one serialized projector type."""
 
@@ -86,6 +100,7 @@ class ProjectorSpec:
     optional_top_tensors: tuple[str, ...] = ()
     block_prefix: str | None = None
     block_suffixes: tuple[str, ...] = ()
+    companion_tensors: tuple[CompanionTensorSpec, ...] = ()
     tensor_roles: tuple[tuple[str, MMProjTensorRole], ...] = ()
     real_artifact_ids: tuple[str, ...] = ()
 
@@ -114,6 +129,7 @@ class ProjectorSpec:
                 self.optional_top_tensors,
                 self.block_prefix,
                 self.block_suffixes,
+                self.companion_tensors,
                 self.tensor_roles,
                 self.real_artifact_ids,
             )
@@ -168,19 +184,29 @@ CLIP_METADATA_SCHEMA: tuple[ClipMetadataField, ...] = (
     ClipMetadataField("clip.has_vision_encoder", default=False),
     ClipMetadataField("clip.has_audio_encoder", default=False),
     ClipMetadataField("clip.has_gen_audio_encoder", default=False),
-    ClipMetadataField("clip.has_text_encoder", note="Absent from the pinned ABI; always false."),
+    ClipMetadataField(
+        "clip.has_text_encoder", note="Absent from the pinned ABI; always false."
+    ),
     ClipMetadataField("clip.use_gelu", default=False),
     ClipMetadataField("clip.use_silu", default=False),
-    ClipMetadataField("clip.{modality}.embedding_length", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE),
+    ClipMetadataField(
+        "clip.{modality}.embedding_length", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE
+    ),
     ClipMetadataField(
         "clip.{modality}.feed_forward_length", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE
     ),
-    ClipMetadataField("clip.{modality}.block_count", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE),
-    ClipMetadataField("clip.{modality}.projection_dim", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE),
+    ClipMetadataField(
+        "clip.{modality}.block_count", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE
+    ),
+    ClipMetadataField(
+        "clip.{modality}.projection_dim", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE
+    ),
     ClipMetadataField(
         "clip.{modality}.attention.head_count", _VISION_BASE | _AUDIO_BASE | _GEN_AUDIO_BASE
     ),
-    ClipMetadataField("clip.{modality}.attention.head_count_kv", default="attention.head_count"),
+    ClipMetadataField(
+        "clip.{modality}.attention.head_count_kv", default="attention.head_count"
+    ),
     ClipMetadataField("clip.{modality}.attention.head_dim"),
     ClipMetadataField(
         "clip.{modality}.attention.layer_norm_epsilon",
@@ -282,6 +308,59 @@ _GEMMA4V_BLOCK_SUFFIXES = (
     *_RANGE_STATS,
 )
 
+_GEMMA4A_CLIPPED_STEMS = (
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_out",
+    "conv_pw1",
+    "conv_pw2",
+    "ffn_up",
+    "ffn_down",
+    "ffn_up_1",
+    "ffn_down_1",
+)
+
+_GEMMA4A_BLOCK_SUFFIXES = (
+    "ffn_norm.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+    "ffn_post_norm.weight",
+    "ffn_norm_1.weight",
+    "ffn_up_1.weight",
+    "ffn_down_1.weight",
+    "ffn_post_norm_1.weight",
+    "attn_pre_norm.weight",
+    "attn_post_norm.weight",
+    "ln2.weight",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_out.weight",
+    "attn_k_rel.weight",
+    "per_dim_scale.weight",
+    "norm_conv.weight",
+    "conv_pw1.weight",
+    "conv_dw.weight",
+    "conv_pw2.weight",
+    *(
+        f"{stem}.{bound}"
+        for stem in _GEMMA4A_CLIPPED_STEMS
+        for bound in ("input_min", "input_max", "output_min", "output_max")
+    ),
+)
+
+_GEMMA4A_TOP_TENSORS = (
+    "a.conv1d.0.norm.weight",
+    "a.conv1d.0.weight",
+    "a.conv1d.1.norm.weight",
+    "a.conv1d.1.weight",
+    "a.input_projection.weight",
+    "a.pre_encode.out.bias",
+    "a.pre_encode.out.weight",
+    "mm.a.input_projection.weight",
+)
+
 _MUSE_GLIMMER_BLOCK_SUFFIXES = tuple(
     f"{stem}.{kind}"
     for stem in ("ln1", "ln2", "attn_q", "attn_k", "attn_v", "attn_out", "ffn_up", "ffn_down")
@@ -300,6 +379,17 @@ _COMMON_REQUIRED_VISION_METADATA = (
     "clip.vision.patch_size",
     "clip.vision.image_mean",
     "clip.vision.image_std",
+)
+
+_COMMON_REQUIRED_AUDIO_METADATA = (
+    "clip.has_audio_encoder",
+    "clip.audio.projector_type",
+    "clip.audio.embedding_length",
+    "clip.audio.feed_forward_length",
+    "clip.audio.block_count",
+    "clip.audio.projection_dim",
+    "clip.audio.attention.head_count",
+    "clip.audio.attention.layer_norm_epsilon",
 )
 
 
@@ -336,18 +426,78 @@ def _rejected(
 
 
 _SPECS: tuple[ProjectorSpec, ...] = (
-    _deferred("mlp", "PROJECTOR_TYPE_MLP", _VISION_BASE, "LLaVA MLP topology and class-token feature selection are not implemented by the GGUF builder."),
-    _deferred("ldp", "PROJECTOR_TYPE_LDP", _VISION_BASE, "MobileVLM LDP convolutional projector semantics are not implemented."),
-    _deferred("ldpv2", "PROJECTOR_TYPE_LDPV2", _VISION_BASE, "MobileVLM LDPv2 pooling/projector semantics are not implemented."),
-    _deferred("resampler", "PROJECTOR_TYPE_MINICPMV", _VISION_BASE, "MiniCPM-V query resampler and positional interpolation are not implemented."),
-    _deferred("adapter", "PROJECTOR_TYPE_GLM_EDGE", _VISION_BASE, "GLM-Edge adapter tensor closure and graph are not implemented."),
-    _deferred("qwen2vl_merger", "PROJECTOR_TYPE_QWEN2VL", _VISION_BASE, "The existing HF Qwen2-VL graph is not wired to the pinned GGUF merger ABI."),
-    _deferred("qwen2.5vl_merger", "PROJECTOR_TYPE_QWEN25VL", _VISION_BASE, "The Qwen2.5-VL merger/window ordering has no GGUF tensor-closure parity test."),
-    _deferred("qwen3vl_merger", "PROJECTOR_TYPE_QWEN3VL", _VISION_BASE, "The Qwen3-VL merger/window ordering has no GGUF tensor-closure parity test."),
-    _deferred("step3vl", "PROJECTOR_TYPE_STEP3VL", _VISION_BASE, "Step3-VL vision and projector graph are not implemented."),
-    _deferred("gemma3", "PROJECTOR_TYPE_GEMMA3", _VISION_BASE, "Gemma3 mmproj feature selection and projector tensor map are not implemented."),
-    _deferred("gemma3nv", "PROJECTOR_TYPE_GEMMA3NV", _VISION_BASE, "Gemma3n vision sidecar routing is not implemented."),
-    _deferred("gemma3na", "PROJECTOR_TYPE_GEMMA3NA", _AUDIO_BASE, "Gemma3n audio sidecar routing is not implemented."),
+    _deferred(
+        "mlp",
+        "PROJECTOR_TYPE_MLP",
+        _VISION_BASE,
+        "LLaVA MLP topology and class-token feature selection are not implemented by the GGUF builder.",
+    ),
+    _deferred(
+        "ldp",
+        "PROJECTOR_TYPE_LDP",
+        _VISION_BASE,
+        "MobileVLM LDP convolutional projector semantics are not implemented.",
+    ),
+    _deferred(
+        "ldpv2",
+        "PROJECTOR_TYPE_LDPV2",
+        _VISION_BASE,
+        "MobileVLM LDPv2 pooling/projector semantics are not implemented.",
+    ),
+    _deferred(
+        "resampler",
+        "PROJECTOR_TYPE_MINICPMV",
+        _VISION_BASE,
+        "MiniCPM-V query resampler and positional interpolation are not implemented.",
+    ),
+    _deferred(
+        "adapter",
+        "PROJECTOR_TYPE_GLM_EDGE",
+        _VISION_BASE,
+        "GLM-Edge adapter tensor closure and graph are not implemented.",
+    ),
+    _deferred(
+        "qwen2vl_merger",
+        "PROJECTOR_TYPE_QWEN2VL",
+        _VISION_BASE,
+        "The existing HF Qwen2-VL graph is not wired to the pinned GGUF merger ABI.",
+    ),
+    _deferred(
+        "qwen2.5vl_merger",
+        "PROJECTOR_TYPE_QWEN25VL",
+        _VISION_BASE,
+        "The Qwen2.5-VL merger/window ordering has no GGUF tensor-closure parity test.",
+    ),
+    _deferred(
+        "qwen3vl_merger",
+        "PROJECTOR_TYPE_QWEN3VL",
+        _VISION_BASE,
+        "The Qwen3-VL merger/window ordering has no GGUF tensor-closure parity test.",
+    ),
+    _deferred(
+        "step3vl",
+        "PROJECTOR_TYPE_STEP3VL",
+        _VISION_BASE,
+        "Step3-VL vision and projector graph are not implemented.",
+    ),
+    _deferred(
+        "gemma3",
+        "PROJECTOR_TYPE_GEMMA3",
+        _VISION_BASE,
+        "Gemma3 mmproj feature selection and projector tensor map are not implemented.",
+    ),
+    _deferred(
+        "gemma3nv",
+        "PROJECTOR_TYPE_GEMMA3NV",
+        _VISION_BASE,
+        "Gemma3n vision sidecar routing is not implemented.",
+    ),
+    _deferred(
+        "gemma3na",
+        "PROJECTOR_TYPE_GEMMA3NA",
+        _AUDIO_BASE,
+        "Gemma3n audio sidecar routing is not implemented.",
+    ),
     ProjectorSpec(
         projector_type="gemma4v",
         enum_name="PROJECTOR_TYPE_GEMMA4V",
@@ -366,58 +516,298 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         block_prefix="v.blk.",
         block_suffixes=_GEMMA4V_BLOCK_SUFFIXES,
+        companion_tensors=(
+            CompanionTensorSpec(
+                modality=MMProjModality.AUDIO,
+                projector_type="gemma4a",
+                required_metadata=_COMMON_REQUIRED_AUDIO_METADATA,
+                required_top_tensors=_GEMMA4A_TOP_TENSORS,
+                block_prefix="a.blk.",
+                block_suffixes=_GEMMA4A_BLOCK_SUFFIXES,
+            ),
+        ),
         tensor_roles=(
             ("v.", MMProjTensorRole.ENCODER),
             ("mm.input_projection.weight", MMProjTensorRole.PROJECTOR),
         ),
         real_artifact_ids=("gemma4-e2b-f16",),
     ),
-    _deferred("gemma4a", "PROJECTOR_TYPE_GEMMA4A", _AUDIO_BASE, "The sidecar carries a.pre_encode tensors that the current audio map drops, and independent Conformer parity is not established."),
-    _deferred("gemma4uv", "PROJECTOR_TYPE_GEMMA4UV", _VISION_BASE, "Encoder-free unified Gemma4 vision sidecars use a different patch embedder contract."),
-    _deferred("gemma4ua", "PROJECTOR_TYPE_GEMMA4UA", _AUDIO_BASE, "Encoder-free unified Gemma4 waveform embedding is not wired to GGUF."),
-    _deferred("phi4", "PROJECTOR_TYPE_PHI4", _VISION_BASE, "The Phi-4 vision projector exists for HF weights but has no pinned GGUF tensor closure."),
-    _deferred("idefics3", "PROJECTOR_TYPE_IDEFICS3", _VISION_BASE, "Idefics3 pixel-shuffle projector GGUF routing is not implemented."),
-    _deferred("pixtral", "PROJECTOR_TYPE_PIXTRAL", _VISION_BASE, "The Pixtral component has no pinned mmproj tensor mapping or positional-interpolation parity."),
-    _deferred("ultravox", "PROJECTOR_TYPE_ULTRAVOX", _AUDIO_BASE, "Whisper encoder plus Ultravox stack projector is not implemented."),
-    _deferred("internvl", "PROJECTOR_TYPE_INTERNVL", _VISION_BASE, "InternVL pixel-shuffle token ordering is not implemented for GGUF."),
-    _deferred("llama4", "PROJECTOR_TYPE_LLAMA4", _VISION_BASE, "Llama4 vision encoder and multimodal target package are out of scope."),
-    _deferred("qwen2a", "PROJECTOR_TYPE_QWEN2A", _AUDIO_BASE, "Qwen2 audio encoder/projector is not implemented."),
-    _deferred("qwen3a", "PROJECTOR_TYPE_QWEN3A", _AUDIO_BASE, "Qwen3 audio encoder/projector is not implemented."),
-    _deferred("glma", "PROJECTOR_TYPE_GLMA", _AUDIO_BASE, "GLM audio encoder/projector is not implemented."),
-    _deferred("qwen2.5o", "PROJECTOR_TYPE_QWEN25O", _VISION_BASE | _AUDIO_BASE, "This legacy string changes meaning by modality; accepting it would create a false alias."),
-    _deferred("voxtral", "PROJECTOR_TYPE_VOXTRAL", _AUDIO_BASE, "Voxtral Whisper encoder/projector is not implemented."),
-    _deferred("meralion", "PROJECTOR_TYPE_MERALION", _AUDIO_BASE, "Meralion audio projector is not implemented."),
-    _deferred("musicflamingo", "PROJECTOR_TYPE_MUSIC_FLAMINGO", _AUDIO_BASE, "Music Flamingo audio projector is not implemented."),
-    _deferred("lfm2", "PROJECTOR_TYPE_LFM2", _VISION_BASE, "The existing LFM2-VL HF graph has no pinned mmproj tensor closure or component parity."),
-    _deferred("kimivl", "PROJECTOR_TYPE_KIMIVL", _VISION_BASE, "Kimi-VL vision/projector graph is not implemented."),
-    _deferred("paddleocr", "PROJECTOR_TYPE_PADDLEOCR", _VISION_BASE, "PaddleOCR vision/projector graph is not implemented."),
-    _deferred("lightonocr", "PROJECTOR_TYPE_LIGHTONOCR", _VISION_BASE, "LightOnOCR Pixtral variant has no exact tensor mapping."),
-    _deferred("cogvlm", "PROJECTOR_TYPE_COGVLM", _VISION_BASE, "CogVLM feature output differs from LLaVA and is not implemented."),
-    _deferred("janus_pro", "PROJECTOR_TYPE_JANUS_PRO", _VISION_BASE, "Janus-Pro vision/projector graph is not implemented."),
-    _deferred("dots_ocr", "PROJECTOR_TYPE_DOTS_OCR", _VISION_BASE, "DotsOCR vision merger is not implemented."),
-    _deferred("dots3note_v", "PROJECTOR_TYPE_DOTS3NOTE_V", _VISION_BASE, "Dots3Note vision pyramid MoE is not implemented."),
-    _deferred("dots3note_a", "PROJECTOR_TYPE_DOTS3NOTE_A", _AUDIO_BASE, "Dots3Note audio graph is not implemented."),
-    _deferred("deepseekocr", "PROJECTOR_TYPE_DEEPSEEKOCR", _VISION_BASE, "DeepSeek-OCR SAM/projector graph is not implemented."),
-    _deferred("deepseekocr2", "PROJECTOR_TYPE_DEEPSEEKOCR2", _VISION_BASE, "DeepSeek-OCR2 SAM/projector graph is not implemented."),
-    _deferred("lfm2a", "PROJECTOR_TYPE_LFM2A", _AUDIO_BASE, "LFM2 conformer audio graph has no GGUF tensor mapping."),
-    _deferred("glm4v", "PROJECTOR_TYPE_GLM4V", _VISION_BASE, "GLM4V downsampler and projector are not implemented."),
-    _deferred("youtuvl", "PROJECTOR_TYPE_YOUTUVL", _VISION_BASE, "YouTu-VL vision/projector graph is not implemented."),
-    _deferred("yasa2", "PROJECTOR_TYPE_YASA2", _VISION_BASE, "YASA2 vision/projector graph is not implemented."),
-    _deferred("kimik25", "PROJECTOR_TYPE_KIMIK25", _VISION_BASE, "Kimi K2.5 vision/projector graph is not implemented."),
-    _deferred("nemotron_v2_vl", "PROJECTOR_TYPE_NEMOTRON_V2_VL", _VISION_BASE, "Nemotron V2 VL vision/projector graph is not implemented."),
-    _deferred("exaone4_5", "PROJECTOR_TYPE_EXAONE4_5", _VISION_BASE, "EXAONE 4.5 vision merger is not implemented."),
-    _deferred("hunyuanvl", "PROJECTOR_TYPE_HUNYUANVL", _VISION_BASE, "HunyuanVL vision/projector graph is not implemented."),
-    _deferred("minicpmv4_6", "PROJECTOR_TYPE_MINICPMV4_6", _VISION_BASE, "MiniCPM-V 4.6 SAM/resampler graph is not implemented."),
-    _deferred("granite_speech", "PROJECTOR_TYPE_GRANITE_SPEECH", _AUDIO_BASE, "Granite Speech audio encoder/projector is not implemented."),
-    _deferred("mimovl", "PROJECTOR_TYPE_MIMOVL", _VISION_BASE, "MiMo-VL vision/projector graph is not implemented."),
-    _deferred("minimax_m3", "PROJECTOR_TYPE_MINIMAX_M3", _VISION_BASE, "MiniMax M3 vision/projector graph is not implemented."),
-    _deferred("granite4_vision", "PROJECTOR_TYPE_GRANITE4_VISION", _VISION_BASE, "Granite 4 vision sidecar graph is not implemented."),
-    _deferred("mimo_audio", "PROJECTOR_TYPE_MIMO_AUDIO", _AUDIO_BASE, "MiMo audio RVQ/local-transformer graph is not implemented."),
-    _deferred("parakeet", "PROJECTOR_TYPE_PARAKEET", _AUDIO_BASE, "Parakeet audio encoder graph is not implemented."),
-    _deferred("qwen3tts_spkenc", "PROJECTOR_TYPE_QWEN3TTS_SPKENC", _AUDIO_BASE, "Qwen3-TTS speaker encoder graph is not implemented."),
-    _rejected("qwen3tts_gen", "PROJECTOR_TYPE_QWEN3TTS_GEN", _GEN_AUDIO_BASE, "Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package."),
-    _deferred("pockettts_spkenc", "PROJECTOR_TYPE_POCKETTTS_SPKENC", _AUDIO_BASE, "PocketTTS speaker encoder graph is not implemented."),
-    _rejected("pockettts_gen", "PROJECTOR_TYPE_POCKETTTS_GEN", _GEN_AUDIO_BASE, "Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package."),
+    _deferred(
+        "gemma4a",
+        "PROJECTOR_TYPE_GEMMA4A",
+        _AUDIO_BASE,
+        "The sidecar carries a.pre_encode tensors that the current audio map drops, and independent Conformer parity is not established.",
+    ),
+    _deferred(
+        "gemma4uv",
+        "PROJECTOR_TYPE_GEMMA4UV",
+        _VISION_BASE,
+        "Encoder-free unified Gemma4 vision sidecars use a different patch embedder contract.",
+    ),
+    _deferred(
+        "gemma4ua",
+        "PROJECTOR_TYPE_GEMMA4UA",
+        _AUDIO_BASE,
+        "Encoder-free unified Gemma4 waveform embedding is not wired to GGUF.",
+    ),
+    _deferred(
+        "phi4",
+        "PROJECTOR_TYPE_PHI4",
+        _VISION_BASE,
+        "The Phi-4 vision projector exists for HF weights but has no pinned GGUF tensor closure.",
+    ),
+    _deferred(
+        "idefics3",
+        "PROJECTOR_TYPE_IDEFICS3",
+        _VISION_BASE,
+        "Idefics3 pixel-shuffle projector GGUF routing is not implemented.",
+    ),
+    _deferred(
+        "pixtral",
+        "PROJECTOR_TYPE_PIXTRAL",
+        _VISION_BASE,
+        "The Pixtral component has no pinned mmproj tensor mapping or positional-interpolation parity.",
+    ),
+    _deferred(
+        "ultravox",
+        "PROJECTOR_TYPE_ULTRAVOX",
+        _AUDIO_BASE,
+        "Whisper encoder plus Ultravox stack projector is not implemented.",
+    ),
+    _deferred(
+        "internvl",
+        "PROJECTOR_TYPE_INTERNVL",
+        _VISION_BASE,
+        "InternVL pixel-shuffle token ordering is not implemented for GGUF.",
+    ),
+    _deferred(
+        "llama4",
+        "PROJECTOR_TYPE_LLAMA4",
+        _VISION_BASE,
+        "Llama4 vision encoder and multimodal target package are out of scope.",
+    ),
+    _deferred(
+        "qwen2a",
+        "PROJECTOR_TYPE_QWEN2A",
+        _AUDIO_BASE,
+        "Qwen2 audio encoder/projector is not implemented.",
+    ),
+    _deferred(
+        "qwen3a",
+        "PROJECTOR_TYPE_QWEN3A",
+        _AUDIO_BASE,
+        "Qwen3 audio encoder/projector is not implemented.",
+    ),
+    _deferred(
+        "glma",
+        "PROJECTOR_TYPE_GLMA",
+        _AUDIO_BASE,
+        "GLM audio encoder/projector is not implemented.",
+    ),
+    _deferred(
+        "qwen2.5o",
+        "PROJECTOR_TYPE_QWEN25O",
+        _VISION_BASE | _AUDIO_BASE,
+        "This legacy string changes meaning by modality; accepting it would create a false alias.",
+    ),
+    _deferred(
+        "voxtral",
+        "PROJECTOR_TYPE_VOXTRAL",
+        _AUDIO_BASE,
+        "Voxtral Whisper encoder/projector is not implemented.",
+    ),
+    _deferred(
+        "meralion",
+        "PROJECTOR_TYPE_MERALION",
+        _AUDIO_BASE,
+        "Meralion audio projector is not implemented.",
+    ),
+    _deferred(
+        "musicflamingo",
+        "PROJECTOR_TYPE_MUSIC_FLAMINGO",
+        _AUDIO_BASE,
+        "Music Flamingo audio projector is not implemented.",
+    ),
+    _deferred(
+        "lfm2",
+        "PROJECTOR_TYPE_LFM2",
+        _VISION_BASE,
+        "The existing LFM2-VL HF graph has no pinned mmproj tensor closure or component parity.",
+    ),
+    _deferred(
+        "kimivl",
+        "PROJECTOR_TYPE_KIMIVL",
+        _VISION_BASE,
+        "Kimi-VL vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "paddleocr",
+        "PROJECTOR_TYPE_PADDLEOCR",
+        _VISION_BASE,
+        "PaddleOCR vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "lightonocr",
+        "PROJECTOR_TYPE_LIGHTONOCR",
+        _VISION_BASE,
+        "LightOnOCR Pixtral variant has no exact tensor mapping.",
+    ),
+    _deferred(
+        "cogvlm",
+        "PROJECTOR_TYPE_COGVLM",
+        _VISION_BASE,
+        "CogVLM feature output differs from LLaVA and is not implemented.",
+    ),
+    _deferred(
+        "janus_pro",
+        "PROJECTOR_TYPE_JANUS_PRO",
+        _VISION_BASE,
+        "Janus-Pro vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "dots_ocr",
+        "PROJECTOR_TYPE_DOTS_OCR",
+        _VISION_BASE,
+        "DotsOCR vision merger is not implemented.",
+    ),
+    _deferred(
+        "dots3note_v",
+        "PROJECTOR_TYPE_DOTS3NOTE_V",
+        _VISION_BASE,
+        "Dots3Note vision pyramid MoE is not implemented.",
+    ),
+    _deferred(
+        "dots3note_a",
+        "PROJECTOR_TYPE_DOTS3NOTE_A",
+        _AUDIO_BASE,
+        "Dots3Note audio graph is not implemented.",
+    ),
+    _deferred(
+        "deepseekocr",
+        "PROJECTOR_TYPE_DEEPSEEKOCR",
+        _VISION_BASE,
+        "DeepSeek-OCR SAM/projector graph is not implemented.",
+    ),
+    _deferred(
+        "deepseekocr2",
+        "PROJECTOR_TYPE_DEEPSEEKOCR2",
+        _VISION_BASE,
+        "DeepSeek-OCR2 SAM/projector graph is not implemented.",
+    ),
+    _deferred(
+        "lfm2a",
+        "PROJECTOR_TYPE_LFM2A",
+        _AUDIO_BASE,
+        "LFM2 conformer audio graph has no GGUF tensor mapping.",
+    ),
+    _deferred(
+        "glm4v",
+        "PROJECTOR_TYPE_GLM4V",
+        _VISION_BASE,
+        "GLM4V downsampler and projector are not implemented.",
+    ),
+    _deferred(
+        "youtuvl",
+        "PROJECTOR_TYPE_YOUTUVL",
+        _VISION_BASE,
+        "YouTu-VL vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "yasa2",
+        "PROJECTOR_TYPE_YASA2",
+        _VISION_BASE,
+        "YASA2 vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "kimik25",
+        "PROJECTOR_TYPE_KIMIK25",
+        _VISION_BASE,
+        "Kimi K2.5 vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "nemotron_v2_vl",
+        "PROJECTOR_TYPE_NEMOTRON_V2_VL",
+        _VISION_BASE,
+        "Nemotron V2 VL vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "exaone4_5",
+        "PROJECTOR_TYPE_EXAONE4_5",
+        _VISION_BASE,
+        "EXAONE 4.5 vision merger is not implemented.",
+    ),
+    _deferred(
+        "hunyuanvl",
+        "PROJECTOR_TYPE_HUNYUANVL",
+        _VISION_BASE,
+        "HunyuanVL vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "minicpmv4_6",
+        "PROJECTOR_TYPE_MINICPMV4_6",
+        _VISION_BASE,
+        "MiniCPM-V 4.6 SAM/resampler graph is not implemented.",
+    ),
+    _deferred(
+        "granite_speech",
+        "PROJECTOR_TYPE_GRANITE_SPEECH",
+        _AUDIO_BASE,
+        "Granite Speech audio encoder/projector is not implemented.",
+    ),
+    _deferred(
+        "mimovl",
+        "PROJECTOR_TYPE_MIMOVL",
+        _VISION_BASE,
+        "MiMo-VL vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "minimax_m3",
+        "PROJECTOR_TYPE_MINIMAX_M3",
+        _VISION_BASE,
+        "MiniMax M3 vision/projector graph is not implemented.",
+    ),
+    _deferred(
+        "granite4_vision",
+        "PROJECTOR_TYPE_GRANITE4_VISION",
+        _VISION_BASE,
+        "Granite 4 vision sidecar graph is not implemented.",
+    ),
+    _deferred(
+        "mimo_audio",
+        "PROJECTOR_TYPE_MIMO_AUDIO",
+        _AUDIO_BASE,
+        "MiMo audio RVQ/local-transformer graph is not implemented.",
+    ),
+    _deferred(
+        "parakeet",
+        "PROJECTOR_TYPE_PARAKEET",
+        _AUDIO_BASE,
+        "Parakeet audio encoder graph is not implemented.",
+    ),
+    _deferred(
+        "qwen3tts_spkenc",
+        "PROJECTOR_TYPE_QWEN3TTS_SPKENC",
+        _AUDIO_BASE,
+        "Qwen3-TTS speaker encoder graph is not implemented.",
+    ),
+    _rejected(
+        "qwen3tts_gen",
+        "PROJECTOR_TYPE_QWEN3TTS_GEN",
+        _GEN_AUDIO_BASE,
+        "Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package.",
+    ),
+    _deferred(
+        "pockettts_spkenc",
+        "PROJECTOR_TYPE_POCKETTTS_SPKENC",
+        _AUDIO_BASE,
+        "PocketTTS speaker encoder graph is not implemented.",
+    ),
+    _rejected(
+        "pockettts_gen",
+        "PROJECTOR_TYPE_POCKETTTS_GEN",
+        _GEN_AUDIO_BASE,
+        "Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package.",
+    ),
     ProjectorSpec(
         projector_type="muse-glimmer",
         enum_name="PROJECTOR_TYPE_MUSE_GLIMMER",
@@ -490,7 +880,7 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         lfs_sha256="7aa788cfe25ae5e4bf4837511f64df22cabe595e58223708274a67b3136f53ab",
         projector_types=("muse-glimmer",),
         paired_text_architecture="muse-glimmer",
-        paired_text_target="Muse-Glimmer-30B-Q4_K_M.gguf",
+        paired_text_target="Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
         metadata=(
             ("general.name", "Muse-Glimmer-30B"),
             ("clip.vision.embedding_length", 1536),
@@ -506,13 +896,11 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
 
 def iter_projector_specs() -> tuple[ProjectorSpec, ...]:
     """Return the exact 60-string pinned projector census."""
-
     return _SPECS
 
 
 def get_projector_spec(projector_type: str) -> ProjectorSpec:
     """Return one projector spec or fail with an actionable pinned-census error."""
-
     try:
         return _INDEX[projector_type]
     except KeyError as exc:
@@ -524,15 +912,11 @@ def get_projector_spec(projector_type: str) -> ProjectorSpec:
 
 def supported_projector_types() -> tuple[str, ...]:
     """Return projector strings that may reach graph construction."""
-
     return tuple(spec.projector_type for spec in _SPECS if spec.is_supported)
 
 
-def projector_type_for_modality(
-    metadata: Mapping[str, Any], modality: MMProjModality
-) -> str:
+def projector_type_for_modality(metadata: Mapping[str, Any], modality: MMProjModality) -> str:
     """Resolve the pinned global-key then modality-key projector fallback."""
-
     projector_type = metadata.get("clip.projector_type")
     if not projector_type:
         projector_type = metadata.get(f"clip.{modality.value}.projector_type")

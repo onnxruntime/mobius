@@ -573,14 +573,28 @@ Real-artifact audit pins:
 | Family | Revision and file | Size | LFS SHA-256 | Metadata/tensor qtypes | Paired text target |
 |---|---|---:|---|---|---|
 | Gemma4 | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2`<br>`mmproj-F16.gguf` | 985,654,080 | `337ee849e80b6169ce9d1d573d424fc1653bcafa5f0cb0cbb901beba54f4b41c` | `gemma4v` + deferred `gemma4a`; 1,163 F32 + 248 F16 tensors; vision 768→1536, audio 1024→1536 | `gemma-4-E2B-it-Q4_K_M.gguf` (`gemma4`) |
-| Muse Glimmer | `unsloth/Muse-Glimmer-30B-GGUF@faa5b025c584459c13febfa5c59883516710ae39`<br>`mmproj-Muse-Glimmer-30B-BF16.gguf` | 3,849,173,728 | `7aa788cfe25ae5e4bf4837511f64df22cabe595e58223708274a67b3136f53ab` | `muse-glimmer`; 506 F32 + 303 BF16 tensors; vision 1536, merge 2, projection 6656 | `Muse-Glimmer-30B-Q4_K_M.gguf` (`muse-glimmer`) |
+| Muse Glimmer | `unsloth/Muse-Glimmer-30B-GGUF@faa5b025c584459c13febfa5c59883516710ae39`<br>`mmproj-Muse-Glimmer-30B-BF16.gguf` | 3,849,173,728 | `7aa788cfe25ae5e4bf4837511f64df22cabe595e58223708274a67b3136f53ab` | `muse-glimmer`; 506 F32 + 303 BF16 tensors; vision 1536, merge 2, projection 6656 | `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` (`muse-glimmer`) |
 
 The Gemma4 processor contract uses tokenizer token `<|image|>` (ID 258880 in
 the audited paired GGUF) and 3×3 spatial pooling. The sidecar's image mean/std
 are metadata for preprocessing; the ONNX vision graph consumes already
 patchified `pixel_values` plus `pixel_position_ids`. Runtime callers must
 generate those inputs in the same patch order. Mobius does not currently emit
-an image-processor asset from GGUF metadata.
+an image-processor asset from GGUF metadata. The Gemma4 vision graph has an
+explicit single-image batch contract (`pixel_values[1, N, ...]` and
+`pixel_position_ids[1, N, 2]`): each image can produce a different number of
+pooled tokens, and the current flattened output has no row-splits output with
+which to represent those variable counts. Process multiple images separately
+and concatenate their feature rows in prompt media order.
+
+Pairing is fail-closed and independent of local filenames. Both GGUF files must
+carry matching non-empty `general.name` values. If either file declares
+`general.base_model.0.name` or `general.base_model.0.repo_url`, the other must
+declare the same normalized binding. Architecture and matching tensor dimensions
+alone are not accepted as source identity. The validator also inventories every
+sidecar tensor: Gemma4's exact deferred `gemma4a` companion closure is allowed
+when declared, but unknown top-level names, near-miss prefixes/suffixes, ranks,
+and packed projector tensors are rejected before graph construction.
 
 Sharded GGUF files are rejected. A single shard has only part of the tensor
 table, and treating it as a complete checkpoint would create a corrupt model.

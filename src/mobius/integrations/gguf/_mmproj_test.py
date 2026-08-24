@@ -34,7 +34,7 @@ _AUDIO_HEADS = 2
 _NUM_MEL_BINS = 8
 _AUDIO_CONV0 = 16
 _AUDIO_CONV1 = 16
-_AUDIO_PROJ_OUT = 24
+_AUDIO_PROJ_OUT = _TEXT_HIDDEN
 
 
 def _write_clip_mmproj_gguf(
@@ -43,12 +43,19 @@ def _write_clip_mmproj_gguf(
     with_audio: bool = True,
     vision_projector_type: str = "gemma4v",
     extra_tensor: str | None = None,
+    identity_name: str = "Gemma-4-E2B-It",
+    identity_repo: str | None = "https://huggingface.co/google/gemma-4-E2B-it",
 ) -> None:
     """Write a small synthetic Gemma4 ``clip`` mmproj GGUF for tests."""
     from gguf import GGUFWriter
 
     head_dim = _VISION_HIDDEN // _VISION_HEADS
     writer = GGUFWriter(str(path), "clip")
+    writer.add_string("general.name", identity_name)
+    writer.add_string("general.base_model.0.name", identity_name)
+    if identity_repo is not None:
+        writer.add_string("general.base_model.0.repo_url", identity_repo)
+    writer.add_string("general.type", "mmproj")
 
     # --- vision metadata ---
     writer.add_bool("clip.has_vision_encoder", True)
@@ -100,8 +107,52 @@ def _write_clip_mmproj_gguf(
         writer.add_uint32("clip.audio.projection_dim", _TEXT_HIDDEN)
         writer.add_float32("clip.audio.attention.layer_norm_epsilon", 1e-6)
         _f32("a.conv1d.0.weight", (_AUDIO_CONV0, 1, 3, 3))
+        _f32("a.conv1d.0.norm.weight", (_AUDIO_CONV0,))
         _f32("a.conv1d.1.weight", (_AUDIO_CONV1, _AUDIO_CONV0, 3, 3))
-        _f32("mm.a.input_projection.weight", (_AUDIO_HIDDEN, _AUDIO_PROJ_OUT))
+        _f32("a.conv1d.1.norm.weight", (_AUDIO_CONV1,))
+        _f32("a.input_projection.weight", (_AUDIO_HIDDEN, _AUDIO_HIDDEN))
+        _f32("a.pre_encode.out.weight", (_AUDIO_PROJ_OUT, _AUDIO_HIDDEN))
+        _f32("a.pre_encode.out.bias", (_AUDIO_PROJ_OUT,))
+        _f32("mm.a.input_projection.weight", (_TEXT_HIDDEN, _AUDIO_PROJ_OUT))
+        audio_head_dim = _AUDIO_HIDDEN // _AUDIO_HEADS
+        clipped_stems = (
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_out",
+            "conv_pw1",
+            "conv_pw2",
+            "ffn_up",
+            "ffn_down",
+            "ffn_up_1",
+            "ffn_down_1",
+        )
+        for layer in range(_AUDIO_LAYERS):
+            prefix = f"a.blk.{layer}."
+            for norm in (
+                "ffn_norm",
+                "ffn_post_norm",
+                "ffn_norm_1",
+                "ffn_post_norm_1",
+                "attn_pre_norm",
+                "attn_post_norm",
+                "ln2",
+                "norm_conv",
+            ):
+                _f32(prefix + norm + ".weight", (_AUDIO_HIDDEN,))
+            _f32(prefix + "per_dim_scale.weight", (audio_head_dim,))
+            for stem in ("attn_q", "attn_k", "attn_v", "attn_out", "attn_k_rel"):
+                _f32(prefix + stem + ".weight", (_AUDIO_HIDDEN, _AUDIO_HIDDEN))
+            _f32(prefix + "conv_pw1.weight", (2 * _AUDIO_HIDDEN, _AUDIO_HIDDEN))
+            _f32(prefix + "conv_dw.weight", (_AUDIO_HIDDEN, 5))
+            _f32(prefix + "conv_pw2.weight", (_AUDIO_HIDDEN, _AUDIO_HIDDEN))
+            for stem in ("ffn_up", "ffn_up_1"):
+                _f32(prefix + stem + ".weight", (_AUDIO_FFN, _AUDIO_HIDDEN))
+            for stem in ("ffn_down", "ffn_down_1"):
+                _f32(prefix + stem + ".weight", (_AUDIO_HIDDEN, _AUDIO_FFN))
+            for stem in clipped_stems:
+                for bound in ("input_min", "input_max", "output_min", "output_max"):
+                    _f32(prefix + stem + "." + bound, (1,))
     if extra_tensor is not None:
         _f32(extra_tensor, (1,))
 
@@ -116,11 +167,27 @@ def _write_minimal_gguf(
     architecture: str,
     *,
     split_count: int = 1,
+    identity_name: str | None = None,
+    identity_repo: str | None = None,
 ) -> None:
     """Write only enough GGUF structure to exercise pre-config guards."""
     from gguf import GGUFWriter
 
     writer = GGUFWriter(str(path), architecture)
+    if identity_name is None:
+        identity_name = {
+            "gemma4": "Gemma-4-E2B-It",
+            "muse-glimmer": "Muse-Glimmer-30B",
+            "muse_glimmer": "Muse-Glimmer-30B",
+        }.get(architecture)
+    if identity_repo is None and architecture == "gemma4":
+        identity_repo = "https://huggingface.co/google/gemma-4-E2B-it"
+    if identity_name is not None:
+        writer.add_string("general.name", identity_name)
+        if architecture == "gemma4" or identity_repo is not None:
+            writer.add_string("general.base_model.0.name", identity_name)
+    if identity_repo is not None:
+        writer.add_string("general.base_model.0.repo_url", identity_repo)
     if split_count > 1:
         writer.add_uint16("split.no", 0)
         writer.add_uint16("split.count", split_count)
@@ -145,6 +212,12 @@ def _write_quantized_gemma4_text_gguf(path: Path) -> None:
     head_dim = hidden_size // num_heads
 
     writer = GGUFWriter(str(path), "gemma4")
+    writer.add_string("general.name", "Gemma-4-E2B-It")
+    writer.add_string("general.base_model.0.name", "Gemma-4-E2B-It")
+    writer.add_string(
+        "general.base_model.0.repo_url",
+        "https://huggingface.co/google/gemma-4-E2B-it",
+    )
     writer.add_context_length(128)
     writer.add_embedding_length(hidden_size)
     writer.add_feed_forward_length(intermediate_size)
@@ -226,6 +299,12 @@ def clip_mmproj_gguf(tmp_path: Path) -> Path:
 
 
 class TestMultimodalPreflightGuards:
+    @staticmethod
+    def _load_pair(text_path: Path, mmproj_path: Path):
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        return GGUFModel(str(text_path)), GGUFModel(str(mmproj_path))
+
     def test_rejects_unsupported_text_architecture_before_config(
         self,
         tmp_path: Path,
@@ -280,8 +359,18 @@ class TestMultimodalPreflightGuards:
 
         text_path = tmp_path / "muse-glimmer.gguf"
         mmproj_path = tmp_path / "mmproj.gguf"
-        _write_minimal_gguf(text_path, "muse-glimmer")
-        _write_clip_mmproj_gguf(mmproj_path)
+        identity_repo = "https://huggingface.co/example/shared-vlm"
+        _write_minimal_gguf(
+            text_path,
+            "muse-glimmer",
+            identity_name="Shared-VLM",
+            identity_repo=identity_repo,
+        )
+        _write_clip_mmproj_gguf(
+            mmproj_path,
+            identity_name="Shared-VLM",
+            identity_repo=identity_repo,
+        )
 
         with (
             mock.patch(
@@ -306,6 +395,121 @@ class TestMultimodalPreflightGuards:
         ):
             build_gemma4_vlm_from_gguf(text_path, mmproj_path, image_token_id=0)
         build_graph.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "extra_tensor",
+        ["unexpected.weight", "vision.blk.0.attn_q.weight"],
+    )
+    def test_complete_inventory_rejects_unknown_tensor_names(
+        self, tmp_path: Path, extra_tensor: str
+    ):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False, extra_tensor=extra_tensor)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+
+        with pytest.raises(ValueError, match=r"outside the pinned.*closure"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_valid_deferred_audio_companion_inventory_is_explicitly_allowed(
+        self, tmp_path: Path
+    ):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+
+        resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
+
+    def test_companion_tensor_wrong_rank_is_rejected(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        original = mmproj.get_tensor_shape
+
+        with (
+            mock.patch.object(
+                mmproj,
+                "get_tensor_shape",
+                side_effect=lambda name: (
+                    (1, 3, 3) if name == "a.conv1d.0.weight" else original(name)
+                ),
+            ),
+            pytest.raises(ValueError, match=r"a\.conv1d\.0\.weight must have shape"),
+        ):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    @pytest.mark.parametrize("missing_side", ["text", "mmproj"])
+    def test_missing_identity_on_either_side_fails_closed(
+        self, tmp_path: Path, missing_side: str
+    ):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        (text if missing_side == "text" else mmproj).metadata.pop("general.name")
+
+        with pytest.raises(ValueError, match=r"both files must declare.*general\.name"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    @pytest.mark.parametrize(
+        ("key", "mismatched"),
+        [
+            ("general.name", "Other-Gemma"),
+            (
+                "general.base_model.0.repo_url",
+                "https://huggingface.co/example/other-gemma",
+            ),
+        ],
+    )
+    def test_identity_binding_mismatch_is_rejected(
+        self, tmp_path: Path, key: str, mismatched: str
+    ):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+        mmproj.metadata[key] = mismatched
+
+        with pytest.raises(ValueError, match=key):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_matching_identity_survives_file_relocation(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text_path = tmp_path / "relocated" / "text" / "renamed-model.gguf"
+        mmproj_path = tmp_path / "another-root" / "renamed-sidecar.gguf"
+        text_path.parent.mkdir(parents=True)
+        mmproj_path.parent.mkdir(parents=True)
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
+        text, mmproj = self._load_pair(text_path, mmproj_path)
+
+        resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
 
     def test_quantized_projector_weight_is_rejected_by_role(self, tmp_path: Path):
         from types import SimpleNamespace
@@ -392,6 +596,26 @@ class TestReadAudioConfig:
 
 class TestVisionEncoderBuildAndRun:
     """Build the Gemma4 vision encoder from the synthetic mmproj and run it."""
+
+    def test_declares_single_image_batch_contract(self, clip_mmproj_gguf: Path):
+        from mobius._configs import Gemma4Config
+        from mobius.integrations.gguf._mmproj import read_mmproj_vision_config
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.models.gemma4 import _Gemma4VisionEncoderModel
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        vision_config = read_mmproj_vision_config(GGUFModel(str(clip_mmproj_gguf)))
+        config = Gemma4Config(
+            hidden_size=_TEXT_HIDDEN,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            vocab_size=64,
+            vision=vision_config,
+        )
+        model = Gemma4Task()._build_vision(_Gemma4VisionEncoderModel(config), config)
+
+        assert next(iter(model.graph.inputs[0].shape)) == 1
+        assert next(iter(model.graph.inputs[1].shape)) == 1
 
     def test_matches_independent_numpy_reference(self, tmp_path: Path):
         """Check patch, position, pooling, norm, and projection semantics."""
@@ -747,6 +971,8 @@ def _write_muse_glimmer_mmproj_gguf(path: Path) -> None:
     from gguf import GGUFWriter
 
     writer = GGUFWriter(str(path), "clip")
+    writer.add_string("general.name", "Muse-Glimmer-30B")
+    writer.add_string("general.type", "mmproj")
     writer.add_bool("clip.has_vision_encoder", True)
     writer.add_string("clip.projector_type", "muse-glimmer")
     writer.add_uint32("clip.vision.embedding_length", _MG_HIDDEN)

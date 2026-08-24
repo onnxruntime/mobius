@@ -292,58 +292,155 @@ def _normalized_identity(value: object) -> str:
     return "".join(character for character in str(value).lower() if character.isalnum())
 
 
+def _normalized_repository(value: object) -> str:
+    repository = str(value).strip().lower().rstrip("/")
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    for prefix in ("https://", "http://", "hf://"):
+        if repository.startswith(prefix):
+            repository = repository[len(prefix) :]
+            break
+    return repository
+
+
 def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
-    """Reject a sidecar whose declared base model contradicts the text GGUF."""
-    text_name = text_gguf.metadata.get("general.name")
-    sidecar_base = mmproj_gguf.metadata.get("general.base_model.0.name")
-    if text_name and sidecar_base:
-        text_identity = _normalized_identity(text_name)
-        sidecar_identity = _normalized_identity(sidecar_base)
-        if text_identity != sidecar_identity:
+    """Require stable name and repository bindings independent of file location."""
+    bindings: tuple[tuple[str, Callable[[object], str]], ...] = (
+        ("general.name", _normalized_identity),
+        ("general.base_model.0.name", _normalized_identity),
+        ("general.base_model.0.repo_url", _normalized_repository),
+    )
+    for key, normalize in bindings:
+        text_value = text_gguf.metadata.get(key)
+        sidecar_value = mmproj_gguf.metadata.get(key)
+        if key == "general.name" and (not text_value or not sidecar_value):
+            raise ValueError(
+                "Cannot establish a trusted text/mmproj pairing: both files must declare "
+                "non-empty general.name metadata."
+            )
+        if bool(text_value) != bool(sidecar_value):
+            raise ValueError(
+                "Cannot establish a trusted text/mmproj pairing: identity binding "
+                f"{key!r} is present on only one file."
+            )
+        if text_value and sidecar_value and normalize(text_value) != normalize(sidecar_value):
             raise ValueError(
                 "mmproj source identity does not match the text GGUF: "
-                f"general.base_model.0.name={sidecar_base!r}, "
-                f"text general.name={text_name!r}."
+                f"{key} is {sidecar_value!r} on the sidecar and {text_value!r} "
+                "on the text model."
             )
     general_type = mmproj_gguf.metadata.get("general.type")
     if general_type not in (None, "mmproj"):
         raise ValueError(f"clip sidecar general.type must be 'mmproj', got {general_type!r}.")
 
 
-def _mmproj_tensor_names_for_spec(mmproj_gguf: Any, spec: ProjectorSpec) -> set[str]:
-    prefixes = tuple({role_prefix for role_prefix, _ in spec.tensor_roles})
-    return {
-        name
-        for name in mmproj_gguf.tensor_names
-        if name.startswith(prefixes)
-        or name in spec.required_top_tensors
-        or name in spec.optional_top_tensors
-    }
-
-
-def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
-    """Validate exact names, layers, shapes, and float storage before graph build."""
-    names = _mmproj_tensor_names_for_spec(mmproj_gguf, spec)
-    top = set(spec.required_top_tensors) | set(spec.optional_top_tensors)
-    block_names: dict[int, set[str]] = {}
-    unexpected: list[str] = []
-    prefix = spec.block_prefix
+def _collect_block_tensors(
+    names: set[str],
+    *,
+    prefix: str,
+    suffixes: tuple[str, ...],
+) -> tuple[dict[int, set[str]], set[str]]:
+    blocks: dict[int, set[str]] = {}
+    matched: set[str] = set()
+    allowed_suffixes = set(suffixes)
     for name in names:
-        if name in top:
-            continue
-        if prefix is None or not name.startswith(prefix):
-            unexpected.append(name)
+        if not name.startswith(prefix):
             continue
         remainder = name[len(prefix) :]
         index_text, separator, suffix = remainder.partition(".")
-        if not separator or not index_text.isdecimal() or suffix not in spec.block_suffixes:
-            unexpected.append(name)
+        if separator and index_text.isdecimal() and suffix in allowed_suffixes:
+            blocks.setdefault(int(index_text), set()).add(suffix)
+            matched.add(name)
+    return blocks, matched
+
+
+def _validate_block_tensor_set(
+    *,
+    projector_type: str,
+    modality: MMProjModality,
+    blocks: dict[int, set[str]],
+    block_count: int,
+    required_suffixes: tuple[str, ...],
+) -> None:
+    expected_layers = set(range(block_count))
+    if set(blocks) != expected_layers:
+        raise ValueError(
+            f"{projector_type} {modality.value} block indices are "
+            f"{sorted(blocks)}, expected {sorted(expected_layers)}."
+        )
+    required = set(required_suffixes)
+    missing = {
+        layer: sorted(required - blocks[layer])
+        for layer in sorted(blocks)
+        if required - blocks[layer]
+    }
+    if missing:
+        raise ValueError(
+            f"{projector_type} mmproj is missing required {modality.value} block "
+            f"suffixes: {missing}"
+        )
+
+
+def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    """Validate the complete sidecar inventory, including deferred companions."""
+    names = set(mmproj_gguf.tensor_names)
+    top = set(spec.required_top_tensors) | set(spec.optional_top_tensors)
+    block_names, matched = _collect_block_tensors(
+        names,
+        prefix=spec.block_prefix or "",
+        suffixes=spec.block_suffixes,
+    )
+    matched.update(top & names)
+
+    active_companions = []
+    for companion in spec.companion_tensors:
+        presence_key = f"clip.has_{companion.modality.value.replace('.', '_')}_encoder"
+        if not mmproj_gguf.metadata.get(presence_key):
             continue
-        block_names.setdefault(int(index_text), set()).add(suffix)
+        actual_type = projector_type_for_modality(mmproj_gguf.metadata, companion.modality)
+        if actual_type != companion.projector_type:
+            raise ValueError(
+                f"{spec.projector_type} sidecar declares companion "
+                f"{companion.modality.value} projector {actual_type!r}, expected "
+                f"{companion.projector_type!r}."
+            )
+        missing_metadata = [
+            key for key in companion.required_metadata if key not in mmproj_gguf.metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{companion.projector_type} companion is missing required metadata: "
+                f"{missing_metadata}"
+            )
+        companion_top = set(companion.required_top_tensors)
+        companion_blocks, companion_matched = _collect_block_tensors(
+            names,
+            prefix=companion.block_prefix,
+            suffixes=companion.block_suffixes,
+        )
+        missing_top = sorted(companion_top - names)
+        if missing_top:
+            raise ValueError(
+                f"{companion.projector_type} companion is missing required tensor(s): "
+                f"{missing_top}"
+            )
+        block_count_key = f"clip.{companion.modality.value}.block_count"
+        _validate_block_tensor_set(
+            projector_type=companion.projector_type,
+            modality=companion.modality,
+            blocks=companion_blocks,
+            block_count=int(mmproj_gguf.metadata[block_count_key]),
+            required_suffixes=companion.block_suffixes,
+        )
+        matched.update(companion_top & names)
+        matched.update(companion_matched)
+        active_companions.append(companion)
+
+    unexpected = sorted(names - matched)
     if unexpected:
         raise ValueError(
             f"{spec.projector_type} mmproj has tensors outside the pinned suffix-exact "
-            f"loader closure: {sorted(unexpected)}. Projector tensors are never dropped."
+            f"loader closure: {unexpected}. Projector tensors are never dropped."
         )
 
     missing_top = sorted(set(spec.required_top_tensors) - names)
@@ -352,23 +449,13 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             f"{spec.projector_type} mmproj is missing required tensor(s): {missing_top}"
         )
     layers = int(mmproj_gguf.metadata["clip.vision.block_count"])
-    expected_layers = set(range(layers))
-    if set(block_names) != expected_layers:
-        raise ValueError(
-            f"{spec.projector_type} mmproj block indices are "
-            f"{sorted(block_names)}, expected {sorted(expected_layers)}."
-        )
-    required_suffixes = set(spec.block_suffixes)
-    missing_by_layer = {
-        layer: sorted(required_suffixes - block_names[layer])
-        for layer in sorted(block_names)
-        if required_suffixes - block_names[layer]
-    }
-    if missing_by_layer:
-        raise ValueError(
-            f"{spec.projector_type} mmproj is missing required block suffixes: "
-            f"{missing_by_layer}"
-        )
+    _validate_block_tensor_set(
+        projector_type=spec.projector_type,
+        modality=MMProjModality.VISION,
+        blocks=block_names,
+        block_count=layers,
+        required_suffixes=spec.block_suffixes,
+    )
 
     for name in sorted(names):
         qtype = mmproj_gguf.get_tensor_type(name).name
@@ -385,12 +472,82 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             )
 
     _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    for companion in active_companions:
+        if companion.projector_type == "gemma4a":
+            _validate_gemma4_audio_companion_shapes(mmproj_gguf, companion)
 
 
 def _expect_mmproj_shape(mmproj_gguf: Any, name: str, expected: tuple[int, ...]) -> None:
     actual = mmproj_gguf.get_tensor_shape(name)
     if actual != expected:
         raise ValueError(f"mmproj tensor {name!r} has shape {actual}, expected {expected}.")
+
+
+def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) -> None:
+    """Validate the deferred Gemma4 audio inventory without claiming graph support."""
+    md = mmproj_gguf.metadata
+    hidden = int(md["clip.audio.embedding_length"])
+    intermediate = int(md["clip.audio.feed_forward_length"])
+    layers = int(md["clip.audio.block_count"])
+    heads = int(md["clip.audio.attention.head_count"])
+    projection = int(md["clip.audio.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError(
+            "gemma4a audio hidden/head dimensions are invalid: "
+            f"embedding_length={hidden}, head_count={heads}."
+        )
+    head_dim = hidden // heads
+
+    conv0_shape = mmproj_gguf.get_tensor_shape("a.conv1d.0.weight")
+    if len(conv0_shape) != 4 or conv0_shape[1:] != (1, 3, 3):
+        raise ValueError(
+            f"a.conv1d.0.weight must have shape [channels, 1, 3, 3], got {conv0_shape}."
+        )
+    conv1_shape = mmproj_gguf.get_tensor_shape("a.conv1d.1.weight")
+    if len(conv1_shape) != 4 or conv1_shape[1:] != (conv0_shape[0], 3, 3):
+        raise ValueError(
+            "a.conv1d.1.weight must have shape [channels, conv0_channels, 3, 3], "
+            f"got {conv1_shape}."
+        )
+    _expect_mmproj_shape(mmproj_gguf, "a.conv1d.0.norm.weight", (conv0_shape[0],))
+    _expect_mmproj_shape(mmproj_gguf, "a.conv1d.1.norm.weight", (conv1_shape[0],))
+    _expect_mmproj_shape(mmproj_gguf, "a.input_projection.weight", (hidden, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "a.pre_encode.out.weight", (projection, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "a.pre_encode.out.bias", (projection,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.input_projection.weight", (projection, projection))
+
+    matrix_shapes = {
+        "attn_q.weight": (hidden, hidden),
+        "attn_k.weight": (hidden, hidden),
+        "attn_v.weight": (hidden, hidden),
+        "attn_out.weight": (hidden, hidden),
+        "attn_k_rel.weight": (hidden, hidden),
+        "conv_pw1.weight": (2 * hidden, hidden),
+        "conv_dw.weight": (hidden, 5),
+        "conv_pw2.weight": (hidden, hidden),
+        "ffn_up.weight": (intermediate, hidden),
+        "ffn_down.weight": (hidden, intermediate),
+        "ffn_up_1.weight": (intermediate, hidden),
+        "ffn_down_1.weight": (hidden, intermediate),
+    }
+    vector_shapes = {
+        "ffn_norm.weight": (hidden,),
+        "ffn_post_norm.weight": (hidden,),
+        "ffn_norm_1.weight": (hidden,),
+        "ffn_post_norm_1.weight": (hidden,),
+        "attn_pre_norm.weight": (hidden,),
+        "attn_post_norm.weight": (hidden,),
+        "ln2.weight": (hidden,),
+        "norm_conv.weight": (hidden,),
+        "per_dim_scale.weight": (head_dim,),
+    }
+    for layer in range(layers):
+        prefix = f"{companion.block_prefix}{layer}."
+        for suffix, shape in (*matrix_shapes.items(), *vector_shapes.items()):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, shape)
+        for suffix in companion.block_suffixes:
+            if suffix.endswith(_CLIPPING_BOUND_SUFFIXES):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (1,))
 
 
 def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
