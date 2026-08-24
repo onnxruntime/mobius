@@ -81,6 +81,15 @@ class UpstreamArchitecture:
             closure or the strongest mechanically available converter-family inventory.
         converter_inventory_status: Whether converter-only extras are exact or remain
             unresolved because inherited/conditional converter hooks were not evaluated.
+        loader_source: Pinned architecture loader source file.
+        loader_helpers: Shared loader helpers whose complete conditional tensor union is
+            expanded into ``tensor_names``.
+        required_metadata: Architecture-specific metadata keys read without an optional
+            default by the pinned loader.
+        optional_metadata: Architecture-specific metadata keys read with a default or
+            otherwise marked optional by the pinned loader.
+        array_metadata: Metadata keys read through the pinned loader's array API. Each
+            key is also classified as required or optional.
     """
 
     gguf_arch: str
@@ -94,6 +103,11 @@ class UpstreamArchitecture:
     tensor_suffixes: tuple[tuple[str, tuple[str, ...]], ...] = ()
     tensor_closure_status: str = ""
     converter_inventory_status: str = ""
+    loader_source: str = ""
+    loader_helpers: tuple[str, ...] = ()
+    required_metadata: tuple[str, ...] = ()
+    optional_metadata: tuple[str, ...] = ()
+    array_metadata: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -160,6 +174,11 @@ def upstream_architectures() -> dict[str, UpstreamArchitecture]:
             ),
             tensor_closure_status=fields.get("tensor_closure_status", ""),
             converter_inventory_status=fields.get("converter_inventory_status", ""),
+            loader_source=fields.get("loader_source", ""),
+            loader_helpers=tuple(fields.get("loader_helpers", ())),
+            required_metadata=tuple(fields.get("required_metadata", ())),
+            optional_metadata=tuple(fields.get("optional_metadata", ())),
+            array_metadata=tuple(fields.get("array_metadata", ())),
         )
         for name, fields in _payload()["architectures"].items()
     }

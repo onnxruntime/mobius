@@ -134,7 +134,11 @@ def _raise_for_unsupported_gguf_architecture(
     """
     spec = try_get_arch_spec(architecture)
     if spec is None:
-        return
+        raise UnsupportedGGUFArchitectureError(
+            f"GGUF architecture {architecture!r} has no immutable capability-registry "
+            f"spec for {source!r}; refusing generic Hugging Face config/model dispatch "
+            "before config extraction. No ONNX artifacts were emitted."
+        )
     if spec.gguf_arch == MMPROJ_ARCHITECTURE and allow_mmproj_companion:
         # mmproj sidecars are opened deliberately by the multimodal path, which
         # pairs them with a text backbone and applies role-specific validation.
@@ -598,15 +602,15 @@ def _validate_gguf_model(
     if not isinstance(gguf_model, GgufShardSet):
         split_count = int(gguf_model.get_metadata("split.count", 1))
         _raise_for_sharded_gguf(source=source, split_count=split_count)
-    from mobius.integrations.gguf._mtp import validate_mtp_tensor_contract
-
-    validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_gguf_architecture(
         gguf_model.architecture,
         source=source,
         tensor_names=gguf_model.tensor_names,
         allow_mmproj_companion=allow_mmproj_companion,
     )
+    from mobius.integrations.gguf._mtp import validate_mtp_tensor_contract
+
+    validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_hybrid_tensor_contract(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)

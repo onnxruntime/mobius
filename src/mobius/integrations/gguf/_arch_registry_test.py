@@ -28,6 +28,7 @@ import pytest
 from mobius._registry import _REGISTRATIONS
 from mobius.integrations.gguf._arch_registry import (
     MMPROJ_ARCHITECTURE,
+    _validate_census_closure,
     get_arch_spec,
     iter_arch_specs,
     supported_architectures,
@@ -56,7 +57,88 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 41
+_EXPECTED_SUPPORTED_COUNT = 51
+_FINAL_CENSUS_CLOSURE = frozenset(
+    {
+        "afmoe",
+        "bailingmoe",
+        "bailingmoe2",
+        "bitnet",
+        "codeshell",
+        "cohere2moe",
+        "command-r",
+        "deepseek",
+        "deepseek2",
+        "deepseek32",
+        "dots1",
+        "dots3note",
+        "ernie4_5",
+        "ernie4_5-moe",
+        "exaone-moe",
+        "exaone4",
+        "gemma-embedding",
+        "gemma4-assistant",
+        "glm-dsa",
+        "glm4",
+        "glm4moe",
+        "gptj",
+        "gptneox",
+        "granite",
+        "granite_swa",
+        "graniteswitch",
+        "hunyuan-moe",
+        "hy_v3",
+        "jais",
+        "jais2",
+        "laguna",
+        "llama-embed",
+        "maincoder",
+        "mellum",
+        "mimo2",
+        "minicpm",
+        "minimax-m2",
+        "minimax-m3",
+        "mistral4",
+        "nanbeige",
+        "orion",
+        "pangu-embedded",
+        "plamo",
+        "plamo3",
+        "plm",
+        "qwen",
+        "refact",
+        "starcoder",
+        "step35",
+        "xverse",
+    }
+)
+_QKV_HELPER_TENSOR_NAMES = frozenset(
+    {
+        "blk.{bid}.attn_qkv.weight",
+        "blk.{bid}.attn_qkv.bias",
+        "blk.{bid}.attn_q.weight",
+        "blk.{bid}.attn_q.bias",
+        "blk.{bid}.attn_k.weight",
+        "blk.{bid}.attn_k.bias",
+        "blk.{bid}.attn_v.weight",
+        "blk.{bid}.attn_v.bias",
+    }
+)
+_GATE_UP_EXPS_HELPER_TENSOR_NAMES = frozenset(
+    {
+        "blk.{bid}.ffn_gate_up_exps.weight",
+        "blk.{bid}.ffn_gate_exps.weight",
+        "blk.{bid}.ffn_up_exps.weight",
+    }
+)
+_FINAL_CENSUS_SUFFIXLESS_TENSORS = frozenset(
+    {
+        ("gemma4-assistant", "masked_embd_ordering"),
+        ("hy_v3", "blk.{bid}.exp_probs_b"),
+        ("plamo3", "blk.{bid}.post_attention_norm"),
+        ("plamo3", "blk.{bid}.post_ffw_norm"),
+    }
+)
 
 # Quantized reachability is separately pinned from float importability. A new
 # architecture must explicitly prove that its graph exposes packed projection
@@ -155,7 +237,7 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 10
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT
 
     def test_falcon_h1_is_not_a_generic_falcon_alias(self) -> None:
         """Falcon-H1 must fail before constructing the incompatible Falcon graph."""
@@ -272,6 +354,35 @@ class TestNamespaceHygiene:
                     f"{name!r} is claimed by both {seen[name]!r} and {spec.gguf_arch!r}"
                 )
                 seen[name] = spec.gguf_arch
+
+    def test_registry_exactly_closes_the_pinned_census(self) -> None:
+        specs = iter_arch_specs()
+        _validate_census_closure(specs, frozenset(upstream_architectures()))
+        assert len(specs) == 147
+        assert {spec.gguf_arch for spec in specs} == set(upstream_architectures())
+
+    @pytest.mark.parametrize(
+        ("mutation", "match"),
+        [
+            ("missing", "missing="),
+            ("extra", "extra="),
+            ("duplicate", "duplicates="),
+            ("alias-drift", "aliases_that_became_canonical="),
+        ],
+    )
+    def test_census_mutation_is_detected(self, mutation: str, match: str) -> None:
+        specs = iter_arch_specs()
+        upstream = set(upstream_architectures())
+        if mutation == "missing":
+            specs = specs[:-1]
+        elif mutation == "extra":
+            upstream.remove(specs[0].gguf_arch)
+        elif mutation == "duplicate":
+            specs = (*specs, specs[0])
+        else:
+            upstream.add("mistral")
+        with pytest.raises(ValueError, match=match):
+            _validate_census_closure(tuple(specs), frozenset(upstream))
 
     @pytest.mark.parametrize("spec", iter_arch_specs(), ids=lambda s: s.gguf_arch)
     def test_alias_resolution_is_total(self, spec) -> None:
@@ -540,6 +651,152 @@ class TestPinnedTensorClosure:
         finally:
             mapping[mapping_key] = removed
             _build_mapping.cache_clear()
+
+
+class TestFinalCensusClosure:
+    @pytest.mark.parametrize("architecture", sorted(_FINAL_CENSUS_CLOSURE))
+    def test_every_newly_closed_id_has_one_nonimportable_spec(self, architecture: str) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None
+        assert spec.gguf_arch == architecture
+        assert spec.model_type is None
+        assert spec.aliases == frozenset()
+        assert all(verdict is not Support.SUPPORTED for verdict in spec.verdicts.values())
+        assert spec.reason
+
+    @pytest.mark.parametrize(
+        "architecture",
+        sorted(_FINAL_CENSUS_CLOSURE - {"gptj"}),
+    )
+    def test_loader_and_converter_audits_are_pinned(self, architecture: str) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert upstream.cpp_loader
+        assert upstream.loader_source.startswith("src/models/")
+        assert upstream.tensor_names
+        assert upstream.tensor_families
+        assert upstream.required_metadata
+        assert upstream.tensor_closure_status == "audited-direct-loader-conditional-union"
+        assert (
+            upstream.converter_inventory_status
+            == "exact-pinned-MODEL_TENSORS-family-inventory"
+        )
+        assert all(
+            name.endswith((".weight", ".bias", ".scale", ".input_scale", ".lora_a", ".lora_b"))
+            or (architecture, name) in _FINAL_CENSUS_SUFFIXLESS_TENSORS
+            for name in upstream.tensor_names
+        )
+
+    def test_shared_loader_helpers_are_fully_expanded(self) -> None:
+        expected = {
+            "create_tensor_qkv": _QKV_HELPER_TENSOR_NAMES,
+            "create_tensor_gate_up_exps": _GATE_UP_EXPS_HELPER_TENSOR_NAMES,
+        }
+        for architecture in sorted(_FINAL_CENSUS_CLOSURE):
+            upstream = upstream_architectures()[architecture]
+            for helper in upstream.loader_helpers:
+                assert helper in expected
+                assert expected[helper] <= set(upstream.tensor_names), (
+                    f"{architecture} does not contain the full {helper} conditional union"
+                )
+
+    def test_suffixless_loader_tensors_are_exact(self) -> None:
+        suffixless = {
+            (architecture, name)
+            for architecture in _FINAL_CENSUS_CLOSURE
+            for name in upstream_architectures()[architecture].tensor_names
+            if not name.endswith(
+                (".weight", ".bias", ".scale", ".input_scale", ".lora_a", ".lora_b")
+            )
+        }
+        assert suffixless == _FINAL_CENSUS_SUFFIXLESS_TENSORS
+
+    def test_step35_metadata_reads_are_exact(self) -> None:
+        upstream = upstream_architectures()["step35"]
+        assert set(upstream.required_metadata) == {
+            "attention.layer_norm_rms_epsilon",
+            "attention.sliding_window",
+            "attention.sliding_window_pattern",
+            "expert_feed_forward_length",
+        }
+        assert set(upstream.optional_metadata) == {
+            "expert_gating_func",
+            "expert_shared_feed_forward_length",
+            "expert_weights_norm",
+            "expert_weights_scale",
+            "nextn_predict_layers",
+            "rope.freq_base_swa",
+            "swiglu_clamp_exp",
+            "swiglu_clamp_shexp",
+        }
+
+    @pytest.mark.parametrize(
+        ("architecture", "optional_keys"),
+        [
+            ("granite", {"expert_shared_feed_forward_length"}),
+            ("granite_swa", {"expert_shared_feed_forward_length"}),
+            (
+                "graniteswitch",
+                {"adapters.router_gain", "expert_shared_feed_forward_length"},
+            ),
+            ("minicpm", {"embedding_scale", "logit_scale", "residual_scale"}),
+        ],
+    )
+    def test_defaulted_metadata_is_not_classified_as_required(
+        self, architecture: str, optional_keys: set[str]
+    ) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert optional_keys <= set(upstream.optional_metadata)
+        assert optional_keys.isdisjoint(upstream.required_metadata)
+
+    def test_array_metadata_reads_are_complete_and_classified(self) -> None:
+        expected = {
+            "dots3note": (
+                {"attention.indexer.types", "attention.sliding_window_pattern"},
+                set(),
+            ),
+            "granite": (set(), {"deepstack_mapping"}),
+            "granite_swa": (
+                {"attention.sliding_window_pattern"},
+                {"attention.rope_pattern", "deepstack_mapping"},
+            ),
+            "graniteswitch": (
+                {"adapters.token_ids_activate", "adapters.token_ids_substitute"},
+                set(),
+            ),
+        }
+        actual = {
+            architecture: set(upstream_architectures()[architecture].array_metadata)
+            for architecture in expected
+        }
+        assert actual == {
+            architecture: required | optional
+            for architecture, (required, optional) in expected.items()
+        }
+        for architecture, (required, optional) in expected.items():
+            upstream = upstream_architectures()[architecture]
+            assert required <= set(upstream.required_metadata)
+            assert required.isdisjoint(upstream.optional_metadata)
+            assert optional <= set(upstream.optional_metadata)
+            assert optional.isdisjoint(upstream.required_metadata)
+
+    def test_dead_gptj_id_is_explicitly_rejected(self) -> None:
+        upstream = upstream_architectures()["gptj"]
+        assert not upstream.cpp_loader
+        assert upstream.tensor_closure_status == "no-loader"
+        assert upstream.converter_inventory_status == "no-converter"
+        with pytest.raises(DisabledGGUFArchitectureError, match="no model loader"):
+            get_arch_spec("gptj")
+
+    @pytest.mark.parametrize("architecture", ["arwkv7", "rwkv6", "rwkv6qwen2", "rwkv7"])
+    def test_rwkv_variants_have_distinct_state_abi_reasons(self, architecture: str) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None and spec.reason is not None
+        assert "state" in spec.reason.lower()
+        assert "Mamba" in spec.reason
+        upstream = upstream_architectures()[architecture]
+        assert upstream.tensor_names
+        assert upstream.tensor_families
+        assert upstream.required_metadata
 
 
 class TestPinnedAudioCohort:
@@ -1236,12 +1493,12 @@ class TestRejectionsAreActionable:
     def test_a_dead_upstream_architecture_says_so(self) -> None:
         """``gptj`` is registered upstream but has no loader, so nothing can read it."""
         with pytest.raises(
-            UnsupportedGGUFArchitectureError, match=re.escape("no llama.cpp model loader")
+            DisabledGGUFArchitectureError, match=re.escape("llama.cpp has no model loader")
         ):
             get_arch_spec("gptj")
 
     def test_an_unimported_upstream_architecture_names_its_cohort(self) -> None:
-        with pytest.raises(UnsupportedGGUFArchitectureError, match="distinct RWKV"):
+        with pytest.raises(UnsupportedGGUFArchitectureError, match="RWKV6 carries"):
             get_arch_spec("rwkv6")
 
     def test_an_unknown_architecture_is_distinguished_from_an_upstream_one(self) -> None:
@@ -1288,9 +1545,9 @@ class TestDocumentedSupportMatrix:
                     if verdict is not Support.SUPPORTED
                 )
             )
-            quantized = spec.quantized_import.value if spec.is_importable else "unreachable"
+            reason = spec.reason or "Validated graph and runtime contract."
             rows.append(
-                f"| `{spec.gguf_arch}` | {aliases} | {model_type} | {status} | {quantized} |"
+                f"| `{spec.gguf_arch}` | {aliases} | {model_type} | {status} | {reason} |"
             )
         return rows
 

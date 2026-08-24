@@ -30,7 +30,6 @@ from mobius.integrations.gguf._upstream import (
     upstream_quant_types,
 )
 
-_UNCOVERED = sorted(set(upstream_architectures()) - {s.gguf_arch for s in iter_arch_specs()})
 _PINNED_VLM_TEXT_ARCHITECTURES = frozenset(
     {
         "chameleon",
@@ -84,25 +83,19 @@ class TestPinIntegrity:
 class TestCoverageIsHonest:
     """Being in the census must never imply being supported."""
 
-    def test_most_upstream_architectures_are_not_covered(self) -> None:
-        assert len(_UNCOVERED) == 147 - len({s.gguf_arch for s in iter_arch_specs()})
+    def test_every_upstream_architecture_has_one_explicit_verdict(self) -> None:
+        assert len(iter_arch_specs()) == len(upstream_architectures()) == 147
+        assert {spec.gguf_arch for spec in iter_arch_specs()} == set(upstream_architectures())
         assert len(supported_architectures()) < len(upstream_architectures())
 
-    @pytest.mark.parametrize("architecture", _UNCOVERED)
-    def test_an_uncovered_architecture_has_no_spec(self, architecture: str) -> None:
-        assert try_get_arch_spec(architecture) is None
-
-    @pytest.mark.parametrize("architecture", _UNCOVERED)
-    def test_an_uncovered_architecture_is_refused_with_a_reason(
-        self, architecture: str
-    ) -> None:
-        with pytest.raises(UnsupportedGGUFArchitectureError) as excinfo:
-            get_arch_spec(architecture)
-        message = str(excinfo.value)
-        assert architecture in message
-        # Either it names the upstream cohort and the alternative, or it says the
-        # architecture cannot be loaded by anything.
-        assert "mobius build" in message or "no llama.cpp model loader" in message
+    @pytest.mark.parametrize(
+        "architecture",
+        sorted(upstream_architectures()),
+    )
+    def test_every_pinned_architecture_resolves_to_a_spec(self, architecture: str) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None
+        assert spec.gguf_arch == architecture
 
     @pytest.mark.parametrize("spec", iter_arch_specs(), ids=lambda s: s.gguf_arch)
     def test_every_registered_architecture_resolves_one_way_or_the_other(self, spec) -> None:
@@ -116,3 +109,39 @@ class TestCoverageIsHonest:
             get_arch_spec(spec.gguf_arch)
         assert spec.reason is not None
         assert spec.reason.split(".")[0] in str(e.value)
+
+    @pytest.mark.parametrize(
+        "architecture",
+        ["bitnet", "deepseek2", "gemma4-assistant", "graniteswitch", "rwkv7"],
+    )
+    def test_deferred_verdict_precedes_mtp_and_qtype_policy(
+        self, architecture: str, monkeypatch
+    ) -> None:
+        from mobius.integrations.gguf import _builder, _mtp
+
+        class FakeGGUF:
+            tensor_names = ()
+
+            @staticmethod
+            def get_metadata(_key: str, default):
+                return default
+
+        model = FakeGGUF()
+        model.architecture = architecture
+        monkeypatch.setattr(
+            _mtp,
+            "validate_mtp_tensor_contract",
+            lambda _model: pytest.fail("MTP policy must not run for a deferred architecture"),
+        )
+        monkeypatch.setattr(
+            _builder,
+            "_raise_for_unsupported_auxiliary_quantization",
+            lambda _model: pytest.fail(
+                "qtype policy must not run for a deferred architecture"
+            ),
+        )
+        with pytest.raises(
+            (UnsupportedGGUFArchitectureError, DisabledGGUFArchitectureError),
+            match="before config extraction",
+        ):
+            _builder._validate_gguf_model(model, source="synthetic.gguf")

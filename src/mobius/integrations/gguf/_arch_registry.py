@@ -51,6 +51,7 @@ __all__ = [
 ]
 
 import functools
+from collections import Counter
 from collections.abc import Callable
 from types import MappingProxyType
 
@@ -260,11 +261,34 @@ _RECURRENT_RUNTIME_VALIDATION_PENDING = (
     "stateful ORT generation. Runtime packaging remains deferred until that evidence exists."
 )
 
-_NO_RWKV_GRAPH = (
-    "llama.cpp implements this as a distinct RWKV recurrent architecture. Mobius has no "
-    "matching RWKV model graph or state-cache contract, so mapping it to Mamba would build "
-    "the wrong recurrence. Build from a supported source/runtime instead."
-)
+_RWKV_GRAPH_REASONS = {
+    "rwkv6": (
+        "RWKV6 carries two F32 states per layer (two token-shift vectors and a per-head "
+        "WKV matrix) and applies token-dependent exp(-exp(decay)), a time_first "
+        "read-before-update term, per-head group norm, and cumulative rescale transforms. "
+        "Mobius has no RWKV state task; Mamba conv/SSM state and transformer KV cache are "
+        "not equivalent."
+    ),
+    "rwkv6qwen2": (
+        "RWKV6-Qwen2 is neither Qwen2 attention nor native RWKV6: it carries one F32 "
+        "token-shift vector plus a per-head matrix state and uses k*(1-w) gated linear "
+        "attention, optional biased/GQA projections, a sigmoid gate, and parallel Qwen "
+        "SwiGLU. Mobius has no task for that recurrent ABI; Mamba conv/SSM state and "
+        "transformer KV cache are not equivalent."
+    ),
+    "rwkv7": (
+        "RWKV7 requires a two-shift F32 state plus a per-head matrix state, generalized "
+        "delta-rule recurrence, six-way token mixing, first-layer value residuals shared "
+        "across depth, ICLR/key-adaptation vectors, and an r_k residual around LayerNorm "
+        "and group norm. Neither Mamba selective scan nor KV-cache plumbing represents it."
+    ),
+    "arwkv7": (
+        "ARWKV7 wraps RWKV7's delta-rule matrix recurrence in a distinct one-shift "
+        "RMSNorm/Qwen residual topology with optional five-versus-six-way interpolation, "
+        "optional gate/group norm, and Qwen SwiGLU. Treating it as RWKV7, Qwen, or Mamba "
+        "would accept the wrong tensor closure and state ABI."
+    ),
+}
 
 _BAILINGMOE3_GRAPH_REASON = (
     "BailingMoE3 alternates head-wise KDA recurrent layers with gated MLA layers, "
@@ -394,6 +418,267 @@ _ENCODER_GRAPH_MISMATCH = {
     "nomic-bert-moe": (
         "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
         "moe_every_n_layers. Mobius has no encoder MoE graph with that schedule."
+    ),
+}
+
+_FINAL_CENSUS_DEFERRED_REASONS = {
+    # Dense / legacy / embedding.
+    "bitnet": (
+        "BitNet requires post-attention and post-FFN sub-norms plus ternary projection "
+        "weights with optional scalar scale tensors. Generic Llama topology and qtype "
+        "handling do not represent that graph or quantization ABI."
+    ),
+    "codeshell": (
+        "CodeShell uses bias-bearing LayerNorm blocks, grouped fused/split QKV semantics, "
+        "a sequential GELU FFN, and an architecture-specific embedding/output tie "
+        "direction. GPT-NeoX similarity is not an exact tensor or graph contract."
+    ),
+    "command-r": (
+        "Command-R uses one weight-only norm feeding attention and SwiGLU in parallel, "
+        "conditional Q/K norms for large variants, tied output, and logit scaling. The "
+        "canonical command-r and cohere2 GGUF contracts are distinct and cannot alias."
+    ),
+    "gemma-embedding": (
+        "Gemma Embedding is a bidirectional stateless embedding graph with alternating "
+        "sliding-window attention, four norm sites, sqrt(hidden) embedding scaling, and "
+        "optional pooling/dense modules. Causal Gemma3 text/VLM tasks expose the wrong ABI."
+    ),
+    "gptneox": (
+        "GPT-NeoX GGUF requires fused biased QKV, bias-bearing LayerNorm/GELU blocks, "
+        "partial RoPE, and metadata-selected parallel versus sequential residual topology. "
+        "Mobius implements only the parallel MHA subset and cannot admit the full loader "
+        "union."
+    ),
+    "jais": (
+        "JAIS combines fused biased QKV, causal ALiBi, 1/head_dim attention scaling, "
+        "parallel SwiGLU, and converter-baked MuP embedding/output scales. Reusing Falcon "
+        "or Llama would lose required value transforms."
+    ),
+    "jais2": (
+        "JAIS2 is a distinct RoPE, bias-bearing LayerNorm decoder with split Q/K/V and a "
+        "non-gated ReLU-squared FFN. It is not the ALiBi/SwiGLU JAIS graph and has no exact "
+        "Mobius tensor recipe."
+    ),
+    "maincoder": (
+        "Maincoder applies Q/K RMSNorm after RoPE and uses an exact tied-output "
+        "QK-normalized SwiGLU closure. Existing generic QK-normalized graphs use different "
+        "ordering, so a family alias would change attention."
+    ),
+    "nanbeige": (
+        "Nanbeige reuses physical layer weights across a configurable logical loop count, "
+        "optionally normalizes between loops, and allocates a distinct KV slot for every "
+        "logical occurrence. A Llama alias would build the wrong layer count and cache ABI."
+    ),
+    "orion": (
+        "Orion uses bias-bearing LayerNorm at attention, FFN, and output sites despite its "
+        "source config naming rms_norm_eps. Mobius Llama uses RMSNorm; interpreting that "
+        "metadata generically would build the wrong normalization."
+    ),
+    "pangu-embedded": (
+        "Pangu Embedded is a causal LM, not an embedding task, and requires a mandatory "
+        "attention-output bias plus conditional LongRoPE factor tensors. Mobius has no "
+        "exact graph or suffix closure for this misleadingly named architecture."
+    ),
+    "plamo": (
+        "PLaMo uses one RMSNorm feeding attention and FFN in parallel, fixed grouped-query "
+        "geometry, and converter-specific Q/output projection shuffles. Sequential Llama "
+        "topology and direct external tensor reuse would both be incorrect."
+    ),
+    "plamo3": (
+        "PLaMo3 requires fused QKV and fused SwiGLU, four norm sites with architecture-"
+        "specific offset transforms, Q/K norm before RoPE, and alternating full/sliding "
+        "attention state. Mobius has no exact iSWA schedule or value transform."
+    ),
+    "plm": (
+        "PLM uses latent KV projections and normalization with shared RoPE keys, expanded "
+        "K/V state, tied output, and a non-gated ReLU-squared FFN. Generic MLA cache "
+        "dimensions do not supply the missing graph or tensor contract."
+    ),
+    "qwen": (
+        "Qwen-v1 requires NeoX-style RoPE, fused biased QKV, and a fused-width SwiGLU "
+        "conversion contract. Mobius's HF qwen family registration is not evidence that "
+        "the canonical GGUF qwen tensor layout is importable."
+    ),
+    "starcoder": (
+        "StarCoder requires learned absolute positions, fused biased QKV, causal "
+        "multi-query attention, bias-bearing LayerNorm/GELU blocks, and a one-head KV "
+        "cache. StarCoder2 uses RoPE and is a different canonical GGUF architecture."
+    ),
+    "xverse": (
+        "Xverse is Llama-shaped but requires converter-defined Q/K reverse permutations, "
+        "including a GQA-specific K transform, before quantized packing. No exact Mobius "
+        "metadata/tensor/value-transform recipe currently owns that contract."
+    ),
+    # Conventional attention / MoE.
+    "afmoe": (
+        "AFMoE combines sandwich norms, Q/K norms, sigmoid-gated attention, MuP embedding "
+        "scaling, a dense prefix, correction-biased routed/shared experts, and optional "
+        "interleaved sliding-window attention. Mobius has no graph or cache task owning "
+        "that complete topology or its expert sidecars."
+    ),
+    "bailingmoe": (
+        "BailingMoE requires an untied head, split-and-permuted Q/K/V conversion, and an "
+        "all-layer softmax routed MoE with mandatory shared experts. Mobius has no exact "
+        "expert-major tensor transform, preservation contract, or parity evidence."
+    ),
+    "deepseek": (
+        "The pinned DeepSeek loader switches from dense SwiGLU to softmax routed experts "
+        "with a mandatory parallel shared branch at leading_dense_block_count. Existing "
+        "DeepSeek-family registrations do not establish this GGUF tensor, routing, or "
+        "quantized expert contract."
+    ),
+    "dots1": (
+        "Dots1 adds Q/K norms, a dense prefix, metadata-selected expert gating, optional "
+        "correction bias, and routed plus shared experts. A fixed Qwen/DeepSeek MoE graph "
+        "would silently change its routing contract."
+    ),
+    "ernie4_5": (
+        "ERNIE 4.5 requires exact fused-QKV and fused-gate/up converter splits plus an "
+        "optional attention-output bias and ERNIE-specific position metadata. Similarity "
+        "to Qwen/Llama is not a suffix-exact tensor or graph contract."
+    ),
+    "ernie4_5-moe": (
+        "ERNIE 4.5 MoE selects periodic expert blocks after a dense prefix, permits an "
+        "optional gate-expert matrix, and uses normalized routing with optional shared "
+        "experts. Mobius has no matching per-layer schedule or converter transform."
+    ),
+    "granite": (
+        "The granite architecture is a conditional dense-or-MoE union with residual, "
+        "embedding, attention, and inverse-logit scales, optional biases/RoPE factors, "
+        "shared experts, and optional deep-stack inputs. It is not the GraniteMoE or "
+        "GraniteHybrid GGUF contract."
+    ),
+    "granite_swa": (
+        "Granite SWA requires attention sinks, a complete interleaved sliding-window "
+        "schedule, residual/logit scaling, fused routed gate-up experts, and optional "
+        "fused shared experts/deep-stack injection. Mobius owns neither that cache ABI "
+        "nor its fused expert sidecars."
+    ),
+    "graniteswitch": (
+        "GraniteSwitch repurposes an appended synthetic layer as a token-history-driven "
+        "adapter router and carries fourteen switched-LoRA tensors per block in addition "
+        "to decoder KV state. It is not MTP, and Mobius has no switched-LoRA graph, "
+        "MUL_MAT_ID quantization contract, or package ABI."
+    ),
+    "hunyuan-moe": (
+        "Hunyuan-MoE applies Q/K normalization after RoPE and runs normalized routed "
+        "experts with an always-parallel shared branch in every layer. Hunyuan dense/VL "
+        "registrations are different architectures and cannot be reused."
+    ),
+    "laguna": (
+        "Laguna combines per-head-or-element softplus attention gates, dual-RoPE "
+        "interleaved sliding-window attention, a dense prefix, and sigmoid "
+        "correction-biased routed/shared experts. Mobius has no exact graph or iSWA cache "
+        "contract."
+    ),
+    "llama-embed": (
+        "llama-embed is a canonical embedding architecture that inherits Llama's "
+        "conditional tensor loader but exposes the embedding graph rather than causal "
+        "logits. Mobius has no GGUF embedding task/package contract for this ID, so it "
+        "must not alias ordinary llama."
+    ),
+    "mellum": (
+        "Mellum requires an untied head, Q/K norms, routed experts in every layer, and a "
+        "metadata-defined full/sliding attention schedule with distinct RoPE behavior. "
+        "Mobius has no matching iSWA cache or expert preservation contract."
+    ),
+    "minicpm": (
+        "MiniCPM requires architecture-specific embedding, residual, and logit scales, "
+        "Q/K permutation, optional long/short RoPE tensors, and a conditional dense-or-MoE "
+        "loader. The existing MiniCPM graph does not prove this complete GGUF contract."
+    ),
+    "minimax-m2": (
+        "MiniMax-M2 uses full-vector Q/K norms, partial RoPE, and all-layer "
+        "correction-biased routed experts under metadata-selected gating. Mobius has no "
+        "exact graph or suffix-safe expert import for that topology."
+    ),
+    "minimax-m3": (
+        "MiniMax-M3 adds F32 sparse-indexer tensors and a second index-key cache with "
+        "position/cell maps, block masks, rollback, and reorder semantics alongside main "
+        "K/V state. Mobius has no MSA cache task or sparse-index operators; dense fallback "
+        "would change the model."
+    ),
+    "refact": (
+        "Refact uses hard-coded ALiBi without RoPE, packed-KV and gate/up converter "
+        "splits, optional projection/MLP biases, and a single KV head. Llama-like tensor "
+        "names are not evidence for a compatible graph."
+    ),
+    # Appended NextN/MTP and target-coupled assistants.
+    "bailingmoe2": (
+        "BailingMoE2 serializes complete dense-or-routed/shared expert trailing blocks "
+        "plus NextN and layer-output norms, but the pinned loader marks every trailing "
+        "tensor skipped and exposes no MTP graph. Mobius cannot invent executable head "
+        "semantics from preserved storage."
+    ),
+    "cohere2moe": (
+        "Cohere2MoE's executable head uses sigmoid routed fused-or-split experts, optional "
+        "shared experts, no FFN norm, and interleaved sliding-window KV state. Mobius's "
+        "single dense Qwen3.5 MTP head cannot represent that graph or cache ABI."
+    ),
+    "deepseek2": (
+        "DeepSeek2 MTP is a complete MLA plus routed/shared MoE block with compressed KV "
+        "cache, Q/KV LoRA alternatives, target-owned embedding/head fallbacks, and "
+        "architecture-specific gating. It is not Mobius's dense full-attention MTP head."
+    ),
+    "deepseek32": (
+        "DeepSeek3.2 extends the DeepSeek2 MLA/MoE head with DSA indexer projections, "
+        "normalization, bias, and sparse-cache metadata. A normal KV-cache NextN task "
+        "would omit required executed tensors and state."
+    ),
+    "dots3note": (
+        "Dots3Note preserves an MLA/DSA trunk and a dense sliding-MLA NextN block, but the "
+        "pinned loader explicitly has no MTP graph and skips the head. Mobius cannot infer "
+        "runtime semantics from its serialized tensors."
+    ),
+    "exaone-moe": (
+        "EXAONE-MoE serializes a dense trailing NextN block after an iSWA routed/shared "
+        "expert trunk, but the pinned loader skips appended blocks. Mobius has no exact "
+        "SWA schedule, remapped global-MTP transform, or executable head contract."
+    ),
+    "exaone4": (
+        "EXAONE4 serializes attention/FFN post-norm trailing blocks and NextN tensors with "
+        "optional synthetic Llama3 RoPE factors, but the pinned loader skips them. No "
+        "Mobius task owns those preserved-only semantics."
+    ),
+    "gemma4-assistant": (
+        "Gemma4 Assistant is a standalone target-coupled model with pre/post projections, "
+        "masked embeddings, scalar layer scales, its own KV cache, and a live target-model "
+        "context. It is neither Gemma4 text nor the target-config-only draft/MTP ABI."
+    ),
+    "glm-dsa": (
+        "GLM-DSA executes an MLA/MoE MTP head with optional shared indexers, DSA cache "
+        "reuse, and GLM-specific sigmoid routing. Mobius has no sparse-index state task "
+        "or suffix-exact ownership for that head."
+    ),
+    "glm4": (
+        "GLM4 serializes complete fused-FFN trailing blocks and NextN tensors, but the "
+        "pinned loader skips appended blocks; GLM-OCR converter transforms also permute "
+        "Q/K for M-RoPE. It must not alias Qwen or an executable Mobius MTP head."
+    ),
+    "glm4moe": (
+        "GLM4-MoE serializes biased attention and periodic dense/routed expert trailing "
+        "blocks with mandatory router bias, but the pinned loader skips them. Mobius has "
+        "no executable contract for the preserved head or its expert sidecars."
+    ),
+    "hy_v3": (
+        "Hunyuan-V3 executes a full-attention NextN head with Q/K norms and optional "
+        "sigmoid routed/shared experts, seeded from target hidden state. Its hyper/routing "
+        "semantics are not Mobius's dense Qwen3.5 sidecar."
+    ),
+    "mimo2": (
+        "MiMo2 requires fused-QKV dense MTP blocks, attention sinks, interleaved sliding "
+        "KV cache, and three chained heads selected by offsets. Mobius permits one head "
+        "and cannot preserve that state or FP8 converter transform."
+    ),
+    "mistral4": (
+        "Mistral4 has no NextN metadata or MTP graph; it inherits Mistral3's conditional "
+        "dense/MoE tensor loader and overrides graph construction. It is not llama, "
+        "mistral alias text, or any DeepSeek/Qwen MTP family."
+    ),
+    "step35": (
+        "Step3.5 executes one or more interleaved-SWA NextN heads with optional gates, "
+        "routed/shared experts, centered-norm transforms, per-layer head geometry, and "
+        "dedicated cache offsets. Mobius's one-head dense MTP ABI cannot represent it."
     ),
 }
 
@@ -1333,13 +1618,24 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_WAVTOKENIZER_DEC_REASON,
     ),
+    *(
+        GGUFArchitectureSpec(
+            gguf_arch=architecture,
+            config=Support.DEFERRED,
+            tensor_map=Support.DEFERRED,
+            graph=Support.DEFERRED,
+            runtime=Support.DEFERRED,
+            reason=reason,
+        )
+        for architecture, reason in _FINAL_CENSUS_DEFERRED_REASONS.items()
+    ),
     GGUFArchitectureSpec(
         gguf_arch="arwkv7",
         config=Support.DEFERRED,
         tensor_map=Support.DEFERRED,
         graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
-        reason=_NO_RWKV_GRAPH,
+        reason=_RWKV_GRAPH_REASONS["arwkv7"],
     ),
     GGUFArchitectureSpec(
         gguf_arch="rwkv6",
@@ -1347,7 +1643,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map=Support.DEFERRED,
         graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
-        reason=_NO_RWKV_GRAPH,
+        reason=_RWKV_GRAPH_REASONS["rwkv6"],
     ),
     GGUFArchitectureSpec(
         gguf_arch="rwkv6qwen2",
@@ -1355,7 +1651,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map=Support.DEFERRED,
         graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
-        reason=_NO_RWKV_GRAPH,
+        reason=_RWKV_GRAPH_REASONS["rwkv6qwen2"],
     ),
     GGUFArchitectureSpec(
         gguf_arch="rwkv7",
@@ -1363,7 +1659,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map=Support.DEFERRED,
         graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
-        reason=_NO_RWKV_GRAPH,
+        reason=_RWKV_GRAPH_REASONS["rwkv7"],
     ),
     GGUFArchitectureSpec(
         gguf_arch="nemotron_h_moe",
@@ -1383,6 +1679,18 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         quantized_import=Support.REJECTED,
         reason=_MMPROJ_REASON,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="gptj",
+        config=Support.REJECTED,
+        tensor_map=Support.REJECTED,
+        graph=Support.REJECTED,
+        runtime=Support.REJECTED,
+        reason=(
+            "The pinned census reserves gptj but llama.cpp has no model loader for it. "
+            "There is no bounded header-to-tensor contract to import, so conversion is "
+            "rejected before config extraction."
+        ),
+    ),
 )
 
 
@@ -1400,6 +1708,29 @@ def _index() -> MappingProxyType[str, GGUFArchitectureSpec]:
                 )
             index[name] = spec
     return MappingProxyType(index)
+
+
+def _validate_census_closure(
+    specs: tuple[GGUFArchitectureSpec, ...],
+    upstream_names: frozenset[str],
+) -> None:
+    """Reject registry/pin drift before architecture dispatch can run."""
+    counts = Counter(spec.gguf_arch for spec in specs)
+    duplicates = sorted(name for name, count in counts.items() if count != 1)
+    canonical = set(counts)
+    missing = sorted(upstream_names - canonical)
+    extra = sorted(canonical - upstream_names)
+    aliases = {alias: spec.gguf_arch for spec in specs for alias in spec.aliases}
+    alias_drift = sorted(set(aliases) & upstream_names)
+    if duplicates or missing or extra or alias_drift:
+        raise ValueError(
+            "GGUF architecture registry does not exactly close the pinned llama.cpp "
+            f"census: duplicates={duplicates}, missing={missing}, extra={extra}, "
+            f"aliases_that_became_canonical={alias_drift}"
+        )
+
+
+_validate_census_closure(_SPECS, frozenset(upstream_architectures()))
 
 
 def iter_arch_specs() -> tuple[GGUFArchitectureSpec, ...]:
