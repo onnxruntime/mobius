@@ -376,10 +376,14 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
 
 def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
     """Reject scale sidecars whose semantics the target quantization ABI cannot express."""
+    from mobius.integrations.gguf._mtp import map_gguf_mtp_to_hf_names
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
     architecture = gguf_model.architecture
     expert_count = gguf_model.get_metadata(f"{architecture}.expert_count")
+    block_count = int(gguf_model.get_metadata(f"{architecture}.block_count", 0))
+    mtp_count = int(gguf_model.get_metadata(f"{architecture}.nextn_predict_layers", 0))
+    mtp_block_indices = range(max(0, block_count - mtp_count), block_count)
     for gguf_name, _raw, _qtype, shape in gguf_model.tensor_items_raw():
         suffix = next(
             (
@@ -392,6 +396,15 @@ def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
         if suffix is None:
             continue
         hf_name = map_gguf_to_hf_names(gguf_name, architecture)
+        if hf_name is None:
+            hf_name = next(
+                (
+                    mapped
+                    for block_index in mtp_block_indices
+                    if (mapped := map_gguf_mtp_to_hf_names(gguf_name, block_index)) is not None
+                ),
+                None,
+            )
         if hf_name is None:
             continue
 

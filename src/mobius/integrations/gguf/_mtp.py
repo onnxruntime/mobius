@@ -88,7 +88,10 @@ def map_gguf_mtp_to_hf_names(gguf_name: str, mtp_block_index: int) -> str | None
     if int(match.group(1)) != mtp_block_index:
         return None
     stem_with_suffix = match.group(2)
-    for suffix in (".weight", ".bias"):
+    # The pinned generic llama.cpp loader also creates optional quantization
+    # sidecars for reachable MTP projections. Keep them visible to the common
+    # pre-build validator instead of silently treating them as unknown tensors.
+    for suffix in (".input_scale", ".weight", ".scale", ".bias"):
         if stem_with_suffix.endswith(suffix):
             stem, tail = stem_with_suffix[: -len(suffix)], suffix
             break
