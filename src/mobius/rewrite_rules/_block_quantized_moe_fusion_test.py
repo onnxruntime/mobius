@@ -100,6 +100,7 @@ def _build_dense_graph(
     bias_expert: int | None = None,
     corrupt_expert_gate_fmt: tuple[int, str] | None = None,
     break_expert: int | None = None,
+    alien_routing_expert: int | None = None,
 ) -> tuple[ir.Model, dict[str, np.ndarray]]:
     """Build a tiny GLM-style dense-fallback native-block MoE graph.
 
@@ -107,7 +108,8 @@ def _build_dense_graph(
     fusion reconstructs routing gate-agnostically. Knobs drive the fail-closed
     tests: ``bias_expert`` adds a bias to one expert, ``corrupt_expert_gate_fmt``
     gives one expert a different gate format, ``break_expert`` replaces one
-    expert's down projection with a non-native op.
+    expert's down projection with a non-native op, ``alien_routing_expert``
+    feeds one expert a distinct (non-shared) routing-weights tensor.
     """
     rng = _rng()
     weights: dict[str, np.ndarray] = {}
@@ -233,8 +235,18 @@ def _build_dense_graph(
         )
         cast.outputs[0].name = f"cast_{e}.out"
         nodes.append(cast)
+        this_rweights = rweights
+        if alien_routing_expert == e:
+            # A distinct routing-weights tensor for one expert means this is not
+            # a single shared-gate storm; that expert is dropped and the layer
+            # must fail closed rather than fuse a short bank.
+            alien = ir.node("Identity", inputs=[rweights], num_outputs=1, name=f"alien_rw_{e}")
+            alien.outputs[0].name = f"alien_rw_{e}.out"
+            alien.outputs[0].type = ir.TensorType(ir.DataType.FLOAT)
+            nodes.append(alien)
+            this_rweights = alien.outputs[0]
         wmul = ir.node(
-            "Mul", inputs=[rweights, cast.outputs[0]], num_outputs=1, name=f"wmul_{e}"
+            "Mul", inputs=[this_rweights, cast.outputs[0]], num_outputs=1, name=f"wmul_{e}"
         )
         wmul.outputs[0].name = f"wmul_{e}.out"
         nodes.append(wmul)
@@ -565,6 +577,32 @@ def test_incomplete_expert_group_fails_closed() -> None:
     fused = fuse_block_quantized_moe(model)
     assert fused == 0
     assert _count(graph, "BlockQuantizedMoE") == 0
+
+
+def test_dropped_trailing_expert_fails_closed() -> None:
+    """Dropping the *highest* expert id must fail closed, not fuse a short bank.
+
+    The survivors ``0..E-2`` still look contiguous, so a gap-only check would
+    silently fuse an expert bank narrower than the router actually selects over
+    (leaving ``ScatterElements`` to index out of bounds). The declared-id set
+    from the ``Equal`` masks is the authority, so this must stay a dense graph.
+    """
+    model, _ = _build_dense_graph(break_expert=E - 1)
+    graph = model.graph
+    fused = fuse_block_quantized_moe(model)
+    assert fused == 0
+    assert _count(graph, "BlockQuantizedMoE") == 0
+    assert _count(graph, "Equal") == E  # dense fallback fully preserved
+
+
+def test_alien_routing_weights_expert_fails_closed() -> None:
+    """An expert wired to a non-shared routing-weights tensor must fail closed."""
+    model, _ = _build_dense_graph(alien_routing_expert=E - 1)
+    graph = model.graph
+    fused = fuse_block_quantized_moe(model)
+    assert fused == 0
+    assert _count(graph, "BlockQuantizedMoE") == 0
+    assert _count(graph, "Equal") == E  # dense fallback fully preserved
 
 
 def test_no_moe_is_a_noop() -> None:

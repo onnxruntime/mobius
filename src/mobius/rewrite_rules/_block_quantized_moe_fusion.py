@@ -259,6 +259,11 @@ class _DenseMoELayer:
     def __init__(self, selected_experts: ir.Value) -> None:
         self.selected_experts = selected_experts
         self.routing_weights: ir.Value | None = None
+        # Every scalar-int ``Equal`` mask on ``selected_experts`` names one
+        # routable expert. We record the full declared id set up front so a
+        # silently dropped expert (untraceable MLP, mismatched routing tensor)
+        # fails closed instead of fusing a smaller-than-actual expert bank.
+        self.declared_ids: set[int] = set()
         self.experts: dict[int, _ExpertProjections] = {}
         self.contributions: list[ir.Value] = []
         self.routed_out: ir.Value | None = None
@@ -272,6 +277,7 @@ class _DenseMoELayer:
             expert_id = _scalar_int(equal.inputs[1])
             if expert_id is None:
                 continue
+            self.declared_ids.add(expert_id)
             cast = _single_consumer(equal.outputs[0], "CastLike", "Cast")
             if cast is None:
                 continue
@@ -345,8 +351,15 @@ class _DenseMoELayer:
     def is_candidate(self) -> bool:
         if self.routing_weights is None or self.routed_out is None:
             return False
-        ids = sorted(self.experts)
-        return ids == list(range(len(ids))) and len(ids) >= 1
+        if not self.experts:
+            return False
+        # Fail closed unless *every* declared expert was fully traced. Checking
+        # only for gap-freeness (``ids == range(len(ids))``) would miss a dropped
+        # highest-id expert, whose survivors ``0..E-2`` still look contiguous.
+        if set(self.experts) != self.declared_ids:
+            return False
+        ids = sorted(self.declared_ids)
+        return ids == list(range(len(ids)))
 
 
 def _projection_format(node: ir.Node, role: str) -> str:
