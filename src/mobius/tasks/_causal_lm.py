@@ -43,6 +43,9 @@ class CausalLMTask(ModelTask):
             - input_ids: [batch, sequence_len] INT64
             - attention_mask: [batch, total_seq_len] INT64
             - position_ids: [batch, sequence_len] INT64
+            - token_type_ids: [batch, sequence_len] INT64 — only for modules
+              that set ``requires_token_type_ids = True`` (PrefixLM models
+              such as HRM-Text); absent for every other model.
             - past_key_values.{i}.key: [batch, num_kv_heads, past_seq_len, head_dim]
             - past_key_values.{i}.value: [batch, num_kv_heads, past_seq_len, head_dim]
         Outputs:
@@ -141,6 +144,10 @@ class CausalLMTask(ModelTask):
         if self._paged_cache:
             return self._build_paged(module, config, graph, builder, op, input_ids, batch)
 
+        # Optional module-declared extra graph inputs, forwarded as forward()
+        # keywords only for the modules that ask for them.
+        extra_module_kwargs: dict[str, ir.Value] = {}
+
         # --- Cache setup (static vs dynamic) ---
         if static:
             attention_mask = None
@@ -172,6 +179,16 @@ class CausalLMTask(ModelTask):
             position_ids = builder.input(
                 "position_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
             )
+
+            # PrefixLM-style models declare that they consume a per-position
+            # ``token_type_ids`` tensor to build a bidirectional prefix block
+            # (HRM-Text).  This is opt-in per module — exactly like the
+            # ``kv_cache_layer_count`` / ``static_kv_cache_specs`` hooks below —
+            # so no other model gains an input or a forward keyword.
+            if getattr(module, "requires_token_type_ids", False):
+                extra_module_kwargs["token_type_ids"] = builder.input(
+                    "token_type_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+                )
 
             # MLA attention: K/V heads equal q heads (no GQA reduction in
             # latent space).  The ONNX Attention op is called with
@@ -216,6 +233,7 @@ class CausalLMTask(ModelTask):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                **extra_module_kwargs,
             )
         intermediate_hidden_states: list | None = None
         final_hidden_state: ir.Value | None = None

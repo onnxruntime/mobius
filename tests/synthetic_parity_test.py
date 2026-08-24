@@ -1311,6 +1311,12 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
             else {}
         ),
     }
+    # PrefixLM models (HRM-Text) take an extra ``token_type_ids`` input. The HF
+    # reference above runs without ``token_type_ids``, i.e. fully causal, so
+    # feed all zeros here — block id -1 makes the bidirectional overlay a no-op
+    # and the two sides compare the same masking contract.
+    if "token_type_ids" in {inp.name for inp in onnx_model.graph.inputs}:
+        feeds["token_type_ids"] = np.zeros_like(input_ids)
     # Add zero-valued past KV cache feeds with correct shapes:
     # batch=1, past_sequence_len=0, other dims from model spec
     for inp in onnx_model.graph.inputs:

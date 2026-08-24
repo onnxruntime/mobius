@@ -146,6 +146,28 @@ def test_explicit_embedding_scale_is_preserved():
     assert config.embedding_scale == pytest.approx(39.191835884530846)
 
 
+def test_raw_json_config_still_gets_rope():
+    """A raw config.json must not silently export a position-free graph.
+
+    ``HrmTextRotaryEmbedding`` is unconditional upstream, but the raw
+    ``config.json`` only carries the *default* ``rope_theta`` of 10000.0, which
+    the generic extractor ignores as a RoPE signal.
+    """
+    config = _mobius_config()
+    assert config.rope_type == "default"
+    assert config.rope_theta == pytest.approx(10_000.0)
+    module, _ = _build_package(config)
+    assert module.model.rotary_emb is not None
+
+
+def test_trusted_hf_config_rope_matches_raw_json():
+    hf_config = _hf_config()
+    trusted = HrmTextConfig.from_transformers(hf_config)
+    raw = _mobius_config()
+    assert trusted.rope_type == raw.rope_type == "default"
+    assert trusted.rope_theta == pytest.approx(raw.rope_theta)
+
+
 def test_config_rejects_non_positive_cycles():
     with pytest.raises(ValueError, match="positive H_cycles"):
         HrmTextConfig.from_transformers(_raw_json_config(L_cycles=0))
@@ -186,6 +208,53 @@ def test_graph_exposes_one_cache_slot_per_attention_invocation():
         assert f"present.{slot}.key" in output_names
         assert f"present.{slot}.value" in output_names
     assert f"past_key_values.{_TOTAL_SLOTS}.key" not in input_names
+
+
+def test_prefix_lm_graph_declares_token_type_ids():
+    config = _mobius_config()
+    assert config.prefix_lm is True
+    module, pkg = _build_package(config)
+    assert module.requires_token_type_ids is True
+    input_names = [value.name for value in pkg["model"].graph.inputs]
+    assert "token_type_ids" in input_names
+    # Declared next to the other per-position inputs, before the cache.
+    assert input_names[:4] == [
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "token_type_ids",
+    ]
+
+
+def test_causal_only_config_has_no_token_type_ids_input():
+    """``prefix_lm=False`` keeps the standard causal input set (and GQA path)."""
+    config = _mobius_config(prefix_lm=False)
+    module, pkg = _build_package(config)
+    assert module.requires_token_type_ids is False
+    assert "token_type_ids" not in {value.name for value in pkg["model"].graph.inputs}
+
+
+def test_prefix_lm_forward_requires_token_type_ids():
+    """A direct forward() call must not silently fall back to causal masking."""
+    config = _mobius_config()
+    module = HrmTextCausalLMModel(config)
+    with pytest.raises(ValueError, match="token_type_ids"):
+        get_task("text-generation").build(_StripTokenTypeIds(module), config)
+
+
+class _StripTokenTypeIds:
+    """Wrap a module so the task's ``token_type_ids`` never reaches forward()."""
+
+    def __init__(self, module):
+        self._module = module
+        self.requires_token_type_ids = False
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+    def __call__(self, op, **kwargs):
+        kwargs.pop("token_type_ids", None)
+        return self._module(op, **kwargs)
 
 
 def test_stack_weights_are_shared_across_recurrence_steps():
@@ -299,11 +368,19 @@ def test_preprocess_weights_rejects_wrong_fused_width():
 
 
 def test_recurrence_matches_huggingface_prefill_and_decode():
-    """Prefill *and* a cached decode step must match upstream.
+    """PrefixLM prefill, causal fallback, and cached decode must match upstream.
 
-    The decode step is the part that pins the KV-cache slot layout: an
-    off-by-one stack ordering still passes a cacheless prefill comparison but
-    reads the wrong slots on the second step.
+    Three things are pinned here:
+
+    * **PrefixLM prefill** — ``token_type_ids == 1`` over the whole prompt must
+      reproduce upstream's ``block_sequence_ids = where(tt == 1, 0, -1)``
+      bidirectional overlay.
+    * **Causal fallback** — all-zero ``token_type_ids`` through the *same*
+      graph must reproduce upstream's ``token_type_ids=None`` path, and the gap
+      between the two modes must be the same size on both sides. Without that
+      second half a graph that ignored the overlay entirely would still pass.
+    * **Cached decode** — the KV-cache slot layout, plus the fact that a
+      generated token leaves the prefix block and attends causally.
     """
     transformers = pytest.importorskip("transformers")
     torch.manual_seed(11)
@@ -316,45 +393,72 @@ def test_recurrence_matches_huggingface_prefill_and_decode():
     apply_weights(pkg["model"], module.preprocess_weights(dict(hf_model.state_dict())))
 
     rng = np.random.default_rng(11)
-    input_ids = rng.integers(1, _VOCAB, size=(1, 5)).astype(np.int64)
+    input_ids = rng.integers(1, _VOCAB, size=(1, 6)).astype(np.int64)
     attention_mask = np.ones_like(input_ids)
     position_ids = np.arange(input_ids.shape[1], dtype=np.int64)[np.newaxis, :]
 
     session = OnnxModelSession(pkg["model"])
     try:
-        feeds: dict[str, np.ndarray] = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        }
-        empty = np.zeros((1, _HEADS, 0, _HEAD_DIM), dtype=np.float32)
-        for slot in range(_TOTAL_SLOTS):
-            feeds[f"past_key_values.{slot}.key"] = empty
-            feeds[f"past_key_values.{slot}.value"] = empty
-        prefill = session.run(feeds)
+
+        def _prefill(token_type_ids: np.ndarray) -> dict[str, np.ndarray]:
+            feeds: dict[str, np.ndarray] = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "token_type_ids": token_type_ids,
+            }
+            empty = np.zeros((1, _HEADS, 0, _HEAD_DIM), dtype=np.float32)
+            for slot in range(_TOTAL_SLOTS):
+                feeds[f"past_key_values.{slot}.key"] = empty
+                feeds[f"past_key_values.{slot}.value"] = empty
+            return session.run(feeds)
+
+        onnx_prefix = _prefill(np.ones_like(input_ids))
+        onnx_causal = _prefill(np.zeros_like(input_ids))
 
         with torch.no_grad():
-            hf_prefill = hf_model(
+            hf_prefix = hf_model(
                 input_ids=torch.from_numpy(input_ids),
                 attention_mask=torch.from_numpy(attention_mask),
                 position_ids=torch.from_numpy(position_ids),
+                token_type_ids=torch.ones_like(torch.from_numpy(input_ids)),
                 use_cache=True,
             )
+            hf_causal_logits = hf_model(
+                input_ids=torch.from_numpy(input_ids),
+                attention_mask=torch.from_numpy(attention_mask),
+                position_ids=torch.from_numpy(position_ids),
+                use_cache=False,
+            ).logits.numpy()
+        hf_prefix_logits = hf_prefix.logits.numpy()
+
         np.testing.assert_allclose(
-            prefill["logits"], hf_prefill.logits.numpy(), rtol=1e-3, atol=1e-3
+            onnx_prefix["logits"], hf_prefix_logits, rtol=1e-3, atol=1e-3
+        )
+        np.testing.assert_allclose(
+            onnx_causal["logits"], hf_causal_logits, rtol=1e-3, atol=1e-3
         )
 
-        next_id = np.array([[int(hf_prefill.logits[0, -1].argmax())]], dtype=np.int64)
+        hf_delta = float(np.abs(hf_prefix_logits - hf_causal_logits).max())
+        onnx_delta = float(np.abs(onnx_prefix["logits"] - onnx_causal["logits"]).max())
+        assert hf_delta > 1e-4, f"HF PrefixLM overlay had no effect ({hf_delta})"
+        assert onnx_delta == pytest.approx(hf_delta, rel=1e-2, abs=1e-5)
+
+        # Cached decode: the generated token is NOT part of the prefix block.
+        next_id = np.array([[int(hf_prefix_logits[0, -1].argmax())]], dtype=np.int64)
         decode_mask = np.ones((1, input_ids.shape[1] + 1), dtype=np.int64)
         decode_pos = np.array([[input_ids.shape[1]]], dtype=np.int64)
         decode_feeds: dict[str, np.ndarray] = {
             "input_ids": next_id,
             "attention_mask": decode_mask,
             "position_ids": decode_pos,
+            "token_type_ids": np.zeros_like(next_id),
         }
         for slot in range(_TOTAL_SLOTS):
-            decode_feeds[f"past_key_values.{slot}.key"] = prefill[f"present.{slot}.key"]
-            decode_feeds[f"past_key_values.{slot}.value"] = prefill[f"present.{slot}.value"]
+            decode_feeds[f"past_key_values.{slot}.key"] = onnx_prefix[f"present.{slot}.key"]
+            decode_feeds[f"past_key_values.{slot}.value"] = onnx_prefix[
+                f"present.{slot}.value"
+            ]
         decode = session.run(decode_feeds)
 
         with torch.no_grad():
@@ -362,7 +466,7 @@ def test_recurrence_matches_huggingface_prefill_and_decode():
                 input_ids=torch.from_numpy(next_id),
                 attention_mask=torch.from_numpy(decode_mask),
                 position_ids=torch.from_numpy(decode_pos),
-                past_key_values=hf_prefill.past_key_values,
+                past_key_values=hf_prefix.past_key_values,
                 use_cache=True,
             )
         np.testing.assert_allclose(

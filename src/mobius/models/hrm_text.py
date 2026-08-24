@@ -53,9 +53,10 @@ from mobius.components import (
     Embedding,
     Linear,
     ScaleFreeRMSNorm,
+    create_attention_bias,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.base import CausalLMModel, TextModel, _retain_last_sequence_token
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -88,6 +89,12 @@ class HrmTextAttention(Attention):
             self.num_attention_heads * self.head_dim,
             bias=config.attn_qkv_bias,
         )
+        # Under PrefixLM the model feeds a float additive bias that already
+        # bakes in causal + padding + the bidirectional prefix overlay, so the
+        # Attention op must not re-apply its own causal mask (that would cancel
+        # the future-position unmasking). Mirrors Gemma4's vision-block overlay.
+        if getattr(config, "prefix_lm", False):
+            self._is_causal = 0
 
     def _post_attention(
         self,
@@ -193,6 +200,7 @@ class HrmTextModel(TextModel):
         self._l_cycles = int(config.L_cycles)
         self._layers_per_stack = _resolve_layers_per_stack(config)
         self._embedding_scale = float(config.embedding_scale)
+        self._prefix_lm = bool(getattr(config, "prefix_lm", False))
 
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
@@ -204,6 +212,78 @@ class HrmTextModel(TextModel):
         # broadcast against (B, S, hidden) — equivalent to HF's ``expand_as``.
         self.z_L_init = nn.Parameter([config.hidden_size], dtype=config.dtype)
 
+    def _build_prefix_lm_context(
+        self,
+        op: OpBuilder,
+        *,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        token_type_ids: ir.Value | None,
+    ) -> tuple[ir.Value, tuple]:
+        """Build the PrefixLM float attention bias and the RoPE embeddings.
+
+        Reproduces upstream ``HrmTextModel.forward``, which converts
+        ``token_type_ids`` into ``block_sequence_ids = where(tt == 1, 0, -1)``
+        and hands it to ``create_causal_mask``.  HuggingFace's
+        ``blockwise_overlay`` unmasks a ``(q, kv)`` pair when
+        ``(q_group == kv_group) & (q_group >= 0)``, OR-ed onto the causal mask;
+        :func:`~mobius.components.create_attention_bias` implements exactly
+        that, so prompt tokens (``token_type_ids == 1``, block ``0``) attend to
+        each other bidirectionally while everything else stays causal.
+
+        Upstream gates the overlay on ``is_first_iteration``.  The exported
+        graph reproduces that behaviour *by data* rather than by branching:
+        a generated token is fed with ``token_type_ids == 0`` -> block ``-1``,
+        and the ``q_group >= 0`` guard makes the overlay a pure no-op for it,
+        leaving plain causal attention on every decode step.  Passing all-zero
+        ``token_type_ids`` therefore reproduces HuggingFace's
+        ``token_type_ids=None`` (fully causal) path exactly, so one graph
+        serves both contracts.
+
+        The bias bakes in causal + padding + prefix-block masking, so
+        :class:`HrmTextAttention` runs with ``is_causal=0``; that also rules out
+        ``GroupQueryAttention``, whose mask model is causal/local-window only.
+        """
+        if token_type_ids is None:
+            raise ValueError(
+                "HRM-Text was built with config.prefix_lm=True, which requires a "
+                "token_type_ids input. The task supplies it via the module's "
+                "requires_token_type_ids hook; a caller invoking forward() "
+                "directly must pass token_type_ids explicitly."
+            )
+        if attention_mask is None:
+            # Static cache passes attention_mask=None and relies on
+            # is_causal=1 + nonpad_kv_seqlen, which cannot express the
+            # bidirectional prefix block.
+            raise NotImplementedError(
+                "HRM-Text PrefixLM masking is not supported with the static KV "
+                "cache: the bidirectional prefix overlay needs the dynamic "
+                "attention_mask to build its float additive bias. Build with "
+                "the default dynamic cache, or set config.prefix_lm=False for a "
+                "fully causal export."
+            )
+
+        position_embeddings = self.rotary_emb(op, position_ids)
+
+        # block_sequence_ids: (B, S_q) int64 — 0 for prefix tokens, -1 otherwise.
+        prefix_marker = op.Constant(value_ints=[1])
+        block_id = op.Constant(value_ints=[0])
+        non_block_id = op.Constant(value_ints=[-1])
+        block_sequence_ids = op.Where(
+            op.Equal(token_type_ids, prefix_marker), block_id, non_block_id
+        )
+
+        # (B, 1, S_q, past + S_q) additive float bias.
+        attention_bias = create_attention_bias(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            dtype=self._dtype,
+            block_sequence_ids=block_sequence_ids,
+        )
+        return attention_bias, position_embeddings
+
     def forward(
         self,
         op: OpBuilder,
@@ -212,6 +292,7 @@ class HrmTextModel(TextModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
         inputs_embeds: ir.Value | None = None,
+        token_type_ids: ir.Value | None = None,
     ):
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
@@ -221,14 +302,23 @@ class HrmTextModel(TextModel):
         # z_H — slow / high-level state: (B, S, hidden)
         z_high = op.Mul(hidden_states, self._embedding_scale)
 
-        attention_bias, position_embeddings = self._build_attention_context(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            hidden_states=z_high,
-            past_key_values=past_key_values,
-        )
+        if self._prefix_lm:
+            attention_bias, position_embeddings = self._build_prefix_lm_context(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                token_type_ids=token_type_ids,
+            )
+        else:
+            attention_bias, position_embeddings = self._build_attention_context(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                hidden_states=z_high,
+                past_key_values=past_key_values,
+            )
 
         num_invocations = self._h_cycles * (self._l_cycles + 1)
         expected_slots = num_invocations * self._layers_per_stack
@@ -285,11 +375,18 @@ class HrmTextCausalLMModel(CausalLMModel):
     sigmoid-gated attention output, and scaled token embeddings.
 
     Inputs: ``input_ids``, ``attention_mask``, ``position_ids``,
-    ``past_key_values``.  Outputs: ``logits`` and one present KV pair per
-    unique attention invocation of the recurrence.
+    ``past_key_values``, plus ``token_type_ids`` when ``config.prefix_lm`` is
+    set (the pre-training PrefixLM mask: ``1`` marks a prompt position that
+    attends bidirectionally within the prefix block, anything else stays
+    causal).  Outputs: ``logits`` and one present KV pair per unique attention
+    invocation of the recurrence.
     """
 
     config_class: type = HrmTextConfig
+    # Class-level default so test/golden harnesses can tell, without building
+    # the model, that this architecture's graph carries a ``token_type_ids``
+    # input. ``__init__`` narrows it per instance from ``config.prefix_lm``.
+    requires_token_type_ids: bool = True
 
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
@@ -298,6 +395,32 @@ class HrmTextCausalLMModel(CausalLMModel):
         self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        # Task hook: ask CausalLMTask for the extra ``token_type_ids`` graph
+        # input. Only meaningful under PrefixLM; a purely causal HRM-Text
+        # export keeps the standard input set.
+        self.requires_token_type_ids = bool(getattr(config, "prefix_lm", False))
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+        token_type_ids: ir.Value | None = None,
+    ):
+        hidden_states, present_key_values = self.model(
+            op,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            token_type_ids=token_type_ids,
+        )
+        # Honour prefill-prefix pruning exactly like CausalLMModel.forward.
+        hidden_states = _retain_last_sequence_token(op, hidden_states)
+        logits = self.lm_head(op, hidden_states)
+        return logits, present_key_values
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

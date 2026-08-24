@@ -15,6 +15,11 @@ import torch
 
 from mobius._configs import ArchitectureConfig
 from mobius._testing.ort_inference import OnnxModelSession
+from mobius._testing.prefix_lm import (
+    TOKEN_TYPE_IDS,
+    generated_token_type_ids,
+    prompt_token_type_ids,
+)
 
 
 class OnnxGenerator:
@@ -109,6 +114,12 @@ class OnnxGenerator:
 
         all_ids = input_ids.copy()
 
+        # PrefixLM models (HRM-Text) take an extra ``token_type_ids`` input:
+        # the whole prompt is one bidirectional prefix block (1), every
+        # generated token is causal (0). Mirrors the model card's documented
+        # ``token_type_ids = ones_like(input_ids)`` prefill call.
+        uses_token_type_ids = TOKEN_TYPE_IDS in set(self.session.input_names)
+
         # First step: process the full prompt
         cur_input_ids = input_ids
         past_seq_len = 0
@@ -128,6 +139,12 @@ class OnnxGenerator:
                 "position_ids": position_ids,
                 **past_kv,
             }
+            if uses_token_type_ids:
+                feeds[TOKEN_TYPE_IDS] = (
+                    prompt_token_type_ids(cur_input_ids)
+                    if past_seq_len == 0
+                    else generated_token_type_ids(cur_input_ids)
+                )
 
             outputs = self.session.run(feeds)
 

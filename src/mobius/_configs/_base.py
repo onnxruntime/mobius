@@ -2938,6 +2938,19 @@ class HrmTextConfig(CausalLMConfig):
     def from_transformers(cls, config, parent_config=None) -> HrmTextConfig:
         base = ArchitectureConfig.from_transformers(config, parent_config)
         fields = _shallow_fields(base)
+        # ``HrmTextRotaryEmbedding`` is unconditional upstream, so this family
+        # always uses RoPE. A raw ``config.json`` only carries the default
+        # ``rope_theta`` of 10000.0, which the generic extractor deliberately
+        # ignores as a RoPE signal (NoPE models inherit it as dead config
+        # data), leaving ``rope_type=None`` and silently exporting a
+        # position-free graph. Pin the default RoPE explicitly instead.
+        if fields.get("rope_type") is None:
+            fields["rope_type"] = "default"
+            if fields.get("rope_theta") is None:
+                fields["rope_theta"] = 10_000.0
+            if fields.get("partial_rotary_factor") is None:
+                # Upstream rotates the full head_dim.
+                fields["partial_rotary_factor"] = 1.0
         return cls(
             **fields,
             H_cycles=_as_int_or_default(getattr(config, "H_cycles", None), 2),

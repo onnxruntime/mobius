@@ -274,6 +274,13 @@ class Attention(nn.Module):
         self._rope_interleave = config.rope_interleave
         # Gemma2-style logit soft-capping; 0.0 means disabled.
         self._softcap = getattr(config, "attn_logit_softcapping", 0.0) or 0.0
+        # Whether the Attention op applies its own causal mask. Subclasses that
+        # feed a float additive bias already encoding causality *and* some
+        # bidirectional unmasking (e.g. a PrefixLM / vision-block overlay) set
+        # this to 0 so the built-in mask does not cancel that unmasking. It is a
+        # static per-graph property, so it lives on the module rather than being
+        # threaded through every forward signature.
+        self._is_causal = 1
 
         self._init_qkv_projections(config, linear_class)
         self.o_proj = linear_class(
@@ -400,6 +407,7 @@ class Attention(nn.Module):
             scale=self.scaling,
             softcap=self._softcap,
             static_cache=static_cache,
+            is_causal=self._is_causal,
         )
 
         attn_output = self._post_attention(op, attn_output, hidden_states)

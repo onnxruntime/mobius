@@ -6,13 +6,14 @@ dtype: "float32"
 
 inputs:
   prompts:
-    - "Here is my poem:"
+    - "<|im_start|><|quad_end|><|object_ref_end|>Explain why the sky is blue.<|im_end|>"
 
 level: "L4+L5"
 
 generation:
   max_new_tokens: 24
   do_sample: false
+  exact_match: true
 
 notes: >-
   HRM-Text 1B hierarchical recurrent decoder. Two independently-weighted
@@ -20,4 +21,8 @@ notes: >-
   = 8 times per forward, so the graph carries 128 KV-cache slots for 16
   per-stack blocks. Parameterless RMSNorm, sigmoid-gated attention output, and
   token embeddings scaled by 1 / initializer_range. Base model with no chat
-  template, so the prompt is fed through the plain tokenizer.
+  template, so the model card's documented prompt (including its literal
+  control tokens) is fed through the plain tokenizer. Both the reference and
+  the exported graph run the PrefixLM contract from the model card -- the whole
+  prompt is one bidirectional block (token_type_ids = 1), generated tokens are
+  causal (0); see mobius._testing.prefix_lm.
