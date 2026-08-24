@@ -26,7 +26,13 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import ACT2FN
-from mobius.components._common import Embedding, LayerNorm, Linear
+from mobius.components._common import (
+    Embedding,
+    LayerNorm,
+    LayerNormNoBias,
+    Linear,
+    create_padding_mask,
+)
 from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
     initialize_rope,
@@ -133,10 +139,10 @@ class _ModernBertLayer(nn.Module):
         # Layer 0 has no attn_norm (Identity in HF)
         self._skip_attn_norm = layer_id == 0
         if not self._skip_attn_norm:
-            self.attn_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.attn_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
 
         self.attn = _ModernBertAttention(config)
-        self.mlp_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = _ModernBertMLP(config)
 
     def forward(
@@ -184,11 +190,11 @@ class ModernBertModel(nn.Module):
             config.hidden_size,
             config.pad_token_id,
         )
-        self.embeddings_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embeddings_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [_ModernBertLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.final_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
 
     def forward(
@@ -212,8 +218,9 @@ class ModernBertModel(nn.Module):
         position_ids = op.Unsqueeze(position_ids, [0])
         position_embeddings = self.rotary_emb(op, position_ids)
 
+        padding_mask = create_padding_mask(op, input_ids, attention_mask)
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states, attention_mask, position_embeddings)
+            hidden_states = layer(op, hidden_states, padding_mask, position_embeddings)
 
         hidden_states = self.final_norm(op, hidden_states)
         return hidden_states

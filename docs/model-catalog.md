@@ -273,6 +273,11 @@ source qtypes can require dequantization/requantization, so this does not imply
 byte preservation for every tensor. Use `--dequantize` for an explicitly float
 model.
 
+Encoder GGUF imports for `bert` and `modern-bert` select
+`feature-extraction` and expose token-level `last_hidden_state` only. Pooling,
+classifier/reranker heads, generative task overrides, and cache options are
+rejected unless their exact output contracts are implemented.
+
 ## Summary
 
 | Category | Count | Primary Classes |

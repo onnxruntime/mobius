@@ -323,6 +323,112 @@ def _write_quantized_gguf(
     writer.close()
 
 
+def _write_encoder_gguf(
+    path: Path,
+    architecture: str,
+    *,
+    quantized: bool = False,
+    pooling_type: int = 0,
+    include_head: bool = False,
+    omit: str | None = None,
+    malformed: str | None = None,
+    auxiliary_suffix: str | None = None,
+) -> None:
+    """Write a one-layer BERT or ModernBERT backbone with pinned tensor names."""
+    from gguf import GGMLQuantizationType, GGUFWriter, PoolingType
+
+    hidden = 64
+    intermediate = 64
+    vocab = 64
+    context = 32
+    writer = GGUFWriter(str(path), architecture)
+    writer.add_context_length(context)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(1)
+    writer.add_head_count(4)
+    writer.add_head_count_kv(4)
+    writer.add_vocab_size(vocab)
+    writer.add_causal_attention(False)
+    writer.add_pooling_type(PoolingType(pooling_type))
+    writer.add_tokenizer_model("bert")
+    writer.add_token_list([f"token-{index}" for index in range(vocab)])
+
+    if architecture == "bert":
+        writer.add_layer_norm_eps(1e-5)
+        writer.add_token_type_count(2)
+    else:
+        writer.add_layer_norm_eps(1e-5)
+        writer.add_rope_dimension_count(hidden // 4)
+        writer.add_rope_freq_base(10000.0)
+        writer.add_string(f"{architecture}.hidden_activation", "gelu")
+
+    rng = np.random.default_rng(0)
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        if name == malformed:
+            shape = (*shape, 1)
+        writer.add_tensor(name, rng.normal(0, 0.02, shape).astype(np.float32))
+
+    def add_q4(name: str, n_out: int, k_in: int) -> None:
+        if name == omit:
+            return
+        if name == malformed:
+            n_out += 1
+        raw = np.zeros((n_out, (k_in // 32) * 18), dtype=np.uint8)
+        for block in range(k_in // 32):
+            offset = block * 18
+            raw[:, offset] = 0
+            raw[:, offset + 1] = 60  # fp16 scale of one
+            raw[:, offset + 2 : offset + 18] = rng.integers(
+                0, 256, (n_out, 16), dtype=np.uint8
+            )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    def add_matrix(name: str, shape: tuple[int, int]) -> None:
+        if quantized:
+            add_q4(name, *shape)
+        else:
+            add_float(name, shape)
+
+    add_float("token_embd.weight", (vocab, hidden))
+    if architecture == "bert":
+        add_float("token_types.weight", (2, hidden))
+        add_float("position_embd.weight", (context, hidden))
+        add_float("token_embd_norm.weight", (hidden,))
+        add_float("token_embd_norm.bias", (hidden,))
+        for projection in ("attn_q", "attn_k", "attn_v", "attn_output"):
+            add_matrix(f"blk.0.{projection}.weight", (hidden, hidden))
+            add_float(f"blk.0.{projection}.bias", (hidden,))
+        for norm in ("attn_output_norm", "layer_output_norm"):
+            add_float(f"blk.0.{norm}.weight", (hidden,))
+            add_float(f"blk.0.{norm}.bias", (hidden,))
+        add_matrix("blk.0.ffn_up.weight", (intermediate, hidden))
+        add_float("blk.0.ffn_up.bias", (intermediate,))
+        add_matrix("blk.0.ffn_down.weight", (hidden, intermediate))
+        add_float("blk.0.ffn_down.bias", (hidden,))
+    else:
+        add_float("token_embd_norm.weight", (hidden,))
+        add_float("output_norm.weight", (hidden,))
+        add_matrix("blk.0.attn_qkv.weight", (3 * hidden, hidden))
+        add_matrix("blk.0.attn_output.weight", (hidden, hidden))
+        add_matrix("blk.0.ffn_up.weight", (2 * intermediate, hidden))
+        add_matrix("blk.0.ffn_down.weight", (hidden, intermediate))
+        add_float("blk.0.ffn_norm.weight", (hidden,))
+
+    if include_head:
+        add_float("cls.weight", (hidden, hidden))
+    if auxiliary_suffix is not None:
+        add_float(f"blk.0.attn_output.{auxiliary_suffix}", (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
+    writer.close()
+
+
 def _write_recurrent_gguf(
     path: Path,
     architecture: str,
@@ -2144,6 +2250,137 @@ class TestBuildQuantizedGguf:
                 {router_key: torch.empty(2, 4)},
                 config=config,
             )
+
+
+class TestEncoderGGUFBuild:
+    """Encoder GGUFs dispatch to feature extraction and preserve token outputs."""
+
+    @staticmethod
+    def _run(model, sequence_length: int, masked: bool = False) -> np.ndarray:
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        mask = np.ones((1, sequence_length), dtype=np.int64)
+        if masked:
+            mask[0, -1] = 0
+        feeds = {
+            "input_ids": np.arange(sequence_length, dtype=np.int64)[None, :],
+            "attention_mask": mask,
+            "token_type_ids": np.zeros((1, sequence_length), dtype=np.int64),
+        }
+        session = OnnxModelSession(model)
+        try:
+            outputs = session.run(feeds)
+        finally:
+            session.close()
+        assert set(outputs) == {"last_hidden_state"}
+        return outputs["last_hidden_state"]
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    def test_float_build_save_load_and_variable_masks(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-f32.gguf"
+        _write_encoder_gguf(path, architecture)
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert {value.name for value in model.graph.outputs} == {"last_hidden_state"}
+        assert not any(
+            marker in value.name
+            for value in (*model.graph.inputs, *model.graph.outputs)
+            for marker in ("past_key_values", "present", "logits")
+        )
+
+        saved = tmp_path / f"{architecture}-saved"
+        package.save(saved, progress_bar=False)
+        reloaded = ModelPackage.load(saved)
+        for sequence_length in (1, 3, 7):
+            output = self._run(reloaded["model"], sequence_length, masked=sequence_length > 1)
+            assert output.shape == (1, sequence_length, 64)
+            assert np.isfinite(output).all()
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    def test_quantized_source_dequantizes_without_output_corruption(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-q4.gguf"
+        _write_encoder_gguf(path, architecture, quantized=True)
+        preserved = build_from_gguf(path, keep_quantized=True)["model"]
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+
+        assert "MatMulNBits" not in {node.op_type for node in preserved.graph}
+        actual = self._run(preserved, 5, masked=True)
+        expected = self._run(explicit_float, 5, masked=True)
+        np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    def test_pooling_classifier_and_task_overrides_are_rejected(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        pooled = tmp_path / f"{architecture}-pooled.gguf"
+        _write_encoder_gguf(pooled, architecture, pooling_type=1)
+        with pytest.raises(ValueError, match="pooling_type"):
+            build_from_gguf(pooled)
+
+        headed = tmp_path / f"{architecture}-head.gguf"
+        _write_encoder_gguf(headed, architecture, include_head=True)
+        with pytest.raises(ValueError, match="silently discard encoder heads"):
+            build_from_gguf(headed)
+
+        plain = tmp_path / f"{architecture}-task.gguf"
+        _write_encoder_gguf(plain, architecture)
+        with pytest.raises(ValueError, match="feature-extraction"):
+            build_from_gguf(plain, task="text-generation")
+        with pytest.raises(ValueError, match="encoder-only"):
+            build_from_gguf(plain, static_cache=True)
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    @pytest.mark.parametrize("failure", ["missing", "rank"])
+    def test_missing_and_malformed_tensors_fail_before_graph_build(
+        self, tmp_path: Path, architecture: str, failure: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        target = "blk.0.attn_q.weight" if architecture == "bert" else "blk.0.attn_qkv.weight"
+        path = tmp_path / f"{architecture}-{failure}.gguf"
+        _write_encoder_gguf(
+            path,
+            architecture,
+            omit=target if failure == "missing" else None,
+            malformed=target if failure == "rank" else None,
+        )
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"missing required|invalid encoder tensor shape"):
+            build_from_gguf(path)
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    @pytest.mark.parametrize("suffix", ["scale", "input_scale"])
+    def test_auxiliary_quantization_sidecars_are_never_dropped(
+        self, tmp_path: Path, architecture: str, suffix: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-{suffix}.gguf"
+        _write_encoder_gguf(path, architecture, auxiliary_suffix=suffix)
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+        )
+        with pytest.raises(ValueError, match=r"scale/input_scale"):
+            build_from_gguf(path)
 
 
 class TestRecurrentGGUFBuild:

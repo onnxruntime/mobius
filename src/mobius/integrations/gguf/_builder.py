@@ -373,6 +373,116 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
+    _raise_for_unsupported_encoder_heads(gguf_model)
+    _raise_for_invalid_encoder_tensor_contract(gguf_model)
+
+
+def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
+    """Reject optional llama.cpp encoder heads that the token-output graph omits."""
+    if gguf_model.architecture not in {"bert", "modern-bert"}:
+        return
+    head_tensors = [
+        name
+        for name in gguf_model.tensor_names
+        if name.startswith(("cls.", "cls_out.", "cls_norm."))
+    ]
+    if head_tensors:
+        raise ValueError(
+            f"{gguf_model.architecture} GGUF contains unsupported pooler/classifier "
+            f"tensor(s): {head_tensors}. Mobius will not silently discard encoder heads."
+        )
+
+
+def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
+    """Validate required encoder tensors and their exact logical ranks/shapes."""
+    architecture = gguf_model.architecture
+    if architecture not in {"bert", "modern-bert"}:
+        return
+
+    metadata = gguf_model.metadata
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    context = int(metadata[f"{architecture}.context_length"])
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+    }
+    if architecture == "bert":
+        token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+        required.update(
+            {
+                "token_types.weight": (token_types, hidden),
+                "position_embd.weight": (context, hidden),
+                "token_embd_norm.weight": (hidden,),
+                "token_embd_norm.bias": (hidden,),
+            }
+        )
+        layer_shapes = {
+            "attn_q.weight": (hidden, hidden),
+            "attn_q.bias": (hidden,),
+            "attn_k.weight": (hidden, hidden),
+            "attn_k.bias": (hidden,),
+            "attn_v.weight": (hidden, hidden),
+            "attn_v.bias": (hidden,),
+            "attn_output.weight": (hidden, hidden),
+            "attn_output.bias": (hidden,),
+            "attn_output_norm.weight": (hidden,),
+            "attn_output_norm.bias": (hidden,),
+            "ffn_up.weight": (intermediate, hidden),
+            "ffn_up.bias": (intermediate,),
+            "ffn_down.weight": (hidden, intermediate),
+            "ffn_down.bias": (hidden,),
+            "layer_output_norm.weight": (hidden,),
+            "layer_output_norm.bias": (hidden,),
+        }
+    else:
+        required.update(
+            {
+                "token_embd_norm.weight": (hidden,),
+                "output_norm.weight": (hidden,),
+            }
+        )
+        layer_shapes = {
+            "attn_qkv.weight": (3 * hidden, hidden),
+            "attn_output.weight": (hidden, hidden),
+            "ffn_up.weight": (2 * intermediate, hidden),
+            "ffn_down.weight": (hidden, intermediate),
+            "ffn_norm.weight": (hidden,),
+        }
+
+    for layer in range(layers):
+        for suffix, shape in layer_shapes.items():
+            required[f"blk.{layer}.{suffix}"] = shape
+        if architecture == "modern-bert" and layer > 0:
+            required[f"blk.{layer}.attn_norm.weight"] = (hidden,)
+
+    actual = {
+        name: tuple(int(dim) for dim in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    missing = sorted(set(required) - set(actual))
+    if missing:
+        raise ValueError(
+            f"{architecture} GGUF is missing required encoder tensor(s): {missing}"
+        )
+    malformed = {
+        name: (required[name], actual[name])
+        for name in required
+        if actual[name] != required[name]
+    }
+    if malformed:
+        raise ValueError(
+            f"{architecture} GGUF has invalid encoder tensor shape(s): {malformed}"
+        )
+    if architecture == "modern-bert" and "blk.0.attn_norm.weight" in actual:
+        raise ValueError(
+            "modern-bert blk.0.attn_norm.weight is present, but Mobius models layer 0 "
+            "as the pinned identity-norm variant and will not ignore the tensor"
+        )
 
 
 def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
@@ -682,6 +792,13 @@ def build_from_gguf(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
             "they carry per-layer conv_state and ssm_state rather than a KV cache."
         )
+    if model_type in {"bert", "modernbert"}:
+        if static_cache:
+            raise ValueError("static_cache is not valid for encoder-only GGUF architectures")
+        if task is not None and task != "feature-extraction":
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports task='feature-extraction', got {task!r}"
+            )
 
     # 2b. Architecture-resolution safety rail. When the GGUF architecture string
     # bridges to a specialised registry key, verify the metadata-derived config

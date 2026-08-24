@@ -374,6 +374,12 @@ Quantized files containing only qtypes with no supported preservation target
 (for example, pure Q6_K or Q5_K weights) fail instead of silently becoming
 float. Re-run with `--dequantize` to request explicit float conversion.
 
+Encoder-only BERT and ModernBERT GGUF backbones auto-select
+`feature-extraction` and output `last_hidden_state`; they do not produce logits
+or cache tensors. Static cache, generative task overrides, pooled/reranker
+metadata, classifier tensors, and unsupported ModernBERT sliding-window variants
+are rejected explicitly.
+
 Sharded GGUF inputs are rejected because a single shard has an incomplete
 tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
 parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI

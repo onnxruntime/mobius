@@ -56,7 +56,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 33
+_EXPECTED_SUPPORTED_COUNT = 35
 
 # Quantized reachability is separately pinned from float importability. A new
 # architecture must explicitly prove that its graph exposes packed projection
@@ -284,6 +284,8 @@ class TestPinnedTensorClosure:
         "granitemoe",
         "mamba",
         "mamba2",
+        "bert",
+        "modern-bert",
     )
 
     @staticmethod
@@ -329,6 +331,26 @@ class TestPinnedTensorClosure:
             assert self._unmapped("olmo") == ["blk.{bid}.attn_q"]
         finally:
             olmo_mapping["blk.{bid}.attn_q"] = removed
+            _build_mapping.cache_clear()
+
+    @pytest.mark.parametrize(
+        ("architecture", "mapping_key"),
+        [
+            ("bert", "blk.{bid}.attn_q"),
+            ("modern-bert", "blk.{bid}.attn_qkv"),
+        ],
+    )
+    def test_deleting_encoder_mapping_breaks_closure(
+        self, architecture: str, mapping_key: str
+    ) -> None:
+        table_name = "bert" if architecture == "bert" else "modern_bert"
+        mapping = _MAPPING_TABLES[table_name]
+        removed = mapping.pop(mapping_key)
+        _build_mapping.cache_clear()
+        try:
+            assert any(name.startswith(mapping_key) for name in self._unmapped(architecture))
+        finally:
+            mapping[mapping_key] = removed
             _build_mapping.cache_clear()
 
     def test_deleting_expert_mapping_breaks_moe_closure(self) -> None:
