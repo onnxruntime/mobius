@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, GraniteSwaConfig
 from mobius.components import (
     Embedding,
     RMSNorm,
@@ -188,6 +188,11 @@ class GraniteSwaCausalLMModel(CausalLMModel):
 
     HuggingFace model_type: ``granite_swa`` (``GraniteSWAForCausalLM``).
     """
+
+    # Declared here as well as on the registry entry: the registry-consistency
+    # check requires the two to agree, and inheriting CausalLMConfig would
+    # silently drop ``layer_rope_theta``.
+    config_class: type = GraniteSwaConfig
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)

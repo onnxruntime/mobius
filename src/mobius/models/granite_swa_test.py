@@ -165,6 +165,9 @@ class TestConfigExtraction:
     def test_registry_wiring(self):
         assert registry.get("granite_swa") is GraniteSwaCausalLMModel
         assert registry.get_config_class("granite_swa") is GraniteSwaConfig
+        # The registry entry and the model class must agree; inheriting
+        # CausalLMConfig would silently drop ``layer_rope_theta``.
+        assert GraniteSwaCausalLMModel.config_class is GraniteSwaConfig
         registration = registry.get_registration("granite_swa")
         assert registration.test_model_id == "ibm-granite/granite-swash-2b"
 
