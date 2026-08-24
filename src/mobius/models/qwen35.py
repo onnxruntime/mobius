@@ -284,7 +284,7 @@ class Qwen35CausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = Qwen35TextModel(config)
+        self._replace_text_model(Qwen35TextModel(config))
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -474,7 +474,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = Qwen35MoETextModel(config)
+        self._replace_text_model(Qwen35MoETextModel(config))
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

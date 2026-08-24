@@ -3407,6 +3407,11 @@ def write_mtp_speculator_metadata(
             or getattr(quantization, "tie_word_embeddings", False)
         )
     )
+    tied_float_head = bool(
+        not quantized_embedding
+        and not quantized_lm_head
+        and getattr(backbone_config, "tie_word_embeddings", False)
+    )
     has_zero_point = bool(quantization is not None and not getattr(quantization, "sym", True))
     embedding_initializers = [embedding_weights]
     if quantized_embedding:
@@ -3418,9 +3423,14 @@ def write_mtp_speculator_metadata(
         ]
     if lm_head_weights is not None:
         lm_head_initializers = [lm_head_weights]
+    elif tied_quantized_head or tied_float_head:
+        # The target LM head consumes the embedding initializer directly; the
+        # canonical text-model rebinder guarantees there is no lm_head-owned
+        # duplicate in the graph.
+        lm_head_initializers = embedding_initializers
     elif quantized_lm_head:
         lm_head_initializers = [
-            "lm_head.qweight" if tied_quantized_head else "lm_head.weight",
+            "lm_head.weight",
             "lm_head.scales",
             *(["lm_head.zero_points"] if has_zero_point else []),
         ]

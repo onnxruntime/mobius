@@ -785,7 +785,13 @@ def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
     writer.close()
 
 
-def _write_qwen35_gguf(path: Path, *, quantized: bool, inner_size: int = 256) -> None:
+def _write_qwen35_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    inner_size: int = 256,
+    quantized_embedding: bool = False,
+) -> None:
     """Write a tiny Qwen3.5 GGUF with three DeltaNet layers and one attention layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
 
@@ -845,7 +851,7 @@ def _write_qwen35_gguf(path: Path, *, quantized: bool, inner_size: int = 256) ->
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
 
     add_projection = add_q4 if quantized else add_float
-    add_float("token_embd.weight", (vocab, hidden))
+    (add_q4 if quantized_embedding else add_float)("token_embd.weight", (vocab, hidden))
     add_float("output_norm.weight", (hidden,))
     for layer in range(4):
         prefix = f"blk.{layer}."
@@ -3669,6 +3675,37 @@ class TestHybridGGUFBuild:
             assert steps[0]["present.3.key"].shape == (1, 2, 3, 8)
             assert steps[1]["present.3.key"].shape == (1, 2, 4, 8)
             assert all(np.isfinite(output["logits"]).all() for output in steps)
+
+    def test_qwen35_tied_quantized_embedding_owns_head_and_saves(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen35-tied-embedding-q4.gguf"
+        _write_qwen35_gguf(path, quantized=True, quantized_embedding=True)
+        package = build_from_gguf(path, keep_quantized=True)
+        model = package["model"]
+
+        initializer_names = set(model.graph.initializers)
+        assert {
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
+        } <= initializer_names
+        assert not any(name.startswith("lm_head.") for name in initializer_names)
+        assert all(
+            value.const_value is not None for value in model.graph.initializers.values()
+        )
+        op_types = {node.op_type for node in model.graph}
+        assert "GatherBlockQuantized" in op_types
+        assert "MatMulNBits" in op_types
+
+        saved = tmp_path / "saved-qwen35"
+        package.save(str(saved), progress_bar=False, check_weights=True)
+        reloaded = ModelPackage.load(str(saved))["model"]
+        assert set(reloaded.graph.initializers) == initializer_names
+        assert all(
+            value.const_value is not None for value in reloaded.graph.initializers.values()
+        )
 
     def test_qwen35_packed_v_head_reorder_fails_closed_when_not_repackable(
         self, tmp_path: Path

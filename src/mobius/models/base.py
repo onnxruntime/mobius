@@ -401,6 +401,12 @@ class CausalLMModel(nn.Module):
         tie = config.tie_word_embeddings or (
             qc is not None and getattr(qc, "tie_word_embeddings", False)
         )
+        if tie and quantize_lm_head != embed_quantized:
+            raise ValueError(
+                "Tied embeddings and LM heads must use compatible storage: "
+                "quantize_embeddings and quantize_lm_head must either both be true "
+                "or both be false."
+            )
 
         if quantize_lm_head and embed_quantized and tie:
             # Tied quantized head: share the embedding's packed table and quant
@@ -439,7 +445,11 @@ class CausalLMModel(nn.Module):
                 self.config.hidden_size,
                 self.config.vocab_size,
             )
-        elif self.config.tie_word_embeddings:
+        elif (
+            self.config.tie_word_embeddings
+            and isinstance(self.lm_head, Linear)
+            and isinstance(self.model.embed_tokens, Embedding)
+        ):
             self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(

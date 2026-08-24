@@ -14,13 +14,18 @@ random configs -- no checkpoint download.
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
+import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
 
 from mobius._configs import QuantizationConfig, VisionConfig
+from mobius._model_package import ModelPackage
 from mobius._testing import make_config
+from mobius.components import QuantizedEmbedding
+from mobius.components._quantized_linear import TiedQuantizedLMHead
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
     Qwen35MoECausalLMModel,
@@ -47,6 +52,217 @@ def _moe_config(quantization: QuantizationConfig | None) -> object:
         layer_types=["full_attention"],
         quantization=quantization,
     )
+
+
+def _text_config(
+    quantization: QuantizationConfig | None,
+    *,
+    tie_word_embeddings: bool,
+    output_final_hidden_state: bool = False,
+) -> object:
+    return make_config(
+        num_hidden_layers=1,
+        hidden_size=_H,
+        intermediate_size=64,
+        moe_intermediate_size=_INT,
+        shared_expert_intermediate_size=_INT,
+        num_local_experts=_E,
+        num_experts_per_tok=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        layer_types=["full_attention"],
+        quantization=quantization,
+        tie_word_embeddings=tie_word_embeddings,
+        output_final_hidden_state=output_final_hidden_state,
+    )
+
+
+def _affine_tied_quantization() -> QuantizationConfig:
+    return QuantizationConfig(
+        bits=4,
+        group_size=_BLK,
+        quant_method="gguf",
+        sym=False,
+        quantize_embeddings=True,
+        quantize_lm_head=True,
+        tie_word_embeddings=True,
+    )
+
+
+def _fill_zero_weights(model: ir.Model) -> None:
+    for value in model.graph.initializers.values():
+        if value.const_value is not None:
+            continue
+        shape = [int(dim) for dim in value.shape]
+        dtype = np.uint8 if value.dtype == ir.DataType.UINT8 else np.float32
+        value.const_value = ir.tensor(np.zeros(shape, dtype=dtype))
+
+
+class TestQwen35TiedHeadRebinding:
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    def test_float_tied_head_rebinds_to_replacement_embedding(self, model_class):
+        from mobius._builder import build_from_module
+
+        config = _text_config(None, tie_word_embeddings=True)
+        module = model_class(config)
+
+        assert module.lm_head.weight is module.model.embed_tokens.weight
+
+        model = build_from_module(module, config, task=module.default_task)["model"]
+        assert "model.embed_tokens.weight" in model.graph.initializers
+        assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
+
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    def test_affine_quantized_tied_head_owns_only_embedding_initializers(self, model_class):
+        from mobius._builder import build_from_module
+
+        config = _text_config(_affine_tied_quantization(), tie_word_embeddings=True)
+        module = model_class(config)
+
+        assert isinstance(module.model.embed_tokens, QuantizedEmbedding)
+        assert isinstance(module.lm_head, TiedQuantizedLMHead)
+        assert module.lm_head.qweight is module.model.embed_tokens.qweight
+        assert module.lm_head.scales is module.model.embed_tokens.scales
+        assert module.lm_head.zero_points is module.model.embed_tokens.zero_points
+
+        model = build_from_module(module, config, task=module.default_task)["model"]
+        initializer_names = set(model.graph.initializers)
+        assert {
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
+        } <= initializer_names
+        assert not any(name.startswith("lm_head.") for name in initializer_names)
+        op_types = {node.op_type for node in model.graph}
+        assert "GatherBlockQuantized" in op_types
+        assert "MatMulNBits" in op_types
+
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_untied_head_remains_independent(self, model_class, quantized):
+        quantization = None
+        if quantized:
+            quantization = dataclasses.replace(
+                _affine_tied_quantization(),
+                tie_word_embeddings=False,
+            )
+        config = _text_config(quantization, tie_word_embeddings=False)
+        module = model_class(config)
+
+        if quantized:
+            assert module.lm_head.weight is not module.model.embed_tokens.qweight
+        else:
+            assert module.lm_head.weight is not module.model.embed_tokens.weight
+
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    @pytest.mark.parametrize(
+        ("quantize_embeddings", "quantize_lm_head"),
+        [(True, False), (False, True)],
+    )
+    def test_mixed_storage_tied_head_fails_closed(
+        self, model_class, quantize_embeddings, quantize_lm_head
+    ):
+        quantization = dataclasses.replace(
+            _affine_tied_quantization(),
+            quantize_embeddings=quantize_embeddings,
+            quantize_lm_head=quantize_lm_head,
+        )
+        config = _text_config(quantization, tie_word_embeddings=True)
+
+        with pytest.raises(ValueError, match="must use compatible storage"):
+            model_class(config)
+
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    def test_tied_quantized_package_saves_and_reloads_with_all_weights(
+        self, model_class, tmp_path: Path
+    ):
+        from mobius._builder import build_from_module
+
+        config = _text_config(_affine_tied_quantization(), tie_word_embeddings=True)
+        module = model_class(config)
+        package = build_from_module(module, config, task=module.default_task)
+        _fill_zero_weights(package["model"])
+
+        assert all(
+            value.const_value is not None
+            for value in package["model"].graph.initializers.values()
+        )
+        output_dir = tmp_path / model_class.__name__
+        package.save(str(output_dir), progress_bar=False, check_weights=True)
+        reloaded = ModelPackage.load(str(output_dir))
+        assert set(reloaded["model"].graph.initializers) == set(
+            package["model"].graph.initializers
+        )
+        assert all(
+            value.const_value is not None
+            for value in reloaded["model"].graph.initializers.values()
+        )
+
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    def test_tied_quantized_logits_use_the_shared_embedding_table(self, model_class):
+        from mobius._builder import build_from_module
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        config = _text_config(
+            _affine_tied_quantization(),
+            tie_word_embeddings=True,
+            output_final_hidden_state=True,
+        )
+        module = model_class(config)
+        model = build_from_module(module, config, task=module.default_task)["model"]
+        _fill_zero_weights(model)
+
+        vocab_size = config.vocab_size
+        codes = (8 + np.arange(vocab_size, dtype=np.uint8) % 7)[:, None]
+        packed_codes = np.repeat(codes | (codes << 4), _H * _BITS // 8, axis=1)
+        row_scales = 0.03125 + np.arange(vocab_size, dtype=np.float32)[:, None] / 4096.0
+        scales = np.repeat(row_scales, _H // _BLK, axis=1)
+        zero_points = np.full((vocab_size, 1), 0x88, dtype=np.uint8)
+        model.graph.initializers["model.embed_tokens.qweight"].const_value = ir.tensor(
+            packed_codes
+        )
+        model.graph.initializers["model.embed_tokens.scales"].const_value = ir.tensor(scales)
+        model.graph.initializers["model.embed_tokens.zero_points"].const_value = ir.tensor(
+            zero_points
+        )
+
+        session = OnnxModelSession(model)
+        try:
+            output = session.run(
+                {
+                    "input_ids": np.array([[1]], dtype=np.int64),
+                    "attention_mask": np.ones((1, 1), dtype=np.int64),
+                    "position_ids": np.array([[0]], dtype=np.int64),
+                    "past_key_values.0.key": np.zeros((1, 2, 0, 8), dtype=np.float32),
+                    "past_key_values.0.value": np.zeros((1, 2, 0, 8), dtype=np.float32),
+                }
+            )
+        finally:
+            session.close()
+
+        dequantized = (codes.astype(np.float32) - 8.0) * row_scales
+        shared_table = np.repeat(dequantized, _H, axis=1)
+        expected = output["mtp_seed"] @ shared_table.T
+        np.testing.assert_allclose(output["logits"], expected, rtol=1e-5, atol=1e-5)
 
 
 def _olive_expert_state_dict() -> dict[str, torch.Tensor]:

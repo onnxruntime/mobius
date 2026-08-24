@@ -2287,7 +2287,9 @@ class TestMtpSpeculatorMetadata:
         if not dedicated_embedding:
             expected_shared.append("model.embed_tokens.weight")
         if not dedicated_head:
-            expected_shared.append("lm_head.weight_t")
+            expected_shared.append(
+                "model.embed_tokens.weight" if tied_output else "lm_head.weight_t"
+            )
         if expected_shared:
             assert spec["shared_weights"] == sorted(set(expected_shared))
         else:
@@ -2319,6 +2321,21 @@ class TestMtpSpeculatorMetadata:
             "model.embed_tokens.qweight",
             "model.embed_tokens.scales",
             "model.embed_tokens.zero_points",
+        ]
+
+    def test_explicit_lm_head_initializer_overrides_inferred_tying(self, tmp_path):
+        _seed_backbone_metadata(tmp_path)
+        out = write_mtp_speculator_metadata(
+            str(tmp_path),
+            backbone_config=_MtpBackboneConfig(tie_word_embeddings=True),
+            lm_head_weights="decoder.shared_output.weight",
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            spec = yaml.safe_load(handle)["speculative"]
+        assert spec["shared_weights"] == [
+            "decoder.shared_output.weight",
+            "model.embed_tokens.weight",
         ]
 
     @pytest.mark.parametrize("dedicated_embedding", [False, True])
@@ -2353,20 +2370,11 @@ class TestMtpSpeculatorMetadata:
         assert out is not None
         with open(out, encoding="utf-8") as handle:
             spec = yaml.safe_load(handle)["speculative"]
-        expected = [
-            "lm_head.qweight",
-            "lm_head.scales",
-            "lm_head.zero_points",
+        assert spec["shared_weights"] == [
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
         ]
-        if not dedicated_embedding:
-            expected.extend(
-                [
-                    "model.embed_tokens.qweight",
-                    "model.embed_tokens.scales",
-                    "model.embed_tokens.zero_points",
-                ]
-            )
-        assert spec["shared_weights"] == sorted(expected)
 
     def test_rollback_capacity_covers_the_proposal_width(self, tmp_path):
         workflow = self._write(tmp_path)["pipeline"]["workflow"]

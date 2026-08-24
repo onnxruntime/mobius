@@ -330,7 +330,9 @@ class TestBuildMtpHead:
         assert head is not None
         target_initializers = package["model"].graph.initializers
         assert "model.embed_tokens.weight" in target_initializers
-        if quantized and not tied_output:
+        if tied_output:
+            assert not any(name.startswith("lm_head.") for name in target_initializers)
+        elif quantized:
             assert {
                 "lm_head.weight",
                 "lm_head.scales",
@@ -397,10 +399,8 @@ class TestBuildMtpHead:
             "model.embed_tokens.qweight",
             "model.embed_tokens.scales",
             "model.embed_tokens.zero_points",
-            "lm_head.qweight",
-            "lm_head.scales",
-            "lm_head.zero_points",
         }.issubset(initializers)
+        assert not any(name.startswith("lm_head.") for name in initializers)
 
 
 class TestMtpAutoDetect:
