@@ -114,8 +114,11 @@ class TestVisionMapping:
     def test_vision_names(self, gguf_name: str, expected: str):
         assert map_mmproj_vision_to_hf(gguf_name) == expected
 
-    def test_stat_tensors_skipped(self):
-        assert map_mmproj_vision_to_hf("v.blk.0.attn_q.weight.input_max") is None
+    def test_clipping_bounds_are_mapped(self):
+        assert (
+            map_mmproj_vision_to_hf("v.blk.0.attn_q.input_max")
+            == "vision_tower.encoder.layers.0.self_attn.q_proj.input_max"
+        )
 
     def test_unknown_stem_skipped(self):
         assert map_mmproj_vision_to_hf("v.blk.0.mystery.weight") is None

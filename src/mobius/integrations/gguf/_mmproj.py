@@ -51,6 +51,14 @@ import numpy as np
 
 from mobius._model_package import ModelPackage
 from mobius.integrations.gguf._arch_registry import MMPROJ_ARCHITECTURE
+from mobius.integrations.gguf._mmproj_registry import (
+    LLAMA_CPP_MMPROJ_SHA,
+    MMProjModality,
+    ProjectorSpec,
+    get_projector_spec,
+    projector_type_for_modality,
+)
+from mobius.integrations.gguf._spec import Support
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +67,7 @@ logger = logging.getLogger(__name__)
 _GEMMA4_VISION_ROPE_THETA = 100.0
 # Gemma4 vision pooler spatial average pooling kernel (k x k). Not present in
 # mmproj metadata; the SigLIP encoder pools N patches to N/k^2 soft tokens.
-_DEFAULT_POOLING_KERNEL_SIZE = 4
+_DEFAULT_POOLING_KERNEL_SIZE = 3
 
 # Muse Glimmer's vision tower uses ordinary 2D RoPE. The mmproj stores no
 # rope.freq_base, so use the published vision config value.
@@ -218,9 +226,9 @@ def read_mmproj_vision_config(gguf_model: Any):
         image_size=int(md["clip.vision.image_size"]),
         patch_size=int(md["clip.vision.patch_size"]),
         norm_eps=float(md.get("clip.vision.attention.layer_norm_epsilon", 1e-6)),
-        # The mmproj carries activation-range stats, not clipped-linear weights,
-        # so the encoder uses plain (non-clipped) Linear layers.
-        use_clipped_linears=False,
+        # The F16 Gemma4 sidecar carries learned activation bounds for every
+        # attention/MLP projection; they are part of ClippableLinear semantics.
+        use_clipped_linears=True,
         position_embedding_size=pos_emb_size,
         pooling_kernel_size=_DEFAULT_POOLING_KERNEL_SIZE,
         hidden_act="gelu_pytorch_tanh",
@@ -267,6 +275,332 @@ def _resolve_local_path(path: str | Path) -> str:
     from mobius.integrations.gguf._builder import _resolve_gguf_path
 
     return _resolve_gguf_path(path)
+
+
+_CLIPPING_BOUND_SUFFIXES = (".input_min", ".input_max", ".output_min", ".output_max")
+_FLOAT_MMPROJ_QTYPES = frozenset({"F32", "F16", "BF16"})
+
+
+def _canonical_text_architecture(architecture: str) -> str:
+    from mobius.integrations.gguf._arch_registry import try_get_arch_spec
+
+    arch_spec = try_get_arch_spec(architecture)
+    return architecture if arch_spec is None else arch_spec.gguf_arch
+
+
+def _normalized_identity(value: object) -> str:
+    return "".join(character for character in str(value).lower() if character.isalnum())
+
+
+def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
+    """Reject a sidecar whose declared base model contradicts the text GGUF."""
+    text_name = text_gguf.metadata.get("general.name")
+    sidecar_base = mmproj_gguf.metadata.get("general.base_model.0.name")
+    if text_name and sidecar_base:
+        text_identity = _normalized_identity(text_name)
+        sidecar_identity = _normalized_identity(sidecar_base)
+        if text_identity != sidecar_identity:
+            raise ValueError(
+                "mmproj source identity does not match the text GGUF: "
+                f"general.base_model.0.name={sidecar_base!r}, "
+                f"text general.name={text_name!r}."
+            )
+    general_type = mmproj_gguf.metadata.get("general.type")
+    if general_type not in (None, "mmproj"):
+        raise ValueError(f"clip sidecar general.type must be 'mmproj', got {general_type!r}.")
+
+
+def _mmproj_tensor_names_for_spec(mmproj_gguf: Any, spec: ProjectorSpec) -> set[str]:
+    prefixes = tuple({role_prefix for role_prefix, _ in spec.tensor_roles})
+    return {
+        name
+        for name in mmproj_gguf.tensor_names
+        if name.startswith(prefixes)
+        or name in spec.required_top_tensors
+        or name in spec.optional_top_tensors
+    }
+
+
+def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    """Validate exact names, layers, shapes, and float storage before graph build."""
+    names = _mmproj_tensor_names_for_spec(mmproj_gguf, spec)
+    top = set(spec.required_top_tensors) | set(spec.optional_top_tensors)
+    block_names: dict[int, set[str]] = {}
+    unexpected: list[str] = []
+    prefix = spec.block_prefix
+    for name in names:
+        if name in top:
+            continue
+        if prefix is None or not name.startswith(prefix):
+            unexpected.append(name)
+            continue
+        remainder = name[len(prefix) :]
+        index_text, separator, suffix = remainder.partition(".")
+        if not separator or not index_text.isdecimal() or suffix not in spec.block_suffixes:
+            unexpected.append(name)
+            continue
+        block_names.setdefault(int(index_text), set()).add(suffix)
+    if unexpected:
+        raise ValueError(
+            f"{spec.projector_type} mmproj has tensors outside the pinned suffix-exact "
+            f"loader closure: {sorted(unexpected)}. Projector tensors are never dropped."
+        )
+
+    missing_top = sorted(set(spec.required_top_tensors) - names)
+    if missing_top:
+        raise ValueError(
+            f"{spec.projector_type} mmproj is missing required tensor(s): {missing_top}"
+        )
+    layers = int(mmproj_gguf.metadata["clip.vision.block_count"])
+    expected_layers = set(range(layers))
+    if set(block_names) != expected_layers:
+        raise ValueError(
+            f"{spec.projector_type} mmproj block indices are "
+            f"{sorted(block_names)}, expected {sorted(expected_layers)}."
+        )
+    required_suffixes = set(spec.block_suffixes)
+    missing_by_layer = {
+        layer: sorted(required_suffixes - block_names[layer])
+        for layer in sorted(block_names)
+        if required_suffixes - block_names[layer]
+    }
+    if missing_by_layer:
+        raise ValueError(
+            f"{spec.projector_type} mmproj is missing required block suffixes: "
+            f"{missing_by_layer}"
+        )
+
+    for name in sorted(names):
+        qtype = mmproj_gguf.get_tensor_type(name).name
+        is_calibration = name.endswith(_CLIPPING_BOUND_SUFFIXES)
+        if is_calibration and qtype != "F32":
+            raise ValueError(
+                f"{name} is a clipping-bound tensor and must be F32, got {qtype}."
+            )
+        if not is_calibration and qtype not in _FLOAT_MMPROJ_QTYPES:
+            raise NotImplementedError(
+                f"{spec.projector_type} mmproj tensor {name!r} uses packed {qtype}. "
+                "Mobius does not preserve packed vision/audio/projector tensors; use "
+                "an F16, BF16, or F32 mmproj so every role is explicitly dequantized."
+            )
+
+    _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+
+
+def _expect_mmproj_shape(mmproj_gguf: Any, name: str, expected: tuple[int, ...]) -> None:
+    actual = mmproj_gguf.get_tensor_shape(name)
+    if actual != expected:
+        raise ValueError(f"mmproj tensor {name!r} has shape {actual}, expected {expected}.")
+
+
+def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    md = mmproj_gguf.metadata
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError(
+            f"{spec.projector_type} vision hidden/head dimensions are invalid: "
+            f"embedding_length={hidden}, head_count={heads}."
+        )
+
+    patch_shape = mmproj_gguf.get_tensor_shape("v.patch_embd.weight")
+    if len(patch_shape) not in (4, 5) or patch_shape[0] != hidden:
+        raise ValueError(
+            f"v.patch_embd.weight must be rank 4/5 with output {hidden}, got {patch_shape}."
+        )
+    if patch_shape[-2:] != (patch, patch):
+        raise ValueError(
+            f"v.patch_embd.weight spatial kernel {patch_shape[-2:]} does not match "
+            f"clip.vision.patch_size={patch}."
+        )
+
+    if spec.projector_type == "gemma4v":
+        position_shape = mmproj_gguf.get_tensor_shape("v.position_embd.weight")
+        if len(position_shape) != 3 or position_shape[0] != 2 or position_shape[2] != hidden:
+            raise ValueError(
+                "Gemma4 position embeddings must have shape [2, positions, hidden], "
+                f"got {position_shape}."
+            )
+        _expect_mmproj_shape(mmproj_gguf, "mm.input_projection.weight", (projection, hidden))
+        head_dim = hidden // heads
+        shapes = {
+            "ln1.weight": (hidden,),
+            "ln2.weight": (hidden,),
+            "attn_post_norm.weight": (hidden,),
+            "ffn_post_norm.weight": (hidden,),
+            "attn_q.weight": (hidden, hidden),
+            "attn_k.weight": (hidden, hidden),
+            "attn_v.weight": (hidden, hidden),
+            "attn_out.weight": (hidden, hidden),
+            "attn_q_norm.weight": (head_dim,),
+            "attn_k_norm.weight": (head_dim,),
+            "ffn_gate.weight": (intermediate, hidden),
+            "ffn_up.weight": (intermediate, hidden),
+            "ffn_down.weight": (hidden, intermediate),
+        }
+        shapes.update(dict.fromkeys(_CLIPPING_BOUND_SUFFIXES, ()))
+        for layer in range(layers):
+            for suffix, expected in shapes.items():
+                if suffix in _CLIPPING_BOUND_SUFFIXES:
+                    continue
+                _expect_mmproj_shape(mmproj_gguf, f"v.blk.{layer}.{suffix}", expected)
+            for stem in (
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_out",
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+            ):
+                for bound in ("input_min", "input_max", "output_min", "output_max"):
+                    _expect_mmproj_shape(mmproj_gguf, f"v.blk.{layer}.{stem}.{bound}", (1,))
+        return
+
+    if spec.projector_type == "muse-glimmer":
+        merge = int(md["clip.vision.spatial_merge_size"])
+        position_shape = mmproj_gguf.get_tensor_shape("v.position_embd.weight")
+        if len(position_shape) != 2 or position_shape[1] != hidden:
+            raise ValueError(
+                "Muse Glimmer position embeddings must have shape [positions, hidden], "
+                f"got {position_shape}."
+            )
+        projector_width = mmproj_gguf.get_tensor_shape("mm.0.weight")[0]
+        _expect_mmproj_shape(
+            mmproj_gguf, "mm.0.weight", (projector_width, hidden * merge * merge)
+        )
+        _expect_mmproj_shape(mmproj_gguf, "mm.1.weight", (projector_width, projector_width))
+        _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, projector_width))
+        for name in ("v.pre_ln.weight", "v.pre_ln.bias", "v.post_ln.weight", "v.post_ln.bias"):
+            _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+        for layer in range(layers):
+            for stem in ("ln1", "ln2"):
+                for kind in ("weight", "bias"):
+                    _expect_mmproj_shape(
+                        mmproj_gguf, f"v.blk.{layer}.{stem}.{kind}", (hidden,)
+                    )
+            for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+                _expect_mmproj_shape(
+                    mmproj_gguf, f"v.blk.{layer}.{stem}.weight", (hidden, hidden)
+                )
+                _expect_mmproj_shape(mmproj_gguf, f"v.blk.{layer}.{stem}.bias", (hidden,))
+            _expect_mmproj_shape(
+                mmproj_gguf, f"v.blk.{layer}.ffn_up.weight", (intermediate, hidden)
+            )
+            _expect_mmproj_shape(mmproj_gguf, f"v.blk.{layer}.ffn_up.bias", (intermediate,))
+            _expect_mmproj_shape(
+                mmproj_gguf, f"v.blk.{layer}.ffn_down.weight", (hidden, intermediate)
+            )
+            _expect_mmproj_shape(mmproj_gguf, f"v.blk.{layer}.ffn_down.bias", (hidden,))
+
+
+def _preflight_mmproj_pair(
+    text_gguf: Any,
+    mmproj_gguf: Any,
+    *,
+    modalities: tuple[MMProjModality, ...],
+) -> dict[MMProjModality, ProjectorSpec]:
+    """Validate the pair and return supported specs before graph construction."""
+    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
+        raise ValueError(
+            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
+            f"{mmproj_gguf.architecture!r}."
+        )
+    _validate_mmproj_source_identity(text_gguf, mmproj_gguf)
+    text_arch = _canonical_text_architecture(text_gguf.architecture)
+    resolved: dict[MMProjModality, ProjectorSpec] = {}
+    for modality in modalities:
+        presence_key = f"clip.has_{modality.value.replace('.', '_')}_encoder"
+        if not mmproj_gguf.metadata.get(presence_key):
+            raise ValueError(
+                f"mmproj GGUF has no {modality.value} encoder ({presence_key} is unset)."
+            )
+        projector_type = projector_type_for_modality(mmproj_gguf.metadata, modality)
+        spec = get_projector_spec(projector_type)
+        if modality not in spec.modalities:
+            raise ValueError(
+                f"Projector {projector_type!r} is not a {modality.value} projector."
+            )
+        if not spec.is_supported:
+            blocked = ", ".join(
+                name
+                for name, verdict in spec.verdicts.items()
+                if verdict is not Support.SUPPORTED
+            )
+            raise NotImplementedError(
+                f"clip projector {projector_type!r} is known at llama.cpp "
+                f"{LLAMA_CPP_MMPROJ_SHA} but is deferred/rejected "
+                f"({blocked} unavailable): {spec.reason}"
+            )
+        if text_arch not in spec.target_architectures:
+            raise ValueError(
+                f"clip projector {projector_type!r} targets "
+                f"{sorted(spec.target_architectures)}, not text architecture "
+                f"{text_gguf.architecture!r}."
+            )
+        missing_metadata = [
+            key for key in spec.required_metadata if key not in mmproj_gguf.metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
+            )
+        _validate_mmproj_tensor_closure(mmproj_gguf, spec)
+        resolved[modality] = spec
+    return resolved
+
+
+def _token_id(text_gguf: Any, token: str) -> int | None:
+    tokens = text_gguf.metadata.get("tokenizer.ggml.tokens")
+    if not isinstance(tokens, list):
+        return None
+    try:
+        return tokens.index(token)
+    except ValueError:
+        return None
+
+
+def _validate_projector_output_and_media_tokens(
+    config: Any,
+    text_gguf: Any,
+    mmproj_gguf: Any,
+    *,
+    require_audio: bool = False,
+) -> None:
+    """Validate dimensions and tokenizer-owned media IDs before graph build."""
+    projection = int(mmproj_gguf.metadata["clip.vision.projection_dim"])
+    if projection != int(config.hidden_size):
+        raise ValueError(
+            f"mmproj projection_dim={projection} does not match text hidden_size="
+            f"{config.hidden_size}."
+        )
+    if int(config.vocab_size) <= 0:
+        raise ValueError(f"Text GGUF has invalid vocab_size={config.vocab_size}.")
+    media_ids = {"image": config.image_token_id}
+    if require_audio:
+        audio_projection = int(mmproj_gguf.metadata["clip.audio.projection_dim"])
+        if audio_projection != int(config.hidden_size):
+            raise ValueError(
+                f"audio mmproj projection_dim={audio_projection} does not match text "
+                f"hidden_size={config.hidden_size}."
+            )
+        media_ids["audio"] = config.audio_token_id
+    for modality, token_id in media_ids.items():
+        if token_id is None:
+            raise ValueError(
+                f"The paired text GGUF does not identify its {modality} media token. "
+                f"Embed tokenizer.ggml.tokens with '<|{modality}|>' or pass the "
+                "architecture-specific explicit token id."
+            )
+        if not 0 <= int(token_id) < int(config.vocab_size):
+            raise ValueError(
+                f"{modality}_token_id={token_id} is outside text vocab_size="
+                f"{config.vocab_size}."
+            )
 
 
 # Text-GGUF tensors whose names are not covered by the block ``gemma4`` text
@@ -457,6 +791,8 @@ def _mmproj_vision_to_hf(mmproj_gguf: Any) -> dict:
             # The flattening order (in_ch, kh, kw) row-major matches the
             # pre-patchified pixel_values layout consumed by the encoder.
             values = values.reshape(values.shape[0], -1)
+        elif name.endswith(_CLIPPING_BOUND_SUFFIXES):
+            values = values.reshape(())
         state_dict[hf_name] = torch.from_numpy(values)
     return state_dict
 
@@ -530,11 +866,12 @@ def build_gemma4_vlm_from_gguf(
 
     mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
     _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
-    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
-        raise ValueError(
-            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
-            f"{mmproj_gguf.architecture!r} for {mmproj_gguf_path!r}."
-        )
+    modalities = (
+        (MMProjModality.VISION, MMProjModality.AUDIO)
+        if include_audio
+        else (MMProjModality.VISION,)
+    )
+    _preflight_mmproj_pair(text_gguf, mmproj_gguf, modalities=modalities)
     logger.info("Building Gemma4 VLM from text=%s mmproj=%s", text_gguf_path, mmproj_gguf_path)
 
     # 1. Text config + merged vision/audio sub-configs.
@@ -553,12 +890,24 @@ def build_gemma4_vlm_from_gguf(
         # 3-component (decoder + vision + embedding) multimodal shape.
         config = dataclasses.replace(config, audio=None)
 
-    if image_token_id is not None:
-        config = dataclasses.replace(config, image_token_id=image_token_id)
+    resolved_image_token_id = (
+        image_token_id
+        if image_token_id is not None
+        else config.image_token_id
+        if config.image_token_id is not None
+        else _token_id(text_gguf, "<|image|>")
+    )
+    updates: dict[str, Any] = {"image_token_id": resolved_image_token_id}
+    if include_audio and config.audio_token_id is None:
+        updates["audio_token_id"] = _token_id(text_gguf, "<|audio|>")
+    config = dataclasses.replace(config, **updates)
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None:
             config = dataclasses.replace(config, dtype=resolved)
+    _validate_projector_output_and_media_tokens(
+        config, text_gguf, mmproj_gguf, require_audio=include_audio
+    )
 
     # 1b. Quantized mode: set the module-global quantization config from the
     # text GGUF BEFORE building so the text graph emits MatMulNBits and, when
@@ -721,11 +1070,7 @@ def build_muse_glimmer_vlm_from_gguf(
 
     mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
     _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
-    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
-        raise ValueError(
-            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
-            f"{mmproj_gguf.architecture!r} for {mmproj_gguf_path!r}."
-        )
+    _preflight_mmproj_pair(text_gguf, mmproj_gguf, modalities=(MMProjModality.VISION,))
     logger.info(
         "Building Muse Glimmer VLM from text=%s mmproj=%s",
         text_gguf_path,
@@ -747,6 +1092,7 @@ def build_muse_glimmer_vlm_from_gguf(
         resolved = resolve_dtype(dtype)
         if resolved is not None:
             config = dataclasses.replace(config, dtype=resolved)
+    _validate_projector_output_and_media_tokens(config, text_gguf, mmproj_gguf)
 
     preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, text_arch)
     if keep_quantized and not preserve_quantization:
@@ -837,10 +1183,17 @@ def build_vlm_from_gguf(
     The mmproj itself is always ``general.architecture = clip``, so the text
     backbone is what decides how the pair is assembled.
     """
+    from mobius.integrations.gguf._builder import _validate_gguf_model
     from mobius.integrations.gguf._reader import GGUFModel
 
-    text_arch = GGUFModel(_resolve_local_path(text_gguf_path)).architecture
-    builder = _resolve_vlm_builder(text_arch)
+    text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
+    _validate_gguf_model(text_gguf, source=str(text_gguf_path))
+    mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
+    _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
+    specs = _preflight_mmproj_pair(text_gguf, mmproj_gguf, modalities=(MMProjModality.VISION,))
+    builder = _resolve_vlm_builder(
+        text_gguf.architecture, specs[MMProjModality.VISION].projector_type
+    )
     return builder(
         text_gguf_path,
         mmproj_gguf_path,
@@ -863,17 +1216,32 @@ _VLM_BUILDERS: dict[str, str] = {
 }
 
 
-def _resolve_vlm_builder(text_arch: str) -> Callable[..., ModelPackage]:
-    """Return the multimodal assembly entry point for a text architecture.
-
-    Architectures with no declared ``vlm_builder`` fall back to the Gemma 4
-    assembly, which is the historical default for an unrecognized pairing.
-    """
+def _resolve_vlm_builder(text_arch: str, projector_type: str) -> Callable[..., ModelPackage]:
+    """Resolve dispatch only from an exact supported projector/target pair."""
     from mobius.integrations.gguf._arch_registry import try_get_arch_spec
 
-    spec = try_get_arch_spec(text_arch)
-    name = None if spec is None else spec.vlm_builder
-    attribute = _VLM_BUILDERS.get(name or "", "build_gemma4_vlm_from_gguf")
+    projector_spec = get_projector_spec(projector_type)
+    if not projector_spec.is_supported:
+        raise NotImplementedError(
+            f"clip projector {projector_type!r} cannot build: {projector_spec.reason}"
+        )
+    text_spec = try_get_arch_spec(text_arch)
+    canonical_text_arch = text_arch if text_spec is None else text_spec.gguf_arch
+    if canonical_text_arch not in projector_spec.target_architectures:
+        raise ValueError(
+            f"clip projector {projector_type!r} targets "
+            f"{sorted(projector_spec.target_architectures)}, not {text_arch!r}."
+        )
+    if text_spec is None or text_spec.vlm_builder != projector_spec.builder:
+        raise ValueError(
+            f"Text architecture {text_arch!r} and clip projector "
+            f"{projector_type!r} do not declare the same VLM builder."
+        )
+    attribute = _VLM_BUILDERS.get(projector_spec.builder)
+    if attribute is None:
+        raise RuntimeError(
+            f"Projector registry references unknown VLM builder {projector_spec.builder!r}."
+        )
     builder: Callable[..., ModelPackage] = globals()[attribute]
     return builder
 

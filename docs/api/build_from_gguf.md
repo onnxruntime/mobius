@@ -483,6 +483,105 @@ upstream cohort, so an unsupported input is never mistaken for a broken one.
 `clip` files are multimodal projector sidecars: pass them as
 `build_from_gguf(text_gguf, mmproj=...)` rather than on their own.
 
+### Multimodal projector sidecars
+
+Projector support is pinned to llama.cpp
+`8d9af256337d1a501250f9bbf4c0859a654bddd6`. The enum has 62 entries:
+60 serialized strings below, one unserialized `MLP_NORM` compatibility entry,
+and `UNKNOWN`. `clip` has vision, audio, and generated-audio presence flags;
+there is no text-encoder presence key at this pin.
+
+Only `gemma4v` and `muse-glimmer` currently pass metadata, suffix-exact tensor
+closure, target-pairing, graph, and component-parity gates. `gemma4a` remains
+deferred: the real sidecar contains `a.pre_encode.*` tensors that the partial
+mapping does not consume. A sidecar may contain that audio tower alongside a
+supported `gemma4v` tower, but requesting an audio graph fails before graph
+construction. Packed projector tensors are rejected; supported encoder and
+projector weights must be F32, F16, or BF16, and Gemma4 clipping bounds must be
+F32. Unknown `.scale`/`.input_scale` tensors and out-of-closure weights are
+errors rather than silently dropped.
+
+<!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->
+
+| Projector string | Modality | Paired text architecture | Status | Limitation |
+|---|---|---|---|---|
+| `mlp` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | LLaVA MLP topology and class-token feature selection are not implemented by the GGUF builder. |
+| `ldp` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MobileVLM LDP convolutional projector semantics are not implemented. |
+| `ldpv2` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MobileVLM LDPv2 pooling/projector semantics are not implemented. |
+| `resampler` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MiniCPM-V query resampler and positional interpolation are not implemented. |
+| `adapter` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | GLM-Edge adapter tensor closure and graph are not implemented. |
+| `qwen2vl_merger` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The existing HF Qwen2-VL graph is not wired to the pinned GGUF merger ABI. |
+| `qwen2.5vl_merger` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The Qwen2.5-VL merger/window ordering has no GGUF tensor-closure parity test. |
+| `qwen3vl_merger` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The Qwen3-VL merger/window ordering has no GGUF tensor-closure parity test. |
+| `step3vl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Step3-VL vision and projector graph are not implemented. |
+| `gemma3` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Gemma3 mmproj feature selection and projector tensor map are not implemented. |
+| `gemma3nv` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Gemma3n vision sidecar routing is not implemented. |
+| `gemma3na` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Gemma3n audio sidecar routing is not implemented. |
+| `gemma4v` | vision | `gemma4` | supported | Exact registry-backed graph, tensor closure, target pairing, and component parity. |
+| `gemma4a` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The sidecar carries a.pre_encode tensors that the current audio map drops, and independent Conformer parity is not established. |
+| `gemma4uv` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Encoder-free unified Gemma4 vision sidecars use a different patch embedder contract. |
+| `gemma4ua` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Encoder-free unified Gemma4 waveform embedding is not wired to GGUF. |
+| `phi4` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The Phi-4 vision projector exists for HF weights but has no pinned GGUF tensor closure. |
+| `idefics3` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Idefics3 pixel-shuffle projector GGUF routing is not implemented. |
+| `pixtral` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The Pixtral component has no pinned mmproj tensor mapping or positional-interpolation parity. |
+| `ultravox` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Whisper encoder plus Ultravox stack projector is not implemented. |
+| `internvl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | InternVL pixel-shuffle token ordering is not implemented for GGUF. |
+| `llama4` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Llama4 vision encoder and multimodal target package are out of scope. |
+| `qwen2a` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Qwen2 audio encoder/projector is not implemented. |
+| `qwen3a` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Qwen3 audio encoder/projector is not implemented. |
+| `glma` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | GLM audio encoder/projector is not implemented. |
+| `qwen2.5o` | audio, vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | This legacy string changes meaning by modality; accepting it would create a false alias. |
+| `voxtral` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Voxtral Whisper encoder/projector is not implemented. |
+| `meralion` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Meralion audio projector is not implemented. |
+| `musicflamingo` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Music Flamingo audio projector is not implemented. |
+| `lfm2` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | The existing LFM2-VL HF graph has no pinned mmproj tensor closure or component parity. |
+| `kimivl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Kimi-VL vision/projector graph is not implemented. |
+| `paddleocr` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | PaddleOCR vision/projector graph is not implemented. |
+| `lightonocr` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | LightOnOCR Pixtral variant has no exact tensor mapping. |
+| `cogvlm` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | CogVLM feature output differs from LLaVA and is not implemented. |
+| `janus_pro` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Janus-Pro vision/projector graph is not implemented. |
+| `dots_ocr` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | DotsOCR vision merger is not implemented. |
+| `dots3note_v` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Dots3Note vision pyramid MoE is not implemented. |
+| `dots3note_a` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Dots3Note audio graph is not implemented. |
+| `deepseekocr` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | DeepSeek-OCR SAM/projector graph is not implemented. |
+| `deepseekocr2` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | DeepSeek-OCR2 SAM/projector graph is not implemented. |
+| `lfm2a` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | LFM2 conformer audio graph has no GGUF tensor mapping. |
+| `glm4v` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | GLM4V downsampler and projector are not implemented. |
+| `youtuvl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | YouTu-VL vision/projector graph is not implemented. |
+| `yasa2` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | YASA2 vision/projector graph is not implemented. |
+| `kimik25` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Kimi K2.5 vision/projector graph is not implemented. |
+| `nemotron_v2_vl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Nemotron V2 VL vision/projector graph is not implemented. |
+| `exaone4_5` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | EXAONE 4.5 vision merger is not implemented. |
+| `hunyuanvl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | HunyuanVL vision/projector graph is not implemented. |
+| `minicpmv4_6` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MiniCPM-V 4.6 SAM/resampler graph is not implemented. |
+| `granite_speech` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Granite Speech audio encoder/projector is not implemented. |
+| `mimovl` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MiMo-VL vision/projector graph is not implemented. |
+| `minimax_m3` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MiniMax M3 vision/projector graph is not implemented. |
+| `granite4_vision` | vision | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Granite 4 vision sidecar graph is not implemented. |
+| `mimo_audio` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | MiMo audio RVQ/local-transformer graph is not implemented. |
+| `parakeet` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Parakeet audio encoder graph is not implemented. |
+| `qwen3tts_spkenc` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | Qwen3-TTS speaker encoder graph is not implemented. |
+| `qwen3tts_gen` | gen.audio | — | metadata rejected; tensor_map rejected; graph rejected; runtime rejected | Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package. |
+| `pockettts_spkenc` | audio | — | metadata deferred; tensor_map deferred; graph deferred; runtime deferred | PocketTTS speaker encoder graph is not implemented. |
+| `pockettts_gen` | gen.audio | — | metadata rejected; tensor_map rejected; graph rejected; runtime rejected | Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package. |
+| `muse-glimmer` | vision | `muse-glimmer` | supported | Exact registry-backed graph, tensor closure, target pairing, and component parity. |
+
+<!-- END GGUF MMPROJ SUPPORT MATRIX -->
+
+Real-artifact audit pins:
+
+| Family | Revision and file | Size | LFS SHA-256 | Metadata/tensor qtypes | Paired text target |
+|---|---|---:|---|---|---|
+| Gemma4 | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2`<br>`mmproj-F16.gguf` | 985,654,080 | `337ee849e80b6169ce9d1d573d424fc1653bcafa5f0cb0cbb901beba54f4b41c` | `gemma4v` + deferred `gemma4a`; 1,163 F32 + 248 F16 tensors; vision 768→1536, audio 1024→1536 | `gemma-4-E2B-it-Q4_K_M.gguf` (`gemma4`) |
+| Muse Glimmer | `unsloth/Muse-Glimmer-30B-GGUF@faa5b025c584459c13febfa5c59883516710ae39`<br>`mmproj-Muse-Glimmer-30B-BF16.gguf` | 3,849,173,728 | `7aa788cfe25ae5e4bf4837511f64df22cabe595e58223708274a67b3136f53ab` | `muse-glimmer`; 506 F32 + 303 BF16 tensors; vision 1536, merge 2, projection 6656 | `Muse-Glimmer-30B-Q4_K_M.gguf` (`muse-glimmer`) |
+
+The Gemma4 processor contract uses tokenizer token `<|image|>` (ID 258880 in
+the audited paired GGUF) and 3×3 spatial pooling. The sidecar's image mean/std
+are metadata for preprocessing; the ONNX vision graph consumes already
+patchified `pixel_values` plus `pixel_position_ids`. Runtime callers must
+generate those inputs in the same patch order. Mobius does not currently emit
+an image-processor asset from GGUF metadata.
+
 Sharded GGUF files are rejected. A single shard has only part of the tensor
 table, and treating it as a complete checkpoint would create a corrupt model.
 
