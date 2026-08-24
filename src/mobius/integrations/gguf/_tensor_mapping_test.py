@@ -85,7 +85,7 @@ class TestMapGGUFToHFNames:
             (
                 "jamba",
                 "blk.2.ssm_b_norm.weight",
-                "model.layers.2.mamba.B_layernorm.weight",
+                "model.layers.2.mamba.b_layernorm.weight",
             ),
             (
                 "nemotron_h",

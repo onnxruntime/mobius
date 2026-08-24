@@ -143,7 +143,7 @@ def _process_llama(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Reverse-permute Q/K weights for Llama/Mistral.
+    """Reverse-permute Q/K weights and biases for Llama/Mistral.
 
     Reference: ``LlamaTensorProcessor`` in HF's
     ``modeling_gguf_pytorch_utils.py``.
@@ -160,9 +160,9 @@ def _process_llama(
         return state_dict
 
     for name, tensor in state_dict.items():
-        if ".q_proj." in name and name.endswith(".weight"):
+        if ".q_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_heads)
-        elif ".k_proj." in name and name.endswith(".weight"):
+        elif ".k_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_kv_heads)
 
     return state_dict

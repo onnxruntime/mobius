@@ -58,6 +58,20 @@ class TestProcessTensorsLlama:
             original_k,
         )
 
+    def test_qk_bias_roundtrip(self) -> None:
+        config = self._make_config(num_heads=4, num_kv_heads=2)
+        original_q = torch.randn(64)
+        original_k = torch.randn(32)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.bias": self._forward_permute(original_q, 4),
+            "model.layers.0.self_attn.k_proj.bias": self._forward_permute(original_k, 2),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["model.layers.0.self_attn.q_proj.bias"], original_q)
+        torch.testing.assert_close(result["model.layers.0.self_attn.k_proj.bias"], original_k)
+
     def test_gqa_different_head_counts(self) -> None:
         """Test GQA with num_kv_heads < num_attention_heads."""
         config = self._make_config(num_heads=8, num_kv_heads=2)

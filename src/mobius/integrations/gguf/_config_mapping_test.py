@@ -96,16 +96,41 @@ class TestSecondHybridCohortConfig:
             assert config.mamba_conv_bias is False
 
     def test_jamba_nope_config_builds_hybrid_graph(self) -> None:
+        import torch
+
         from mobius.integrations.gguf._config_mapping import gguf_to_config
+        from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
         from mobius.models import JambaCausalLMModel
         from mobius.tasks import HybridCausalLMTask
 
         config = gguf_to_config(
-            _FakeDenseGGUF("jamba", self._metadata("jamba"), ["token_embd.weight"])
+            _FakeDenseGGUF(
+                "jamba",
+                self._metadata("jamba"),
+                ["token_embd.weight", "output.weight"],
+            )
         )
         assert config.rope_type is None
-        package = HybridCausalLMTask().build(JambaCausalLMModel(config), config)
+        module = JambaCausalLMModel(config)
+        package = HybridCausalLMTask().build(module, config)
         assert "model" in package
+
+        mapped = {
+            map_gguf_to_hf_names(name, "jamba"): torch.ones(1)
+            for name in (
+                "blk.0.ssm_dt_norm.weight",
+                "blk.0.ssm_b_norm.weight",
+                "blk.0.ssm_c_norm.weight",
+            )
+        }
+        processed = module.preprocess_weights(mapped)
+        expected = {
+            "model.layers.0.mamba.ssm.dt_layernorm.weight",
+            "model.layers.0.mamba.ssm.b_layernorm.weight",
+            "model.layers.0.mamba.ssm.c_layernorm.weight",
+        }
+        assert set(processed) == expected
+        assert expected <= set(package["model"].graph.initializers)
 
     @pytest.mark.parametrize("architecture", ["jamba", "nemotron_h", "granitehybrid"])
     def test_wrong_schedule_length_rejects(self, architecture: str) -> None:

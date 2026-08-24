@@ -595,11 +595,12 @@ def gguf_to_config(
             nonzero = {value for value in values if value}
             if len(nonzero) != 1:
                 raise ValueError(
-                    "lfm2 attention layers must use one consistent non-zero KV-head count, "
+                    f"{canonical_arch} attention layers must use one consistent non-zero "
+                    "KV-head count, "
                     f"got {sorted(nonzero)}"
                 )
             if not nonzero:
-                raise ValueError("lfm2 GGUF has no attention layer KV-head count")
+                raise ValueError(f"{canonical_arch} GGUF has no attention layer KV-head count")
             num_kv_heads = nonzero.pop()
         else:
             # Per-layer array → pick the majority value (sliding layers dominate)

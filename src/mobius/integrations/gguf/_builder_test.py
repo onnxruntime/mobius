@@ -4793,6 +4793,10 @@ class TestHybridTensorContract:
             self._FakeGGUF(architecture, metadata, names)
         )
 
+        with pytest.raises(ValueError, match="missing"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(architecture, metadata, names[:-1])
+            )
         with pytest.raises(ValueError, match="unexpected"):
             _raise_for_invalid_hybrid_tensor_contract(
                 self._FakeGGUF(
@@ -4800,6 +4804,14 @@ class TestHybridTensorContract:
                     metadata,
                     [*names, "blk.0.attn_q.weight"],
                 )
+            )
+        mtp_metadata = {
+            **metadata,
+            f"{architecture}.nextn_predict_layers": 1,
+        }
+        with pytest.raises(ValueError, match=r"auxiliary|folded MTP"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(architecture, mtp_metadata, names)
             )
         with pytest.raises(ValueError, match="out_of_range"):
             _raise_for_invalid_hybrid_tensor_contract(
@@ -4809,6 +4821,37 @@ class TestHybridTensorContract:
                     [*names, "blk.2.attn_norm.weight"],
                 )
             )
+        partial_bias = {
+            "nemotron_h": "blk.1.ffn_up.bias",
+            "granitehybrid": "blk.1.attn_q.bias",
+        }.get(architecture)
+        if partial_bias is not None:
+            with pytest.raises(ValueError, match=r"partial .* bias family"):
+                _raise_for_invalid_hybrid_tensor_contract(
+                    self._FakeGGUF(
+                        architecture,
+                        metadata,
+                        [*names, partial_bias],
+                    )
+                )
+
+    def test_nemotron_h_moe_schedule_rejects_with_actionable_error(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        model = self._FakeGGUF(
+            "nemotron_h",
+            {
+                "nemotron_h.block_count": 2,
+                "nemotron_h.attention.head_count_kv": [0, 2],
+                "nemotron_h.feed_forward_length": [0, 128],
+                "nemotron_h.expert_count": 4,
+            },
+            self._second_cohort_names("nemotron_h"),
+        )
+        with pytest.raises(ValueError, match="MoE GGUF import is deferred"):
+            _raise_for_invalid_hybrid_tensor_contract(model)
 
     def test_partial_fused_and_separate_experts_are_rejected(self) -> None:
         from mobius.integrations.gguf._builder import (

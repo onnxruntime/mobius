@@ -1089,6 +1089,60 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
 
     expected = set(required_global)
     allowed = required_global | optional_global
+    if architecture == "nemotron_h" and "moe" in layer_types:
+        raise ValueError(
+            "Nemotron-H MoE GGUF import is deferred; fused softmax MoE is incompatible "
+            "with its sigmoid correction-bias routing"
+        )
+
+    def require_all_or_none(label: str, names: list[str]) -> None:
+        present = sorted(set(names) & actual)
+        if present and len(present) != len(names):
+            missing_family = sorted(set(names) - actual)
+            raise ValueError(
+                f"{architecture} GGUF has a partial {label} bias family: "
+                f"present={present}, missing={missing_family}"
+            )
+
+    recurrent_layers = [
+        index
+        for index, layer_type in enumerate(layer_types)
+        if layer_type in {"mamba", "mamba2"}
+    ]
+    attention_layers = [
+        index for index, layer_type in enumerate(layer_types) if layer_type == "full_attention"
+    ]
+    require_all_or_none(
+        "recurrent convolution",
+        [f"blk.{index}.ssm_conv1d.bias" for index in recurrent_layers],
+    )
+    if architecture == "granitehybrid":
+        require_all_or_none(
+            "attention Q/K/V projection",
+            [
+                f"blk.{index}.attn_{projection}.bias"
+                for index in attention_layers
+                for projection in ("q", "k", "v")
+            ],
+        )
+    if architecture in {"nemotron_h", "granitehybrid"}:
+        require_all_or_none(
+            "attention output projection",
+            [f"blk.{index}.attn_output.bias" for index in attention_layers],
+        )
+    if architecture == "nemotron_h":
+        mlp_layers = [
+            index for index, layer_type in enumerate(layer_types) if layer_type == "mlp"
+        ]
+        require_all_or_none(
+            "dense MLP",
+            [
+                f"blk.{index}.ffn_{projection}.bias"
+                for index in mlp_layers
+                for projection in ("up", "down")
+            ],
+        )
+
     for index, layer_type in enumerate(layer_types):
         prefix = f"blk.{index}."
         required = common | required_by_type[layer_type]
