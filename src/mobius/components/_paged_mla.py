@@ -173,13 +173,23 @@ def paged_attention_rejection(config: ArchitectureConfig) -> str | None:
         return "PagedAttention LATENT requires v_head_dim > 0."
 
     # --- Query-dependent sparse selection is not expressible. ---
-    # The operator has no query-dependent sparse-index input. GLM's DSA indexer
-    # (index_topk / indexer_types / index_n_heads / index_head_dim) is consumed
-    # *only* when use_dsa is active; --glm-full-attention (use_dsa=False) drops
-    # every indexer weight and builds plain dense MLA, so those vestigial config
-    # fields must NOT reject on their own. DeepSeek-V4 CSA/HCA is discriminated
-    # by its own always-on fields (compress_ratios / o_lora_rank / hc_mult).
-    if getattr(config, "use_dsa", False):
+    # The operator has no query-dependent sparse-index input. DSA is *active*
+    # only when use_dsa is set AND an indexer is actually configured (GLM's
+    # index_n_heads/index_head_dim/index_topk/indexer_types). use_dsa alone is
+    # not a discriminator: it defaults True on every ArchitectureConfig and is
+    # vestigial for plain DeepSeek-V2/V3 (whose dense text model never reads it),
+    # so gating on use_dsa alone would wrongly reject DeepSeek-V3. Conversely
+    # --glm-full-attention (use_dsa=False) drops every indexer weight and builds
+    # plain dense MLA, so its still-present indexer config must NOT reject.
+    # DeepSeek-V4 CSA/HCA is discriminated by its own always-on fields
+    # (compress_ratios / o_lora_rank / hc_mult).
+    _indexer_configured = (
+        _has("index_n_heads")
+        or _has("index_head_dim")
+        or _has("index_topk")
+        or bool(getattr(config, "indexer_types", None))
+    )
+    if getattr(config, "use_dsa", False) and _indexer_configured:
         return (
             "PagedAttention LATENT cannot express GLM DeepSeek Sparse Attention "
             "(DSA/IndexShare): query-dependent sparse indices have no operator "
@@ -229,10 +239,14 @@ def paged_attention_rejection(config: ArchitectureConfig) -> str | None:
     l = int(config.kv_lora_rank)  # noqa: E741  (matches oracle naming)
     r = int(config.qk_rope_head_dim)
     head_size = l + r
-    if head_size % 8 != 0:
-        return f"PagedAttention LATENT requires head_size % 8 == 0; got {head_size}."
-    if l % 8 != 0:
-        return f"PagedAttention LATENT requires latent_dim (kv_lora_rank) % 8 == 0; got {l}."
+    # Dense MLA always emits do_rotary=1 with cos/sin caches, so the native
+    # validator's check_rotary_caches applies: head_size shall be a multiple of
+    # 16 (validate.rs:510). Because rotary_dim (r) is a multiple of 16, this
+    # forces kv_lora_rank (l) % 16 == 0 as well.
+    if head_size % 16 != 0:
+        return f"PagedAttention LATENT requires head_size % 16 == 0; got {head_size}."
+    if l % 16 != 0:
+        return f"PagedAttention LATENT requires latent_dim (kv_lora_rank) % 16 == 0; got {l}."
     if not (1 <= l <= head_size):
         return f"PagedAttention LATENT requires 1 <= v_head_size <= head_size; got {l}."
     if r != 0 and r % 16 != 0:

@@ -36,8 +36,8 @@ from mobius.models.deepseek import DeepSeekV3CausalLMModel
 from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
 from mobius.tasks import CausalLMTask
 
-# Paged-eligible tiny MLA geometry: head_size = kv_lora + rope = 32 (% 8 == 0),
-# kv_lora_rank % 8 == 0, qk_rope_head_dim % 16 == 0. Shared by every model here.
+# Paged-eligible tiny MLA geometry: head_size = kv_lora + rope = 32 (% 16 == 0),
+# kv_lora_rank % 16 == 0, qk_rope_head_dim % 16 == 0. Shared by every model here.
 _PAGED_GEOMETRY = dict(
     kv_lora_rank=16,
     qk_nope_head_dim=8,
@@ -84,7 +84,13 @@ def _glm_full_attention_config(**overrides):
 
 
 def _deepseek_config(**overrides):
-    """Tiny DeepSeek-V3 dense-MLA config (proves eligibility is not name-gated)."""
+    """Tiny DeepSeek-V3 dense-MLA config (proves eligibility is not name-gated).
+
+    ``use_dsa`` is intentionally left at its ``True`` default: it is vestigial
+    for plain DeepSeek-V3 (the dense text model never reads it, and no indexer
+    is configured), so the paged export must still qualify — guarding the
+    "use_dsa alone must not reject" regression.
+    """
     defaults = dict(
         model_type="deepseek_v3",
         vocab_size=48,
@@ -107,7 +113,6 @@ def _deepseek_config(**overrides):
         topk_method="noaux_tc",
         norm_topk_prob=True,
         routed_scaling_factor=2.5,
-        use_dsa=False,
     )
     defaults.update(_PAGED_GEOMETRY)
     defaults.update(overrides)
@@ -176,6 +181,11 @@ class TestFeatureOnStructure:
 
     def test_deepseek_v3_emits_paged_not_name_gated(self):
         config = _deepseek_config(export_paged_attention=True)
+        # Regression: use_dsa defaults to True on every config, but plain
+        # DeepSeek-V3 has no indexer configured, so DSA is not active and the
+        # paged export must still qualify (eligibility is property-based, not
+        # gated on the vestigial use_dsa flag or the model name).
+        assert getattr(config, "use_dsa", True) is True
         graph = self._graph(config, model_cls=DeepSeekV3CausalLMModel)
         assert len(_paged_nodes(graph)) == config.num_hidden_layers
 

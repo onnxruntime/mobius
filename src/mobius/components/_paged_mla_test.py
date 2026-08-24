@@ -31,8 +31,8 @@ from mobius.components._paged_mla import (
     paged_attention_rejection,
 )
 
-# Tiny geometry that satisfies the LATENT constraints (head_size % 8 == 0,
-# kv_lora_rank % 8 == 0, qk_rope_head_dim % 16 == 0).
+# Tiny geometry that satisfies the LATENT constraints (head_size % 16 == 0,
+# kv_lora_rank % 16 == 0, qk_rope_head_dim % 16 == 0).
 _TINY = dict(
     hidden_size=64,
     num_attention_heads=2,
@@ -240,9 +240,21 @@ class TestEligibility:
         assert paged_attention_eligible(make_config(**_GLM))
 
     def test_dsa_indexshare_rejected(self):
-        reason = paged_attention_rejection(_cfg(use_dsa=True))
+        # DSA is active only when use_dsa is set AND an indexer is configured.
+        reason = paged_attention_rejection(
+            _cfg(use_dsa=True, index_n_heads=2, index_head_dim=16, index_topk=8)
+        )
         assert reason is not None
         assert "DSA" in reason or "IndexShare" in reason
+
+    def test_deepseek_v3_default_use_dsa_is_eligible(self):
+        # use_dsa defaults True on every config and is vestigial for plain
+        # DeepSeek-V2/V3 (no indexer configured); it must NOT trigger a DSA
+        # rejection, or --features paged-attention would be unusable for
+        # DeepSeek-V3 (its headline target).
+        cfg = _cfg(use_dsa=True)  # no index_* fields => not DSA-active
+        assert paged_attention_rejection(cfg) is None
+        assert paged_attention_eligible(cfg)
 
     def test_vestigial_indexer_config_is_eligible_when_dsa_off(self):
         # --glm-full-attention drops the indexer weights and builds plain dense
@@ -276,18 +288,18 @@ class TestEligibility:
         assert paged_attention_rejection(cfg) is not None
 
     def test_geometry_constraints_rejected(self):
-        # head_size = kv_lora + rope not divisible by 8.
+        # head_size = kv_lora + rope not divisible by 16.
         assert paged_attention_rejection(_cfg(kv_lora_rank=16, qk_rope_head_dim=4)) is not None
         # rope not divisible by 16.
         assert paged_attention_rejection(_cfg(qk_rope_head_dim=8)) is not None
-        # kv_lora not divisible by 8.
-        assert (
-            paged_attention_rejection(_cfg(kv_lora_rank=12, qk_rope_head_dim=16)) is not None
-        )
+        # kv_lora not divisible by 16 (8-aligned but not 16-aligned).
+        assert paged_attention_rejection(_cfg(kv_lora_rank=8, qk_rope_head_dim=16)) is not None
 
     def test_mla_geometry_raises_on_ineligible(self):
         with pytest.raises(ValueError, match="DSA"):
-            mla_paged_geometry(_cfg(use_dsa=True))
+            mla_paged_geometry(
+                _cfg(use_dsa=True, index_n_heads=2, index_head_dim=16, index_topk=8)
+            )
 
 
 class TestGeometry:
