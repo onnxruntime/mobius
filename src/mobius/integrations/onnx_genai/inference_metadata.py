@@ -3390,6 +3390,8 @@ def write_mtp_speculator_metadata(
         )
     target_name = candidates[0]
 
+    from mobius.models.base import effective_tie_word_embeddings
+
     dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
     dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
     quantization = getattr(backbone_config, "quantization", None)
@@ -3399,19 +3401,9 @@ def write_mtp_speculator_metadata(
     quantized_lm_head = bool(
         quantization is not None and getattr(quantization, "quantize_lm_head", False)
     )
-    tied_quantized_head = bool(
-        quantized_embedding
-        and quantized_lm_head
-        and (
-            getattr(backbone_config, "tie_word_embeddings", False)
-            or getattr(quantization, "tie_word_embeddings", False)
-        )
-    )
-    tied_float_head = bool(
-        not quantized_embedding
-        and not quantized_lm_head
-        and getattr(backbone_config, "tie_word_embeddings", False)
-    )
+    effective_tie = effective_tie_word_embeddings(backbone_config)
+    tied_quantized_head = bool(quantized_embedding and quantized_lm_head and effective_tie)
+    tied_float_head = bool(not quantized_embedding and not quantized_lm_head and effective_tie)
     has_zero_point = bool(quantization is not None and not getattr(quantization, "sym", True))
     embedding_initializers = [embedding_weights]
     if quantized_embedding:

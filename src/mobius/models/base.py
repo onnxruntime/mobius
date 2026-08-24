@@ -47,6 +47,20 @@ from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 logger = logging.getLogger(__name__)
 
 
+def effective_tie_word_embeddings(config: ArchitectureConfig) -> bool:
+    """Return the effective embedding/head tie declared by model or quantizer metadata.
+
+    Olive may clear the top-level flag after quantizing a tied table, while
+    preserving the tie in ``quantization.tie_word_embeddings``. A top-level
+    false value therefore does not override an explicit quantization-level tie.
+    """
+    quantization = getattr(config, "quantization", None)
+    return bool(
+        getattr(config, "tie_word_embeddings", False)
+        or (quantization is not None and getattr(quantization, "tie_word_embeddings", False))
+    )
+
+
 def linear_class_for_config(config: ArchitectureConfig):
     """Return the configured quantized linear factory, or ``None`` for float."""
     qc = getattr(config, "quantization", None)
@@ -398,9 +412,7 @@ class CausalLMModel(nn.Module):
         embed_quantized = qc is not None and getattr(qc, "quantize_embeddings", False)
         # Olive RTN may quantize+tie the head while clearing the model's
         # top-level tie flag; recover it from the quantization config.
-        tie = config.tie_word_embeddings or (
-            qc is not None and getattr(qc, "tie_word_embeddings", False)
-        )
+        tie = effective_tie_word_embeddings(config)
         if tie and quantize_lm_head != embed_quantized:
             raise ValueError(
                 "Tied embeddings and LM heads must use compatible storage: "
@@ -433,7 +445,7 @@ class CausalLMModel(nn.Module):
             # graph. Only valid when both are unquantized float tables;
             # quantized embed/head use different packed layouts and are tied
             # by sharing Parameters in TiedQuantizedLMHead above.
-            if config.tie_word_embeddings and not embed_quantized:
+            if tie and not embed_quantized:
                 self.lm_head.weight = self.model.embed_tokens.weight
 
     def _replace_text_model(self, model: nn.Module) -> None:
@@ -446,7 +458,7 @@ class CausalLMModel(nn.Module):
                 self.config.vocab_size,
             )
         elif (
-            self.config.tie_word_embeddings
+            effective_tie_word_embeddings(self.config)
             and isinstance(self.lm_head, Linear)
             and isinstance(self.model.embed_tokens, Embedding)
         ):
@@ -490,7 +502,7 @@ class CausalLMModel(nn.Module):
         return preprocess_quantized_weights(
             state_dict,
             qc,
-            tie_embeddings=self.config.tie_word_embeddings,
+            tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=None,
         )
 

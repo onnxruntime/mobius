@@ -2345,7 +2345,7 @@ class TestMtpSpeculatorMetadata:
         from mobius._configs import QuantizationConfig
 
         _seed_backbone_metadata(tmp_path)
-        backbone = _MtpBackboneConfig(tie_word_embeddings=True)
+        backbone = _MtpBackboneConfig(tie_word_embeddings=False)
         backbone.quantization = QuantizationConfig(
             bits=4,
             group_size=32,

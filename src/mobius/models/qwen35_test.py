@@ -123,7 +123,7 @@ class TestQwen35TiedHeadRebinding:
     def test_affine_quantized_tied_head_owns_only_embedding_initializers(self, model_class):
         from mobius._builder import build_from_module
 
-        config = _text_config(_affine_tied_quantization(), tie_word_embeddings=True)
+        config = _text_config(_affine_tied_quantization(), tie_word_embeddings=False)
         module = model_class(config)
 
         assert isinstance(module.model.embed_tokens, QuantizedEmbedding)
@@ -143,6 +143,75 @@ class TestQwen35TiedHeadRebinding:
         op_types = {node.op_type for node in model.graph}
         assert "GatherBlockQuantized" in op_types
         assert "MatMulNBits" in op_types
+
+    @pytest.mark.parametrize(
+        "model_class",
+        [Qwen35CausalLMModel, Qwen35MoECausalLMModel],
+    )
+    def test_quantization_only_float_tie_saves_and_matches_shared_table(
+        self, model_class, tmp_path: Path
+    ):
+        from mobius._builder import build_from_module
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method="olive",
+            sym=False,
+            tie_word_embeddings=True,
+        )
+        config = _text_config(
+            quantization,
+            tie_word_embeddings=False,
+            output_final_hidden_state=True,
+        )
+        module = model_class(config)
+        assert module.lm_head.weight is module.model.embed_tokens.weight
+
+        table = torch.linspace(
+            -0.25,
+            0.5,
+            config.vocab_size * _H,
+            dtype=torch.float32,
+        ).reshape(config.vocab_size, _H)
+        processed = module.preprocess_weights({"model.embed_tokens.weight": table})
+        assert processed["lm_head.weight"] is processed["model.embed_tokens.weight"]
+
+        package = build_from_module(module, config, task=module.default_task)
+        model = package["model"]
+        assert "model.embed_tokens.weight" in model.graph.initializers
+        assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
+        _fill_zero_weights(model)
+        model.graph.initializers["model.embed_tokens.weight"].const_value = ir.tensor(
+            table.numpy()
+        )
+
+        session = OnnxModelSession(model)
+        try:
+            output = session.run(
+                {
+                    "input_ids": np.array([[1]], dtype=np.int64),
+                    "attention_mask": np.ones((1, 1), dtype=np.int64),
+                    "position_ids": np.array([[0]], dtype=np.int64),
+                    "past_key_values.0.key": np.zeros((1, 2, 0, 8), dtype=np.float32),
+                    "past_key_values.0.value": np.zeros((1, 2, 0, 8), dtype=np.float32),
+                }
+            )
+        finally:
+            session.close()
+
+        expected = output["mtp_seed"] @ table.numpy().T
+        np.testing.assert_allclose(output["logits"], expected, rtol=1e-5, atol=1e-5)
+
+        output_dir = tmp_path / f"{model_class.__name__}-float"
+        package.save(str(output_dir), progress_bar=False, check_weights=True)
+        reloaded = ModelPackage.load(str(output_dir))["model"]
+        assert "model.embed_tokens.weight" in reloaded.graph.initializers
+        assert not any(name.startswith("lm_head.") for name in reloaded.graph.initializers)
+        assert all(
+            value.const_value is not None for value in reloaded.graph.initializers.values()
+        )
 
     @pytest.mark.parametrize(
         "model_class",
@@ -194,7 +263,7 @@ class TestQwen35TiedHeadRebinding:
     ):
         from mobius._builder import build_from_module
 
-        config = _text_config(_affine_tied_quantization(), tie_word_embeddings=True)
+        config = _text_config(_affine_tied_quantization(), tie_word_embeddings=False)
         module = model_class(config)
         package = build_from_module(module, config, task=module.default_task)
         _fill_zero_weights(package["model"])
@@ -224,7 +293,7 @@ class TestQwen35TiedHeadRebinding:
 
         config = _text_config(
             _affine_tied_quantization(),
-            tie_word_embeddings=True,
+            tie_word_embeddings=False,
             output_final_hidden_state=True,
         )
         module = model_class(config)
