@@ -35,7 +35,9 @@ __all__ = [
     "iter_quant_specs",
     "lm_head_preserve_type_names",
     "native_block_format",
+    "quant_import_decision",
     "quant_spec_by_name",
+    "render_quant_support_matrix",
 ]
 
 import functools
@@ -45,8 +47,11 @@ from mobius.integrations.gguf._spec import (
     AffineRepackSpec,
     GGUFQuantSpec,
     NativeBlockSpec,
+    QuantImportRoute,
+    RepackExactness,
     StorageRole,
     Support,
+    TensorRole,
 )
 from mobius.integrations.gguf._upstream import upstream_quant_types
 
@@ -54,7 +59,8 @@ from mobius.integrations.gguf._upstream import upstream_quant_types
 # mobius capabilities, keyed by upper-case ggml type name
 # ---------------------------------------------------------------------------
 
-#: Types the runtime reads in their serialized GGUF block layout. The block
+#: Types whose serialized GGUF block layout matches ``BlockQuantizedMatMul``.
+#: This is an operator-ABI statement, not real-weight runtime evidence. The block
 #: geometry is *not* repeated here — it is asserted against the pinned census
 #: when the spec is constructed, so a wrong byte count is a test failure.
 _NATIVE_BLOCK_FORMATS: MappingProxyType[str, str] = MappingProxyType(
@@ -96,6 +102,41 @@ _AFFINE_REPACK_TARGETS: MappingProxyType[str, AffineRepackSpec] = MappingProxyTy
     }
 )
 
+# Primary projection/output route for every active stored qtype at the pin.
+# Keeping this census literal is intentional: adding an upstream qtype must fail
+# closure tests until its importer behavior is reviewed explicitly.
+_STORED_ROUTE_POLICY: MappingProxyType[
+    str, tuple[QuantImportRoute, RepackExactness | None]
+] = MappingProxyType(
+    {
+        "Q4_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
+        "Q4_1": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
+        "Q5_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q5_1": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q8_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
+        "Q2_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q3_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q4_K": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
+        "Q5_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q6_K": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
+        "TQ1_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "TQ2_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "IQ4_NL": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ4_XS": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ3_S": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ3_XXS": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ2_XXS": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ2_XS": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ2_S": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ1_S": (QuantImportRoute.NATIVE_BYTES, None),
+        "IQ1_M": (QuantImportRoute.NATIVE_BYTES, None),
+        "MXFP4": (QuantImportRoute.NATIVE_BYTES, None),
+        "NVFP4": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
+        "Q1_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
+        "Q2_0": (QuantImportRoute.REJECTED, None),
+    }
+)
+
 #: Types whose presence forces the shared graph scaffolding to carry explicit
 #: ``zero_points``, even when the file is otherwise made of runtime-native
 #: blocks. These are the formats whose GGUF dequantization uses a non-zero
@@ -121,29 +162,9 @@ _REQUIRES_EXPLICIT_ZERO_POINT: frozenset[str] = frozenset(
 #: the two tables above because the head is also allowed to ride the generic
 #: requantization path.
 _LM_HEAD_PRESERVE: frozenset[str] = frozenset(
-    {
-        "Q1_0",
-        "Q2_K",
-        "Q3_K",
-        "Q4_0",
-        "Q4_1",
-        "Q4_K",
-        "Q5_0",
-        "Q5_1",
-        "Q5_K",
-        "Q6_K",
-        "Q8_0",
-        "MXFP4",
-        "IQ4_NL",
-        "IQ4_XS",
-        "IQ3_S",
-        "IQ3_XXS",
-        "IQ2_XXS",
-        "IQ2_XS",
-        "IQ2_S",
-        "IQ1_S",
-        "IQ1_M",
-    }
+    name
+    for name, (route, _) in _STORED_ROUTE_POLICY.items()
+    if route is not QuantImportRoute.REJECTED
 )
 
 #: Upstream ``gguf_role`` strings → :class:`StorageRole`. The census stores the
@@ -229,6 +250,7 @@ def _specs() -> MappingProxyType[int, GGUFQuantSpec]:
                 bytes=upstream.block_bytes,
             )
         )
+        route, exactness = _STORED_ROUTE_POLICY.get(name, (QuantImportRoute.REJECTED, None))
         specs[type_id] = GGUFQuantSpec(
             ggml_type_id=type_id,
             name=name,
@@ -238,6 +260,8 @@ def _specs() -> MappingProxyType[int, GGUFQuantSpec]:
             dequantize=verdict,
             native_preserve=native,
             affine_repack=_AFFINE_REPACK_TARGETS.get(name),
+            import_route=route,
+            repack_exactness=exactness,
             requires_explicit_zero_point=name in _REQUIRES_EXPLICIT_ZERO_POINT,
             lm_head_preserve=name in _LM_HEAD_PRESERVE,
             reason=reason,
@@ -285,6 +309,133 @@ def native_block_format(ggml_type: object) -> str | None:
     return spec.native_preserve.format
 
 
+def quant_import_decision(
+    ggml_type: object,
+    tensor_role: TensorRole,
+    *,
+    target_bits: int | None = None,
+    target_block_size: int | None = None,
+) -> tuple[QuantImportRoute, RepackExactness | None, str]:
+    """Return the enforced importer route for a qtype and tensor role."""
+    spec = get_quant_spec(ggml_type)
+    if spec is None:
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            "The ggml type id is outside the pinned llama.cpp census.",
+        )
+    if not spec.is_quantized_storage:
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            f"{spec.name} is {spec.role.value}, not readable quantized weight storage.",
+        )
+    if spec.import_route is QuantImportRoute.REJECTED:
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            spec.reason
+            or (
+                f"{spec.name} has no trustworthy decoder or compatible runtime kernel. "
+                "Re-quantize to a supported qtype."
+            ),
+        )
+    if (
+        tensor_role
+        in {
+            TensorRole.AFFINE_PROJECTION,
+            TensorRole.EMBEDDING,
+        }
+        and spec.native_preserve is not None
+    ):
+        if spec.dequantize is Support.SUPPORTED:
+            return (
+                QuantImportRoute.DEQUANTIZE_REQUANTIZE,
+                None,
+                (
+                    "GatherBlockQuantized does not consume BlockQuantizedMatMul's "
+                    "native GGUF byte ABI; the embedding must use the affine Gather ABI."
+                    if tensor_role is TensorRole.EMBEDDING
+                    else "This graph exposes only the affine MatMulNBits ABI, not "
+                    "BlockQuantizedMatMul's native GGUF byte ABI."
+                ),
+            )
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            (
+                "The native projection ABI is not valid for GatherBlockQuantized, and "
+                "no trusted decoder is available for conversion."
+            ),
+        )
+    if tensor_role is TensorRole.NON_MATMUL:
+        if spec.dequantize is Support.SUPPORTED:
+            return (
+                QuantImportRoute.DEQUANTIZE_FLOAT,
+                None,
+                "Non-MatMul tensors are dequantized to float; no packed runtime ABI applies.",
+            )
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            "This non-MatMul tensor cannot remain quantized and has no trusted decoder.",
+        )
+    if tensor_role is TensorRole.EXPERT:
+        if spec.native_preserve is not None:
+            return (
+                QuantImportRoute.NATIVE_BYTES,
+                None,
+                (
+                    "Allowed only when the expert-major source is contiguous and maps "
+                    "to complete per-expert projection rows."
+                ),
+            )
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            (
+                "Only contiguous native expert-major blocks have a complete packed-tensor "
+                "route. Rebuild with keep_quantized=False for float expert normalization."
+            ),
+        )
+    target = (
+        None
+        if target_bits is None or target_block_size is None
+        else (target_bits, target_block_size)
+    )
+    if (
+        target is not None
+        and spec.affine_repack is not None
+        and spec.affine_repack.as_params() != target
+    ):
+        if spec.dequantize is Support.SUPPORTED:
+            return (
+                QuantImportRoute.DEQUANTIZE_REQUANTIZE,
+                RepackExactness.LOSSY,
+                (
+                    f"The exact {spec.repack_params} affine layout does not match target "
+                    f"{target}; conversion through float is lossy."
+                ),
+            )
+        return (
+            QuantImportRoute.REJECTED,
+            None,
+            (
+                f"The exact {spec.repack_params} affine layout does not match target "
+                f"{target}, and no trusted decoder is available."
+            ),
+        )
+    return (
+        spec.import_route,
+        spec.repack_exactness,
+        (
+            "The runtime operator consumes the exact GGUF block bytes."
+            if spec.import_route is QuantImportRoute.NATIVE_BYTES
+            else "The source is converted through the declared affine/runtime target."
+        ),
+    )
+
+
 def affine_repack_target(ggml_type: object) -> AffineRepackSpec | None:
     """Return the ``MatMulNBits`` repack target for a type, if it has one."""
     spec = get_quant_spec(ggml_type)
@@ -318,3 +469,28 @@ def explicit_zero_point_type_names() -> frozenset[str]:
     return frozenset(
         spec.name for spec in iter_quant_specs() if spec.requires_explicit_zero_point
     )
+
+
+def render_quant_support_matrix() -> str:
+    """Render the active stored-qtype policy table for generated documentation."""
+    rows = [
+        (
+            "| Stored qtype | ID | Projection/output route | Direct exactness | "
+            "Embedding route | Expert-major route | Non-MatMul route | Runtime |"
+        ),
+        "|---|---:|---|---|---|---|---|---|",
+    ]
+    for spec in iter_quant_specs():
+        if not spec.is_quantized_storage:
+            continue
+        projection = quant_import_decision(spec.ggml_type_id, TensorRole.PROJECTION)[0]
+        embedding = quant_import_decision(spec.ggml_type_id, TensorRole.EMBEDDING)[0]
+        expert = quant_import_decision(spec.ggml_type_id, TensorRole.EXPERT)[0]
+        other = quant_import_decision(spec.ggml_type_id, TensorRole.NON_MATMUL)[0]
+        exactness = "—" if spec.repack_exactness is None else spec.repack_exactness.value
+        rows.append(
+            f"| `{spec.name}` | {spec.ggml_type_id} | {projection.value} | "
+            f"{exactness} | {embedding.value} | {expert.value} | {other.value} | "
+            f"{spec.runtime.value} |"
+        )
+    return "\n".join(rows)

@@ -30,7 +30,7 @@ _VOCAB = 100
 _BLOCK_COUNT = 2  # 1 decoder layer + 1 nextn head block
 
 
-def _write_qwen35_mtp_gguf(path: Path) -> None:
+def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False) -> None:
     """Write a tiny ``qwen35`` GGUF with a trailing ``blk.1.nextn.*`` MTP head."""
     from gguf import GGUFWriter
 
@@ -51,27 +51,39 @@ def _write_qwen35_mtp_gguf(path: Path) -> None:
     def f32(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
 
+    def weight(name: str, shape: tuple[int, int]) -> None:
+        if not quantized:
+            f32(name, shape)
+            return
+        from gguf import GGMLQuantizationType
+
+        n_out, k_in = shape
+        raw = np.zeros((n_out, k_in // 32 * 18), dtype=np.uint8)
+        raw[:, ::18] = np.array([0.5], dtype=np.float16).view(np.uint8)[0]
+        raw[:, 1::18] = np.array([0.5], dtype=np.float16).view(np.uint8)[1]
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
     def _add_decoder_block(idx: int) -> None:
         # Qwen3.5 uses doubled-Q output gating: q_proj emits 2 * num_heads *
         # head_dim rows (gate + query).
-        f32(f"blk.{idx}.attn_q.weight", (2 * _NH * _HD, _H))
-        f32(f"blk.{idx}.attn_k.weight", (_NKV * _HD, _H))
-        f32(f"blk.{idx}.attn_v.weight", (_NKV * _HD, _H))
-        f32(f"blk.{idx}.attn_output.weight", (_H, _NH * _HD))
+        weight(f"blk.{idx}.attn_q.weight", (2 * _NH * _HD, _H))
+        weight(f"blk.{idx}.attn_k.weight", (_NKV * _HD, _H))
+        weight(f"blk.{idx}.attn_v.weight", (_NKV * _HD, _H))
+        weight(f"blk.{idx}.attn_output.weight", (_H, _NH * _HD))
         f32(f"blk.{idx}.attn_q_norm.weight", (_HD,))
         f32(f"blk.{idx}.attn_k_norm.weight", (_HD,))
         f32(f"blk.{idx}.attn_norm.weight", (_H,))
         f32(f"blk.{idx}.post_attention_norm.weight", (_H,))
-        f32(f"blk.{idx}.ffn_gate.weight", (_FFN, _H))
-        f32(f"blk.{idx}.ffn_up.weight", (_FFN, _H))
-        f32(f"blk.{idx}.ffn_down.weight", (_H, _FFN))
+        weight(f"blk.{idx}.ffn_gate.weight", (_FFN, _H))
+        weight(f"blk.{idx}.ffn_up.weight", (_FFN, _H))
+        weight(f"blk.{idx}.ffn_down.weight", (_H, _FFN))
 
     # Decoder layer 0.
     _add_decoder_block(0)
 
     # MTP head block (index 1): the nextn cross-conditioning tensors plus a
     # full attention/FFN sublayer.
-    f32("blk.1.nextn.eh_proj.weight", (_H, 2 * _H))
+    weight("blk.1.nextn.eh_proj.weight", (_H, 2 * _H))
     f32("blk.1.nextn.enorm.weight", (_H,))
     f32("blk.1.nextn.hnorm.weight", (_H,))
     f32("blk.1.nextn.shared_head_norm.weight", (_H,))
@@ -195,6 +207,20 @@ class TestBuildMtpHead:
             if value.const_value is None
         ]
         assert not missing, f"initializers missing weights: {missing}"
+
+    def test_quantized_head_preserves_all_projection_weights(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "tiny_qwen35_quantized_mtp.gguf"
+        _write_qwen35_mtp_gguf(path, quantized=True)
+
+        pkg = build_from_gguf(str(path), keep_quantized=True)
+        head = pkg.mtp_head["model"]
+        op_types = [node.op_type for node in head.graph]
+
+        assert op_types.count("MatMulNBits") == 8
+        assert "fc.weight" in head.graph.initializers
+        assert "fc.scales" in head.graph.initializers
 
     def test_no_head_when_gguf_lacks_nextn(self):
         # A config with no MTP metadata must not build a head.

@@ -123,10 +123,10 @@ execution-provider-dependent.
 
 F32-, F16-, and BF16-only GGUFs use the normal float import path even though
 `keep_quantized=True` is the default: there is no quantization to preserve.
-Quantized GGUFs containing only qtypes with no supported preservation target
-(for example, pure Q6_K or Q5_K weights) fail with an actionable error rather
-than silently becoming float. Pass `keep_quantized=False` to request that float
-conversion explicitly.
+Quantized GGUFs whose qtypes have no trustworthy decoder or compatible runtime
+kernel (currently `Q2_0`) fail with an actionable error. Decoder-backed formats
+such as `Q5_K` use the explicit dequantize/requantize route; they are not
+silently treated as preserved source quantization.
 
 ## Supported GGUF Architectures
 
@@ -226,19 +226,90 @@ implemented and validated. These include fused/interleaved or dual-form QKV
 ## Supported stored quantization types
 
 `mobius/integrations/gguf/_quant_registry.py` covers all 43 `ggml_type` slots
-at the same pinned commit and answers four separate questions per slot:
-whether the GGUF parse layer can read it, whether it can be dequantized to
-float, whether its blocks are handed to the runtime unchanged, and whether it
-can be repacked into a `MatMulNBits` affine layout.
+and all 25 active storage-quantized types at the same pinned commit. Every
+stored qtype has one explicit projection/output route. The table is generated
+from that registry and checked byte-for-byte by `_quant_registry_test.py`.
 
-- **Repacked to `MatMulNBits`**: `Q4_0`, `Q4_1`, `Q8_0`, `Q4_K`, `Q6_K`, `Q1_0`.
-- **Preserved byte-for-byte**: `MXFP4`, `IQ4_NL`, `IQ4_XS`, `IQ3_S`, `IQ3_XXS`,
-  `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ1_S`, `IQ1_M`.
-- **Rejected**: the eight retired slots (`Q4_2`, `Q4_3`, `Q4_0_4_4`,
-  `Q4_0_4_8`, `Q4_0_8_8`, `IQ4_NL_4_4`, `IQ4_NL_4_8`, `IQ4_NL_8_8`), which have
-  a block size of 0 and are unreadable at the GGUF parse layer, and `Q8_1` /
-  `Q8_K`, which are compute-only intermediates that are never valid weight
-  storage.
+<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->
+
+| Stored qtype | ID | Projection/output route | Direct exactness | Embedding route | Expert-major route | Non-MatMul route | Runtime |
+|---|---:|---|---|---|---|---|---|
+| `Q4_0` | 2 | affine repack | exact | affine repack | rejected | dequantize to float | deferred |
+| `Q4_1` | 3 | affine repack | lossy | affine repack | rejected | dequantize to float | deferred |
+| `Q5_0` | 6 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `Q5_1` | 7 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `Q8_0` | 8 | affine repack | exact | affine repack | rejected | dequantize to float | deferred |
+| `Q2_K` | 10 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `Q3_K` | 11 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `Q4_K` | 12 | affine repack | lossy | affine repack | rejected | dequantize to float | deferred |
+| `Q5_K` | 13 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `Q6_K` | 14 | affine repack | lossy | affine repack | rejected | dequantize to float | deferred |
+| `IQ2_XXS` | 16 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ2_XS` | 17 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ3_XXS` | 18 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ1_S` | 19 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ4_NL` | 20 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ3_S` | 21 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ2_S` | 22 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ4_XS` | 23 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `IQ1_M` | 29 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `TQ1_0` | 34 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `TQ2_0` | 35 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `MXFP4` | 39 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
+| `NVFP4` | 40 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `Q1_0` | 41 | affine repack | exact | affine repack | rejected | rejected | deferred |
+| `Q2_0` | 42 | rejected | — | rejected | rejected | rejected | deferred |
+
+<!-- END GGUF QUANTIZATION MATRIX -->
+
+`Q4_0`, `Q8_0`, and mainline `Q1_0` have exact formulas when the graph uses
+their direct affine target. Exactness is target-dependent: normalizing `Q8_0`
+to a mixed graph's 4-bit/block-32 target is lossy, while `Q1_0` is rejected
+when its exact 2-bit/block-128 target cannot be used because it has no decoder.
+`Q4_1` rounds its floating source offset to an integer zero point; `Q4_K` and
+`Q6_K` are decoded and requantized to 4-bit/block-32, so those direct affine
+routes are lossy. The remaining dequantize/requantize routes use the pinned
+`gguf-py` decoder and a 4-bit/block-32 target. `Q2_0` is rejected because the
+pinned package has neither a decoder nor a compatible runtime kernel.
+
+Native bytes are only valid for compatible `BlockQuantizedMatMul`
+projection/output weights. They are not a `GatherBlockQuantized` embedding
+ABI. Tied input/output weights may share one affine table, but native projection
+support does not make the embedding native. Native expert-major tensors are
+accepted only when the source is contiguous and maps to complete per-expert
+projection rows. Non-native expert-major tensors are rejected in quantized mode
+until a complete split-and-repack path exists; `keep_quantized=False` retains
+the existing float normalization path. Norms, biases, and other non-MatMul
+tensors are dequantized to float or rejected. Runtime remains **deferred** until
+real-weight ONNX Runtime execution is recorded; graph construction and operator
+ABI matching are not runtime evidence.
+
+### Representative mixed-qtype evidence
+
+The following file was downloaded and inspected; its preset name was not used
+to infer tensor formats:
+
+- Repository: `lmstudio-community/Qwen2.5-0.5B-Instruct-GGUF`
+- Revision: `3b32d0bf1ac136098d417677c7d757360f1ceb6b`
+- Filename: `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf`
+- Size: `397807936` bytes
+- LFS SHA-256: `fa4d41b65761ed565cac6b5f62e35135d050408b033114a128ab308c02b2e83a`
+- Tensor inventory: 290 tensors: 121 `F32`, 132 `Q5_0`, 12 `Q4_K`,
+  12 `Q6_K`, and 13 `Q8_0`
+- Element inventory: 71,552 `F32`; 251,854,848 `Q5_0`; 52,297,728
+  `Q4_K`; 52,297,728 `Q6_K`; 137,510,912 `Q8_0`
+- Build evidence: direct import produced one model with 169 `MatMulNBits`
+  nodes, one `GatherBlockQuantized` node, and no `BlockQuantizedMatMul` nodes
+
+This file therefore takes mixed routes: `Q4_K`/`Q6_K` use their declared lossy
+affine conversion, `Q5_0` dequantizes/requantizes, and `Q8_0` is converted to
+the graph's common 4-bit/block-32 target rather than retaining its standalone
+8-bit affine layout. This is build evidence, not runtime execution evidence.
+
+The eight retired slots (`Q4_2`, `Q4_3`, `Q4_0_4_4`, `Q4_0_4_8`,
+`Q4_0_8_8`, `IQ4_NL_4_4`, `IQ4_NL_4_8`, `IQ4_NL_8_8`) have block size zero
+and are unreadable. `Q8_1` and `Q8_K` are compute-only intermediates, never
+valid GGUF weight storage.
 
 
 ## NVIDIA Nemotron 3.5 Lightning waiver

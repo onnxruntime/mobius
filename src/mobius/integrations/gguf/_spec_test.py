@@ -16,6 +16,8 @@ from mobius.integrations.gguf._spec import (
     GGUFArchitectureSpec,
     GGUFQuantSpec,
     NativeBlockSpec,
+    QuantImportRoute,
+    RepackExactness,
     StorageRole,
     Support,
 )
@@ -88,7 +90,11 @@ class TestQuantSpecValidation:
         return GGUFQuantSpec(**fields)
 
     def test_a_minimal_quantized_spec_is_accepted(self) -> None:
-        spec = self._quantized(affine_repack=AffineRepackSpec(4, 32))
+        spec = self._quantized(
+            affine_repack=AffineRepackSpec(4, 32),
+            import_route=QuantImportRoute.AFFINE_REPACK,
+            repack_exactness=RepackExactness.LOSSY,
+        )
         assert spec.readable
         assert spec.repack_params == (4, 32)
 
@@ -120,13 +126,20 @@ class TestQuantSpecValidation:
             self._quantized(
                 native_preserve=NativeBlockSpec("q4_k", 256, 144),
                 affine_repack=AffineRepackSpec(4, 32),
+                import_route=QuantImportRoute.NATIVE_BYTES,
             )
 
     def test_native_geometry_must_match_upstream(self) -> None:
         with pytest.raises(ValueError, match="must match the upstream block size"):
-            self._quantized(native_preserve=NativeBlockSpec("q4_k", 32, 144))
+            self._quantized(
+                native_preserve=NativeBlockSpec("q4_k", 32, 144),
+                import_route=QuantImportRoute.NATIVE_BYTES,
+            )
         with pytest.raises(ValueError, match="must match the upstream type size"):
-            self._quantized(native_preserve=NativeBlockSpec("q4_k", 256, 17))
+            self._quantized(
+                native_preserve=NativeBlockSpec("q4_k", 256, 17),
+                import_route=QuantImportRoute.NATIVE_BYTES,
+            )
 
     def test_preservation_flags_require_quantized_storage(self) -> None:
         with pytest.raises(ValueError, match="lm_head_preserve only applies"):

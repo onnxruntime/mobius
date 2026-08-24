@@ -51,7 +51,7 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import Qwen35MtpConfig
 from mobius.components import Linear, create_attention_bias, initialize_rope
 from mobius.components._rms_norm import OffsetRMSNorm
-from mobius.models.qwen35 import Qwen35DecoderLayer
+from mobius.models.qwen35 import Qwen35DecoderLayer, _linear_factory
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -90,7 +90,8 @@ class Qwen35MtpModel(nn.Module):
         # Input projection: fuse the token embedding with the target hidden.
         self.pre_fc_norm_embedding = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = OffsetRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.fc = Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        linear_class = _linear_factory(config) or Linear
+        self.fc = linear_class(2 * config.hidden_size, config.hidden_size, bias=False)
 
         # The single full-attention MTP decoder layer.
         self.layers = nn.ModuleList([Qwen35DecoderLayer(config, layer_idx=0)])

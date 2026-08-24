@@ -228,12 +228,30 @@ def _write_quantized_gguf(
         _add_q4_0("token_embd.weight", vocab_size, hidden_size)
     elif embedding_quantization == "q8_0":
         _add_q8_0("token_embd.weight", vocab_size, hidden_size)
+    elif embedding_quantization == "q5_1":
+        _add_q5_1("token_embd.weight", vocab_size, hidden_size)
+    elif embedding_quantization == "iq4_nl":
+        block_bytes = 18
+        n_blocks = (hidden_size + 31) // 32
+        raw = np.zeros((vocab_size, n_blocks * block_bytes), dtype=np.uint8)
+        scale = np.array([1.0], dtype=np.float16).view(np.uint8)
+        for block_index in range(n_blocks):
+            offset = block_index * block_bytes
+            raw[:, offset : offset + 2] = scale
+        writer.add_tensor(
+            "token_embd.weight",
+            raw,
+            raw_dtype=GGMLQuantizationType.IQ4_NL,
+        )
+    elif embedding_quantization is not None:
+        _add_native("token_embd.weight", vocab_size, hidden_size, embedding_quantization)
     else:
         add_float("token_embd.weight", (vocab_size, hidden_size))
 
-    if projection_quantization in {"q4_0", "q8_0"}:
+    if projection_quantization in {"q4_0", "q5_1", "q8_0"}:
         add_projection = {
             "q4_0": _add_q4_0,
+            "q5_1": _add_q5_1,
             "q8_0": _add_q8_0,
         }[projection_quantization]
     elif projection_quantization in {"f32", "f16", "bf16"}:
@@ -337,6 +355,14 @@ def q4_0_tied_embedding_gguf(tmp_path: Path) -> Path:
     """Create a GGUF with one Q4_0 table shared by embedding and LM head."""
     path = tmp_path / "test_q4_0_tied_embedding.gguf"
     _write_quantized_gguf(path, quantize_embedding=True, tie_embeddings=True)
+    return path
+
+
+@pytest.fixture
+def iq4_nl_embedding_gguf(tmp_path: Path) -> Path:
+    """Create a native-IQ embedding with ordinary Q4_0 projections."""
+    path = tmp_path / "test_iq4_nl_embedding.gguf"
+    _write_quantized_gguf(path, embedding_quantization="iq4_nl")
     return path
 
 
@@ -1044,6 +1070,12 @@ class TestReuseGgufWeights:
         assert final_model.read_bytes() == b"new model"
         assert final_manifest.read_bytes() == b"new manifest"
         assert not final_sidecar.exists()
+@pytest.fixture
+def q5_1_gguf(tmp_path: Path) -> Path:
+    """Create a GGUF whose projections require dequantize/requantize."""
+    path = tmp_path / "test_q5_1.gguf"
+    _write_quantized_gguf(path, projection_quantization="q5_1")
+    return path
 
 
 class TestBuildQuantizedGguf:
@@ -1086,6 +1118,23 @@ class TestBuildQuantizedGguf:
             .const_value
             is not None
         )
+
+    def test_decoder_backed_qtype_build_save_reload(
+        self, q5_1_gguf: Path, tmp_path: Path
+    ) -> None:
+        """A pure Q5_1 file uses the declared 4-bit requantization route."""
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        output_dir = tmp_path / "saved_q5_1"
+        package = build_from_gguf(q5_1_gguf)
+        package.save(str(output_dir), progress_bar=False)
+        model = ModelPackage.load(str(output_dir))["model"]
+
+        quantized_nodes = [node for node in model.graph if node.op_type == "MatMulNBits"]
+        assert quantized_nodes
+        assert all(node.attributes["bits"].value == 4 for node in quantized_nodes)
+        assert all(node.attributes["block_size"].value == 32 for node in quantized_nodes)
 
     def test_float_only_default_uses_float_path(self, float_only_gguf: Path):
         """F32/BF16-only GGUFs do not fail when preservation is the default."""
@@ -1252,9 +1301,20 @@ class TestBuildQuantizedGguf:
             ]
         )
         np.testing.assert_allclose(actual, expected)
-
         wrong = _run_gather_block_quantized(tmp_path, zero_point=0x00).astype(np.float32)
         assert not np.allclose(wrong, expected)
+
+    def test_native_projection_abi_embedding_is_converted_to_gather(
+        self, iq4_nl_embedding_gguf: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        model = build_from_gguf(iq4_nl_embedding_gguf)["model"]
+        gather_nodes = [node for node in model.graph if node.op_type == "GatherBlockQuantized"]
+
+        assert len(gather_nodes) == 1
+        assert "model.embed_tokens.qweight" in model.graph.initializers
+        assert "model.embed_tokens.weight" not in model.graph.initializers
 
     def test_tied_quantized_embedding_drives_matmulnbits_head(
         self, q4_0_tied_embedding_gguf: Path
@@ -1383,6 +1443,36 @@ class TestBuildQuantizedGguf:
 
         assert not _can_quantize_embedding(model, "llama", bits=4, block_size=128)
 
+    def test_decoder_backed_embedding_uses_affine_gather_target(self, monkeypatch):
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf import _tencent_q1_0
+        from mobius.integrations.gguf._builder import _can_quantize_embedding
+
+        monkeypatch.setattr(_tencent_q1_0, "is_tencent_q1_0_layout", lambda _model: False)
+        tensor = SimpleNamespace(
+            name="token_embd.weight",
+            tensor_type=GGMLQuantizationType.Q5_1,
+            shape=(64, 256),
+        )
+        model = SimpleNamespace(_reader=SimpleNamespace(tensors=[tensor]))
+
+        assert _can_quantize_embedding(model, "llama", bits=4, block_size=32)
+
+    def test_decoder_backed_output_head_stays_quantized(self):
+        from mobius.integrations.gguf._builder import _can_quantize_lm_head
+
+        class _OutputModel:
+            def tensor_items_raw(self):
+                yield (
+                    "output.weight",
+                    np.empty(0, dtype=np.uint8),
+                    SimpleNamespace(name="TQ1_0"),
+                    (256, 64),
+                )
+
+        assert _can_quantize_lm_head(_OutputModel(), "llama")
+
     def test_detect_q4_k_m_mixed_profile(self):
         """Q4_K presence selects a 4-bit target despite more Q5_0 tensors."""
         from gguf import GGMLQuantizationType
@@ -1408,8 +1498,8 @@ class TestBuildQuantizedGguf:
         bits, block_size, is_sym = _detect_quant_params(_MixedModel(), "llama")
         assert (bits, block_size, is_sym) == (4, 32, False)
 
-    def test_unsupported_quant_type_requires_explicit_dequantization(self):
-        """Unsupported quantized inputs fail instead of silently becoming float."""
+    def test_decoder_backed_qtype_selects_explicit_requantization_target(self):
+        """A decoder-backed qtype takes the declared 4-bit requantization route."""
         from gguf import GGMLQuantizationType
 
         from mobius.integrations.gguf._builder import _detect_quant_params
@@ -1423,15 +1513,61 @@ class TestBuildQuantizedGguf:
                     (64, 128),
                 )
 
+        assert _detect_quant_params(_UnsupportedModel(), "llama") == (4, 32, False)
+
+    def test_qtype_without_decoder_or_kernel_is_rejected_actionably(self):
+        import enum
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _PinnedQType(enum.IntEnum):
+            Q2_0 = 42
+
+        class _Q20Model:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    _PinnedQType.Q2_0,
+                    (64, 128),
+                )
+
         with pytest.raises(
             ValueError,
-            match=(
-                r"No supported quantized preservation target for GGUF weight "
-                r"types: Q5_K. Use keep_quantized=False \(API\) or "
-                r"--dequantize \(CLI\) for explicit float import."
-            ),
+            match=r"Q2_0: gguf-py ships no Python dequantizer.*Re-quantize",
         ):
-            _detect_quant_params(_UnsupportedModel(), "llama")
+            _detect_quant_params(_Q20Model(), "llama")
+
+    def test_out_of_census_qtype_is_rejected_before_route_selection(self):
+        import enum
+
+        from mobius.integrations.gguf._builder import _detect_quant_params
+
+        class _FutureQType(enum.IntEnum):
+            FUTURE = 99
+
+        class _FutureModel:
+            def tensor_items_raw(self):
+                yield (
+                    "blk.0.ffn_down.weight",
+                    np.empty(0, dtype=np.uint8),
+                    _FutureQType.FUTURE,
+                    (64, 128),
+                )
+
+        with pytest.raises(ValueError, match=r"outside the pinned llama\.cpp census"):
+            _detect_quant_params(_FutureModel(), "llama")
+
+    def test_architecture_without_quantized_modules_rejects_preservation(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "internlm2_q4_0.gguf"
+        _write_quantized_gguf(path, architecture="internlm2")
+
+        with pytest.raises(ValueError, match="does not expose quantized projection"):
+            build_from_gguf(path)
 
     def test_q6_k_selects_the_asymmetric_four_bit_repack_target(self):
         """Q6_K repacks to the same 4-bit/32 target as Q4_K, with zero points.
