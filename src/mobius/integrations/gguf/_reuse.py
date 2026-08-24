@@ -557,7 +557,7 @@ def _replace_artifacts(
     """Install staged files with a durable rollback journal."""
     root = managed_paths[0].parent
     with _package_lock(root):
-        _recover_transaction_locked(root, preserve=frozenset(replacements.values()))
+        _recover_transaction_locked(root)
         _replace_artifacts_locked(replacements, managed_paths)
 
 
@@ -667,14 +667,11 @@ def _recover_transaction(root: Path) -> None:
         _recover_transaction_locked(root)
 
 
-def _recover_transaction_locked(
-    root: Path, *, preserve: frozenset[Path] = frozenset()
-) -> None:
+def _recover_transaction_locked(root: Path) -> None:
     """Roll back an interrupted replacement while owning the package lock."""
     transaction_path = root / _TRANSACTION_NAME
     _require_regular_or_missing(transaction_path, artifact="transaction journal")
     if not transaction_path.exists():
-        _cleanup_stale_temporary_artifacts_locked(root, preserve=preserve)
         return
     journal = _validated_transaction_journal(transaction_path)
     if journal["phase"] == "committed":
@@ -688,7 +685,6 @@ def _recover_transaction_locked(
             staged_path.unlink(missing_ok=True)
         transaction_path.unlink()
         _fsync_directory(root)
-        _cleanup_stale_temporary_artifacts_locked(root)
         return
     for entry in journal["managed"]:
         final_path = root / entry["final"]
@@ -706,7 +702,6 @@ def _recover_transaction_locked(
         staged_path.unlink(missing_ok=True)
     transaction_path.unlink(missing_ok=True)
     _fsync_directory(root)
-    _cleanup_stale_temporary_artifacts_locked(root)
 
 
 def _publish_json(path: Path, payload: Mapping[str, object], token: str) -> None:
@@ -719,24 +714,6 @@ def _publish_json(path: Path, payload: Mapping[str, object], token: str) -> None
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _cleanup_stale_temporary_artifacts_locked(
-    root: Path, *, preserve: frozenset[Path] = frozenset()
-) -> None:
-    """Remove only generated temporary files while no writer can be active."""
-    final_names = {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME, _TRANSACTION_NAME}
-    for path in root.iterdir():
-        if path in preserve:
-            continue
-        if not any(
-            re.fullmatch(rf"\.{re.escape(name)}\.[0-9a-f]{{32}}\.tmp", path.name)
-            for name in final_names
-        ):
-            continue
-        _require_regular_or_missing(path, artifact="stale temporary")
-        path.unlink()
-    _fsync_directory(root)
 
 
 def _validated_transaction_journal(path: Path) -> _TransactionJournal:

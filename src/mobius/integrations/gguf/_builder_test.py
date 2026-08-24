@@ -564,6 +564,23 @@ class TestReuseGgufWeights:
             package.save(str(tmp_path), progress_bar=False)
         assert gguf_path.stat().st_size == package.gguf_reuse_plan.size
 
+    def test_generated_looking_files_without_journal_are_preserved(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        token = "0" * 32
+        gguf_path = tmp_path / f".model.onnx.{token}.tmp"
+        unrelated = tmp_path / f".gguf-reuse.json.{token}.tmp"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        source_bytes = gguf_path.read_bytes()
+        unrelated.write_bytes(b"user-owned temporary data")
+
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+
+        assert gguf_path.read_bytes() == source_bytes
+        assert unrelated.read_bytes() == b"user-owned temporary data"
+
     def test_ordinary_resave_removes_stale_reuse_manifest(self, tmp_path: Path):
         from mobius._model_package import ModelPackage
         from mobius.integrations.gguf import build_from_gguf
