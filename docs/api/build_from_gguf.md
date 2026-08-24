@@ -209,8 +209,9 @@ ignored.
 Pinned BERT files may use either split Q/K/V tensors or float fused
 `attn_qkv.{weight,bias}` tensors; fused rows are split losslessly before weight
 application. Quantized fused QKV is rejected because splitting packed blocks is
-not lossless. BERT `attention.head_count_kv` defaults to `attention.head_count`;
-different values are rejected until the encoder graph supports GQA-sized K/V.
+not lossless. For both supported encoders, `attention.head_count_kv` defaults to
+`attention.head_count`; different values are rejected until the graphs support
+GQA-sized K/V.
 
 Compatible 2-D encoder projection matrices use `MatMulNBits`, while a quantized
 `token_embd.weight` explicitly dequantizes: encoder modules do not yet expose the

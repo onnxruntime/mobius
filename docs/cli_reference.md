@@ -381,8 +381,8 @@ metadata, classifier tensors, and unsupported ModernBERT sliding-window variants
 are rejected explicitly.
 Quantized encoder linear weights use `MatMulNBits`, but quantized token
 embeddings dequantize because these graphs do not yet implement
-`GatherBlockQuantized`. BERT GQA metadata and quantized fused QKV are rejected;
-float fused QKV is split losslessly.
+`GatherBlockQuantized`. BERT and ModernBERT GQA metadata are rejected; BERT
+quantized fused QKV is also rejected, while float fused QKV is split losslessly.
 
 Sharded GGUF inputs are rejected because a single shard has an incomplete
 tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2

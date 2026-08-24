@@ -2458,25 +2458,29 @@ class TestEncoderGGUFBuild:
         with pytest.raises(ValueError, match=r"attn_qkv.bias"):
             build_from_gguf(path)
 
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
     @pytest.mark.parametrize("kv_heads", [None, 4])
-    def test_bert_kv_heads_default_to_query_heads_or_accept_equality(
-        self, tmp_path: Path, kv_heads: int | None
+    def test_encoder_kv_heads_default_to_query_heads_or_accept_equality(
+        self, tmp_path: Path, architecture: str, kv_heads: int | None
     ) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
         from mobius.integrations.gguf._reader import GGUFModel
 
-        path = tmp_path / f"bert-kv-{kv_heads}.gguf"
-        _write_encoder_gguf(path, "bert", kv_heads=kv_heads)
+        path = tmp_path / f"{architecture}-kv-{kv_heads}.gguf"
+        _write_encoder_gguf(path, architecture, kv_heads=kv_heads)
         config = gguf_to_config(GGUFModel(path))
         assert config.num_attention_heads == 4
         assert config.num_key_value_heads == 4
 
-    def test_bert_gqa_rejected_before_graph_build(self, tmp_path: Path, monkeypatch) -> None:
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    def test_encoder_gqa_rejected_before_graph_build(
+        self, tmp_path: Path, architecture: str, monkeypatch
+    ) -> None:
         from mobius import _builder as core_builder
         from mobius.integrations.gguf import build_from_gguf
 
-        path = tmp_path / "bert-gqa.gguf"
-        _write_encoder_gguf(path, "bert", kv_heads=2)
+        path = tmp_path / f"{architecture}-gqa.gguf"
+        _write_encoder_gguf(path, architecture, kv_heads=2)
         monkeypatch.setattr(
             core_builder,
             "build_from_module",

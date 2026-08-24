@@ -1349,6 +1349,12 @@ def _validate_encoder_metadata(
     arch: str,
 ) -> None:
     """Validate metadata that changes an encoder's externally visible contract."""
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(
+            f"{arch} GGUF grouped-query attention is not supported: "
+            f"attention.head_count={config.num_attention_heads}, "
+            f"attention.head_count_kv={config.num_key_value_heads}"
+        )
     if bool(metadata[f"{arch}.attention.causal"]):
         raise ValueError(f"{arch}.attention.causal must be false for encoder import")
     # llama_hparams defaults omitted pooling metadata to NONE.
@@ -1373,12 +1379,6 @@ def _bert_encoder_postprocess(
 ) -> ArchitectureConfig:
     """Apply pinned BERT defaults and tokenizer-owned token-type metadata."""
     _validate_encoder_metadata(config, metadata, "bert")
-    if config.num_key_value_heads != config.num_attention_heads:
-        raise ValueError(
-            "BERT GGUF grouped-query attention is not supported: "
-            f"attention.head_count={config.num_attention_heads}, "
-            f"attention.head_count_kv={config.num_key_value_heads}"
-        )
     token_types = metadata.get("tokenizer.ggml.token_type_count")
     if token_types is None or int(token_types) <= 0:
         raise ValueError(

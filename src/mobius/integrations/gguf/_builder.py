@@ -407,9 +407,9 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
     layers = int(metadata[f"{architecture}.block_count"])
     num_heads = int(metadata[f"{architecture}.attention.head_count"])
     num_kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", num_heads))
-    if architecture == "bert" and num_kv_heads != num_heads:
+    if num_kv_heads != num_heads:
         raise ValueError(
-            "BERT GGUF grouped-query attention is not supported: "
+            f"{architecture} GGUF grouped-query attention is not supported: "
             f"attention.head_count={num_heads}, attention.head_count_kv={num_kv_heads}"
         )
     vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
