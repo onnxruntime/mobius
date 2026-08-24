@@ -215,19 +215,34 @@ _GPT2_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": "transformer.h.{bid}.ln_2",
 }
 
-# Mamba uses backbone.* naming.
+# Mamba uses model.* in Mobius; preprocess_weights nests the selective-scan
+# parameters under mixer.ssm after this GGUF-to-HF stage.
 _MAMBA_MAPPING: dict[str, str] = {
+    "token_embd": "model.embeddings",
+    "output": "lm_head",
+    "output_norm": "model.norm_f",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.norm",
+    "blk.{bid}.ssm_in": "model.layers.{bid}.mixer.in_proj",
+    "blk.{bid}.ssm_out": "model.layers.{bid}.mixer.out_proj",
+    "blk.{bid}.ssm_conv1d": "model.layers.{bid}.mixer.conv1d",
+    "blk.{bid}.ssm_dt": "model.layers.{bid}.mixer.dt_proj",
+    "blk.{bid}.ssm_a": "model.layers.{bid}.mixer.A_log",
+    "blk.{bid}.ssm_d": "model.layers.{bid}.mixer.D",
+    "blk.{bid}.ssm_x": "model.layers.{bid}.mixer.x_proj",
+}
+
+_MAMBA2_MAPPING: dict[str, str] = {
     "token_embd": "backbone.embeddings",
     "output": "lm_head",
     "output_norm": "backbone.norm_f",
     "blk.{bid}.attn_norm": "backbone.layers.{bid}.norm",
-    "blk.{bid}.ssm_in": ("backbone.layers.{bid}.mixer.in_proj"),
-    "blk.{bid}.ssm_out": ("backbone.layers.{bid}.mixer.out_proj"),
-    "blk.{bid}.ssm_conv1d": ("backbone.layers.{bid}.mixer.conv1d"),
-    "blk.{bid}.ssm_dt": ("backbone.layers.{bid}.mixer.dt_proj"),
+    "blk.{bid}.ssm_in": "backbone.layers.{bid}.mixer.in_proj",
+    "blk.{bid}.ssm_out": "backbone.layers.{bid}.mixer.out_proj",
+    "blk.{bid}.ssm_conv1d": "backbone.layers.{bid}.mixer.conv1d",
+    "blk.{bid}.ssm_dt": "backbone.layers.{bid}.mixer.dt_bias@",
     "blk.{bid}.ssm_a": "backbone.layers.{bid}.mixer.A_log",
     "blk.{bid}.ssm_d": "backbone.layers.{bid}.mixer.D",
-    "blk.{bid}.ssm_x": ("backbone.layers.{bid}.mixer.x_proj"),
+    "blk.{bid}.ssm_norm": "backbone.layers.{bid}.mixer.norm",
 }
 
 # MoE extensions for Qwen2MoE/Qwen3MoE/DeepSeek.
@@ -380,6 +395,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "falcon": _FALCON_MAPPING,
         "gpt2": _GPT2_MAPPING,
         "mamba": _MAMBA_MAPPING,
+        "mamba2": _MAMBA2_MAPPING,
         "deepseek4": _DEEPSEEK4_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,

@@ -286,20 +286,33 @@ class TestMapGGUFToHFNames:
     # ---- Mamba ----
 
     def test_mamba_mapping(self) -> None:
-        assert (
-            map_gguf_to_hf_names("token_embd.weight", "mamba") == "backbone.embeddings.weight"
-        )
+        assert map_gguf_to_hf_names("token_embd.weight", "mamba") == "model.embeddings.weight"
         assert (
             map_gguf_to_hf_names("blk.0.ssm_in.weight", "mamba")
-            == "backbone.layers.0.mixer.in_proj.weight"
+            == "model.layers.0.mixer.in_proj.weight"
         )
         assert (
             map_gguf_to_hf_names("blk.0.ssm_conv1d.weight", "mamba")
-            == "backbone.layers.0.mixer.conv1d.weight"
+            == "model.layers.0.mixer.conv1d.weight"
         )
         assert (
             map_gguf_to_hf_names("blk.0.ssm_a.weight", "mamba")
-            == "backbone.layers.0.mixer.A_log.weight"
+            == "model.layers.0.mixer.A_log.weight"
+        )
+
+    def test_mamba2_mapping_and_bare_parameters(self) -> None:
+        assert (
+            map_gguf_to_hf_names("blk.3.ssm_in.weight", "mamba2")
+            == "backbone.layers.3.mixer.in_proj.weight"
+        )
+        assert (
+            map_gguf_to_hf_names("blk.3.ssm_dt.bias", "mamba2")
+            == "backbone.layers.3.mixer.dt_bias"
+        )
+        assert map_gguf_to_hf_names("blk.3.ssm_a", "mamba2") == "backbone.layers.3.mixer.A_log"
+        assert (
+            map_gguf_to_hf_names("blk.3.ssm_norm.weight", "mamba2")
+            == "backbone.layers.3.mixer.norm.weight"
         )
 
     # ---- MoE ----

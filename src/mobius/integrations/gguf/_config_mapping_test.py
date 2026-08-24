@@ -119,6 +119,91 @@ class TestDenseCohortConfig:
         assert config.no_rope_layers == [1, 1, 1, 0]
 
 
+class TestPureRecurrentConfig:
+    @staticmethod
+    def _metadata(architecture: str) -> dict:
+        return {
+            f"{architecture}.embedding_length": 64,
+            f"{architecture}.feed_forward_length": 0,
+            f"{architecture}.block_count": 2,
+            f"{architecture}.attention.head_count": 0,
+            f"{architecture}.attention.layer_norm_rms_epsilon": 1e-5,
+            f"{architecture}.context_length": 1024,
+            f"{architecture}.vocab_size": 256,
+            f"{architecture}.ssm.conv_kernel": 4,
+            f"{architecture}.ssm.inner_size": 128,
+            f"{architecture}.ssm.state_size": 8,
+            f"{architecture}.ssm.time_step_rank": 8,
+            f"{architecture}.ssm.dt_b_c_rms": False,
+        }
+
+    def test_mamba_config_uses_ssm_metadata_not_attention_placeholders(self) -> None:
+        from mobius._configs import MambaConfig
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "mamba",
+                self._metadata("mamba"),
+                ["token_embd.weight"],
+            )
+        )
+
+        assert isinstance(config, MambaConfig)
+        assert config.intermediate_size == 128
+        assert config.state_size == 8
+        assert config.time_step_rank == 8
+        assert config.conv_kernel == 4
+        assert config.expand == 2
+        assert config.tie_word_embeddings is True
+
+    def test_mamba2_config_derives_head_geometry(self) -> None:
+        from mobius._configs import Mamba2Config
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("mamba2")
+        metadata["mamba2.ssm.group_count"] = 2
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "mamba2",
+                metadata,
+                ["token_embd.weight", "output.weight"],
+            )
+        )
+
+        assert isinstance(config, Mamba2Config)
+        assert config.num_heads == 8
+        assert config.head_dim == 16
+        assert config.n_groups == 2
+        assert config.chunk_size == 256
+        assert config.tie_word_embeddings is False
+
+    def test_mamba2_rejects_nonintegral_head_dimension(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("mamba2")
+        metadata["mamba2.ssm.group_count"] = 1
+        metadata["mamba2.ssm.time_step_rank"] = 7
+        with pytest.raises(ValueError, match="must be divisible"):
+            gguf_to_config(_FakeDenseGGUF("mamba2", metadata, ["token_embd.weight"]))
+
+    def test_mamba_rejects_unimplemented_dt_b_c_norm_variant(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("mamba")
+        metadata["mamba.ssm.dt_b_c_rms"] = True
+        with pytest.raises(ValueError, match="extra B/C/dt norms"):
+            gguf_to_config(_FakeDenseGGUF("mamba", metadata, ["token_embd.weight"]))
+
+    def test_mamba2_rejects_group_count_that_does_not_divide_heads(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("mamba2")
+        metadata["mamba2.ssm.group_count"] = 3
+        with pytest.raises(ValueError, match="must divide both"):
+            gguf_to_config(_FakeDenseGGUF("mamba2", metadata, ["token_embd.weight"]))
+
+
 class TestConventionalMoEConfig:
     @staticmethod
     def _metadata(architecture: str) -> dict:

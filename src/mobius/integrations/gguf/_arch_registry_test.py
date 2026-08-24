@@ -56,7 +56,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 32
+_EXPECTED_SUPPORTED_COUNT = 33
 
 # Quantized reachability is separately pinned from float importability. A new
 # architecture must explicitly prove that its graph exposes packed projection
@@ -282,6 +282,8 @@ class TestPinnedTensorClosure:
         "qwen2moe",
         "qwen3moe",
         "granitemoe",
+        "mamba",
+        "mamba2",
     )
 
     @staticmethod
@@ -334,6 +336,67 @@ class TestPinnedTensorClosure:
             moe_mapping["blk.{bid}.ffn_gate_exps"] = removed
             _build_mapping.cache_clear()
 
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            (
+                "mamba",
+                {
+                    "token_embd",
+                    "output_norm",
+                    "output",
+                    "blk.{bid}.attn_norm",
+                    "blk.{bid}.ssm_in",
+                    "blk.{bid}.ssm_conv1d",
+                    "blk.{bid}.ssm_x",
+                    "blk.{bid}.ssm_dt",
+                    "blk.{bid}.ssm_a",
+                    "blk.{bid}.ssm_d",
+                    "blk.{bid}.ssm_out",
+                },
+            ),
+            (
+                "mamba2",
+                {
+                    "token_embd",
+                    "output_norm",
+                    "output",
+                    "blk.{bid}.attn_norm",
+                    "blk.{bid}.ssm_in",
+                    "blk.{bid}.ssm_conv1d",
+                    "blk.{bid}.ssm_dt",
+                    "blk.{bid}.ssm_a",
+                    "blk.{bid}.ssm_d",
+                    "blk.{bid}.ssm_norm",
+                    "blk.{bid}.ssm_out",
+                },
+            ),
+        ],
+    )
+    def test_pure_recurrent_pinned_tensor_sets_are_exact(
+        self, architecture: str, expected: set[str]
+    ) -> None:
+        assert set(upstream_architectures()[architecture].tensor_families) == expected
+
+    @pytest.mark.parametrize(
+        ("architecture", "mapping_key"),
+        [
+            ("mamba", "blk.{bid}.ssm_x"),
+            ("mamba2", "blk.{bid}.ssm_norm"),
+        ],
+    )
+    def test_deleting_recurrent_mapping_breaks_closure(
+        self, architecture: str, mapping_key: str
+    ) -> None:
+        mapping = _MAPPING_TABLES[architecture]
+        removed = mapping.pop(mapping_key)
+        _build_mapping.cache_clear()
+        try:
+            assert mapping_key in self._unmapped(architecture)
+        finally:
+            mapping[mapping_key] = removed
+            _build_mapping.cache_clear()
+
 
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
@@ -360,8 +423,8 @@ class TestRejectionsAreActionable:
             get_arch_spec("gptj")
 
     def test_an_unimported_upstream_architecture_names_its_cohort(self) -> None:
-        with pytest.raises(UnsupportedGGUFArchitectureError, match="C05-pure-recurrent"):
-            get_arch_spec("mamba2")
+        with pytest.raises(UnsupportedGGUFArchitectureError, match="distinct RWKV"):
+            get_arch_spec("rwkv6")
 
     def test_an_unknown_architecture_is_distinguished_from_an_upstream_one(self) -> None:
         with pytest.raises(UnsupportedGGUFArchitectureError, match="not among the 147"):

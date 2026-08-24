@@ -655,6 +655,11 @@ def build_from_gguf(
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
+    if static_cache and model_type in {"mamba", "mamba2"}:
+        raise ValueError(
+            f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
+            "they carry per-layer conv_state and ssm_state rather than a KV cache."
+        )
 
     # 2b. Architecture-resolution safety rail. When the GGUF architecture string
     # bridges to a specialised registry key, verify the metadata-derived config
@@ -2244,10 +2249,10 @@ def _validate_moe_weight_shape(
     config,
 ) -> None:
     """Reject router/expert tensors that could otherwise be partially routed."""
-    num_experts = config.num_local_experts
+    num_experts = getattr(config, "num_local_experts", None)
     if num_experts is None:
         return
-    expert_size = config.moe_intermediate_size or config.intermediate_size
+    expert_size = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
     if ".mlp.experts." in name:
         projection = name.rsplit(".mlp.experts.", 1)[1].split(".", 1)[0]
         if projection not in {"gate_proj", "up_proj", "down_proj"}:

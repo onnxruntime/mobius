@@ -394,6 +394,12 @@ class BaseModelConfig:
 
     # Model dtype (from HF config dtype)
     dtype: ir.DataType = ir.DataType.FLOAT
+    quantization: QuantizationConfig | None = None
+
+    # HuggingFace identity and token metadata used by package persistence.
+    model_type: str | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
 
 
 @dataclasses.dataclass
@@ -2458,6 +2464,7 @@ class Mamba2Config(BaseModelConfig):
     layer_norm_epsilon: float = 1e-5
     use_conv_bias: bool = True
     norm_before_gate: bool = True
+    chunk_size: int = 256
 
     def __post_init__(self):
         # Mamba2 requires d_inner = num_heads * head_dim.
@@ -2504,6 +2511,7 @@ class Mamba2Config(BaseModelConfig):
             layer_norm_epsilon=getattr(config, "layer_norm_epsilon", 1e-5),
             use_conv_bias=getattr(config, "use_conv_bias", True),
             norm_before_gate=getattr(config, "norm_before_gate", True),
+            chunk_size=getattr(config, "chunk_size", 256),
         )
 
         # Model dtype

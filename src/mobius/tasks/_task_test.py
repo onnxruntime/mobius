@@ -749,6 +749,7 @@ class TestSSMCausalLMTask:
         assert "past_states.0.conv_state" in input_names
         assert "past_states.0.ssm_state" in input_names
         assert "past_states.1.conv_state" in input_names
+        assert str(tuple(model.graph.inputs[0].shape)[1]) == "1"
 
     def test_no_kv_cache(self):
         config, module = self._make_mamba()
@@ -819,6 +820,7 @@ class TestSSM2CausalLMTask:
         assert "input_ids" in input_names
         assert "past_states.0.conv_state" in input_names
         assert "past_states.0.ssm_state" in input_names
+        assert str(tuple(model.graph.inputs[0].shape)[1]) == "sequence_len"
 
     def test_outputs(self):
         config, module = self._make_mamba2()
