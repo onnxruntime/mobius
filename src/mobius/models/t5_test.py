@@ -14,6 +14,40 @@ import torch
 from mobius.models.t5 import _rename_t5_weight
 
 
+def test_standard_t5_graph_contract_is_stable():
+    """Ordinary T5 keeps the pre-GGUF deterministic graph size and cache shape."""
+    from mobius._configs import ArchitectureConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+    from mobius.tasks import Seq2SeqTask
+
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        num_decoder_layers=2,
+        vocab_size=256,
+        max_position_embeddings=64,
+        hidden_act="gelu",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        pad_token_id=0,
+    )
+    package = Seq2SeqTask().build(T5ForConditionalGeneration(config), config)
+    decoder = package["decoder"]
+
+    assert sum(len(list(model.graph)) for model in package.values()) == 176
+    assert len(list(package["encoder"].graph)) == 81
+    assert len(list(decoder.graph)) == 95
+    decoder_inputs = {value.name: value for value in decoder.graph.inputs}
+    assert "encoder_attention_mask" not in decoder_inputs
+    assert str(decoder_inputs["past_key_values.0.cross.key"].shape) == (
+        "[batch,4,encoder_sequence_len,16]"
+    )
+
+
 def test_t5_encoder_is_public_and_consumes_attention_mask():
     from mobius._configs import ArchitectureConfig
     from mobius.models import T5EncoderModel
