@@ -72,6 +72,7 @@ __all__ = [
     "optimize_model",
     "register_ep",
     "registry",
+    "stream_safetensors_to_model",
     "tasks",
 ]
 
@@ -136,7 +137,7 @@ from mobius.adapters import (
     compose_adapter_deltas,
     fingerprint_model_weights,
 )
-from mobius.integrations._weight_loading import apply_weights
+from mobius.integrations._weight_loading import apply_weights, stream_safetensors_to_model
 from mobius.integrations.diffusers import build_diffusers_pipeline
 from mobius.integrations.gguf import build_from_gguf
 from mobius.integrations.nemo import build_from_nemo

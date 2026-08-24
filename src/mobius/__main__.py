@@ -711,6 +711,88 @@ def _cmd_preflight_gguf(args: argparse.Namespace) -> None:
         raise SystemExit(2)
 
 
+def _probe_gpu_total_bytes() -> int | None:
+    """Return the largest single-GPU memory in bytes via nvidia-smi, or None."""
+    import shutil as _shutil
+    import subprocess
+
+    exe = _shutil.which("nvidia-smi")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run(
+            [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    mibs = [int(line) for line in out.stdout.split() if line.strip().isdigit()]
+    if not mibs:
+        return None
+    return max(mibs) * 1024 * 1024
+
+
+def _cmd_preflight(args: argparse.Namespace) -> None:
+    """Execute the 'preflight' subcommand (resumable export dry-run)."""
+    from mobius.preflight import ExportMode, LoaderMode, run_preflight
+
+    gpu_total = None
+    if args.gpu_total_bytes:
+        gpu_total = _parse_size(args.gpu_total_bytes)
+    elif not args.no_gpu_probe:
+        gpu_total = _probe_gpu_total_bytes()
+
+    result = run_preflight(
+        args.model_id,
+        output_dir=args.output,
+        revision=args.revision,
+        download_dir=args.download_dir,
+        export_mode=ExportMode(args.export_mode),
+        loader=LoaderMode(args.loader),
+        group_size=args.group_size,
+        target_dtype_bytes=args.target_dtype_bytes,
+        gpu_total_bytes=gpu_total,
+        margin_frac=args.margin,
+        state_path=args.state,
+    )
+
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        b = result.budget
+        print(f"Model:        {result.model_id}")
+        print(f"Revision:     {result.revision or 'default'}")
+        print(f"Commit:       {result.commit_sha or '(local)'}")
+        print(f"Shards:       {len(result.shards)}")
+        if b is not None:
+            print(f"Params:       {b.param_count:,}  dtypes={b.dtype_bytes}")
+            print(f"Source:       {b.source_bytes / 1e12:.3f} TB (download)")
+            print(f"Output:       {b.output_bytes / 1e12:.3f} TB ({b.export_mode})")
+            print(
+                f"Peak RAM:     {b.peak_ram_bytes / 1e9:.1f} GB ({b.loader}) "
+                f"[eager={b.peak_ram_eager_bytes / 1e9:.1f} GB, "
+                f"stream={b.peak_ram_stream_bytes / 1e9:.1f} GB]"
+            )
+            print(f"Weights VRAM: {b.vram_weights_bytes / 1e9:.1f} GB")
+        for chk in result.checks:
+            state = "OK " if chk.ok else "FAIL"
+            print(
+                f"  [{state}] {chk.kind}: need {chk.required_bytes / 1e9:.1f} GB, "
+                f"free {chk.free_bytes / 1e9:.1f} GB"
+            )
+        if result.blockers:
+            print("BLOCKERS:")
+            for blk in result.blockers:
+                print(f"  - {blk}")
+        print(f"VERDICT: {'READY' if result.ok else 'REFUSED'}")
+
+    if not result.ok:
+        raise SystemExit(2)
+
+
 def _cmd_info(args: argparse.Namespace) -> None:
     """Execute the 'info' subcommand."""
     from mobius.integrations.diffusers._builder import (
@@ -1130,6 +1212,87 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trust remote code when loading the HuggingFace model config.",
     )
     info_parser.set_defaults(func=_cmd_info)
+
+    # --- preflight ---
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Dry-run an export: validate shard metadata and compute the exact "
+        "disk/RAM/VRAM budget, refusing before any download if it will not fit.",
+    )
+    preflight_parser.add_argument(
+        "model_id",
+        help="HuggingFace model ID or local checkpoint directory to preflight.",
+    )
+    preflight_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="Intended output directory for the exported ONNX (checked for free space).",
+    )
+    preflight_parser.add_argument(
+        "--revision",
+        default=None,
+        help="Model revision/branch/commit to resolve (default: main).",
+    )
+    preflight_parser.add_argument(
+        "--download-dir",
+        default=None,
+        help="Directory the shards will download into (default: output dir). "
+        "Its filesystem is checked for the source-download budget.",
+    )
+    preflight_parser.add_argument(
+        "--export-mode",
+        choices=["passthrough", "fp16", "int4-qmoe"],
+        default="passthrough",
+        help="Weight representation of the exported artifact (default: passthrough).",
+    )
+    preflight_parser.add_argument(
+        "--loader",
+        choices=["eager", "stream"],
+        default="stream",
+        help="Weight application strategy that sets the host-RAM peak.",
+    )
+    preflight_parser.add_argument(
+        "--group-size",
+        type=int,
+        default=32,
+        help="Quantization block size for int4-qmoe output sizing (default: 32).",
+    )
+    preflight_parser.add_argument(
+        "--target-dtype-bytes",
+        type=float,
+        default=2.0,
+        help="Bytes/param of the resident runtime weights for the VRAM estimate "
+        "(2.0=fp16/bf16, 0.5=int4).",
+    )
+    preflight_parser.add_argument(
+        "--gpu-total-bytes",
+        default=None,
+        help="Largest single-GPU memory (e.g. '80GB'); default probes nvidia-smi.",
+    )
+    preflight_parser.add_argument(
+        "--no-gpu-probe",
+        action="store_true",
+        help="Do not probe nvidia-smi for GPU memory.",
+    )
+    preflight_parser.add_argument(
+        "--margin",
+        type=float,
+        default=0.05,
+        help="Fractional free-space headroom required above each budget (default 0.05).",
+    )
+    preflight_parser.add_argument(
+        "--state",
+        default=None,
+        help="Resumable state JSON file; records validated shards and refuses on "
+        "checkpoint identity drift.",
+    )
+    preflight_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the full verdict as JSON.",
+    )
+    preflight_parser.set_defaults(func=_cmd_preflight)
 
     # --- convert-comfyui ---
     comfy_parser = subparsers.add_parser(
