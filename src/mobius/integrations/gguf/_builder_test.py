@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -3740,6 +3741,69 @@ class TestGGUFPreflightGuards:
         assert "llama.cpp/Unsloth" in message
         assert "Olive" in message
 
+    @pytest.mark.parametrize(
+        ("architecture", "projection_quantization"),
+        [
+            pytest.param(architecture, quantization, id=f"{architecture}-{quantization}")
+            for architecture in ("pockettts", "qwen3tts", "talkie", "wavtokenizer-dec")
+            for quantization in ("f32", "q4_0")
+        ],
+    )
+    @pytest.mark.parametrize(
+        "build_options",
+        [
+            pytest.param({}, id="default"),
+            pytest.param({"dtype": "f16"}, id="dtype"),
+            pytest.param({"static_cache": True}, id="static-cache"),
+            pytest.param({"keep_quantized": False}, id="dequantize"),
+        ],
+    )
+    def test_deferred_audio_architectures_fail_before_all_downstream_stages(
+        self,
+        architecture: str,
+        projection_quantization: str,
+        build_options: dict[str, object],
+        tmp_path: Path,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius import _registry as core_registry
+        from mobius.integrations.gguf import _builder as gguf_builder
+        from mobius.integrations.gguf import _config_mapping, build_from_gguf
+        from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
+
+        path = tmp_path / f"{architecture}-{projection_quantization}.gguf"
+        _write_quantized_gguf(
+            path,
+            architecture=architecture,
+            projection_quantization=projection_quantization,
+        )
+
+        downstream = AssertionError("deferred architecture reached a downstream stage")
+        with (
+            mock.patch.object(
+                gguf_builder, "_has_quantized_weights", side_effect=downstream
+            ) as quantization_probe,
+            mock.patch.object(
+                _config_mapping, "gguf_to_config", side_effect=downstream
+            ) as config_extraction,
+            mock.patch.object(
+                core_registry.registry, "get", side_effect=downstream
+            ) as module_lookup,
+            mock.patch.object(
+                core_builder, "build_from_module", side_effect=downstream
+            ) as graph_build,
+            pytest.raises(
+                UnsupportedGGUFArchitectureError,
+                match=rf"{re.escape(architecture)}.*before config extraction",
+            ),
+        ):
+            build_from_gguf(path, **build_options)
+
+        quantization_probe.assert_not_called()
+        config_extraction.assert_not_called()
+        module_lookup.assert_not_called()
+        graph_build.assert_not_called()
+
     def test_remote_nemotron_h_moe_fails_before_download(self):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
 
@@ -3756,6 +3820,29 @@ class TestGGUFPreflightGuards:
 
         api_type.return_value.model_info.assert_called_once_with(
             "unsloth/nemotron", expand=["gguf"]
+        )
+        download.assert_not_called()
+
+    def test_remote_deferred_audio_architecture_fails_before_download(self):
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+        from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
+
+        filename = "talkie-f16.gguf"
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
+            pytest.raises(
+                UnsupportedGGUFArchitectureError,
+                match=r"talkie.*before config extraction",
+            ),
+        ):
+            api_type.return_value.model_info.return_value = SimpleNamespace(
+                gguf={"architecture": "talkie"}
+            )
+            _resolve_gguf_path(f"example/talkie:{filename}")
+
+        api_type.return_value.model_info.assert_called_once_with(
+            "example/talkie", expand=["gguf"]
         )
         download.assert_not_called()
 

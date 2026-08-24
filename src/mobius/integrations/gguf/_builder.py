@@ -37,6 +37,7 @@ from mobius.integrations.gguf._arch_registry import (
 from mobius.integrations.gguf._errors import (
     DisabledGGUFArchitectureError,
     ShardedGGUFNotSupportedError,
+    UnsupportedGGUFArchitectureError,
 )
 from mobius.integrations.gguf._spec import Support
 
@@ -99,12 +100,12 @@ def _raise_for_unsupported_gguf_architecture(
     source: str,
     tensor_names: Iterable[str] | None = None,
 ) -> None:
-    """Reject GGUF architectures that do not have semantic conversion evidence.
+    """Reject known architectures whose config, tensor map, or graph is unavailable.
 
-    Only architectures the registry marks ``REJECTED`` are refused here. An
-    architecture that is merely unregistered still reaches the tensor-mapping
-    gate, which produces the actionable "not imported yet" message; failing
-    early would change which error a caller sees.
+    This gate runs immediately after the GGUF header is available so dtype,
+    quantization, config extraction, registry lookup, and graph construction
+    cannot obscure the architecture verdict. Runtime packaging is deliberately
+    excluded: an importable graph may still have a deferred runtime contract.
     """
     spec = try_get_arch_spec(architecture)
     if spec is None:
@@ -115,8 +116,15 @@ def _raise_for_unsupported_gguf_architecture(
         # passes one as the model itself, and the tensor-mapping gate already
         # produces that message.
         return
-    rejected = [name for name, verdict in spec.verdicts.items() if verdict is Support.REJECTED]
-    if not rejected:
+    import_verdicts = {
+        name: verdict
+        for name, verdict in spec.verdicts.items()
+        if name in {"config", "tensor_map", "graph"}
+    }
+    unavailable = [
+        name for name, verdict in import_verdicts.items() if verdict is not Support.SUPPORTED
+    ]
+    if not unavailable:
         return
 
     layout = ""
@@ -130,9 +138,16 @@ def _raise_for_unsupported_gguf_architecture(
             f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
         )
 
-    raise DisabledGGUFArchitectureError(
-        f"Direct GGUF conversion for architecture {spec.gguf_arch!r} is intentionally "
-        f"disabled for {source!r}.{layout} {spec.reason} No ONNX artifacts were emitted."
+    if any(verdict is Support.REJECTED for verdict in import_verdicts.values()):
+        raise DisabledGGUFArchitectureError(
+            f"Direct GGUF conversion for architecture {spec.gguf_arch!r} is intentionally "
+            f"disabled for {source!r}.{layout} {spec.reason} No ONNX artifacts were emitted."
+        )
+    capabilities = ", ".join(unavailable)
+    raise UnsupportedGGUFArchitectureError(
+        f"GGUF architecture {spec.gguf_arch!r} is deferred for {source!r} before config "
+        f"extraction because these import capabilities are unavailable: {capabilities}. "
+        f"{spec.reason} No ONNX artifacts were emitted."
     )
 
 

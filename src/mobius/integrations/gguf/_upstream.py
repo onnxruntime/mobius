@@ -70,6 +70,9 @@ class UpstreamArchitecture:
             cohorts whose explicit deferral depends on proving the graph mismatch.
         tensor_names: Exact full tensor names, including suffixes, created by
             architecture-specific pinned C++ tensor creation sites.
+        converter_extra_tensor_names: Exact full tensor names emitted by a pinned
+            converter but not created by the architecture-specific C++ loader.
+            These are semantic sidecars, not part of the loader-required closure.
         expert_tensor_suffixes: Exact suffixes created for routed expert tensors
             by the pinned C++ generic loader pass.
     """
@@ -80,6 +83,7 @@ class UpstreamArchitecture:
     dual_moe: bool
     tensor_families: tuple[str, ...] = ()
     tensor_names: tuple[str, ...] = ()
+    converter_extra_tensor_names: tuple[str, ...] = ()
     expert_tensor_suffixes: tuple[str, ...] = ()
 
 
@@ -139,6 +143,7 @@ def upstream_architectures() -> dict[str, UpstreamArchitecture]:
             dual_moe=fields["dual_moe"],
             tensor_families=tuple(fields.get("tensor_families", ())),
             tensor_names=tuple(fields.get("tensor_names", ())),
+            converter_extra_tensor_names=tuple(fields.get("converter_extra_tensor_names", ())),
             expert_tensor_suffixes=tuple(fields.get("expert_tensor_suffixes", ())),
         )
         for name, fields in _payload()["architectures"].items()

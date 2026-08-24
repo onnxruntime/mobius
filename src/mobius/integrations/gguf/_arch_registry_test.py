@@ -532,14 +532,14 @@ class TestPinnedAudioCohort:
     _EXPECTED_COUNTS: ClassVar[dict[str, int]] = {
         "pockettts": 3 + 10 * 24,
         "qwen3tts": 3 + 11 * 28,
-        "talkie": 2 + 11 * 40,
+        "talkie": 2 + 9 * 40,
         "wavtokenizer-dec": 161,
     }
 
     @classmethod
-    def _expanded_names(cls, architecture: str) -> set[str]:
+    def _expanded_patterns(cls, architecture: str, field: str) -> set[str]:
         names: set[str] = set()
-        for pattern in upstream_architectures()[architecture].tensor_names:
+        for pattern in getattr(upstream_architectures()[architecture], field):
             if "{bid}" in pattern:
                 names.update(
                     pattern.replace("{bid}", str(index))
@@ -549,11 +549,15 @@ class TestPinnedAudioCohort:
                 names.add(pattern)
         return names
 
+    @classmethod
+    def _expanded_names(cls, architecture: str) -> set[str]:
+        return cls._expanded_patterns(architecture, "tensor_names")
+
     @pytest.mark.parametrize("architecture", sorted(_LAYER_COUNTS))
-    def test_converter_inventory_is_suffix_exact_and_complete(self, architecture: str) -> None:
+    def test_loader_inventory_is_suffix_exact_and_complete(self, architecture: str) -> None:
         names = self._expanded_names(architecture)
         assert len(names) == self._EXPECTED_COUNTS[architecture]
-        assert all(name.endswith((".weight", ".bias", ".scale")) for name in names)
+        assert all(name.endswith((".weight", ".bias")) for name in names)
 
     def test_pockettts_inventory_has_no_semantic_output_head(self) -> None:
         names = self._expanded_names("pockettts")
@@ -567,12 +571,18 @@ class TestPinnedAudioCohort:
         assert "blk.0.attn_q_norm.weight" in names
         assert not any(name.startswith("a.gen.") for name in names)
 
-    def test_talkie_gain_sidecars_cannot_be_dropped(self) -> None:
-        names = self._expanded_names("talkie")
-        assert "blk.0.attn_output.scale" in names
-        assert "blk.0.ffn_down.scale" in names
-        assert "blk.0.layer_output_scale.weight" in names
-        assert "blk.0.attn_output.input_scale" not in names
+    def test_talkie_loader_and_converter_closures_are_distinct(self) -> None:
+        loader_names = self._expanded_names("talkie")
+        converter_extras = self._expanded_patterns("talkie", "converter_extra_tensor_names")
+
+        assert len(loader_names) == 362
+        assert len(converter_extras) == 80
+        assert len(loader_names | converter_extras) == 442
+        assert not loader_names & converter_extras
+        assert "blk.0.attn_output.scale" in converter_extras
+        assert "blk.0.ffn_down.scale" in converter_extras
+        assert "blk.0.layer_output_scale.weight" in loader_names
+        assert "blk.0.attn_output.input_scale" not in converter_extras
 
     def test_wavtokenizer_heterogeneous_stacks_are_literal(self) -> None:
         names = self._expanded_names("wavtokenizer-dec")
