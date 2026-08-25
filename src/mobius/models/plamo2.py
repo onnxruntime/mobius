@@ -426,15 +426,31 @@ class Plamo2ForCausalLM(nn.Module):
         }
         norms_are_folded = bool(getattr(self.config, "_plamo2_norms_are_folded", False))
         tied_embeddings = effective_tie_word_embeddings(self.config)
+        tied_weight: torch.Tensor | None = None
+        if tied_embeddings:
+            embedding_weight = state_dict.get("model.embed_tokens.weight")
+            head_weight = state_dict.get("lm_head.weight")
+            if embedding_weight is not None and head_weight is not None:
+                if not torch.equal(embedding_weight, head_weight):
+                    raise ValueError(
+                        "PLaMo2 tied checkpoint contains conflicting "
+                        "model.embed_tokens.weight and lm_head.weight tensors"
+                    )
+                tied_weight = embedding_weight
+            else:
+                tied_weight = embedding_weight if embedding_weight is not None else head_weight
+
         for name, value in state_dict.items():
             name = name.replace("model.layers.layers.", "model.layers.")
-            if name == "model.embed_tokens.weight" and tied_embeddings:
-                result[name] = value
-                # onnxscript materializes the shared Parameter under both use
-                # sites, while the official checkpoint stores only the embedding.
-                result["lm_head.weight"] = value
-                continue
-            if name == "lm_head.weight" and tied_embeddings:
+            if (
+                tied_embeddings
+                and tied_weight is not None
+                and name in {"model.embed_tokens.weight", "lm_head.weight"}
+            ):
+                # Checkpoints may serialize either tied key. Keep one tensor object
+                # under both graph parameter names so weight loading deduplicates it.
+                result["model.embed_tokens.weight"] = tied_weight
+                result["lm_head.weight"] = tied_weight
                 continue
             if name == "model.norm.weight":
                 result[name] = value if norms_are_folded else value + 1.0

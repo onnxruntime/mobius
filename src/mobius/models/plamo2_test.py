@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius import build_from_module
@@ -453,7 +454,7 @@ def test_plamo2_preprocesses_offsets_and_decay_values() -> None:
         "model.layers.layers.0.post_mlp_norm.weight": torch.tensor([6.0]),
         "model.layers.layers.0.mixer.A_log": torch.tensor([0.0, 1.0]),
         "model.embed_tokens.weight": torch.tensor([8.0]),
-        "lm_head.weight": torch.tensor([9.0]),
+        "lm_head.weight": torch.tensor([8.0]),
     }
     actual = model.preprocess_weights(weights)
     torch.testing.assert_close(actual["model.norm.weight"], torch.tensor([3.0]))
@@ -480,6 +481,45 @@ def test_plamo2_preprocesses_offsets_and_decay_values() -> None:
     torch.testing.assert_close(actual["lm_head.weight"], torch.tensor([8.0]))
 
 
+@pytest.mark.parametrize("source_key", ["model.embed_tokens.weight", "lm_head.weight"])
+def test_plamo2_preprocesses_either_single_tied_weight(source_key: str) -> None:
+    model = Plamo2ForCausalLM(_config())
+    weight = torch.arange(8, dtype=torch.float32)
+
+    actual = model.preprocess_weights({source_key: weight})
+
+    assert actual["model.embed_tokens.weight"] is weight
+    assert actual["lm_head.weight"] is weight
+
+
+def test_plamo2_unifies_exact_duplicate_tied_weights() -> None:
+    model = Plamo2ForCausalLM(_config())
+    embedding_weight = torch.arange(8, dtype=torch.float32)
+    head_weight = embedding_weight.clone()
+
+    actual = model.preprocess_weights(
+        {
+            "model.embed_tokens.weight": embedding_weight,
+            "lm_head.weight": head_weight,
+        }
+    )
+
+    assert actual["model.embed_tokens.weight"] is embedding_weight
+    assert actual["lm_head.weight"] is embedding_weight
+
+
+def test_plamo2_rejects_conflicting_tied_weights() -> None:
+    model = Plamo2ForCausalLM(_config())
+
+    with pytest.raises(ValueError, match="conflicting"):
+        model.preprocess_weights(
+            {
+                "model.embed_tokens.weight": torch.tensor([8.0]),
+                "lm_head.weight": torch.tensor([9.0]),
+            }
+        )
+
+
 def test_plamo2_preprocesses_effectively_tied_quantized_embeddings() -> None:
     config = _config()
     config.tie_word_embeddings = False
@@ -489,7 +529,7 @@ def test_plamo2_preprocesses_effectively_tied_quantized_embeddings() -> None:
     actual = model.preprocess_weights(
         {
             "model.embed_tokens.weight": torch.tensor([8.0]),
-            "lm_head.weight": torch.tensor([9.0]),
+            "lm_head.weight": torch.tensor([8.0]),
         }
     )
 
