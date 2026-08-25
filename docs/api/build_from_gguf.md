@@ -181,7 +181,7 @@ def build_from_gguf(
 | `gguf_path` | `str \| Path` | (required) | Local `.gguf` path or `owner/repo:filename.gguf` Hub reference. |
 | `task` | `str \| None` | `None` | Override the model task (e.g. `"text-generation"`). When `None`, the task is auto-detected from the model type. |
 | `dtype` | `str \| None` | `None` | Override model dtype (e.g. `"f16"`). When `None`, defaults to float32. |
-| `keep_quantized` | `bool` | `True` | Preserve quantization when present. Supported affine blocks are repacked as `MatMulNBits`; in text-only builds, supported native IQ/MXFP4 projection blocks retain their bytes. Multimodal and mixed presets may require dequantization/requantization. Set to `False` to dequantize all weights. |
+| `keep_quantized` | `bool` | `True` | Preserve quantization when present. Supported affine blocks are repacked as `MatMulNBits`; in text-only builds, supported native IQ/MXFP4 projection blocks retain their bytes. Projection tensors that would require lossy requantization are rejected. Set to `False` to dequantize all weights. |
 | `execution_provider` | `str` | `"default"` | Target EP for EP-aware graph optimization. |
 | `mmproj` | `str \| Path \| None` | `None` | Optional companion multimodal-projector GGUF. |
 | `static_cache` | `bool` | `False` | Build a fixed-width KV cache when the architecture supports it. |
@@ -267,9 +267,10 @@ mobius build-gguf draft.gguf --target-config target/ --output output/draft/
 
 1. Reads GGUF metadata to detect architecture and config
 2. Maps GGUF tensor names to HuggingFace weight names
-3. Preserves supported quantized tensors by default, using repacking,
-   text-only native-block retention, or dequantize/requantize according to the
-   source qtype and build path; `keep_quantized=False` dequantizes every tensor
+3. Preserves supported quantized tensors by default using value-preserving
+   repacking or text-only native-block retention; any projection requiring
+   lossy requantization fails closed, while `keep_quantized=False` explicitly
+   dequantizes every tensor
 4. Applies architecture-specific tensor processors (e.g. Q/K permute)
 5. Builds the ONNX graph using the same pipeline as `build()`
 6. Runs `preprocess_weights()` (HF → ONNX name mapping)
@@ -277,10 +278,12 @@ mobius build-gguf draft.gguf --target-config target/ --output output/draft/
 
 F32-, F16-, and BF16-only GGUFs use the normal float import path even though
 `keep_quantized=True` is the default: there is no quantization to preserve.
-Quantized GGUFs whose qtypes have no trustworthy decoder or compatible runtime
-kernel (currently `Q2_0`) fail with an actionable error. Decoder-backed formats
-such as `Q5_K` use the explicit dequantize/requantize route; they are not
-silently treated as preserved source quantization.
+Quantized GGUFs containing only qtypes with no supported preservation target
+(for example, pure Q5_K weights) fail with an actionable error rather
+than silently becoming float. Pass `keep_quantized=False` to request that float
+conversion explicitly.
+Mixed presets such as Q4_K_M also fail when their projection inventory includes
+Q5/Q6/Q8 tensors that cannot share one lossless MatMulNBits contract.
 
 ### Native blocks, conversion, and source-file reuse
 

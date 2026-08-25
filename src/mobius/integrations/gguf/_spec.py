@@ -166,11 +166,14 @@ class AffineRepackSpec:
             input. This is a property of the *target*, not of the source: Q6_K
             is symmetric on disk but requantizes through the asymmetric affine
             path, so it still needs zero points.
+        lossless: Whether repacking preserves the source dequantized values
+            without requantization.
     """
 
     bits: int
     block_size: int
     omit_zero_points: bool = False
+    lossless: bool = False
 
     def __post_init__(self) -> None:
         if self.bits <= 0 or self.block_size <= 0:
@@ -392,6 +395,7 @@ class GGUFQuantSpec:
                 f"{label}: unreadable slots cannot be dequantized; the GGUF parse "
                 "layer rejects them first"
             )
+
         if self.native_preserve is not None and self.affine_repack is not None:
             raise ValueError(
                 f"{label}: a type is either preserved natively or repacked into an "
@@ -435,6 +439,13 @@ class GGUFQuantSpec:
                 f"{label}: requires_explicit_zero_point only applies to quantized "
                 "storage types"
             )
+
+    @property
+    def preserves_values(self) -> bool:
+        """Whether a quantized graph can consume this type without requantization."""
+        return self.native_preserve is not None or (
+            self.affine_repack is not None and self.affine_repack.lossless
+        )
 
     @property
     def readable(self) -> bool:

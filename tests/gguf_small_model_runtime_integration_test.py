@@ -27,7 +27,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from mobius import ModelPackage
+from mobius import ModelPackage, build_from_gguf
 from mobius.__main__ import main
 from mobius.integrations.gguf import (
     GGUFTokenizerAsset,
@@ -177,6 +177,21 @@ _CASES = (
         ),
         tokenizer_identity_exact=False,
     ),
+)
+
+_Q4_K_M_CASE = _RuntimeCase(
+    name="smollm2-135m-instruct-q4-k-m",
+    gguf_repository="unsloth/SmolLM2-135M-Instruct-GGUF",
+    gguf_revision="9e6855bc4be717fca1ef21360a1db4b29d5c559a",
+    gguf_filename="SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    gguf_size=105_454_144,
+    gguf_sha256="ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747",
+    reference_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
+    reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
+    prompt="Here is my poem:",
+    tensor_qtypes={"F32": 61, "Q4_K": 16, "Q5_0": 166, "Q6_K": 14, "Q8_0": 15},
+    config_sha256="303a313b8a2544e6338e30d388406d245ff208ba2e1fa21ea3e4a6304a032459",
+    generated_tokens=(198, 198, 18, 504, 2388, 13685, 284, 5208, 28, 198),
 )
 
 
@@ -420,3 +435,109 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
         ort_logits = output["logits"]
     assert len(repeated) == len(expected)
     np.testing.assert_array_equal(repeated, expected)
+
+
+@pytest.mark.integration
+@pytest.mark.integration_fast
+def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
+    tmp_path: Path,
+) -> None:
+    """Q4_K_M preservation is rejected; explicit dequantization retains full parity."""
+    case = _Q4_K_M_CASE
+    gguf_path = Path(
+        hf_hub_download(
+            repo_id=case.gguf_repository,
+            revision=case.gguf_revision,
+            filename=case.gguf_filename,
+        )
+    )
+    assert gguf_path.stat().st_size == case.gguf_size
+    assert _sha256(gguf_path) == case.gguf_sha256
+    gguf_model = GGUFModel(gguf_path)
+    qtypes = Counter(qtype.name for _, _, qtype, _ in gguf_model.tensor_items_raw())
+    assert dict(sorted(qtypes.items())) == case.tensor_qtypes
+
+    with pytest.raises(
+        ValueError,
+        match=r"blk\.0\.attn_k\.weight \(Q5_0\).*cannot represent.*losslessly",
+    ):
+        build_from_gguf(gguf_path)
+
+    with pytest.raises(ValueError, match=r"cannot represent.*losslessly"):
+        main(["build-gguf", str(gguf_path), "--output", str(tmp_path / "rejected")])
+
+    output_dir = tmp_path / case.name
+    captured: list[ModelPackage] = []
+    original_save = ModelPackage.save
+
+    def capture_save(package: ModelPackage, *args: object, **kwargs: object) -> None:
+        captured.append(package)
+        original_save(package, *args, **kwargs)
+
+    with mock.patch.object(ModelPackage, "save", capture_save):
+        main(
+            [
+                "build-gguf",
+                str(gguf_path),
+                "--output",
+                str(output_dir),
+                "--dequantize",
+                "--dtype",
+                "f32",
+                "--execution-provider",
+                "cpu",
+            ]
+        )
+
+    assert len(captured) == 1
+    package = captured[0]
+    route = json.loads(package.gguf_import_route)
+    assert route["preserve_quantization"] is False
+    assert all(node.op_type != "MatMulNBits" for node in package["model"].graph)
+
+    reloaded = ModelPackage.load(output_dir)
+    assert tuple(reloaded) == ("model",)
+    session = ort.InferenceSession(
+        str(output_dir / "model.onnx"), providers=["CPUExecutionProvider"]
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        case.reference_repository, revision=case.reference_revision
+    )
+    reference = AutoModelForCausalLM.from_pretrained(
+        case.gguf_repository,
+        revision=case.gguf_revision,
+        gguf_file=case.gguf_filename,
+        dtype=torch.float32,
+    ).eval()
+    prompt_ids = tokenizer(case.prompt, return_tensors="pt").input_ids
+    with torch.no_grad():
+        reference_output = reference(prompt_ids, use_cache=True)
+
+    input_ids = prompt_ids.numpy()
+    ort_output = _run_ort(session, input_ids, _empty_cache(session), 0)
+    ort_logits = ort_output["logits"]
+    reference_logits = reference_output.logits.numpy()
+    np.testing.assert_allclose(ort_logits, reference_logits, rtol=1e-4, atol=2e-4)
+
+    cache = _next_cache(ort_output)
+    reference_cache = reference_output.past_key_values
+    generated: list[int] = []
+    for step in range(len(case.generated_tokens)):
+        token = int(ort_logits[0, -1].argmax())
+        generated.append(token)
+        token_ids = np.array([[token]], dtype=np.int64)
+        ort_output = _run_ort(session, token_ids, cache, input_ids.shape[1] + step)
+        cache = _next_cache(ort_output)
+        with torch.no_grad():
+            reference_output = reference(
+                torch.from_numpy(token_ids),
+                past_key_values=reference_cache,
+                use_cache=True,
+            )
+        reference_cache = reference_output.past_key_values
+        ort_logits = ort_output["logits"]
+        reference_logits = reference_output.logits.numpy()
+        np.testing.assert_allclose(ort_logits, reference_logits, rtol=1e-4, atol=2e-4)
+
+    np.testing.assert_array_equal(generated, case.generated_tokens)

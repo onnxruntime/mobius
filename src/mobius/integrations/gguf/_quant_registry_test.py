@@ -27,6 +27,7 @@ from mobius.integrations.gguf._quant_registry import (
     get_quant_spec,
     iter_quant_specs,
     lm_head_preserve_type_names,
+    lossless_preservation_type_names,
     quant_import_decision,
     quant_spec_by_name,
     render_quant_support_matrix,
@@ -87,15 +88,7 @@ _LEGACY_EXPLICIT_ZERO_POINT_TYPES = frozenset(
 _EXPECTED_LM_HEAD_PRESERVE = frozenset(
     {
         "Q1_0",
-        "Q2_K",
-        "Q3_K",
         "Q4_0",
-        "Q4_1",
-        "Q4_K",
-        "Q5_0",
-        "Q5_1",
-        "Q5_K",
-        "Q6_K",
         "Q8_0",
         "TQ1_0",
         "TQ2_0",
@@ -185,6 +178,11 @@ class TestBehaviorPreservation:
 
     def test_lm_head_preserve_types(self) -> None:
         assert lm_head_preserve_type_names() == _EXPECTED_LM_HEAD_PRESERVE
+
+    def test_only_value_preserving_affine_types_are_advertised(self) -> None:
+        preserved = lossless_preservation_type_names()
+        assert {"Q1_0", "Q4_0", "Q8_0"} <= preserved
+        assert {"Q4_1", "Q4_K", "Q6_K"}.isdisjoint(preserved)
 
     def test_float_storage_types(self) -> None:
         assert float_storage_type_ids() == _LEGACY_FLOAT_TYPE_IDS

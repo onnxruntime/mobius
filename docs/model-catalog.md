@@ -267,11 +267,10 @@ All decoder-only LLMs and MoE models support quantized weight loading:
 | **AWQ** | HuggingFace (e.g. `-AWQ` suffix models) | `build("TheBloke/Llama-2-7B-AWQ")` |
 | **GGUF** | Local `.gguf` files | `build_from_gguf("model.gguf")` |
 
-GGUF import preserves supported quantization by default using affine repacking
-or, for supported text-only inputs, native quantized ops. Multimodal and mixed
-source qtypes can require dequantization/requantization, so this does not imply
-byte preservation for every tensor. Use `--dequantize` for an explicitly float
-model.
+GGUF import preserves supported quantization by default using value-preserving
+affine repacking or, for supported text-only inputs, native quantized ops.
+Projection tensors that would require lossy dequantization/requantization fail
+closed. Use `--dequantize` for an explicitly float model.
 
 Encoder GGUF imports for `bert` and `modern-bert` select
 `feature-extraction` and expose token-level `last_hidden_state` only. Pooling,

@@ -323,9 +323,10 @@ mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/ \
 
 Build an ONNX model from a GGUF file (e.g. from llama.cpp). This is an explicit
 opt-in import path; `mobius build` does not auto-discover or select GGUF files.
-Supported GGUF quantization is preserved by default. This can involve
-byte-preserving native blocks in text-only builds, affine repacking, or
-dequantize/requantize for multimodal and mixed source qtypes.
+Supported GGUF quantization is preserved by default through byte-preserving
+native blocks or value-preserving affine repacking. Mixed source qtypes that
+would require lossy dequantization/requantization, including Q4_K_M presets,
+fail closed and require `--dequantize`.
 
 > **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
@@ -377,6 +378,8 @@ contain no quantization to preserve.
 Quantized files containing only qtypes with no supported preservation target
 (for example, pure Q5_K weights) fail instead of silently becoming
 float. Re-run with `--dequantize` to request explicit float conversion.
+The same rule applies when only some projection tensors are incompatible with
+the selected affine target; Mobius does not silently requantize those tensors.
 
 Encoder-only BERT and ModernBERT GGUF backbones auto-select
 `feature-extraction` and output `last_hidden_state`; they do not produce logits

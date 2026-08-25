@@ -46,7 +46,12 @@ def _const(name: str, arr: np.ndarray) -> ir.Value:
 
 
 def _build_matmulnbits_model(
-    n_out: int, k_in: int, block: int, seed: int = 0
+    n_out: int,
+    k_in: int,
+    block: int,
+    seed: int = 0,
+    *,
+    accuracy_level: int | None = None,
 ) -> tuple[ir.Model, dict, np.ndarray, np.ndarray, np.ndarray]:
     """Build a single-node MatMulNBits model with random 4-bit weights.
 
@@ -67,14 +72,15 @@ def _build_matmulnbits_model(
     sc_c = _const("scales", scales)
     zp_c = _const("zero_points", zero_points)
     y = ir.Value(name="Y")
+    attributes = {"K": k_in, "N": n_out, "bits": 4, "block_size": block}
+    if accuracy_level is not None:
+        attributes["accuracy_level"] = accuracy_level
     node = ir.Node(
         "com.microsoft",
         "MatMulNBits",
         inputs=[a_val, b_c, sc_c, zp_c],
         outputs=[y],
-        attributes=ir.convenience.convert_attributes(
-            {"K": k_in, "N": n_out, "bits": 4, "block_size": block}
-        ),
+        attributes=ir.convenience.convert_attributes(attributes),
     )
     graph = ir.Graph(
         inputs=[a_val],
@@ -117,6 +123,30 @@ class TestMatMulNBitsInlineParity:
         got = _run(inlined, feeds2)
 
         np.testing.assert_allclose(got, reference, rtol=0, atol=0)
+
+    def test_accuracy_four_matches_explicit_asymmetric_dequantization(self):
+        """The CPU kernel consumes Mobius's packed weights and zero points correctly."""
+        model, feeds, packed, scales, packed_zero_points = _build_matmulnbits_model(
+            n_out=8,
+            k_in=64,
+            block=32,
+            seed=11,
+            accuracy_level=4,
+        )
+        got = _run(model, feeds)
+
+        quants = np.empty((8, 2, 32), dtype=np.float32)
+        quants[..., 0::2] = packed & 0x0F
+        quants[..., 1::2] = packed >> 4
+        zero_points = np.empty((8, 2), dtype=np.float32)
+        zero_points[..., 0::2] = packed_zero_points & 0x0F
+        zero_points[..., 1::2] = packed_zero_points >> 4
+        weights = ((quants - zero_points[..., None]) * scales[..., None]).reshape(8, 64)
+        expected = feeds["A"] @ weights.T
+
+        error = got - expected
+        assert float(np.max(np.abs(error))) < 0.1
+        assert float(np.linalg.norm(error) / np.linalg.norm(expected)) < 0.02
 
     def test_inline_matches_native_op_odd_blocks(self):
         """Odd n_blocks exercises the zero-point nibble slice (ceil(nb/2))."""
