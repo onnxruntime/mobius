@@ -1,0 +1,49 @@
+{
+  "model_id": "HuggingFaceTB/SmolLM-135M",
+  "prompt": "Once upon a time,",
+  "generated_tokens": [
+    665,
+    436,
+    253,
+    7436,
+    1838,
+    8180,
+    3365,
+    14176,
+    30,
+    2306,
+    5732,
+    3415,
+    874,
+    18064,
+    284,
+    4464,
+    351,
+    874,
+    2428,
+    30
+  ],
+  "generated_text": " there was a curious little girl named Lily. She loved exploring her backyard and playing with her friends.",
+  "provenance": {
+    "reference": {
+      "repository": "HuggingFaceTB/SmolLM-135M",
+      "revision": "1d461723eec654e65efdc40cf49301c89c0c92f4"
+    },
+    "gguf": {
+      "repository": "neopolita/smollm-135m-gguf",
+      "revision": "22cca988936eafe92908e7558907c3964e10bba7",
+      "filename": "ggml-model-f16.gguf",
+      "size": 270885504,
+      "lfs_sha256": "ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2",
+      "tensor_count": 272,
+      "tensor_qtypes": {
+        "F16": 211,
+        "F32": 61
+      },
+      "execution_provider": "cpu",
+      "config_sha256": "134f95e6a635d978737d712ed61ac8959acebdf080eafae838cf97f12c416430",
+      "preserve_quantization": false,
+      "keep_quantized": true
+    }
+  }
+}

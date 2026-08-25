@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-r"""Detect which model_types are affected by a set of changed files.
+r"""Detect which model or golden-case selectors are affected by changed files.
 
 Uses AST-based static import analysis (no actual imports) to determine
 which model types need testing when source files change. Designed for
@@ -58,7 +58,7 @@ def classify_file(path: str) -> str:
     """Classify a changed file path.
 
     Returns one of: 'model', 'traceable', 'shared_infra',
-    'test_config', 'test', 'other'.
+    'test_config', 'golden_case', 'golden_data', 'test', 'other'.
     """
     normalized = path.replace("\\", "/")
 
@@ -71,6 +71,10 @@ def classify_file(path: str) -> str:
             # add an entry here. Defer the run-all decision until model files
             # have been collected so those PRs can use import-graph scoping.
             return "test_config"
+        if normalized.startswith("testdata/cases/") and normalized.endswith(".yaml"):
+            return "golden_case"
+        if normalized.startswith("testdata/golden/") and normalized.endswith(".json"):
+            return "golden_data"
         if normalized.endswith("_test.py") or normalized.startswith("tests/"):
             return "test"
         return "other"
@@ -430,6 +434,10 @@ def detect_affected_models(
     affected: set[str] = set()
     run_all = False
     test_config_changed = False
+    golden_case_files: list[str] = []
+    _, _, golden_detection_failed = _detect_changed_golden_cases(changed_files)
+    if golden_detection_failed:
+        return {"affected": [], "run_all": True}
 
     # Classify files
     model_files: list[str] = []
@@ -441,6 +449,8 @@ def detect_affected_models(
             break
         elif category == "test_config":
             test_config_changed = True
+        elif category == "golden_case":
+            golden_case_files.append(path)
         elif category == "model":
             # Deleted model files could break dependents — run all
             full_path = _PROJECT_ROOT / path
@@ -461,8 +471,13 @@ def detect_affected_models(
     if test_config_changed and not model_files:
         return {"affected": [], "run_all": True}
 
+    for path in golden_case_files:
+        full_path = _PROJECT_ROOT / path
+        if not full_path.exists():
+            return {"affected": [], "run_all": True}
+
     if not model_files and not traceable_files:
-        return {"affected": [], "run_all": False}
+        return {"affected": sorted(affected), "run_all": False}
 
     # Build the registry map: source_module → [model_types]
     registry_map = _build_source_module_to_types()
@@ -530,6 +545,64 @@ def detect_affected_models(
     return {"affected": sorted(affected), "run_all": False}
 
 
+def _read_golden_case_levels(yaml_path: Path) -> set[str] | None:
+    """Read one top-level L4/L5 declaration without requiring PyYAML."""
+    for line in yaml_path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("level:"):
+            continue
+        value = line.partition(":")[2].strip().strip("\"'")
+        if value == "L4":
+            return {"L4"}
+        if value == "L5":
+            return {"L5"}
+        if value == "L4+L5":
+            return {"L4", "L5"}
+        return None
+    return None
+
+
+def _detect_changed_golden_cases(
+    changed_files: list[str],
+) -> tuple[list[str], list[str], bool]:
+    """Return level-specific exact case IDs and whether detection failed closed."""
+    l4_cases: set[str] = set()
+    l5_cases: set[str] = set()
+    cases_root = _PROJECT_ROOT / "testdata" / "cases"
+
+    for path in changed_files:
+        category = classify_file(path)
+        if category not in {"golden_case", "golden_data"}:
+            continue
+        full_path = _PROJECT_ROOT / path
+        if not full_path.exists():
+            return [], [], True
+
+        if category == "golden_case":
+            yaml_path = full_path
+            case_id = full_path.stem
+            is_generation_data = False
+            if len(list(cases_root.rglob(f"{case_id}.yaml"))) != 1:
+                return [], [], True
+        else:
+            stem = full_path.stem
+            is_generation_data = stem.endswith("_generation")
+            case_id = stem.removesuffix("_generation")
+            matches = sorted(cases_root.rglob(f"{case_id}.yaml"))
+            if len(matches) != 1:
+                return [], [], True
+            yaml_path = matches[0]
+
+        levels = _read_golden_case_levels(yaml_path)
+        if levels is None or (is_generation_data and "L5" not in levels):
+            return [], [], True
+        if "L4" in levels and not is_generation_data:
+            l4_cases.add(case_id)
+        if "L5" in levels:
+            l5_cases.add(case_id)
+
+    return sorted(l4_cases), sorted(l5_cases), False
+
+
 def main() -> None:
     """CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -562,17 +635,47 @@ def main() -> None:
         changed = [line.strip() for line in args.changed_files.split("\n") if line.strip()]
 
     result = detect_affected_models(changed)
+    golden_l4_cases, golden_l5_cases, golden_detection_failed = _detect_changed_golden_cases(
+        changed
+    )
+    if golden_detection_failed:
+        result = {"affected": [], "run_all": True}
+    if result["run_all"]:
+        golden_l4_cases = []
+        golden_l5_cases = []
 
     if args.output_format == "github":
         # Output for GitHub Actions
         affected_json = json.dumps(result["affected"])
+        golden_l4_cases_json = json.dumps(golden_l4_cases)
+        golden_l5_cases_json = json.dumps(golden_l5_cases)
         run_all = "true" if result["run_all"] else "false"
-        has_affected = "true" if (result["run_all"] or result["affected"]) else "false"
+        has_model_affected = bool(result["run_all"] or result["affected"])
+        has_l4_affected = "true" if has_model_affected or golden_l4_cases else "false"
+        has_l5_affected = "true" if has_model_affected or golden_l5_cases else "false"
+        has_affected = (
+            "true"
+            if (result["run_all"] or result["affected"] or golden_l4_cases or golden_l5_cases)
+            else "false"
+        )
         print(f"affected={affected_json}")
+        print(f"golden_l4_cases={golden_l4_cases_json}")
+        print(f"golden_l5_cases={golden_l5_cases_json}")
         print(f"run_all={run_all}")
         print(f"has_affected={has_affected}")
+        print(f"has_l4_affected={has_l4_affected}")
+        print(f"has_l5_affected={has_l5_affected}")
     else:
-        print(json.dumps(result, indent=2))
+        print(
+            json.dumps(
+                {
+                    **result,
+                    "golden_l4_cases": golden_l4_cases,
+                    "golden_l5_cases": golden_l5_cases,
+                },
+                indent=2,
+            )
+        )
 
 
 if __name__ == "__main__":

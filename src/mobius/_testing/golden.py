@@ -132,6 +132,13 @@ class GoldenTestCase:
     (DFlash, MTP) that share a base checkpoint whose ``architectures`` field
     would otherwise auto-route to the base model.  ``None`` = auto-detect."""
 
+    gguf_source: dict[str, object] | None
+    """Pinned GGUF artifact used instead of HuggingFace weights.
+
+    ``model_id`` and ``revision`` still identify the independent HuggingFace
+    tokenizer/reference checkpoint used to create the golden data.
+    """
+
     yaml_path: Path
     """Absolute path to the source YAML file."""
 
@@ -259,6 +266,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         ci_skip_reason=data.get("ci_skip_reason"),
         min_token_match_ratio=data.get("min_token_match_ratio"),
         architecture=data.get("architecture"),
+        gguf_source=data.get("gguf"),
         yaml_path=yaml_path,
     )
 
@@ -320,6 +328,7 @@ def save_golden_ref(
     input_ids: np.ndarray | list[int],
     component_norms: dict[str, float] | None = None,
     component_shapes: dict[str, tuple[int, ...]] | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> None:
     """Save golden reference data to a ``.json`` file (L4 only).
 
@@ -345,6 +354,7 @@ def save_golden_ref(
         input_ids: Tokenized input array.
         component_norms: L2 norms for multi-model component outputs.
         component_shapes: Output shapes for multi-model components.
+        provenance: Immutable source identities used to generate the golden.
     """
     json_path = Path(json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,6 +389,8 @@ def save_golden_ref(
         data["component_shapes"] = {
             k: [int(x) for x in v] for k, v in component_shapes.items()
         }
+    if provenance:
+        data["provenance"] = provenance
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
@@ -392,6 +404,7 @@ def save_generation_json(
     prompt: str,
     generated_tokens: list[int],
     generated_text: str | None = None,
+    provenance: dict[str, object] | None = None,
 ) -> None:
     """Save a ``*_generation.json`` L5 marker file alongside the main golden.
 
@@ -405,6 +418,7 @@ def save_generation_json(
         generated_tokens: Token IDs produced by greedy generation (prompt excluded).
         generated_text: Decoded string of ``generated_tokens``. ``None`` if
             the tokenizer was not available at generation time.
+        provenance: Immutable source identities used to generate the golden.
     """
     json_path = Path(json_path)
     json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -416,6 +430,8 @@ def save_generation_json(
     }
     if generated_text is not None:
         data["generated_text"] = generated_text
+    if provenance:
+        data["provenance"] = provenance
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
