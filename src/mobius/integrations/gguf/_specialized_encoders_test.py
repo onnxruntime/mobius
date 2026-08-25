@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
+import onnx_ir as ir
 import pytest
 import torch
 
@@ -16,7 +18,7 @@ from mobius.integrations.gguf._builder import (
 )
 from mobius.integrations.gguf._config_mapping import gguf_to_config
 from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
-from mobius.tasks import FeatureExtractionTask
+from mobius.tasks import FeatureExtractionTask, GGUFEncoderFeatureExtractionTask
 
 
 class _FakeGGUF:
@@ -179,7 +181,7 @@ def test_config_and_tiny_graph_follow_encoder_abi(arch: str) -> None:
         assert config.attn_o_bias
 
     module = registry.get(get_arch_spec(arch).module_type)(config)
-    package = FeatureExtractionTask().build(module, config)
+    package = GGUFEncoderFeatureExtractionTask().build(module, config)
     graph = package["model"].graph
     assert [value.name for value in graph.outputs] == ["last_hidden_state"]
     assert not any("past_key_values" in value.name for value in graph.inputs)
@@ -286,12 +288,71 @@ def test_jina_uses_tanh_approximate_gelu() -> None:
     assert all(node.attributes["approximate"].value == "tanh" for node in gelu_nodes)
 
 
-@pytest.mark.parametrize("arch", ["eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"])
-def test_pooled_specialized_encoder_files_fail_closed(arch: str) -> None:
+@pytest.mark.parametrize(
+    ("arch", "pooling_type"),
+    [("eurobert", 1), ("neo-bert", 2), ("nomic-bert", 1), ("jina-bert-v2", 1)],
+)
+def test_specialized_encoder_pooling_uses_sentence_embedding_abi(
+    arch: str, pooling_type: int
+) -> None:
     metadata = _metadata(arch)
-    metadata[f"{arch}.pooling_type"] = 1
-    with pytest.raises(ValueError, match="token-level last_hidden_state only"):
+    metadata[f"{arch}.pooling_type"] = pooling_type
+    tensors = _tensors(arch)
+    config = gguf_to_config(_FakeGGUF(arch, metadata, tensors))
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    package = GGUFEncoderFeatureExtractionTask().build(module, config)
+    assert [value.name for value in package["model"].graph.outputs] == ["sentence_embedding"]
+    package.apply_weights(
+        {
+            map_gguf_to_hf_names(name, arch): torch.zeros(shape)
+            for name, shape in tensors.items()
+        }
+    )
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    session = OnnxModelSession(package["model"])
+    try:
+        output = session.run(
+            {
+                "input_ids": np.array([[1, 2, 0]], dtype=np.int64),
+                "attention_mask": np.array([[1, 1, 0]], dtype=np.int64),
+                "token_type_ids": np.array([[0, 1, 0]], dtype=np.int64),
+            }
+        )["sentence_embedding"]
+    finally:
+        session.close()
+    assert output.shape == (1, 8)
+
+
+def test_unknown_specialized_encoder_pooling_fails_closed() -> None:
+    arch = "neo-bert"
+    metadata = _metadata(arch)
+    metadata[f"{arch}.pooling_type"] = 3
+    with pytest.raises(ValueError, match="not a known encoder pooling"):
         gguf_to_config(_FakeGGUF(arch, metadata, _tensors(arch)))
+
+
+@pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+def test_jina_alibi_graph_loads_in_reduced_precision(dtype: ir.DataType) -> None:
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    arch = "jina-bert-v2"
+    tensors = _tensors(arch)
+    config = dataclasses.replace(
+        gguf_to_config(_FakeGGUF(arch, _metadata(arch), tensors)),
+        dtype=dtype,
+    )
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    package = FeatureExtractionTask().build(module, config)
+    torch_dtype = torch.float16 if dtype is ir.DataType.FLOAT16 else torch.bfloat16
+    package.apply_weights(
+        {
+            map_gguf_to_hf_names(name, arch): torch.zeros(shape, dtype=torch_dtype)
+            for name, shape in tensors.items()
+        }
+    )
+    session = OnnxModelSession(package["model"])
+    session.close()
 
 
 @pytest.mark.parametrize(

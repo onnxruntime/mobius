@@ -2898,11 +2898,8 @@ def _specialized_encoder_postprocess(
         raise ValueError(f"{arch}.attention.causal must be false for encoder import")
 
     pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
-    if pooling_type != 0:
-        raise ValueError(
-            f"{arch}.pooling_type={pooling_type} is not supported because the "
-            "feature-extraction graph exposes token-level last_hidden_state only"
-        )
+    if pooling_type not in {0, 1, 2}:
+        raise ValueError(f"{arch}.pooling_type={pooling_type} is not a known encoder pooling")
     if metadata.get(f"{arch}.classifier.output_labels"):
         raise ValueError(f"{arch} classifier heads are not part of feature extraction")
 

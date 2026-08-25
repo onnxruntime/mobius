@@ -41,6 +41,7 @@ def _bidirectional_alibi_bias(
     op: OpBuilder,
     input_ids: ir.Value,
     padding_mask: ir.Value,
+    like: ir.Value,
     num_heads: int,
 ):
     """Create llama.cpp-compatible non-causal ALiBi plus the request padding mask."""
@@ -61,12 +62,16 @@ def _bidirectional_alibi_bias(
     slopes_const = op.Constant(
         value_floats=np.asarray(slopes[:num_heads], dtype=np.float32).tolist()
     )
-    alibi = op.Neg(
-        op.Mul(
-            op.Unsqueeze(slopes_const, [0, 2, 3]),
-            op.Unsqueeze(distance, [0, 1]),
-        )
-    )  # (1, heads, sequence, sequence)
+    alibi = op.CastLike(
+        op.Neg(
+            op.Mul(
+                op.Unsqueeze(slopes_const, [0, 2, 3]),
+                op.Unsqueeze(distance, [0, 1]),
+            )
+        ),
+        like,
+    )
+    # (1, heads, sequence, sequence), cast to the query/model dtype.
     return op.Where(padding_mask, alibi, op.CastLike(-10000.0, alibi))
 
 
@@ -246,6 +251,7 @@ class _PreNormEncoder(nn.Module):
 
     def __init__(self, config: ArchitectureConfig, *, packed: bool):
         super().__init__()
+        self._pooling_type = config.pooling_type
         self.token_embeddings = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -262,7 +268,10 @@ class _PreNormEncoder(nn.Module):
         positions = _position_embeddings(op, input_ids, self.rotary_emb)
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, padding_mask, positions)
-        return self.output_norm(op, hidden_states)
+        hidden_states = self.output_norm(op, hidden_states)
+        return _pool_encoder_output(
+            op, hidden_states, attention_mask, pooling_type=self._pooling_type
+        )
 
     def preprocess_weights(self, state_dict: dict[str, torch.Tensor]):
         return state_dict
@@ -328,6 +337,7 @@ class _PostNormEncoder(nn.Module):
     def __init__(self, config: ArchitectureConfig, *, jina: bool):
         super().__init__()
         self._jina = jina
+        self._pooling_type = config.pooling_type
         self.token_embeddings = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -351,7 +361,11 @@ class _PostNormEncoder(nn.Module):
         padding_mask = create_padding_mask(op, input_ids, attention_mask)
         if self._jina:
             attention_bias = _bidirectional_alibi_bias(
-                op, input_ids, padding_mask, self.layers[0].attention.num_heads
+                op,
+                input_ids,
+                padding_mask,
+                hidden_states,
+                self.layers[0].attention.num_heads,
             )
             positions = None
         else:
@@ -359,7 +373,9 @@ class _PostNormEncoder(nn.Module):
             positions = _position_embeddings(op, input_ids, self.rotary_emb)
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, attention_bias, positions)
-        return hidden_states
+        return _pool_encoder_output(
+            op, hidden_states, attention_mask, pooling_type=self._pooling_type
+        )
 
     def preprocess_weights(self, state_dict: dict[str, torch.Tensor]):
         return state_dict
@@ -377,3 +393,16 @@ class JinaBertV2GGUFModel(_PostNormEncoder):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config, jina=True)
+
+
+def _pool_encoder_output(op, hidden_states, attention_mask, *, pooling_type: int):
+    """Apply the GGUF pooling contract: NONE=0, MEAN=1, CLS=2."""
+    if pooling_type == 0:
+        return hidden_states
+    if pooling_type == 2:
+        return op.Gather(hidden_states, op.Constant(value_int=0), axis=1)
+    mask = op.Unsqueeze(op.CastLike(attention_mask, hidden_states), [2])
+    summed = op.ReduceSum(op.Mul(hidden_states, mask), axes=[1], keepdims=0)
+    count = op.ReduceSum(mask, axes=[1], keepdims=0)
+    count = op.Max(count, op.CastLike(1.0, count))
+    return op.Div(summed, count)

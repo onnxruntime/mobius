@@ -36,6 +36,7 @@ __all__ = [
     "DenoisingTask",
     "DiarizationTask",
     "FeatureExtractionTask",
+    "GGUFEncoderFeatureExtractionTask",
     "FunASRSpeechLanguageTask",
     "Gemma3VisionLanguageTask",
     "Gemma3nTask",
@@ -120,7 +121,10 @@ from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
-from mobius.tasks._feature_extraction import FeatureExtractionTask
+from mobius.tasks._feature_extraction import (
+    FeatureExtractionTask,
+    GGUFEncoderFeatureExtractionTask,
+)
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma3n import Gemma3nTask
 from mobius.tasks._gemma4 import (
@@ -196,6 +200,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "denoising": DenoisingTask,
     "diarization": DiarizationTask,
     "feature-extraction": FeatureExtractionTask,
+    "gguf-encoder-feature-extraction": GGUFEncoderFeatureExtractionTask,
     "masked-diffusion": MaskedDiffusionTask,
     "minimax-music3-condition": MiniMaxMusic3ConditionTask,
     "minimax-music3-denoising": MiniMaxMusic3DenoisingTask,

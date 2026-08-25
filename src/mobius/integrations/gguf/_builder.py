@@ -4097,6 +4097,10 @@ def build_from_gguf(
         from mobius.tasks import CausalLMTask
 
         resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
+    elif gguf_arch in {"eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"}:
+        from mobius.tasks import GGUFEncoderFeatureExtractionTask
+
+        resolved_task = GGUFEncoderFeatureExtractionTask()
     elif task is None:
         resolved_task = _default_task_for_model(module_type)
     else:

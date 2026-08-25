@@ -818,10 +818,18 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "megatron-bert": ModelRegistration(BertModel, task="feature-extraction"),
     "mobilebert": ModelRegistration(BertModel, task="feature-extraction"),
     "modernbert": ModelRegistration(ModernBertModel, task="feature-extraction"),
-    "eurobert_gguf": ModelRegistration(EuroBertGGUFModel, task="feature-extraction"),
-    "jina_bert_v2_gguf": ModelRegistration(JinaBertV2GGUFModel, task="feature-extraction"),
-    "neo_bert_gguf": ModelRegistration(NeoBertGGUFModel, task="feature-extraction"),
-    "nomic_bert_gguf": ModelRegistration(NomicBertGGUFModel, task="feature-extraction"),
+    "eurobert_gguf": ModelRegistration(
+        EuroBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "jina_bert_v2_gguf": ModelRegistration(
+        JinaBertV2GGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "neo_bert_gguf": ModelRegistration(
+        NeoBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "nomic_bert_gguf": ModelRegistration(
+        NomicBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
     "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
     "mra": ModelRegistration(BertModel, task="feature-extraction"),
     "nezha": ModelRegistration(BertModel, task="feature-extraction"),
