@@ -948,6 +948,161 @@ def _write_plamo2_gguf(
     writer.close()
 
 
+def _write_jamba_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    omit: str | None = None,
+    extra: str | None = None,
+    expert_count: int = 2,
+    expert_used_count: int = 1,
+    malformed_shape: str | None = None,
+    invalid_decay: bool = False,
+) -> None:
+    """Write a tiny mixed Jamba GGUF with one dense and one routed layer."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    inner = 64
+    state = 4
+    rank = 2
+    kernel = 4
+    rng = np.random.default_rng(612)
+
+    writer = GGUFWriter(str(path), "jamba")
+    writer.add_context_length(32)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(2)
+    writer.add_head_count(heads)
+    writer.add_head_count_kv([0, kv_heads])
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_vocab_size(vocab)
+    writer.add_ssm_conv_kernel(kernel)
+    writer.add_ssm_inner_size(inner)
+    writer.add_ssm_state_size(state)
+    writer.add_ssm_time_step_rank(rank)
+    writer.add_expert_count(expert_count)
+    writer.add_expert_used_count(expert_used_count)
+    writer.add_string("jamba.feed_forward.activation", "silu")
+
+    def adjusted_shape(name: str, shape: tuple[int, ...]) -> tuple[int, ...]:
+        if name == malformed_shape:
+            return (*shape[:-1], shape[-1] + 1)
+        return shape
+
+    def add_float(
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        expert_order: bool = False,
+        negative: bool = False,
+    ) -> None:
+        if name == omit:
+            return
+        shape = adjusted_shape(name, shape)
+        values = rng.normal(0.0, 0.03, size=shape).astype(np.float32)
+        if negative:
+            values = -np.exp(values)
+            if invalid_decay:
+                values.flat[0] = -np.inf
+        if expert_order:
+            for expert in range(shape[0]):
+                values[expert].fill(expert + 1)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        shape = adjusted_shape(name, shape)
+        assert shape[-1] % 32 == 0
+        byte_shape = (*shape[:-1], shape[-1] // 32 * 18)
+        raw = np.zeros(byte_shape, dtype=np.uint8)
+        for index in np.ndindex(shape[:-1]):
+            for block in range(shape[-1] // 32):
+                offset = block * 18
+                raw[(*index, slice(offset, offset + 2))] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    projection = add_q4 if quantized else add_float
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+
+    projection("blk.0.ffn_gate.weight", (intermediate, hidden))
+    projection("blk.0.ffn_up.weight", (intermediate, hidden))
+    projection("blk.0.ffn_down.weight", (hidden, intermediate))
+    (add_q4 if quantized else add_float)("blk.0.ssm_in.weight", (2 * inner, hidden))
+    add_float("blk.0.ssm_conv1d.weight", (inner, kernel))
+    add_float("blk.0.ssm_conv1d.bias", (inner,))
+    (add_q4 if quantized else add_float)(
+        "blk.0.ssm_x.weight",
+        (rank + 2 * state, inner),
+    )
+    add_float("blk.0.ssm_dt_norm.weight", (rank,))
+    add_float("blk.0.ssm_dt.weight", (inner, rank))
+    add_float("blk.0.ssm_dt.bias", (inner,))
+    add_float("blk.0.ssm_b_norm.weight", (state,))
+    add_float("blk.0.ssm_c_norm.weight", (state,))
+    add_float("blk.0.ssm_a", (inner, state), negative=True)
+    add_float("blk.0.ssm_d", (inner,))
+    (add_q4 if quantized else add_float)("blk.0.ssm_out.weight", (hidden, inner))
+
+    projection("blk.1.attn_q.weight", (hidden, hidden))
+    projection("blk.1.attn_k.weight", (kv_heads * hidden // heads, hidden))
+    projection("blk.1.attn_v.weight", (kv_heads * hidden // heads, hidden))
+    projection("blk.1.attn_output.weight", (hidden, hidden))
+    add_float("blk.1.ffn_gate_inp.weight", (expert_count, hidden))
+    if quantized:
+        projection(
+            "blk.1.ffn_gate_exps.weight",
+            (expert_count, intermediate, hidden),
+        )
+        projection(
+            "blk.1.ffn_up_exps.weight",
+            (expert_count, intermediate, hidden),
+        )
+        projection(
+            "blk.1.ffn_down_exps.weight",
+            (expert_count, hidden, intermediate),
+        )
+    else:
+        add_float(
+            "blk.1.ffn_gate_exps.weight",
+            (expert_count, intermediate, hidden),
+            expert_order=True,
+        )
+        add_float(
+            "blk.1.ffn_up_exps.weight",
+            (expert_count, intermediate, hidden),
+            expert_order=True,
+        )
+        add_float(
+            "blk.1.ffn_down_exps.weight",
+            (expert_count, hidden, intermediate),
+            expert_order=True,
+        )
+    if extra is not None:
+        add_float(extra, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
     """Write a tiny two-layer LFM2 GGUF with one conv and one attention layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -4656,6 +4811,151 @@ class TestPlamo2GGUFBuild:
 
         path = tmp_path / "plamo2-invalid.gguf"
         _write_plamo2_gguf(path, quantized=False, **kwargs)
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match=match):
+            build_from_gguf(path)
+        assert not graph_build_started
+
+
+class TestJambaGGUFBuild:
+    """Jamba GGUF import preserves mixed mixers, routed experts, and state."""
+
+    @staticmethod
+    def _inputs(tokens: np.ndarray) -> dict[str, np.ndarray]:
+        batch, sequence = tokens.shape
+        return {
+            "input_ids": tokens,
+            "position_ids": np.broadcast_to(
+                np.arange(sequence, dtype=np.int64),
+                (batch, sequence),
+            ).copy(),
+            "attention_mask": np.ones((batch, sequence), np.int64),
+            "past_key_values.0.conv_state": np.zeros((batch, 64, 3), np.float32),
+            "past_key_values.0.ssm_state": np.zeros((batch, 64, 4), np.float32),
+            "past_key_values.1.key": np.zeros((batch, 2, 0, 8), np.float32),
+            "past_key_values.1.value": np.zeros((batch, 2, 0, 8), np.float32),
+        }
+
+    def test_float_import_preserves_expert_order_and_round_trips(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "jamba-f32.gguf"
+        _write_jamba_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert model.metadata_props["mobius.runtime_support"].endswith(
+            "onnxruntime/mobius#605"
+        )
+        assert [value.name for value in model.graph.outputs] == [
+            "logits",
+            "present.0.conv_state",
+            "present.0.ssm_state",
+            "present.1.key",
+            "present.1.value",
+        ]
+        for expert in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                value = model.graph.initializers[
+                    f"model.layers.1.feed_forward.experts.{expert}.{projection}.weight_t"
+                ].const_value.numpy()
+                np.testing.assert_array_equal(value, expert + 1)
+
+        output_dir = tmp_path / "saved-jamba"
+        package.save(output_dir, progress_bar=False)
+        session = OnnxModelSession(ModelPackage.load(output_dir)["model"])
+        outputs = session.run(self._inputs(np.asarray([[1, 2], [3, 4]], np.int64)))
+        assert outputs["logits"].shape == (2, 2, 64)
+        assert outputs["present.0.ssm_state"].dtype == np.float32
+
+    def test_prefill_decode_reorder_and_snapshot_replay(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "jamba-state.gguf"
+        _write_jamba_gguf(path, quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        histories = np.asarray([[1, 2], [3, 4]], np.int64)
+        prefill = session.run(self._inputs(histories))
+
+        order = np.asarray([1, 0], np.int64)
+        next_tokens = np.asarray([[5], [6]], np.int64)
+        decode_inputs = {
+            "input_ids": next_tokens,
+            "position_ids": np.full((2, 1), 2, np.int64),
+            "attention_mask": np.ones((2, 3), np.int64),
+            "past_key_values.0.conv_state": prefill["present.0.conv_state"][order],
+            "past_key_values.0.ssm_state": prefill["present.0.ssm_state"][order],
+            "past_key_values.1.key": prefill["present.1.key"][order],
+            "past_key_values.1.value": prefill["present.1.value"][order],
+        }
+        decoded = session.run(decode_inputs)
+        replayed = session.run(decode_inputs)
+        for name in decoded:
+            np.testing.assert_array_equal(decoded[name], replayed[name])
+
+        full_tokens = np.concatenate([histories[order], next_tokens], axis=1)
+        full = session.run(self._inputs(full_tokens))
+        np.testing.assert_allclose(
+            decoded["logits"][:, -1],
+            full["logits"][:, -1],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+
+    def test_quantized_source_keeps_only_compatible_matmul_roles(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "jamba-q4.gguf"
+        _write_jamba_gguf(path, quantized=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        # 4 attention + 3 dense FFN + 2 experts * 3 expert projections.
+        assert sum(node.op_type == "MatMulNBits" for node in model.graph) == 13
+        for stem in (
+            "model.layers.0.mamba.in_proj.weight_t",
+            "model.layers.0.mamba.conv1d.weight",
+            "model.layers.0.mamba.ssm.x_proj.weight_t",
+            "model.layers.0.mamba.ssm.dt_proj.weight_t",
+            "model.layers.0.mamba.out_proj.weight_t",
+        ):
+            assert model.graph.initializers[stem].const_value.dtype == ir.DataType.FLOAT
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"omit": "blk.1.ffn_up_exps.weight"}, "tensor closure"),
+            ({"extra": "blk.0.ffn_gate_inp.weight"}, "tensor closure"),
+            (
+                {"malformed_shape": "blk.1.ffn_gate_exps.weight"},
+                "tensor shape",
+            ),
+            ({"expert_count": 0, "expert_used_count": 1}, "expert_count"),
+            ({"expert_count": 1, "expert_used_count": 1}, "not a routed-MoE"),
+            ({"expert_count": 2, "expert_used_count": 3}, "expert_used_count"),
+            ({"invalid_decay": True}, "finite negative"),
+            ({"extra": "blk.0.ssm_in.scale"}, "auxiliary|tensor closure"),
+        ],
+    )
+    def test_malformed_sources_fail_before_graph(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        kwargs: dict[str, object],
+        match: str,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "jamba-invalid.gguf"
+        _write_jamba_gguf(path, quantized=False, **kwargs)
         graph_build_started = False
 
         def unexpected_graph_build(*args, **kwargs):

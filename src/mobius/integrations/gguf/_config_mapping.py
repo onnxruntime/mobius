@@ -24,6 +24,7 @@ __all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvabl
 
 import dataclasses
 import logging
+import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -1441,26 +1442,58 @@ def _jamba_postprocess(
     metadata: dict[str, Any],
     model: Any,
 ) -> JambaConfig:
-    """Build the dense Jamba subset from the serialized per-layer schedule."""
+    """Build exact Jamba mixer and routed-FFN schedules from serialized tensors."""
     inner_size = int(metadata["jamba.ssm.inner_size"])
     if inner_size != 2 * config.hidden_size:
         raise ValueError(
             "jamba.ssm.inner_size must equal 2 * embedding_length for the pinned loader"
         )
-    if int(metadata.get("jamba.expert_count", 0)) or any(
-        ".ffn_gate_inp." in name for name in model.tensor_names
-    ):
+    if config.hidden_act not in {"silu", "swish"}:
+        raise ValueError("Jamba GGUF requires the pinned SiLU feed-forward activation")
+    num_experts = int(metadata.get("jamba.expert_count", 0))
+    top_k = int(metadata.get("jamba.expert_used_count", 0))
+    expert_layers = sorted(
+        {
+            int(match.group(1))
+            for name in model.tensor_names
+            if (match := re.fullmatch(r"blk\.(\d+)\.ffn_gate_inp\.weight", name))
+        }
+    )
+    if num_experts:
+        if num_experts == 1:
+            raise ValueError(
+                "Jamba expert_count=1 is not a routed-MoE layout; use dense FFN tensors"
+            )
+        if not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"jamba.expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        if not expert_layers:
+            raise ValueError("Jamba expert metadata requires at least one routed MoE layer")
+    elif top_k or expert_layers:
         raise ValueError(
-            "Jamba GGUF MoE layers are deferred until stacked-expert parity is established"
+            "Jamba routed tensors require positive expert_count and expert_used_count"
         )
+    output_present = "output.weight" in set(model.tensor_names)
+    fields = _shallow_fields(config)
+    fields.update(
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        moe_intermediate_size=config.intermediate_size if num_experts else None,
+        norm_topk_prob=False,
+        routed_scaling_factor=1.0,
+        tie_word_embeddings=not output_present,
+        rope_type=None,
+    )
     return JambaConfig(
-        **_shallow_fields(config),
+        **fields,
         mamba_d_state=int(metadata["jamba.ssm.state_size"]),
         mamba_d_conv=int(metadata["jamba.ssm.conv_kernel"]),
         mamba_expand=2,
         mamba_dt_rank=int(metadata["jamba.ssm.time_step_rank"]),
         mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
         mamba_proj_bias=False,
+        expert_layer_indices=expert_layers,
     )
 
 

@@ -2592,6 +2592,9 @@ class JambaConfig(ArchitectureConfig):
     attn_layer_offset: int = 4
     expert_layer_period: int = 2
     expert_layer_offset: int = 1
+    # GGUF serializes the resolved schedule through tensor presence rather than
+    # preserving the source period/offset pair.
+    expert_layer_indices: list[int] | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> JambaConfig:
@@ -2601,18 +2604,33 @@ class JambaConfig(ArchitectureConfig):
         n = base.num_hidden_layers
         attn_period = getattr(config, "attn_layer_period", 8)
         attn_offset = getattr(config, "attn_layer_offset", 4)
+        expert_period = getattr(config, "expert_layer_period", 2)
+        expert_offset = getattr(config, "expert_layer_offset", 1)
+        if attn_period <= 0 or not 0 <= attn_offset < attn_period:
+            raise ValueError("Jamba attn_layer_offset must be in [0, attn_layer_period)")
+        if expert_period <= 0 or not 0 <= expert_offset < expert_period:
+            raise ValueError("Jamba expert_layer_offset must be in [0, expert_layer_period)")
         layer_types = []
         for i in range(n):
-            if (i - attn_offset) % attn_period == 0:
+            if i % attn_period == attn_offset:
                 layer_types.append("full_attention")
             else:
                 layer_types.append("mamba")
 
         num_experts = getattr(config, "num_experts", 16)
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 2)
+        dt_rank = getattr(config, "mamba_dt_rank", "auto")
+        if dt_rank == "auto":
+            dt_rank = math.ceil(base.hidden_size / 16)
 
         # Exclude fields we set explicitly below to avoid duplicate keyword args
-        _exclude = {"layer_types", "num_local_experts", "num_experts_per_tok"}
+        _exclude = {
+            "layer_types",
+            "num_local_experts",
+            "num_experts_per_tok",
+            "norm_topk_prob",
+            "rope_type",
+        }
         base_fields = {k: v for k, v in _shallow_fields(base).items() if k not in _exclude}
         return cls(
             **base_fields,
@@ -2623,13 +2641,16 @@ class JambaConfig(ArchitectureConfig):
             mamba_d_state=getattr(config, "mamba_d_state", 16),
             mamba_d_conv=getattr(config, "mamba_d_conv", 4),
             mamba_expand=getattr(config, "mamba_expand", 2),
-            mamba_dt_rank=getattr(config, "mamba_dt_rank", 256),
+            mamba_dt_rank=int(dt_rank),
             mamba_conv_bias=getattr(config, "mamba_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
             attn_layer_period=attn_period,
             attn_layer_offset=attn_offset,
-            expert_layer_period=getattr(config, "expert_layer_period", 2),
-            expert_layer_offset=getattr(config, "expert_layer_offset", 1),
+            expert_layer_period=expert_period,
+            expert_layer_offset=expert_offset,
+            expert_layer_indices=[i for i in range(n) if i % expert_period == expert_offset],
+            norm_topk_prob=False,
+            rope_type=None,
         )
 
 

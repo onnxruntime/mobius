@@ -261,6 +261,15 @@ _RECURRENT_RUNTIME_VALIDATION_PENDING = (
     "stateful ORT generation. Runtime packaging remains deferred until that evidence exists."
 )
 
+_JAMBA_RUNTIME_VALIDATION_PENDING = (
+    "Exact mixed attention/Mamba and dense/routed-MoE schedules, strict tensor closure "
+    "and shapes, GGUF value transforms, compatible projection quantization, value-checked "
+    "expert ordering, reduced Transformers parity, and multi-token ORT state threading, "
+    "reorder, and replay are covered. Generic ORT GenAI runtime packaging remains deferred "
+    "because its released cache schema cannot represent heterogeneous KV, convolution, and "
+    "recurrent state slots; tracked by #605."
+)
+
 _RWKV_GRAPH_REASONS = {
     "rwkv6": (
         "RWKV6 carries two F32 states per layer (two token-shift vectors and a per-head "
@@ -1063,8 +1072,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.time_step_rank",
         ),
         runtime=Support.DEFERRED,
-        quantized_import=Support.REJECTED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+        reason=_JAMBA_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="nemotron_h",

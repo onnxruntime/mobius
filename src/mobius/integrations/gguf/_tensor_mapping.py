@@ -387,6 +387,10 @@ _JAMBA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_gate": "model.layers.{bid}.feed_forward.gate_proj",
     "blk.{bid}.ffn_up": "model.layers.{bid}.feed_forward.up_proj",
     "blk.{bid}.ffn_down": "model.layers.{bid}.feed_forward.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.feed_forward.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.feed_forward.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.feed_forward.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.feed_forward.experts.down_proj",
 }
 
 _NEMOTRON_H_MAPPING: dict[str, str] = {
