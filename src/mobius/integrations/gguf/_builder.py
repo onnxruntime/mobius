@@ -20,7 +20,6 @@ __all__ = ["build_from_gguf"]
 import logging
 import math
 import re
-import struct
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
@@ -49,6 +48,7 @@ from mobius.integrations.gguf._errors import (
     ShardedGGUFNotSupportedError,
     UnsupportedGGUFArchitectureError,
 )
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
 from mobius.integrations.gguf._spec import Support
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
@@ -70,20 +70,6 @@ _GGUF_SHARD_FILENAME_RE = re.compile(
 )
 _NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
 _GGUF_HEADER_RANGE_BYTES = 16 * 1024 * 1024
-_GGUF_ARCHITECTURE_KEY = b"general.architecture"
-_GGUF_SCALAR_WIDTHS = {
-    0: 1,  # UINT8
-    1: 1,  # INT8
-    2: 2,  # UINT16
-    3: 2,  # INT16
-    4: 4,  # UINT32
-    5: 4,  # INT32
-    6: 4,  # FLOAT32
-    7: 1,  # BOOL
-    10: 8,  # UINT64
-    11: 8,  # INT64
-    12: 8,  # FLOAT64
-}
 
 
 def _summarize_nemotron_h_moe_layout(
@@ -401,82 +387,9 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
 
 def _gguf_architecture_from_header_prefix(data: bytes, *, source: str) -> str:
     """Read ``general.architecture`` from a bounded GGUF header prefix."""
-    if len(data) < 24 or data[:4] != b"GGUF":
-        raise ValueError(f"{source!r} does not begin with a valid GGUF header.")
-    version = struct.unpack_from("<I", data, 4)[0]
-    if version not in {2, 3}:
-        raise ValueError(f"{source!r} uses unsupported GGUF version {version}.")
-
-    def read_uint32(offset: int) -> tuple[int, int]:
-        end = offset + 4
-        if end > len(data):
-            raise ValueError(f"{source!r} has a truncated GGUF metadata header.")
-        return struct.unpack_from("<I", data, offset)[0], end
-
-    def read_uint64(offset: int) -> tuple[int, int]:
-        end = offset + 8
-        if end > len(data):
-            raise ValueError(f"{source!r} has a truncated GGUF metadata header.")
-        return struct.unpack_from("<Q", data, offset)[0], end
-
-    def read_string(offset: int) -> tuple[bytes, int]:
-        length, offset = read_uint64(offset)
-        end = offset + length
-        if end > len(data):
-            raise ValueError(f"{source!r} has a truncated GGUF metadata string.")
-        return data[offset:end], end
-
-    def skip_value(value_type: int, offset: int, *, depth: int = 0) -> int:
-        width = _GGUF_SCALAR_WIDTHS.get(value_type)
-        if width is not None:
-            end = offset + width
-            if end > len(data):
-                raise ValueError(f"{source!r} has a truncated GGUF metadata value.")
-            return end
-        if value_type == 8:
-            _, offset = read_string(offset)
-            return offset
-        if value_type != 9:
-            raise ValueError(f"{source!r} uses unknown GGUF metadata type {value_type}.")
-        if depth >= 8:
-            raise ValueError(f"{source!r} has excessively nested GGUF metadata arrays.")
-        element_type, offset = read_uint32(offset)
-        count, offset = read_uint64(offset)
-        if count > len(data):
-            raise ValueError(f"{source!r} declares an impossible GGUF metadata array size.")
-        for _ in range(count):
-            offset = skip_value(element_type, offset, depth=depth + 1)
-        return offset
-
-    kv_count = struct.unpack_from("<Q", data, 16)[0]
-    if kv_count > len(data):
-        raise ValueError(f"{source!r} declares an impossible GGUF metadata entry count.")
-    offset = 24
-    architecture_values: list[bytes] = []
-    for _ in range(kv_count):
-        key, offset = read_string(offset)
-        value_type, offset = read_uint32(offset)
-        if key == _GGUF_ARCHITECTURE_KEY:
-            if value_type != 8:
-                raise ValueError(
-                    f"{source!r} encodes general.architecture with GGUF type "
-                    f"{value_type}, expected string type 8."
-                )
-            value, offset = read_string(offset)
-            architecture_values.append(value)
-        else:
-            offset = skip_value(value_type, offset)
-
-    if len(architecture_values) != 1:
-        raise ValueError(
-            f"{source!r} must contain exactly one general.architecture metadata entry, "
-            f"found {len(architecture_values)}."
-        )
-    value = architecture_values[0]
-    try:
-        return value.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"{source!r} has a non-UTF-8 general.architecture value.") from error
+    architecture = _gguf_architecture_from_header(data, source=source)
+    assert architecture is not None
+    return architecture
 
 
 def _preflight_hf_gguf_file(

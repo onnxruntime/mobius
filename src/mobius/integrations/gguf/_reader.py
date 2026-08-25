@@ -25,12 +25,15 @@ from __future__ import annotations
 __all__ = ["GGUFModel"]
 
 import logging
+import mmap
 from array import array
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +162,17 @@ class GGUFModel:
             raise FileNotFoundError(f"GGUF file not found: {self._path}")
 
         source_identity = _stat_identity(self._path)
+        if source_identity[2] < 24:
+            raise ValueError(f"{str(self._path)!r} does not begin with a valid GGUF header.")
+        with (
+            self._path.open("rb") as stream,
+            mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ) as mapped,
+        ):
+            _gguf_architecture_from_header(
+                mapped,
+                source=str(self._path),
+                require_architecture=False,
+            )
         self._reader = GGUFReader(str(self._path))
         if _stat_identity(self._path) != source_identity:
             raise ValueError("GGUF source changed while the reader was opening it")
