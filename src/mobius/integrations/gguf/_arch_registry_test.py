@@ -174,6 +174,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "olmoe",
         "phi3",
         "phimoe",
+        "plamo2",
         "qwen2",
         "qwen2moe",
         "qwen3",
