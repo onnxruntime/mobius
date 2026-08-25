@@ -669,15 +669,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print(f"Saved {name} to {path}")
 
     # Save the trailing MTP / "nextn" self-speculative head sidecar (when the
-    # GGUF shipped one) into a ``mtp/`` subdirectory next to the backbone.
+    # GGUF shipped one). ModelPackage.save() persisted it into ``mtp/``.
     mtp_head = getattr(pkg, "mtp_head", None)
     if mtp_head is not None:
         mtp_dir = os.path.join(output_dir, "mtp")
-        mtp_head.save(
-            mtp_dir,
-            external_data=args.external_data,
-            max_workers=args.max_workers,
-        )
         print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
 
     draft_manifest = getattr(pkg, "draft_manifest", None)

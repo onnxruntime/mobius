@@ -1,6 +1,23 @@
 {
 "source": "https://github.com/ggml-org/llama.cpp",
 "commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+"mtp_nextn": {
+  "metadata_key_template": "{arch}.nextn_predict_layers",
+  "metadata_type": "uint32",
+  "head_count_semantics": "block_count includes the trailing appended MTP blocks; their indices are [block_count-nextn_predict_layers, block_count)",
+  "modern_tensor_names": ["blk.{bid}.nextn.eh_proj.weight", "blk.{bid}.nextn.embed_tokens.weight", "blk.{bid}.nextn.enorm.weight", "blk.{bid}.nextn.hnorm.weight", "blk.{bid}.nextn.shared_head_head.weight", "blk.{bid}.nextn.shared_head_norm.weight"],
+  "legacy_tensor_names": ["nextn.pre_projection.weight", "nextn.post_projection.weight"],
+  "generic_loader_extra_suffixes": ["scale", "input_scale"],
+  "loader_metadata_consumers": ["bailingmoe2", "bailingmoe3", "cohere2moe", "deepseek2", "deepseek32", "deepseek4", "dots3note", "exaone-moe", "exaone4", "gemma4-assistant", "glm-dsa", "glm4", "glm4moe", "hy_v3", "mimo2", "nemotron_h", "nemotron_h_moe", "qwen35", "qwen35moe", "qwen3next", "step35"],
+  "loader_executed_sidecars": ["bailingmoe3", "cohere2moe", "deepseek2", "deepseek32", "deepseek4", "glm-dsa", "hy_v3", "mimo2", "nemotron_h_moe", "qwen35", "qwen35moe", "qwen3next", "step35"],
+  "loader_preserved_or_skipped": ["bailingmoe2", "dots3note", "exaone-moe", "exaone4", "glm4", "glm4moe"],
+  "standalone_assistant": ["gemma4-assistant"],
+  "converter_metadata_emitters": ["bailingmoe2", "bailingmoe3", "cohere2moe", "deepseek2", "deepseek32", "deepseek4", "dots3note", "exaone-moe", "exaone4", "gemma4-assistant", "glm-dsa", "glm4", "glm4moe", "hy_v3", "mimo2", "nemotron_h_moe", "qwen35", "qwen35moe", "qwen3next", "step35"],
+  "converter_mtp_only_opt_in": ["bailingmoe3", "deepseek2", "deepseek32", "deepseek4", "dots3note", "glm-dsa", "hy_v3", "nemotron_h_moe", "qwen35", "qwen35moe", "qwen3next", "step35"],
+  "non_mtp_metadata_reemitters": ["graniteswitch"],
+  "mobius_supported_sidecars": ["qwen35"],
+  "mobius_runtime_status": "DEFERRED"
+},
 "architectures": {
   "afmoe": {"cohort": "C02-moe-dense-attn", "cpp_loader": true, "dual_moe": true},
   "apertus": {"cohort": "C01-dense-transformer", "cpp_loader": true, "dual_moe": false, "tensor_families": ["token_embd", "output_norm", "output", "rope_freqs", "blk.{bid}.attn_norm", "blk.{bid}.attn_q", "blk.{bid}.attn_k", "blk.{bid}.attn_v", "blk.{bid}.attn_output", "blk.{bid}.attn_rot_embd", "blk.{bid}.attn_q_norm", "blk.{bid}.attn_k_norm", "blk.{bid}.ffn_norm", "blk.{bid}.ffn_gate", "blk.{bid}.ffn_down", "blk.{bid}.ffn_up"]},

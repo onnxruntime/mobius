@@ -6012,7 +6012,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # inputs_embeds + the target's hidden_states instead of input_ids;
     # borrows the target's embed/lm_head), so the generic
     # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
-    # src/mobius/models/_qwen35_mtp_test.py.
+    # src/mobius/models/_qwen35_mtp_test.py and the registered dense-qwen35
+    # GGUF capability in src/mobius/integrations/gguf/_mtp_test.py.
     "Qwen35MtpModel",
     # EAGLE-3 drafter: bespoke IO contract (inputs_embeds, fused_hidden,
     # recycled_hidden and draft-vocab logits). Covered by _eagle3_test.py.
