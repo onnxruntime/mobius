@@ -684,6 +684,28 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("baichuan", {}, False),
     ("codegen2", {}, False),
     ("command_r", {}, False),
+    (
+        "jais2",
+        {
+            "hidden_act": "relu2",
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+        },
+        False,
+    ),
+    (
+        "kclgpt",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    ("xverse", {}, False),
     # === DeepSeek (MLA + MoE) ===
     (
         "deepseek_v3",

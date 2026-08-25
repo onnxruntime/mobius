@@ -1456,6 +1456,91 @@ class CausalLMConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class Jais2Config(CausalLMConfig):
+    """Normalize the published Jais2 projection and LayerNorm configuration."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Jais2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        attention_bias = bool(getattr(config, "attention_bias", True))
+        fields = _shallow_fields(base)
+        fields.update(
+            attn_qkv_bias=attention_bias,
+            attn_o_bias=attention_bias,
+            mlp_bias=bool(getattr(config, "mlp_bias", True)),
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
+class CodeShellConfig(CausalLMConfig):
+    """Canonicalize the published CodeShell HuggingFace configuration."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> CodeShellConfig:
+        if getattr(config, "position_embedding_type", "rope") != "rope":
+            raise ValueError("CodeShell export only supports position_embedding_type='rope'")
+
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        hidden_size = int(getattr(config, "hidden_size", None) or config.n_embd)
+        num_heads = int(getattr(config, "num_attention_heads", None) or config.n_head)
+        num_kv_heads = (
+            int(getattr(config, "num_query_groups", num_heads))
+            if getattr(config, "group_query_attention", False)
+            else num_heads
+        )
+        rope = base.rope or RoPEConfig(rope_type="default", rope_theta=10_000.0)
+        fields = _shallow_fields(base)
+        fields.update(
+            hidden_size=hidden_size,
+            head_dim=hidden_size // num_heads,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            num_hidden_layers=int(
+                getattr(config, "num_hidden_layers", None) or config.n_layer
+            ),
+            intermediate_size=int(
+                getattr(config, "intermediate_size", None)
+                or getattr(config, "n_inner", None)
+                or 4 * hidden_size
+            ),
+            max_position_embeddings=int(
+                getattr(config, "max_position_embeddings", None) or config.n_positions
+            ),
+            hidden_act=getattr(config, "activation_function", "gelu_pytorch_tanh"),
+            attn_qkv_bias=True,
+            attn_o_bias=True,
+            mlp_bias=True,
+            tie_word_embeddings=True,
+            rope=rope,
+            rope_type=rope.rope_type,
+            rope_theta=rope.rope_theta,
+            rope_scaling=rope.rope_scaling,
+            partial_rotary_factor=rope.partial_rotary_factor,
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
+class XverseConfig(CausalLMConfig):
+    """Supply Xverse's source-defined standard RoPE default."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> XverseConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        rope = base.rope or RoPEConfig(rope_type="default", rope_theta=10_000.0)
+        fields = _shallow_fields(base)
+        fields.update(
+            rope=rope,
+            rope_type=rope.rope_type,
+            rope_theta=rope.rope_theta,
+            rope_scaling=rope.rope_scaling,
+            partial_rotary_factor=rope.partial_rotary_factor,
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
 class MiniMaxConfig(CausalLMConfig):
     """Exact configuration for MiniMax-Text-01 and MiniMax-M1 backbones."""
 

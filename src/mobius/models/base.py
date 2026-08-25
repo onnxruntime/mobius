@@ -564,7 +564,7 @@ class LayerNormCausalLMModel(CausalLMModel):
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
         # Replace TextModel with the LayerNorm-based variant.
-        self.model = LayerNormTextModel(config)
+        self._replace_text_model(LayerNormTextModel(config))
 
 
 class FusedGateUpCausalLMModel(CausalLMModel):

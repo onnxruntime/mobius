@@ -57,7 +57,10 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 59
+_EXPECTED_SUPPORTED_COUNT = 67
+_PROMOTED_CONVENTIONAL_DECODERS = frozenset(
+    {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
+)
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -163,6 +166,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "granitemoe",
         "hunyuan-dense",
         "jamba",
+        "jais2",
         "kimi-k3",
         "kimi-linear",
         "lfm2",
@@ -189,6 +193,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "qwen3next",
         "rnd1",
         "seed_oss",
+        "command-r",
         "smollm3",
         "stablelm",
         "starcoder2",
@@ -281,6 +286,12 @@ class TestCapabilityClosure:
             "nemotron_h",
             "nemotron_h_moe",
             "phi2",
+            "bloom",
+            "codeshell",
+            "orion",
+            "qwen",
+            "starcoder",
+            "xverse",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
@@ -662,7 +673,9 @@ class TestPinnedTensorClosure:
 
 
 class TestFinalCensusClosure:
-    @pytest.mark.parametrize("architecture", sorted(_FINAL_CENSUS_CLOSURE))
+    @pytest.mark.parametrize(
+        "architecture", sorted(_FINAL_CENSUS_CLOSURE - _PROMOTED_CONVENTIONAL_DECODERS)
+    )
     def test_every_newly_closed_id_has_one_nonimportable_spec(self, architecture: str) -> None:
         spec = try_get_arch_spec(architecture)
         assert spec is not None
@@ -1514,7 +1527,7 @@ class TestPinnedRemainingVLMTextCohort:
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
 
-    @pytest.mark.parametrize("architecture", ["bloom"])
+    @pytest.mark.parametrize("architecture", [])
     def test_configurable_but_unmappable_architectures_are_refused(
         self, architecture: str
     ) -> None:
