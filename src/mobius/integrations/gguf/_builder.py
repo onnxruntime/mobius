@@ -5351,37 +5351,71 @@ def _load_quantized_state_dict(
 
         if gguf_arch == "kimi-k3" and module_hf_name.endswith(".kv_b_proj.weight"):
             # K3 may serialize MLA K/V-B as one head-major matrix, while the
-            # graph has distinct quantized projections. Dequantize once, split
-            # on the semantic K/V axis, then pack each exact target layout.
-            values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+            # graph has distinct quantized projections. Preserve each source
+            # row exactly while splitting and reordering the head-major blocks.
+            route, exactness, _reason = quant_import_decision(
+                qtype,
+                TensorRole.PROJECTION,
+                target_bits=target_bits,
+                target_block_size=target_block_size,
+            )
+            if (
+                route is not QuantImportRoute.AFFINE_REPACK
+                or exactness is not RepackExactness.EXACT
+                or not can_repack(qtype_val)
+            ):
+                quant_name = get_quant_spec(qtype)
+                quant_name = quant_name.name if quant_name is not None else str(qtype)
+                raise ValueError(
+                    "Quantization-preserving GGUF import would change the dequantized "
+                    f"values of {gguf_name} ({quant_name}). Use keep_quantized=False "
+                    "(API) or --dequantize (CLI) for explicit float import."
+                )
+            repacked = repack_gguf_tensor(
+                raw.ravel().view(np.uint8),
+                qtype_val,
+                (int(np_shape[0]), int(np_shape[1])),
+            )
+            if repacked.bits != target_bits or repacked.block_size != target_block_size:
+                raise ValueError(
+                    f"Kimi-K3 fused KV-B tensor {gguf_name} does not match the "
+                    f"{target_bits}-bit/block-{target_block_size} target"
+                )
             heads = int(config.num_attention_heads)
             nope_dim = int(config.qk_nope_head_dim)
             value_dim = int(config.v_head_dim)
-            kv_rank = int(config.kv_lora_rank)
-            fused = values.reshape(heads, nope_dim + value_dim, kv_rank)
             prefix = module_hf_name.removesuffix("kv_b_proj.weight")
-            split_values = {
-                prefix + "k_b_proj": fused[:, :nope_dim].reshape(-1, kv_rank),
-                prefix + "v_b_proj": fused[:, nope_dim:].reshape(-1, kv_rank),
+            split_ranges = {
+                prefix + "k_b_proj": (0, nope_dim),
+                prefix + "v_b_proj": (nope_dim, nope_dim + value_dim),
             }
-            for target_stem, target_values in split_values.items():
+            for target_stem, (start, end) in split_ranges.items():
                 if target_stem not in quantized_stems:
                     raise ValueError(
                         f"Kimi-K3 fused KV-B target {target_stem!r} is not quantized"
                     )
-                repacked = repack_dequantized_tensor(
-                    target_values,
-                    bits=target_bits,
-                    block_size=target_block_size,
-                    symmetric=target_symmetric,
+                weight = repacked.weight.reshape(
+                    heads, nope_dim + value_dim, *repacked.weight.shape[1:]
+                )[:, start:end].reshape(-1, *repacked.weight.shape[1:])
+                scales = repacked.scales.reshape(
+                    heads, nope_dim + value_dim, *repacked.scales.shape[1:]
+                )[:, start:end].reshape(-1, *repacked.scales.shape[1:])
+                zero_points = (
+                    repacked.zero_points.reshape(
+                        heads,
+                        nope_dim + value_dim,
+                        *repacked.zero_points.shape[1:],
+                    )[:, start:end].reshape(-1, *repacked.zero_points.shape[1:])
+                    if repacked.zero_points is not None
+                    else None
                 )
-                state_dict[f"{target_stem}.weight"] = torch.from_numpy(repacked.weight)
-                state_dict[f"{target_stem}.scales"] = torch.from_numpy(repacked.scales)
-                if repacked.zero_points is not None:
+                state_dict[f"{target_stem}.weight"] = torch.from_numpy(weight.copy())
+                state_dict[f"{target_stem}.scales"] = torch.from_numpy(scales.copy())
+                if zero_points is not None:
                     state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
-                        repacked.zero_points
+                        zero_points.copy()
                     )
-            n_requantized += 2
+            n_repacked += 2
             continue
 
         # Repack every target QuantizedLinear weight. Mixed GGUF presets
