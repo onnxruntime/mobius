@@ -45,6 +45,7 @@ from mobius.integrations.gguf._preflight import (
     preflight_hf_gguf,
     preflight_local_gguf,
 )
+from mobius.integrations.gguf._reuse import verify_gguf_reuse_manifest
 from mobius.integrations.gguf._runtime_package import write_gguf_runtime_package
 from mobius.integrations.gguf._shard_set import (
     GgufShardError,
@@ -60,6 +61,7 @@ __all__ = [
     "build_gemma4_vlm_from_gguf",
     "write_gguf_runtime_package",
     "write_gguf_tokenizer_json",
+    "verify_gguf_reuse_manifest",
     # Multi-shard GGUF import
     "GgufShardSet",
     "GgufShardManifest",

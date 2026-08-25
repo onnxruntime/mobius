@@ -93,6 +93,8 @@ class ModelPackage(UserDict[str, ir.Model]):
     ) -> None:
         super().__init__(models or {})
         self.config = config
+        # Optional persistence policy attached by the GGUF importer.
+        self.gguf_reuse_plan: Any = None
         self.policy_components = dict(policy_components or {})
         self.adapter_target_manifest = adapter_target_manifest
         self.adapter_service_options = adapter_service_options or AdapterServiceOptions()
@@ -202,6 +204,18 @@ class ModelPackage(UserDict[str, ir.Model]):
             )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
+        reuse_plan = getattr(self, "gguf_reuse_plan", None)
+        if reuse_plan is not None:
+            if external_data != "onnx":
+                raise ValueError(
+                    "GGUF weight reuse requires external_data='onnx'; safetensors "
+                    "cannot preserve arbitrary GGUF byte ranges."
+                )
+            if max_shard_size_bytes is not None:
+                raise ValueError(
+                    "GGUF weight reuse writes one converted-weight sidecar and does "
+                    "not support max_shard_size_bytes."
+                )
         os.makedirs(directory, exist_ok=True)
         selected = {
             name: model
@@ -209,6 +223,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             if components is None or components(name)
         }
         use_subfolders = len(selected) > 1
+        if reuse_plan is not None and (len(selected) != 1 or use_subfolders):
+            raise ValueError("GGUF weight reuse currently supports one flat ONNX model only.")
 
         for name, model in selected.items():
             callback = _make_progress_callback() if progress_bar else None
@@ -221,7 +237,16 @@ class ModelPackage(UserDict[str, ir.Model]):
                 model_dir = directory
             path = os.path.join(model_dir, "model.onnx")
             with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
-                if external_data == "safetensors":
+                if reuse_plan is not None:
+                    from mobius.integrations.gguf._reuse import save_reuse_package
+
+                    save_reuse_package(
+                        saved_model,
+                        path,
+                        reuse_plan,
+                        callback=callback,
+                    )
+                elif external_data == "safetensors":
                     ir.save_safetensors(
                         saved_model,
                         path,
@@ -238,6 +263,13 @@ class ModelPackage(UserDict[str, ir.Model]):
                         save_kwargs["max_workers"] = max_workers
                     ir.save(saved_model, path, **save_kwargs)
 
+        if reuse_plan is None:
+            # Re-saving a loaded reuse package through the ordinary saver copies
+            # all weights into ONNX external data, so any old reuse manifest in
+            # the destination would become a false provenance claim.
+            stale_reuse_manifest = os.path.join(directory, "gguf-reuse.json")
+            if os.path.isfile(stale_reuse_manifest):
+                os.remove(stale_reuse_manifest)
         if include_policy_components:
             self.save_policy_components(directory, check_weights=check_weights)
         if include_adapter_artifacts:
@@ -594,6 +626,8 @@ class ModelPackage(UserDict[str, ir.Model]):
         self,
         state_dict: dict[str, torch.Tensor],
         prefix_map: dict[str, str] | None = None,
+        *,
+        fold_constants: bool = True,
     ) -> None:
         """Apply weights from a state dict across component models.
 
@@ -654,6 +688,9 @@ class ModelPackage(UserDict[str, ir.Model]):
                     applied |= _apply_weights_to_model(model, unmatched)
 
         _log_weight_mapping(state_dict, applied)
+
+        if not fold_constants:
+            return
 
         # Fold constants now that weights have been loaded.
         # PackQKV emits Concat(w_q, w_k, w_v) in the graph; those nodes can only

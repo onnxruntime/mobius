@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -388,6 +390,644 @@ def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
         value_projection_quantization="q5_1",
     )
     return path
+
+
+class TestReuseGgufWeights:
+    """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
+
+    def test_mixed_save_preserves_ranges_and_runs(self, tmp_path: Path):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.save(str(tmp_path), progress_bar=False)
+
+        verify_gguf_reuse_manifest(tmp_path)
+        manifest = json.loads((tmp_path / "gguf-reuse.json").read_text())
+        converted = manifest["converted_tensors"]
+        assert len(converted) == len(set(converted))
+        assert "model.layers.0.self_attn.q_proj.weight" not in converted
+        assert "model.embed_tokens.weight" not in converted
+        q_route = next(
+            route
+            for route in manifest["reused_tensors"]
+            if route["initializer"] == "model.layers.0.self_attn.q_proj.weight"
+        )
+        assert q_route["transform"] == "llama_qk_permute"
+        reloaded = ModelPackage.load(str(tmp_path))
+        initializers = reloaded["model"].graph.initializers
+        embedding = initializers["model.embed_tokens.weight"].const_value
+        q_proj = initializers["model.layers.0.self_attn.q_proj.weight"].const_value
+        assert isinstance(embedding, ir.ExternalTensor)
+        assert embedding.location == "model.gguf"
+        assert embedding.offset is not None
+        assert embedding.length == 256 * 64 * 4
+        # Llama Q weights keep their GGUF bytes; ONNX performs the row permutation.
+        assert isinstance(q_proj, ir.ExternalTensor)
+        assert q_proj.location == "model.gguf"
+        assert any(
+            node.name == "model.layers.0.self_attn.q_proj.weight.gguf_reuse.Transpose"
+            for node in reloaded["model"].graph
+        )
+
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        session = ort.InferenceSession(
+            str(tmp_path / "model.onnx"),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        feeds = {
+            "input_ids": np.zeros((1, 2), dtype=np.int64),
+            "attention_mask": np.zeros((1, 2), dtype=np.int64),
+            "position_ids": np.zeros((1, 2), dtype=np.int64),
+            "past_key_values.0.key": np.zeros((1, 2, 0, 16), dtype=np.float32),
+            "past_key_values.0.value": np.zeros((1, 2, 0, 16), dtype=np.float32),
+        }
+        outputs = session.run(None, feeds)
+        assert outputs[0].shape == (1, 2, 256)
+        assert np.isfinite(outputs[0]).all()
+
+        reference_dir = tmp_path / "reference"
+        build_from_gguf(gguf_path).save(str(reference_dir), progress_bar=False)
+        reference_session = ort.InferenceSession(
+            str(reference_dir / "model.onnx"),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        reference_outputs = reference_session.run(None, feeds)
+        np.testing.assert_allclose(outputs[0], reference_outputs[0], rtol=1e-5, atol=1e-5)
+
+    def test_native_projection_bytes_are_not_copied_to_sidecar(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(
+            gguf_path,
+            architecture="qwen2",
+            hidden_size=256,
+            num_heads=4,
+            num_kv_heads=4,
+            intermediate_size=256,
+            projection_quantization="iq4_nl",
+        )
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.save(str(tmp_path), progress_bar=False)
+
+        source = GGUFModel(gguf_path)
+        offset, length, _ = source.tensor_storage_range("blk.0.attn_q.weight")
+        direct_payload = gguf_path.read_bytes()[offset : offset + length]
+        sidecar = (tmp_path / "model.onnx.data").read_bytes()
+        assert direct_payload not in sidecar
+
+        reloaded = ir.load(tmp_path / "model.onnx")
+        q_proj = reloaded.graph.initializers[
+            "model.layers.0.self_attn.q_proj.weight"
+        ].const_value
+        assert isinstance(q_proj, ir.ExternalTensor)
+        assert (q_proj.location, q_proj.offset, q_proj.length) == (
+            "model.gguf",
+            offset,
+            length,
+        )
+
+    def test_rejects_non_flat_source_and_detects_identity_change(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        gguf_path = source_dir / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+
+        with pytest.raises(ValueError, match="flat same-directory packaging"):
+            package.save(str(tmp_path / "output"), progress_bar=False)
+
+        package.save(str(source_dir), progress_bar=False)
+        with gguf_path.open("r+b") as stream:
+            stream.seek(-1, 2)
+            byte = stream.read(1)
+            stream.seek(-1, 2)
+            stream.write(bytes([byte[0] ^ 0xFF]))
+        with pytest.raises(ValueError, match="identity mismatch"):
+            verify_gguf_reuse_manifest(source_dir)
+
+    def test_does_not_reuse_same_size_dtype_cast(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(
+            gguf_path,
+            projection_quantization="f16",
+            float_type="f16",
+        )
+        with pytest.raises(ValueError, match="no byte-compatible tensors"):
+            build_from_gguf(
+                gguf_path,
+                dtype="bf16",
+                reuse_gguf_weights=True,
+            )
+
+    @pytest.mark.parametrize("artifact_name", ["model.onnx.data", ".gguf-reuse.lock"])
+    def test_rejects_generated_artifact_name_collision(
+        self, tmp_path: Path, artifact_name: str
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / artifact_name
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        with pytest.raises(ValueError, match="collides"):
+            package.save(str(tmp_path), progress_bar=False)
+        # Validation happens before any generated artifact can truncate the source.
+        assert gguf_path.stat().st_size == package.gguf_reuse_plan.size
+
+    @pytest.mark.parametrize("artifact_name", ["model.onnx.data", ".gguf-reuse.lock"])
+    def test_rejects_hardlink_to_generated_artifact(self, tmp_path: Path, artifact_name: str):
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        os.link(gguf_path, tmp_path / artifact_name)
+
+        with pytest.raises(ValueError, match="hard-linked"):
+            package.save(str(tmp_path), progress_bar=False)
+        assert gguf_path.stat().st_size == package.gguf_reuse_plan.size
+
+    def test_generated_looking_files_without_journal_are_preserved(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        token = "0" * 32
+        gguf_path = tmp_path / f".model.onnx.{token}.tmp"
+        unrelated = tmp_path / f".gguf-reuse.json.{token}.tmp"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        source_bytes = gguf_path.read_bytes()
+        unrelated.write_bytes(b"user-owned temporary data")
+
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+
+        assert gguf_path.read_bytes() == source_bytes
+        assert unrelated.read_bytes() == b"user-owned temporary data"
+
+    def test_ordinary_resave_removes_stale_reuse_manifest(self, tmp_path: Path):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+
+        loaded = ModelPackage.load(str(tmp_path))
+        loaded.save(str(tmp_path), progress_bar=False)
+        assert not (tmp_path / "gguf-reuse.json").exists()
+
+    def test_verifier_rejects_unmanifested_external_initializer(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        model_path = tmp_path / "model.onnx"
+        model = ir.load(model_path)
+        initializer = next(
+            value
+            for value in model.graph.initializers.values()
+            if not isinstance(value.const_value, ir.ExternalTensor)
+        )
+        tensor = initializer.const_value
+        assert tensor is not None
+        initializer.const_value = ir.ExternalTensor(
+            "model.onnx.data",
+            0,
+            tensor.nbytes,
+            tensor.dtype,
+            shape=tensor.shape,
+            name=tensor.name or initializer.name,
+            base_dir=tmp_path,
+        )
+        ir.save(model, model_path)
+
+        with pytest.raises(ValueError, match="Unmanifested sidecar initializer"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    def test_verifier_rejects_wrong_external_dtype(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        model_path = tmp_path / "model.onnx"
+        model = ir.load(model_path)
+        initializer = model.graph.initializers["model.embed_tokens.weight"]
+        external = initializer.const_value
+        assert isinstance(external, ir.ExternalTensor)
+        initializer.const_value = ir.ExternalTensor(
+            external.location,
+            external.offset,
+            external.length,
+            ir.DataType.UINT8,
+            shape=ir.Shape([external.length]),
+            name=external.name,
+            base_dir=tmp_path,
+        )
+        initializer.dtype = ir.DataType.UINT8
+        initializer.shape = ir.Shape([external.length])
+        ir.save(model, model_path)
+
+        with pytest.raises(ValueError, match="incompatible dtype"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    def test_verifier_rejects_wrong_manifest_qtype(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        manifest_path = tmp_path / "gguf-reuse.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["reused_tensors"][0]["qtype"] = "F16"
+        manifest_path.write_text(json.dumps(manifest))
+
+        with pytest.raises(ValueError, match="does not match source tensor"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    @pytest.mark.parametrize("length_delta", [-1, 1])
+    def test_verifier_rejects_wrong_sidecar_byte_length(
+        self, tmp_path: Path, length_delta: int
+    ):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        model_path = tmp_path / "model.onnx"
+        model = ir.load(model_path)
+        initializer = next(
+            value
+            for value in model.graph.initializers.values()
+            if isinstance(value.const_value, ir.ExternalTensor)
+            and value.const_value.location == "model.onnx.data"
+        )
+        external = initializer.const_value
+        assert isinstance(external, ir.ExternalTensor)
+        assert external.length is not None
+        initializer.const_value = ir.ExternalTensor(
+            external.location,
+            external.offset,
+            external.length + length_delta,
+            external.dtype,
+            shape=external.shape,
+            name=external.name,
+            base_dir=tmp_path,
+        )
+        ir.save(model, model_path)
+
+        with pytest.raises(ValueError, match="byte length"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    def test_save_and_verifier_do_not_run_behind_active_writer(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            _reuse,
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.save(str(tmp_path), progress_bar=False)
+
+        with _reuse._package_lock(tmp_path):
+            operations = (
+                lambda: verify_gguf_reuse_manifest(tmp_path),
+                lambda: package.save(str(tmp_path), progress_bar=False),
+            )
+            for operation in operations:
+                with pytest.raises(ValueError, match="locked by active writer"):
+                    operation()
+
+    @pytest.mark.parametrize(
+        "artifact_name", [".gguf-reuse.lock", ".gguf-reuse.transaction.json"]
+    )
+    def test_rejects_dangling_control_artifact_symlink(
+        self, tmp_path: Path, artifact_name: str
+    ):
+        from mobius.integrations.gguf import (
+            _reuse,
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        artifact = tmp_path / artifact_name
+        if artifact_name == _reuse._LOCK_NAME:
+            artifact.unlink()
+        artifact.symlink_to(tmp_path / "missing-target")
+
+        with pytest.raises(ValueError, match="Unsafe GGUF"):
+            if artifact_name == _reuse._LOCK_NAME:
+                verify_gguf_reuse_manifest(tmp_path)
+            else:
+                build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+                    str(tmp_path), progress_bar=False
+                )
+        assert artifact.is_symlink()
+
+    @pytest.mark.parametrize(
+        "artifact_name", ["model.onnx", "model.onnx.data", "gguf-reuse.json"]
+    )
+    def test_verifier_rejects_symlinked_package_artifact(
+        self, tmp_path: Path, artifact_name: str
+    ):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        artifact = tmp_path / artifact_name
+        moved = tmp_path / f"{artifact_name}.moved"
+        artifact.replace(moved)
+        artifact.symlink_to(moved)
+
+        with pytest.raises(ValueError, match="Unsafe GGUF"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    def test_failed_rerun_restores_existing_package(self, tmp_path: Path, monkeypatch):
+        from mobius.integrations.gguf import _reuse, build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        artifact_names = ("model.onnx", "model.onnx.data", "gguf-reuse.json")
+        original = {name: (tmp_path / name).read_bytes() for name in artifact_names}
+
+        real_replace = _reuse.os.replace
+        injected = False
+
+        def fail_manifest_install(source, destination):
+            nonlocal injected
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                not injected
+                and source_path.name.startswith(".gguf-reuse.json.")
+                and destination_path.name == "gguf-reuse.json"
+            ):
+                injected = True
+                raise OSError("injected manifest install failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(_reuse.os, "replace", fail_manifest_install)
+        rerun = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        with pytest.raises(OSError, match="injected"):
+            rerun.save(str(tmp_path), progress_bar=False)
+
+        assert injected
+        assert {name: (tmp_path / name).read_bytes() for name in artifact_names} == original
+        assert not list(tmp_path.glob(".*.tmp"))
+        assert not list(tmp_path.glob(".*.backup"))
+
+    def test_interrupted_rerun_recovers_from_transaction_journal(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from mobius.integrations.gguf import (
+            _reuse,
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        artifact_names = ("model.onnx", "model.onnx.data", "gguf-reuse.json")
+        original = {name: (tmp_path / name).read_bytes() for name in artifact_names}
+
+        real_replace = _reuse.os.replace
+        interrupted = False
+
+        def interrupt_manifest_install(source, destination):
+            nonlocal interrupted
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                not interrupted
+                and source_path.name.startswith(".gguf-reuse.json.")
+                and destination_path.name == "gguf-reuse.json"
+            ):
+                interrupted = True
+                raise KeyboardInterrupt
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(_reuse.os, "replace", interrupt_manifest_install)
+        rerun = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        with pytest.raises(KeyboardInterrupt):
+            rerun.save(str(tmp_path), progress_bar=False)
+        monkeypatch.setattr(_reuse.os, "replace", real_replace)
+
+        verify_gguf_reuse_manifest(tmp_path)
+        assert {name: (tmp_path / name).read_bytes() for name in artifact_names} == original
+        assert not (tmp_path / ".gguf-reuse.transaction.json").exists()
+        assert not list(tmp_path.glob(".*.backup"))
+
+    def test_committed_transaction_recovery_keeps_new_artifacts(self, tmp_path: Path):
+        from mobius.integrations.gguf import _reuse
+
+        token = "0" * 32
+        managed = []
+        for name in ("model.onnx", "model.onnx.data", "gguf-reuse.json"):
+            final = tmp_path / name
+            final.write_bytes(f"new {name}".encode())
+            backup_name = f".{name}.{token}.backup"
+            (tmp_path / backup_name).write_bytes(f"old {name}".encode())
+            managed.append({"final": name, "backup": backup_name, "had_existing": True})
+        journal = {
+            "phase": "committed",
+            "managed": managed,
+            "staged": [
+                f".model.onnx.{token}.tmp",
+                f".gguf-reuse.json.{token}.tmp",
+            ],
+        }
+        (tmp_path / ".gguf-reuse.transaction.json").write_text(json.dumps(journal))
+
+        _reuse._recover_transaction(tmp_path)
+
+        for name in ("model.onnx", "model.onnx.data", "gguf-reuse.json"):
+            assert (tmp_path / name).read_bytes() == f"new {name}".encode()
+        assert not list(tmp_path.glob(".*.backup"))
+        assert not (tmp_path / ".gguf-reuse.transaction.json").exists()
+
+    def test_verifier_rejects_wrong_transform_parameter(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        manifest_path = tmp_path / "gguf-reuse.json"
+        manifest = json.loads(manifest_path.read_text())
+        q_route = next(
+            route
+            for route in manifest["reused_tensors"]
+            if route["transform"] == "llama_qk_permute"
+        )
+        q_route["transform_parameter"] = 3
+        manifest_path.write_text(json.dumps(manifest))
+
+        with pytest.raises(ValueError, match="Invalid Q/K head count"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    def test_verifier_rejects_wrong_transform_permutation(self, tmp_path: Path):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            verify_gguf_reuse_manifest,
+        )
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        model_path = tmp_path / "model.onnx"
+        model = ir.load(model_path)
+        transpose = next(
+            node
+            for node in model.graph
+            if node.name == "model.layers.0.self_attn.q_proj.weight.gguf_reuse.Transpose"
+        )
+        transpose.attributes["perm"] = ir.AttrInt64s("perm", [0, 1, 2, 3])
+        ir.save(model, model_path)
+
+        with pytest.raises(ValueError, match="Q/K permutation shapes are wrong"):
+            verify_gguf_reuse_manifest(tmp_path)
+
+    def test_overwrite_rejects_filesystem_without_hardlinks(self, tmp_path: Path, monkeypatch):
+        from mobius.integrations.gguf import _reuse, build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.save(str(tmp_path), progress_bar=False)
+        original = (tmp_path / "model.onnx").read_bytes()
+
+        def reject_link(source, destination):
+            raise OSError("hard links unavailable")
+
+        monkeypatch.setattr(_reuse.os, "link", reject_link)
+        with pytest.raises(ValueError, match="requires same-directory hard-link"):
+            package.save(str(tmp_path), progress_bar=False)
+        assert (tmp_path / "model.onnx").read_bytes() == original
+        assert not (tmp_path / ".gguf-reuse.transaction.json").exists()
+
+    def test_recovery_rejects_unsafe_journal_paths(self, tmp_path: Path):
+        from mobius.integrations.gguf import _reuse
+
+        victim = tmp_path.parent / "victim"
+        victim.write_bytes(b"keep")
+        journal = {
+            "managed": [
+                {
+                    "final": "../victim",
+                    "backup": ".victim.00000000000000000000000000000000.backup",
+                    "had_existing": True,
+                },
+                {
+                    "final": "model.onnx.data",
+                    "backup": ".model.onnx.data.00000000000000000000000000000000.backup",
+                    "had_existing": False,
+                },
+                {
+                    "final": "gguf-reuse.json",
+                    "backup": ".gguf-reuse.json.00000000000000000000000000000000.backup",
+                    "had_existing": False,
+                },
+            ],
+            "staged": [
+                ".model.onnx.00000000000000000000000000000000.tmp",
+                ".gguf-reuse.json.00000000000000000000000000000000.tmp",
+            ],
+        }
+        (tmp_path / ".gguf-reuse.transaction.json").write_text(json.dumps(journal))
+
+        with pytest.raises(ValueError, match="Unsafe GGUF transaction"):
+            _reuse._recover_transaction(tmp_path)
+        assert victim.read_bytes() == b"keep"
+
+    def test_transaction_removes_obsolete_sidecar(self, tmp_path: Path):
+        from mobius.integrations.gguf import _reuse
+
+        final_model = tmp_path / "model.onnx"
+        final_sidecar = tmp_path / "model.onnx.data"
+        final_manifest = tmp_path / "gguf-reuse.json"
+        for path in (final_model, final_sidecar, final_manifest):
+            path.write_bytes(b"old")
+        staged_model = tmp_path / f".model.onnx.{'0' * 32}.tmp"
+        staged_manifest = tmp_path / f".gguf-reuse.json.{'1' * 32}.tmp"
+        staged_model.write_bytes(b"new model")
+        staged_manifest.write_bytes(b"new manifest")
+
+        _reuse._replace_artifacts(
+            {
+                final_model: staged_model,
+                final_manifest: staged_manifest,
+            },
+            (final_model, final_sidecar, final_manifest),
+        )
+
+        assert final_model.read_bytes() == b"new model"
+        assert final_manifest.read_bytes() == b"new manifest"
+        assert not final_sidecar.exists()
 
 
 class TestBuildQuantizedGguf:

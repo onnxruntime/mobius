@@ -476,6 +476,7 @@ class TestCLIBuildGGUF:
             main(["build-gguf", "--help"])
         out = capsys.readouterr().out
         assert "--dequantize" in out
+        assert "--reuse-gguf-weights" in out
         assert "--output OUTPUT_DIR" in out
         assert "--keep-quantized" not in out, "the unread deprecated alias was removed"
         assert "--max-shard-size" in out, "shard sizing applies to GGUF builds too"
@@ -536,6 +537,45 @@ class TestCLIBuildGGUF:
             )
 
         assert build.call_args.kwargs["keep_quantized"] is expected
+
+    def test_reuse_flag_is_forwarded(self, tmp_path):
+        """The explicit CLI opt-in reaches the GGUF API unchanged."""
+        from mobius.__main__ import main
+
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(())
+        package.values.return_value = iter(())
+        with mock.patch(
+            "mobius.integrations.gguf.build_from_gguf",
+            return_value=package,
+        ) as build:
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(tmp_path / "output"),
+                    "--reuse-gguf-weights",
+                ]
+            )
+
+        assert build.call_args.kwargs["reuse_gguf_weights"] is True
+
+    def test_reuse_rejects_ort_genai_runtime(self, tmp_path):
+        from mobius.__main__ import main
+
+        with pytest.raises(SystemExit, match="cannot be combined"):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(tmp_path / "output"),
+                    "--reuse-gguf-weights",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
 
     def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
         """build-gguf forwards the selected runtime after saving the graph."""

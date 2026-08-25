@@ -605,6 +605,13 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
 
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
+    reuse_gguf_weights = args.reuse_gguf_weights
+    if reuse_gguf_weights and args.runtime == "ort-genai":
+        raise SystemExit(
+            "Error: --reuse-gguf-weights cannot be combined with --runtime ort-genai "
+            "because genai_config.json cannot require disabled ORT constant folding. "
+            "Use direct ONNX Runtime with ORT_DISABLE_ALL."
+        )
 
     if keep_quantized:
         print("Preserving supported GGUF quantization (float-only inputs stay float)...")
@@ -632,6 +639,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         execution_provider=args.execution_provider,
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
+        reuse_gguf_weights=reuse_gguf_weights,
     )
 
     if args.release:
@@ -1182,6 +1190,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--dequantize",
         action="store_true",
         help="Dequantize all GGUF weights to float instead of preserving quantization.",
+    )
+    gguf_parser.add_argument(
+        "--reuse-gguf-weights",
+        action="store_true",
+        help=(
+            "Reuse compatible tensor byte ranges directly from the original GGUF. "
+            "The GGUF must be a real file in the flat output directory; converted "
+            "weights are written to model.onnx.data."
+        ),
     )
     gguf_parser.add_argument(
         "--runtime",

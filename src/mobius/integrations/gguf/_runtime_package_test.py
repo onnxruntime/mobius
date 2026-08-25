@@ -94,6 +94,18 @@ class TestWriteGgufRuntimePackage:
                 runtime="tflite",
             )
 
+    def test_ort_genai_rejects_reused_gguf_weights(self, tmp_path):
+        pkg = _FakePackage()
+        pkg.gguf_reuse_plan = object()
+        with pytest.raises(ValueError, match="no supported setting"):
+            write_gguf_runtime_package(
+                pkg,
+                tmp_path / "m.gguf",
+                tmp_path / "out",
+                runtime="ort-genai",
+            )
+        assert not (tmp_path / "out").exists()
+
     def test_save_model_false_leaves_an_already_saved_graph_alone(self, tmp_path):
         """The CLI saves the graph itself, then asks only for runtime artifacts."""
         pkg = _FakePackage()

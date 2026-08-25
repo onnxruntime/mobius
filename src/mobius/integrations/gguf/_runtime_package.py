@@ -64,6 +64,13 @@ def write_gguf_runtime_package(
     """
     if runtime not in ("onnx-genai", "ort-genai"):
         raise ValueError(f"Unknown runtime {runtime!r}; expected 'onnx-genai' or 'ort-genai'.")
+    if runtime == "ort-genai" and getattr(pkg, "gguf_reuse_plan", None) is not None:
+        raise ValueError(
+            "ORT GenAI packaging is not supported with reused GGUF weights because "
+            "genai_config.json has no supported setting that disables ORT constant "
+            "folding. Use direct ONNX Runtime with ORT_DISABLE_ALL, or build without "
+            "reuse_gguf_weights."
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

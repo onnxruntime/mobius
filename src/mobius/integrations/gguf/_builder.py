@@ -431,6 +431,7 @@ def build_from_gguf(
     static_cache: bool = False,
     max_seq_len: int | None = None,
     allow_dense_moe: bool | None = None,
+    reuse_gguf_weights: bool = False,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -497,6 +498,10 @@ def build_from_gguf(
             ``False`` — the build fails closed with a typed capability error
             rather than silently shipping a dense graph. This is a research /
             correctness knob and makes no throughput claim.
+        reuse_gguf_weights: Reuse compatible tensor payloads directly from the
+            original GGUF via ONNX external-data ranges. The GGUF must be a real
+            file in the final flat output directory. Converted tensors are
+            written once to ``model.onnx.data``.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -514,6 +519,10 @@ def build_from_gguf(
     # vision/audio encoders are assembled by the dedicated VLM builder. Keep
     # build_from_gguf as the single public entry point (text-only or multimodal).
     if mmproj is not None:
+        if reuse_gguf_weights:
+            raise ValueError(
+                "reuse_gguf_weights=True does not yet support multimodal/mmproj packages."
+            )
         if static_cache:
             raise ValueError("static_cache=True is not supported with a companion mmproj.")
         from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
@@ -535,7 +544,7 @@ def build_from_gguf(
         GGUF_ARCH_TO_MODEL_TYPE,
         gguf_to_config,
     )
-    from mobius.integrations.gguf._shard_set import open_gguf_model
+    from mobius.integrations.gguf._shard_set import GgufShardSet, open_gguf_model
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
@@ -560,6 +569,17 @@ def build_from_gguf(
     gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = open_gguf_model(gguf_path)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
+    if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
+        raise ValueError(
+            "reuse_gguf_weights=True does not yet support multi-shard GGUF sets. "
+            "Build without reuse to preserve current multi-shard import behavior."
+        )
+    if reuse_gguf_weights and not gguf_model.is_little_endian:
+        raise ValueError(
+            "reuse_gguf_weights=True requires a little-endian GGUF because ONNX "
+            "external tensors interpret the referenced bytes as little-endian. "
+            "Build without reuse to convert this file."
+        )
     gguf_arch = gguf_model.architecture
     logger.info("Loaded GGUF model: %s (arch=%s)", gguf_path, gguf_arch)
     preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
@@ -715,10 +735,21 @@ def build_from_gguf(
     )
 
     # 6. Load tensors from GGUF → state_dict
+    reuse_candidates_by_id = {} if reuse_gguf_weights else None
     if preserve_quantization:
-        state_dict = _load_quantized_state_dict(gguf_model, gguf_arch, module, config)
+        state_dict = _load_quantized_state_dict(
+            gguf_model,
+            gguf_arch,
+            module,
+            config,
+            reuse_candidates=reuse_candidates_by_id,
+        )
     else:
-        state_dict = _load_dequantized_state_dict(gguf_model, gguf_arch)
+        state_dict = _load_dequantized_state_dict(
+            gguf_model,
+            gguf_arch,
+            reuse_candidates=reuse_candidates_by_id,
+        )
 
     logger.info(
         "Mapped %d state_dict entries from GGUF tensors",
@@ -741,10 +772,26 @@ def build_from_gguf(
         }
         float_dict = {k: state_dict[k] for k in float_keys}
         quant_dict = {k: state_dict[k] for k in state_dict if k not in float_keys}
+        before_processing = dict(float_dict)
         float_dict = process_tensors(float_dict, config)
+        if reuse_candidates_by_id is not None:
+            _record_reuse_process_transforms(
+                before_processing,
+                float_dict,
+                reuse_candidates_by_id,
+                config,
+            )
         state_dict = {**float_dict, **quant_dict}
     else:
+        before_processing = dict(state_dict)
         state_dict = process_tensors(state_dict, config)
+        if reuse_candidates_by_id is not None:
+            _record_reuse_process_transforms(
+                before_processing,
+                state_dict,
+                reuse_candidates_by_id,
+                config,
+            )
 
     # 7b. Normalize GGUF-specific weight shapes to match HF conventions.
     # This converts GGUF tensor quirks (stacked experts, 1D gates, 2D
@@ -758,7 +805,24 @@ def build_from_gguf(
 
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
-    pkg.apply_weights(state_dict, prefix_map=prefix_map)
+    pkg.apply_weights(
+        state_dict,
+        prefix_map=prefix_map,
+        fold_constants=not reuse_gguf_weights,
+    )
+    if reuse_gguf_weights:
+        from mobius.integrations.gguf._reuse import attach_reused_initializers
+
+        if emit_mtp_head:
+            raise ValueError(
+                "reuse_gguf_weights=True does not yet support packages with an MTP sidecar."
+            )
+        final_candidates = {
+            name: reuse_candidates_by_id[id(tensor)]
+            for name, tensor in state_dict.items()
+            if id(tensor) in reuse_candidates_by_id
+        }
+        attach_reused_initializers(pkg, gguf_path, final_candidates)
 
     # 9b. Sparse-MoE fusion + honesty gate (final graph state).
     # Now that every native block carries its real packed bytes, collapse the
@@ -791,6 +855,53 @@ def build_from_gguf(
             pkg.mtp_head = mtp_pkg
 
     return pkg
+
+
+def _record_reuse_process_transforms(
+    before: dict,
+    after: dict,
+    candidates: dict,
+    config,
+) -> None:
+    """Carry exact-byte candidates through known graph-expressible transforms."""
+    import dataclasses
+
+    from mobius.integrations.gguf._tensor_processors import needs_llama_qk_permute
+
+    for name, transformed in after.items():
+        original = before.get(name)
+        if original is None or id(original) == id(transformed):
+            continue
+        candidate = candidates.get(id(original))
+        if candidate is None:
+            continue
+
+        transform: str | None = None
+        parameter: int | None = None
+        if needs_llama_qk_permute(getattr(config, "model_type", None)) and (
+            ".q_proj." in name or ".k_proj." in name
+        ):
+            transform = "llama_qk_permute"
+            parameter = (
+                config.num_attention_heads
+                if ".q_proj." in name
+                else config.num_key_value_heads
+            )
+        elif "A_log" in name:
+            transform = "log_neg"
+        elif "norm" in name and original.shape == transformed.shape:
+            transform = "subtract_one"
+        elif tuple(reversed(original.shape)) == tuple(transformed.shape):
+            transform = "transpose"
+        elif original.numel() == transformed.numel():
+            transform = "reshape"
+
+        if transform is not None:
+            candidates[id(transformed)] = dataclasses.replace(
+                candidate,
+                transform=transform,
+                transform_parameter=parameter,
+            )
 
 
 def _is_quantized_weight(key: str, state_dict: dict) -> bool:
@@ -1468,6 +1579,7 @@ def _load_dequantized_state_dict(
     gguf_arch: str,
     name_mapper: Callable[[str, str], str | None] | None = None,
     warn_unmapped: bool = True,
+    reuse_candidates: dict | None = None,
 ) -> dict:
     """Load all tensors dequantized to float (Phase 1 path).
 
@@ -1498,7 +1610,21 @@ def _load_dequantized_state_dict(
             # writable so PyTorch can mutate if needed.
             if not np_array.flags.writeable:
                 np_array = np.array(np_array)
-            state_dict[hf_name] = torch.from_numpy(np_array)
+            tensor = torch.from_numpy(np_array)
+            state_dict[hf_name] = tensor
+            if reuse_candidates is not None:
+                qtype = gguf_model.get_tensor_type(gguf_name)
+                if getattr(qtype, "name", None) in {"F32", "F16"}:
+                    from mobius.integrations.gguf._reuse import GGUFReuseCandidate
+
+                    offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
+                    reuse_candidates[id(tensor)] = GGUFReuseCandidate(
+                        gguf_name,
+                        offset,
+                        length,
+                        qtype_name,
+                        tuple(int(dim) for dim in np_array.shape),
+                    )
         else:
             if warn_unmapped:
                 logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
@@ -1512,6 +1638,7 @@ def _load_quantized_state_dict(
     config,
     name_mapper: Callable[[str, str], str | None] | None = None,
     warn_unmapped: bool = True,
+    reuse_candidates: dict | None = None,
 ) -> dict:
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
@@ -1635,12 +1762,13 @@ def _load_quantized_state_dict(
             for index, native_stem in enumerate(native_targets):
                 w = torch.from_numpy(np.array(packed[index], copy=True))
                 target_name = f"{native_stem}.weight"
-                if _needs_qk_permute(
+                needs_permute = _needs_qk_permute(
                     target_name,
                     num_heads,
                     num_kv_heads,
                     model_type,
-                ):
+                )
+                if needs_permute:
                     n_head = (
                         num_heads
                         if ".q_proj." in target_name or ".qkv_proj." in target_name
@@ -1648,6 +1776,21 @@ def _load_quantized_state_dict(
                     )
                     w = _reverse_permute(w, n_head)
                 state_dict[target_name] = w
+                if (
+                    reuse_candidates is not None
+                    and len(native_targets) == 1
+                    and not needs_permute
+                ):
+                    from mobius.integrations.gguf._reuse import GGUFReuseCandidate
+
+                    offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
+                    reuse_candidates[id(w)] = GGUFReuseCandidate(
+                        gguf_name,
+                        offset,
+                        length,
+                        qtype_name,
+                        tuple(int(dim) for dim in w.shape),
+                    )
             n_repacked += len(native_targets)
         elif should_repack:
             if is_tencent_q1_0_tensor:
@@ -1730,7 +1873,22 @@ def _load_quantized_state_dict(
                     arr = np.array(arr)
             else:
                 arr = dequantize(raw, qtype).reshape(np_shape)
-            state_dict[hf_name] = torch.from_numpy(arr)
+            tensor = torch.from_numpy(arr)
+            state_dict[hf_name] = tensor
+            if reuse_candidates is not None and qtype in (
+                GGMLQuantizationType.F32,
+                GGMLQuantizationType.F16,
+            ):
+                from mobius.integrations.gguf._reuse import GGUFReuseCandidate
+
+                offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
+                reuse_candidates[id(tensor)] = GGUFReuseCandidate(
+                    gguf_name,
+                    offset,
+                    length,
+                    qtype_name,
+                    tuple(int(dim) for dim in arr.shape),
+                )
 
     logger.info(
         "Loaded %d state_dict entries (%d GGUF tensors repacked for quantized ops, "

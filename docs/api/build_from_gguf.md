@@ -22,6 +22,7 @@ def build_from_gguf(
     mmproj: str | Path | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
+    reuse_gguf_weights: bool = False,
 ) -> ModelPackage:
 ```
 
@@ -37,6 +38,7 @@ def build_from_gguf(
 | `mmproj` | `str \| Path \| None` | `None` | Optional companion multimodal-projector GGUF. |
 | `static_cache` | `bool` | `False` | Build a fixed-width KV cache when the architecture supports it. |
 | `max_seq_len` | `int \| None` | `None` | Static-cache sequence limit. |
+| `reuse_gguf_weights` | `bool` | `False` | Reuse byte-compatible F32/F16 and native IQ/MXFP4 tensor ranges from the original GGUF instead of copying them into ONNX external data. |
 
 ## Returns
 
@@ -62,6 +64,50 @@ pkg.save("output/llama-float/")
 # Via CLI
 mobius build-gguf llama-3.2-1b-q4_0.gguf --output output/llama/
 ```
+
+### Reuse the original GGUF as external data
+
+Place the GGUF directly in the output directory, then opt in:
+
+```bash
+mobius build-gguf output/llama/model.gguf \
+  --output output/llama/ \
+  --reuse-gguf-weights
+```
+
+The package contains `model.onnx`, the original GGUF, `model.onnx.data` with
+only converted/materialized tensors, and `gguf-reuse.json`. The manifest pins
+the GGUF location, size, SHA-256, qtypes, and exact reused ranges. ONNX runtimes
+do not enforce that digest; applications can call
+`mobius.integrations.gguf.verify_gguf_reuse_manifest()` before session creation.
+
+Initial support is deliberately limited to one flat text model. Multimodal,
+MTP, nested, sharded, symlinked, absolute, and parent-relative GGUF layouts are
+rejected rather than copied or linked. F32/F16 tensors and compatible
+IQ4_NL/IQ4_XS/IQ3_S/IQ3_XXS/IQ2_XXS/IQ2_XS/IQ2_S/IQ1_S/IQ1_M/MXFP4
+projection/output tensors can be reused when no logical transform is required.
+Repacked, requantized, dequantized, or synthesized tensors are true storage
+changes and therefore go to the sidecar.
+
+Float transpose, norm-offset arithmetic, Llama Q/K row permutation, and Mamba
+`A_log`/shape transforms are not inherent storage incompatibilities. Reuse mode
+keeps their original F32/F16 bytes in the GGUF and inserts the corresponding
+ONNX `Transpose`, `Sub`, `Neg`/`Log`, or `Reshape` operations before their graph
+consumers. Opaque packed UINT8 blocks are never passed through a generic ONNX
+`Transpose`; only a consumer with a proven native block layout can reuse them.
+
+Create ORT sessions with graph optimization disabled
+(`SessionOptions.graph_optimization_level = ORT_DISABLE_ALL`) so ORT does not
+constant-fold them into another materialized weight copy. This first version
+therefore rejects `--runtime ort-genai`: the current `genai_config.json` schema
+has no supported session option that can require disabled constant folding.
+Use direct ONNX Runtime for reuse packages.
+
+Disabling folding preserves storage reuse but does not make transforms free at
+runtime. A transpose/permutation or arithmetic node may allocate a transformed
+weight buffer and consume startup or execution time. The package avoids a second
+on-disk copy; peak runtime memory and performance remain transform- and
+execution-provider-dependent.
 
 ## Behavior
 
