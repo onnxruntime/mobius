@@ -154,6 +154,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "eagle3",
         "exaone",
         "falcon",
+        "falcon-h1",
         "gemma",
         "gemma2",
         "gemma3",

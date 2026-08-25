@@ -18,6 +18,7 @@ from mobius.components import (
     initialize_rope,
 )
 
+
 class FalconH1MLP(nn.Module):
     """Falcon-H1 SwiGLU feed-forward network with MuP gate and output scaling."""
 
@@ -42,12 +43,12 @@ class FalconH1MLP(nn.Module):
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         gate = self.gate_proj(op, hidden_states)
-        if self.gate_multiplier != 1.0:
+        if self.gate_multiplier != 1.0:  # noqa: RUF069
             gate = op.Mul(gate, self.gate_multiplier)
         gate = op.Mul(gate, op.Sigmoid(gate))
         hidden_states = op.Mul(self.up_proj(op, hidden_states), gate)
         hidden_states = self.down_proj(op, hidden_states)
-        if self.down_multiplier != 1.0:
+        if self.down_multiplier != 1.0:  # noqa: RUF069
             hidden_states = op.Mul(hidden_states, self.down_multiplier)
         return hidden_states
 
@@ -117,11 +118,11 @@ class FalconH1DecoderLayer(nn.Module):
             ssm_state,
             mamba_attention_mask,
         )
-        if self.ssm_out_multiplier != 1.0:
+        if self.ssm_out_multiplier != 1.0:  # noqa: RUF069
             mamba_output = op.Mul(mamba_output, self.ssm_out_multiplier)
 
         attention_input = normalized
-        if self.attention_in_multiplier != 1.0:
+        if self.attention_in_multiplier != 1.0:  # noqa: RUF069
             attention_input = op.Mul(attention_input, self.attention_in_multiplier)
         attention_output, present_key_value = self.self_attn(
             op,
@@ -131,7 +132,7 @@ class FalconH1DecoderLayer(nn.Module):
             past_key_value=(past_key, past_value),
         )
         present_key, present_value = present_key_value
-        if self.attention_out_multiplier != 1.0:
+        if self.attention_out_multiplier != 1.0:  # noqa: RUF069
             attention_output = op.Mul(
                 attention_output,
                 self.attention_out_multiplier,
@@ -169,7 +170,7 @@ class FalconH1Model(nn.Module):
         past_key_values: tuple[ir.Value, ...],
     ) -> tuple[ir.Value, tuple[ir.Value, ...]]:
         hidden_states = self.embed_tokens(op, input_ids)
-        if self.embedding_multiplier != 1.0:
+        if self.embedding_multiplier != 1.0:  # noqa: RUF069
             hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
 
         position_embeddings = self.rotary_emb(op, position_ids)
@@ -199,9 +200,7 @@ class FalconH1Model(nn.Module):
                 past_key_values[offset + 2],
                 past_key_values[offset + 3],
             )
-            present_key_values.extend(
-                [present_key, present_value, present_conv, present_ssm]
-            )
+            present_key_values.extend([present_key, present_value, present_conv, present_ssm])
         return self.final_layernorm(op, hidden_states), tuple(present_key_values)
 
 
@@ -243,7 +242,7 @@ class FalconH1ForCausalLM(nn.Module):
             past_key_values,
         )
         logits = self.lm_head(op, hidden_states)
-        if self.lm_head_multiplier != 1.0:
+        if self.lm_head_multiplier != 1.0:  # noqa: RUF069
             logits = op.Mul(logits, self.lm_head_multiplier)
         return logits, present_key_values
 

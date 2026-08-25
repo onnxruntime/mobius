@@ -8,9 +8,8 @@ from onnxscript import nn
 
 from mobius._configs import BaseModelConfig, FalconH1Config
 from mobius._model_package import ModelPackage
-
-from ._base import ModelTask, _make_graph, _make_model
-from ._cache_utils import _register_linear_attention_functions
+from mobius.tasks._base import ModelTask, _make_graph, _make_model
+from mobius.tasks._cache_utils import _register_linear_attention_functions
 
 
 class FalconH1CausalLMTask(ModelTask):
@@ -144,8 +143,7 @@ class FalconH1CausalLMTask(ModelTask):
                 state.shape = ir.Shape(
                     [
                         batch,
-                        config.mamba_d_ssm
-                        + 2 * config.mamba_n_groups * config.mamba_d_state,
+                        config.mamba_d_ssm + 2 * config.mamba_n_groups * config.mamba_d_state,
                         config.mamba_d_conv - 1,
                     ]
                 )
@@ -166,9 +164,7 @@ class FalconH1CausalLMTask(ModelTask):
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)
-        model.metadata_props["mobius.cache_abi"] = (
-            "per-layer:key,value,conv_state,ssm_state"
-        )
+        model.metadata_props["mobius.cache_abi"] = "per-layer:key,value,conv_state,ssm_state"
         model.metadata_props["mobius.runtime_support"] = (
             "deferred: downstream heterogeneous-state package schema is unavailable"
         )

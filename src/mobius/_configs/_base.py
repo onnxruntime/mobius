@@ -2748,8 +2748,12 @@ class FalconH1Config(ArchitectureConfig):
             raise ValueError("mamba_n_heads must divide mamba_d_ssm")
         if self.mamba_d_head * self.mamba_n_heads != self.mamba_d_ssm:
             raise ValueError("mamba_d_head * mamba_n_heads must equal mamba_d_ssm")
-        if self.mamba_n_groups <= 0 or self.mamba_d_ssm % self.mamba_n_groups:
-            raise ValueError("mamba_n_groups must divide mamba_d_ssm")
+        if (
+            self.mamba_n_groups <= 0
+            or self.mamba_n_heads % self.mamba_n_groups
+            or self.mamba_d_ssm % self.mamba_n_groups
+        ):
+            raise ValueError("mamba_n_groups must divide both mamba_n_heads and mamba_d_ssm")
         if self.mamba_d_state <= 0 or self.mamba_d_conv <= 0 or self.mamba_chunk_size <= 0:
             raise ValueError("Falcon-H1 state, convolution, and chunk sizes must be positive")
         if len(self.mlp_multipliers) != 2:

@@ -5,13 +5,8 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
-import torch
 import pytest
-
-from mobius._configs import FalconH1Config
-from mobius._testing.ort_inference import OnnxModelSession
-from mobius.integrations._weight_loading import apply_weights
-
+import torch
 from _test_configs import CAUSAL_LM_CONFIGS, _base_config
 from synthetic_parity_test import (
     _build_onnx_model,
@@ -19,6 +14,10 @@ from synthetic_parity_test import (
     _create_hf_model,
     _fill_random_weights,
 )
+
+from mobius._configs import FalconH1Config
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.integrations._weight_loading import apply_weights
 
 
 def _tiny_overrides() -> dict:
@@ -35,6 +34,18 @@ def test_falcon_h1_rejects_invalid_attention_and_ssm_geometry() -> None:
         _base_config(**(base | {"head_dim": 15}))
     with pytest.raises(ValueError, match="mamba_d_head"):
         _base_config(**(base | {"mamba_d_head": 15}))
+    with pytest.raises(ValueError, match="mamba_n_groups must divide both"):
+        _base_config(
+            **(
+                base
+                | {
+                    "mamba_d_ssm": 24,
+                    "mamba_n_heads": 3,
+                    "mamba_d_head": 8,
+                    "mamba_n_groups": 2,
+                }
+            )
+        )
     with pytest.raises(ValueError, match="exactly five"):
         _base_config(**(base | {"ssm_multipliers": [1.0] * 4}))
     with pytest.raises(ValueError, match="ordered and non-negative"):
@@ -118,8 +129,7 @@ def test_falcon_h1_prefill_decode_logits_and_four_states_match_transformers() ->
                 f"past_key_values.{layer}.conv_state": np.zeros(
                     (
                         1,
-                        config.mamba_d_ssm
-                        + 2 * config.mamba_n_groups * config.mamba_d_state,
+                        config.mamba_d_ssm + 2 * config.mamba_n_groups * config.mamba_d_state,
                         config.mamba_d_conv - 1,
                     ),
                     np.float32,
