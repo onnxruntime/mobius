@@ -1032,7 +1032,7 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 324), ("F16", 196)),
         tensor_count=520,
-        parity_test="TestQwenVLMMProj.test_qwen2_tensor_transform_values",
+        parity_test=("TestQwenVLMMProj.test_qwen_tensor_transform_values[qwen2vl_merger]"),
         processor_repository="Qwen/Qwen2-VL-2B-Instruct",
         processor_revision="895c3a49bc3fa70a340399125c650a463535e71c",
         processor_files=(
@@ -1071,7 +1071,7 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 291), ("F16", 228)),
         tensor_count=519,
-        parity_test="TestQwenVLMMProj.test_qwen25_tensor_transform_values",
+        parity_test=("TestQwenVLMMProj.test_qwen_tensor_transform_values[qwen2.5vl_merger]"),
         processor_repository="Qwen/Qwen2.5-VL-3B-Instruct",
         processor_revision="66285546d2b821cf421d4f5eb2576359d3770cd3",
         processor_files=(

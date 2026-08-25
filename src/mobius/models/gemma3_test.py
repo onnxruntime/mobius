@@ -20,12 +20,12 @@ def _session(model: ir.Model) -> ort.InferenceSession:
     return ort.InferenceSession(proto.SerializeToString(), providers=["CPUExecutionProvider"])
 
 
-def _embedding_session() -> ort.InferenceSession:
+def _embedding_session(*, image_token_id: int = 9) -> ort.InferenceSession:
     config = ArchitectureConfig(
         vocab_size=16,
         hidden_size=4,
         pad_token_id=0,
-        image_token_id=9,
+        image_token_id=image_token_id,
     )
     model = build_embedding_from_features(
         _Gemma3EmbeddingModel(config),
@@ -63,6 +63,24 @@ class TestGemma3Embedding:
         )[0]
         np.testing.assert_array_equal(actual[0, 0], features[0])
         np.testing.assert_array_equal(actual[1, 1], features[1])
+
+    def test_processor_soft_tokens_beyond_vocab_are_safely_replaced(self) -> None:
+        session = _embedding_session(image_token_id=16)
+        features = np.arange(256 * 4, dtype=np.float32).reshape(256, 4)
+        input_ids = np.array([[14, *([16] * 256), 15]], dtype=np.int64)
+
+        actual = session.run(
+            None,
+            {
+                "input_ids": input_ids,
+                "image_features": features,
+            },
+        )[0]
+
+        weights = 2.0 * np.arange(64, dtype=np.float32).reshape(16, 4)
+        np.testing.assert_array_equal(actual[0, 0], weights[14])
+        np.testing.assert_array_equal(actual[0, 1:257], features)
+        np.testing.assert_array_equal(actual[0, 257], weights[15])
 
 
 class TestGemma3VisionEncoder:

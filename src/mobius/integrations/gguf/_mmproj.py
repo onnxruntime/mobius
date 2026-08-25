@@ -1616,7 +1616,7 @@ def build_gemma3_vlm_from_gguf(
         if image_token_id is not None
         else config.image_token_id
         if config.image_token_id is not None
-        else _token_id(text_gguf, "<start_of_image>")
+        else _token_id(text_gguf, "<image_soft_token>")
     )
     config = dataclasses.replace(
         config,

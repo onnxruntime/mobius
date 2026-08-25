@@ -134,13 +134,20 @@ class _Gemma3EmbeddingModel(nn.Module):
         self.image_token_id = config.image_token_id or 0
 
     def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
-        text_embeds = self.embed_tokens(op, input_ids)
-
         image_mask = op.Equal(
             input_ids,
             op.Constant(value_int=self.image_token_id),
         )
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
+
+        # Gemma 3's <image_soft_token> is one past the text embedding table.
+        # Substitute a valid row before Gather; image positions are replaced below.
+        safe_input_ids = op.Where(
+            image_mask,
+            op.Constant(value_int=self.config.pad_token_id or 0),
+            input_ids,
+        )
+        text_embeds = self.embed_tokens(op, safe_input_ids)
 
         # Number image placeholders over the flattened batch so row 2 starts
         # after row 1's features rather than reusing feature row zero.
@@ -176,7 +183,7 @@ class Gemma3MultiModalModel(nn.Module):
     - embedding: token embedding + image feature fusion
     """
 
-    default_task: str = "vision-language"
+    default_task: str = "gemma3-vision-language"
     category: str = "Multimodal"
 
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.

@@ -1155,10 +1155,11 @@ Projector support is pinned to llama.cpp
 and `UNKNOWN`. `clip` has vision, audio, and generated-audio presence flags;
 there is no text-encoder presence key at this pin.
 
-Only `gemma4v` and `muse-glimmer` currently pass metadata, suffix-exact tensor
-closure, target-pairing, graph, and component-parity gates. This admits graph
-import, not a runtime package: both runtime verdicts remain deferred pending the
-paired text target, processor, and deterministic end-to-end generation.
+`gemma3`, `gemma4v`, `muse-glimmer`, `qwen2vl_merger`, and
+`qwen2.5vl_merger` currently pass metadata, suffix-exact tensor closure,
+target-pairing, graph, and component-parity gates. This admits graph import,
+not runtime support: all five runtime verdicts remain deferred pending proven
+processor asset publication and deterministic downstream orchestration.
 `gemma4a` remains
 deferred: the real sidecar contains `a.pre_encode.*` tensors that the partial
 mapping does not consume. A sidecar may contain that audio tower alongside a
@@ -1239,8 +1240,28 @@ Real-artifact audit pins:
 
 | Family | Revision and file | Size | LFS SHA-256 | Metadata/tensor qtypes | Paired text target |
 |---|---|---:|---|---|---|
+| Gemma 3 | `ggml-org/gemma-3-4b-it-GGUF@ab31416aceb30cd095cb34cc27eea120940964e4`<br>`mmproj-model-f16.gguf` | 851,251,104 | `8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb` | `gemma3`; 276 F32 + 163 F16 tensors; vision 1152→2560 | `gemma-3-4b-it-Q4_K_M.gguf` (`gemma3`) |
 | Gemma4 | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2`<br>`mmproj-F16.gguf` | 985,654,080 | `337ee849e80b6169ce9d1d573d424fc1653bcafa5f0cb0cbb901beba54f4b41c` | `gemma4v` + deferred `gemma4a`; 1,163 F32 + 248 F16 tensors; vision 768→1536, audio 1024→1536 | `gemma-4-E2B-it-Q4_K_M.gguf` (`gemma4`) |
 | Muse Glimmer | `unsloth/Muse-Glimmer-30B-GGUF@faa5b025c584459c13febfa5c59883516710ae39`<br>`mmproj-Muse-Glimmer-30B-BF16.gguf` | 3,849,173,728 | `7aa788cfe25ae5e4bf4837511f64df22cabe595e58223708274a67b3136f53ab` | `muse-glimmer`; 506 F32 + 303 BF16 tensors; vision 1536, merge 2, projection 6656 | `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` (`muse-glimmer`) |
+| Qwen2-VL | `ggml-org/Qwen2-VL-2B-Instruct-GGUF@bb307c036e8a1ed7b663bbd0c35b41c4c9294cfd`<br>`mmproj-Qwen2-VL-2B-Instruct-f16.gguf` | 1,331,656,160 | `ecb20cabcdd8dbc277de06bd6eb980aeb2adfaaba9f199a434e328d205675d03` | `qwen2vl_merger`; 324 F32 + 196 F16 tensors; vision 1280→1536 | `Qwen2-VL-2B-Instruct-Q4_K_M.gguf` (`qwen2vl`) |
+| Qwen2.5-VL | `ggml-org/Qwen2.5-VL-3B-Instruct-GGUF@5037fcf163dd95d1e41d1974465f0898ed108ca2`<br>`mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf` | 1,338,428,128 | `b9160fe9d814d1fadf68395677468534778b39ac33c2e7561b7b218626e60d5e` | `qwen2.5vl_merger`; 291 F32 + 228 F16 tensors; vision 1280→2048 | `Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf` (`qwen2vl`) |
+
+The Gemma 3 processor assets are pinned to
+`google/gemma-3-4b-it@093f9f388b31de276ce2de164bdc2081324b9767`.
+`Gemma3Processor` emits `pixel_values` as
+`float32[num_images,3,896,896]` and 256 `<image_soft_token>` placeholders
+per image. The vision graph processes one image row per invocation; callers
+concatenate its 256-row outputs in processor order. The gated parent assets
+and ORT GenAI orchestration remain runtime waivers.
+
+The Qwen processor assets are pinned to
+`Qwen/Qwen2-VL-2B-Instruct@895c3a49bc3fa70a340399125c650a463535e71c`
+and
+`Qwen/Qwen2.5-VL-3B-Instruct@66285546d2b821cf421d4f5eb2576359d3770cd3`.
+Their independent float32 image/video patch streams bind to separate vision
+invocations, then to `image_features` and `video_features` on the embedding
+graph. Qwen2.5 timing metadata and downstream M-RoPE construction are not
+consumed by these graphs, so runtime support remains deferred.
 
 The Gemma4 processor contract uses tokenizer token `<|image|>` (ID 258880 in
 the audited paired GGUF) and 3×3 spatial pooling. The sidecar's image mean/std

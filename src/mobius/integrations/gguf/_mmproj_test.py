@@ -1120,6 +1120,20 @@ class TestQwenVLMMProj:
         assert package["decoder"].graph.inputs[0].name == "inputs_embeds"
         assert package["decoder"].graph.inputs[2].shape[0] == 3
 
+        vision_session = ort.InferenceSession(
+            ir.serde.serialize_model(package["vision_encoder"]).SerializeToString(),
+            providers=["CPUExecutionProvider"],
+        )
+        vision_result = vision_session.run(
+            None,
+            {
+                "pixel_values": np.arange(96, dtype=np.float32).reshape(4, 24) / 100,
+                "image_grid_thw": np.array([[1, 2, 2]], dtype=np.int64),
+            },
+        )[0]
+        assert vision_result.shape == (1, 16)
+        assert np.isfinite(vision_result).all()
+
         embedding_path = tmp_path / "embedding.onnx"
         ir.save(package["embedding"], str(embedding_path))
         session = ort.InferenceSession(
@@ -1152,6 +1166,36 @@ class TestQwenVLMMProj:
         )[0]
         assert text_only.shape == (2, 1, 16)
         assert np.isfinite(text_only).all()
+
+        decoder_session = ort.InferenceSession(
+            ir.serde.serialize_model(package["decoder"]).SerializeToString(),
+            providers=["CPUExecutionProvider"],
+        )
+        prefill_feeds = {
+            "inputs_embeds": result[:1, :2],
+            "attention_mask": np.ones((1, 2), dtype=np.int64),
+            "position_ids": np.zeros((3, 1, 2), dtype=np.int64),
+        }
+        for layer in range(2):
+            for cache_type in ("key", "value"):
+                prefill_feeds[f"past_key_values.{layer}.{cache_type}"] = np.empty(
+                    (1, 2, 0, 8),
+                    dtype=np.float32,
+                )
+        prefill = decoder_session.run(None, prefill_feeds)
+        assert prefill[0].shape == (1, 2, 32)
+
+        decode_feeds = {
+            "inputs_embeds": text_only[:1],
+            "attention_mask": np.ones((1, 3), dtype=np.int64),
+            "position_ids": np.full((3, 1, 1), 2, dtype=np.int64),
+        }
+        for layer in range(2):
+            decode_feeds[f"past_key_values.{layer}.key"] = prefill[1 + 2 * layer]
+            decode_feeds[f"past_key_values.{layer}.value"] = prefill[2 + 2 * layer]
+        decode = decoder_session.run(None, decode_feeds)
+        assert decode[0].shape == (1, 1, 32)
+        assert all(cache.shape[2] == 3 for cache in decode[1:])
 
 
 class TestReadVisionConfig:
