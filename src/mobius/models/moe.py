@@ -12,14 +12,14 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import preprocess_quantized_weights
+from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
 from mobius.components import (
     Attention,
-    Embedding,
     LayerNorm,
     Linear,
     MoELayer,
     RMSNorm,
+    RMSNormBias,
     SparseMixerGate,
     create_attention_bias,
     initialize_rope,
@@ -27,7 +27,8 @@ from mobius.components import (
 from mobius.components._attention import StaticCacheState
 from mobius.components._moe import MLP, SigmoidTopKGate, SoftmaxTopKGate
 from mobius.components._quantized_linear import make_quantized_linear_factory
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, embedding_for_config
+from mobius.models.phi3 import split_fused_qkv
 
 
 def _quantized_linear_class(config: ArchitectureConfig) -> type | None:
@@ -66,9 +67,22 @@ def _preprocess_moe_weights(model: nn.Module, state_dict) -> dict:
     Callers pass a state dict whose HF expert layout has already been
     normalised (see :func:`_rename_moe_expert_weights`).
     """
+    quantization = getattr(model.config, "quantization", None)
+    # The GGUF importer already emits the graph's exact per-expert packed
+    # parameter names. Do not route those tensors through the HF GPTQ/AWQ
+    # preprocessor, whose fallback guard correctly rejects packed expert
+    # tensors that have not yet been assigned to QuantizedLinear modules.
+    if quantization is not None and quantization.quant_method == "gguf":
+        if (
+            model.config.tie_word_embeddings
+            and "lm_head.weight" not in state_dict
+            and "model.embed_tokens.weight" in state_dict
+        ):
+            state_dict["lm_head.weight"] = state_dict["model.embed_tokens.weight"]
+        return state_dict
     return preprocess_quantized_weights(
         state_dict,
-        getattr(model.config, "quantization", None),
+        quantization,
         tie_embeddings=model.config.tie_word_embeddings,
         qmoe_target_path=".mlp",
         qmoe_quant_methods=("gptq", "awq", "olive"),
@@ -201,9 +215,7 @@ class MoETextModel(nn.Module):
     ):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
 
         def _make_gate() -> nn.Module:
             if gate_factory is None:
@@ -215,6 +227,7 @@ class MoETextModel(nn.Module):
                     config.num_local_experts,
                     config.num_experts_per_tok,
                     norm_topk_prob=config.norm_topk_prob,
+                    routed_scaling_factor=config.routed_scaling_factor,
                 )
             return gate_factory(
                 config.hidden_size, config.num_local_experts, config.num_experts_per_tok
@@ -288,7 +301,40 @@ class Phi3MoECausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        state_dict = super().preprocess_weights(state_dict)
+        for key in list(state_dict):
+            if "qkv_proj" not in key:
+                continue
+            q, k, v = split_fused_qkv(
+                state_dict.pop(key),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            )
+            state_dict[key.replace("qkv_proj", "q_proj")] = q
+            state_dict[key.replace("qkv_proj", "k_proj")] = k
+            state_dict[key.replace("qkv_proj", "v_proj")] = v
+        return state_dict
+
+
+class PhiMoEGGUFCausalLMModel(Phi3MoECausalLMModel):
+    """PhiMoE graph matching llama.cpp's GGUF inference semantics.
+
+    The HuggingFace model uses SparseMixer routing, while the pinned llama.cpp
+    loader uses full softmax followed by normalized top-k routing. GGUF import
+    therefore uses this internal graph without changing native HF builds.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        nn.Module.__init__(self)
+        self.config = config
+        self.model = MoETextModel(config, norm_class=RMSNormBias)
+        quantization = getattr(config, "quantization", None)
+        quantized_head = quantization is not None and bool(
+            getattr(quantization, "quantize_lm_head", False)
+        )
+        head_class = _quantized_linear_class(config) if quantized_head else None
+        self.lm_head = (head_class or Linear)(config.hidden_size, config.vocab_size, bias=True)
 
 
 class MoECausalLMModel(CausalLMModel):
@@ -301,10 +347,15 @@ class MoECausalLMModel(CausalLMModel):
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = MoETextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        quantization = getattr(config, "quantization", None)
+        if quantization is not None and quantization.quant_method == "gguf":
+            super().__init__(config)
+            self._replace_text_model(MoETextModel(config))
+        else:
+            nn.Module.__init__(self)
+            self.config = config
+            self.model = MoETextModel(config)
+            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -406,10 +457,15 @@ class Qwen2MoECausalLMModel(CausalLMModel):
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = MoETextModel(config, layer_class=Qwen2MoEDecoderLayer)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        quantization = getattr(config, "quantization", None)
+        if quantization is not None and quantization.quant_method == "gguf":
+            super().__init__(config)
+            self._replace_text_model(MoETextModel(config, layer_class=Qwen2MoEDecoderLayer))
+        else:
+            nn.Module.__init__(self)
+            self.config = config
+            self.model = MoETextModel(config, layer_class=Qwen2MoEDecoderLayer)
+            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -430,8 +486,13 @@ class UngatedSharedMoELayer(MoELayer):
     Replicates HuggingFace ``Ernie4_5_MoeBlock`` and ``Glm4MoeMoE``.
     """
 
-    def __init__(self, config: ArchitectureConfig, gate: nn.Module | None = None):
-        super().__init__(config, gate=gate)
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        linear_class: type | None = None,
+    ):
+        super().__init__(config, gate=gate, linear_class=linear_class)
         assert config.shared_expert_intermediate_size is not None, (
             "UngatedSharedMoELayer requires config.shared_expert_intermediate_size"
         )
@@ -440,7 +501,7 @@ class UngatedSharedMoELayer(MoELayer):
         )
         # Quantize the shared expert when the checkpoint does (mobius#513);
         # GPTQ/AWQ Ernie4.5-MoE / GLM4-MoE pack ``mlp.shared_expert.*``.
-        self.shared_expert = MLP(shared_config, linear_class=_quantized_linear_class(config))
+        self.shared_expert = MLP(shared_config, linear_class=linear_class)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
         # Routed expert output: top-k weighted sum  [B, S, H]
@@ -462,7 +523,9 @@ class UngatedSharedMoEDecoderLayer(MoEDecoderLayer):
         super().__init__(config, gate=gate, norm_class=norm_class)
         # Replace the standard MoELayer with the ungated shared variant.
         # Re-use the gate already created by MoEDecoderLayer.__init__.
-        self.mlp = UngatedSharedMoELayer(config, gate=self.mlp.gate)
+        self.mlp = UngatedSharedMoELayer(
+            config, gate=self.mlp.gate, linear_class=_quantized_linear_class(config)
+        )
 
 
 def _preprocess_shared_moe_weights(
@@ -611,6 +674,22 @@ def _rename_moe_expert_weights(
        ``input_linear.weight [N, 2*inter, hidden]`` → per-expert gate_proj + up_proj
        ``output_linear.weight [N, hidden, inter]`` → per-expert down_proj
        ``router.layer.weight`` → ``gate.weight``
+
+    Packed quantized expert tensors (Olive ``…_qweight``/``_scales``/``_qzeros``,
+    GPTQ/AWQ ``….qweight``/``.scales``/``.qzeros`` — see
+    :func:`~mobius._weight_utils.is_packed_quant_key`) are **never** split.
+    Splitting them would reinterpret packed bytes as float rows *and* collapse
+    every sidecar of one projection onto the same per-expert ``.weight`` key,
+    keeping only the last one. Call sites that continue into
+    :func:`_preprocess_moe_weights` (the :class:`MoECausalLMModel` family) need
+    the fused expert-major layout intact for ``pack_qmoe_expert_weights``; for
+    every other call site this function simply leaves the packed keys alone.
+
+    Module-path renames still apply to packed keys under the Olive convention,
+    where the suffix hangs off a retained ``.weight`` component
+    (``…mlp.router.weight_qweight`` → ``…mlp.gate.weight_qweight``). Dotted
+    GPTQ/AWQ sidecars have no ``.weight`` component (``…mlp.router.qweight``),
+    so no rename pattern matches them and they pass through as-is.
     """
     # Step 0: GraniteMoE uses block_sparse_moe; rename to mlp to match our attribute.
     state_dict = {
@@ -632,6 +711,10 @@ def _rename_moe_expert_weights(
     # Second pass: split fused 3D expert weights and rename routers
     fused: dict[str, torch.Tensor] = {}
     for name, tensor in list(renamed.items()):
+        # Packed quantized sidecars are never split: they must stay fused for the
+        # downstream QMoE packer, and splitting also collides their keys. Only
+        # float fused tensors are split into per-expert ``.weight`` keys.
+        is_packed = is_packed_quant_key(name)
         # GraniteMoE: router.layer.weight → gate.weight
         if ".router.layer.weight" in name:
             new_name = name.replace(".router.layer.weight", ".gate.weight")
@@ -643,7 +726,7 @@ def _rename_moe_expert_weights(
             fused[new_name] = tensor
             del renamed[name]
         # GraniteMoE: input_linear.weight [N, 2*inter, hidden] → gate_proj + up_proj
-        elif ".input_linear.weight" in name and tensor.dim() == 3:
+        elif not is_packed and ".input_linear.weight" in name and tensor.dim() == 3:
             prefix = name.replace(".input_linear.weight", "")
             num_experts = tensor.shape[0]
             half = tensor.shape[1] // 2
@@ -654,7 +737,7 @@ def _rename_moe_expert_weights(
                 fused[f"{prefix}.experts.{i}.up_proj.weight"] = up_w
             del renamed[name]
         # GraniteMoE: output_linear.weight [N, hidden, inter] → down_proj
-        elif ".output_linear.weight" in name and tensor.dim() == 3:
+        elif not is_packed and ".output_linear.weight" in name and tensor.dim() == 3:
             prefix = name.replace(".output_linear.weight", "")
             num_experts = tensor.shape[0]
             for i in range(num_experts):
@@ -662,7 +745,7 @@ def _rename_moe_expert_weights(
             del renamed[name]
         # Fused gate_up_proj [N, 2*inter, hidden] → per-expert gate_proj + up_proj
         # (Mixtral, OLMoE, Qwen2-MoE, PhiMoE)
-        elif ".experts.gate_up_proj" in name and tensor.dim() == 3:
+        elif not is_packed and ".experts.gate_up_proj" in name and tensor.dim() == 3:
             prefix = name.split(".experts.gate_up_proj")[0]
             num_experts = tensor.shape[0]
             half = tensor.shape[1] // 2
@@ -674,7 +757,12 @@ def _rename_moe_expert_weights(
             del renamed[name]
         # Fused experts.down_proj [N, hidden, inter] → per-expert down_proj
         # Only match the fused format (3D tensor), not per-expert experts.{i}.down_proj
-        elif ".experts.down_proj" in name and tensor.dim() == 3 and "experts." in name:
+        elif (
+            not is_packed
+            and ".experts.down_proj" in name
+            and tensor.dim() == 3
+            and "experts." in name
+        ):
             parts = name.split(".experts.down_proj")
             if len(parts) == 2 and not parts[0].endswith(tuple("0123456789")):
                 prefix = parts[0]

@@ -16,7 +16,7 @@ from typing import NamedTuple
 import onnx_ir as ir
 from onnxscript import GraphBuilder
 
-from mobius._configs import BaseModelConfig
+from mobius._configs import BaseModelConfig, FalconH1Config
 
 _FUNCTIONS_DOMAIN = "com.microsoft"
 
@@ -225,6 +225,23 @@ def _make_hybrid_cache_inputs(
         for stateless MLP layers.
     """
     layer_types = config.layer_types or []
+    if not layer_types:
+        layer_types = ["full_attention"] * config.num_hidden_layers
+    elif len(layer_types) != config.num_hidden_layers:
+        raise ValueError("Hybrid layer_types must contain exactly num_hidden_layers entries")
+    supported_layer_types = {
+        "full_attention",
+        "lightning_attention",
+        "conv",
+        "linear_attention",
+        "mamba",
+        "mamba2",
+        "mlp",
+        "moe",
+    }
+    unknown = sorted(set(layer_types) - supported_layer_types)
+    if unknown:
+        raise ValueError(f"Unsupported hybrid layer type(s): {unknown}")
     pairs: list[StatePair] = []
 
     # DeltaNet dimensions from config (computed once via shared helper)
@@ -254,7 +271,7 @@ def _make_hybrid_cache_inputs(
     mamba2_conv_dim = mamba2_d_inner + 2 * mamba2_n_groups * mamba2_d_state
 
     for i in range(config.num_hidden_layers):
-        ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+        ltype = layer_types[i]
 
         if ltype == "lightning_attention":
             # Lightning Attention: single recurrent state only (no conv_state)
@@ -314,7 +331,7 @@ def _make_hybrid_cache_inputs(
                 shape=[batch, mamba2_n_heads, mamba2_d_state, mamba2_d_head],
             )
             pairs.append((conv_state, ssm_state))
-        else:
+        elif ltype == "full_attention":
             past_key = builder.input(
                 f"{prefix}.{i}.key",
                 dtype=dtype,
@@ -326,6 +343,8 @@ def _make_hybrid_cache_inputs(
                 shape=[batch, config.num_key_value_heads, past_seq_len, config.head_dim],
             )
             pairs.append((past_key, past_value))
+        else:
+            raise AssertionError(f"Unhandled hybrid layer type: {ltype}")
 
     return pairs
 
@@ -348,8 +367,14 @@ def _register_hybrid_cache_outputs(
     Output shapes and dtypes are inferred by the shape inference pass
     that runs during model optimization.
     """
+    if not layer_types:
+        layer_types = ["full_attention"] * len(present_key_values)
+    if len(layer_types) != len(present_key_values):
+        raise ValueError(
+            "Hybrid output layer_types must match the number of layer state tuples"
+        )
     for i, states in enumerate(present_key_values):
-        ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+        ltype = layer_types[i]
         if ltype == "mlp" or ltype == "moe":
             continue  # MLP and MoE layers produce no cache state
         if ltype == "lightning_attention":
@@ -368,9 +393,11 @@ def _register_hybrid_cache_outputs(
             elif ltype in ("mamba", "mamba2"):
                 builder.add_output(state_a, f"{prefix}.{i}.conv_state")
                 builder.add_output(state_b, f"{prefix}.{i}.ssm_state")
-            else:
+            elif ltype == "full_attention":
                 builder.add_output(state_a, f"{prefix}.{i}.key")
                 builder.add_output(state_b, f"{prefix}.{i}.value")
+            else:
+                raise ValueError(f"Unsupported hybrid output layer type: {ltype!r}")
 
 
 def _register_linear_attention_functions(
@@ -387,10 +414,17 @@ def _register_linear_attention_functions(
     layer_types = getattr(config, "layer_types", None) or []
     has_deltanet = "linear_attention" in layer_types
     has_lightning = "lightning_attention" in layer_types
-    has_mamba2 = "mamba2" in layer_types
+    has_mamba = "mamba" in layer_types
+    has_mamba2 = "mamba2" in layer_types or isinstance(config, FalconH1Config)
     has_short_conv = "conv" in layer_types
 
-    if not has_deltanet and not has_lightning and not has_mamba2 and not has_short_conv:
+    if (
+        not has_deltanet
+        and not has_lightning
+        and not has_mamba
+        and not has_mamba2
+        and not has_short_conv
+    ):
         return
 
     from mobius.functions import (
@@ -426,6 +460,24 @@ def _register_linear_attention_functions(
             stash_type=config.dtype,
         )
         model.functions[attn_func_gated.identifier()] = attn_func_gated
+
+    if has_mamba:
+        d_inner = config.hidden_size * getattr(config, "mamba_expand", 2)
+        conv_func = causal_conv_nd_with_state(
+            kernel_size=getattr(config, "mamba_d_conv", 4),
+            channels=d_inner,
+            ndim=1,
+            activation="silu",
+        )
+        attn_func = linear_attention(
+            q_num_heads=d_inner,
+            kv_num_heads=d_inner,
+            update_rule="gated",
+            scale=1.0,
+            stash_type=ir.DataType.FLOAT,
+        )
+        model.functions[conv_func.identifier()] = conv_func
+        model.functions[attn_func.identifier()] = attn_func
 
     if has_mamba2:
         mamba2_n_heads = getattr(config, "mamba_n_heads", 0)

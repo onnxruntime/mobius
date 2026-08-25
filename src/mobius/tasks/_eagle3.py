@@ -36,7 +36,11 @@ class Eagle3DraftTask(ModelTask):
         fused_hidden = builder.input(
             "fused_hidden",
             dtype=config.dtype,
-            shape=[batch, seq_len, 3 * config.hidden_size],
+            shape=[
+                batch,
+                seq_len,
+                3 * (config.target_hidden_size or config.hidden_size),
+            ],
         )
         recycled_hidden = builder.input(
             "recycled_hidden",
@@ -62,7 +66,7 @@ class Eagle3DraftTask(ModelTask):
             past_seq_len,
         )
 
-        draft_logits, recycled_hidden_out, present_key_values = module(
+        draft_output, recycled_hidden_out, present_key_values = module(
             builder.op,
             inputs_embeds=inputs_embeds,
             fused_hidden=fused_hidden,
@@ -72,7 +76,10 @@ class Eagle3DraftTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        builder.add_output(draft_logits, "draft_logits")
+        builder.add_output(
+            draft_output,
+            "draft_hidden" if config.use_target_lm_head else "draft_logits",
+        )
         builder.add_output(recycled_hidden_out, "next_hidden")
         _register_kv_cache_outputs(
             builder,

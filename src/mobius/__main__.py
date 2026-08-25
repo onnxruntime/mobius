@@ -10,6 +10,7 @@ import glob
 import json
 import logging
 import os
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
     "glm-full-attention": "glm_full_attention",
+    "paged-attention": "export_paged_attention",
 }
 
 
@@ -173,6 +175,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
             from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
             model_type = _TEXT_ONLY_MODEL_TYPE.get(model_type, model_type)
+        if model_type == "falcon_h1":
+            raise ValueError(
+                "--static-cache cannot represent Falcon-H1's per-layer K, V, "
+                "convolution, and SSM states"
+            )
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 
@@ -269,6 +276,23 @@ def _cmd_build(args: argparse.Namespace) -> None:
         }
     else:
         static_cache_params = None
+
+    # PagedAttention (LATENT dense-MLA) export uses the paged-cache task with
+    # caller-owned page buffers. It is a distinct cache authority, so it cannot
+    # be combined with the static-cache task or an explicit --task.
+    export_paged_attention = getattr(args, "export_paged_attention", False)
+    if export_paged_attention:
+        if static_cache_params is not None:
+            raise SystemExit(
+                "Error: --features paged-attention cannot be combined with "
+                "--features static-cache."
+            )
+        if task is not None:
+            raise SystemExit(
+                "Error: --features paged-attention cannot be combined with --task. "
+                "Remove --task to use --features paged-attention."
+            )
+        task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
     output_dir = args.output_dir
@@ -358,6 +382,16 @@ def _cmd_build(args: argparse.Namespace) -> None:
                     f"model_type 'glm_moe_dsa' (got '{model_type}')."
                 )
             config = dataclasses.replace(config, use_dsa=False)
+        if export_paged_attention:
+            from mobius.components._paged_mla import paged_attention_rejection
+
+            config = dataclasses.replace(config, export_paged_attention=True)
+            reason = paged_attention_rejection(config)
+            if reason is not None:
+                raise SystemExit(
+                    f"Error: --features paged-attention is not supported for this "
+                    f"model: {reason}"
+                )
         if static_cache_params is not None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
@@ -406,6 +440,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
+            export_paged_attention=export_paged_attention,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -576,6 +611,13 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
 
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
+    reuse_gguf_weights = args.reuse_gguf_weights
+    if reuse_gguf_weights and args.runtime == "ort-genai":
+        raise SystemExit(
+            "Error: --reuse-gguf-weights cannot be combined with --runtime ort-genai "
+            "because genai_config.json cannot require disabled ORT constant folding. "
+            "Use direct ONNX Runtime with ORT_DISABLE_ALL."
+        )
 
     if keep_quantized:
         print("Preserving supported GGUF quantization (float-only inputs stay float)...")
@@ -583,8 +625,10 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print("Dequantized mode: converting GGUF weights to float...")
 
     gguf_path = args.gguf_path
+    gguf_reference = gguf_path
     output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    target_config = getattr(args, "target_config", None)
+    runtime = getattr(args, "runtime", None)
 
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -594,27 +638,83 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
+    if target_config is not None and runtime is not None:
+        raise SystemExit(
+            "Error: dflash/eagle3 target-coupled drafts do not support standalone "
+            "runtime packaging; omit --runtime to save the auxiliary graph and manifest."
+        )
+    tokenizer_repository = getattr(args, "tokenizer_repository", None)
+    tokenizer_revision = getattr(args, "tokenizer_revision", None)
+    if (tokenizer_repository is None) != (tokenizer_revision is None):
+        raise SystemExit(
+            "Error: --tokenizer-repository and --tokenizer-revision must be provided together."
+        )
+    if runtime is None and tokenizer_repository is not None:
+        raise SystemExit(
+            "Error: pinned tokenizer materialization is only available with --runtime."
+        )
+
+    if runtime is not None:
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
+        from mobius.integrations.gguf._builder import (
+            _resolve_gguf_path,
+            _validate_gguf_model,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._spec import Support
+
+        # Resolve and validate the exact selected source before graph construction
+        # so a deferred tokenizer cannot leave a graph-only directory behind.
+        resolved_gguf_path = _resolve_gguf_path(gguf_path)
+        gguf_model = GGUFModel(resolved_gguf_path)
+        _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
+        architecture_spec = get_arch_spec(gguf_model.architecture)
+        if architecture_spec.runtime is not Support.SUPPORTED:
+            raise SystemExit(
+                f"Error: GGUF runtime packaging for {architecture_spec.gguf_arch!r} is "
+                f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
+            )
+        if tokenizer_repository is None or tokenizer_revision is None:
+            raise SystemExit(
+                "Error: GGUF runtime packaging requires --tokenizer-repository and an "
+                "immutable --tokenizer-revision."
+            )
+        if tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/")):
+            raise SystemExit(
+                "Error: --tokenizer-repository must be an owner/repository Hub ID."
+            )
+        if re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None:
+            raise SystemExit(
+                "Error: --tokenizer-revision must be an immutable 40-hex commit SHA."
+            )
 
     pkg = build_from_gguf(
-        gguf_path,
+        gguf_reference,
         mmproj=mmproj_path,
         dtype=args.dtype,
         keep_quantized=keep_quantized,
         execution_provider=args.execution_provider,
         static_cache=args.static_cache,
         max_seq_len=args.max_seq_len,
+        reuse_gguf_weights=reuse_gguf_weights,
+        target_config=target_config,
+        _gguf_model=gguf_model if runtime is not None else None,
     )
 
     if args.release:
         for model in pkg.values():
             strip_debug_metadata(model)
 
-    pkg.save(
-        output_dir,
-        external_data=args.external_data,
-        max_shard_size_bytes=_parse_size(args.max_shard_size) if args.max_shard_size else None,
-        max_workers=args.max_workers,
-    )
+    if runtime is None:
+        os.makedirs(output_dir, exist_ok=True)
+        pkg.save(
+            output_dir,
+            external_data=args.external_data,
+            max_shard_size_bytes=(
+                _parse_size(args.max_shard_size) if args.max_shard_size else None
+            ),
+            max_workers=args.max_workers,
+        )
     for name in pkg:
         use_subfolders = len(pkg) > 1
         if use_subfolders:
@@ -624,39 +724,39 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print(f"Saved {name} to {path}")
 
     # Save the trailing MTP / "nextn" self-speculative head sidecar (when the
-    # GGUF shipped one) into a ``mtp/`` subdirectory next to the backbone.
+    # GGUF shipped one). ModelPackage.save() persisted it into ``mtp/``.
     mtp_head = getattr(pkg, "mtp_head", None)
     if mtp_head is not None:
         mtp_dir = os.path.join(output_dir, "mtp")
-        mtp_head.save(
-            mtp_dir,
-            external_data=args.external_data,
-            max_workers=args.max_workers,
-        )
         print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
 
-    runtime = getattr(args, "runtime", None)
+    draft_manifest = getattr(pkg, "draft_manifest", None)
+    if draft_manifest is not None:
+        from mobius.integrations.gguf._draft import write_draft_manifest
+
+        manifest_path = write_draft_manifest(draft_manifest, output_dir)
+        print(f"Saved draft pairing manifest to {manifest_path}")
+
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
 
-        # The graph is already saved above; this adds the tokenizer (rebuilt
-        # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
-        # no Hugging Face source directory) and the runtime's own contract.
         artifacts = write_gguf_runtime_package(
-            pkg, gguf_path, output_dir, runtime=runtime, save_model=False
+            pkg,
+            gguf_path,
+            output_dir,
+            runtime=runtime,
+            runtime_version=getattr(args, "runtime_version", None),
+            tokenizer_repository=tokenizer_repository,
+            tokenizer_revision=tokenizer_revision,
+            local_files_only=getattr(args, "local_files_only", False),
+            external_data=args.external_data,
+            max_shard_size_bytes=(
+                _parse_size(args.max_shard_size) if args.max_shard_size else None
+            ),
+            max_workers=args.max_workers,
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
-        if mtp_head is not None:
-            from mobius.integrations.onnx_genai.inference_metadata import (
-                write_mtp_speculator_metadata,
-            )
-
-            spec_path = write_mtp_speculator_metadata(
-                output_dir, backbone_config=getattr(pkg, "config", None)
-            )
-            if spec_path is not None:
-                print(f"  speculator: {spec_path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
@@ -1155,16 +1255,63 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dequantize all GGUF weights to float instead of preserving quantization.",
     )
     gguf_parser.add_argument(
+        "--reuse-gguf-weights",
+        action="store_true",
+        help=(
+            "Reuse compatible tensor byte ranges directly from the original GGUF. "
+            "The GGUF must be a real file in the flat output directory; converted "
+            "weights are written to model.onnx.data."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--target-config",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Exact target model directory or config.json for a dflash/eagle3 "
+            "speculative draft. The adjacent tokenizer.json is required and its "
+            "ordered vocabulary must exactly match the GGUF tokenizer."
+        ),
+    )
+    gguf_parser.add_argument(
         "--runtime",
         choices=["ort-genai", "onnx-genai"],
         default=None,
         help=(
             "Generate runtime-specific config files after building. "
-            "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
-            "reconstructed from the GGUF's embedded tokenizer metadata; "
-            "'ort-genai' is currently rejected until GGUF cache/tokenizer "
-            "contracts have runtime generation coverage."
+            "Both routes require an exact tokenizer.huggingface.json embedded in "
+            "the GGUF; opaque tokenizer.ggml.pre metadata is not reconstructed. "
+            "'onnx-genai' writes inference_metadata.yaml and 'ort-genai' writes "
+            "genai_config.json."
         ),
+    )
+    gguf_parser.add_argument(
+        "--runtime-version",
+        default=None,
+        help=(
+            "Exact selected runtime version. Required once an architecture has a "
+            "runtime-supported evidence record; it must equal the version validated there."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--tokenizer-repository",
+        default=None,
+        metavar="OWNER/REPO",
+        help=(
+            "Exact Hugging Face repository containing tokenizer assets for runtime "
+            "packaging. Requires --tokenizer-revision and must match runtime evidence."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--tokenizer-revision",
+        default=None,
+        metavar="COMMIT_SHA",
+        help="Immutable 40-hex revision for --tokenizer-repository.",
+    )
+    gguf_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only already-cached pinned tokenizer assets; perform no Hub requests.",
     )
     gguf_parser.add_argument(
         "--static-cache",

@@ -550,6 +550,31 @@ class TestUnpackQ4KScales:
 
 
 class TestRepackQ4K:
+    def test_asymmetric_block_matches_explicit_llama_dequantization(self):
+        """Exercise scale high bits, min subtraction, and paired nibble ordering."""
+        block = _make_q4_k_block(
+            d=1.0,
+            dmin=1.0,
+            sub_scales=[1, 2, 3, 4, 17, 18, 19, 20],
+            sub_mins=[5, 6, 7, 8, 33, 34, 35, 36],
+            nibbles=[
+                value
+                for pair in ((0, 1), (2, 3), (4, 5), (6, 7))
+                for value in pair
+                for _ in range(32)
+            ],
+        )
+
+        actual = quants.dequantize(
+            block.reshape(1, -1), quants.GGMLQuantizationType.Q4_K
+        ).ravel()
+        expected = np.repeat(
+            np.array([-5.0, -4.0, -1.0, 4.0, 35.0, 56.0, 79.0, 104.0]),
+            32,
+        )
+
+        np.testing.assert_array_equal(actual, expected)
+
     def test_single_super_block_shapes(self):
         """Single Q4_K super-block -> 8 MatMulNBits sub-blocks."""
         sc = [10] * 8

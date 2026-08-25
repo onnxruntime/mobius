@@ -24,60 +24,55 @@ __all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvabl
 
 import dataclasses
 import logging
-from typing import Any
+import math
+import re
+from collections.abc import Iterable
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from mobius._configs import (
     ArchitectureConfig,
+    FalconH1Config,
     Gemma2Config,
     Gemma4Config,
+    GraniteMoeHybridConfig,
+    JambaConfig,
+    KimiK3Config,
+    KimiLinearConfig,
+    Lfm2MoeConfig,
+    Mamba2Config,
+    MambaConfig,
+    MiniMaxConfig,
     MuseGlimmerConfig,
+    NemotronHConfig,
+    Plamo2Config,
     _shallow_fields,
 )
+from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
+
+if TYPE_CHECKING:
+    from mobius._configs import DFlashConfig, Eagle3Config
 
 logger = logging.getLogger(__name__)
 
 
 # Map GGUF architecture names → our registry model_type strings.
-# Most names match; a few need remapping.
-GGUF_ARCH_TO_MODEL_TYPE: dict[str, str] = {
-    "llama": "llama",
-    "mistral": "llama",  # Mistral uses Llama architecture
-    "qwen2": "qwen2",
-    "qwen2_moe": "qwen2_moe",
-    "qwen3": "qwen3",
-    "qwen3_moe": "qwen3_moe",
-    "qwen35": "qwen3_5_text",
-    "qwen35moe": "qwen3_5_moe",
-    "gemma2": "gemma2",
-    "gemma3": "gemma3_text",
-    # Gemma 4 GGUF contains the text backbone only — no vision or audio encoder.
-    # Vision and audio encoders are exported separately from the HuggingFace checkpoint.
-    "gemma4": "gemma4_text",
-    "phi3": "phi3",
-    "falcon": "falcon",
-    "gpt2": "gpt2",
-    "mamba": "mamba",
-    "bloom": "bloom",
-    "starcoder2": "starcoder2",
-    "stablelm": "stablelm",
-    "nemotron": "nemotron",
-    "t5": "t5",
-    "hunyuan-dense": "hunyuan_v1_dense",
-    "deepseek4": "deepseek_v4",
-    # GLM-5.2 GGUFs (e.g. unsloth/GLM-5.2-GGUF) tag the architecture 'glm-dsa'
-    # (MLA + DeepSeek Sparse Attention + MoE). Mobius's canonical registry key
-    # is 'glm_moe_dsa'. This is an explicit format-bridge mapping keyed on the
-    # authoritative GGUF architecture string, never on the filename or model
-    # name. ``assert_glm_moe_dsa_resolvable`` verifies the head/layer/expert/DSA
-    # properties before the builder selects GlmMoeDsaCausalLMModel.
-    "glm-dsa": "glm_moe_dsa",
-    "glm_dsa": "glm_moe_dsa",
-    "deci": "llama",  # DeciLM uses Llama architecture
-    "muse-glimmer": "muse_glimmer_text",
-    "muse_glimmer": "muse_glimmer_text",
-}
+#
+# Derived from :mod:`mobius.integrations.gguf._arch_registry`, which is the
+# single source of truth. It stays exported under this name because callers
+# outside this module read it, but it is now read-only: mutating it here would
+# desynchronize it from the tensor mapping, the weight processors, and the
+# capability verdicts that are all built from the same specs.
+GGUF_ARCH_TO_MODEL_TYPE: MappingProxyType[str, str] = MappingProxyType(
+    {
+        name: spec.model_type
+        for spec in iter_arch_specs()
+        if spec.model_type is not None
+        for name in sorted(spec.names)
+    }
+)
 
 
 # Standard GGUF metadata keys → HuggingFace config field names.
@@ -90,57 +85,47 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "attention.head_count": "num_attention_heads",
     "attention.head_count_kv": "num_key_value_heads",
     "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "attention.layer_norm_epsilon": "rms_norm_eps",
     "rope.freq_base": "rope_theta",
     "context_length": "max_position_embeddings",
     "vocab_size": "vocab_size",
     "rope.dimension_count": "head_dim",
+    "attention.sliding_window": "sliding_window",
+    "logit_scale": "logit_scale",
+    "hidden_activation": "hidden_act",
     # MoE fields
     "expert_count": "num_local_experts",
     "expert_used_count": "num_experts_per_tok",
     "expert_feed_forward_length": "moe_intermediate_size",
     "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
+    "expert_shared_count": "n_shared_experts",
+    "expert_weights_scale": "routed_scaling_factor",
+    "expert_weights_norm": "norm_topk_prob",
+    "expert_group_count": "n_group",
+    "expert_group_used_count": "topk_group",
+    "moe_latent_size": "moe_latent_size",
     # Hybrid (DeltaNet / Mamba + Attention) fields
     "full_attention_interval": "full_attention_interval",
     # SSM/DeltaNet fields (used for linear attention in hybrid models)
     "ssm.group_count": "linear_num_key_heads",
     "ssm.time_step_rank": "linear_num_value_heads",
     "ssm.conv_kernel": "linear_conv_kernel_dim",
+    "ssm.inner_size": "linear_inner_size",
+    "ssm.state_size": "linear_key_head_dim",
+    "shortconv.l_cache": "short_conv_kernel",
 }
 
-# Muse Glimmer has no rope.dimension_count; head_dim comes from key_length.
+_DRAFT_KEY_MAP = {
+    "block_size": "block_size",
+    "target_hidden_size": "target_hidden_size",
+    "target_layers": "target_layer_ids",
+    "norm_before_residual": "norm_before_residual",
+    "norm_before_fc": "norm_before_fc",
+}
+
 _MUSE_GLIMMER_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.sliding_window": "sliding_window",
-}
-
-_ARCH_KEY_MAPS: dict[str, dict[str, str]] = {
-    # Both spellings are accepted wherever muse-glimmer is recognized.
-    "muse-glimmer": _MUSE_GLIMMER_KEY_MAP,
-    "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
-    "deepseek4": {
-        "attention.key_length": "head_dim",
-        "rope.dimension_count": "qk_rope_head_dim",
-        "attention.q_lora_rank": "q_lora_rank",
-        "attention.sliding_window": "sliding_window",
-        "expert_count": "num_local_experts",
-        "expert_used_count": "num_experts_per_tok",
-        "expert_feed_forward_length": "moe_intermediate_size",
-        "expert_shared_count": "n_shared_experts",
-        "expert_weights_scale": "routed_scaling_factor",
-        "expert_weights_norm": "norm_topk_prob",
-        "swiglu_clamp_exp": "swiglu_limit",
-        "attention.indexer.head_count": "index_n_heads",
-        "attention.indexer.key_length": "index_head_dim",
-        "attention.indexer.top_k": "index_topk",
-        "attention.output_group_count": "o_groups",
-        "attention.output_lora_rank": "o_lora_rank",
-        "attention.compress_ratios": "compress_ratios",
-        "attention.compress_rope_freq_base": "compress_rope_theta",
-        "hyper_connection.count": "hc_mult",
-        "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
-        "hyper_connection.epsilon": "hc_eps",
-        "hash_layer_count": "num_hash_layers",
-    },
 }
 
 # GLM-5.2 ('glm-dsa') shares DeepSeek's MLA + MoE + DSA-indexer metadata layout
@@ -164,8 +149,146 @@ _GLM_DSA_KEY_MAP = {
     "attention.indexer.key_length": "index_head_dim",
     "attention.indexer.top_k": "index_topk",
 }
-_ARCH_KEY_MAPS["glm-dsa"] = _GLM_DSA_KEY_MAP
-_ARCH_KEY_MAPS["glm_dsa"] = _GLM_DSA_KEY_MAP
+
+_MAMBA_KEY_MAP = {
+    "attention.layer_norm_rms_epsilon": "layer_norm_epsilon",
+    "ssm.conv_kernel": "conv_kernel",
+    "ssm.group_count": "n_groups",
+    "ssm.inner_size": "intermediate_size",
+    "ssm.state_size": "state_size",
+    "ssm.time_step_rank": "time_step_rank",
+}
+
+_FALCON_H1_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "mamba_d_conv",
+    "ssm.group_count": "mamba_n_groups",
+    "ssm.inner_size": "mamba_d_ssm",
+    "ssm.state_size": "mamba_d_state",
+    "ssm.time_step_rank": "mamba_n_heads",
+}
+
+_PLAMO2_KEY_MAP = {
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "mamba_d_conv",
+    "ssm.group_count": "mamba_group_count",
+    "ssm.state_size": "mamba_d_state",
+    "ssm.time_step_rank": "mamba_num_heads",
+}
+
+_JAMBA_KEY_MAP = {
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "mamba_d_conv",
+    "ssm.inner_size": "mamba_d_inner",
+    "ssm.state_size": "mamba_d_state",
+    "ssm.time_step_rank": "mamba_dt_rank",
+}
+
+_NEMOTRON_H_KEY_MAP = {
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "conv_kernel",
+    "ssm.group_count": "n_groups",
+    "ssm.state_size": "state_size",
+    "ssm.time_step_rank": "mamba_num_heads",
+}
+
+_GRANITEHYBRID_KEY_MAP = {
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "conv_kernel",
+    "ssm.group_count": "n_groups",
+    "ssm.inner_size": "mamba_intermediate_size",
+    "ssm.state_size": "state_size",
+    "ssm.time_step_rank": "mamba_num_heads",
+}
+
+_MINIMAX_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.value_length": "value_head_dim",
+    "residual_scale": "residual_scale",
+}
+
+_KIMI_LINEAR_KEY_MAP = {
+    "attention.key_length_mla": "qk_nope_head_dim",
+    "attention.value_length_mla": "v_head_dim",
+    "attention.kv_lora_rank": "kv_lora_rank",
+    "rope.dimension_count": "qk_rope_head_dim",
+    "ssm.conv_kernel": "linear_conv_kernel_dim",
+    "kda.head_dim": "linear_key_head_dim",
+    "expert_feed_forward_length": "moe_intermediate_size",
+    "expert_shared_count": "n_shared_experts",
+    "leading_dense_block_count": "first_k_dense_replace",
+    "expert_weights_scale": "routed_scaling_factor",
+}
+
+_KIMI_K3_KEY_MAP = {
+    **_KIMI_LINEAR_KEY_MAP,
+    "attention.q_lora_rank": "q_lora_rank",
+    "kda.gate_lower_bound": "linear_gate_lower_bound",
+    "expert_latent_length": "routed_expert_hidden_size",
+    "expert_weights_norm": "norm_topk_prob",
+    "attn_res.block_size": "attn_res_block_size",
+    "activation.situ_beta": "activation_situ_beta",
+    "activation.situ_linear_beta": "activation_situ_linear_beta",
+}
+
+_T5_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.relative_buckets_count": "relative_attention_num_buckets",
+    "decoder_block_count": "num_decoder_layers",
+    "decoder_start_token_id": "decoder_start_token_id",
+}
+
+#: Named architecture-specific key maps that :attr:`GGUFArchitectureSpec.
+#: config_key_map` selects. Every name here must be referenced by a spec and
+#: every name a spec references must exist here; ``_arch_registry_test`` checks
+#: both directions so a typo cannot silently drop config fields.
+_KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
+    {
+        "draft": _DRAFT_KEY_MAP,
+        "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
+        "glm_dsa": _GLM_DSA_KEY_MAP,
+        "mamba": _MAMBA_KEY_MAP,
+        "falcon_h1": _FALCON_H1_KEY_MAP,
+        "plamo2": _PLAMO2_KEY_MAP,
+        "jamba": _JAMBA_KEY_MAP,
+        "nemotron_h": _NEMOTRON_H_KEY_MAP,
+        "granitehybrid": _GRANITEHYBRID_KEY_MAP,
+        "minimax": _MINIMAX_KEY_MAP,
+        "kimi_linear": _KIMI_LINEAR_KEY_MAP,
+        "kimi_k3": _KIMI_K3_KEY_MAP,
+        "t5": _T5_KEY_MAP,
+    }
+)
+
+
+def _arch_key_map(gguf_arch: str) -> dict[str, str]:
+    """Return the extra GGUF-key → config-field map for *gguf_arch*."""
+    spec = try_get_arch_spec(gguf_arch)
+    if spec is None or spec.config_key_map is None:
+        return {}
+    return _KEY_MAP_TABLES[spec.config_key_map]
+
+
+#: Per-architecture key maps expanded over every canonical name and alias.
+#: Derived from the registry rather than declared, so a spelling accepted by the
+#: tensor mapping cannot be missing here.
+_ARCH_KEY_MAPS: MappingProxyType[str, dict[str, str]] = MappingProxyType(
+    {
+        name: _KEY_MAP_TABLES[spec.config_key_map]
+        for spec in iter_arch_specs()
+        if spec.config_key_map is not None
+        for name in sorted(spec.names)
+    }
+)
 
 
 # GGUF hidden_act values → HuggingFace activation function names
@@ -225,7 +348,7 @@ def _extract_config_fields(
     # architectures before they are added upstream.
     fallback_mapping = {
         **_DEFAULT_KEY_MAP,
-        **_ARCH_KEY_MAPS.get(gguf_arch, {}),
+        **_arch_key_map(gguf_arch),
     }
     for gguf_suffix, hf_key in fallback_mapping.items():
         full_key = f"{gguf_arch}.{gguf_suffix}"
@@ -245,6 +368,209 @@ def _extract_config_fields(
             hf_fields["vocab_size"] = len(tokens)
 
     return hf_fields
+
+
+_DELTA_NET_ARCHITECTURES = frozenset({"qwen35", "qwen35moe", "qwen3next"})
+
+
+def _nextn_predict_layers(gguf_arch: str, metadata: dict[str, Any]) -> int:
+    """Read the exact nextn spelling from pinned llama.cpp."""
+    dotted_key = f"{gguf_arch}.nextn.predict_layers"
+    if dotted_key in metadata:
+        raise ValueError(
+            f"Unsupported non-pinned MTP metadata key {dotted_key!r}; expected "
+            f"{gguf_arch}.nextn_predict_layers"
+        )
+    key = f"{gguf_arch}.nextn_predict_layers"
+    if key not in metadata:
+        return 0
+    count = int(metadata[key])
+    if count < 0:
+        raise ValueError(f"{key} must be non-negative, got {count}")
+    return count
+
+
+def _derive_hybrid_layout(
+    gguf_arch: str,
+    metadata: dict[str, Any],
+    tensor_names: Iterable[str] | None = None,
+) -> tuple[int, list[str] | None, int]:
+    """Derive the trunk layer count and exact mixer schedule from GGUF metadata."""
+    total_layers = int(metadata[f"{gguf_arch}.block_count"])
+    mtp_count = _nextn_predict_layers(gguf_arch, metadata)
+    trunk_layers = total_layers - mtp_count
+    if trunk_layers <= 0:
+        raise ValueError(
+            f"GGUF metadata inconsistent: block_count ({total_layers}) <= "
+            f"nextn predict layers ({mtp_count}) for architecture {gguf_arch}."
+        )
+
+    if gguf_arch in {
+        "lfm2",
+        "lfm2moe",
+        "jamba",
+        "granitehybrid",
+        "plamo2",
+        "kimi-linear",
+        "kimi-k3",
+    }:
+        raw_kv_heads = metadata.get(f"{gguf_arch}.attention.head_count_kv")
+        if not isinstance(raw_kv_heads, (list, tuple, np.ndarray)):
+            raise ValueError(
+                f"{gguf_arch}.attention.head_count_kv must be a per-layer array; "
+                "a scalar cannot reconstruct the hybrid attention/conv schedule"
+            )
+        kv_heads = [int(value) for value in raw_kv_heads]
+        if len(kv_heads) != total_layers:
+            raise ValueError(
+                f"{gguf_arch}.attention.head_count_kv must contain exactly "
+                f"{total_layers} entries, got {len(kv_heads)}"
+            )
+        if any(value < 0 for value in kv_heads):
+            raise ValueError(
+                f"{gguf_arch}.attention.head_count_kv entries must be non-negative"
+            )
+        recurrent_type = {
+            "lfm2": "conv",
+            "lfm2moe": "conv",
+            "jamba": "mamba",
+            "granitehybrid": "mamba2",
+            "plamo2": "mamba",
+            "kimi-linear": "kimi_linear_attention",
+            "kimi-k3": "kimi_k3_attention",
+        }[gguf_arch]
+        return (
+            trunk_layers,
+            [
+                recurrent_type if value == 0 else "full_attention"
+                for value in kv_heads[:trunk_layers]
+            ],
+            mtp_count,
+        )
+
+    if gguf_arch in {"nemotron_h", "nemotron_h_moe"}:
+        kv_raw = metadata.get(f"{gguf_arch}.attention.head_count_kv")
+        ffn_raw = metadata.get(f"{gguf_arch}.feed_forward_length")
+        if not isinstance(kv_raw, (list, tuple, np.ndarray)) or not isinstance(
+            ffn_raw, (list, tuple, np.ndarray)
+        ):
+            raise ValueError(
+                f"{gguf_arch} requires per-layer attention.head_count_kv and "
+                "feed_forward_length arrays"
+            )
+        kv_heads = [int(value) for value in kv_raw]
+        ffn_lengths = [int(value) for value in ffn_raw]
+        if len(kv_heads) != total_layers or len(ffn_lengths) != total_layers:
+            raise ValueError(
+                f"{gguf_arch} schedule arrays must each contain exactly {total_layers} entries"
+            )
+        if any(value < 0 for value in (*kv_heads, *ffn_lengths)):
+            raise ValueError(f"{gguf_arch} schedule entries must be non-negative")
+        uses_moe = int(metadata.get(f"{gguf_arch}.expert_count", 0)) > 0
+        names = set(tensor_names) if tensor_names is not None else None
+        layer_types = []
+        for layer, (kv_heads_i, ffn_length_i) in enumerate(
+            zip(kv_heads[:trunk_layers], ffn_lengths[:trunk_layers])
+        ):
+            if ffn_length_i:
+                has_router = names is not None and f"blk.{layer}.ffn_gate_inp.weight" in names
+                layer_types.append(
+                    "moe" if has_router or (names is None and uses_moe) else "mlp"
+                )
+            elif kv_heads_i == 0:
+                layer_types.append("mamba2")
+            else:
+                layer_types.append("full_attention")
+        return trunk_layers, layer_types, mtp_count
+
+    if gguf_arch == "minimax-01":
+        recurrent_key = f"{gguf_arch}.attention.recurrent_layers"
+        raw_recurrent = metadata.get(recurrent_key)
+        if raw_recurrent is None:
+            interval = int(metadata.get(f"{gguf_arch}.full_attention_interval", 8))
+            if interval <= 0:
+                raise ValueError(
+                    f"{gguf_arch}.full_attention_interval must be positive, got {interval}"
+                )
+            recurrent = [(layer + 1) % interval != 0 for layer in range(total_layers)]
+        else:
+            if not isinstance(raw_recurrent, (list, tuple, np.ndarray)):
+                raise ValueError(f"{recurrent_key} must be a boolean array")
+            if len(raw_recurrent) != total_layers:
+                raise ValueError(
+                    f"{recurrent_key} must contain exactly {total_layers} entries, "
+                    f"got {len(raw_recurrent)}"
+                )
+            if any(
+                not isinstance(value, (bool, np.bool_, int, np.integer))
+                or int(value) not in (0, 1)
+                for value in raw_recurrent
+            ):
+                raise ValueError(f"{recurrent_key} entries must be booleans or 0/1")
+            recurrent = [bool(value) for value in raw_recurrent]
+            if f"{gguf_arch}.full_attention_interval" in metadata:
+                interval = int(metadata[f"{gguf_arch}.full_attention_interval"])
+                if interval <= 0:
+                    raise ValueError(
+                        f"{gguf_arch}.full_attention_interval must be positive, got {interval}"
+                    )
+                periodic = [(layer + 1) % interval != 0 for layer in range(total_layers)]
+                if recurrent != periodic:
+                    raise ValueError(
+                        "MiniMax-01 recurrent_layers contradicts full_attention_interval"
+                    )
+        return (
+            trunk_layers,
+            [
+                "lightning_attention" if value else "full_attention"
+                for value in recurrent[:trunk_layers]
+            ],
+            mtp_count,
+        )
+
+    if gguf_arch not in _DELTA_NET_ARCHITECTURES:
+        return trunk_layers, None, mtp_count
+
+    recurrent_key = f"{gguf_arch}.attention.recurrent_layers"
+    recurrent = metadata.get(recurrent_key)
+    if recurrent is not None:
+        if isinstance(recurrent, (list, tuple, np.ndarray)):
+            if any(
+                not isinstance(value, (bool, np.bool_, int, np.integer))
+                or int(value) not in (0, 1)
+                for value in recurrent
+            ):
+                raise ValueError(f"{recurrent_key} entries must be booleans or 0/1")
+            recurrent_layers = [bool(value) for value in recurrent]
+            if len(recurrent_layers) != total_layers:
+                raise ValueError(
+                    f"{recurrent_key} must contain exactly {total_layers} entries, "
+                    f"got {len(recurrent_layers)}"
+                )
+        elif isinstance(recurrent, (bool, np.bool_)):
+            recurrent_layers = [bool(recurrent)] * total_layers
+        else:
+            raise ValueError(f"{recurrent_key} must be a boolean or boolean array")
+        if any(recurrent_layers[trunk_layers:]):
+            raise ValueError(f"{recurrent_key} marks an appended MTP block as recurrent")
+    else:
+        interval = int(metadata.get(f"{gguf_arch}.full_attention_interval", 4))
+        if interval <= 0:
+            raise ValueError(
+                f"{gguf_arch}.full_attention_interval must be positive, got {interval}"
+            )
+        recurrent_layers = [
+            i < trunk_layers and (i + 1) % interval != 0 for i in range(total_layers)
+        ]
+
+    return (
+        trunk_layers,
+        [
+            "linear_attention" if value else "full_attention"
+            for value in recurrent_layers[:trunk_layers]
+        ],
+        mtp_count,
+    )
 
 
 def gguf_to_config(
@@ -270,6 +596,24 @@ def gguf_to_config(
     gguf_arch = model.architecture
     metadata = model.metadata
 
+    # Resolve the architecture spec once. It is deliberately *not* required
+    # here: config extraction is a separate capability from tensor mapping, and
+    # some architectures (bloom, t5) can be configured but not mapped. The
+    # tensor-mapping gate raises for those, with a reason.
+    spec = try_get_arch_spec(gguf_arch)
+    canonical_arch = spec.gguf_arch if spec is not None else gguf_arch
+    if spec is not None:
+        missing_metadata = [
+            suffix
+            for suffix in spec.required_metadata
+            if f"{gguf_arch}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"GGUF architecture {gguf_arch!r} is missing required metadata: "
+                f"{', '.join(missing_metadata)}"
+            )
+
     # Resolve model_type
     model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
 
@@ -293,11 +637,18 @@ def gguf_to_config(
     # during tensor mapping. Without this correction the builder would create
     # an extra decoder layer whose linear-attention / GQA initializers have no
     # backing GGUF weights and fail the ``_check_weights`` invariant on save.
-    nextn_layers = metadata.get(f"{gguf_arch}.nextn_predict_layers")
+    nextn_layers = _nextn_predict_layers(gguf_arch, metadata)
     mtp_predict_layers = 0
     mtp_block_indices: list[int] = []
-    if nextn_layers is not None and int(nextn_layers) > 0:
-        mtp_count = int(nextn_layers)
+    if nextn_layers > 0:
+        mtp_count = nextn_layers
+        if mtp_count > 1:
+            raise ValueError(
+                f"GGUF architecture {gguf_arch!r} declares nextn_predict_layers="
+                f"{mtp_count}, but mobius can export exactly one MTP sidecar head. "
+                "Multi-head MTP export is not supported; use a checkpoint with one "
+                "nextn prediction layer."
+            )
         decoder_layers = int(hf_fields["num_hidden_layers"]) - mtp_count
         if decoder_layers <= 0:
             raise ValueError(
@@ -321,9 +672,33 @@ def gguf_to_config(
     head_dim = hf_fields.get("head_dim")
     hidden_size = hf_fields["hidden_size"]
     num_attention_heads = hf_fields["num_attention_heads"]
+    if isinstance(num_attention_heads, (list, np.ndarray)):
+        values = [int(value) for value in num_attention_heads]
+        if canonical_arch not in {"plamo2", "nemotron_h", "nemotron_h_moe"}:
+            raise ValueError(
+                f"{canonical_arch} has unsupported per-layer attention head counts"
+            )
+        nonzero = {value for value in values if value}
+        if len(nonzero) != 1:
+            raise ValueError(
+                f"{canonical_arch} attention layers must use one consistent non-zero "
+                "head count"
+            )
+        if not nonzero:
+            raise ValueError(f"{canonical_arch} GGUF has no attention layer")
+        num_attention_heads = nonzero.pop()
+    if canonical_arch in {"mamba", "mamba2"}:
+        # Pure recurrent GGUFs deliberately write attention.head_count=0.
+        # The temporary ArchitectureConfig still needs a nonzero placeholder;
+        # the postprocessor replaces it with the real SSM head geometry.
+        num_attention_heads = int(num_attention_heads) or 1
     key_length = metadata.get(f"{gguf_arch}.attention.key_length")
     if key_length is not None:
         head_dim = int(key_length)
+    elif canonical_arch == "cohere2":
+        # Cohere2's rope.dimension_count is the rotated prefix, not the full
+        # attention head width. The graph still projects hidden_size / heads.
+        head_dim = hidden_size // num_attention_heads
     elif head_dim is None:
         head_dim = hidden_size // num_attention_heads
 
@@ -332,9 +707,31 @@ def gguf_to_config(
     # most common (mode) value as the scalar config value.
     num_kv_heads = hf_fields.get("num_key_value_heads", num_attention_heads)
     if isinstance(num_kv_heads, (list, np.ndarray)):
-        # Per-layer array → pick the majority value (sliding layers dominate)
-        values = list(num_kv_heads)
-        num_kv_heads = max(set(values), key=values.count)
+        values = [int(value) for value in num_kv_heads]
+        if canonical_arch in {
+            "lfm2",
+            "lfm2moe",
+            "jamba",
+            "nemotron_h",
+            "nemotron_h_moe",
+            "granitehybrid",
+            "plamo2",
+            "minimax-01",
+            "kimi-linear",
+        }:
+            nonzero = {value for value in values if value}
+            if len(nonzero) != 1:
+                raise ValueError(
+                    f"{canonical_arch} attention layers must use one consistent non-zero "
+                    "KV-head count, "
+                    f"got {sorted(nonzero)}"
+                )
+            if not nonzero:
+                raise ValueError(f"{canonical_arch} GGUF has no attention layer KV-head count")
+            num_kv_heads = nonzero.pop()
+        else:
+            # Per-layer array → pick the majority value (sliding layers dominate)
+            num_kv_heads = max(set(values), key=values.count)
 
     # Map activation function
     hidden_act = hf_fields.get("hidden_act")
@@ -347,26 +744,81 @@ def gguf_to_config(
             # Default activation by architecture
             hidden_act = _default_activation(model_type)
 
-    # Derive layer_types from full_attention_interval for hybrid models
+    # Derive the exact hybrid schedule from the same serialized metadata used
+    # by pinned llama.cpp. Explicit recurrent arrays always win over intervals.
     full_attention_interval = hf_fields.get("full_attention_interval")
     num_hidden_layers = hf_fields["num_hidden_layers"]
     layer_types: list[str] | None = None
-    if full_attention_interval is not None:
-        layer_types = [
-            "full_attention" if (i + 1) % full_attention_interval == 0 else "linear_attention"
-            for i in range(num_hidden_layers)
-        ]
+    if (
+        canonical_arch
+        in {
+            "lfm2",
+            "lfm2moe",
+            "jamba",
+            "nemotron_h",
+            "nemotron_h_moe",
+            "granitehybrid",
+            "plamo2",
+            "kimi-linear",
+        }
+        or canonical_arch in _DELTA_NET_ARCHITECTURES
+    ):
+        derived_layers, layer_types, derived_mtp_count = _derive_hybrid_layout(
+            canonical_arch, metadata, model.tensor_names
+        )
+        if derived_layers != int(num_hidden_layers) or derived_mtp_count != mtp_predict_layers:
+            raise ValueError("Hybrid schedule and decoder layer metadata disagree")
+        if canonical_arch in _DELTA_NET_ARCHITECTURES:
+            full_attention_interval = int(
+                metadata.get(f"{canonical_arch}.full_attention_interval", 4)
+            )
+
+    if canonical_arch in {"nemotron_h", "nemotron_h_moe"}:
+        ffn_lengths = metadata[f"{gguf_arch}.feed_forward_length"]
+        nonzero_ffn_lengths = {int(value) for value in ffn_lengths if int(value)}
+        if len(nonzero_ffn_lengths) > 1:
+            raise ValueError(
+                f"{gguf_arch} FFN layers must use one consistent feed-forward length"
+            )
+        hf_fields["intermediate_size"] = (
+            nonzero_ffn_lengths.pop() if nonzero_ffn_lengths else 4 * hidden_size
+        )
 
     # Derive DeltaNet head dimensions from SSM metadata.
-    # ssm.state_size = head dimension for both K and V heads.
+    # Key width comes from state_size. Value width is independently derived from
+    # inner_size / time_step_rank and must not be guessed from key width.
     ssm_state_size = metadata.get(f"{gguf_arch}.ssm.state_size")
     linear_key_head_dim = int(ssm_state_size) if ssm_state_size else None
-    linear_value_head_dim = int(ssm_state_size) if ssm_state_size else None
+    linear_value_head_dim = None
+    if canonical_arch in _DELTA_NET_ARCHITECTURES:
+        inner_size = int(metadata[f"{gguf_arch}.ssm.inner_size"])
+        value_heads = int(metadata[f"{gguf_arch}.ssm.time_step_rank"])
+        key_heads = int(metadata[f"{gguf_arch}.ssm.group_count"])
+        conv_kernel = int(metadata[f"{gguf_arch}.ssm.conv_kernel"])
+        if min(inner_size, value_heads, key_heads, conv_kernel, int(ssm_state_size)) <= 0:
+            raise ValueError(f"{gguf_arch} DeltaNet dimensions must all be positive")
+        if inner_size % value_heads:
+            raise ValueError(
+                f"{gguf_arch}.ssm.inner_size ({inner_size}) must be divisible by "
+                f"ssm.time_step_rank ({value_heads})"
+            )
+        if inner_size != int(ssm_state_size) * value_heads:
+            raise ValueError(
+                f"{gguf_arch}.ssm.inner_size ({inner_size}) must equal "
+                f"ssm.state_size * ssm.time_step_rank "
+                f"({int(ssm_state_size) * value_heads}) for the pinned DeltaNet loader"
+            )
+        if value_heads % key_heads:
+            raise ValueError(
+                f"{gguf_arch}.ssm.time_step_rank ({value_heads}) must be divisible by "
+                f"ssm.group_count ({key_heads})"
+            )
+        linear_value_head_dim = inner_size // value_heads
 
     # Derive partial_rotary_factor from rope.dimension_count / head_dim.
-    rope_dim = hf_fields.get("head_dim")  # from rope.dimension_count
+    rope_dim = metadata.get(f"{gguf_arch}.rope.dimension_count")
     if rope_dim is not None and head_dim > 0 and rope_dim != head_dim:
-        partial_rotary_factor = rope_dim / head_dim
+        partial_rotary_factor = int(rope_dim) / head_dim
     else:
         partial_rotary_factor = 1.0
 
@@ -383,8 +835,8 @@ def gguf_to_config(
     # and the full-attention layers produce garbage tokens. Section interleave,
     # when a model needs it, is a distinct ``mrope_interleaved`` signal handled
     # via ``mrope_section``. Only architectures that genuinely use adjacent-pair
-    # rotation set the flat flag here.
-    rope_interleave = gguf_arch == "deepseek4"
+    # rotation declare the flag on their spec.
+    rope_interleave = spec is not None and spec.rope_interleave
 
     # Derive rope_type from rope.scaling.type. GGUF stores the scaling
     # variant under ``<arch>.rope.scaling.type`` (or omits the key for the
@@ -423,6 +875,28 @@ def gguf_to_config(
             "beta_slow": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_slow", 1.0),
         }
 
+    if canonical_arch in {"qwen35", "qwen35moe"}:
+        mrope_section = metadata[f"{gguf_arch}.rope.dimension_sections"]
+        if not isinstance(mrope_section, (list, tuple, np.ndarray)) or len(mrope_section) != 4:
+            raise ValueError(
+                f"{gguf_arch}.rope.dimension_sections must contain exactly four entries"
+            )
+        mrope_section = [int(value) for value in mrope_section]
+    else:
+        mrope_section = None
+
+    if canonical_arch in {"qwen35moe", "qwen3next"}:
+        top_k = int(hf_fields["num_experts_per_tok"])
+        experts = int(hf_fields["num_local_experts"])
+        intermediate = int(hf_fields.get("intermediate_size", 4 * hidden_size))
+        if min(top_k, experts) <= 0 or top_k > experts:
+            raise ValueError(
+                f"{gguf_arch} expert counts are invalid: expert_count={experts}, "
+                f"expert_used_count={top_k}"
+            )
+        hf_fields.setdefault("moe_intermediate_size", intermediate // top_k)
+        hf_fields.setdefault("shared_expert_intermediate_size", intermediate)
+
     # HunYuan-V1-Dense: HF runs dynamic-NTK RoPE with rope_theta=10000 and
     # alpha=1000. The Tencent quantization pipeline bakes those into a
     # static rope.freq_base (~1.1e7) and sets rope.scaling.type='none' in
@@ -431,7 +905,7 @@ def gguf_to_config(
     # HF dynamic-NTK config so the ONNX model behaves correctly on
     # long-context inputs.
     if (
-        gguf_arch == "hunyuan-dense"
+        canonical_arch == "hunyuan-dense"
         and rope_type == "default"
         and rope_freq_base is not None
         and float(rope_freq_base) > 1e6
@@ -473,6 +947,8 @@ def gguf_to_config(
         rope_scaling=rope_scaling,
         rms_norm_eps=hf_fields.get("rms_norm_eps", 1e-5),
         hidden_act=hidden_act,
+        pad_token_id=int(metadata.get("tokenizer.ggml.padding_token_id", 0)),
+        eos_token_id=metadata.get("tokenizer.ggml.eos_token_id"),
         tie_word_embeddings=_infer_tie_embeddings(model),
         # Projection biases are not in GGUF metadata; infer from tensor
         # presence. Qwen2/Qwen3 carry Q/K/V biases — omitting them breaks
@@ -482,6 +958,10 @@ def gguf_to_config(
         mlp_bias=_infer_mlp_bias(model),
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
+        mrope_section=mrope_section,
+        num_decoder_layers=hf_fields.get("num_decoder_layers"),
+        decoder_start_token_id=hf_fields.get("decoder_start_token_id"),
+        relative_attention_num_buckets=hf_fields.get("relative_attention_num_buckets", 32),
         # MoE fields (None when not present → non-MoE model)
         num_local_experts=hf_fields.get("num_local_experts"),
         num_experts_per_tok=hf_fields.get("num_experts_per_tok"),
@@ -492,7 +972,7 @@ def gguf_to_config(
         routed_scaling_factor=hf_fields.get("routed_scaling_factor", 1.0),
         scoring_func=(
             "sqrtsoftplus"
-            if gguf_arch == "deepseek4"
+            if canonical_arch == "deepseek4"
             else hf_fields.get("scoring_func", "softmax")
         ),
         q_lora_rank=hf_fields.get("q_lora_rank"),
@@ -510,6 +990,7 @@ def gguf_to_config(
         num_hash_layers=hf_fields.get("num_hash_layers", 0),
         swiglu_limit=swiglu_limit,
         sliding_window=hf_fields.get("sliding_window"),
+        logit_scale=hf_fields.get("logit_scale", 1.0),
         original_max_position_embeddings=(
             rope_scaling.get("original_max_position_embeddings")
             if rope_scaling is not None
@@ -524,9 +1005,14 @@ def gguf_to_config(
         linear_key_head_dim=linear_key_head_dim,
         linear_value_head_dim=linear_value_head_dim,
         linear_conv_kernel_dim=(hf_fields.get("linear_conv_kernel_dim") or 4),
+        short_conv_kernel=(hf_fields.get("short_conv_kernel") or 3),
     )
 
-    # Store model_type for registry lookup and tensor processor dispatch.
+    # Store the source architecture and model_type for registry lookup and for
+    # weight-processor dispatch. ``_gguf_arch`` is what lets downstream
+    # dispatch key on the architecture spec instead of guessing from
+    # ``model_type``, which is where the Gemma 3 processor used to get lost.
+    config._gguf_arch = spec.gguf_arch if spec is not None else gguf_arch
     config._gguf_model_type = model_type
     config.model_type = model_type
 
@@ -534,9 +1020,12 @@ def gguf_to_config(
     # config subclass (e.g. Gemma4Config instead of plain ArchitectureConfig).
     # Postprocessors take the GGUF model too, because a few architectures store
     # config scalars inside tensors rather than in the key-value metadata.
-    postprocessor = _CONFIG_POSTPROCESSORS.get(model_type)
-    if postprocessor is not None:
+    postprocessor_name = None if spec is None else spec.config_postprocessor
+    if postprocessor_name is not None:
+        postprocessor = _CONFIG_POSTPROCESSORS[postprocessor_name]
         config = postprocessor(config, metadata, model)
+        model_type = config.model_type or model_type
+        config._gguf_arch = spec.gguf_arch
         config._gguf_model_type = model_type
         config.model_type = model_type
 
@@ -557,6 +1046,69 @@ def gguf_to_config(
     )
 
     return config
+
+
+def _lfm2moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> Lfm2MoeConfig:
+    """Restore LFM2MoE fields serialized by the pinned llama.cpp converter.
+
+    The pinned loader defaults a missing dense-prefix length to zero and
+    requires the SIGMOID gating enum. Its graph always normalizes selected
+    probabilities, and the architecture loader does not read a scaling
+    override, so metadata that conflicts with those invariants is rejected.
+    """
+    del model
+    arch = "lfm2moe"
+    gating = int(metadata[f"{arch}.expert_gating_func"])
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+    num_dense_layers = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if not 0 <= num_dense_layers <= config.num_hidden_layers:
+        raise ValueError(
+            f"{arch}.leading_dense_block_count must be in [0, "
+            f"{config.num_hidden_layers}], got {num_dense_layers}"
+        )
+    if (
+        config.num_local_experts is None
+        or config.num_experts_per_tok is None
+        or config.moe_intermediate_size is None
+    ):
+        raise ValueError("lfm2moe requires expert count, top-k, and expert FFN width")
+    if not 0 < config.num_experts_per_tok <= config.num_local_experts:
+        raise ValueError(
+            "lfm2moe expert_used_count must be positive and no greater than expert_count"
+        )
+
+    if metadata.get(f"{arch}.expert_weights_norm", True) is not True:
+        raise ValueError(
+            "lfm2moe.expert_weights_norm=False is incompatible with the pinned "
+            "llama.cpp graph, which always normalizes selected expert weights"
+        )
+    expert_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+    if expert_scale != 1.0:  # noqa: RUF069
+        raise ValueError(
+            "lfm2moe.expert_weights_scale must be 1.0 because the pinned loader "
+            "does not read an architecture-specific override"
+        )
+
+    fields = _shallow_fields(config)
+    fields.update(
+        hidden_act="silu",
+        attn_qk_norm=True,
+        short_conv_bias=False,
+        scoring_func="sigmoid",
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+    )
+    return Lfm2MoeConfig(
+        **fields,
+        num_dense_layers=num_dense_layers,
+        # The pinned loader requires exp_probs_b for every routed layer.
+        use_expert_bias=True,
+    )
 
 
 def _gemma2_postprocess(
@@ -611,6 +1163,678 @@ def _gemma2_postprocess(
         query_pre_attn_scalar=float(query_pre_attn_scalar)
         if query_pre_attn_scalar is not None
         else None,
+    )
+
+
+def _baichuan_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    del metadata, model
+    if config.num_hidden_layers != 32:
+        raise ValueError(
+            "Baichuan GGUF import supports only the pinned 32-layer/7B RoPE profile; "
+            f"got block_count={config.num_hidden_layers}. The 40-layer/13B loader uses "
+            "a hardcoded ALiBi path that the Mobius graph does not represent."
+        )
+    return dataclasses.replace(
+        config,
+        num_key_value_heads=config.num_attention_heads,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        tie_word_embeddings=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        hidden_act="silu",
+    )
+
+
+def _chatglm_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    names = set(model.tensor_names)
+    head_dim = int(
+        metadata.get(
+            "chatglm.attention.key_length",
+            config.hidden_size // config.num_attention_heads,
+        )
+    )
+    rope_dim = int(metadata.get("chatglm.rope.dimension_count", head_dim))
+    qkv_biases = [
+        f"blk.{layer}.attn_qkv.bias" in names
+        or all(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        for layer in range(config.num_hidden_layers)
+    ]
+    return dataclasses.replace(
+        config,
+        head_dim=head_dim,
+        partial_rotary_factor=rope_dim / head_dim,
+        rope_type="default",
+        hidden_act="silu",
+        tie_word_embeddings="output.weight" not in names,
+        attn_qkv_bias=all(qkv_biases),
+        attn_o_bias=False,
+        mlp_bias=False,
+    )
+
+
+def _phi2_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    del model
+    head_dim = int(
+        metadata.get(
+            "phi2.attention.key_length",
+            config.hidden_size // config.num_attention_heads,
+        )
+    )
+    rope_dim = int(metadata.get("phi2.rope.dimension_count", head_dim))
+    return dataclasses.replace(
+        config,
+        head_dim=head_dim,
+        partial_rotary_factor=rope_dim / head_dim,
+        intermediate_size=4 * config.hidden_size,
+        num_key_value_heads=config.num_attention_heads,
+        rope_type="default",
+        hidden_act="gelu_new",
+        tie_word_embeddings=False,
+        attn_qkv_bias=True,
+        attn_o_bias=True,
+        mlp_bias=True,
+    )
+
+
+def _seed_oss_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    del metadata
+    return dataclasses.replace(
+        config,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        tie_word_embeddings="output.weight" not in set(model.tensor_names),
+        attn_qkv_bias=_infer_attn_qkv_bias(model),
+        attn_o_bias=False,
+        mlp_bias=False,
+        hidden_act="silu",
+    )
+
+
+def _moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Validate and complete conventional-attention MoE metadata."""
+    del model
+    arch = getattr(config, "_gguf_arch", config.model_type)
+    num_experts = config.num_local_experts
+    top_k = config.num_experts_per_tok
+    if num_experts is None or int(num_experts) <= 0:
+        raise ValueError(f"{arch}.expert_count must be greater than zero")
+    if top_k is None or int(top_k) <= 0 or int(top_k) > int(num_experts):
+        raise ValueError(
+            f"{arch}.expert_used_count must be in [1, {num_experts}], got {top_k}"
+        )
+    if config.intermediate_size <= 0:
+        raise ValueError(f"{arch}.feed_forward_length must be greater than zero")
+    if config.moe_intermediate_size is not None and config.moe_intermediate_size <= 0:
+        raise ValueError(f"{arch}.expert_feed_forward_length must be greater than zero")
+    if (
+        config.shared_expert_intermediate_size is not None
+        and config.shared_expert_intermediate_size <= 0
+    ):
+        raise ValueError(f"{arch}.expert_shared_feed_forward_length must be greater than zero")
+
+    updates: dict[str, Any] = {}
+    if arch in ("qwen2moe", "qwen3moe"):
+        if config.moe_intermediate_size is None:
+            if config.intermediate_size % int(top_k):
+                raise ValueError(
+                    f"{arch}.feed_forward_length ({config.intermediate_size}) must be "
+                    f"divisible by expert_used_count ({top_k}) when "
+                    "expert_feed_forward_length is absent"
+                )
+            updates["moe_intermediate_size"] = config.intermediate_size // int(top_k)
+    if arch == "qwen2moe":
+        updates["norm_topk_prob"] = False
+        if config.shared_expert_intermediate_size is None:
+            updates["shared_expert_intermediate_size"] = config.intermediate_size
+    elif arch == "qwen3moe":
+        updates["attn_qk_norm"] = True
+        updates["attn_qk_norm_full"] = False
+        updates["norm_topk_prob"] = True
+    elif arch == "olmoe":
+        updates["attn_qk_norm"] = True
+        updates["attn_qk_norm_full"] = True
+        updates["norm_topk_prob"] = False
+
+    return dataclasses.replace(config, **updates)
+
+
+def _diffusion_common_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Validate the common no-cache masked-diffusion contract."""
+    arch = model.architecture
+    mask_token_id = metadata.get("tokenizer.ggml.mask_token_id")
+    if mask_token_id is None:
+        raise ValueError(
+            "tokenizer.ggml.mask_token_id is required for masked-diffusion generation"
+        )
+    mask_token_id = int(mask_token_id)
+    if not 0 <= mask_token_id < config.vocab_size:
+        raise ValueError(
+            f"tokenizer.ggml.mask_token_id must be in [0, {config.vocab_size}), "
+            f"got {mask_token_id}"
+        )
+    if config.hidden_act not in (None, "silu"):
+        raise ValueError(f"{arch}.hidden_activation must be silu, got {config.hidden_act!r}")
+
+    result = dataclasses.replace(
+        config,
+        hidden_act="silu",
+        rope_type="default",
+        mlp_bias=False,
+        mask_token_id=mask_token_id,
+        diffusion_shift_logits=bool(
+            metadata.get("diffusion.shift_logits", arch in {"dream", "rnd1"})
+        ),
+    )
+    return result
+
+
+def _dense_diffusion_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+    *,
+    dream: bool,
+) -> ArchitectureConfig:
+    result = _diffusion_common_postprocess(config, metadata, model)
+    names = set(model.tensor_names)
+    output_present = "output.weight" in names
+    qkv_bias = _diffusion_qkv_bias(config, names, allow_fused=dream)
+    if qkv_bias and not dream:
+        raise ValueError("llada GGUF does not support Q/K/V projection biases")
+    return dataclasses.replace(
+        result,
+        attn_qkv_bias=qkv_bias,
+        attn_o_bias=False,
+        tie_word_embeddings=not output_present,
+    )
+
+
+def _diffusion_qkv_bias(
+    config: ArchitectureConfig,
+    names: set[str],
+    *,
+    allow_fused: bool,
+) -> bool:
+    """Validate per-layer fused/separate QKV alternatives and bias consistency."""
+    layer_biases: list[bool] = []
+    for layer in range(config.num_hidden_layers):
+        fused_weight = f"blk.{layer}.attn_qkv.weight"
+        fused_bias = f"blk.{layer}.attn_qkv.bias"
+        separate_weights = {
+            f"blk.{layer}.attn_{projection}.weight" for projection in ("q", "k", "v")
+        }
+        separate_biases = {
+            f"blk.{layer}.attn_{projection}.bias" for projection in ("q", "k", "v")
+        }
+        has_fused = fused_weight in names
+        present_weights = separate_weights & names
+        if has_fused and not allow_fused:
+            raise ValueError(f"llada does not support fused QKV tensor {fused_weight!r}")
+        if has_fused and present_weights:
+            raise ValueError(
+                f"layer {layer} provides both fused and separate QKV projection weights"
+            )
+        if not has_fused and present_weights != separate_weights:
+            missing = sorted(separate_weights - present_weights)
+            raise ValueError(f"masked-diffusion GGUF is missing {missing[0]!r}")
+
+        if has_fused:
+            if separate_biases & names:
+                raise ValueError(
+                    f"layer {layer} mixes a fused QKV weight with separate Q/K/V biases"
+                )
+            layer_biases.append(fused_bias in names)
+        else:
+            present_biases = separate_biases & names
+            if present_biases and present_biases != separate_biases:
+                missing = sorted(separate_biases - present_biases)
+                raise ValueError(
+                    f"Q/K/V bias must be present consistently; missing {missing[0]!r}"
+                )
+            if fused_bias in names:
+                raise ValueError(
+                    f"layer {layer} provides fused QKV bias without a fused weight"
+                )
+            layer_biases.append(bool(present_biases))
+    if len(set(layer_biases)) > 1:
+        raise ValueError("Q/K/V bias presence must be consistent across every layer")
+    return layer_biases[0] if layer_biases else False
+
+
+def _dream_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _dense_diffusion_postprocess(config, metadata, model, dream=True)
+
+
+def _llada_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _dense_diffusion_postprocess(config, metadata, model, dream=False)
+
+
+def _diffusion_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+    *,
+    normalize_topk: bool,
+    require_output: bool,
+) -> ArchitectureConfig:
+    result = _diffusion_common_postprocess(config, metadata, model)
+    result = _moe_postprocess(result, metadata, model)
+    assert result.num_experts_per_tok is not None
+    if result.moe_intermediate_size is None:
+        if result.intermediate_size % result.num_experts_per_tok:
+            raise ValueError(
+                f"{model.architecture}.feed_forward_length ({result.intermediate_size}) "
+                "must be divisible by expert_used_count "
+                f"({result.num_experts_per_tok}) when expert_feed_forward_length is absent"
+            )
+        expert_width = result.intermediate_size // result.num_experts_per_tok
+    else:
+        expert_width = result.moe_intermediate_size
+
+    output_present = "output.weight" in set(model.tensor_names)
+    if require_output and not output_present:
+        raise ValueError(f"{model.architecture} requires output.weight")
+    return dataclasses.replace(
+        result,
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        attn_qkv_bias=_diffusion_qkv_bias(config, set(model.tensor_names), allow_fused=True),
+        attn_o_bias=False,
+        moe_intermediate_size=expert_width,
+        norm_topk_prob=normalize_topk,
+        tie_word_embeddings=not output_present,
+    )
+
+
+def _llada_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _diffusion_moe_postprocess(
+        config, metadata, model, normalize_topk=False, require_output=True
+    )
+
+
+def _rnd1_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    return _diffusion_moe_postprocess(
+        config, metadata, model, normalize_topk=True, require_output=False
+    )
+
+
+def _granitemoe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Apply Granite scaling and select its dense or MoE graph exactly."""
+    del model
+    arch = "granitemoe"
+    num_experts = config.num_local_experts
+    top_k = config.num_experts_per_tok
+    if config.intermediate_size <= 0:
+        raise ValueError("granitemoe.feed_forward_length must be greater than zero")
+    if num_experts is None or int(num_experts) == 0:
+        if top_k not in (None, 0):
+            raise ValueError(
+                "granitemoe.expert_used_count must be absent or zero when expert_count is zero"
+            )
+        model_type = "granite"
+        num_experts = None
+        top_k = None
+    else:
+        if int(num_experts) < 0:
+            raise ValueError("granitemoe.expert_count must not be negative")
+        if top_k is None or int(top_k) <= 0 or int(top_k) > int(num_experts):
+            raise ValueError(
+                f"granitemoe.expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        model_type = "granitemoe"
+
+    logit_scale = float(metadata[f"{arch}.logit_scale"])
+    if not logit_scale:
+        raise ValueError("granitemoe.logit_scale must be nonzero")
+    return dataclasses.replace(
+        config,
+        model_type=model_type,
+        num_local_experts=num_experts,
+        num_experts_per_tok=top_k,
+        embedding_multiplier=float(metadata.get(f"{arch}.embedding_scale", 1.0)),
+        attention_multiplier=(
+            float(metadata[f"{arch}.attention.scale"])
+            if f"{arch}.attention.scale" in metadata
+            else None
+        ),
+        logits_scaling=logit_scale,
+        residual_multiplier=float(metadata.get(f"{arch}.residual_scale", 1.0)),
+        norm_topk_prob=True,
+    )
+
+
+def _jamba_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> JambaConfig:
+    """Build exact Jamba mixer and routed-FFN schedules from serialized tensors."""
+    inner_size = int(metadata["jamba.ssm.inner_size"])
+    if inner_size != 2 * config.hidden_size:
+        raise ValueError(
+            "jamba.ssm.inner_size must equal 2 * embedding_length for the pinned loader"
+        )
+    if config.hidden_act not in {"silu", "swish"}:
+        raise ValueError("Jamba GGUF requires the pinned SiLU feed-forward activation")
+    num_experts = int(metadata.get("jamba.expert_count", 0))
+    top_k = int(metadata.get("jamba.expert_used_count", 0))
+    expert_layers = sorted(
+        {
+            int(match.group(1))
+            for name in model.tensor_names
+            if (match := re.fullmatch(r"blk\.(\d+)\.ffn_gate_inp\.weight", name))
+        }
+    )
+    if num_experts:
+        if num_experts == 1:
+            raise ValueError(
+                "Jamba expert_count=1 is not a routed-MoE layout; use dense FFN tensors"
+            )
+        if not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"jamba.expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        if not expert_layers:
+            raise ValueError("Jamba expert metadata requires at least one routed MoE layer")
+    elif top_k or expert_layers:
+        raise ValueError(
+            "Jamba routed tensors require positive expert_count and expert_used_count"
+        )
+    output_present = "output.weight" in set(model.tensor_names)
+    fields = _shallow_fields(config)
+    fields.update(
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        moe_intermediate_size=config.intermediate_size if num_experts else None,
+        norm_topk_prob=False,
+        routed_scaling_factor=1.0,
+        tie_word_embeddings=not output_present,
+        rope_type=None,
+    )
+    return JambaConfig(
+        **fields,
+        mamba_d_state=int(metadata["jamba.ssm.state_size"]),
+        mamba_d_conv=int(metadata["jamba.ssm.conv_kernel"]),
+        mamba_expand=2,
+        mamba_dt_rank=int(metadata["jamba.ssm.time_step_rank"]),
+        mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
+        mamba_proj_bias=False,
+        expert_layer_indices=expert_layers,
+    )
+
+
+def _nemotron_h_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> NemotronHConfig:
+    """Build the exact dense or routed-MoE Nemotron-H backbone."""
+    arch = model.architecture
+    if arch not in {"nemotron_h", "nemotron_h_moe"}:
+        raise ValueError(f"Unexpected GGUF architecture for Nemotron-H: {arch!r}")
+    inner_size = int(metadata[f"{arch}.ssm.inner_size"])
+    num_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    groups = int(metadata[f"{arch}.ssm.group_count"])
+    if min(inner_size, num_heads) <= 0 or inner_size % num_heads:
+        raise ValueError(
+            f"{arch}.ssm.inner_size must be positive and divisible by ssm.time_step_rank"
+        )
+    if groups <= 0 or num_heads % groups:
+        raise ValueError(f"{arch}.ssm.time_step_rank must be divisible by ssm.group_count")
+
+    num_experts = int(metadata.get(f"{arch}.expert_count", 0))
+    top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
+    layer_types = list(config.layer_types or ())
+    routed_layers = [i for i, layer_type in enumerate(layer_types) if layer_type == "moe"]
+    if arch == "nemotron_h_moe":
+        if num_experts <= 1 or not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"{arch} requires expert_count > 1 and expert_used_count in "
+                f"[1, expert_count], got {num_experts} and {top_k}"
+            )
+        if not routed_layers:
+            raise ValueError(f"{arch} metadata declares experts but has no routed MoE layer")
+        if config.moe_intermediate_size is None or config.moe_intermediate_size <= 0:
+            raise ValueError(f"{arch}.expert_feed_forward_length must be greater than zero")
+        if (
+            config.shared_expert_intermediate_size is None
+            or config.shared_expert_intermediate_size <= 0
+        ):
+            raise ValueError(
+                f"{arch}.expert_shared_feed_forward_length must be greater than zero"
+            )
+        shared_count = int(metadata.get(f"{arch}.expert_shared_count", 1))
+        if shared_count != 1:
+            raise ValueError(
+                f"{arch}.expert_shared_count must be exactly 1, got {shared_count}"
+            )
+        n_group = int(metadata.get(f"{arch}.expert_group_count", 1))
+        topk_group = int(metadata.get(f"{arch}.expert_group_used_count", 1))
+        if (n_group, topk_group) != (1, 1):
+            raise ValueError(
+                f"{arch} grouped expert routing is unsupported; "
+                f"expert_group_count and expert_group_used_count must both be 1, "
+                f"got {n_group} and {topk_group}"
+            )
+        latent_size = metadata.get(f"{arch}.moe_latent_size")
+        if latent_size is not None and int(latent_size) <= 0:
+            raise ValueError(f"{arch}.moe_latent_size must be greater than zero when present")
+    elif num_experts or top_k or routed_layers:
+        raise ValueError(
+            "nemotron_h uses the dense architecture contract; routed experts require "
+            "general.architecture='nemotron_h_moe'"
+        )
+
+    fields = _shallow_fields(config)
+    fields.update(
+        hidden_act="relu2",
+        layer_types=layer_types,
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm", True)),
+        routed_scaling_factor=float(metadata.get(f"{arch}.expert_weights_scale", 1.0)),
+        n_group=1,
+        topk_group=1,
+    )
+    return NemotronHConfig(
+        **fields,
+        mamba_n_heads=num_heads,
+        mamba_d_head=inner_size // num_heads,
+        mamba_d_state=int(metadata[f"{arch}.ssm.state_size"]),
+        mamba_n_groups=groups,
+        mamba_d_conv=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        mamba_expand=inner_size // config.hidden_size,
+        mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
+        mamba_proj_bias=False,
+        moe_latent_size=(
+            int(metadata[f"{arch}.moe_latent_size"])
+            if f"{arch}.moe_latent_size" in metadata
+            else None
+        ),
+    )
+
+
+def _granitehybrid_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> GraniteMoeHybridConfig:
+    """Build GraniteHybrid with its exact shared-MLP and routed-expert geometry."""
+    arch = "granitehybrid"
+    inner_size = int(metadata["granitehybrid.ssm.inner_size"])
+    num_heads = int(metadata["granitehybrid.ssm.time_step_rank"])
+    groups = int(metadata["granitehybrid.ssm.group_count"])
+    if inner_size != 2 * config.hidden_size:
+        raise ValueError("granitehybrid.ssm.inner_size must equal 2 * embedding_length")
+    if min(num_heads, groups) <= 0 or inner_size % num_heads or num_heads % groups:
+        raise ValueError("GraniteHybrid Mamba2 head and group dimensions are inconsistent")
+
+    num_experts = int(metadata.get(f"{arch}.expert_count", 0))
+    top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
+    if bool(num_experts) != bool(top_k):
+        raise ValueError(
+            "GraniteHybrid expert_count and expert_used_count must both be zero "
+            "or both positive"
+        )
+    expert_width = config.intermediate_size
+    if expert_width <= 0:
+        raise ValueError("granitehybrid.feed_forward_length must be greater than zero")
+    if num_experts:
+        if num_experts <= 1:
+            raise ValueError(
+                "GraniteHybrid expert_count=1 is not a routed-MoE layout; "
+                "use the dense shared-MLP tensors"
+            )
+        if not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"GraniteHybrid expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+        if shared_width < 0:
+            raise ValueError(
+                "granitehybrid.expert_shared_feed_forward_length must be non-negative"
+            )
+        if not bool(metadata.get(f"{arch}.expert_weights_norm", True)):
+            raise ValueError("GraniteHybrid requires normalized top-k routing weights")
+        routed_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+        if not math.isclose(routed_scale, 1.0, rel_tol=0.0, abs_tol=0.0):
+            raise ValueError(
+                "GraniteHybrid does not define an additional routed-expert output scale; "
+                f"got expert_weights_scale={routed_scale}"
+            )
+    else:
+        shared_width = config.intermediate_size
+        if f"{arch}.expert_shared_feed_forward_length" in metadata:
+            raise ValueError(
+                "granitehybrid.expert_shared_feed_forward_length requires routed experts"
+            )
+
+    if config.hidden_act not in (None, "silu"):
+        raise ValueError(
+            f"granitehybrid.hidden_activation must be silu, got {config.hidden_act!r}"
+        )
+    logit_scale = float(metadata.get(f"{arch}.logit_scale", 1.0))
+    if math.isclose(logit_scale, 0.0, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("granitehybrid.logit_scale must be nonzero")
+    tensor_names = set(model.tensor_names)
+    has_attention_bias = any(".attn_q.bias" in name for name in tensor_names)
+    has_attention_output_bias = any(".attn_output.bias" in name for name in tensor_names)
+    has_mlp_bias = any(
+        name.endswith((".ffn_gate.bias", ".ffn_up.bias", ".ffn_down.bias"))
+        for name in tensor_names
+    )
+    fields = _shallow_fields(config)
+    fields.update(
+        hidden_act="silu",
+        intermediate_size=int(expert_width),
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        attn_qkv_bias=has_attention_bias,
+        attn_o_bias=has_attention_output_bias,
+        mlp_bias=has_mlp_bias,
+        rope_type=(
+            fields["rope_type"]
+            if bool(metadata.get("granitehybrid.rope.scaling.finetuned", True))
+            else None
+        ),
+        embedding_multiplier=float(metadata.get("granitehybrid.embedding_scale", 1.0)),
+        residual_multiplier=float(metadata.get("granitehybrid.residual_scale", 1.0)),
+        attention_multiplier=(
+            float(metadata["granitehybrid.attention.scale"]) or None
+            if "granitehybrid.attention.scale" in metadata
+            else None
+        ),
+        logits_scaling=logit_scale,
+    )
+    return GraniteMoeHybridConfig(
+        **fields,
+        mamba_n_heads=num_heads,
+        mamba_d_head=inner_size // num_heads,
+        mamba_d_state=int(metadata["granitehybrid.ssm.state_size"]),
+        mamba_n_groups=groups,
+        mamba_d_conv=int(metadata["granitehybrid.ssm.conv_kernel"]),
+        mamba_expand=2,
+        mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
+        mamba_proj_bias=False,
+        shared_intermediate_size=int(shared_width),
+    )
+
+
+def _phimoe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Complete PhiMoE metadata, including tensor-backed LongRoPE factors."""
+    config = _moe_postprocess(config, metadata, model)
+    tensor_names = set(getattr(model, "tensor_names", ()) or ())
+    long_name = "rope_factors_long.weight"
+    short_name = "rope_factors_short.weight"
+    if long_name not in tensor_names and short_name not in tensor_names:
+        return config
+    if long_name not in tensor_names or short_name not in tensor_names:
+        raise ValueError(
+            "phimoe LongRoPE requires both rope_factors_long.weight and "
+            "rope_factors_short.weight"
+        )
+    if model is None or not hasattr(model, "get_tensor"):
+        raise ValueError("phimoe LongRoPE factors could not be read from the GGUF model")
+
+    original_context = metadata.get("phimoe.rope.scaling.original_context_length")
+    if original_context is None:
+        raise ValueError(
+            "phimoe.rope.scaling.original_context_length is required with LongRoPE factors"
+        )
+    return dataclasses.replace(
+        config,
+        rope_type="longrope",
+        rope_scaling={
+            "long_factor": model.get_tensor(long_name).reshape(-1).tolist(),
+            "short_factor": model.get_tensor(short_name).reshape(-1).tolist(),
+        },
+        original_max_position_embeddings=int(original_context),
     )
 
 
@@ -872,6 +2096,74 @@ def _gemma3_postprocess(
     return config
 
 
+def _olmo_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Reject OLMo variants whose QKV clamp the current graph cannot express."""
+    clamp = metadata.get("olmo.attention.clamp_kqv")
+    if clamp is not None and float(clamp) > 0:
+        raise ValueError(
+            "GGUF metadata olmo.attention.clamp_kqv is non-zero, but mobius's "
+            "OLMo attention graph does not implement QKV activation clamping."
+        )
+    return config
+
+
+def _dense_sliding_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Apply dense-architecture attention semantics omitted by generic GGUF metadata."""
+    arch = config._gguf_arch
+    if arch == "olmo2":
+        config.attn_qk_norm = True
+        config.attn_qk_norm_full = True
+    elif arch == "cohere2":
+        # Cohere2 rotates adjacent even/odd pairs rather than split halves.
+        config.rope_interleave = True
+        config.layer_types = [
+            "full_attention" if (layer_index + 1) % 4 == 0 else "sliding_attention"
+            for layer_index in range(config.num_hidden_layers)
+        ]
+        config.no_rope_layers = [
+            0 if layer_type == "full_attention" else 1 for layer_type in config.layer_types
+        ]
+    elif arch == "smollm3":
+        # llama.cpp does not serialize no_rope_layer_interval. SmolLM3 fixes it
+        # at four: every fourth layer skips RoPE.
+        config.no_rope_layers = [
+            0 if (layer_index + 1) % 4 == 0 else 1
+            for layer_index in range(config.num_hidden_layers)
+        ]
+
+    pattern = metadata.get(f"{arch}.attention.sliding_window_pattern")
+    if pattern is None:
+        return config
+    if arch == "olmo2":
+        raise ValueError(
+            "GGUF architecture olmo2 carries an attention.sliding_window_pattern "
+            "(OLMo3 semantics), but mobius's OLMo2 graph does not yet implement "
+            "per-layer sliding attention."
+        )
+    if not isinstance(pattern, (list, tuple, np.ndarray)):
+        raise TypeError(
+            f"GGUF metadata {arch}.attention.sliding_window_pattern must be a "
+            f"per-layer bool array, got {type(pattern).__name__}."
+        )
+    if len(pattern) != config.num_hidden_layers:
+        raise ValueError(
+            f"GGUF metadata {arch}.attention.sliding_window_pattern has "
+            f"{len(pattern)} entries for {config.num_hidden_layers} layers."
+        )
+    config.layer_types = [
+        "sliding_attention" if bool(is_sliding) else "full_attention" for is_sliding in pattern
+    ]
+    return config
+
+
 def _muse_glimmer_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -997,14 +2289,676 @@ def _muse_glimmer_qk_scale_factor(model: Any, default: float) -> float:
     return float(values[0])
 
 
-# Architecture-specific config postprocessors.
-# Each takes a base ArchitectureConfig + raw metadata and returns
-# an architecture-specific config subclass.
+def _base_model_fields(config: ArchitectureConfig, cls: type) -> dict[str, Any]:
+    """Copy only fields accepted by a recurrent BaseModelConfig subclass."""
+    return {
+        field.name: getattr(config, field.name)
+        for field in dataclasses.fields(cls)
+        if hasattr(config, field.name)
+    }
+
+
+def _mamba_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> MambaConfig:
+    """Build the Mamba config from llama.cpp's SSM metadata."""
+    del model
+    arch = "mamba"
+    if bool(metadata.get(f"{arch}.ssm.dt_b_c_rms")):
+        raise ValueError(
+            "mamba.ssm.dt_b_c_rms=true requires FalconMamba's extra B/C/dt norms, "
+            "which the pure Mamba graph does not implement"
+        )
+    fields = _base_model_fields(config, MambaConfig)
+    fields.update(
+        intermediate_size=int(metadata[f"{arch}.ssm.inner_size"]),
+        state_size=int(metadata[f"{arch}.ssm.state_size"]),
+        conv_kernel=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        time_step_rank=int(metadata[f"{arch}.ssm.time_step_rank"]),
+        layer_norm_epsilon=float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"]),
+        use_conv_bias=True,
+        expand=int(metadata[f"{arch}.ssm.inner_size"]) // config.hidden_size,
+    )
+    result = MambaConfig(**fields)
+    result.model_type = "mamba"
+    return result
+
+
+def _mamba2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> Mamba2Config:
+    """Build Mamba2 head/group geometry from pinned GGUF SSM metadata."""
+    del model
+    arch = "mamba2"
+    d_inner = int(metadata[f"{arch}.ssm.inner_size"])
+    num_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    n_groups = int(metadata[f"{arch}.ssm.group_count"])
+    if num_heads <= 0 or d_inner % num_heads:
+        raise ValueError(
+            f"{arch}.ssm.inner_size ({d_inner}) must be divisible by "
+            f"ssm.time_step_rank/head_count ({num_heads})"
+        )
+    if n_groups <= 0 or num_heads % n_groups or d_inner % n_groups:
+        raise ValueError(
+            f"{arch}.ssm.group_count ({n_groups}) must divide both head_count "
+            f"({num_heads}) and inner_size ({d_inner})"
+        )
+    fields = _base_model_fields(config, Mamba2Config)
+    fields.update(
+        intermediate_size=d_inner,
+        num_heads=num_heads,
+        head_dim=d_inner // num_heads,
+        state_size=int(metadata[f"{arch}.ssm.state_size"]),
+        n_groups=n_groups,
+        conv_kernel=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        expand=d_inner // config.hidden_size,
+        layer_norm_epsilon=float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"]),
+        use_conv_bias=True,
+        chunk_size=256,
+    )
+    result = Mamba2Config(**fields)
+    result.model_type = "mamba2"
+    return result
+
+
+def _falcon_h1_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> FalconH1Config:
+    """Build exact Falcon-H1 attention and Mamba2 geometry from pinned metadata."""
+    arch = "falcon-h1"
+    d_inner = int(metadata[f"{arch}.ssm.inner_size"])
+    num_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    n_groups = int(metadata[f"{arch}.ssm.group_count"])
+    key_dim = int(metadata[f"{arch}.attention.key_length"])
+    value_dim = int(metadata[f"{arch}.attention.value_length"])
+    if key_dim <= 0 or value_dim != key_dim:
+        raise ValueError(
+            "falcon-h1 requires equal positive attention key/value head dimensions"
+        )
+    if config.num_attention_heads * key_dim != config.hidden_size:
+        raise ValueError(
+            "falcon-h1 attention.head_count * attention.key_length must equal embedding_length"
+        )
+    if num_heads <= 0 or d_inner <= 0 or d_inner % num_heads:
+        raise ValueError(
+            "falcon-h1 ssm.time_step_rank must divide the positive ssm.inner_size"
+        )
+    if n_groups <= 0 or num_heads % n_groups or d_inner % n_groups:
+        raise ValueError(
+            "falcon-h1 ssm.group_count must divide both the SSM head count and inner size"
+        )
+
+    names = set(model.tensor_names) if model is not None else set()
+    layers = config.num_hidden_layers
+    conv_biases = {f"blk.{layer}.ssm_conv1d.bias" for layer in range(layers)}
+    ssm_norms = {f"blk.{layer}.ssm_norm.weight" for layer in range(layers)}
+    fields = _base_model_fields(config, FalconH1Config)
+    fields.update(
+        hidden_act="silu",
+        head_dim=key_dim,
+        mamba_d_ssm=d_inner,
+        mamba_n_heads=num_heads,
+        mamba_d_head=d_inner // num_heads,
+        mamba_n_groups=n_groups,
+        mamba_d_state=int(metadata[f"{arch}.ssm.state_size"]),
+        mamba_d_conv=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        mamba_expand=2,
+        mamba_chunk_size=256,
+        mamba_conv_bias=conv_biases.issubset(names),
+        mamba_proj_bias=False,
+        mamba_norm_before_gate=True,
+        mamba_rms_norm=ssm_norms.issubset(names),
+        attention_bias=config.attn_qkv_bias,
+        projectors_bias=False,
+        # The pinned converter folds every Falcon-H1 multiplier into its tensor.
+        embedding_multiplier=1.0,
+        lm_head_multiplier=1.0,
+        mlp_multipliers=(1.0, 1.0),
+        key_multiplier=1.0,
+        attention_in_multiplier=1.0,
+        attention_out_multiplier=1.0,
+        ssm_multipliers=(1.0, 1.0, 1.0, 1.0, 1.0),
+        ssm_in_multiplier=1.0,
+        ssm_out_multiplier=1.0,
+    )
+    result = FalconH1Config(**fields)
+    result.model_type = "falcon_h1"
+    return result
+
+
+def _plamo2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> Plamo2Config:
+    """Build PLaMo2 from its exact serialized schedule and tensor geometry."""
+    arch = "plamo2"
+    layers = config.num_hidden_layers
+    head_counts = tuple(int(value) for value in metadata[f"{arch}.attention.head_count"])
+    kv_head_counts = tuple(int(value) for value in metadata[f"{arch}.attention.head_count_kv"])
+    if len(head_counts) != layers or len(kv_head_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    if ssm_heads <= 0 or inner % ssm_heads:
+        raise ValueError("PLaMo2 SSM head count must divide ssm.inner_size")
+    if int(metadata[f"{arch}.ssm.group_count"]) != 0:
+        raise ValueError("PLaMo2 supports only ssm.group_count=0")
+
+    key_length = metadata.get(f"{arch}.attention.key_length")
+    value_length = metadata.get(f"{arch}.attention.value_length")
+    inferred: set[tuple[int, int]] = set()
+    if model is not None:
+        for layer, kv_heads in enumerate(kv_head_counts):
+            if kv_heads == 0:
+                continue
+            q_heads = head_counts[layer]
+            qkv_shape = model.get_tensor_shape(f"blk.{layer}.attn_qkv.weight")
+            output_shape = model.get_tensor_shape(f"blk.{layer}.attn_output.weight")
+            value_width, value_remainder = divmod(int(output_shape[1]), q_heads)
+            key_width, key_remainder = divmod(
+                int(qkv_shape[0]) - kv_heads * value_width,
+                q_heads + kv_heads,
+            )
+            if value_remainder or key_remainder or min(key_width, value_width) <= 0:
+                raise ValueError("PLaMo2 key/value widths cannot be inferred exactly")
+            inferred.add((key_width, value_width))
+    if inferred and len(inferred) != 1:
+        raise ValueError("PLaMo2 attention tensor shapes contradict across layers")
+    if inferred:
+        inferred_key, inferred_value = inferred.pop()
+        if key_length is not None and int(key_length) != inferred_key:
+            raise ValueError("PLaMo2 attention.key_length contradicts tensor shapes")
+        if value_length is not None and int(value_length) != inferred_value:
+            raise ValueError("PLaMo2 attention.value_length contradicts tensor shapes")
+        key_length = inferred_key
+        value_length = inferred_value
+    if key_length is None or value_length is None:
+        raise ValueError("PLaMo2 key/value widths require exact tensor-shape evidence")
+    key_length = int(key_length)
+    value_length = int(value_length)
+    if (
+        key_length != value_length
+        or key_length * config.num_attention_heads != config.hidden_size
+    ):
+        raise ValueError(
+            "PLaMo2 requires equal key/value widths and head_count * width == embedding_length"
+        )
+    if inner != ssm_heads * key_length:
+        raise ValueError(
+            "PLaMo2 ssm.inner_size must equal ssm.time_step_rank * attention key width"
+        )
+
+    fields = _base_model_fields(config, Plamo2Config)
+    fields.pop("layer_types", None)
+    fields.update(
+        hidden_act="silu",
+        head_dim=key_length,
+        # The released PLaMo2 converter wrote 1e6 here even though the pinned
+        # reference architecture uses its 1e4 local-RoPE default for every
+        # attention layer. Preserve other explicit bases for future variants.
+        rope_theta=(
+            10_000.0
+            if float(metadata[f"{arch}.rope.freq_base"]) == 1_000_000.0  # noqa: RUF069
+            else config.rope_theta
+        ),
+        attention_head_counts=head_counts,
+        attention_kv_head_counts=kv_head_counts,
+        mamba_num_heads=ssm_heads,
+        mamba_d_state=int(metadata[f"{arch}.ssm.state_size"]),
+        mamba_d_conv=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        mamba_dt_rank=max(64, config.hidden_size // 16),
+        mamba_group_count=0,
+        attention_window_size=min(config.max_position_embeddings, 2048),
+        use_predefined_initial_state=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+    )
+    result = Plamo2Config(**fields)
+    result.model_type = "plamo2"
+    return result
+
+
+def _validate_encoder_metadata(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    arch: str,
+) -> None:
+    """Validate metadata that changes an encoder's externally visible contract."""
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(
+            f"{arch} GGUF grouped-query attention is not supported: "
+            f"attention.head_count={config.num_attention_heads}, "
+            f"attention.head_count_kv={config.num_key_value_heads}"
+        )
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false for encoder import")
+    # llama_hparams defaults omitted pooling metadata to NONE.
+    pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
+    if pooling_type != 0:
+        raise ValueError(
+            f"{arch}.pooling_type={pooling_type} requests pooled/reranker output, but "
+            "Mobius currently exports token embeddings only (pooling_type=NONE/0)"
+        )
+    labels = metadata.get(f"{arch}.classifier.output_labels")
+    if labels:
+        raise ValueError(
+            f"{arch}.classifier.output_labels declares a classifier head, but the "
+            "feature-extraction graph exports token embeddings only"
+        )
+
+
+def _t5_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Apply the pinned llama.cpp T5 defaults and reject unrepresentable variants."""
+    arch = model.architecture
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{arch}.attention.head_count_kv", heads))
+    if heads <= 0 or kv_heads != heads:
+        raise ValueError(
+            f"{arch} requires multi-head attention with head_count_kv == head_count; "
+            f"got {kv_heads} and {heads}"
+        )
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    key_length = int(metadata.get(f"{arch}.attention.key_length", hidden // heads))
+    value_length = int(metadata.get(f"{arch}.attention.value_length", hidden // heads))
+    if key_length <= 0 or value_length != key_length:
+        raise ValueError(
+            f"{arch} requires equal positive attention key/value lengths; "
+            f"got key={key_length}, value={value_length}"
+        )
+    if int(metadata[f"{arch}.feed_forward_length"]) <= 0:
+        raise ValueError(f"{arch}.feed_forward_length must be greater than zero")
+
+    encoder_layers = int(metadata[f"{arch}.block_count"])
+    decoder_layers = (
+        int(metadata.get("t5.decoder_block_count", encoder_layers)) if arch == "t5" else None
+    )
+    names = set(model.tensor_names)
+    encoder_bias_layers = [
+        i for i in range(encoder_layers) if f"enc.blk.{i}.attn_rel_b.weight" in names
+    ]
+    decoder_bias_layers = (
+        [i for i in range(decoder_layers or 0) if f"dec.blk.{i}.attn_rel_b.weight" in names]
+        if arch == "t5"
+        else None
+    )
+    if not encoder_bias_layers or encoder_bias_layers[0] != 0:
+        raise ValueError(f"{arch} GGUF must contain enc.blk.0.attn_rel_b.weight")
+    if arch == "t5" and (not decoder_bias_layers or decoder_bias_layers[0] != 0):
+        raise ValueError("t5 GGUF must contain dec.blk.0.attn_rel_b.weight")
+
+    layer_prefixes = [
+        *(f"enc.blk.{i}" for i in range(encoder_layers)),
+        *(f"dec.blk.{i}" for i in range(decoder_layers or 0)),
+    ]
+    gated = [f"{prefix}.ffn_gate.weight" in names for prefix in layer_prefixes]
+    if any(gated) and not all(gated):
+        raise ValueError(
+            f"{arch} GGUF mixes gated and non-gated FFN layers; one global T5 "
+            "activation contract cannot represent that layout"
+        )
+    is_gated = bool(gated and gated[0])
+    if is_gated:
+        raise ValueError(
+            f"{arch} GGUF gated FFNs are ambiguous: the pinned converter does not "
+            "serialize feed_forward_proj or dense_act_fn, so identical metadata and "
+            "tensor shapes can represent gated-gelu, gated-silu, or other activations. "
+            "Pinned llama.cpp always executes these tensors as tanh-approximate GELU, "
+            "but Mobius cannot prove that this matches the source checkpoint."
+        )
+    return dataclasses.replace(
+        config,
+        head_dim=key_length,
+        num_key_value_heads=heads,
+        num_decoder_layers=decoder_layers,
+        hidden_act="relu",
+        is_gated_act=False,
+        scale_decoder_outputs=False,
+        relative_attention_max_distance=128,
+        encoder_relative_attention_bias_layers=encoder_bias_layers,
+        decoder_relative_attention_bias_layers=decoder_bias_layers,
+    )
+
+
+def _minimax_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> MiniMaxConfig:
+    """Restore the exact pinned MiniMax-01 GGUF execution contract."""
+    arch = model.architecture
+    head_dim = int(metadata[f"{arch}.attention.key_length"])
+    value_dim = int(metadata[f"{arch}.attention.value_length"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    residual_scale = float(metadata[f"{arch}.residual_scale"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    if head_dim <= 0 or value_dim != head_dim:
+        raise ValueError(
+            f"MiniMax-01 requires equal positive key/value lengths, got {head_dim}/{value_dim}"
+        )
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+        raise ValueError(
+            f"MiniMax-01 rope.dimension_count must be positive, even, and <= {head_dim}"
+        )
+    if not math.isfinite(residual_scale) or residual_scale <= 0:
+        raise ValueError("MiniMax-01 residual_scale must be finite and positive")
+    if experts <= 1 or not 1 <= top_k <= experts:
+        raise ValueError(
+            f"MiniMax-01 expert counts are invalid: expert_count={experts}, "
+            f"expert_used_count={top_k}"
+        )
+    if any(
+        key in metadata
+        for key in (
+            f"{arch}.expert_shared_count",
+            f"{arch}.expert_shared_feed_forward_length",
+        )
+    ):
+        raise ValueError("MiniMax-01 pinned GGUF does not support shared experts")
+
+    _, layer_types, _ = _derive_hybrid_layout(arch, metadata, model.tensor_names)
+    assert layer_types is not None
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="minimax",
+        head_dim=head_dim,
+        partial_rotary_factor=rope_dim / head_dim,
+        layer_types=layer_types,
+        hidden_act="silu",
+        norm_topk_prob=True,
+        disable_qmoe=True,
+        lightning_norm_eps=config.rms_norm_eps,
+        full_attn_alpha_factor=residual_scale,
+        full_attn_beta_factor=1.0,
+        linear_attn_alpha_factor=residual_scale,
+        linear_attn_beta_factor=1.0,
+        mlp_alpha_factor=residual_scale,
+        mlp_beta_factor=1.0,
+    )
+    return MiniMaxConfig(**fields)
+
+
+def _kimi_linear_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> KimiLinearConfig:
+    """Restore the pinned llama.cpp Kimi Linear configuration."""
+    arch = model.architecture
+    _, layer_types, mtp_count = _derive_hybrid_layout(arch, metadata, model.tensor_names)
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("Kimi Linear GGUF does not support appended NextN blocks")
+    gating = int(metadata[f"{arch}.expert_gating_func"])
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kda_dim = int(metadata[f"{arch}.kda.head_dim"])
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    extra_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    if qk_dim <= extra_dim:
+        raise ValueError("Kimi Linear MLA key length must exceed the nominal extra-key width")
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="kimi_linear",
+        num_key_value_heads=1,
+        head_dim=qk_dim,
+        qk_nope_head_dim=qk_dim - extra_dim,
+        qk_rope_head_dim=extra_dim,
+        v_head_dim=int(metadata[f"{arch}.attention.value_length_mla"]),
+        kv_lora_rank=int(metadata[f"{arch}.attention.kv_lora_rank"]),
+        intermediate_size=int(metadata[f"{arch}.feed_forward_length"]),
+        moe_intermediate_size=int(metadata[f"{arch}.expert_feed_forward_length"]),
+        n_shared_experts=int(metadata[f"{arch}.expert_shared_count"]),
+        first_k_dense_replace=int(metadata[f"{arch}.leading_dense_block_count"]),
+        layer_types=layer_types,
+        linear_num_key_heads=heads,
+        linear_num_value_heads=heads,
+        linear_key_head_dim=kda_dim,
+        linear_value_head_dim=kda_dim,
+        linear_conv_kernel_dim=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        hidden_act="silu",
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        disable_qmoe=True,
+        q_lora_rank=None,
+        rope_type=None,
+        rope_theta=None,
+        rope_scaling=None,
+        partial_rotary_factor=None,
+    )
+    return KimiLinearConfig(**fields)
+
+
+def _kimi_k3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> KimiK3Config:
+    """Restore the exact pinned llama.cpp Kimi-K3 text configuration."""
+    arch = model.architecture
+    _, layer_types, mtp_count = _derive_hybrid_layout(arch, metadata, model.tensor_names)
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("Kimi-K3 GGUF does not support appended NextN blocks")
+    gating = int(metadata[f"{arch}.expert_gating_func"])
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kda_dim = int(metadata[f"{arch}.kda.head_dim"])
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    extra_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    if qk_dim <= extra_dim:
+        raise ValueError("Kimi-K3 MLA key length must exceed the nominal extra-key width")
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="kimi_k3",
+        num_key_value_heads=1,
+        head_dim=qk_dim,
+        q_lora_rank=int(metadata[f"{arch}.attention.q_lora_rank"]),
+        qk_nope_head_dim=qk_dim - extra_dim,
+        qk_rope_head_dim=extra_dim,
+        v_head_dim=int(metadata[f"{arch}.attention.value_length_mla"]),
+        kv_lora_rank=int(metadata[f"{arch}.attention.kv_lora_rank"]),
+        intermediate_size=int(metadata[f"{arch}.feed_forward_length"]),
+        moe_intermediate_size=int(metadata[f"{arch}.expert_feed_forward_length"]),
+        n_shared_experts=int(metadata.get(f"{arch}.expert_shared_count", 0)),
+        first_k_dense_replace=int(metadata.get(f"{arch}.leading_dense_block_count", 0)),
+        routed_scaling_factor=float(metadata.get(f"{arch}.expert_weights_scale", 0.0)),
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm")),
+        layer_types=layer_types,
+        linear_num_key_heads=heads,
+        linear_num_value_heads=heads,
+        linear_key_head_dim=kda_dim,
+        linear_value_head_dim=kda_dim,
+        linear_conv_kernel_dim=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        linear_gate_lower_bound=-float(
+            metadata.get(f"{arch}.kda.gate_lower_bound", -math.inf)
+        ),
+        linear_use_full_rank_gate=True,
+        routed_expert_hidden_size=int(
+            metadata.get(f"{arch}.expert_latent_length", config.hidden_size)
+        ),
+        attn_res_block_size=int(metadata.get(f"{arch}.attn_res.block_size", 0)),
+        latent_moe_use_norm=True,
+        mla_use_output_gate=True,
+        activation_situ_beta=float(metadata.get(f"{arch}.activation.situ_beta", 1.0)),
+        activation_situ_linear_beta=float(
+            metadata.get(f"{arch}.activation.situ_linear_beta", 0.0)
+        ),
+        hidden_act="situ",
+        n_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        disable_qmoe=True,
+        tie_word_embeddings=False,
+        rope_type=None,
+        rope_theta=None,
+        rope_scaling=None,
+        partial_rotary_factor=None,
+    )
+    return KimiK3Config(**fields)
+
+
+def _bert_encoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Apply pinned BERT defaults and tokenizer-owned token-type metadata."""
+    _validate_encoder_metadata(config, metadata, "bert")
+    token_types = metadata.get("tokenizer.ggml.token_type_count")
+    if token_types is None or int(token_types) <= 0:
+        raise ValueError(
+            "BERT GGUF requires tokenizer.ggml.token_type_count > 0 for token-type embeddings"
+        )
+    config.type_vocab_size = int(token_types)
+    config.hidden_act = "gelu"
+    config.rope_type = None
+    config.attn_qkv_bias = _infer_attn_qkv_bias(model)
+    config.attn_o_bias = _infer_attn_o_bias(model)
+    config.mlp_bias = _infer_mlp_bias(model)
+    return config
+
+
+def _modern_bert_encoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Apply pinned ModernBERT bias-free GeGLU/RoPE semantics."""
+    _validate_encoder_metadata(config, metadata, "modern-bert")
+    del model
+    sliding_window = int(metadata.get("modern-bert.attention.sliding_window", 0))
+    if sliding_window:
+        raise ValueError(
+            "modern-bert GGUF requests symmetric sliding-window attention "
+            f"(window={sliding_window}), which the current encoder graph does not implement"
+        )
+    config.type_vocab_size = 0
+    config.hidden_act = config.hidden_act or "gelu"
+    config.attn_qkv_bias = False
+    config.attn_o_bias = False
+    config.mlp_bias = False
+    return config
+
+
+def _dflash_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> DFlashConfig:
+    from mobius._configs import DFlashConfig
+
+    # The pinned Qwen converter serializes layer-input indices (HF output index + 1).
+    # Mobius consumes decoder-layer outputs, so normalize back to zero-based ids.
+    target_layers = [int(value) - 1 for value in metadata["dflash.target_layers"]]
+    raw_shapes = {name: shape for name, _raw, _qtype, shape in model.tensor_items_raw()}
+    draft_vocab = (
+        int(raw_shapes["d2t"][0])
+        if "d2t" in raw_shapes
+        else len(metadata.get("tokenizer.ggml.tokens", ()))
+    )
+    fields = {field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
+    fields.update(
+        model_type="DFlashDraftModel",
+        vocab_size=len(metadata.get("tokenizer.ggml.tokens", ())),
+        target_layer_ids=target_layers,
+        block_size=int(metadata["dflash.block_size"]),
+        num_target_layers=None,
+        draft_vocab_size=draft_vocab,
+        use_draft_lm_head="output.weight" in model.tensor_names,
+    )
+    return DFlashConfig(**fields)
+
+
+def _eagle3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> Eagle3Config:
+    from mobius._configs import Eagle3Config
+
+    target_layers = [int(value) for value in metadata["eagle3.target_layers"]]
+    raw_shapes = {name: shape for name, _raw, _qtype, shape in model.tensor_items_raw()}
+    target_vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    draft_vocab = int(raw_shapes["d2t"][0]) if "d2t" in raw_shapes else target_vocab
+    fields = {field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
+    fields.update(
+        model_type="Eagle3DraftModel",
+        vocab_size=target_vocab,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        draft_vocab_size=draft_vocab,
+        target_hidden_size=int(metadata["eagle3.target_hidden_size"]),
+        target_layer_ids=target_layers,
+        norm_before_residual=bool(metadata.get("eagle3.norm_before_residual")),
+        norm_before_fc=bool(metadata.get("eagle3.norm_before_fc")),
+        fc_norm=False,
+        use_target_lm_head="output.weight" not in model.tensor_names,
+    )
+    return Eagle3Config(**fields)
+
+
+# Architecture-specific config postprocessors, keyed by the name a
+# :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
+# + raw metadata and returns an architecture-specific config subclass.
+#
+# Keyed by postprocessor name rather than by ``model_type``: the old
+# model_type keying is what let the Gemma weight processor drift out of reach
+# when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "dflash": _dflash_postprocess,
+    "eagle3": _eagle3_postprocess,
+    "dream": _dream_postprocess,
+    "llada": _llada_postprocess,
+    "llada_moe": _llada_moe_postprocess,
+    "rnd1": _rnd1_postprocess,
+    "olmo": _olmo_postprocess,
+    "moe": _moe_postprocess,
+    "granitemoe": _granitemoe_postprocess,
+    "phimoe": _phimoe_postprocess,
+    "dense_sliding": _dense_sliding_postprocess,
     "gemma2": _gemma2_postprocess,
-    "gemma3_text": _gemma3_postprocess,
-    "gemma4_text": _gemma4_postprocess,
-    "muse_glimmer_text": _muse_glimmer_postprocess,
+    "baichuan": _baichuan_postprocess,
+    "chatglm": _chatglm_postprocess,
+    "phi2": _phi2_postprocess,
+    "seed_oss": _seed_oss_postprocess,
+    "gemma3": _gemma3_postprocess,
+    "gemma4": _gemma4_postprocess,
+    "muse_glimmer": _muse_glimmer_postprocess,
+    "mamba": _mamba_postprocess,
+    "mamba2": _mamba2_postprocess,
+    "falcon_h1": _falcon_h1_postprocess,
+    "plamo2": _plamo2_postprocess,
+    "jamba": _jamba_postprocess,
+    "lfm2moe": _lfm2moe_postprocess,
+    "nemotron_h": _nemotron_h_postprocess,
+    "nemotron_h_moe": _nemotron_h_postprocess,
+    "granitehybrid": _granitehybrid_postprocess,
+    "bert_encoder": _bert_encoder_postprocess,
+    "modern_bert_encoder": _modern_bert_encoder_postprocess,
+    "t5": _t5_postprocess,
+    "minimax": _minimax_postprocess,
+    "kimi_linear": _kimi_linear_postprocess,
+    "kimi_k3": _kimi_k3_postprocess,
 }
 
 
@@ -1017,7 +2971,9 @@ def _default_activation(model_type: str) -> str:
     if model_type.startswith("gemma"):
         return "gelu_pytorch_tanh"
     # Most modern models use SiLU/Swish
-    gelu_models = {"gpt2", "bloom", "starcoder2", "t5"}
+    if model_type == "arcee":
+        return "relu2"
+    gelu_models = {"bert", "gpt2", "bloom", "modernbert", "starcoder2", "t5"}
     if model_type in gelu_models:
         return "gelu"
     return "silu"

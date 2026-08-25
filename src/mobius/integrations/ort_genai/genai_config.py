@@ -15,6 +15,13 @@ import json
 import os
 from typing import Any
 
+_SPECIALIZED_DECODER_MODEL_TYPES = {
+    "gpt2": "gpt2",
+    "lfm2": "lfm2",
+    "lfm2_vl": "lfm2",
+}
+_LONGROPE_DECODER_MODEL_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
+
 
 def _default_decoder_inputs(
     *,
@@ -138,8 +145,10 @@ class GenaiConfigGenerator:
     and assembles the nested dict structure that ORT-GenAI expects.
 
     Args:
-        model_type: The ORT-GenAI model type string (e.g. ``"qwen2"``,
-            ``"llama"``, ``"qwen2_5_vl"``).
+        model_type: The source architecture or specialized ORT-GenAI model type.
+            Decoder-only configs emit ``"decoder"`` unless this value identifies
+            a runtime-specific state ABI, or LongRoPE is explicitly requested.
+            Multimodal configs retain the supplied pipeline type.
         vocab_size: Model vocabulary size.
         hidden_size: Decoder hidden dimension.
         num_hidden_layers: Number of decoder transformer layers.
@@ -161,6 +170,12 @@ class GenaiConfigGenerator:
             :func:`_default_decoder_inputs`. Must already include KV
             cache template entries (``past_key_names``,
             ``past_value_names``).
+        decoder_outputs: Explicit decoder output mapping derived from the
+            graph, including logits and present-cache templates.
+        uses_longrope: Preserve a Phi-3-family specialized type because the
+            runtime must recompute LongRoPE caches across the context threshold.
+        has_specialized_topology: Preserve the supplied type for packages with
+            auxiliary graphs or runtime-managed pipelines.
     """
 
     def __init__(
@@ -179,11 +194,15 @@ class GenaiConfigGenerator:
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
+        decoder_outputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
         decoder_graph_capture: bool | None = None,
         layer_types: list[str] | None = None,
         conv_cache_size: int | None = None,
+        sliding_window: dict[str, Any] | None = None,
+        uses_longrope: bool = False,
+        has_specialized_topology: bool = False,
     ):
         self.model_type = model_type
         self.vocab_size = vocab_size
@@ -200,6 +219,7 @@ class GenaiConfigGenerator:
 
         # Explicit decoder inputs (from graph introspection); None -> use defaults
         self._decoder_inputs = decoder_inputs
+        self._decoder_outputs = decoder_outputs
         # Explicit decoder filename; None -> use "model.onnx"
         self._decoder_filename = decoder_filename
         # Whether the exported decoder ONNX graph supports in-place KV-cache
@@ -211,6 +231,9 @@ class GenaiConfigGenerator:
         self._decoder_graph_capture = decoder_graph_capture
         self._layer_types = layer_types
         self._conv_cache_size = conv_cache_size
+        self._sliding_window = sliding_window
+        self._uses_longrope = uses_longrope
+        self._has_specialized_topology = has_specialized_topology
 
         # Optional VLM fields (set via with_vision())
         self._vision: dict[str, Any] | None = None
@@ -236,9 +259,12 @@ class GenaiConfigGenerator:
         eos_token_id: int | list[int] | None = None,
         pad_token_id: int | None = None,
         decoder_inputs: dict[str, str] | None = None,
+        decoder_outputs: dict[str, str] | None = None,
         decoder_filename: str | None = None,
         supports_in_place_kv_cache: bool | None = None,
         num_cache_layer_slots: int | None = None,
+        sliding_window: dict[str, Any] | None = None,
+        has_specialized_topology: bool = False,
     ) -> GenaiConfigGenerator:
         """Create a generator from a BaseModelConfig-like dataclass.
 
@@ -284,6 +310,7 @@ class GenaiConfigGenerator:
             eos_token_id=eos_token_id,
             pad_token_id=pad,
             decoder_inputs=decoder_inputs,
+            decoder_outputs=decoder_outputs,
             decoder_filename=decoder_filename,
             supports_in_place_kv_cache=supports_in_place_kv_cache,
             layer_types=getattr(config, "layer_types", None),
@@ -292,6 +319,12 @@ class GenaiConfigGenerator:
                 if hasattr(config, "short_conv_kernel")
                 else None
             ),
+            sliding_window=sliding_window,
+            uses_longrope=(
+                model_type in _LONGROPE_DECODER_MODEL_TYPES
+                and getattr(config, "rope_type", None) == "longrope"
+            ),
+            has_specialized_topology=has_specialized_topology,
         )
 
     def with_vision(
@@ -514,6 +547,14 @@ class GenaiConfigGenerator:
     def generate(self) -> dict[str, Any]:
         """Generate the full genai_config.json dict."""
         is_multimodal = self._vision is not None or self._audio is not None
+        if is_multimodal or self._has_specialized_topology:
+            emitted_model_type = self.model_type
+        elif self.model_type in _SPECIALIZED_DECODER_MODEL_TYPES:
+            emitted_model_type = _SPECIALIZED_DECODER_MODEL_TYPES[self.model_type]
+        elif self.model_type in _LONGROPE_DECODER_MODEL_TYPES and self._uses_longrope:
+            emitted_model_type = self.model_type
+        else:
+            emitted_model_type = "decoder"
 
         # Decoder section — use explicit inputs when available (from
         # graph introspection), otherwise fall back to defaults.
@@ -531,7 +572,11 @@ class GenaiConfigGenerator:
             "head_size": self.head_dim,
             "hidden_size": self.hidden_size,
             "inputs": decoder_inputs,
-            "outputs": _default_decoder_outputs(),
+            "outputs": (
+                dict(self._decoder_outputs)
+                if self._decoder_outputs is not None
+                else _default_decoder_outputs()
+            ),
             "num_attention_heads": self.num_attention_heads,
             "num_hidden_layers": self.num_hidden_layers,
             "num_key_value_heads": self.num_key_value_heads,
@@ -541,12 +586,14 @@ class GenaiConfigGenerator:
             decoder["conv_cache_size"] = (
                 self._conv_cache_size if self._conv_cache_size is not None else 3
             )
-            decoder["inputs"]["past_conv_names"] = "past_key_values.%d.conv_state"
-            decoder["outputs"]["present_conv_names"] = "present.%d.conv_state"
+            decoder["inputs"].setdefault("past_conv_names", "past_key_values.%d.conv_state")
+            decoder["outputs"].setdefault("present_conv_names", "present.%d.conv_state")
+        if self._sliding_window is not None:
+            decoder["sliding_window"] = self._sliding_window
 
         # Model section
         model: dict[str, Any] = {
-            "type": self.model_type,
+            "type": emitted_model_type,
             "vocab_size": self.vocab_size,
             "context_length": self.context_length,
             "decoder": decoder,

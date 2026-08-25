@@ -182,8 +182,6 @@ _SEMANTIC_IDS: dict[tuple[str, int], str] = {
     ("qwen3_next", 0): "qwen3_next_hybrid",
     ("qwen3_next", 1): "qwen3_next_all_full_attn",
     ("qwen3_next", 2): "qwen3_next_all_linear_attn",
-    ("falcon_h1", 0): "falcon_h1_alibi",
-    ("falcon_h1", 1): "falcon_h1_parallel_attn",
     ("jamba", 0): "jamba_hybrid_moe",
     ("jamba", 1): "jamba_all_attention",
     ("bamba", 0): "bamba_hybrid",
@@ -251,12 +249,17 @@ class TestBuildGraph:
         # Check expected inputs exist
         input_names = {inp.name for inp in model.graph.inputs}
         assert "input_ids" in input_names
-        assert "attention_mask" in input_names
-        assert "position_ids" in input_names
 
         # Check outputs include logits and KV cache
         output_names = {out.name for out in model.graph.outputs}
         assert "logits" in output_names
+        if task_name == "masked-diffusion":
+            assert input_names == {"input_ids"}
+            assert output_names == {"logits", "proposed_tokens"}
+            return
+
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
 
         # Check KV cache / hybrid cache outputs.  Models whose trailing layers
         # borrow K,V from an earlier layer (Gemma 3n's num_kv_shared_layers)
@@ -281,12 +284,23 @@ class TestBuildGraph:
                 assert f"present.{i}.recurrent_state" in output_names, (
                     f"Missing present.{i}.recurrent_state"
                 )
+            elif ltype in ("kimi_linear_attention", "kimi_k3_attention"):
+                for state_name in (
+                    "q_conv_state",
+                    "k_conv_state",
+                    "v_conv_state",
+                    "recurrent_state",
+                ):
+                    assert f"present.{i}.{state_name}" in output_names, (
+                        f"Missing present.{i}.{state_name}"
+                    )
             elif ltype in ("mamba", "mamba2"):
                 assert f"present.{i}.conv_state" in output_names, (
                     f"Missing present.{i}.conv_state"
                 )
-                assert f"present.{i}.ssm_state" in output_names, (
-                    f"Missing present.{i}.ssm_state"
+                state_name = "recurrent_state" if model_type == "plamo2" else "ssm_state"
+                assert f"present.{i}.{state_name}" in output_names, (
+                    f"Missing present.{i}.{state_name}"
                 )
             elif ltype == "conv":
                 assert f"present.{i}.conv_state" in output_names, (
@@ -315,7 +329,11 @@ class TestBuildGraph:
             for n in init_names
         )
         has_attn = any(
-            "self_attn" in n or "self_attention" in n or "attention" in n or ".attn." in n
+            "self_attn" in n
+            or "self_attention" in n
+            or "attention" in n
+            or ".attn." in n
+            or "qkv_proj" in n
             for n in init_names
         )
         has_mlp = any("mlp" in n or "expert" in n or "feed_forward" in n for n in init_names)
@@ -915,6 +933,50 @@ class TestBuildGraphQuantized:
         module = registry.get("glm4_moe")(self._shared_moe_config("glm4_moe", qc))
         layer = module.model.layers[0]
         assert type(layer.mlp.shared_expert.down_proj).__name__ == "QuantizedLinear"
+
+    def test_qwen3_moe_olive_int4_emits_qmoe_and_matmulnbits(self):
+        """Olive-int4 Qwen3-MoE fuses routed experts into QMoE, attention into MatMulNBits.
+
+        Graph/parameter-ABI check only — no weights are loaded and
+        ``preprocess_weights`` is not exercised here (see
+        ``src/mobius/models/moe_test.py`` for the state-dict side). It pins the
+        shapes the fused expert path *expects*: one ``com.microsoft::QMoE`` per
+        layer with expert-major ``[experts, 2*moe_inter, hidden*bits/8]``
+        weights, plus MatMulNBits for the four quantized attention projections.
+        """
+        from mobius._configs import QuantizationConfig
+
+        qc = QuantizationConfig(bits=4, group_size=32, quant_method="olive", sym=True)
+        config = self._shared_moe_config("qwen3_moe", qc)
+        module = registry.get("qwen3_moe")(config)
+        pkg = CausalLMTask().build(module, config)
+        model = pkg["model"]
+
+        qmoe = [n for n in model.graph if n.op_type == "QMoE"]
+        nbits = [n for n in model.graph if n.op_type == "MatMulNBits"]
+        assert len(qmoe) == 1, f"routed experts must fuse to one QMoE, got {len(qmoe)}"
+        assert len(nbits) == 4, f"attention q/k/v/o must emit 4 MatMulNBits, got {len(nbits)}"
+
+        initializers = model.graph.initializers
+        experts = config.num_local_experts
+        assert tuple(initializers["model.layers.0.mlp.fc1_experts_weights"].shape) == (
+            experts,
+            2 * config.moe_intermediate_size,
+            config.hidden_size * qc.bits // 8,
+        )
+        assert tuple(initializers["model.layers.0.mlp.fc2_experts_weights"].shape) == (
+            experts,
+            config.hidden_size,
+            config.moe_intermediate_size * qc.bits // 8,
+        )
+        assert tuple(initializers["model.layers.0.mlp.fc1_scales"].shape) == (
+            experts,
+            2 * config.moe_intermediate_size,
+            config.hidden_size // qc.group_size,
+        )
+        # Symmetric quantization carries no zero points for the routed experts.
+        moe_initializers = [n for n in initializers if n.startswith("model.layers.0.mlp.")]
+        assert not any("zero_point" in name for name in moe_initializers)
 
 
 class TestBuildGraphVisionLanguage:
@@ -5756,10 +5818,8 @@ class TestBuildJambaGraph:
             expert_layer_offset=1,
             num_local_experts=2,
             num_experts_per_tok=1,
-            # Jamba's attention layers use standard RoPE; enable it
-            # explicitly since ArchitectureConfig defaults ``rope_type`` to
-            # ``None`` (NoPE) to express "no RoPE" structurally.
-            rope_type="default",
+            # Jamba attention is positional-encoding-free.
+            rope_type=None,
         )
 
     def test_jamba_builds(self):
@@ -5820,6 +5880,85 @@ class TestBuildJambaGraph:
         model_cls = registry.get("jamba")
         assert model_cls.__name__ == "JambaCausalLMModel"
 
+    def test_jamba_transformers_config_uses_exact_schedules(self):
+        """Transformers periods resolve without duplicate inherited fields."""
+        from transformers import JambaConfig as HFJambaConfig
+
+        from mobius._configs import JambaConfig
+
+        config = JambaConfig.from_transformers(
+            HFJambaConfig(
+                vocab_size=TINY_VOCAB,
+                hidden_size=TINY_HIDDEN,
+                intermediate_size=TINY_INTERMEDIATE,
+                num_hidden_layers=4,
+                num_attention_heads=TINY_HEADS,
+                num_key_value_heads=TINY_KV_HEADS,
+                attn_layer_period=2,
+                attn_layer_offset=1,
+                expert_layer_period=2,
+                expert_layer_offset=1,
+                num_experts=2,
+                num_experts_per_tok=1,
+                mamba_d_state=8,
+                mamba_d_conv=4,
+                mamba_expand=2,
+                mamba_dt_rank="auto",
+            )
+        )
+        assert config.layer_types == [
+            "mamba",
+            "full_attention",
+            "mamba",
+            "full_attention",
+        ]
+        assert config.expert_layer_indices == [1, 3]
+        assert config.mamba_dt_rank == (TINY_HIDDEN + 15) // 16
+        assert config.rope_type is None
+        assert config.norm_topk_prob is False
+
+    def test_jamba_router_softmaxes_in_float32(self):
+        """Jamba routes with a full-expert float32 softmax before top-k."""
+        import dataclasses
+
+        import onnx_ir as ir
+
+        from mobius._builder import build_from_module
+        from mobius.models.jamba import JambaCausalLMModel
+        from mobius.tasks import HybridCausalLMTask
+
+        config = dataclasses.replace(self._jamba_config(), dtype=ir.DataType.FLOAT16)
+        model = build_from_module(
+            JambaCausalLMModel(config),
+            config,
+            task=HybridCausalLMTask(),
+        )["model"]
+        softmaxes = [node for node in model.graph if node.op_type == "Softmax"]
+        assert softmaxes
+        for softmax in softmaxes:
+            assert softmax.inputs[0].producer().op_type == "Cast"
+
+    def test_jamba_low_precision_state_matches_model_dtype(self):
+        """The public recurrent ABI matches Transformers cache storage dtype."""
+        import dataclasses
+
+        import onnx_ir as ir
+
+        from mobius._builder import build_from_module
+        from mobius.models.jamba import JambaCausalLMModel
+        from mobius.tasks import HybridCausalLMTask
+
+        config = dataclasses.replace(self._jamba_config(), dtype=ir.DataType.FLOAT16)
+        model = build_from_module(
+            JambaCausalLMModel(config),
+            config,
+            task=HybridCausalLMTask(),
+        )["model"]
+        inputs = {value.name: value for value in model.graph.inputs}
+        outputs = {value.name: value for value in model.graph.outputs}
+        assert inputs["past_key_values.0.ssm_state"].dtype == ir.DataType.FLOAT16
+        assert outputs["present.0.ssm_state"].dtype == ir.DataType.FLOAT16
+
     def test_jamba_preprocess_weights_moe_renames(self):
         """Verify MoE expert weight renames and SSM nesting."""
         import torch
@@ -5851,6 +5990,42 @@ class TestBuildJambaGraph:
         # Non-SSM stays flat
         assert "model.layers.0.mamba.in_proj.weight" in result
 
+    def test_jamba_preprocesses_fused_experts_in_numeric_order(self):
+        """Current Transformers stacks every expert in one fused parameter."""
+        import torch
+
+        from mobius.models.jamba import JambaCausalLMModel
+
+        module = JambaCausalLMModel(self._jamba_config())
+        gate_up = torch.stack(
+            [
+                torch.full((2 * TINY_INTERMEDIATE, TINY_HIDDEN), expert + 1.0)
+                for expert in range(2)
+            ]
+        )
+        down = torch.stack(
+            [torch.full((TINY_HIDDEN, TINY_INTERMEDIATE), expert + 3.0) for expert in range(2)]
+        )
+        result = module.preprocess_weights(
+            {
+                "model.layers.1.feed_forward.experts.gate_up_proj.weight": gate_up,
+                "model.layers.1.feed_forward.experts.down_proj.weight": down,
+            }
+        )
+        for expert in range(2):
+            torch.testing.assert_close(
+                result[f"model.layers.1.feed_forward.experts.{expert}.gate_proj.weight"],
+                torch.full((TINY_INTERMEDIATE, TINY_HIDDEN), expert + 1.0),
+            )
+            torch.testing.assert_close(
+                result[f"model.layers.1.feed_forward.experts.{expert}.up_proj.weight"],
+                torch.full((TINY_INTERMEDIATE, TINY_HIDDEN), expert + 1.0),
+            )
+            torch.testing.assert_close(
+                result[f"model.layers.1.feed_forward.experts.{expert}.down_proj.weight"],
+                torch.full((TINY_HIDDEN, TINY_INTERMEDIATE), expert + 3.0),
+            )
+
 
 # ===========================================================================
 # Registry completeness
@@ -5859,6 +6034,8 @@ class TestBuildJambaGraph:
 # Model types exercised by non-parametrized test classes above (VLM,
 # whisper, audio, TTS, diffusion, etc.).  Keep sorted for readability.
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
+    # T5 encoder-only hidden-state contract (co-located models/t5_test.py).
+    "t5encoder",
     # LLaDA masked-diffusion LM (co-located src/mobius/models/llada_test.py):
     # bidirectional Llama backbone with a masked-diffusion task, so it has no
     # attention_mask / KV cache and does not fit the generic causal-LM harness.
@@ -5970,7 +6147,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # inputs_embeds + the target's hidden_states instead of input_ids;
     # borrows the target's embed/lm_head), so the generic
     # ALL_CAUSAL_LM_CONFIGS matrix can't drive it. Covered by
-    # src/mobius/models/_qwen35_mtp_test.py.
+    # src/mobius/models/_qwen35_mtp_test.py and the registered dense-qwen35
+    # GGUF capability in src/mobius/integrations/gguf/_mtp_test.py.
     "Qwen35MtpModel",
     # EAGLE-3 drafter: bespoke IO contract (inputs_embeds, fused_hidden,
     # recycled_hidden and draft-vocab logits). Covered by _eagle3_test.py.

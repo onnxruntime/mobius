@@ -19,8 +19,10 @@ Two properties are asserted:
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -28,7 +30,15 @@ import torch
 
 from mobius._configs import ArchitectureConfig
 from mobius.integrations._weight_loading import apply_weights
-from mobius.models.llada import LLaDAModel
+from mobius.models.llada import (
+    DreamConfig,
+    DreamModel,
+    LLaDAModel,
+    LLaDAMoEConfig,
+    LLaDAMoEModel,
+    RND1Config,
+    RND1Model,
+)
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 
 
@@ -55,6 +65,79 @@ def _make_config() -> ArchitectureConfig:
         rope_type="default",
         rope_theta=500000.0,
     )
+
+
+def _official_hf_config(model_type: str, **overrides):
+    values = {
+        "model_type": model_type,
+        "vocab_size": 256,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 128,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10_000.0,
+        "tie_word_embeddings": False,
+        "pad_token_id": 0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_official_transformers_aliases_and_config_fields():
+    from mobius.integrations.transformers._builder import _resolve_module_class
+
+    dream = DreamConfig.from_transformers(_official_hf_config("Dream", mask_token_id=255))
+    assert dream.attn_qkv_bias is True
+    assert dream.mask_token_id == 255
+    assert dream.diffusion_shift_logits is True
+
+    llada_moe = LLaDAMoEConfig.from_transformers(
+        _official_hf_config(
+            "llada",
+            architectures=["LLaDAMoEModel"],
+            num_experts=8,
+            num_experts_per_tok=2,
+            expert_intermediate_size=32,
+            qk_layernorm=True,
+            norm_topk_prob=None,
+        )
+    )
+    assert llada_moe.moe_intermediate_size == 32
+    assert llada_moe.attn_qk_norm is True
+    assert llada_moe.norm_topk_prob is False
+
+    rnd1 = RND1Config.from_transformers(
+        _official_hf_config(
+            "rnd1",
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+        )
+    )
+    assert rnd1.attn_qk_norm is True
+    assert rnd1.norm_topk_prob is True
+
+    module_class, _, resolved_type = _resolve_module_class(
+        "llada",
+        SimpleNamespace(architectures=["LLaDAMoEModel"]),
+        None,
+        None,
+    )
+    assert module_class is LLaDAMoEModel
+    assert resolved_type == "LLaDAMoEModel"
+
+    module_class, _, resolved_type = _resolve_module_class(
+        "Dream",
+        SimpleNamespace(architectures=["DreamModel"]),
+        None,
+        None,
+    )
+    assert module_class is DreamModel
+    assert resolved_type == "Dream"
 
 
 def _random_llada_weights(config: ArchitectureConfig) -> dict[str, torch.Tensor]:
@@ -214,6 +297,66 @@ def test_llada_attention_is_bidirectional():
     # leave every position before the perturbation untouched.
     earlier_delta = np.abs(base[0, 0] - perturbed[0, 0]).max()
     assert earlier_delta > 1e-4, f"earlier position unchanged (Δ={earlier_delta})"
+
+
+def test_shifted_diffusion_logits_follow_llama_cpp_alignment():
+    config = _make_config()
+    state = _random_llada_weights(config)
+    unshifted = _build_onnx_session(config, state)
+    shifted = _build_onnx_session(
+        dataclasses.replace(config, diffusion_shift_logits=True),
+        state,
+    )
+    input_ids = np.array([[3, 7, 1, 9, 4, 2]], dtype=np.int64)
+
+    raw_logits = unshifted.run(None, {"input_ids": input_ids})[0]
+    shifted_logits = shifted.run(None, {"input_ids": input_ids})[0]
+
+    np.testing.assert_array_equal(shifted_logits[:, 0], raw_logits[:, 0])
+    np.testing.assert_array_equal(shifted_logits[:, 1:], raw_logits[:, :-1])
+
+
+@pytest.mark.parametrize(
+    ("model_class", "norm_topk_prob"),
+    [(LLaDAMoEModel, False), (RND1Model, True)],
+)
+def test_diffusion_moe_graph_executes_without_cache(model_class, norm_topk_prob):
+    import onnx_ir as ir
+    import onnxruntime as ort
+
+    from mobius.rewrite_rules._testing_utils import fill_random_weights
+
+    config = dataclasses.replace(
+        _make_config(),
+        num_hidden_layers=1,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        attn_qk_norm=True,
+        norm_topk_prob=norm_topk_prob,
+    )
+    module = model_class(config)
+    model = MaskedDiffusionTask().build(module, config)["model"]
+    fill_random_weights(model)
+
+    assert module.model.layers[0].mlp.gate.norm_topk_prob is norm_topk_prob
+    assert [value.name for value in model.graph.inputs] == ["input_ids"]
+    assert not any(
+        token in value.name
+        for value in (*model.graph.inputs, *model.graph.outputs)
+        for token in ("past", "present", "cache")
+    )
+
+    session = ort.InferenceSession(
+        ir.serde.serialize_model(model).SerializeToString(),
+        providers=["CPUExecutionProvider"],
+    )
+    logits, proposed = session.run(
+        None, {"input_ids": np.array([[3, 7, 1, 9]], dtype=np.int64)}
+    )
+    assert logits.shape == (1, 4, config.vocab_size)
+    assert proposed.shape == (1, 4)
+    assert np.isfinite(logits).all()
 
 
 def test_llada_export_signature_matches_masked_diffusion_metadata():

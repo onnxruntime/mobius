@@ -16,7 +16,6 @@ from mobius._weight_utils import (
 )
 from mobius.components._attention import Qwen35Attention
 from mobius.components._common import (
-    Embedding,
     Linear,
     create_attention_bias,
 )
@@ -25,7 +24,11 @@ from mobius.components._mlp import MLP
 from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.components._rms_norm import OffsetRMSNorm
 from mobius.components._rotary_embedding import initialize_rope
-from mobius.models.base import CausalLMModel
+from mobius.models.base import (
+    CausalLMModel,
+    effective_tie_word_embeddings,
+    embedding_for_config,
+)
 from mobius.models.moe import Qwen2MoELayer
 from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
@@ -203,9 +206,7 @@ class Qwen35TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [Qwen35DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )
@@ -287,7 +288,7 @@ class Qwen35CausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = Qwen35TextModel(config)
+        self._replace_text_model(Qwen35TextModel(config))
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -409,9 +410,7 @@ class Qwen35MoETextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [
                 Qwen35MoEDecoderLayer(config, layer_idx=i)
@@ -479,7 +478,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = Qwen35MoETextModel(config)
+        self._replace_text_model(Qwen35MoETextModel(config))
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -556,7 +555,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         return preprocess_quantized_weights(
             cleaned,
             self.config.quantization,
-            tie_embeddings=self.config.tie_word_embeddings,
+            tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("gptq", "awq", "olive"),
         )
@@ -654,9 +653,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
         quantization = self.config.quantization
-        tie = self.config.tie_word_embeddings or (
-            quantization is not None and getattr(quantization, "tie_word_embeddings", False)
-        )
+        tie = effective_tie_word_embeddings(self.config)
         # Preserve the old VL partial-state-dict behavior: tying is a no-op
         # when neither decoder table is present. Production builds pass the
         # full checkpoint, while focused callers may pass architecture slices.
@@ -739,7 +736,7 @@ class Qwen35VLDecoderModel(nn.Module):
                 stripped = stripped[len("language_model.") :]
             renamed[stripped] = value
 
-        if self.config.tie_word_embeddings:
+        if effective_tie_word_embeddings(self.config):
             if "lm_head.weight" not in renamed and "model.embed_tokens.weight" in renamed:
                 renamed["lm_head.weight"] = renamed["model.embed_tokens.weight"]
         return renamed
@@ -860,9 +857,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         quantization = self.config.quantization
         use_qmoe = supported_qmoe_quantization(quantization) is not None
 
-        tie = self.config.tie_word_embeddings or (
-            quantization is not None and quantization.tie_word_embeddings
-        )
+        tie = effective_tie_word_embeddings(self.config)
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):

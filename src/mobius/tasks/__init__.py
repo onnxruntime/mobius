@@ -45,9 +45,12 @@ __all__ = [
     "GlmMoeDsaTask",
     "GlmOcrVLTask",
     "HybridCausalLMTask",
+    "FalconH1CausalLMTask",
     "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
     "ImageClassificationTask",
+    "KimiK3CausalLMTask",
+    "KimiLinearCausalLMTask",
     "Lfm2VlTask",
     "ModelTask",
     "MllamaVisionLanguageTask",
@@ -66,6 +69,7 @@ __all__ = [
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
+    "Plamo2CausalLMTask",
     "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
     "QwenImageVAETask",
@@ -114,6 +118,7 @@ from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
+from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
 from mobius.tasks._feature_extraction import FeatureExtractionTask
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
 from mobius.tasks._gemma3n import Gemma3nTask
@@ -127,6 +132,8 @@ from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
 from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
 from mobius.tasks._image_classification import ImageClassificationTask
+from mobius.tasks._kimi_k3 import KimiK3CausalLMTask
+from mobius.tasks._kimi_linear import KimiLinearCausalLMTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
 from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3ConditionTask,
@@ -139,6 +146,7 @@ from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
+from mobius.tasks._plamo2 import Plamo2CausalLMTask
 from mobius.tasks._qwen35_mtp import Qwen35MtpTask
 from mobius.tasks._qwen_image import QwenImageDenoisingTask
 from mobius.tasks._qwen_image_text_encoder import QwenImageTextEncoderTask
@@ -201,6 +209,10 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
+    "kimi-k3-text-generation": KimiK3CausalLMTask,
+    "kimi-linear-text-generation": KimiLinearCausalLMTask,
+    "falcon-h1-text-generation": FalconH1CausalLMTask,
+    "plamo2-text-generation": Plamo2CausalLMTask,
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,
     "qwen35-mtp": Qwen35MtpTask,

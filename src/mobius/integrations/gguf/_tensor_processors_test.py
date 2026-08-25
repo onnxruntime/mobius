@@ -7,11 +7,79 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mobius.integrations.gguf._tensor_processors import (
     process_tensors,
 )
+
+
+class TestProcessTensorsKimiLinear:
+    def test_inverts_decay_conv_and_mla_split_layouts(self) -> None:
+        heads, rank, nope, value_dim, channels, kernel = 2, 3, 4, 5, 6, 3
+        decay_log = torch.arange(heads, dtype=torch.float32).reshape(1, 1, heads, 1)
+        conv = torch.arange(channels * kernel, dtype=torch.float32).reshape(
+            1, channels, 1, kernel
+        )
+        key_hf = torch.arange(heads * nope * rank, dtype=torch.float32).reshape(
+            heads, nope, rank
+        )
+        value_hf = torch.arange(heads * value_dim * rank, dtype=torch.float32).reshape(
+            heads, value_dim, rank
+        )
+        state = {
+            "model.layers.0.self_attn.A_log": -torch.exp(decay_log),
+            "model.layers.0.self_attn.q_conv1d.weight": conv,
+            "model.layers.1.self_attn.k_b_proj.weight": key_hf.transpose(1, 2),
+            "model.layers.1.self_attn.v_b_proj.weight": value_hf,
+        }
+        config = SimpleNamespace(model_type="kimi_linear", _gguf_arch="kimi-linear")
+
+        result = process_tensors(state, config)
+
+        torch.testing.assert_close(result["model.layers.0.self_attn.A_log"], decay_log)
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_conv1d.weight"],
+            conv.reshape(channels, kernel),
+        )
+        torch.testing.assert_close(
+            result["model.layers.1.self_attn.k_b_proj.weight"],
+            key_hf.reshape(heads * nope, rank),
+        )
+        torch.testing.assert_close(
+            result["model.layers.1.self_attn.v_b_proj.weight"],
+            value_hf.reshape(heads * value_dim, rank),
+        )
+
+    def test_rejects_non_negative_decay(self) -> None:
+        config = SimpleNamespace(model_type="kimi_linear", _gguf_arch="kimi-linear")
+        with pytest.raises(ValueError, match="finite negative"):
+            process_tensors(
+                {"model.layers.0.self_attn.A_log": torch.tensor([0.0])},
+                config,
+            )
+
+
+class TestProcessTensorsKimiK3:
+    def test_restores_collapsed_conv_and_decay(self) -> None:
+        config = SimpleNamespace(model_type="kimi_k3", _gguf_arch="kimi-k3")
+        state = {
+            "model.layers.0.self_attn.q_conv1d.weight": torch.arange(
+                24, dtype=torch.float32
+            ).reshape(1, 6, 4),
+            "model.layers.0.self_attn.A_log": -torch.exp(
+                torch.tensor([0.25, -0.5], dtype=torch.float32)
+            ),
+        }
+
+        result = process_tensors(state, config)
+
+        assert result["model.layers.0.self_attn.q_conv1d.weight"].shape == (6, 4)
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.A_log"],
+            torch.tensor([0.25, -0.5], dtype=torch.float32),
+        )
 
 
 class TestProcessTensorsLlama:
@@ -57,6 +125,20 @@ class TestProcessTensorsLlama:
             original_k,
         )
 
+    def test_qk_bias_roundtrip(self) -> None:
+        config = self._make_config(num_heads=4, num_kv_heads=2)
+        original_q = torch.randn(64)
+        original_k = torch.randn(32)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.bias": self._forward_permute(original_q, 4),
+            "model.layers.0.self_attn.k_proj.bias": self._forward_permute(original_k, 2),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["model.layers.0.self_attn.q_proj.bias"], original_q)
+        torch.testing.assert_close(result["model.layers.0.self_attn.k_proj.bias"], original_k)
+
     def test_gqa_different_head_counts(self) -> None:
         """Test GQA with num_kv_heads < num_attention_heads."""
         config = self._make_config(num_heads=8, num_kv_heads=2)
@@ -98,6 +180,47 @@ class TestProcessTensorsLlama:
             result["model.layers.0.self_attn.q_proj.weight"],
             original,
         )
+
+    def test_internlm2_reverses_the_pinned_converter_permutation(self) -> None:
+        """InternLM2's converter calls LlamaModel.permute for both Q and K."""
+        config = self._make_config(
+            model_type="internlm2",
+            num_heads=4,
+            num_kv_heads=2,
+        )
+        config._gguf_arch = "internlm2"
+        original_q = torch.arange(64 * 8, dtype=torch.float32).reshape(64, 8)
+        original_k = torch.arange(32 * 8, dtype=torch.float32).reshape(32, 8)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.weight": self._forward_permute(original_q, 4),
+            "model.layers.0.self_attn.k_proj.weight": self._forward_permute(original_k, 2),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"], original_q
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.k_proj.weight"], original_k
+        )
+
+    def test_dense_cohort_converter_permutation_contract(self) -> None:
+        from mobius.integrations.gguf._tensor_processors import (
+            needs_llama_qk_permute,
+        )
+
+        for model_type in (
+            "olmo",
+            "arcee",
+            "smollm3",
+            "internlm2",
+            "granitemoe",
+            "llada",
+        ):
+            assert needs_llama_qk_permute(model_type)
+        for model_type in ("olmo2", "cohere2", "exaone", "dream"):
+            assert not needs_llama_qk_permute(model_type)
 
     def test_reverse_matches_hf_reference_head_dim_64(self) -> None:
         """Reverse permute must match HF's reference for real head dims.
@@ -201,6 +324,15 @@ class TestBuilderNeedsQkPermute:
         name = "model.layers.0.self_attn.q_proj.weight"
         assert _needs_qk_permute(name, 32, 32, "llama") is True
         assert _needs_qk_permute(name, 32, 32, "mistral") is True
+        assert _needs_qk_permute(name, 32, 8, "granitemoe") is True
+        assert _needs_qk_permute(name, 32, 32, "llada", "llada") is True
+
+    def test_diffusion_moe_quantized_qk_is_not_permuted(self) -> None:
+        from mobius.integrations.gguf._builder import _needs_qk_permute
+
+        name = "model.layers.0.self_attn.q_proj.weight"
+        assert _needs_qk_permute(name, 32, 8, "llada", "llada-moe") is False
+        assert _needs_qk_permute(name, 32, 8, "llada", "rnd1") is False
 
     def test_non_qk_tensor_never_permuted(self) -> None:
         from mobius.integrations.gguf._builder import _needs_qk_permute
@@ -280,6 +412,177 @@ class TestProcessTensorsMamba:
         }
         result = process_tensors(state_dict, config)
         assert result["backbone.layers.0.mixer.conv1d.weight"].shape == (16, 1, 4)
+
+    def test_decay_transform_recovers_original_a_log_values(self) -> None:
+        config = SimpleNamespace(model_type="mamba")
+        a_log = torch.tensor([-2.0, 0.0, 1.5], dtype=torch.float32)
+        gguf_a = -torch.exp(a_log)
+        state_dict = {"model.layers.0.mixer.A_log": gguf_a}
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["model.layers.0.mixer.A_log"], a_log)
+        torch.testing.assert_close(
+            -torch.exp(result["model.layers.0.mixer.A_log"]),
+            gguf_a,
+        )
+
+    def test_decay_transform_rejects_wrong_direction_input(self) -> None:
+        config = SimpleNamespace(model_type="mamba2")
+        state_dict = {"backbone.layers.0.mixer.A_log": torch.tensor([-1.0, 0.25])}
+
+        with pytest.raises(ValueError, match="only negative"):
+            process_tensors(state_dict, config)
+
+    def test_mamba2_squeezes_cpp_head_parameter_layout(self) -> None:
+        config = SimpleNamespace(model_type="mamba2")
+        state_dict = {
+            "backbone.layers.0.mixer.A_log": -torch.exp(torch.tensor([[0.0], [1.0]])),
+            "backbone.layers.0.mixer.D": torch.tensor([[1.0], [2.0]]),
+            "backbone.layers.0.mixer.norm.weight": torch.tensor([[3.0, 4.0]]),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.A_log"],
+            torch.tensor([0.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.D"],
+            torch.tensor([1.0, 2.0]),
+        )
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.norm.weight"],
+            torch.tensor([3.0, 4.0]),
+        )
+
+    def test_nemotron_h_restores_attention_and_mamba_values(self) -> None:
+        config = SimpleNamespace(
+            model_type="nemotron_h",
+            _gguf_arch="nemotron_h",
+            layer_types=["mamba2", "full_attention"],
+            num_attention_heads=2,
+            num_key_value_heads=1,
+        )
+        q = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        k = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        def permute(tensor: torch.Tensor, heads: int) -> torch.Tensor:
+            return (
+                tensor.reshape(heads, 2, tensor.shape[0] // heads // 2, *tensor.shape[1:])
+                .swapaxes(1, 2)
+                .reshape(tensor.shape)
+            )
+
+        state_dict = {
+            "backbone.layers.1.mixer.q_proj.weight": permute(q, 2),
+            "backbone.layers.1.mixer.k_proj.weight": permute(k, 1),
+            "backbone.layers.0.mixer.A_log": -torch.exp(torch.tensor([[0.0], [1.0]])),
+            "backbone.layers.0.mixer.D": torch.tensor([[3.0], [4.0]]),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["backbone.layers.1.mixer.q_proj.weight"], q)
+        torch.testing.assert_close(result["backbone.layers.1.mixer.k_proj.weight"], k)
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.A_log"], torch.tensor([0.0, 1.0])
+        )
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.D"], torch.tensor([3.0, 4.0])
+        )
+
+    def test_granitehybrid_dense_gate_up_fusion_preserves_order(self) -> None:
+        config = SimpleNamespace(
+            model_type="granitemoehybrid",
+            _gguf_arch="granitehybrid",
+            layer_types=["mamba2"],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+        )
+        gate = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        up = torch.arange(8, 16, dtype=torch.float32).reshape(2, 4)
+        gate_bias = torch.tensor([101.0, 102.0])
+        up_bias = torch.tensor([201.0, 202.0])
+        a_log = torch.tensor([[-1.0], [-2.0]])
+        state_dict = {
+            "model.layers.0.shared_mlp.gate_proj.weight": gate,
+            "model.layers.0.shared_mlp.up_proj.weight": up,
+            "model.layers.0.shared_mlp.gate_proj.bias": gate_bias,
+            "model.layers.0.shared_mlp.up_proj.bias": up_bias,
+            "model.layers.0.mamba.A_log": a_log,
+            "model.layers.0.mamba.D": torch.ones(2, 1),
+            "model.layers.0.mamba.norm.weight": torch.ones(1, 4),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(
+            result["model.layers.0.shared_mlp.input_linear.weight"],
+            torch.cat((gate, up), dim=0),
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.shared_mlp.input_linear.bias"],
+            torch.cat((gate_bias, up_bias), dim=0),
+        )
+        assert "model.layers.0.shared_mlp.gate_proj.bias" not in result
+        assert "model.layers.0.shared_mlp.up_proj.bias" not in result
+        torch.testing.assert_close(
+            result["model.layers.0.mamba.A_log"], torch.log(-a_log).flatten()
+        )
+        assert result["model.layers.0.mamba.D"].shape == (2,)
+        assert result["model.layers.0.mamba.norm.weight"].shape == (4,)
+
+    def test_granitehybrid_expert_gate_up_fusion_preserves_expert_order(self) -> None:
+        config = SimpleNamespace(
+            model_type="granitemoehybrid",
+            _gguf_arch="granitehybrid",
+            layer_types=["mamba2"],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+        )
+        gate = torch.stack((torch.full((2, 4), 11.0), torch.full((2, 4), 12.0)))
+        up = torch.stack((torch.full((2, 4), 21.0), torch.full((2, 4), 22.0)))
+        state_dict = {
+            "model.layers.0.block_sparse_moe.gate_proj.weight": gate,
+            "model.layers.0.block_sparse_moe.up_proj.weight": up,
+        }
+
+        result = process_tensors(state_dict, config)
+
+        fused = result["model.layers.0.block_sparse_moe.input_linear.weight"]
+        assert fused.shape == (2, 4, 4)
+        torch.testing.assert_close(fused[:, :2], gate)
+        torch.testing.assert_close(fused[:, 2:], up)
+
+    @pytest.mark.parametrize(
+        "state_dict",
+        [
+            {
+                "model.layers.0.shared_mlp.up_proj.bias": torch.ones(2),
+            },
+            {
+                "model.layers.0.block_sparse_moe.gate_proj.weight": torch.ones(2, 3, 4),
+                "model.layers.0.block_sparse_moe.up_proj.weight": torch.ones(2, 4, 4),
+            },
+        ],
+    )
+    def test_granitehybrid_gate_up_fusion_fails_closed(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> None:
+        config = SimpleNamespace(
+            model_type="granitemoehybrid",
+            _gguf_arch="granitehybrid",
+            layer_types=[],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+
+        with pytest.raises(ValueError, match=r"missing paired|same rank-3 shape"):
+            process_tensors(state_dict, config)
 
 
 class TestProcessTensorsNoop:

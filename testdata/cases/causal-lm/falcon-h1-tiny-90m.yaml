@@ -1,0 +1,18 @@
+model_id: "tiiuae/Falcon-H1-Tiny-90M-Base"
+model_type: "falcon_h1"
+revision: "7994372e93b62822ae25f8bfb19f653649cea3a3"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Dedicated parallel Attention+Mamba2 graph with four states per layer."
+skip_reason: "Runtime package generation is deferred until heterogeneous-state schema support in onnxruntime/mobius#605."

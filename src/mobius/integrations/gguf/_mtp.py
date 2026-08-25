@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Emit the Qwen3.5/3.8 multi-token-prediction (MTP) self-speculative head from GGUF.
+"""Validate and emit GGUF multi-token-prediction (MTP) auxiliary heads.
 
 The dense ``unsloth/Qwen3.8-27B`` (and ``Qwen/Qwen3.6-27B``) GGUF ships a
 trained MTP head as the trailing ``blk.<N>`` block, tagged by the
@@ -17,16 +17,18 @@ The head graph mirrors llama.cpp's NEXTN tensors and vLLM's
     blk.<N>.nextn.enorm            -> pre_fc_norm_embedding   (OffsetRMSNorm)
     blk.<N>.nextn.hnorm            -> pre_fc_norm_hidden       (OffsetRMSNorm)
     blk.<N>.nextn.eh_proj          -> fc                       (2H -> H GEMM)
-    blk.<N>.nextn.shared_head_norm -> norm                     (OffsetRMSNorm)
+    blk.<N>.nextn.embed_tokens     -> embed_tokens             (optional)
+    blk.<N>.nextn.shared_head_norm -> norm                     (optional)
+    blk.<N>.nextn.shared_head_head -> lm_head                  (optional)
     blk.<N>.attn_norm              -> layers.0.input_layernorm
     blk.<N>.attn_q/k/v/output      -> layers.0.self_attn.{q,k,v,o}_proj
     blk.<N>.attn_q_norm/k_norm     -> layers.0.self_attn.{q,k}_norm
     blk.<N>.post_attention_norm    -> layers.0.post_attention_layernorm
     blk.<N>.ffn_gate/up/down       -> layers.0.mlp.{gate,up,down}_proj
 
-The head borrows the target's shared ``embed_tokens`` / ``lm_head`` (it has
-none of its own), so the orchestrator embeds the drafted token, runs the
-head, and decodes ``mtp_hidden`` through the target LM head.
+Absent optional tables fall back exactly to the target embedding, final norm,
+and output head. Dedicated embedding/head tables become sidecar modules;
+fallback embedding/head ownership remains explicit in runtime metadata.
 """
 
 from __future__ import annotations
@@ -34,12 +36,186 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+
+from mobius.integrations.gguf._spec import Support
 
 if TYPE_CHECKING:
     from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MtpArchitectureCapability:
+    """Pinned llama.cpp MTP capability for one ``general.architecture`` value."""
+
+    support: Support
+    loader_behavior: str
+    block_kind: str
+    reason: str
+
+
+_DENSE_QWEN35_MTP = MtpArchitectureCapability(
+    support=Support.SUPPORTED,
+    loader_behavior="executed-sidecar",
+    block_kind="dense-full-attention",
+    reason=(
+        "The appended block is exactly one dense Qwen3.5 full-attention decoder layer "
+        "with the standard per-block nextn conditioning tensors."
+    ),
+)
+
+_PINNED_MTP_CAPABILITIES = MappingProxyType(
+    {
+        # Exact dense sidecar supported by this module.
+        "qwen35": _DENSE_QWEN35_MTP,
+        # Pinned loaders execute these heads, but their routed/stateful decoder
+        # blocks are not represented by Qwen35MtpModel.
+        "bailingmoe3": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-kda-mla",
+            "the MTP block carries routed experts and KDA/MLA state semantics",
+        ),
+        "cohere2moe": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-full-attention",
+            "the MTP block carries Cohere2 routed and shared experts",
+        ),
+        "deepseek2": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-mla",
+            "the MTP block carries DeepSeek MLA and routed-expert semantics",
+        ),
+        "deepseek32": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-dsa-mla",
+            "the MTP block carries DSA/MLA attention and routed experts",
+        ),
+        "deepseek4": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-hyperconnection",
+            "the MTP block carries hyper-connections, compressed state, and routed experts",
+        ),
+        "glm-dsa": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-dsa-mla",
+            "the MTP block carries GLM DSA/MLA and routed-expert semantics",
+        ),
+        "hy_v3": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-hyperconnection",
+            "the MTP block carries HY-V3 hyper-connections and routed experts",
+        ),
+        "mimo2": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-full-attention",
+            "the MTP block carries MiMo2 routed experts and layer-output norm fallback",
+        ),
+        "nemotron_h_moe": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-hybrid",
+            "the MTP block carries Nemotron-H routed experts and hybrid-state semantics",
+        ),
+        "qwen35moe": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-full-attention",
+            "MTP blocks use routed experts and a shared expert that are not represented",
+        ),
+        "qwen3next": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-hybrid",
+            "the MTP block carries Qwen3-Next routed experts and hybrid-state semantics",
+        ),
+        "step35": MtpArchitectureCapability(
+            Support.REJECTED,
+            "executed-sidecar",
+            "routed-full-attention",
+            "the MTP block carries Step3.5 routed and shared experts",
+        ),
+        # These pinned loaders consume/preserve NextN metadata or tensors but do
+        # not expose an executable decoder-MTP graph for the serialized head.
+        "bailingmoe2": MtpArchitectureCapability(
+            Support.REJECTED,
+            "preserved-unused",
+            "routed-full-attention",
+            "the pinned loader skips the appended NextN blocks during execution",
+        ),
+        "dots3note": MtpArchitectureCapability(
+            Support.REJECTED,
+            "preserved-unused",
+            "routed-dsa",
+            "the pinned loader marks MTP tensors skipped and has no MTP graph",
+        ),
+        "exaone-moe": MtpArchitectureCapability(
+            Support.REJECTED,
+            "preserved-unused",
+            "routed-full-attention",
+            "the pinned loader preserves NextN tensors without an MTP graph",
+        ),
+        "exaone4": MtpArchitectureCapability(
+            Support.REJECTED,
+            "preserved-unused",
+            "dense-full-attention",
+            "the pinned loader preserves NextN tensors without an MTP graph",
+        ),
+        "glm4": MtpArchitectureCapability(
+            Support.REJECTED,
+            "preserved-unused",
+            "dense-full-attention",
+            "the pinned loader preserves NextN tensors without an MTP graph",
+        ),
+        "glm4moe": MtpArchitectureCapability(
+            Support.REJECTED,
+            "preserved-unused",
+            "routed-full-attention",
+            "the pinned loader preserves NextN tensors without an MTP graph",
+        ),
+        "nemotron_h": MtpArchitectureCapability(
+            Support.REJECTED,
+            "converter-conditional",
+            "hybrid",
+            "only the distinct nemotron_h_moe loader owns the routed MTP graph",
+        ),
+        # Gemma4 Assistant is a standalone drafter with global projection
+        # tensors, not an appended target-owned sidecar.
+        "gemma4-assistant": MtpArchitectureCapability(
+            Support.REJECTED,
+            "standalone-drafter",
+            "legacy-global-projections",
+            "nextn.pre_projection/post_projection describe a standalone assistant model",
+        ),
+        # Granite Switch repurposes n_layer_nextn for its router-cache layer.
+        # llama.cpp's generic saver can therefore re-emit this metadata, but it
+        # never denotes an MTP head for this architecture.
+        "graniteswitch": MtpArchitectureCapability(
+            Support.REJECTED,
+            "metadata-reemitted-non-mtp",
+            "router-cache-sentinel",
+            "nextn_predict_layers is a round-trip artifact for the extra router layer",
+        ),
+    }
+)
+
+_MTP_METADATA_SUFFIXES = (".nextn_predict_layers", ".nextn.predict_layers")
+_LEGACY_NEXTN_TENSORS = frozenset(
+    {
+        "nextn.pre_projection.weight",
+        "nextn.post_projection.weight",
+    }
+)
 
 # GGUF ``blk.<N>.<stem>`` -> Qwen35MtpModel-internal parameter stem. Keys are
 # the GGUF stems (without ``.weight``); values are the head module's own
@@ -50,7 +226,9 @@ _MTP_STEM_MAP: dict[str, str] = {
     "nextn.enorm": "pre_fc_norm_embedding",
     "nextn.hnorm": "pre_fc_norm_hidden",
     "nextn.eh_proj": "fc",
+    "nextn.embed_tokens": "embed_tokens",
     "nextn.shared_head_norm": "norm",
+    "nextn.shared_head_head": "lm_head",
     # The single full-attention decoder layer.
     "attn_norm": "layers.0.input_layernorm",
     "attn_q": "layers.0.self_attn.q_proj",
@@ -64,6 +242,9 @@ _MTP_STEM_MAP: dict[str, str] = {
     "ffn_up": "layers.0.mlp.up_proj",
     "ffn_down": "layers.0.mlp.down_proj",
 }
+_SUPPORTED_MTP_BLOCK_TENSORS: frozenset[str] = frozenset(
+    f"{stem}.weight" for stem in _MTP_STEM_MAP
+)
 
 # Head norms that are ``OffsetRMSNorm`` (``1 + weight``) but whose target name
 # does not end in ``norm.weight`` — the generic offset-strip in
@@ -73,6 +254,207 @@ _MTP_EXTRA_OFFSET_NORMS: frozenset[str] = frozenset(
 )
 
 _BLK_PATTERN = re.compile(r"^blk\.(\d+)\.(.+)$")
+
+
+def mtp_architecture_capabilities() -> MappingProxyType[str, MtpArchitectureCapability]:
+    """Return the immutable pinned architecture-by-MTP capability policy."""
+    return _PINNED_MTP_CAPABILITIES
+
+
+def validate_mtp_tensor_contract(gguf_model) -> None:
+    """Reject unsupported or incomplete MTP metadata/tensors before graph construction."""
+    architecture = gguf_model.architecture
+    metadata = gguf_model.metadata
+    tensor_names = set(gguf_model.tensor_names)
+    exact_key = f"{architecture}.nextn_predict_layers"
+
+    mtp_metadata_keys = sorted(
+        key
+        for key in metadata
+        if isinstance(key, str)
+        and (key.endswith(_MTP_METADATA_SUFFIXES) or ".mtp" in key.lower())
+    )
+    unexpected_metadata = [key for key in mtp_metadata_keys if key != exact_key]
+    if unexpected_metadata:
+        raise ValueError(
+            f"{architecture} GGUF contains unsupported MTP metadata key(s): "
+            f"{unexpected_metadata}; pinned llama.cpp uses only {exact_key!r}"
+        )
+
+    modern_tensors: dict[int, set[str]] = {}
+    unknown_mtp_tensors: list[str] = []
+    auxiliary_tensors: list[str] = []
+    for name in tensor_names:
+        if name in _LEGACY_NEXTN_TENSORS:
+            continue
+        match = _BLK_PATTERN.match(name)
+        if match is not None and match.group(2).startswith("nextn."):
+            block_index = int(match.group(1))
+            suffix = match.group(2)
+            if suffix.endswith((".scale", ".input_scale")):
+                auxiliary_tensors.append(name)
+                continue
+            if not suffix.endswith(".weight"):
+                unknown_mtp_tensors.append(name)
+                continue
+            stem = suffix[: -len(".weight")]
+            if stem not in _MTP_STEM_MAP:
+                unknown_mtp_tensors.append(name)
+                continue
+            modern_tensors.setdefault(block_index, set()).add(stem)
+            continue
+        if name.startswith(("nextn.", "mtp.")) or ".nextn." in name or ".mtp." in name:
+            unknown_mtp_tensors.append(name)
+
+    if auxiliary_tensors:
+        raise ValueError(
+            f"{sorted(auxiliary_tensors)}: Mobius cannot represent GGUF scale/input_scale "
+            "sidecars in the MTP quantization ABI"
+        )
+    if unknown_mtp_tensors:
+        raise ValueError(
+            f"{architecture} GGUF contains unsupported nextn tensor(s) or mtp tensor(s): "
+            f"{sorted(unknown_mtp_tensors)}"
+        )
+
+    legacy_tensors = sorted(tensor_names & _LEGACY_NEXTN_TENSORS)
+    raw_count = metadata.get(exact_key, 0)
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int):
+        raise TypeError(f"{exact_key} must be an integer, got {raw_count!r}")
+    count = raw_count
+    if count < 0:
+        raise ValueError(f"{exact_key} must be non-negative, got {count}")
+    if count == 0 and (modern_tensors or legacy_tensors):
+        raise ValueError(
+            f"{architecture} GGUF contains MTP tensors but does not declare a positive "
+            f"{exact_key}"
+        )
+    if count == 0:
+        return
+
+    capability = _PINNED_MTP_CAPABILITIES.get(architecture)
+    if capability is None:
+        raise ValueError(
+            f"{architecture} GGUF declares MTP, but that architecture is absent from the "
+            "pinned llama.cpp MTP loader/converter census"
+        )
+    if capability.support is not Support.SUPPORTED:
+        raise NotImplementedError(
+            f"{architecture} GGUF MTP is rejected: {capability.reason}; "
+            f"pinned loader behavior={capability.loader_behavior}, "
+            f"block kind={capability.block_kind}"
+        )
+    if not (modern_tensors or legacy_tensors):
+        raise ValueError(
+            f"{architecture} GGUF declares {exact_key}={count} but contains no MTP tensors"
+        )
+    if count != 1:
+        raise ValueError(
+            f"{architecture} GGUF declares {count} MTP heads and has {count} MTP blocks, "
+            "but only exactly one appended MTP block can be represented; refusing to "
+            "silently truncate the remaining heads"
+        )
+    if legacy_tensors:
+        raise ValueError(
+            f"{architecture} GGUF mixes unsupported legacy global NextN tensors "
+            f"{legacy_tensors} with the modern per-block namespace"
+        )
+
+    block_count_key = f"{architecture}.block_count"
+    raw_block_count = metadata.get(block_count_key, 0)
+    if isinstance(raw_block_count, bool) or not isinstance(raw_block_count, int):
+        raise TypeError(f"{block_count_key} must be an integer, got {raw_block_count!r}")
+    block_count = raw_block_count
+    expected_block = block_count - 1
+    if block_count <= count:
+        raise ValueError(
+            f"{architecture} GGUF block_count={block_count} must exceed MTP head count {count}"
+        )
+    if set(modern_tensors) != {expected_block}:
+        raise ValueError(
+            f"{architecture} GGUF MTP tensors must all belong to trailing block "
+            f"{expected_block}, got blocks {sorted(modern_tensors)}"
+        )
+    block_prefix = f"blk.{expected_block}."
+    unexpected_block_tensors = sorted(
+        name
+        for name in tensor_names
+        if name.startswith(block_prefix)
+        and name.removeprefix(block_prefix) not in _SUPPORTED_MTP_BLOCK_TENSORS
+    )
+    if unexpected_block_tensors:
+        raise ValueError(
+            f"{architecture} GGUF MTP block contains unsupported tensor(s): "
+            f"{unexpected_block_tensors}"
+        )
+
+    required = {"nextn.eh_proj", "nextn.enorm", "nextn.hnorm"}
+    missing = sorted(required - modern_tensors[expected_block])
+    if missing:
+        raise ValueError(
+            f"{architecture} GGUF MTP block {expected_block} is missing required tensor "
+            f"stem(s): {missing}"
+        )
+
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    num_heads = int(metadata[f"{architecture}.attention.head_count"])
+    num_kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", num_heads))
+    head_dim = int(metadata.get(f"{architecture}.attention.key_length", hidden // num_heads))
+    raw_ffn = metadata[f"{architecture}.feed_forward_length"]
+    if isinstance(raw_ffn, (list, tuple)):
+        if len(raw_ffn) != block_count:
+            raise ValueError(
+                f"{architecture}.feed_forward_length must contain {block_count} entries, "
+                f"got {len(raw_ffn)}"
+            )
+        ffn = int(raw_ffn[expected_block])
+    else:
+        ffn = int(raw_ffn)
+
+    prefix = f"blk.{expected_block}."
+    expected_shapes: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+        f"{prefix}nextn.eh_proj.weight": (hidden, 2 * hidden),
+        f"{prefix}nextn.enorm.weight": (hidden,),
+        f"{prefix}nextn.hnorm.weight": (hidden,),
+        f"{prefix}attn_norm.weight": (hidden,),
+        f"{prefix}attn_q.weight": (2 * num_heads * head_dim, hidden),
+        f"{prefix}attn_k.weight": (num_kv_heads * head_dim, hidden),
+        f"{prefix}attn_v.weight": (num_kv_heads * head_dim, hidden),
+        f"{prefix}attn_output.weight": (hidden, num_heads * head_dim),
+        f"{prefix}attn_q_norm.weight": (head_dim,),
+        f"{prefix}attn_k_norm.weight": (head_dim,),
+        f"{prefix}post_attention_norm.weight": (hidden,),
+        f"{prefix}ffn_gate.weight": (ffn, hidden),
+        f"{prefix}ffn_up.weight": (ffn, hidden),
+        f"{prefix}ffn_down.weight": (hidden, ffn),
+    }
+    optional_shapes = {
+        "output.weight": (vocab, hidden),
+        f"{prefix}nextn.embed_tokens.weight": (vocab, hidden),
+        f"{prefix}nextn.shared_head_norm.weight": (hidden,),
+        f"{prefix}nextn.shared_head_head.weight": (vocab, hidden),
+    }
+    actual_shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+        if name in expected_shapes or name in optional_shapes
+    }
+    missing_shapes = sorted(set(expected_shapes) - set(actual_shapes))
+    malformed_shapes = {
+        name: (expected_shapes.get(name, optional_shapes.get(name)), actual)
+        for name, actual in actual_shapes.items()
+        if actual != expected_shapes.get(name, optional_shapes.get(name))
+    }
+    if missing_shapes or malformed_shapes:
+        raise ValueError(
+            f"Invalid {architecture} GGUF MTP tensor shapes: missing={missing_shapes}, "
+            f"malformed={malformed_shapes}"
+        )
 
 
 def map_gguf_mtp_to_hf_names(gguf_name: str, mtp_block_index: int) -> str | None:
@@ -88,7 +470,10 @@ def map_gguf_mtp_to_hf_names(gguf_name: str, mtp_block_index: int) -> str | None
     if int(match.group(1)) != mtp_block_index:
         return None
     stem_with_suffix = match.group(2)
-    for suffix in (".weight", ".bias"):
+    # The pinned generic llama.cpp loader also creates optional quantization
+    # sidecars for reachable MTP projections. Keep them visible to the common
+    # pre-build validator instead of silently treating them as unknown tensors.
+    for suffix in (".input_scale", ".weight", ".scale", ".bias"):
         if stem_with_suffix.endswith(suffix):
             stem, tail = stem_with_suffix[: -len(suffix)], suffix
             break
@@ -105,7 +490,12 @@ def has_mtp_head(config) -> bool:
     return bool(getattr(config, "_gguf_mtp_block_indices", None))
 
 
-def derive_mtp_config(config):
+def derive_mtp_config(
+    config,
+    *,
+    use_dedicated_embeddings: bool = False,
+    use_dedicated_lm_head: bool = False,
+):
     """Derive a :class:`Qwen35MtpConfig` from the resolved backbone *config*.
 
     All dimensions (hidden size, head dim, KV heads, rope, quantization,
@@ -125,11 +515,15 @@ def derive_mtp_config(config):
     fields["num_hidden_layers"] = 1
     fields["layer_types"] = ["full_attention"]
     fields["output_layer_indices"] = None
+    fields["output_final_hidden_state"] = False
+    fields["use_dedicated_embeddings"] = use_dedicated_embeddings
+    fields["use_dedicated_lm_head"] = use_dedicated_lm_head
     mtp_config = Qwen35MtpConfig(**fields)
     # Preserve the model_type so tensor processors / quantization dispatch the
     # same way as the backbone.
     mtp_config.model_type = getattr(config, "model_type", None)
     mtp_config._gguf_model_type = getattr(config, "_gguf_model_type", None)
+    mtp_config._gguf_arch = getattr(config, "_gguf_arch", None)
     return mtp_config
 
 
@@ -172,6 +566,7 @@ def build_mtp_head_from_gguf(
         _load_dequantized_state_dict,
         _load_quantized_state_dict,
         _normalize_gguf_weights,
+        _replace_native_block_linears,
     )
     from mobius.integrations.gguf._tensor_processors import process_tensors
     from mobius.models.qwen35_mtp import Qwen35MtpModel
@@ -180,24 +575,43 @@ def build_mtp_head_from_gguf(
     mtp_blocks = getattr(config, "_gguf_mtp_block_indices", None)
     if not mtp_blocks:
         return None
-    if len(mtp_blocks) > 1:
-        logger.warning(
-            "GGUF declares %d MTP blocks; only the first (block %d) is exported "
-            "as the self-speculative head.",
-            len(mtp_blocks),
-            mtp_blocks[0],
+    validate_mtp_tensor_contract(gguf_model)
+    if len(mtp_blocks) != 1:
+        raise ValueError(
+            f"GGUF declares {len(mtp_blocks)} MTP blocks, but ModelPackage can "
+            "represent exactly one MTP sidecar head. Multi-head MTP export is not "
+            f"supported; got blocks {list(mtp_blocks)} and produced no partial sidecar."
         )
     mtp_block_index = int(mtp_blocks[0])
     gguf_arch = gguf_model.architecture
+    tensor_names = set(gguf_model.tensor_names)
+    mtp_prefix = f"blk.{mtp_block_index}.nextn."
+    use_dedicated_embeddings = f"{mtp_prefix}embed_tokens.weight" in tensor_names
+    use_dedicated_norm = f"{mtp_prefix}shared_head_norm.weight" in tensor_names
+    use_dedicated_lm_head = f"{mtp_prefix}shared_head_head.weight" in tensor_names
 
-    mtp_config = derive_mtp_config(config)
+    mtp_config = derive_mtp_config(
+        config,
+        use_dedicated_embeddings=use_dedicated_embeddings,
+        use_dedicated_lm_head=use_dedicated_lm_head,
+    )
     module = Qwen35MtpModel(mtp_config)
+
+    def _mapper(gguf_name: str, _arch: str) -> str | None:
+        if not use_dedicated_norm and gguf_name == "output_norm.weight":
+            return "norm.weight"
+        return map_gguf_mtp_to_hf_names(gguf_name, mtp_block_index)
+
+    if preserve_quantization:
+        _replace_native_block_linears(
+            module,
+            gguf_model,
+            gguf_arch,
+            name_mapper=_mapper,
+        )
     pkg = build_from_module(
         module, mtp_config, Qwen35MtpTask(), execution_provider=execution_provider
     )
-
-    def _mapper(gguf_name: str, _arch: str) -> str | None:
-        return map_gguf_mtp_to_hf_names(gguf_name, mtp_block_index)
 
     if preserve_quantization:
         state_dict = _load_quantized_state_dict(
@@ -207,6 +621,7 @@ def build_mtp_head_from_gguf(
             mtp_config,
             name_mapper=_mapper,
             warn_unmapped=False,
+            dequantize_float_linear_types={"lm_head": {"Q4_1"}},
         )
         # Mirror the backbone (build_from_gguf steps 7/7b): run process_tensors
         # over only the float tensors (native quant blocks were already

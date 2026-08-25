@@ -476,6 +476,7 @@ class TestCLIBuildGGUF:
             main(["build-gguf", "--help"])
         out = capsys.readouterr().out
         assert "--dequantize" in out
+        assert "--reuse-gguf-weights" in out
         assert "--output OUTPUT_DIR" in out
         assert "--keep-quantized" not in out, "the unread deprecated alias was removed"
         assert "--max-shard-size" in out, "shard sizing applies to GGUF builds too"
@@ -520,6 +521,8 @@ class TestCLIBuildGGUF:
 
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
+        package.mtp_head = None
+        package.draft_manifest = None
         package.values.return_value = iter(())
         with mock.patch(
             "mobius.integrations.gguf.build_from_gguf",
@@ -537,14 +540,73 @@ class TestCLIBuildGGUF:
 
         assert build.call_args.kwargs["keep_quantized"] is expected
 
-    def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
-        """build-gguf forwards the selected runtime after saving the graph."""
+    def test_reuse_flag_is_forwarded(self, tmp_path):
+        """The explicit CLI opt-in reaches the GGUF API unchanged."""
         from mobius.__main__ import main
 
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
+        package.values.return_value = iter(())
+        with mock.patch(
+            "mobius.integrations.gguf.build_from_gguf",
+            return_value=package,
+        ) as build:
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(tmp_path / "output"),
+                    "--reuse-gguf-weights",
+                ]
+            )
+
+        assert build.call_args.kwargs["reuse_gguf_weights"] is True
+
+    def test_reuse_rejects_ort_genai_runtime(self, tmp_path):
+        from mobius.__main__ import main
+
+        with pytest.raises(SystemExit, match="cannot be combined"):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(tmp_path / "output"),
+                    "--reuse-gguf-weights",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+    def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
+        """build-gguf forwards the selected runtime after saving the graph."""
+        from mobius.__main__ import main
+        from mobius.integrations.gguf._spec import Support
+
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(())
+        package.mtp_head = None
+        package.draft_manifest = None
         output_dir = tmp_path / "output"
         with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._reader.GGUFModel",
+                return_value=mock.Mock(metadata={}, architecture="llama"),
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._arch_registry.get_arch_spec",
+                return_value=mock.Mock(
+                    gguf_arch="llama",
+                    runtime=Support.SUPPORTED,
+                    reason=None,
+                ),
+            ),
             mock.patch(
                 "mobius.integrations.gguf.build_from_gguf",
                 return_value=package,
@@ -562,6 +624,10 @@ class TestCLIBuildGGUF:
                     str(output_dir),
                     "--runtime",
                     "ort-genai",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "a" * 40,
                 ]
             )
 
@@ -570,5 +636,50 @@ class TestCLIBuildGGUF:
             str(tmp_path / "model.gguf"),
             str(output_dir),
             runtime="ort-genai",
-            save_model=False,
+            runtime_version=None,
+            tokenizer_repository="owner/tokenizer",
+            tokenizer_revision="a" * 40,
+            local_files_only=False,
+            external_data="onnx",
+            max_shard_size_bytes=None,
+            max_workers=8,
         )
+
+    def test_runtime_without_pinned_tokenizer_fails_before_graph_or_output(self, tmp_path):
+        from mobius.__main__ import main
+        from mobius.integrations.gguf._spec import Support
+
+        output = tmp_path / "output"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._reader.GGUFModel",
+                return_value=mock.Mock(metadata={}, architecture="llama"),
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._arch_registry.get_arch_spec",
+                return_value=mock.Mock(
+                    gguf_arch="llama",
+                    runtime=Support.SUPPORTED,
+                    reason=None,
+                ),
+            ),
+            mock.patch("mobius.integrations.gguf.build_from_gguf") as build,
+            pytest.raises(SystemExit, match="requires --tokenizer-repository"),
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(output),
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+        build.assert_not_called()
+        assert not output.exists()

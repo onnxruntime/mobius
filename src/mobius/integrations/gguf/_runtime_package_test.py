@@ -1,27 +1,33 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for the shared GGUF runtime-package emitter."""
+"""Tests for atomic, tokenizer-gated GGUF runtime package emission."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
-from mobius.integrations.gguf import write_gguf_runtime_package
+from mobius.integrations.gguf import _runtime_package, write_gguf_runtime_package
+from mobius.integrations.gguf._spec import Support
+
+_TOKENIZER_REPOSITORY = "owner/tokenizer"
+_TOKENIZER_REVISION = "c" * 40
 
 
 class _FakePackage:
-    """Minimal stand-in for ModelPackage: records whether save() ran.
-
-    Deliberately not a ``dict`` subclass — the emitter only calls ``save()``
-    and reads ``config``, so mapping behaviour would be unused state.
-    """
-
     def __init__(self):
         self.config = object()
+        self.gguf_architecture = "llama"
+        self.gguf_execution_provider = "cpu"
+        self.gguf_import_route = '{"route_schema":1}'
+        self.gguf_artifact_identity = SimpleNamespace(
+            architecture="llama", filename="model.gguf", sha256="a" * 64
+        )
+        self.gguf_tokenizer_verdict = _materialized()
         self.saved_to: str | None = None
 
     def save(self, path, **kwargs):
@@ -29,92 +35,242 @@ class _FakePackage:
         Path(path).mkdir(parents=True, exist_ok=True)
         (Path(path) / "model.onnx").write_bytes(b"stub")
 
+    def __iter__(self):
+        return iter(("model",))
+
+
+def _materialized():
+    return SimpleNamespace(
+        materialized=True,
+        reason="exact embedded tokenizer",
+        metadata_sha256="f" * 64,
+    )
+
+
+def _write_tokenizer(_source, output, **_kwargs):
+    path = Path(output) / "tokenizer.json"
+    path.write_text("{}", encoding="utf-8")
+    return str(path)
+
+
+def _write_config(_pkg, output, **_kwargs):
+    path = Path(output) / "inference_metadata.yaml"
+    path.write_text("model: {}", encoding="utf-8")
+    return {"inference_metadata": str(path)}
+
+
+def _write_runtime(pkg, source, output, **kwargs):
+    return write_gguf_runtime_package(
+        pkg,
+        source,
+        output,
+        tokenizer_repository=_TOKENIZER_REPOSITORY,
+        tokenizer_revision=_TOKENIZER_REVISION,
+        **kwargs,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _runtime_supported():
+    with (
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.get_arch_spec",
+            return_value=SimpleNamespace(
+                runtime=Support.SUPPORTED,
+                reason=None,
+                gguf_arch="llama",
+                runtime_evidence_ids=("test-evidence",),
+            ),
+        ),
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
+            return_value=SimpleNamespace(
+                evidence_id="test-evidence",
+                graph_files=("model.onnx",),
+                graph_sha256=mock.ANY,
+                runtime_package_files=("model.onnx",),
+                runtime_package_sha256=mock.ANY,
+                tokenizer_repository=_TOKENIZER_REPOSITORY,
+                tokenizer_revision=_TOKENIZER_REVISION,
+                tokenizer_metadata_sha256="f" * 64,
+                tokenizer_assets=(("tokenizer.json", 2, "a" * 64),),
+            ),
+        ),
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.gguf_graph_package_identity",
+            return_value=SimpleNamespace(files=("model.onnx",), sha256=mock.ANY),
+        ),
+    ):
+        yield
+
 
 class TestWriteGgufRuntimePackage:
-    """A saved package must be loadable: graph + tokenizer + runtime contract."""
+    def test_atomic_publication_refuses_concurrent_destination(self, tmp_path):
+        stage = tmp_path / "stage"
+        stage.mkdir()
+        (stage / "model.onnx").write_bytes(b"staged")
+        output = tmp_path / "output"
+        output.mkdir()
 
-    def test_emits_graph_tokenizer_and_inference_metadata(self, tmp_path):
+        with pytest.raises(FileExistsError):
+            _runtime_package._publish_directory_no_replace(stage, output)
+
+        assert (stage / "model.onnx").read_bytes() == b"staged"
+        assert not list(output.iterdir())
+
+    def test_deferred_architecture_rejects_before_source_read_or_output(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"
-        tok = str(out / "tokenizer.json")
-
         with (
             mock.patch(
-                "mobius.integrations.gguf._runtime_package.write_gguf_tokenizer_json",
-                return_value=tok,
-            ) as write_tok,
-            mock.patch(
-                "mobius.integrations.onnx_genai.write_onnx_genai_config",
-                return_value={"inference_metadata": str(out / "inference_metadata.yaml")},
-            ) as write_cfg,
+                "mobius.integrations.gguf._runtime_package.get_arch_spec",
+                return_value=SimpleNamespace(
+                    runtime=Support.DEFERRED,
+                    reason="independent parity is missing",
+                ),
+            ),
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match=r"runtime packaging.*deferred"),
         ):
-            artifacts = write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out)
+            _write_runtime(pkg, tmp_path / "m.gguf", out)
+        read_source.assert_not_called()
+        assert not out.exists()
 
-        assert pkg.saved_to == str(out)
-        assert artifacts["tokenizer"] == tok
-        assert artifacts["inference_metadata"].endswith("inference_metadata.yaml")
-        write_tok.assert_called_once()
-        write_cfg.assert_called_once()
-
-    def test_ort_genai_runtime_emits_genai_config(self, tmp_path):
-        """Both runtimes are reachable from the one entry point.
-
-        A GGUF checkpoint has no Hugging Face source directory, so the
-        ort-genai writer is called without one; the tokenizer rebuilt from the
-        GGUF is the one the package ships.
-        """
+    def test_atomically_emits_graph_tokenizer_and_runtime_config(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"
-
         with (
             mock.patch(
-                "mobius.integrations.gguf._runtime_package.write_gguf_tokenizer_json",
-                return_value=str(out / "tokenizer.json"),
+                "mobius.integrations.gguf._runtime_package.GGUFModel",
+                return_value=SimpleNamespace(metadata={}, architecture="llama"),
             ),
             mock.patch(
-                "mobius.integrations.ort_genai.write_ort_genai_config",
-                return_value={"genai_config": str(out / "genai_config.json")},
-            ) as write_cfg,
+                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
+                return_value=_materialized(),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.materialize_gguf_tokenizer",
+                side_effect=_write_tokenizer,
+            ),
+            mock.patch(
+                "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                side_effect=_write_config,
+            ),
         ):
-            artifacts = write_gguf_runtime_package(
-                pkg, tmp_path / "m.gguf", out, runtime="ort-genai"
-            )
+            artifacts = _write_runtime(pkg, tmp_path / "m.gguf", out)
 
-        assert artifacts["genai_config"].endswith("genai_config.json")
-        assert "inference_metadata" not in artifacts
-        write_cfg.assert_called_once()
+        assert (out / "model.onnx").read_bytes() == b"stub"
+        assert Path(artifacts["tokenizer"]) == out / "tokenizer.json"
+        assert Path(artifacts["inference_metadata"]) == out / "inference_metadata.yaml"
+        assert not list(tmp_path.glob(".out.*.tmp"))
 
-    def test_unknown_runtime_is_rejected(self, tmp_path):
-        """Fail closed on an unrecognised runtime rather than silently picking one."""
-        with pytest.raises(ValueError, match="Unknown runtime"):
-            write_gguf_runtime_package(
-                _FakePackage(),
+    def test_missing_pinned_tokenizer_source_rejects_before_save_or_output(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        with (
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match="explicit tokenizer_repository"),
+        ):
+            write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out)
+        read_source.assert_not_called()
+        assert pkg.saved_to is None
+        assert not out.exists()
+
+    def test_replaced_source_tokenizer_rejects_before_save_or_output(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.GGUFModel",
+                return_value=SimpleNamespace(metadata={}, architecture="llama"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
+                return_value=SimpleNamespace(
+                    materialized=True,
+                    reason="replacement",
+                    metadata_sha256="different-tokenizer-metadata",
+                ),
+            ),
+            pytest.raises(ValueError, match="replaced tokenizer source"),
+        ):
+            _write_runtime(pkg, tmp_path / "m.gguf", out)
+        assert pkg.saved_to is None
+        assert not out.exists()
+
+    def test_existing_output_is_never_replaced(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        out.mkdir()
+        sentinel = out / "sentinel.bin"
+        sentinel.write_bytes(b"unchanged")
+        with (
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(FileExistsError, match="non-atomic directory replacement"),
+        ):
+            _write_runtime(pkg, tmp_path / "m.gguf", out)
+        read_source.assert_not_called()
+        assert {path.name: path.read_bytes() for path in out.iterdir()} == {
+            "sentinel.bin": b"unchanged"
+        }
+
+    def test_ort_genai_rejects_reused_gguf_weights(self, tmp_path):
+        pkg = _FakePackage()
+        pkg.gguf_reuse_plan = object()
+        with pytest.raises(ValueError, match="no supported setting"):
+            _write_runtime(
+                pkg,
                 tmp_path / "m.gguf",
                 tmp_path / "out",
-                runtime="tflite",
+                runtime="ort-genai",
             )
+        assert not (tmp_path / "out").exists()
 
-    def test_save_model_false_leaves_an_already_saved_graph_alone(self, tmp_path):
-        """The CLI saves the graph itself, then asks only for runtime artifacts."""
+    def test_target_coupled_draft_runtime_package_is_rejected(self, tmp_path):
         pkg = _FakePackage()
+        pkg.draft_manifest = {"architecture": "eagle3"}
         out = tmp_path / "out"
 
+        with pytest.raises(ValueError, match="target-coupled speculative draft"):
+            _write_runtime(
+                pkg,
+                tmp_path / "eagle3.gguf",
+                out,
+            )
+        assert pkg.saved_to is None
+        assert not out.exists()
+
+    @pytest.mark.parametrize("runtime", ["onnx-genai", "ort-genai"])
+    def test_runtime_rejects_unevidenced_mtp_before_source_read(self, tmp_path, runtime):
+        pkg = _FakePackage()
+        pkg.mtp_head = SimpleNamespace(config=object())
+        out = tmp_path / "out"
         with (
-            mock.patch(
-                "mobius.integrations.gguf._runtime_package.write_gguf_tokenizer_json",
-                return_value=None,
-            ),
-            mock.patch(
-                "mobius.integrations.onnx_genai.write_onnx_genai_config",
-                return_value={"inference_metadata": "x.yaml"},
-            ),
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match="runtime-evidenced GGUF MTP"),
         ):
-            artifacts = write_gguf_runtime_package(
-                pkg, tmp_path / "m.gguf", out, save_model=False
+            _write_runtime(pkg, tmp_path / "m.gguf", out, runtime=runtime)
+        read_source.assert_not_called()
+        assert not out.exists()
+
+    def test_unknown_runtime_rejects_before_source_read(self, tmp_path):
+        with pytest.raises(ValueError, match="Unknown runtime"):
+            write_gguf_runtime_package(
+                _FakePackage(), tmp_path / "m.gguf", tmp_path / "out", runtime="tflite"
             )
 
-        assert pkg.saved_to is None
-        # A GGUF with no tokenizer metadata yields no tokenizer key rather than
-        # a None value the caller would have to special-case.
-        assert "tokenizer" not in artifacts
-        assert artifacts["inference_metadata"] == "x.yaml"
+    def test_save_model_false_is_rejected_before_source_read(self, tmp_path):
+        with (
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match="save_model=False is not supported"),
+        ):
+            write_gguf_runtime_package(
+                _FakePackage(), tmp_path / "m.gguf", tmp_path / "output", save_model=False
+            )
+        read_source.assert_not_called()
+
+    def test_target_coupled_draft_rejects_before_source_read(self, tmp_path):
+        pkg = _FakePackage()
+        pkg.draft_manifest = {"architecture": "eagle3"}
+        with pytest.raises(ValueError, match="target-coupled speculative draft"):
+            _write_runtime(pkg, tmp_path / "m.gguf", tmp_path / "out")

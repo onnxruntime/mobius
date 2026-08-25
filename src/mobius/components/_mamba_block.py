@@ -19,11 +19,13 @@ HuggingFace reference: ``MambaMixer``, ``BambaMixer``,
 
 from __future__ import annotations
 
+import math
+
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, Linear
-from mobius.components._rms_norm import GatedRMSNorm
+from mobius.components._rms_norm import GatedRMSNorm, PostGatedRMSNorm
 from mobius.components._ssm import SelectiveScan
 
 
@@ -294,6 +296,20 @@ class Mamba2Block(nn.Module):
         eps: float = 1e-5,
         norm_group_size: int | None = None,
         time_step_min: float = 0.0,
+        time_step_max: float | None = None,
+        in_proj_bias: bool | None = None,
+        out_proj_bias: bool | None = None,
+        use_norm: bool = True,
+        norm_before_gate: bool = False,
+        input_multiplier: float = 1.0,
+        projection_multipliers: tuple[float, float, float, float, float] = (
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ),
+        output_multiplier: float = 1.0,
     ):
         super().__init__()
         self.d_model = d_model
@@ -306,11 +322,19 @@ class Mamba2Block(nn.Module):
         self.conv_kernel = conv_kernel
         self.heads_per_group = num_heads // n_groups
         self.time_step_min = time_step_min
+        self.time_step_max = time_step_max
+        self.input_multiplier = input_multiplier
+        self.projection_multipliers = projection_multipliers
+        self.output_multiplier = output_multiplier
 
         self.conv_dim = d_inner + 2 * n_groups * d_state
 
         proj_size = d_inner + self.conv_dim + num_heads
-        self.in_proj = Linear(d_model, proj_size, bias=proj_bias)
+        self.in_proj = Linear(
+            d_model,
+            proj_size,
+            bias=proj_bias if in_proj_bias is None else in_proj_bias,
+        )
         self.conv1d = _Mamba2DepthwiseConv1d(
             self.conv_dim,
             conv_kernel,
@@ -322,12 +346,16 @@ class Mamba2Block(nn.Module):
         self.A_log = nn.Parameter([num_heads])
         self.D = nn.Parameter([num_heads])
         self.dt_bias = nn.Parameter([num_heads])
-        self.norm = GatedRMSNorm(
+        if use_norm:
+            norm_cls = PostGatedRMSNorm if norm_before_gate else GatedRMSNorm
+            self.norm = norm_cls(d_inner, eps=eps, group_size=norm_group_size)
+        else:
+            self.norm = None
+        self.out_proj = Linear(
             d_inner,
-            eps=eps,
-            group_size=norm_group_size,
+            d_model,
+            bias=proj_bias if out_proj_bias is None else out_proj_bias,
         )
-        self.out_proj = Linear(d_inner, d_model, bias=proj_bias)
 
     def forward(
         self,
@@ -335,6 +363,7 @@ class Mamba2Block(nn.Module):
         hidden_states: ir.Value,
         conv_state: ir.Value,
         ssm_state: ir.Value,
+        padding_mask: ir.Value | None = None,
     ):
         """Forward pass for the Mamba2 block.
 
@@ -352,13 +381,35 @@ class Mamba2Block(nn.Module):
         """
         # Step 1: Input projection → gate, xBC, dt
         # projected: (B, T, d_inner + conv_dim + num_heads)
-        projected = self.in_proj(op, hidden_states)
+        mamba_input = hidden_states
+        if not math.isclose(self.input_multiplier, 1.0):
+            mamba_input = op.Mul(mamba_input, self.input_multiplier)
+        projected = self.in_proj(op, mamba_input)
         gate, x_bc, dt_raw = op.Split(
             projected,
             [self.d_inner, self.conv_dim, self.num_heads],
             axis=-1,
             _outputs=3,
         )
+        gate_scale, x_scale, b_scale, c_scale, dt_scale = self.projection_multipliers
+        if not math.isclose(gate_scale, 1.0):
+            gate = op.Mul(gate, gate_scale)
+        if not all(math.isclose(scale, 1.0) for scale in (x_scale, b_scale, c_scale)):
+            x_hidden, b_mat, c_mat = op.Split(
+                x_bc,
+                [self.d_inner, self.n_groups * self.d_state, self.n_groups * self.d_state],
+                axis=-1,
+                _outputs=3,
+            )
+            if not math.isclose(x_scale, 1.0):
+                x_hidden = op.Mul(x_hidden, x_scale)
+            if not math.isclose(b_scale, 1.0):
+                b_mat = op.Mul(b_mat, b_scale)
+            if not math.isclose(c_scale, 1.0):
+                c_mat = op.Mul(c_mat, c_scale)
+            x_bc = op.Concat(x_hidden, b_mat, c_mat, axis=-1)
+        if not math.isclose(dt_scale, 1.0):
+            dt_raw = op.Mul(dt_raw, dt_scale)
         # gate: (B, T, d_inner) — gating signal for GatedRMSNorm
         # x_bc: (B, T, conv_dim) — input to conv1d
         # dt_raw: (B, T, num_heads) — raw time step
@@ -369,6 +420,11 @@ class Mamba2Block(nn.Module):
         conv_out, new_conv_state = self.conv1d(op, x_bc_t, conv_state)
         # Transpose back: (B, T, conv_dim)
         x_bc_activated = op.Transpose(conv_out, perm=[0, 2, 1])
+        if padding_mask is not None:
+            x_bc_activated = op.Mul(
+                x_bc_activated,
+                op.CastLike(padding_mask, x_bc_activated),
+            )
 
         # Step 3: Split xBC → x, B, C
         gs = self.n_groups * self.d_state
@@ -391,8 +447,18 @@ class Mamba2Block(nn.Module):
 
         # dt = softplus(dt_raw + dt_bias): (B, T, num_heads)
         dt = op.Softplus(op.Add(dt_raw_f32, dt_bias_f32))
-        if self.time_step_min > 0.0:
-            dt = op.Clip(dt, op.Constant(value_float=self.time_step_min))
+        if self.time_step_min > 0.0 or self.time_step_max is not None:
+            min_value = (
+                op.Constant(value_float=self.time_step_min)
+                if self.time_step_min > 0.0
+                else None
+            )
+            max_value = (
+                op.Constant(value_float=self.time_step_max)
+                if self.time_step_max is not None
+                else None
+            )
+            dt = op.Clip(dt, min_value, max_value)
 
         # decay = A * dt in log-space: g_t where exp(g_t) is the decay
         # A = -exp(A_log), so decay = -exp(A_log) * dt
@@ -457,10 +523,14 @@ class Mamba2Block(nn.Module):
         y = op.Add(la_output, d_skip)
 
         # Step 9: GatedRMSNorm
-        y_normed = self.norm(op, y, gate)
+        y_normed = (
+            self.norm(op, y, gate) if self.norm is not None else op.Mul(y, op.Swish(gate))
+        )
 
         # Step 10: Output projection
         output = self.out_proj(op, y_normed)
+        if not math.isclose(self.output_multiplier, 1.0):
+            output = op.Mul(output, self.output_multiplier)
 
         return output, new_conv_state, new_ssm_state
 

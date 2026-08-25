@@ -25,6 +25,7 @@ from __future__ import annotations
 __all__ = ["GGUFModel"]
 
 import logging
+import mmap
 from array import array
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,7 +33,14 @@ from typing import Any
 
 import numpy as np
 
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
+
 logger = logging.getLogger(__name__)
+
+
+def _stat_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
 def _parse_field_value(field) -> Any:
@@ -98,12 +106,7 @@ def _parse_array(data: list[int], parts: list, element_type) -> list[Any]:
         result = []
         for idx in data:
             part = parts[idx]
-            try:
-                result.append(array("B", list(part)).tobytes().decode())
-            except UnicodeDecodeError:
-                result.append(
-                    array("B", list(part)).tobytes().decode("utf-8", errors="replace")
-                )
+            result.append(array("B", list(part)).tobytes().decode("utf-8"))
         return result
 
     # Numeric arrays: data indices point into the parts list
@@ -158,12 +161,49 @@ class GGUFModel:
         if not self._path.is_file():
             raise FileNotFoundError(f"GGUF file not found: {self._path}")
 
+        source_identity = _stat_identity(self._path)
+        if source_identity[2] < 24:
+            raise ValueError(f"{str(self._path)!r} does not begin with a valid GGUF header.")
+        with (
+            self._path.open("rb") as stream,
+            mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ) as mapped,
+        ):
+            _gguf_architecture_from_header(
+                mapped,
+                source=str(self._path),
+                require_architecture=False,
+            )
         self._reader = GGUFReader(str(self._path))
+        if _stat_identity(self._path) != source_identity:
+            raise ValueError("GGUF source changed while the reader was opening it")
+        self._source_identity = source_identity
+        with self._path.open("rb") as stream:
+            header = stream.read(8)
+        if len(header) != 8 or header[:4] != b"GGUF":
+            raise ValueError(f"Invalid GGUF header in {self._path}")
+        little_version = int.from_bytes(header[4:], byteorder="little")
+        self._format_version = (
+            little_version
+            if little_version <= 0xFFFF
+            else int.from_bytes(header[4:], byteorder="big")
+        )
         self._metadata: dict[str, Any] | None = None
         # Build tensor name → index map for O(1) lookup
         self._tensor_index: dict[str, int] = {
             t.name: i for i, t in enumerate(self._reader.tensors)
         }
+
+    @property
+    def format_version(self) -> int:
+        """GGUF container version parsed from the file header."""
+        return self._format_version
+
+    def source_matches_path(self) -> bool:
+        """Return whether the path still names the exact file opened by this reader."""
+        try:
+            return _stat_identity(self._path) == self._source_identity
+        except OSError:
+            return False
 
     @property
     def architecture(self) -> str:
@@ -186,7 +226,11 @@ class GGUFModel:
             for key, field in self._reader.fields.items():
                 try:
                     self._metadata[key] = _parse_field_value(field)
-                except Exception:
+                except Exception as error:
+                    if key.startswith("tokenizer."):
+                        raise ValueError(
+                            f"Failed to parse GGUF tokenizer metadata field {key!r}"
+                        ) from error
                     logger.debug("Failed to parse GGUF field '%s'", key)
         return self._metadata
 
@@ -229,6 +273,11 @@ class GGUFModel:
         which yields the records of every shard in order.
         """
         return list(self._reader.tensors)
+
+    @property
+    def is_little_endian(self) -> bool:
+        """Whether raw tensor payloads use ONNX-compatible little-endian bytes."""
+        return getattr(self._reader.endianess, "name", None) == "LITTLE"
 
     def _dequantize_tensor(self, tensor) -> np.ndarray:
         """Dequantize a single :class:`ReaderTensor` to a numpy array.
@@ -342,6 +391,24 @@ class GGUFModel:
         if name not in self._tensor_index:
             raise KeyError(f"Tensor '{name}' not found in GGUF file.")
         return self._reader.get_tensor(self._tensor_index[name]).tensor_type
+
+    def tensor_storage_range(self, name: str) -> tuple[int, int, str]:
+        """Return the exact file offset, byte length, and qtype for a tensor."""
+        if name not in self._tensor_index:
+            raise KeyError(f"Tensor '{name}' not found in GGUF file.")
+        tensor = self._reader.get_tensor(self._tensor_index[name])
+        return (
+            int(tensor.data_offset),
+            int(tensor.n_bytes),
+            str(getattr(tensor.tensor_type, "name", tensor.tensor_type)),
+        )
+
+    def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+        """Get a tensor's logical numpy shape without reading its payload."""
+        if name not in self._tensor_index:
+            raise KeyError(f"Tensor '{name}' not found in GGUF file.")
+        tensor = self._reader.get_tensor(self._tensor_index[name])
+        return tuple(int(dim) for dim in reversed(tensor.shape))
 
     def __repr__(self) -> str:
         arch = self.architecture if self._reader else "?"

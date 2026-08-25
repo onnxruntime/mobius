@@ -30,6 +30,7 @@ from mobius.components._common import (
     Linear,
     create_padding_mask,
 )
+from mobius.models.base import linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -42,21 +43,21 @@ if TYPE_CHECKING:
 class _BertSelfAttention(nn.Module):
     """Self-attention projections: query, key, value (HF naming)."""
 
-    def __init__(self, hidden_size: int, num_heads: int, bias: bool):
+    def __init__(self, hidden_size: int, num_heads: int, bias: bool, linear_class=Linear):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.query = Linear(hidden_size, hidden_size, bias=bias)
-        self.key = Linear(hidden_size, hidden_size, bias=bias)
-        self.value = Linear(hidden_size, hidden_size, bias=bias)
+        self.query = linear_class(hidden_size, hidden_size, bias=bias)
+        self.key = linear_class(hidden_size, hidden_size, bias=bias)
+        self.value = linear_class(hidden_size, hidden_size, bias=bias)
 
 
 class _BertAttentionOutput(nn.Module):
     """Attention output projection + LayerNorm (HF naming)."""
 
-    def __init__(self, hidden_size: int, eps: float, bias: bool):
+    def __init__(self, hidden_size: int, eps: float, bias: bool, linear_class=Linear):
         super().__init__()
-        self.dense = Linear(hidden_size, hidden_size, bias=bias)
+        self.dense = linear_class(hidden_size, hidden_size, bias=bias)
         # Capital 'LayerNorm' matches HF BERT naming
         self.LayerNorm = LayerNorm(hidden_size, eps=eps)
 
@@ -70,12 +71,19 @@ class _BertAttention(nn.Module):
       attention.output.LayerNorm.weight
     """
 
-    def __init__(self, hidden_size: int, num_heads: int, eps: float, bias: bool):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        eps: float,
+        bias: bool,
+        linear_class=Linear,
+    ):
         super().__init__()
         # 'self' is a valid Python attribute name (HF uses it)
-        self_attn = _BertSelfAttention(hidden_size, num_heads, bias)
+        self_attn = _BertSelfAttention(hidden_size, num_heads, bias, linear_class)
         self.self = self_attn
-        self.output = _BertAttentionOutput(hidden_size, eps, bias)
+        self.output = _BertAttentionOutput(hidden_size, eps, bias, linear_class)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, attention_mask: ir.Value):
         """Bidirectional self-attention.
@@ -112,9 +120,10 @@ class _BertIntermediate(nn.Module):
         intermediate_size: int,
         hidden_act: str,
         bias: bool,
+        linear_class=Linear,
     ):
         super().__init__()
-        self.dense = Linear(hidden_size, intermediate_size, bias=bias)
+        self.dense = linear_class(hidden_size, intermediate_size, bias=bias)
         self._act_fn = ACT2FN[hidden_act]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -124,9 +133,16 @@ class _BertIntermediate(nn.Module):
 class _BertOutput(nn.Module):
     """BERT output (down-projection + LayerNorm, HF naming)."""
 
-    def __init__(self, intermediate_size: int, hidden_size: int, eps: float, bias: bool):
+    def __init__(
+        self,
+        intermediate_size: int,
+        hidden_size: int,
+        eps: float,
+        bias: bool,
+        linear_class=Linear,
+    ):
         super().__init__()
-        self.dense = Linear(intermediate_size, hidden_size, bias=bias)
+        self.dense = linear_class(intermediate_size, hidden_size, bias=bias)
         self.LayerNorm = LayerNorm(hidden_size, eps=eps)
 
 
@@ -149,11 +165,30 @@ class _BertEncoderLayer(nn.Module):
         hidden_act: str = "gelu",
         layer_norm_eps: float = 1e-12,
         bias: bool = True,
+        linear_class=Linear,
     ):
         super().__init__()
-        self.attention = _BertAttention(hidden_size, num_attention_heads, layer_norm_eps, bias)
-        self.intermediate = _BertIntermediate(hidden_size, intermediate_size, hidden_act, bias)
-        self.output = _BertOutput(intermediate_size, hidden_size, layer_norm_eps, bias)
+        self.attention = _BertAttention(
+            hidden_size,
+            num_attention_heads,
+            layer_norm_eps,
+            bias,
+            linear_class,
+        )
+        self.intermediate = _BertIntermediate(
+            hidden_size,
+            intermediate_size,
+            hidden_act,
+            bias,
+            linear_class,
+        )
+        self.output = _BertOutput(
+            intermediate_size,
+            hidden_size,
+            layer_norm_eps,
+            bias,
+            linear_class,
+        )
 
     def forward(
         self,
@@ -274,6 +309,7 @@ class _BertEncoder(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        linear_class = linear_class_for_config(config) or Linear
         self.layer = nn.ModuleList(
             [
                 _BertEncoderLayer(
@@ -283,6 +319,7 @@ class _BertEncoder(nn.Module):
                     hidden_act=config.hidden_act,
                     layer_norm_eps=config.rms_norm_eps,
                     bias=True,
+                    linear_class=linear_class,
                 )
                 for _ in range(config.num_hidden_layers)
             ]

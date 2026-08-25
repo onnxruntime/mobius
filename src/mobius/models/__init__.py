@@ -44,6 +44,7 @@ __all__ = [
     "ErnieCausalLMModel",
     "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
+    "FalconH1ForCausalLM",
     "FluxTransformer2DModel",
     "FunASRForConditionalGeneration",
     "GPT2CausalLMModel",
@@ -80,11 +81,16 @@ __all__ = [
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
+    "KimiK3CausalLMModel",
+    "KimiLinearCausalLMModel",
     "Llama4CausalLMModel",
+    "DreamModel",
     "LLaDAModel",
+    "LLaDAMoEModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "Lfm2CausalLMModel",
+    "Lfm2MoECausalLMModel",
     "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
@@ -115,6 +121,7 @@ __all__ = [
     "PersimmonCausalLMModel",
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
+    "PhiMoEGGUFCausalLMModel",
     "Phi3SmallCausalLMModel",
     "Phi3VModel",
     "Phi4MMCausalLMModel",
@@ -148,6 +155,7 @@ __all__ = [
     "Qwen3TTSCodecEncoderModel",
     "Qwen3TTSEmbeddingModel",
     "Qwen3TTSForConditionalGeneration",
+    "RND1Model",
     "Qwen3TTSSpeakerEncoderModel",
     "Qwen3TTSTalkerDecoderModel",
     "Qwen3TTSTokenizerV2Model",
@@ -179,6 +187,7 @@ __all__ = [
     "mimi_default_config",
     "moshi_depformer_config",
     "moshi_temporal_config",
+    "Plamo2ForCausalLM",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -222,6 +231,7 @@ from mobius.models.falcon import (
     FalconCausalLMModel,
     MPTCausalLMModel,
 )
+from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.flux_sd3 import FluxTransformer2DModel, SD3Transformer2DModel
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma import Gemma2CausalLMModel, GemmaCausalLMModel
@@ -251,9 +261,11 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
-from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.kimi_k3 import KimiK3CausalLMModel
+from mobius.models.kimi_linear import KimiLinearCausalLMModel
+from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
-from mobius.models.llada import LLaDAModel
+from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
@@ -275,6 +287,7 @@ from mobius.models.moe import (
     HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,
+    PhiMoEGGUFCausalLMModel,
     Qwen2MoECausalLMModel,
 )
 from mobius.models.moonshine import MoonshineForConditionalGeneration
@@ -306,6 +319,7 @@ from mobius.models.phi import (
 from mobius.models.phi3 import Phi3CausalLMModel
 from mobius.models.phi3_v import Phi3VModel
 from mobius.models.phi4_siglip import Phi4SigLIPModel
+from mobius.models.plamo2 import Plamo2ForCausalLM
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,

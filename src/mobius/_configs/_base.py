@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -21,6 +22,9 @@ from mobius._configs._sub_configs import (
     TTSConfig,
     VisionConfig,
 )
+
+if TYPE_CHECKING:
+    from mobius.integrations._block_quant import BlockQuantScheme
 
 DEFAULT_INT = -42
 
@@ -390,6 +394,14 @@ class BaseModelConfig:
 
     # Model dtype (from HF config dtype)
     dtype: ir.DataType = ir.DataType.FLOAT
+    quantization: QuantizationConfig | None = None
+
+    # HuggingFace identity and token metadata used by package persistence.
+    model_type: str | None = None
+    bos_token_id: int | None = None
+    eos_token_id: int | list[int] | None = None
+    mask_token_id: int | None = None
+    diffusion_shift_logits: bool = False
 
 
 @dataclasses.dataclass
@@ -410,6 +422,8 @@ class ArchitectureConfig(BaseModelConfig):
     linear_value_head_dim: int | None = None
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
+    linear_gate_lower_bound: float | None = None
+    linear_use_full_rank_gate: bool = False
 
     # Double-gated short-convolution config (LFM2-style hybrid layers).
     short_conv_kernel: int = 3
@@ -450,8 +464,11 @@ class ArchitectureConfig(BaseModelConfig):
 
     # Encoder-decoder config
     num_decoder_layers: int | None = None
+    decoder_start_token_id: int | None = None
     relative_attention_num_buckets: int = 32
     relative_attention_max_distance: int = 128
+    encoder_relative_attention_bias_layers: list[int] | None = None
+    decoder_relative_attention_bias_layers: list[int] | None = None
     is_gated_act: bool = False
     scale_decoder_outputs: bool | None = None
 
@@ -471,6 +488,16 @@ class ArchitectureConfig(BaseModelConfig):
     topk_method: str = "greedy"
     first_k_dense_replace: int = 0
     n_shared_experts: int | None = None
+    disable_qmoe: bool = False
+
+    # MiniMax-01 hybrid attention and normalized-residual scaling.
+    lightning_norm_eps: float | None = None
+    full_attn_alpha_factor: float = 1.0
+    full_attn_beta_factor: float = 1.0
+    linear_attn_alpha_factor: float = 1.0
+    linear_attn_beta_factor: float = 1.0
+    mlp_alpha_factor: float = 1.0
+    mlp_beta_factor: float = 1.0
 
     # Multi-head Latent Attention (MLA) config — DeepSeek-V2/V3
     q_lora_rank: int | None = None
@@ -479,6 +506,14 @@ class ArchitectureConfig(BaseModelConfig):
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
     rope_interleave: bool = False
+    mla_use_output_gate: bool = False
+
+    # Kimi-K3 attention-residual and latent-expert configuration.
+    attn_res_block_size: int | None = None
+    routed_expert_hidden_size: int | None = None
+    latent_moe_use_norm: bool = False
+    activation_situ_beta: float = 1.0
+    activation_situ_linear_beta: float | None = None
 
     # DeepSeek-V4 compressed sparse attention / Hyper-Connections.
     o_groups: int = 1
@@ -494,6 +529,17 @@ class ArchitectureConfig(BaseModelConfig):
     num_hash_layers: int = 0
     swiglu_limit: float = 0.0
     num_nextn_predict_layers: int = 0
+    # DeepSeek-V4 native compressed-sparse-attention export toggle. Not an
+    # upstream HF field -- a Mobius export-time opt-in (default False) that
+    # replaces the dense CSA/HCA correctness fallback with the frozen
+    # ``pkg.nxrt::CompressedSparseAttention`` v1 op for property-matching
+    # ratio-128 (HCA) layers. Off by default so every shipped graph stays
+    # byte-identical and ``pkg.nxrt``-free unless explicitly requested via
+    # ``config_overrides={"native_csa": True}``. When requested, layers that
+    # do not satisfy the frozen op contract raise a typed export error rather
+    # than silently emitting the dense fallback (see
+    # ``mobius.models._deepseek_v4_csa``).
+    native_csa: bool = False
 
     # GLM-5.2 (``glm_moe_dsa``) DeepSeek Sparse Attention (DSA).
     #
@@ -503,6 +549,12 @@ class ArchitectureConfig(BaseModelConfig):
     # (reusing ``DeepSeekV3TextModel`` unchanged) on runtimes that cannot yet
     # execute ``pkg.nxrt::IndexShare``.
     use_dsa: bool = True
+    # Opt-in export of ``com.microsoft::PagedAttention`` (LATENT / absorbed-MLA
+    # mode) for property-compatible dense MLA. Default off. When off, exports are
+    # byte-identical to the current dense-MLA graph. Eligibility is decided from
+    # semantic geometry (see ``mobius.components._paged_mla``), never model names;
+    # an incompatible geometry raises rather than silently falling back.
+    export_paged_attention: bool = False
     # Per-layer indexer schedule ("full" runs the indexer; "shared" reuses the
     # top-k selection from the closest preceding "full" layer). When the
     # checkpoint config omits this list, it is derived from
@@ -620,7 +672,16 @@ class ArchitectureConfig(BaseModelConfig):
     codec_decoder: CodecDecoderConfig | None = None
     codec_encoder: CodecEncoderConfig | None = None
     quantization: QuantizationConfig | None = None
-
+    # Deferred block-scaled FP8 / packed-FP4 scheme (DeepSeek-V4-Flash native
+    # CSA). Recorded by ``from_transformers`` when ``native_csa`` opts into
+    # deferring #602's config-resolution block-quant reject so that graph
+    # construction can progress past the former generic weight-shape mismatch.
+    # The runtime-capability gate
+    # (``mobius.models._deepseek_v4_csa.assert_native_runtime_supports_block_quant``)
+    # then fails closed on the *runnable* full export until nxrt advertises real
+    # block-FP8 / planar-FP4 format strings. ``None`` for every ordinary,
+    # per-tensor-fp8, or non-native path.
+    block_quant_scheme: BlockQuantScheme | None = None
     # HuggingFace model_type and special token IDs — populated by from_transformers()
     # so that genai_config.json can be written without re-fetching the HF config.
     model_type: str | None = None
@@ -637,6 +698,9 @@ class ArchitectureConfig(BaseModelConfig):
     # ``model(..., output_hidden_states=True).hidden_states[k + 1]`` in
     # transformers (where index 0 is the embedding output).
     output_layer_indices: list[int] | None = None
+    # Emit the post-final-norm state as ``mtp_seed``. This is separate from
+    # output_layer_indices, whose hidden_states.N outputs remain pre-final-norm.
+    output_final_hidden_state: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
@@ -746,6 +810,8 @@ class ArchitectureConfig(BaseModelConfig):
             model_type=model_type,
             bos_token_id=getattr(config, "bos_token_id", None),
             eos_token_id=getattr(config, "eos_token_id", None),
+            mask_token_id=getattr(config, "mask_token_id", None),
+            diffusion_shift_logits=getattr(config, "diffusion_shift_logits", False),
             video_token_id=getattr(
                 parent_config or config,
                 "video_token_id",
@@ -963,6 +1029,11 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", 0.0),
             num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
+            # DeepSeek-V4 native CSA/HCA export opt-in. No HF equivalent --
+            # every checkpoint defaults to the dense correctness fallback;
+            # ``config_overrides={"native_csa": True}`` opts a build into the
+            # frozen ``pkg.nxrt::CompressedSparseAttention`` v1 ratio-128 path.
+            native_csa=getattr(config, "native_csa", False),
             # GLM-5.2 DSA. ``use_dsa`` has no HF equivalent -- every checkpoint
             # defaults to the sparse path; ``--glm-full-attention`` overrides
             # it afterwards via ``dataclasses.replace``/``config_overrides``.
@@ -985,11 +1056,18 @@ class ArchitectureConfig(BaseModelConfig):
                 getattr(config, "num_decoder_layers", None)
                 or getattr(config, "decoder_layers", None)
             ),
+            decoder_start_token_id=getattr(config, "decoder_start_token_id", None),
             relative_attention_num_buckets=getattr(
                 config, "relative_attention_num_buckets", 32
             ),
             relative_attention_max_distance=getattr(
                 config, "relative_attention_max_distance", 128
+            ),
+            encoder_relative_attention_bias_layers=getattr(
+                config, "encoder_relative_attention_bias_layers", None
+            ),
+            decoder_relative_attention_bias_layers=getattr(
+                config, "decoder_relative_attention_bias_layers", None
             ),
             is_gated_act=getattr(config, "is_gated_act", False),
             scale_decoder_outputs=getattr(config, "scale_decoder_outputs", None),
@@ -1016,7 +1094,7 @@ class ArchitectureConfig(BaseModelConfig):
         )
 
         # Falcon/Bloom model-specific overrides
-        if model_type in ("falcon", "falcon_h1"):
+        if model_type == "falcon":
             # Falcon MQA: multi_query=True with old architecture → 1 KV head
             if getattr(config, "multi_query", False) and not getattr(
                 config, "new_decoder_architecture", False
@@ -1191,8 +1269,28 @@ class ArchitectureConfig(BaseModelConfig):
         if resolved is not None:
             options["dtype"] = resolved
 
-        # Quantization config
-        quant = QuantizationConfig.from_transformers(config)
+        # Quantization config. Block-scaled FP8 / packed-FP4 checkpoints
+        # (DeepSeek-V4-Flash) are rejected here by #602's typed
+        # ``BlockQuantExportError`` (the INT4/per-tensor path cannot load them).
+        # For a native-CSA export we *defer* that reject so graph construction
+        # can progress past the former generic weight-shape mismatch; the
+        # runtime-capability gate
+        # (``mobius.models._deepseek_v4_csa.assert_native_runtime_supports_block_quant``,
+        # invoked at weight-load / full-export) then fails closed until nxrt
+        # advertises real block-FP8 / planar-FP4 format strings. Every non-native
+        # path keeps #602's early, loud reject.
+        from mobius.integrations._block_quant import (
+            BlockQuantExportError,
+            BlockQuantScheme,
+        )
+
+        try:
+            quant = QuantizationConfig.from_transformers(config)
+        except BlockQuantExportError:
+            if not getattr(config, "native_csa", False):
+                raise
+            options["block_quant_scheme"] = BlockQuantScheme.from_hf_config(config)
+            quant = None
         if quant is None and parent_config is not None:
             quant = QuantizationConfig.from_transformers(parent_config)
         if quant is not None:
@@ -1358,6 +1456,283 @@ class CausalLMConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class MiniMaxConfig(CausalLMConfig):
+    """Exact configuration for MiniMax-Text-01 and MiniMax-M1 backbones."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MiniMaxConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        raw_schedule = getattr(config, "attn_type_list", None)
+        if raw_schedule is None:
+            raise ValueError("MiniMax-01 config requires an explicit attn_type_list")
+        if len(raw_schedule) != base.num_hidden_layers:
+            raise ValueError(
+                "MiniMax-01 attn_type_list must contain exactly "
+                f"{base.num_hidden_layers} entries, got {len(raw_schedule)}"
+            )
+        if any(value not in (0, 1, False, True) for value in raw_schedule):
+            raise ValueError("MiniMax-01 attn_type_list entries must be 0 or 1")
+        if not bool(getattr(config, "postnorm", True)):
+            raise ValueError("MiniMax-01 requires postnorm=true")
+        if int(getattr(config, "shared_intermediate_size", 0) or 0):
+            raise ValueError(
+                "MiniMax-01 shared experts are not supported by the pinned GGUF architecture"
+            )
+
+        beta_names = (
+            "layernorm_full_attention_beta",
+            "layernorm_linear_attention_beta",
+            "layernorm_mlp_beta",
+        )
+        betas = {name: float(getattr(config, name, 1.0)) for name in beta_names}
+        if any(not math.isclose(value, 1.0) for value in betas.values()):
+            raise ValueError(f"MiniMax-01 beta residual factors must all equal 1.0: {betas}")
+
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="minimax",
+            layer_types=[
+                "full_attention" if int(value) == 1 else "lightning_attention"
+                for value in raw_schedule
+            ],
+            hidden_act="silu",
+            norm_topk_prob=True,
+            disable_qmoe=True,
+            lightning_norm_eps=float(getattr(config, "lightning_norm_eps", 1e-6)),
+            full_attn_alpha_factor=float(
+                getattr(config, "layernorm_full_attention_alpha", 1.0)
+            ),
+            full_attn_beta_factor=betas["layernorm_full_attention_beta"],
+            linear_attn_alpha_factor=float(
+                getattr(config, "layernorm_linear_attention_alpha", 1.0)
+            ),
+            linear_attn_beta_factor=betas["layernorm_linear_attention_beta"],
+            mlp_alpha_factor=float(getattr(config, "layernorm_mlp_alpha", 1.0)),
+            mlp_beta_factor=betas["layernorm_mlp_beta"],
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
+class KimiLinearConfig(CausalLMConfig):
+    """Exact configuration for Moonshot Kimi Linear models."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> KimiLinearConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        linear = _as_attribute_config(getattr(config, "linear_attn_config", None))
+        if linear is None:
+            raise ValueError("Kimi Linear requires linear_attn_config")
+
+        kda_layers = [int(i) for i in getattr(linear, "kda_layers", ())]
+        full_layers = [int(i) for i in getattr(linear, "full_attn_layers", ())]
+        expected = set(range(1, base.num_hidden_layers + 1))
+        if set(kda_layers) & set(full_layers):
+            raise ValueError("Kimi Linear KDA and full-attention schedules must not overlap")
+        if set(kda_layers) | set(full_layers) != expected:
+            raise ValueError(
+                "Kimi Linear schedules must exactly partition one-based layer indices "
+                f"1..{base.num_hidden_layers}"
+            )
+        if len(kda_layers) != len(set(kda_layers)) or len(full_layers) != len(
+            set(full_layers)
+        ):
+            raise ValueError("Kimi Linear schedules must not contain duplicate layers")
+        if not bool(getattr(config, "mla_use_nope", False)):
+            raise ValueError("Kimi Linear requires mla_use_nope=true")
+        if getattr(config, "q_lora_rank", None) not in (None, 0):
+            raise ValueError("Kimi Linear Q-LoRA is not supported by the authoritative graph")
+        if int(getattr(config, "num_nextn_predict_layers", 0)):
+            raise ValueError("Kimi Linear NextN prediction layers are not supported")
+        if int(getattr(config, "moe_layer_freq", 1)) != 1:
+            raise ValueError("Kimi Linear requires moe_layer_freq=1")
+        if str(getattr(config, "moe_router_activation_func", "")) != "sigmoid":
+            raise ValueError("Kimi Linear requires sigmoid expert routing")
+        if not bool(getattr(config, "moe_renormalize", False)):
+            raise ValueError("Kimi Linear requires selected expert weight renormalization")
+        n_group = int(vars(config).get("num_expert_group", 1))
+        topk_group = int(vars(config).get("topk_group", 1))
+        if n_group != 1 or topk_group != 1:
+            raise ValueError(
+                "Kimi Linear supports only the pinned single expert-group profile"
+            )
+
+        num_heads = int(vars(linear).get("num_heads", base.num_attention_heads))
+        head_dim = int(linear.head_dim)
+        conv_kernel = int(linear.short_conv_kernel_size)
+        if num_heads != base.num_attention_heads:
+            raise ValueError("Kimi Linear KDA and MLA head counts must match")
+        if conv_kernel < 2:
+            raise ValueError("Kimi Linear short_conv_kernel_size must be at least 2")
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="kimi_linear",
+            layer_types=[
+                "kimi_linear_attention" if i + 1 in set(kda_layers) else "full_attention"
+                for i in range(base.num_hidden_layers)
+            ],
+            linear_num_key_heads=num_heads,
+            linear_num_value_heads=num_heads,
+            linear_key_head_dim=head_dim,
+            linear_value_head_dim=head_dim,
+            linear_conv_kernel_dim=conv_kernel,
+            num_local_experts=int(config.num_experts),
+            num_experts_per_tok=int(config.num_experts_per_token),
+            n_group=n_group,
+            topk_group=topk_group,
+            n_shared_experts=int(config.num_shared_experts),
+            norm_topk_prob=True,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            disable_qmoe=True,
+            rope_type=None,
+            rope_theta=None,
+            rope_scaling=None,
+            partial_rotary_factor=None,
+        )
+        result = cls(**fields)
+        if result.qk_nope_head_dim is None or result.qk_rope_head_dim is None:
+            raise ValueError("Kimi Linear requires both MLA key dimension fields")
+        if result.v_head_dim is None or result.kv_lora_rank is None:
+            raise ValueError("Kimi Linear requires MLA value dimension and KV-LoRA rank")
+        return result
+
+
+@dataclasses.dataclass
+class KimiK3Config(CausalLMConfig):
+    """Text-decoder configuration extracted from the composite Kimi-K3 config."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> KimiK3Config:
+        parent = parent_config or config
+        text = _as_attribute_config(getattr(config, "text_config", None)) or config
+        base = ArchitectureConfig.from_transformers(text, parent)
+        if (
+            base.quantization is not None
+            and base.quantization.quant_method == "compressed-tensors"
+        ):
+            raise NotImplementedError(
+                "Kimi-K3 compressed-tensors checkpoints use selective MXFP4 routed "
+                "experts, which are not representable by the generic quantized-linear "
+                "loader. Use a GGUF checkpoint or an unquantized state dict."
+            )
+        linear = _as_attribute_config(getattr(text, "linear_attn_config", None))
+        if linear is None:
+            raise ValueError("Kimi-K3 requires text_config.linear_attn_config")
+
+        kda_layers = [int(i) for i in getattr(linear, "kda_layers", ())]
+        full_layers = [int(i) for i in getattr(linear, "full_attn_layers", ())]
+        expected = set(range(1, base.num_hidden_layers + 1))
+        if (
+            set(kda_layers) & set(full_layers)
+            or set(kda_layers) | set(full_layers) != expected
+            or len(kda_layers) != len(set(kda_layers))
+            or len(full_layers) != len(set(full_layers))
+        ):
+            raise ValueError(
+                "Kimi-K3 KDA and MLA schedules must uniquely partition one-based "
+                f"layer indices 1..{base.num_hidden_layers}"
+            )
+        if not bool(getattr(text, "mla_use_nope", False)):
+            raise ValueError("Kimi-K3 requires mla_use_nope=true")
+        if not bool(getattr(text, "mla_use_output_gate", False)):
+            raise ValueError("Kimi-K3 requires mla_use_output_gate=true")
+        if not bool(getattr(linear, "use_full_rank_gate", False)):
+            raise ValueError("Kimi-K3 requires a full-rank KDA output gate")
+        raw_lower_bound = float(getattr(linear, "gate_lower_bound", 0.0))
+        if raw_lower_bound >= 0.0:
+            raise ValueError("Kimi-K3 gate_lower_bound must be negative")
+        if int(getattr(text, "first_k_dense_replace", 0)) != 1:
+            raise ValueError("Kimi-K3 requires exactly one leading dense layer")
+        if int(getattr(text, "num_shared_experts", 0)) != 2:
+            raise ValueError("Kimi-K3 requires exactly two shared experts")
+        if str(getattr(text, "hidden_act", "")) != "situ":
+            raise ValueError("Kimi-K3 requires SiTU expert activation")
+        if not math.isclose(float(getattr(text, "activation_situ_beta", 0.0)), 4.0):
+            raise ValueError("Kimi-K3 requires activation_situ_beta=4")
+        if not math.isclose(float(getattr(text, "activation_situ_linear_beta", 0.0)), 25.0):
+            raise ValueError("Kimi-K3 requires activation_situ_linear_beta=25")
+        if not bool(getattr(text, "latent_moe_use_norm", False)):
+            raise ValueError("Kimi-K3 requires latent MoE RMS normalization")
+        if getattr(text, "routed_expert_hidden_size", None) is None:
+            raise ValueError("Kimi-K3 requires routed_expert_hidden_size")
+        if getattr(text, "q_lora_rank", None) in (None, 0):
+            raise ValueError("Kimi-K3 requires Q-LoRA")
+        if bool(getattr(text, "tie_word_embeddings", False)):
+            raise ValueError("Kimi-K3 requires an untied LM head")
+        if str(getattr(text, "moe_router_activation_func", "")) != "sigmoid":
+            raise ValueError("Kimi-K3 requires sigmoid expert routing")
+        if not bool(getattr(text, "moe_renormalize", False)):
+            raise ValueError("Kimi-K3 requires selected expert weight renormalization")
+        if int(getattr(text, "moe_layer_freq", 1)) != 1:
+            raise ValueError("Kimi-K3 requires MoE in every layer after layer zero")
+        if str(getattr(text, "topk_method", "")) != "noaux_tc":
+            raise ValueError("Kimi-K3 requires correction-bias noaux_tc routing")
+        if (
+            int(getattr(text, "num_expert_group", 1)) != 1
+            or int(getattr(text, "topk_group", 1)) != 1
+        ):
+            raise ValueError("Kimi-K3 requires the released single expert-group profile")
+        if int(getattr(text, "num_nextn_predict_layers", 0)):
+            raise ValueError("Kimi-K3 NextN prediction layers are not supported")
+        if int(getattr(text, "attn_res_block_size", 0)) <= 0:
+            raise ValueError("Kimi-K3 requires a positive attn_res_block_size")
+
+        num_heads = int(vars(linear).get("num_heads", base.num_attention_heads))
+        conv_kernel = int(linear.short_conv_kernel_size)
+        if num_heads != base.num_attention_heads:
+            raise ValueError("Kimi-K3 KDA and MLA head counts must match")
+        if conv_kernel < 2:
+            raise ValueError("Kimi-K3 short_conv_kernel_size must be at least 2")
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="kimi_k3",
+            layer_types=[
+                "kimi_k3_attention" if i + 1 in set(kda_layers) else "full_attention"
+                for i in range(base.num_hidden_layers)
+            ],
+            linear_num_key_heads=num_heads,
+            linear_num_value_heads=num_heads,
+            linear_key_head_dim=int(linear.head_dim),
+            linear_value_head_dim=int(linear.head_dim),
+            linear_conv_kernel_dim=conv_kernel,
+            linear_gate_lower_bound=-raw_lower_bound,
+            linear_use_full_rank_gate=True,
+            mla_use_output_gate=True,
+            attn_res_block_size=int(text.attn_res_block_size),
+            routed_expert_hidden_size=int(text.routed_expert_hidden_size),
+            latent_moe_use_norm=True,
+            activation_situ_beta=float(text.activation_situ_beta),
+            activation_situ_linear_beta=float(text.activation_situ_linear_beta),
+            num_local_experts=int(text.num_experts),
+            num_experts_per_tok=int(text.num_experts_per_token),
+            n_group=int(getattr(text, "num_expert_group", 1)),
+            topk_group=int(getattr(text, "topk_group", 1)),
+            n_shared_experts=2,
+            norm_topk_prob=True,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            disable_qmoe=True,
+            rope_type=None,
+            rope_theta=None,
+            rope_scaling=None,
+            partial_rotary_factor=None,
+            tie_word_embeddings=False,
+        )
+        result = cls(**fields)
+        required = (
+            result.q_lora_rank,
+            result.kv_lora_rank,
+            result.qk_nope_head_dim,
+            result.qk_rope_head_dim,
+            result.v_head_dim,
+        )
+        if any(value is None for value in required):
+            raise ValueError("Kimi-K3 requires complete Q-LoRA and MLA dimensions")
+        return result
+
+
+@dataclasses.dataclass
 class EncoderConfig(ArchitectureConfig):
     """Configuration for encoder-only models (BERT, ViT, etc.)."""
 
@@ -1420,6 +1795,7 @@ class NemotronParseConfig(ArchitectureConfig):
         )
         fields.update(
             model_type="nemotron_parse",
+            decoder_start_token_id=int(getattr(config, "decoder_start_token_id", 2)),
             bos_token_id=getattr(config, "bos_token_id", fields.get("bos_token_id")),
             eos_token_id=getattr(config, "eos_token_id", fields.get("eos_token_id")),
             pad_token_id=getattr(config, "pad_token_id", fields["pad_token_id"]),
@@ -1450,7 +1826,6 @@ class NemotronParseConfig(ArchitectureConfig):
             image_width=image_width,
             vision_max_grid_size=max_resolution // patch_size,
             num_summary_tokens=3,
-            decoder_start_token_id=int(getattr(config, "decoder_start_token_id", 2)),
             scale_embedding=bool(getattr(decoder, "scale_embedding", True)),
             add_final_layer_norm=bool(getattr(decoder, "add_final_layer_norm", True)),
         )
@@ -1527,6 +1902,23 @@ class Lfm2Config(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class Lfm2MoeConfig(CausalLMConfig):
+    """Configuration for LFM2MoE's dense-prefix and routed-expert feed-forwards."""
+
+    num_dense_layers: int = 2
+    use_expert_bias: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2MoeConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            num_dense_layers=getattr(config, "num_dense_layers", 2),
+            use_expert_bias=getattr(config, "use_expert_bias", True),
+        )
+
+
+@dataclasses.dataclass
 class Lfm2VlConfig(Lfm2Config):
     """Configuration for LiquidAI LFM2-VL (SigLIP2 NaFlex + LFM2 decoder).
 
@@ -1594,6 +1986,8 @@ class DFlashConfig(CausalLMConfig):
     block_size: int | None = None
     mask_token_id: int | None = None
     num_target_layers: int | None = None
+    draft_vocab_size: int | None = None
+    use_draft_lm_head: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> DFlashConfig:
@@ -1605,8 +1999,10 @@ class DFlashConfig(CausalLMConfig):
                 "target_layer_ids": getattr(dflash_cfg, "target_layer_ids", None),
                 "mask_token_id": getattr(dflash_cfg, "mask_token_id", None),
             }
+        base_fields = _shallow_fields(base)
+        base_fields.pop("mask_token_id", None)
         return cls(
-            **_shallow_fields(base),
+            **base_fields,
             target_layer_ids=dflash_cfg.get("target_layer_ids"),
             block_size=getattr(config, "block_size", None),
             mask_token_id=dflash_cfg.get("mask_token_id"),
@@ -1636,6 +2032,9 @@ class Qwen35MtpConfig(CausalLMConfig):
     ``layer_types`` to ``["full_attention"]`` regardless of the parent's
     (64-layer, hybrid) stack — the MTP head has exactly one layer.
     """
+
+    use_dedicated_embeddings: bool = False
+    use_dedicated_lm_head: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Qwen35MtpConfig:
@@ -1689,6 +2088,8 @@ class Eagle3Config(CausalLMConfig):
     fc_norm: bool = False
     target_hidden_size: int | None = None
     eagle_aux_hidden_state_layer_ids: list[int] | None = None
+    target_layer_ids: list[int] | None = None
+    use_target_lm_head: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Eagle3Config:
@@ -2403,6 +2804,7 @@ class Mamba2Config(BaseModelConfig):
     layer_norm_epsilon: float = 1e-5
     use_conv_bias: bool = True
     norm_before_gate: bool = True
+    chunk_size: int = 256
 
     def __post_init__(self):
         # Mamba2 requires d_inner = num_heads * head_dim.
@@ -2449,6 +2851,7 @@ class Mamba2Config(BaseModelConfig):
             layer_norm_epsilon=getattr(config, "layer_norm_epsilon", 1e-5),
             use_conv_bias=getattr(config, "use_conv_bias", True),
             norm_before_gate=getattr(config, "norm_before_gate", True),
+            chunk_size=getattr(config, "chunk_size", 256),
         )
 
         # Model dtype
@@ -2486,6 +2889,9 @@ class JambaConfig(ArchitectureConfig):
     attn_layer_offset: int = 4
     expert_layer_period: int = 2
     expert_layer_offset: int = 1
+    # GGUF serializes the resolved schedule through tensor presence rather than
+    # preserving the source period/offset pair.
+    expert_layer_indices: list[int] | None = None
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> JambaConfig:
@@ -2495,18 +2901,33 @@ class JambaConfig(ArchitectureConfig):
         n = base.num_hidden_layers
         attn_period = getattr(config, "attn_layer_period", 8)
         attn_offset = getattr(config, "attn_layer_offset", 4)
+        expert_period = getattr(config, "expert_layer_period", 2)
+        expert_offset = getattr(config, "expert_layer_offset", 1)
+        if attn_period <= 0 or not 0 <= attn_offset < attn_period:
+            raise ValueError("Jamba attn_layer_offset must be in [0, attn_layer_period)")
+        if expert_period <= 0 or not 0 <= expert_offset < expert_period:
+            raise ValueError("Jamba expert_layer_offset must be in [0, expert_layer_period)")
         layer_types = []
         for i in range(n):
-            if (i - attn_offset) % attn_period == 0:
+            if i % attn_period == attn_offset:
                 layer_types.append("full_attention")
             else:
                 layer_types.append("mamba")
 
         num_experts = getattr(config, "num_experts", 16)
         num_experts_per_tok = getattr(config, "num_experts_per_tok", 2)
+        dt_rank = getattr(config, "mamba_dt_rank", "auto")
+        if dt_rank == "auto":
+            dt_rank = math.ceil(base.hidden_size / 16)
 
         # Exclude fields we set explicitly below to avoid duplicate keyword args
-        _exclude = {"layer_types", "num_local_experts", "num_experts_per_tok"}
+        _exclude = {
+            "layer_types",
+            "num_local_experts",
+            "num_experts_per_tok",
+            "norm_topk_prob",
+            "rope_type",
+        }
         base_fields = {k: v for k, v in _shallow_fields(base).items() if k not in _exclude}
         return cls(
             **base_fields,
@@ -2517,13 +2938,16 @@ class JambaConfig(ArchitectureConfig):
             mamba_d_state=getattr(config, "mamba_d_state", 16),
             mamba_d_conv=getattr(config, "mamba_d_conv", 4),
             mamba_expand=getattr(config, "mamba_expand", 2),
-            mamba_dt_rank=getattr(config, "mamba_dt_rank", 256),
+            mamba_dt_rank=int(dt_rank),
             mamba_conv_bias=getattr(config, "mamba_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
             attn_layer_period=attn_period,
             attn_layer_offset=attn_offset,
-            expert_layer_period=getattr(config, "expert_layer_period", 2),
-            expert_layer_offset=getattr(config, "expert_layer_offset", 1),
+            expert_layer_period=expert_period,
+            expert_layer_offset=expert_offset,
+            expert_layer_indices=[i for i in range(n) if i % expert_period == expert_offset],
+            norm_topk_prob=False,
+            rope_type=None,
         )
 
 
@@ -2582,6 +3006,296 @@ class BambaConfig(ArchitectureConfig):
             mamba_expand=mamba_expand,
             mamba_conv_bias=getattr(config, "mamba_conv_bias", True),
             mamba_proj_bias=getattr(config, "mamba_proj_bias", False),
+        )
+
+
+@dataclasses.dataclass
+class FalconH1Config(ArchitectureConfig):
+    """Configuration for Falcon-H1 parallel Attention + Mamba2 decoder layers."""
+
+    mamba_d_ssm: int = 1024
+    mamba_n_heads: int = 128
+    mamba_d_head: int = 8
+    mamba_n_groups: int = 1
+    mamba_d_state: int = 256
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_chunk_size: int = 256
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+    mamba_norm_before_gate: bool = True
+    mamba_rms_norm: bool = False
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))
+    attention_bias: bool = False
+    projectors_bias: bool = False
+    lm_head_multiplier: float = 1.0
+    embedding_multiplier: float = 1.0
+    mlp_multipliers: tuple[float, float] = (1.0, 1.0)
+    key_multiplier: float = 1.0
+    attention_out_multiplier: float = 1.0
+    attention_in_multiplier: float = 1.0
+    ssm_multipliers: tuple[float, float, float, float, float] = (
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+    )
+    ssm_in_multiplier: float = 1.0
+    ssm_out_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.attn_qkv_bias = self.attention_bias
+        self.attn_o_bias = self.attention_bias
+        if self.hidden_act != "silu":
+            raise ValueError("Falcon-H1 supports only hidden_act='silu'")
+        if (
+            self.head_dim <= 0
+            or self.num_attention_heads <= 0
+            or self.hidden_size != self.num_attention_heads * self.head_dim
+        ):
+            raise ValueError("Falcon-H1 hidden_size must equal num_attention_heads * head_dim")
+        if (
+            self.num_key_value_heads <= 0
+            or self.num_attention_heads % self.num_key_value_heads
+        ):
+            raise ValueError("Falcon-H1 num_key_value_heads must divide num_attention_heads")
+        if self.mamba_d_ssm <= 0 or self.mamba_n_heads <= 0:
+            raise ValueError("Falcon-H1 Mamba dimensions must be positive")
+        if self.mamba_d_ssm % self.mamba_n_heads:
+            raise ValueError("mamba_n_heads must divide mamba_d_ssm")
+        if self.mamba_d_head * self.mamba_n_heads != self.mamba_d_ssm:
+            raise ValueError("mamba_d_head * mamba_n_heads must equal mamba_d_ssm")
+        if (
+            self.mamba_n_groups <= 0
+            or self.mamba_n_heads % self.mamba_n_groups
+            or self.mamba_d_ssm % self.mamba_n_groups
+        ):
+            raise ValueError("mamba_n_groups must divide both mamba_n_heads and mamba_d_ssm")
+        if self.mamba_d_state <= 0 or self.mamba_d_conv <= 0 or self.mamba_chunk_size <= 0:
+            raise ValueError("Falcon-H1 state, convolution, and chunk sizes must be positive")
+        if len(self.mlp_multipliers) != 2:
+            raise ValueError("mlp_multipliers must contain exactly two values")
+        if len(self.ssm_multipliers) != 5:
+            raise ValueError("ssm_multipliers must contain exactly five values")
+        if len(self.time_step_limit) != 2:
+            raise ValueError("time_step_limit must contain exactly two values")
+        time_step_min, time_step_max = self.time_step_limit
+        if time_step_min < 0 or time_step_max < time_step_min:
+            raise ValueError("time_step_limit must be ordered and non-negative")
+        multipliers = (
+            self.embedding_multiplier,
+            self.lm_head_multiplier,
+            self.attention_in_multiplier,
+            self.attention_out_multiplier,
+            self.key_multiplier,
+            self.ssm_in_multiplier,
+            self.ssm_out_multiplier,
+            *self.mlp_multipliers,
+            *self.ssm_multipliers,
+        )
+        if not all(math.isfinite(value) for value in multipliers):
+            raise ValueError("Falcon-H1 multipliers must all be finite")
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> FalconH1Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields.pop("embedding_multiplier", None)
+        fields["mlp_bias"] = bool(getattr(config, "mlp_bias", False))
+        d_ssm = getattr(config, "mamba_d_ssm", None)
+        if d_ssm is None:
+            d_ssm = int(getattr(config, "mamba_expand", 2)) * base.hidden_size
+        n_heads = int(getattr(config, "mamba_n_heads", 128))
+        d_head = getattr(config, "mamba_d_head", "auto")
+        if d_head == "auto":
+            if d_ssm % n_heads:
+                raise ValueError("mamba_n_heads must divide mamba_d_ssm")
+            d_head = d_ssm // n_heads
+        time_step_limit = getattr(config, "time_step_limit", None) or (
+            0.0,
+            float("inf"),
+        )
+        return cls(
+            **fields,
+            mamba_d_ssm=int(d_ssm),
+            mamba_n_heads=n_heads,
+            mamba_d_head=int(d_head),
+            mamba_n_groups=int(getattr(config, "mamba_n_groups", 1)),
+            mamba_d_state=int(getattr(config, "mamba_d_state", 256)),
+            mamba_d_conv=int(getattr(config, "mamba_d_conv", 4)),
+            mamba_expand=int(getattr(config, "mamba_expand", 2)),
+            mamba_chunk_size=int(getattr(config, "mamba_chunk_size", 256)),
+            mamba_conv_bias=bool(getattr(config, "mamba_conv_bias", True)),
+            mamba_proj_bias=bool(getattr(config, "mamba_proj_bias", False)),
+            mamba_norm_before_gate=bool(getattr(config, "mamba_norm_before_gate", True)),
+            mamba_rms_norm=bool(getattr(config, "mamba_rms_norm", False)),
+            time_step_limit=tuple(float(value) for value in time_step_limit),
+            attention_bias=bool(getattr(config, "attention_bias", False)),
+            projectors_bias=bool(getattr(config, "projectors_bias", False)),
+            lm_head_multiplier=float(getattr(config, "lm_head_multiplier", 1.0)),
+            embedding_multiplier=float(getattr(config, "embedding_multiplier", 1.0)),
+            mlp_multipliers=tuple(
+                float(value)
+                for value in (getattr(config, "mlp_multipliers", None) or (1.0, 1.0))
+            ),
+            key_multiplier=float(getattr(config, "key_multiplier", 1.0)),
+            attention_out_multiplier=float(getattr(config, "attention_out_multiplier", 1.0)),
+            attention_in_multiplier=float(getattr(config, "attention_in_multiplier", 1.0)),
+            ssm_multipliers=tuple(
+                float(value)
+                for value in (
+                    getattr(config, "ssm_multipliers", None) or (1.0, 1.0, 1.0, 1.0, 1.0)
+                )
+            ),
+            ssm_in_multiplier=float(getattr(config, "ssm_in_multiplier", 1.0)),
+            ssm_out_multiplier=float(getattr(config, "ssm_out_multiplier", 1.0)),
+        )
+
+
+@dataclasses.dataclass
+class Plamo2Config(ArchitectureConfig):
+    """Configuration for PLaMo2 alternating Mamba/attention decoder layers."""
+
+    attention_head_counts: tuple[int, ...] = ()
+    attention_kv_head_counts: tuple[int, ...] = ()
+    mamba_num_heads: int = 32
+    mamba_d_state: int = 64
+    mamba_d_conv: int = 4
+    mamba_dt_rank: int = 128
+    mamba_group_count: int = 0
+    attention_window_size: int = 2048
+    use_predefined_initial_state: bool = False
+
+    def __post_init__(self) -> None:
+        if self.hidden_act != "silu":
+            raise ValueError("PLaMo2 supports only hidden_act='silu'")
+        if not math.isclose(self.rms_norm_eps, 1e-6, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("PLaMo2 requires rms_norm_eps=1e-6")
+        if self.mamba_group_count != 0:
+            raise ValueError("PLaMo2 supports only ssm.group_count=0")
+        if self.use_predefined_initial_state:
+            raise ValueError("PLaMo2 predefined initial state is unsupported")
+        if len(self.attention_head_counts) != self.num_hidden_layers:
+            raise ValueError(
+                "PLaMo2 attention_head_counts must contain exactly num_hidden_layers entries"
+            )
+        if len(self.attention_kv_head_counts) != self.num_hidden_layers:
+            raise ValueError(
+                "PLaMo2 attention_kv_head_counts must contain exactly num_hidden_layers entries"
+            )
+        layer_types: list[str] = []
+        for layer, (heads, kv_heads) in enumerate(
+            zip(self.attention_head_counts, self.attention_kv_head_counts)
+        ):
+            if kv_heads == 0:
+                if heads != 0:
+                    raise ValueError(
+                        f"PLaMo2 layer {layer} has head_count={heads} but head_count_kv=0"
+                    )
+                layer_types.append("mamba")
+            else:
+                if heads <= 0 or heads % kv_heads:
+                    raise ValueError(
+                        f"PLaMo2 layer {layer} has invalid attention head geometry "
+                        f"head_count={heads}, head_count_kv={kv_heads}"
+                    )
+                if heads != self.num_attention_heads or kv_heads != self.num_key_value_heads:
+                    raise ValueError(
+                        "PLaMo2 currently requires one shared attention geometry across "
+                        "all attention layers"
+                    )
+                layer_types.append("full_attention")
+        if (
+            not layer_types
+            or "mamba" not in layer_types
+            or "full_attention" not in layer_types
+        ):
+            raise ValueError("PLaMo2 requires both Mamba and attention layers")
+        self.layer_types = layer_types
+        if self.head_dim <= 0 or self.hidden_size != self.num_attention_heads * self.head_dim:
+            raise ValueError("PLaMo2 hidden_size must equal num_attention_heads * head_dim")
+        if self.mamba_num_heads <= 0:
+            raise ValueError("PLaMo2 mamba_num_heads must be positive")
+        if self.mamba_d_state <= 0 or self.mamba_d_conv <= 1 or self.mamba_dt_rank <= 0:
+            raise ValueError(
+                "PLaMo2 Mamba state, convolution, and dt dimensions must be positive"
+            )
+        if self.attention_window_size <= 0:
+            raise ValueError("PLaMo2 attention_window_size must be positive")
+
+    @property
+    def mamba_inner_size(self) -> int:
+        return self.mamba_num_heads * self.head_dim
+
+    @property
+    def mamba_head_dim(self) -> int:
+        return self.head_dim
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Plamo2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields["hidden_act"] = getattr(config, "hidden_act", None) or "silu"
+        fields["rope_type"] = getattr(config, "rope_type", None) or "default"
+        fields["rope_theta"] = float(
+            getattr(config, "rope_local_theta", getattr(config, "rope_theta", 10_000.0))
+        )
+        fields["head_dim"] = int(getattr(config, "hidden_size_per_head", base.head_dim))
+        fields["partial_rotary_factor"] = 1.0
+        if getattr(config, "full_attention_idx", None):
+            raise ValueError("PLaMo2 full_attention_idx layers are unsupported")
+        layers = base.num_hidden_layers
+        explicit_heads = getattr(config, "attention_head_counts", None)
+        explicit_kv_heads = getattr(config, "attention_kv_head_counts", None)
+        if explicit_heads is not None or explicit_kv_heads is not None:
+            if explicit_heads is None or explicit_kv_heads is None:
+                raise ValueError(
+                    "PLaMo2 per-layer attention head arrays must be supplied together"
+                )
+            head_counts = tuple(int(value) for value in explicit_heads)
+            kv_head_counts = tuple(int(value) for value in explicit_kv_heads)
+        else:
+            mamba_enabled = bool(getattr(config, "mamba_enabled", True))
+            mamba_step = int(getattr(config, "mamba_step", 2))
+            if mamba_enabled and mamba_step <= 1:
+                raise ValueError("PLaMo2 mamba_step must be greater than one")
+
+            def is_mamba(layer: int) -> bool:
+                if not mamba_enabled:
+                    return False
+                if layers <= mamba_step // 2:
+                    return layer != layers - 1
+                return layer % mamba_step != mamba_step // 2
+
+            head_counts = tuple(
+                0 if is_mamba(i) else base.num_attention_heads for i in range(layers)
+            )
+            kv_head_counts = tuple(
+                0 if is_mamba(i) else base.num_key_value_heads for i in range(layers)
+            )
+
+        return cls(
+            **fields,
+            attention_head_counts=head_counts,
+            attention_kv_head_counts=kv_head_counts,
+            mamba_num_heads=int(getattr(config, "mamba_num_heads", 32)),
+            mamba_d_state=int(getattr(config, "mamba_d_state", 64)),
+            mamba_d_conv=int(getattr(config, "mamba_d_conv", 4)),
+            mamba_dt_rank=int(
+                getattr(config, "mamba_dt_rank", max(64, base.hidden_size // 16))
+            ),
+            mamba_group_count=int(getattr(config, "mamba_group_count", 0)),
+            attention_window_size=int(
+                getattr(
+                    config,
+                    "attention_window_size",
+                    getattr(config, "sliding_window", 2048),
+                )
+            ),
+            use_predefined_initial_state=bool(
+                getattr(config, "use_predefined_initial_state", False)
+            ),
         )
 
 

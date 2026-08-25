@@ -18,10 +18,8 @@ Usage::
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
 
-    # Write a directory the runtime can actually load (graph + tokenizer +
-    # inference metadata). Saving only the graph produces a package that
-    # loads nowhere.
-    write_gguf_runtime_package(pkg, "path/to/model.gguf", "out_dir")
+    # Runtime packaging is fail-closed and available only for an exact artifact,
+    # import route, runtime version, and pinned tokenizer evidence record.
 
 :func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
 to :func:`build_gemma4_vlm_from_gguf` for the multimodal assembly.
@@ -40,10 +38,12 @@ from mobius.integrations.gguf._config_mapping import (
 from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
 from mobius.integrations.gguf._preflight import (
     GgufPreflightReport,
+    GgufTypeStat,
     preflight_gguf,
     preflight_hf_gguf,
     preflight_local_gguf,
 )
+from mobius.integrations.gguf._reuse import verify_gguf_reuse_manifest
 from mobius.integrations.gguf._runtime_package import write_gguf_runtime_package
 from mobius.integrations.gguf._shard_set import (
     GgufShardError,
@@ -52,13 +52,22 @@ from mobius.integrations.gguf._shard_set import (
     discover_gguf_shards,
     open_gguf_model,
 )
-from mobius.integrations.gguf._tokenizer import write_gguf_tokenizer_json
+from mobius.integrations.gguf._tokenizer import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
+    materialize_gguf_tokenizer,
+    write_gguf_tokenizer_json,
+)
 
 __all__ = [
     "build_from_gguf",
     "build_gemma4_vlm_from_gguf",
+    "GGUFTokenizerAsset",
+    "GGUFTokenizerSource",
+    "materialize_gguf_tokenizer",
     "write_gguf_runtime_package",
     "write_gguf_tokenizer_json",
+    "verify_gguf_reuse_manifest",
     # Multi-shard GGUF import
     "GgufShardSet",
     "GgufShardManifest",
@@ -75,4 +84,5 @@ __all__ = [
     "preflight_local_gguf",
     "preflight_hf_gguf",
     "GgufPreflightReport",
+    "GgufTypeStat",
 ]

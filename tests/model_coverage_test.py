@@ -150,6 +150,19 @@ _COVERAGE_SKIP: dict[str, str] = {
     "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
     "(graph build + diffusers-parity + bidirectionality); no small public "
     "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
+    "dream": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "Dream": "Alias for dream — covered by src/mobius/models/llada_test.py",
+    "llada_moe": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
+    "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
+    "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
+    "real-weight L4/L5 parity remains pending.",
+    "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
+    "and GGUF integration tests; generic encoder tests require token_type_ids",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
@@ -157,6 +170,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "gpt_oss": "Internal model — no public HF checkpoint",
     "helium": "Alias for mistral — covered by mistral",
     "open-llama": "Alias for llama — covered by llama",
+    "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
     "seed_oss": "Internal model — no public HF checkpoint",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
@@ -274,7 +288,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "doge": "CausalLM — YAML not yet created",
     "ernie4_5": "CausalLM — YAML not yet created",
     "exaone": "CausalLM — YAML not yet created",
-    "falcon_h1": "CausalLM — YAML not yet created",
     "falcon_mamba": "SSM — YAML not yet created",
     "imagegpt": "Vision model — YAML not yet created",
     "internlm2": "CausalLM — YAML not yet created",
@@ -296,7 +309,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "Gemma4AssistantForCausalLM": "Drafter alias of gemma4_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
     "gemma4_unified_assistant": "Drafter (unified variant) — covered by _gemma4_assistant_test.py + L4/L5 golden",
     "Gemma4UnifiedAssistantForCausalLM": "Drafter alias of gemma4_unified_assistant — covered by _gemma4_assistant_test.py + L4/L5 golden",
-    "Qwen35MtpModel": "Drafter (inputs_embeds + target hidden_states IO; borrows target embed/lm_head) — covered by src/mobius/models/_qwen35_mtp_test.py + L4 golden (qwen35-mtp)",
+    "Qwen35MtpModel": "Drafter (inputs_embeds + post-final-norm target hidden_states IO; dedicated/shared embed, norm, and head ownership) — covered by src/mobius/models/_qwen35_mtp_test.py, src/mobius/integrations/gguf/_mtp_test.py, and L4 golden (qwen35-mtp)",
     "Eagle3LlamaForCausalLM": "Drafter (inputs_embeds + fused/recycled hidden IO; own draft-vocab lm_head) — covered by src/mobius/models/_eagle3_test.py",
     "LlamaForCausalLMEagle3": "Drafter (EAGLE-3 arch alias used by the Qwen3-8B checkpoint) — covered by src/mobius/models/_eagle3_test.py",
     "Eagle3Speculator": "Drafter (speculators-format EAGLE-3, RedHat Qwen3) — covered by src/mobius/models/_eagle3_test.py",

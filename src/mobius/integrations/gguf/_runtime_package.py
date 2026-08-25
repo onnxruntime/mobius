@@ -16,12 +16,76 @@ so both supported runtimes are reachable from one entry point.
 
 from __future__ import annotations
 
+import ctypes
+import os
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-from mobius.integrations.gguf._tokenizer import write_gguf_tokenizer_json
+from mobius.integrations.gguf._arch_registry import get_arch_spec
+from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._runtime_evidence import (
+    gguf_graph_package_identity,
+    matching_runtime_evidence,
+)
+from mobius.integrations.gguf._spec import Support
+from mobius.integrations.gguf._tokenizer import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
+    inspect_gguf_tokenizer,
+    materialize_gguf_tokenizer,
+)
 
 __all__ = ["write_gguf_runtime_package"]
+
+
+def _publish_directory_no_replace(stage: Path, destination: Path) -> None:
+    """Atomically publish a directory while refusing an existing destination."""
+    if sys.platform == "linux":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                "Atomic no-replace directory publication requires renameat2 on Linux"
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(stage),
+            -100,
+            os.fsencode(destination),
+            1,
+        )
+    elif sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renamex_np = libc.renamex_np
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(stage), os.fsencode(destination), 0x00000004)
+    elif os.name == "nt":
+        os.rename(stage, destination)
+        return
+    else:
+        raise OSError(
+            f"Atomic no-replace directory publication is unsupported on {sys.platform!r}"
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+
 
 Runtime = Literal["onnx-genai", "ort-genai"]
 
@@ -32,63 +96,234 @@ def write_gguf_runtime_package(
     output_dir: str | Path,
     *,
     runtime: Runtime = "onnx-genai",
+    runtime_version: str | None = None,
+    tokenizer_repository: str | None = None,
+    tokenizer_revision: str | None = None,
+    local_files_only: bool = False,
     save_model: bool = True,
     **save_kwargs: Any,
 ) -> dict[str, str]:
-    """Write a complete, loadable package for a GGUF-built model.
+    """Write a complete, loadable package for a runtime-evidenced GGUF model.
 
-    Emits the ONNX graph (unless it is already saved), a ``tokenizer.json``
-    reconstructed from the GGUF's embedded ggml metadata, and the selected
-    runtime's configuration contract.
+    Emission is gated by the architecture runtime verdict and an exact structured
+    evidence match. The function emits the graph, hash-verified tokenizer assets
+    from an immutable Hub revision, and the selected runtime's configuration
+    contract as one staged directory.
 
     Args:
         pkg: The :class:`~mobius.ModelPackage` returned by
             :func:`~mobius.integrations.gguf.build_from_gguf`.
-        gguf_path: The source ``.gguf`` file. The tokenizer is reconstructed
-            from it because a GGUF checkpoint has no Hugging Face source
-            directory to copy one from.
+        gguf_path: The source ``.gguf`` file. Runtime packaging is rejected when
+            its tokenizer metadata does not match the selected evidence record.
         output_dir: Destination directory.
         runtime: Which runtime contract to emit. ``"onnx-genai"`` writes
             ``inference_metadata.yaml``; ``"ort-genai"`` writes
             ``genai_config.json``.
-        save_model: Save the ONNX graph too. Pass ``False`` when the caller has
-            already saved it and only wants the runtime artifacts.
+        runtime_version: Exact runtime version covered by the evidence record.
+        tokenizer_repository: Exact Hub repository holding tokenizer assets.
+        tokenizer_revision: Immutable 40-hex tokenizer repository revision.
+        local_files_only: Resolve tokenizer assets only from the local Hub cache.
+        save_model: Must remain ``True``. Existing graph directories cannot be
+            associated with the build-time evidence transaction safely.
         **save_kwargs: Forwarded to :meth:`ModelPackage.save`.
 
     Returns:
-        Mapping of artifact name to written path. The ``tokenizer`` key is
-        absent when the GGUF carries no tokenizer metadata to rebuild from.
+        Mapping of artifact name to written path.
 
     Raises:
         ValueError: If ``runtime`` is not a supported runtime name.
     """
     if runtime not in ("onnx-genai", "ort-genai"):
         raise ValueError(f"Unknown runtime {runtime!r}; expected 'onnx-genai' or 'ort-genai'.")
-
+    if not save_model:
+        raise ValueError(
+            "save_model=False is not supported for runtime-evidenced GGUF packages because "
+            "an existing graph cannot be bound to the build-time evidence transaction."
+        )
+    if tokenizer_repository is None or tokenizer_revision is None:
+        raise ValueError(
+            "GGUF runtime packaging requires an explicit tokenizer_repository and immutable "
+            "tokenizer_revision."
+        )
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        raise FileExistsError(
+            f"GGUF runtime package destination already exists: {output_dir}. "
+            "Refusing a non-atomic directory replacement."
+        )
+    architecture = getattr(pkg, "gguf_architecture", None)
+    if not architecture:
+        raise ValueError(
+            "GGUF runtime packaging requires the canonical source architecture captured "
+            "during graph construction."
+        )
+    architecture_spec = get_arch_spec(architecture)
+    if architecture_spec.runtime is not Support.SUPPORTED:
+        raise ValueError(
+            f"GGUF runtime packaging for {architecture!r} is "
+            f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
+        )
+    import_route = getattr(pkg, "gguf_import_route", None)
+    if not import_route:
+        raise ValueError(
+            "GGUF runtime packaging requires the exact import route captured during "
+            "graph construction."
+        )
+    built_identity = getattr(pkg, "gguf_artifact_identity", None)
+    if built_identity is None:
+        raise ValueError(
+            "GGUF runtime packaging requires the immutable source identity captured during "
+            "graph construction."
+        )
+    if runtime == "ort-genai" and getattr(pkg, "gguf_reuse_plan", None) is not None:
+        raise ValueError(
+            "ORT GenAI packaging is not supported with reused GGUF weights because "
+            "genai_config.json has no supported setting that disables ORT constant "
+            "folding. Use direct ONNX Runtime with ORT_DISABLE_ALL, or build without "
+            "reuse_gguf_weights."
+        )
+    draft_manifest = getattr(pkg, "draft_manifest", None)
+    if draft_manifest is not None:
+        raise ValueError(
+            f"{draft_manifest['architecture']} is a target-coupled speculative draft; "
+            "standalone runtime packaging is unsupported. Save the ONNX auxiliary "
+            "package and draft_manifest.json, then pair it with the exact validated target."
+        )
+    mtp_head = getattr(pkg, "mtp_head", None)
+    if mtp_head is not None:
+        raise ValueError(
+            f"{runtime} runtime packaging does not yet have a runtime-evidenced GGUF MTP "
+            "sidecar contract; refusing to emit an unreachable mtp/model.onnx."
+        )
 
-    artifacts: dict[str, str] = {}
-    if save_model:
-        pkg.save(str(output_dir), **save_kwargs)
+    source_path = Path(getattr(pkg, "gguf_source_path", gguf_path))
+    source_model = GGUFModel(source_path)
+    source_architecture = get_arch_spec(source_model.architecture).gguf_arch
+    if source_architecture != architecture:
+        raise ValueError(
+            "The GGUF source architecture no longer matches the canonical architecture "
+            f"captured during graph construction: built={architecture!r}, "
+            f"current={source_architecture!r}."
+        )
+    evidence = matching_runtime_evidence(
+        architecture_spec.runtime_evidence_ids,
+        architecture=architecture,
+        runtime=runtime,
+        source_path=source_path,
+        gguf_model=source_model,
+        built_identity=built_identity,
+        import_route=import_route,
+        runtime_version=runtime_version,
+        tokenizer_repository=tokenizer_repository,
+        tokenizer_revision=tokenizer_revision,
+    )
+    source_metadata = source_model.metadata
+    verdict = inspect_gguf_tokenizer(
+        source_metadata,
+        source=str(source_path),
+        require_complete=True,
+    )
+    built_verdict = getattr(pkg, "gguf_tokenizer_verdict", None)
+    if (
+        built_verdict is None
+        or built_verdict.metadata_sha256 is None
+        or built_verdict.metadata_sha256 != verdict.metadata_sha256
+    ):
+        raise ValueError(
+            "The GGUF tokenizer metadata no longer matches the identity captured during "
+            "graph construction; refusing to pair the graph with a replaced tokenizer source."
+        )
 
-    tokenizer_path = write_gguf_tokenizer_json(gguf_path, output_dir)
-    if tokenizer_path is not None:
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(
+        tempfile.mkdtemp(prefix=f".{output_dir.name}.", suffix=".tmp", dir=output_dir.parent)
+    )
+    try:
+        artifacts: dict[str, str] = {}
+        pkg.save(str(stage), **save_kwargs)
+        graph_identity = gguf_graph_package_identity(stage)
+        if (
+            graph_identity.files != evidence.graph_files
+            or graph_identity.sha256 != evidence.graph_sha256
+        ):
+            raise ValueError(
+                "Serialized GGUF graph package does not match runtime evidence: "
+                f"expected files={evidence.graph_files}, sha256={evidence.graph_sha256}; "
+                f"got files={graph_identity.files}, sha256={graph_identity.sha256}."
+            )
+
+        tokenizer_source = GGUFTokenizerSource(
+            repository=evidence.tokenizer_repository,
+            revision=evidence.tokenizer_revision,
+            metadata_sha256=evidence.tokenizer_metadata_sha256,
+            assets=tuple(
+                GGUFTokenizerAsset(filename, size, sha256)
+                for filename, size, sha256 in evidence.tokenizer_assets
+            ),
+        )
+        tokenizer_path = materialize_gguf_tokenizer(
+            source_path,
+            stage,
+            source=tokenizer_source,
+            metadata=source_metadata,
+            source_identity=(f"sha256:{built_identity.sha256}/{built_identity.filename}"),
+            local_files_only=local_files_only,
+        )
         artifacts["tokenizer"] = tokenizer_path
 
-    if runtime == "ort-genai":
-        from mobius.integrations.ort_genai import write_ort_genai_config
+        if runtime == "ort-genai":
+            from mobius.integrations.ort_genai import write_ort_genai_config
 
-        # A GGUF checkpoint has no Hugging Face source, so there is no
-        # `hf_model_id` or local config directory to copy tokenizer files from;
-        # the tokenizer written above is the one this package ships.
-        artifacts.update(write_ort_genai_config(pkg, str(output_dir)))
-    else:
-        from mobius.integrations.onnx_genai import write_onnx_genai_config
-
-        artifacts.update(
-            write_onnx_genai_config(
-                pkg, str(output_dir), config=getattr(pkg, "config", None), source=None
+            execution_provider = getattr(pkg, "gguf_execution_provider", None)
+            if execution_provider not in {"cpu", "cuda", "dml"}:
+                raise ValueError(
+                    "ORT GenAI runtime packaging requires an explicit evidenced execution "
+                    "provider: cpu, cuda, or dml."
+                )
+            artifacts.update(
+                write_ort_genai_config(
+                    pkg,
+                    str(stage),
+                    ep=execution_provider,
+                    runtime_version=runtime_version,
+                )
             )
-        )
-    return artifacts
+        else:
+            from mobius.integrations.onnx_genai import write_onnx_genai_config
+
+            artifacts.update(
+                write_onnx_genai_config(
+                    pkg, str(stage), config=getattr(pkg, "config", None), source=None
+                )
+            )
+        if mtp_head is not None:
+            from mobius.integrations.onnx_genai.inference_metadata import (
+                write_mtp_speculator_metadata,
+            )
+
+            speculator_path = write_mtp_speculator_metadata(
+                stage,
+                backbone_config=getattr(pkg, "config", None),
+                proposer_config=getattr(mtp_head, "config", None),
+            )
+            if speculator_path is not None:
+                artifacts["speculator"] = str(speculator_path)
+        runtime_identity = gguf_graph_package_identity(stage)
+        if (
+            runtime_identity.files != evidence.runtime_package_files
+            or runtime_identity.sha256 != evidence.runtime_package_sha256
+        ):
+            raise ValueError(
+                "Completed GGUF runtime package does not match evidence: "
+                f"expected files={evidence.runtime_package_files}, "
+                f"sha256={evidence.runtime_package_sha256}; "
+                f"got files={runtime_identity.files}, sha256={runtime_identity.sha256}."
+            )
+        _publish_directory_no_replace(stage, output_dir)
+        return {
+            name: str(output_dir / Path(path).relative_to(stage))
+            for name, path in artifacts.items()
+        }
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)

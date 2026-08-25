@@ -161,6 +161,47 @@ tokenizer files to the output directory:
 - With `--config` (local directory): tokenizer files are copied from that
   directory.
 
+For a graph-representable, single-model decoder-only text graph, Mobius emits the
+architecture-neutral `model.type: "decoder"` contract supported by
+onnxruntime-genai 0.14.0 and newer. Validation targets only the latest stable
+release, currently 0.15.2.
+The graph determines the exact semantic input names, output names, cache templates,
+and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
+architecture names do not need a runtime registry entry.
+
+Architecture-specific types remain only where the runtime selects different
+behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` selects
+`Gpt_Model`, but Mobius's separate rank-4 key/value cache ABI does not match that
+runtime's rank-5 combined-cache contract, so config generation currently fails
+closed. `phi3`, `phimoe`, and `phi3small` retain their names only when their config selects
+LongRoPE, because the released generator uses those names to recompute caches when
+generation crosses the short-context threshold. Ordinary Phi-3-family graphs use
+`decoder`. Multimodal, audio, encoder-decoder, special-position-ID,
+and split pipeline packages remain outside the generic path and require their
+dedicated types and schemas. These exceptions follow the
+[v0.15.2 runtime model factory](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/model.cpp#L874-L907),
+which selects `Gpt_Model`, `LFM2_Model`, `WhisperModel`, `MarianModel`,
+`MultiModalLanguageModel`, and `DecoderOnlyPipelineModel` separately from
+`DecoderOnly_Model`; Qwen-VL's special position handling is likewise implemented in
+its [dedicated runtime model](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/qwen_vl_model.cpp).
+The Phi-3 LongRoPE threshold dispatch is in the released
+[`Generator`](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/generators.cpp).
+
+Released generic recurrent state is enabled only when the optimized graph exposes
+matching `conv_state` and `recurrent_state` names derived from the same cache
+template. Mobius rejects static-cache names and heterogeneous state layouts that
+the released config schema cannot represent rather than emitting a misleading
+dense cache. The deferred state-manifest work is tracked by
+[#605](https://github.com/onnxruntime/mobius/issues/605).
+
+Each export also writes `runtime_compatibility.json`. Generic decoder metadata
+records the minimum runtime version and the latest stable release exercised by
+Mobius (0.15.2); it never emits the unreleased `decoder.state_groups` field.
+Generic config availability does not promote a GGUF runtime verdict: the only
+runtime-supported GGUF route remains the exact pinned SmolLM F16/CPU package, while
+SmolLM2 remains rejected because its GGUF padding-token metadata conflicts with the
+official pinned tokenizer.
+
 #### Example
 
 ```bash
@@ -321,10 +362,12 @@ mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/ \
 
 ## `mobius build-gguf`
 
-Build an ONNX model from a GGUF file (e.g. from llama.cpp).
-Supported GGUF quantization is preserved by default. This can involve
-byte-preserving native blocks in text-only builds, affine repacking, or
-dequantize/requantize for multimodal and mixed source qtypes.
+Build an ONNX model from a GGUF file (e.g. from llama.cpp). This is an explicit
+opt-in import path; `mobius build` does not auto-discover or select GGUF files.
+Supported GGUF quantization is preserved by default through byte-preserving
+native blocks or value-preserving affine repacking. Mixed source qtypes that
+would require lossy dequantization/requantization, including Q4_K_M presets,
+fail closed and require `--dequantize`.
 
 > **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
@@ -338,7 +381,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 
 | Argument | Description |
 |----------|-------------|
-| `GGUF_PATH` | Path to a `.gguf` model file. |
+| `GGUF_PATH` | Local `.gguf` path or exact `owner/repo:filename.gguf` Hub reference. Hub preflight range-reads only that filename, resolves the requested ref to an immutable commit, and downloads that exact revision; repository-level metadata is never used. |
 
 ### Options
 
@@ -350,7 +393,10 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
-| `--runtime RUNTIME` | `onnx-genai` emits supported runtime metadata. `ort-genai` is rejected until GGUF cache/tokenizer generation coverage exists. |
+| `--runtime RUNTIME` | Request `onnx-genai` or `ort-genai` metadata. Emission is rejected unless the architecture has structured runtime evidence and the GGUF embeds an exact validated tokenizer; neither format bypasses the architecture verdict. |
+| `--runtime-version VERSION` | Exact selected runtime version. Once runtime support exists, this must equal the version in the matching evidence record; compatible-version ranges are not inferred. |
+| `--mmproj PATH` | Exact companion `clip` GGUF. Pairing validates source identity, target architecture, modality, tensor closure, and dimensions before graph construction. |
+| `--target-config PATH` | Exact target config directory for `dflash`/`eagle3`; requires the adjacent complete `tokenizer.json` and emits a target-binding draft manifest. |
 | `--release` | Strip build-time debug and provenance metadata before saving while preserving functional `mobius.*` metadata. |
 | `--static-cache` | Build a fixed-width cache where supported. |
 | `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |
@@ -371,14 +417,35 @@ mobius build-gguf model.gguf --output output/ --dtype f16
 F32-, F16-, and BF16-only files build normally as float models because they
 contain no quantization to preserve.
 Quantized files containing only qtypes with no supported preservation target
-(for example, pure Q6_K or Q5_K weights) fail instead of silently becoming
+(for example, pure Q5_K weights) fail instead of silently becoming
 float. Re-run with `--dequantize` to request explicit float conversion.
+The same rule applies when only some projection tensors are incompatible with
+the selected affine target; Mobius does not silently requantize those tensors.
+
+Encoder-only BERT and ModernBERT GGUF backbones auto-select
+`feature-extraction` and output `last_hidden_state`; they do not produce logits
+or cache tensors. Static cache, generative task overrides, pooled/reranker
+metadata, classifier tensors, and unsupported ModernBERT sliding-window variants
+are rejected explicitly.
+Quantized encoder linear weights use `MatMulNBits`, but quantized token
+embeddings dequantize because these graphs do not yet implement
+`GatherBlockQuantized`. BERT and ModernBERT GQA metadata are rejected; BERT
+quantized fused QKV is also rejected, while float fused QKV is split losslessly.
 
 Sharded GGUF inputs are rejected because a single shard has an incomplete
-tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
-parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI
-generation are validated. See
-[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-waiver).
+tensor table. MTP-free `nemotron_h_moe` backbones are supported with exact
+hybrid scheduling and routed/shared/latent expert semantics; quantized sources
+require `--dequantize`. Files with the released combined attention+MoE MTP
+sidecar fail before graph construction, and ORT GenAI packaging remains
+deferred. See
+[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-h-moe-support-boundary).
+
+Runtime packaging requires a validated embedded `tokenizer.huggingface.json`;
+opaque tokenizer pre-types are never reconstructed. Deferred/rejected
+architecture, tokenizer, draft-pairing, or mmproj checks run before durable
+output. Multimodal packages use `decoder`, `vision_encoder`, optional
+`audio_encoder`, and `embedding`; an admitted trailing MTP head is persisted
+under `mtp/`.
 
 ---
 

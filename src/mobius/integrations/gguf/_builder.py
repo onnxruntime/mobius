@@ -7,11 +7,10 @@ Converts ``.gguf`` model files to ONNX using the standard build
 pipeline. Quantized preservation is the default: affine linear-layer weights
 are repacked into MatMulNBits format and compatible token embeddings into
 GatherBlockQuantized format. For text-only builds, runtime-supported native
-IQ/MXFP4 projection blocks are preserved for BlockQuantizedMatMul. Multimodal
-text backbones and mixed presets such as Q4_K_M are normalized to one affine
-layout, so not every source tensor is byte-preserved. Other tensors are
-dequantized. Set ``keep_quantized=False`` to dequantize all weights to float
-explicitly.
+IQ/MXFP4 projection blocks are preserved for BlockQuantizedMatMul. A requested
+preservation route fails closed when a projection would need lossy
+dequantization/requantization, including mixed Q4_K_M presets. Set
+``keep_quantized=False`` to request a fully float import explicitly.
 """
 
 from __future__ import annotations
@@ -19,24 +18,46 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
+import math
 import re
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
+import numpy as np
 import tqdm
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import (
+    HfApi,
+    get_hf_file_metadata,
+    get_session,
+    hf_hub_download,
+    hf_hub_url,
+)
+from huggingface_hub.utils import build_hf_headers
 
 from mobius._model_package import ModelPackage
+from mobius.integrations.gguf._arch_registry import (
+    MMPROJ_ARCHITECTURE,
+    arch_names_with,
+    try_get_arch_spec,
+)
+from mobius.integrations.gguf._errors import (
+    DisabledGGUFArchitectureError,
+    ShardedGGUFNotSupportedError,
+    UnsupportedGGUFArchitectureError,
+)
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
+from mobius.integrations.gguf._spec import Support
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
 try:
-    from httpx import TransportError as _HttpxTransportError
+    from httpx import HTTPError as _HttpxHTTPError
 except ImportError:
     pass
 else:
-    _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxTransportError,)
+    _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxHTTPError,)
 
 if TYPE_CHECKING:
     from mobius.tasks import ModelTask
@@ -48,6 +69,7 @@ _GGUF_SHARD_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 _NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
+_GGUF_HEADER_RANGE_BYTES = 16 * 1024 * 1024
 
 
 def _summarize_nemotron_h_moe_layout(
@@ -88,13 +110,39 @@ def _raise_for_unsupported_gguf_architecture(
     *,
     source: str,
     tensor_names: Iterable[str] | None = None,
+    allow_mmproj_companion: bool = False,
 ) -> None:
-    """Reject GGUF architectures that do not have semantic conversion evidence."""
-    if architecture != _NEMOTRON_H_MOE_ARCHITECTURE:
+    """Reject known architectures whose config, tensor map, or graph is unavailable.
+
+    This gate runs immediately after the GGUF header is available so dtype,
+    quantization, config extraction, registry lookup, and graph construction
+    cannot obscure the architecture verdict. Runtime packaging is deliberately
+    excluded: an importable graph may still have a deferred runtime contract.
+    """
+    spec = try_get_arch_spec(architecture)
+    if spec is None:
+        raise UnsupportedGGUFArchitectureError(
+            f"GGUF architecture {architecture!r} has no immutable capability-registry "
+            f"spec for {source!r}; refusing generic Hugging Face config/model dispatch "
+            "before config extraction. No ONNX artifacts were emitted."
+        )
+    if spec.gguf_arch == MMPROJ_ARCHITECTURE and allow_mmproj_companion:
+        # mmproj sidecars are opened deliberately by the multimodal path, which
+        # pairs them with a text backbone and applies role-specific validation.
+        return
+    import_verdicts = {
+        name: verdict
+        for name, verdict in spec.verdicts.items()
+        if name in {"config", "tensor_map", "graph"}
+    }
+    unavailable = [
+        name for name, verdict in import_verdicts.items() if verdict is not Support.SUPPORTED
+    ]
+    if not unavailable:
         return
 
     layout = ""
-    if tensor_names is not None:
+    if architecture == _NEMOTRON_H_MOE_ARCHITECTURE and tensor_names is not None:
         counts, mtp_blocks, mtp_kinds = _summarize_nemotron_h_moe_layout(tensor_names)
         mtp_kind_names = {index: sorted(kinds) for index, kinds in mtp_kinds.items()}
         layout = (
@@ -104,18 +152,16 @@ def _raise_for_unsupported_gguf_architecture(
             f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
         )
 
-    raise NotImplementedError(
-        "Direct GGUF conversion for architecture 'nemotron_h_moe' is intentionally "
-        f"disabled for {source!r}.{layout} GGUF block_count includes a combined "
-        "attention+MoE MTP auxiliary block, so aliasing it to the 52-layer "
-        "'nemotron_h' backbone would build the wrong graph. The current Nemotron-H "
-        "Mamba2 path also lacks passing full-logit/generation parity, and common "
-        "GGUF presets contain Q5_0/Q5_1 expert tensors that cannot be preserved by "
-        "MatMulNBits. No ONNX artifacts were emitted. Use llama.cpp/Unsloth to run "
-        "the GGUF without changing its quantization, or start from the official "
-        "pinned BF16 Hugging Face checkpoint and quantize the validated ONNX export "
-        "with Olive only after L4/L5 semantic generation passes. See "
-        "docs/api/build_from_gguf.md for the pinned recipe and waiver."
+    if any(verdict is Support.REJECTED for verdict in import_verdicts.values()):
+        raise DisabledGGUFArchitectureError(
+            f"Direct GGUF conversion for architecture {spec.gguf_arch!r} is intentionally "
+            f"disabled for {source!r}.{layout} {spec.reason} No ONNX artifacts were emitted."
+        )
+    capabilities = ", ".join(unavailable)
+    raise UnsupportedGGUFArchitectureError(
+        f"GGUF architecture {spec.gguf_arch!r} is deferred for {source!r} before config "
+        f"extraction because these import capabilities are unavailable: {capabilities}. "
+        f"{spec.reason} No ONNX artifacts were emitted."
     )
 
 
@@ -136,7 +182,7 @@ def _raise_for_sharded_gguf(
         return
 
     shard_detail = f" shard {shard_index} of {split_count}" if shard_index else ""
-    raise NotImplementedError(
+    raise ShardedGGUFNotSupportedError(
         f"Sharded GGUF input is not supported: {source!r} is{shard_detail}. "
         "The GGUF builder reads one file and cannot assemble split tensor tables; "
         "continuing would emit an incomplete ONNX model. Select a single-file GGUF "
@@ -339,7 +385,128 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
         )
 
 
-def _validate_gguf_model(gguf_model, *, source: str) -> None:
+def _gguf_architecture_from_header_prefix(data: bytes, *, source: str) -> str:
+    """Read ``general.architecture`` from a bounded GGUF header prefix."""
+    architecture = _gguf_architecture_from_header(data, source=source)
+    assert architecture is not None
+    return architecture
+
+
+def _preflight_hf_gguf_file(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str = "main",
+    allow_mmproj_companion: bool = False,
+    expected_architecture: str | None = None,
+) -> str:
+    """Validate the exact selected Hub file header and return its immutable revision."""
+    source = f"{repo_id}@{revision}:{filename}"
+    _raise_for_sharded_gguf(source=source, filename=filename)
+    url = hf_hub_url(repo_id, filename, revision=revision)
+    try:
+        metadata = get_hf_file_metadata(url)
+    except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
+        raise RuntimeError(
+            f"Cannot resolve the exact selected GGUF file {source!r} to an immutable "
+            "revision; refusing repository-level metadata or mutable-revision fallback"
+        ) from error
+    commit_hash = metadata.commit_hash
+    if (
+        not isinstance(commit_hash, str)
+        or re.fullmatch(r"[0-9a-fA-F]{40}", commit_hash) is None
+    ):
+        raise ValueError(
+            f"Hub did not resolve a 40-character immutable commit SHA for {source!r}."
+        )
+
+    headers = build_hf_headers()
+    if urlparse(url).netloc != urlparse(metadata.location).netloc:
+        headers.pop("authorization", None)
+    headers["Range"] = f"bytes=0-{_GGUF_HEADER_RANGE_BYTES - 1}"
+
+    def read_response(response) -> list[bytes]:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        size = 0
+        chunk_iterator = (
+            response.iter_bytes()
+            if hasattr(response, "iter_bytes")
+            else response.iter_content(chunk_size=64 * 1024)
+        )
+        for chunk in chunk_iterator:
+            remaining = _GGUF_HEADER_RANGE_BYTES - size
+            if remaining <= 0:
+                break
+            chunks.append(chunk[:remaining])
+            size += min(len(chunk), remaining)
+            if size == _GGUF_HEADER_RANGE_BYTES:
+                break
+        return chunks
+
+    try:
+        session = get_session()
+        stream = getattr(session, "stream", None)
+        if callable(stream):
+            with stream("GET", metadata.location, headers=headers) as response:
+                chunks = read_response(response)
+        else:
+            with session.get(metadata.location, headers=headers, stream=True) as response:
+                chunks = read_response(response)
+    except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
+        logger.warning(
+            "Bounded GGUF header range read failed for %s (%s); downloading the "
+            "same immutable revision and validating its local header before dispatch.",
+            source,
+            error,
+        )
+        return commit_hash
+    try:
+        architecture = _gguf_architecture_from_header_prefix(
+            b"".join(chunks),
+            source=source,
+        )
+    except ValueError as error:
+        if "truncated GGUF metadata" not in str(error):
+            raise
+        logger.warning(
+            "The selected GGUF metadata header for %s exceeds the bounded range; "
+            "downloading the same immutable revision for full local validation.",
+            source,
+        )
+        return commit_hash
+    if expected_architecture is not None and architecture != expected_architecture:
+        raise ValueError(
+            f"Expected a {expected_architecture!r} mmproj GGUF for {source!r}, "
+            f"got architecture {architecture!r}. No payload was downloaded."
+        )
+    _raise_for_unsupported_gguf_architecture(
+        architecture,
+        source=source,
+        allow_mmproj_companion=allow_mmproj_companion,
+    )
+    return commit_hash
+
+
+def _preflight_hf_mmproj_companion_file(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str = "main",
+) -> str:
+    """Validate one exact Hub mmproj file and pin its immutable revision."""
+    return _preflight_hf_gguf_file(
+        repo_id,
+        filename,
+        revision=revision,
+        allow_mmproj_companion=True,
+        expected_architecture=MMPROJ_ARCHITECTURE,
+    )
+
+
+def _validate_gguf_model(
+    gguf_model, *, source: str, allow_mmproj_companion: bool = False
+) -> None:
     """Validate a parsed GGUF before config extraction or graph construction."""
     from mobius.integrations.gguf._shard_set import GgufShardSet
 
@@ -353,7 +520,2627 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         gguf_model.architecture,
         source=source,
         tensor_names=gguf_model.tensor_names,
+        allow_mmproj_companion=allow_mmproj_companion,
     )
+    from mobius.integrations.gguf._mtp import validate_mtp_tensor_contract
+
+    validate_mtp_tensor_contract(gguf_model)
+    _raise_for_unsupported_auxiliary_quantization(gguf_model)
+    _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
+    _raise_for_invalid_plamo2_tensor_contract(gguf_model)
+    _raise_for_invalid_minimax_tensor_contract(gguf_model)
+    _raise_for_invalid_kimi_k3_tensor_contract(gguf_model)
+    _raise_for_invalid_kimi_linear_tensor_contract(gguf_model)
+    _raise_for_invalid_hybrid_tensor_contract(gguf_model)
+    _raise_for_invalid_t5_tensor_contract(gguf_model)
+    _raise_for_malformed_recurrent_tensors(gguf_model)
+    _raise_for_unsupported_encoder_heads(gguf_model)
+    _raise_for_invalid_encoder_tensor_contract(gguf_model)
+    _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
+    from mobius.integrations.gguf._draft import validate_draft_tensor_contract
+
+    validate_draft_tensor_contract(gguf_model)
+    if not allow_mmproj_companion:
+        from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+        # Validate tokenizer identity and tables before config extraction. A
+        # known-but-deferred tokenizer is allowed for graph-only imports; an
+        # unknown or contradictory tokenizer is not.
+        inspect_gguf_tokenizer(gguf_model.metadata, source=source)
+
+
+def _raise_for_invalid_minimax_tensor_contract(gguf_model) -> None:
+    """Validate MiniMax-01 metadata, per-layer families, and exact tensor shapes."""
+    if gguf_model.architecture != "minimax-01":
+        return
+
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+    metadata = gguf_model.metadata
+    layers, layer_types, mtp_count = _derive_hybrid_layout(
+        "minimax-01", metadata, gguf_model.tensor_names
+    )
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("MiniMax-01 GGUF does not support appended MTP blocks")
+
+    hidden = int(metadata["minimax-01.embedding_length"])
+    intermediate = int(metadata["minimax-01.feed_forward_length"])
+    heads = int(metadata["minimax-01.attention.head_count"])
+    kv_heads = int(metadata["minimax-01.attention.head_count_kv"])
+    head_dim = int(metadata["minimax-01.attention.key_length"])
+    value_dim = int(metadata["minimax-01.attention.value_length"])
+    rope_dim = int(metadata["minimax-01.rope.dimension_count"])
+    experts = int(metadata["minimax-01.expert_count"])
+    top_k = int(metadata["minimax-01.expert_used_count"])
+    residual_scale = float(metadata["minimax-01.residual_scale"])
+    norm_eps = float(metadata["minimax-01.attention.layer_norm_rms_epsilon"])
+    rope_freq_base = float(metadata["minimax-01.rope.freq_base"])
+    vocab = int(metadata.get("minimax-01.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if (
+        min(hidden, intermediate, heads, kv_heads, head_dim, experts, top_k, vocab) <= 0
+        or heads % kv_heads
+        or value_dim != head_dim
+        or rope_dim <= 0
+        or rope_dim > head_dim
+        or rope_dim % 2
+        or experts <= 1
+        or top_k > experts
+        or not math.isfinite(residual_scale)
+        or residual_scale <= 0
+        or not math.isfinite(norm_eps)
+        or norm_eps <= 0
+        or not math.isfinite(rope_freq_base)
+        or rope_freq_base <= 0
+    ):
+        raise ValueError("MiniMax-01 GGUF has inconsistent architecture metadata")
+    if any(
+        key in metadata
+        for key in (
+            "minimax-01.expert_shared_count",
+            "minimax-01.expert_shared_feed_forward_length",
+        )
+    ):
+        raise ValueError("MiniMax-01 pinned GGUF does not support shared experts")
+
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {"output.weight": (vocab, hidden)}
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate_inp.weight": (experts, hidden),
+                prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
+                prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+            }
+        )
+        if layer_type == "lightning_attention":
+            required.update(
+                {
+                    prefix + "attn_qkv.weight": (3 * q_width, hidden),
+                    prefix + "attn_gate.weight": (q_width, hidden),
+                    prefix + "attn_norm_2.weight": (q_width,),
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "attn_q.weight": (q_width, hidden),
+                    prefix + "attn_k.weight": (kv_width, hidden),
+                    prefix + "attn_v.weight": (kv_width, hidden),
+                }
+            )
+
+    actual = set(gguf_model.tensor_names)
+    allowed = set(required) | set(optional)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - allowed)
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            "Invalid MiniMax-01 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, out_of_range={out_of_range}"
+        )
+    if not hasattr(gguf_model, "tensor_items_raw"):
+        return
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    malformed = {
+        name: (shape, shapes.get(name))
+        for name, shape in {**required, **optional}.items()
+        if name in shapes and shapes[name] != shape
+    }
+    if malformed:
+        raise ValueError(f"MiniMax-01 GGUF has invalid tensor shape(s): {malformed}")
+
+
+def _raise_for_invalid_kimi_linear_tensor_contract(gguf_model) -> None:
+    """Validate Kimi Linear's pinned metadata and exact heterogeneous closure."""
+    if gguf_model.architecture != "kimi-linear":
+        return
+
+    import numpy as np
+
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    if int(gguf_model.format_version) != 3:
+        raise ValueError(
+            f"Kimi Linear supports only pinned GGUF v3, got v{gguf_model.format_version}"
+        )
+    metadata = gguf_model.metadata
+    arch = "kimi-linear"
+    layers, layer_types, mtp_count = _derive_hybrid_layout(
+        arch, metadata, gguf_model.tensor_names
+    )
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("Kimi Linear GGUF does not support appended NextN blocks")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    dense_intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    value_dim = int(metadata[f"{arch}.attention.value_length_mla"])
+    kv_rank = int(metadata[f"{arch}.attention.kv_lora_rank"])
+    extra_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    kda_dim = int(metadata[f"{arch}.kda.head_dim"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    expert_intermediate = int(metadata[f"{arch}.expert_feed_forward_length"])
+    shared = int(metadata[f"{arch}.expert_shared_count"])
+    dense_layers = int(metadata[f"{arch}.leading_dense_block_count"])
+    routed_scale = float(metadata[f"{arch}.expert_weights_scale"])
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    if (
+        min(
+            layers,
+            hidden,
+            dense_intermediate,
+            heads,
+            qk_dim,
+            value_dim,
+            kv_rank,
+            extra_dim,
+            kda_dim,
+            conv,
+            experts,
+            top_k,
+            expert_intermediate,
+        )
+        <= 0
+        or conv < 2
+        or qk_dim <= extra_dim
+        or top_k > experts
+        or shared != 1
+        or dense_layers != 1
+        or not math.isfinite(routed_scale)
+        or routed_scale <= 0
+        or not math.isfinite(epsilon)
+        or epsilon <= 0
+    ):
+        raise ValueError("Kimi Linear GGUF has inconsistent pinned architecture metadata")
+    for key in ("expert_group_count", "expert_group_used_count"):
+        if f"{arch}.{key}" in metadata and int(metadata[f"{arch}.{key}"]) != 1:
+            raise ValueError(f"Kimi Linear requires {arch}.{key}=1")
+
+    kv_counts = metadata[f"{arch}.attention.head_count_kv"]
+    if not isinstance(kv_counts, (list, tuple, np.ndarray)):
+        raise TypeError("kimi-linear.attention.head_count_kv must be an exact per-layer array")
+    kv_counts = [int(value) for value in kv_counts]
+    if len(kv_counts) != layers or any(value not in {0, 1} for value in kv_counts):
+        raise ValueError(
+            "Kimi Linear per-layer KV-head counts must contain block_count entries of 0 or 1"
+        )
+    if all(value == 0 for value in kv_counts) or all(value == 1 for value in kv_counts):
+        raise ValueError("Kimi Linear requires both KDA and MLA layers")
+
+    actual_shapes = {
+        name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))
+        for name in gguf_model.tensor_names
+    }
+    vocab = int(
+        metadata.get(
+            f"{arch}.vocab_size",
+            actual_shapes.get("token_embd.weight", (0,))[0],
+        )
+    )
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+        "output.weight": (vocab, hidden),
+    }
+    projection_width = heads * kda_dim
+    nope_dim = qk_dim - extra_dim
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "ffn_norm.weight": (hidden,),
+            }
+        )
+        if layer_type == "kimi_linear_attention":
+            required.update(
+                {
+                    prefix + "attn_q.weight": (projection_width, hidden),
+                    prefix + "attn_k.weight": (projection_width, hidden),
+                    prefix + "attn_v.weight": (projection_width, hidden),
+                    prefix + "ssm_conv1d_q.weight": (1, projection_width, 1, conv),
+                    prefix + "ssm_conv1d_k.weight": (1, projection_width, 1, conv),
+                    prefix + "ssm_conv1d_v.weight": (1, projection_width, 1, conv),
+                    prefix + "ssm_f_a.weight": (kda_dim, hidden),
+                    prefix + "ssm_f_b.weight": (projection_width, kda_dim),
+                    prefix + "ssm_beta.weight": (heads, hidden),
+                    prefix + "ssm_a": (1, 1, heads, 1),
+                    prefix + "ssm_dt.bias": (projection_width,),
+                    prefix + "ssm_g_a.weight": (kda_dim, hidden),
+                    prefix + "ssm_g_b.weight": (projection_width, kda_dim),
+                    prefix + "ssm_norm.weight": (kda_dim,),
+                    prefix + "attn_output.weight": (hidden, projection_width),
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "attn_q.weight": (heads * qk_dim, hidden),
+                    prefix + "attn_kv_a_mqa.weight": (kv_rank + extra_dim, hidden),
+                    prefix + "attn_kv_a_norm.weight": (kv_rank,),
+                    prefix + "attn_k_b.weight": (heads, kv_rank, nope_dim),
+                    prefix + "attn_v_b.weight": (heads, value_dim, kv_rank),
+                    prefix + "attn_output.weight": (hidden, heads * value_dim),
+                }
+            )
+        if layer < dense_layers:
+            required.update(
+                {
+                    prefix + "ffn_gate.weight": (dense_intermediate, hidden),
+                    prefix + "ffn_up.weight": (dense_intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, dense_intermediate),
+                }
+            )
+        else:
+            shared_width = shared * expert_intermediate
+            required.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "exp_probs_b.bias": (experts,),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        expert_intermediate,
+                    ),
+                    prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                }
+            )
+
+    actual = set(gguf_model.tensor_names)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - set(required))
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            "Invalid Kimi Linear GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, out_of_range={out_of_range}"
+        )
+    malformed = {
+        name: (shape, actual_shapes.get(name))
+        for name, shape in required.items()
+        if actual_shapes.get(name) != shape
+    }
+    if malformed:
+        raise ValueError(f"Kimi Linear GGUF has invalid tensor shape(s): {malformed}")
+
+    float_types = float_storage_type_ids()
+    non_matmul = {
+        name
+        for name in required
+        if name.endswith(("_norm.weight", "ssm_a", "ssm_dt.bias", "exp_probs_b.bias"))
+        or "conv1d" in name
+    }
+    invalid_storage = []
+    for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
+        qtype_id = getattr(qtype, "value", qtype)
+        if name in non_matmul and qtype_id not in float_types:
+            invalid_storage.append(name)
+    if invalid_storage:
+        raise ValueError(
+            "Kimi Linear recurrent, norm, and routing auxiliary tensors must remain float: "
+            f"{sorted(invalid_storage)}"
+        )
+
+    for layer, layer_type in enumerate(layer_types):
+        if layer_type != "kimi_linear_attention":
+            continue
+        name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Kimi Linear decay tensor {name!r}: expected finite -exp(A_log)"
+            )
+
+
+def _raise_for_invalid_kimi_k3_tensor_contract(gguf_model) -> None:
+    """Validate Kimi-K3 metadata, layer families, storage, and exact tensor closure."""
+    if gguf_model.architecture != "kimi-k3":
+        return
+
+    import numpy as np
+
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    if int(gguf_model.format_version) != 3:
+        raise ValueError(
+            f"Kimi-K3 supports only pinned GGUF v3, got v{gguf_model.format_version}"
+        )
+    metadata = gguf_model.metadata
+    arch = "kimi-k3"
+    layers, layer_types, mtp_count = _derive_hybrid_layout(
+        arch, metadata, gguf_model.tensor_names
+    )
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("Kimi-K3 GGUF does not support appended NextN blocks")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    dense_intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    q_rank = int(metadata[f"{arch}.attention.q_lora_rank"])
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    value_dim = int(metadata[f"{arch}.attention.value_length_mla"])
+    kv_rank = int(metadata[f"{arch}.attention.kv_lora_rank"])
+    extra_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    kda_dim = int(metadata[f"{arch}.kda.head_dim"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    expert_intermediate = int(metadata[f"{arch}.expert_feed_forward_length"])
+    shared = int(metadata.get(f"{arch}.expert_shared_count", 0))
+    dense_layers = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    routed_scale = float(metadata.get(f"{arch}.expert_weights_scale", 0.0))
+    expert_latent = int(metadata.get(f"{arch}.expert_latent_length", hidden))
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    gate_lower_bound = float(metadata.get(f"{arch}.kda.gate_lower_bound", -math.inf))
+    attn_res_block = int(metadata.get(f"{arch}.attn_res.block_size", 0))
+    situ_beta = float(metadata.get(f"{arch}.activation.situ_beta", 1.0))
+    situ_linear_beta = float(metadata.get(f"{arch}.activation.situ_linear_beta", 0.0))
+    gating = int(metadata.get(f"{arch}.expert_gating_func", 0))
+    if (
+        min(
+            layers,
+            hidden,
+            dense_intermediate,
+            heads,
+            q_rank,
+            qk_dim,
+            value_dim,
+            kv_rank,
+            extra_dim,
+            kda_dim,
+            conv,
+            experts,
+            top_k,
+            expert_intermediate,
+            shared,
+            expert_latent,
+            attn_res_block,
+        )
+        <= 0
+        or conv < 2
+        or qk_dim <= extra_dim
+        or top_k > experts
+        or dense_layers != 1
+        or shared != 2
+        or gating != 2
+        or not bool(metadata.get(f"{arch}.expert_weights_norm", False))
+        or not math.isfinite(routed_scale)
+        or routed_scale <= 0
+        or not math.isfinite(epsilon)
+        or epsilon <= 0
+        or not math.isfinite(gate_lower_bound)
+        or gate_lower_bound >= 0
+        or not math.isfinite(situ_beta)
+        or not math.isclose(situ_beta, 4.0)
+        or not math.isfinite(situ_linear_beta)
+        or not math.isclose(situ_linear_beta, 25.0)
+    ):
+        raise ValueError("Kimi-K3 GGUF has inconsistent pinned architecture metadata")
+
+    kv_counts = metadata[f"{arch}.attention.head_count_kv"]
+    if not isinstance(kv_counts, (list, tuple, np.ndarray)):
+        raise TypeError("kimi-k3.attention.head_count_kv must be an exact per-layer array")
+    kv_counts = [int(value) for value in kv_counts]
+    if len(kv_counts) != layers or any(value not in {0, 1} for value in kv_counts):
+        raise ValueError(
+            "Kimi-K3 per-layer KV-head counts must contain block_count entries of 0 or 1"
+        )
+    if all(value == 0 for value in kv_counts) or all(value == 1 for value in kv_counts):
+        raise ValueError("Kimi-K3 requires both KDA and MLA layers")
+
+    actual_shapes = {
+        name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))
+        for name in gguf_model.tensor_names
+    }
+    vocab = int(
+        metadata.get(
+            f"{arch}.vocab_size",
+            actual_shapes.get("token_embd.weight", (0,))[0],
+        )
+    )
+    required: dict[str, tuple[int, ...] | tuple[tuple[int, ...], ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+        "output.weight": (vocab, hidden),
+        "output_res_score.weight": (hidden,),
+    }
+    projection_width = heads * kda_dim
+    nope_dim = qk_dim - extra_dim
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "attn_res_score.weight": (hidden,),
+                prefix + "ffn_res_score.weight": (hidden,),
+            }
+        )
+        if layer_type == "kimi_k3_attention":
+            required.update(
+                {
+                    prefix + "attn_q.weight": (projection_width, hidden),
+                    prefix + "attn_k.weight": (projection_width, hidden),
+                    prefix + "attn_v.weight": (projection_width, hidden),
+                    prefix + "ssm_conv1d_q.weight": (
+                        (1, projection_width, 1, conv),
+                        (1, projection_width, conv),
+                    ),
+                    prefix + "ssm_conv1d_k.weight": (
+                        (1, projection_width, 1, conv),
+                        (1, projection_width, conv),
+                    ),
+                    prefix + "ssm_conv1d_v.weight": (
+                        (1, projection_width, 1, conv),
+                        (1, projection_width, conv),
+                    ),
+                    prefix + "ssm_f_a.weight": (kda_dim, hidden),
+                    prefix + "ssm_f_b.weight": (projection_width, kda_dim),
+                    prefix + "ssm_beta.weight": (heads, hidden),
+                    prefix + "ssm_a": (heads,),
+                    prefix + "ssm_dt.bias": (projection_width,),
+                    prefix + "ssm_g.weight": (projection_width, hidden),
+                    prefix + "ssm_norm.weight": (kda_dim,),
+                    prefix + "attn_output.weight": (hidden, projection_width),
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "attn_q_a.weight": (q_rank, hidden),
+                    prefix + "attn_q_a_norm.weight": (q_rank,),
+                    prefix + "attn_q_b.weight": (heads * qk_dim, q_rank),
+                    prefix + "attn_kv_a_mqa.weight": (kv_rank + extra_dim, hidden),
+                    prefix + "attn_kv_a_norm.weight": (kv_rank,),
+                    prefix + "attn_gate.weight": (heads * value_dim, hidden),
+                    prefix + "attn_output.weight": (hidden, heads * value_dim),
+                }
+            )
+            fused = prefix + "attn_kv_b.weight"
+            split_k = prefix + "attn_k_b.weight"
+            split_v = prefix + "attn_v_b.weight"
+            has_fused = fused in actual_shapes
+            has_split = split_k in actual_shapes or split_v in actual_shapes
+            if has_fused == has_split:
+                raise ValueError(
+                    f"Kimi-K3 layer {layer} must contain exactly one KV-B representation"
+                )
+            if has_fused:
+                required[fused] = (heads * (nope_dim + value_dim), kv_rank)
+            else:
+                required[split_k] = (heads, kv_rank, nope_dim)
+                required[split_v] = (heads, value_dim, kv_rank)
+        if layer < dense_layers:
+            required.update(
+                {
+                    prefix + "ffn_gate.weight": (dense_intermediate, hidden),
+                    prefix + "ffn_up.weight": (dense_intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, dense_intermediate),
+                }
+            )
+        else:
+            shared_width = shared * expert_intermediate
+            required.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "exp_probs_b.bias": (experts,),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        expert_latent,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        expert_latent,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        expert_latent,
+                        expert_intermediate,
+                    ),
+                    prefix + "ffn_routed_down.weight": (expert_latent, hidden),
+                    prefix + "ffn_routed_up.weight": (hidden, expert_latent),
+                    prefix + "ffn_routed_norm.weight": (expert_latent,),
+                    prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                }
+            )
+
+    actual = set(gguf_model.tensor_names)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - set(required))
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            "Invalid Kimi-K3 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, out_of_range={out_of_range}"
+        )
+    malformed: dict[str, object] = {}
+    for name, expected in required.items():
+        actual_shape = actual_shapes.get(name)
+        alternatives = expected if expected and isinstance(expected[0], tuple) else (expected,)
+        if actual_shape not in alternatives:
+            malformed[name] = (expected, actual_shape)
+    if malformed:
+        raise ValueError(f"Kimi-K3 GGUF has invalid tensor shape(s): {malformed}")
+
+    float_types = float_storage_type_ids()
+    non_matmul = {
+        name
+        for name in required
+        if name.endswith(
+            ("_norm.weight", "ssm_a", "ssm_dt.bias", "exp_probs_b.bias", "_res_score.weight")
+        )
+        or "conv1d" in name
+    }
+    invalid_storage = []
+    for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
+        qtype_id = getattr(qtype, "value", qtype)
+        if name in non_matmul and qtype_id not in float_types:
+            invalid_storage.append(name)
+    if invalid_storage:
+        raise ValueError(
+            "Kimi-K3 recurrent, normalization, residual-score, and routing auxiliary "
+            f"tensors must remain float: {sorted(invalid_storage)}"
+        )
+
+    for layer, layer_type in enumerate(layer_types):
+        if layer_type != "kimi_k3_attention":
+            continue
+        name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Kimi-K3 decay tensor {name!r}: expected finite -exp(A_log)"
+            )
+
+
+def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
+    """Validate the exact pinned C01 dense profiles before config extraction."""
+    import numpy as np
+
+    architecture = gguf_model.architecture
+    if architecture not in {"baichuan", "chatglm", "phi2", "seed_oss"}:
+        return
+
+    metadata = gguf_model.metadata
+    required_geometry = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    missing_geometry = [
+        f"{architecture}.{suffix}"
+        for suffix in required_geometry
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_geometry:
+        raise ValueError(
+            f"{architecture} GGUF is missing required dense metadata: {missing_geometry}"
+        )
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    context = int(metadata[f"{architecture}.context_length"])
+    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+    if (
+        context <= 0
+        or hidden <= 0
+        or intermediate <= 0
+        or layers <= 0
+        or heads <= 0
+        or hidden % heads
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid dense model geometry")
+    default_head_dim = hidden // heads
+    key_head_dim = int(metadata.get(f"{architecture}.attention.key_length", default_head_dim))
+    value_head_dim = int(metadata.get(f"{architecture}.attention.value_length", key_head_dim))
+    if key_head_dim <= 0 or value_head_dim <= 0 or key_head_dim != value_head_dim:
+        raise ValueError(
+            f"{architecture} GGUF requires equal positive key/value head widths, got "
+            f"key_length={key_head_dim}, value_length={value_head_dim}"
+        )
+    head_dim = key_head_dim
+    rope_dim = int(metadata.get(f"{architecture}.rope.dimension_count", head_dim))
+    if kv_heads <= 0 or heads % kv_heads:
+        raise ValueError(
+            f"{architecture} GGUF has invalid grouped-query geometry: "
+            f"head_count={heads}, head_count_kv={kv_heads}"
+        )
+    if architecture in {"baichuan", "chatglm", "phi2"} and heads * head_dim != hidden:
+        raise ValueError(
+            f"{architecture} requires attention key width * head_count == "
+            f"embedding_length, got {head_dim} * {heads} != {hidden}"
+        )
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+        raise ValueError(
+            f"{architecture} GGUF has invalid rope.dimension_count={rope_dim} "
+            f"for head_dim={head_dim}"
+        )
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if vocab <= 0:
+        raise ValueError(f"{architecture} GGUF has no positive vocabulary size")
+
+    if architecture == "baichuan":
+        if layers != 32:
+            raise ValueError(
+                "Baichuan GGUF import supports only block_count=32 (the pinned 7B RoPE "
+                f"profile), got {layers}; block_count=40 uses unsupported hardcoded ALiBi."
+            )
+        if kv_heads != heads or rope_dim != head_dim:
+            raise ValueError(
+                "Baichuan 7B requires full MHA and full-head RoPE: "
+                f"head_count={heads}, head_count_kv={kv_heads}, "
+                f"rope.dimension_count={rope_dim}, head_dim={head_dim}"
+            )
+        if float(metadata.get("baichuan.attention.max_alibi_bias", 0.0)):
+            raise ValueError("Baichuan 7B RoPE metadata contradicts a nonzero ALiBi bias")
+    elif architecture == "phi2":
+        if kv_heads != heads or intermediate != 4 * hidden:
+            raise ValueError(
+                "Phi-2 requires full MHA and feed_forward_length == 4 * embedding_length"
+            )
+    elif architecture == "seed_oss":
+        if layers != 64:
+            raise ValueError(f"Seed-OSS pinned profile requires block_count=64, got {layers}")
+        if kv_heads <= 0 or heads % kv_heads or rope_dim != head_dim:
+            raise ValueError(
+                "Seed-OSS requires valid grouped-query geometry and full-head RoPE"
+            )
+
+    items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in items
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {}
+    if architecture in {"baichuan", "phi2"}:
+        required["output.weight"] = (vocab, hidden)
+    elif architecture in {"chatglm", "seed_oss"}:
+        optional["output.weight"] = (vocab, hidden)
+    if architecture == "phi2":
+        required.update(
+            {
+                "output_norm.bias": (hidden,),
+                "output.bias": (vocab,),
+            }
+        )
+
+    q_dim = heads * head_dim
+    kv_dim = kv_heads * head_dim
+    qkv_biases: list[str] = []
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        fused_weight = prefix + "attn_qkv.weight"
+        separate_weights = {
+            prefix + "attn_q.weight": (q_dim, hidden),
+            prefix + "attn_k.weight": (kv_dim, hidden),
+            prefix + "attn_v.weight": (kv_dim, hidden),
+        }
+        if architecture in {"chatglm", "phi2"}:
+            has_fused = fused_weight in actual
+            present_separate = set(separate_weights) & set(actual)
+            if has_fused == bool(present_separate) or (
+                present_separate and present_separate != set(separate_weights)
+            ):
+                raise ValueError(
+                    f"{architecture} layer {layer} must contain exactly one complete QKV "
+                    "layout: one fused attn_qkv tensor or all separate attn_q/attn_k/attn_v "
+                    "tensors"
+                )
+        else:
+            has_fused = False
+
+        if not has_fused:
+            required.update(separate_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_dim,),
+                prefix + "attn_k.bias": (kv_dim,),
+                prefix + "attn_v.bias": (kv_dim,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        else:
+            required[fused_weight] = (q_dim + 2 * kv_dim, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_dim + 2 * kv_dim,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        mismatched_biases = sorted(alternate_biases & set(actual))
+        if mismatched_biases:
+            raise ValueError(
+                f"{architecture} layer {layer} QKV bias layout does not match its "
+                f"weight layout: {mismatched_biases}"
+            )
+
+        if architecture == "chatglm":
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_output.weight": (hidden, q_dim),
+                    prefix + "ffn_norm.weight": (hidden,),
+                    prefix + "ffn_up.weight": (2 * intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional.update(selected_biases)
+            qkv_biases.extend(selected_biases)
+        else:
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_output.weight": (hidden, q_dim),
+                }
+            )
+            if architecture != "phi2":
+                required.update(
+                    {
+                        prefix + "ffn_up.weight": (intermediate, hidden),
+                        prefix + "ffn_down.weight": (hidden, intermediate),
+                    }
+                )
+        if architecture == "baichuan":
+            required[prefix + "ffn_norm.weight"] = (hidden,)
+        if architecture in {"baichuan", "seed_oss"}:
+            required[prefix + "ffn_gate.weight"] = (intermediate, hidden)
+        if architecture == "phi2":
+            required.update(
+                {
+                    prefix + "attn_norm.bias": (hidden,),
+                    prefix + "attn_output.bias": (hidden,),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_up.bias": (intermediate,),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                    prefix + "ffn_down.bias": (hidden,),
+                }
+            )
+            required.update(selected_biases)
+        elif architecture == "seed_oss":
+            required.update(
+                {
+                    prefix + "post_attention_norm.weight": (hidden,),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional.update(
+                {
+                    prefix + "attn_q.bias": (q_dim,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                }
+            )
+
+    if architecture == "seed_oss":
+        attention_scale = float(metadata.get("seed_oss.attention.scale", 0.0))
+        if not np.isfinite(attention_scale):
+            raise ValueError("seed_oss.attention.scale must be finite")
+        if attention_scale:
+            raise ValueError(
+                f"seed_oss.attention.scale={attention_scale} is not consumed by the "
+                "pinned llama.cpp loader for this architecture"
+            )
+        qkv_biases = {
+            f"blk.{layer}.attn_{projection}.bias"
+            for layer in range(layers)
+            for projection in ("q", "k", "v")
+        }
+        present_qkv_biases = qkv_biases & set(actual)
+        if present_qkv_biases and present_qkv_biases != qkv_biases:
+            raise ValueError(
+                "Seed-OSS Q/K/V bias tensors must be present for every projection "
+                "in every layer or absent entirely"
+            )
+
+    if architecture == "chatglm":
+        present_biases = set(qkv_biases) & set(actual)
+        if present_biases and present_biases != set(qkv_biases):
+            raise ValueError("ChatGLM QKV bias must be present in every layer or none")
+
+    allowed = set(required) | set(optional)
+    shape_checked = set(allowed)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in shape_checked & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_falcon_h1_tensor_contract(gguf_model) -> None:
+    """Validate Falcon-H1's complete parallel attention/Mamba2 tensor closure."""
+    if gguf_model.architecture != "falcon-h1":
+        return
+
+    import numpy as np
+
+    metadata = gguf_model.metadata
+    arch = "falcon-h1"
+    positive_fields = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.key_length",
+        "attention.value_length",
+        "ssm.conv_kernel",
+        "ssm.inner_size",
+        "ssm.state_size",
+        "ssm.time_step_rank",
+        "ssm.group_count",
+    )
+    required_fields = (*positive_fields, "attention.layer_norm_rms_epsilon", "rope.freq_base")
+    missing_metadata = sorted(
+        suffix for suffix in required_fields if f"{arch}.{suffix}" not in metadata
+    )
+    if missing_metadata:
+        raise ValueError(
+            f"falcon-h1 GGUF is missing required metadata field(s): {missing_metadata}"
+        )
+    values = {suffix: int(metadata[f"{arch}.{suffix}"]) for suffix in positive_fields}
+    invalid = sorted(suffix for suffix, value in values.items() if value <= 0)
+    if invalid:
+        raise ValueError(f"falcon-h1 GGUF has non-positive metadata field(s): {invalid}")
+    rms_epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    if not np.isfinite(rms_epsilon) or rms_epsilon <= 0:
+        raise ValueError("falcon-h1 attention.layer_norm_rms_epsilon must be positive")
+    if not np.isfinite(rope_base) or rope_base <= 0:
+        raise ValueError("falcon-h1 rope.freq_base must be positive")
+
+    hidden = values["embedding_length"]
+    intermediate = values["feed_forward_length"]
+    layers = values["block_count"]
+    attn_heads = values["attention.head_count"]
+    kv_heads = values["attention.head_count_kv"]
+    key_dim = values["attention.key_length"]
+    value_dim = values["attention.value_length"]
+    conv_kernel = values["ssm.conv_kernel"]
+    ssm_inner = values["ssm.inner_size"]
+    state_size = values["ssm.state_size"]
+    ssm_heads = values["ssm.time_step_rank"]
+    groups = values["ssm.group_count"]
+    if (
+        key_dim != value_dim
+        or hidden != attn_heads * key_dim
+        or attn_heads % kv_heads
+        or ssm_inner % ssm_heads
+        or ssm_heads % groups
+        or ssm_inner % groups
+    ):
+        raise ValueError("falcon-h1 GGUF has inconsistent attention or SSM geometry")
+
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if vocab <= 0:
+        raise ValueError("falcon-h1 GGUF has no positive vocabulary size")
+
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (vocab, hidden),
+    }
+    q_dim = attn_heads * key_dim
+    kv_dim = kv_heads * key_dim
+    conv_dim = ssm_inner + 2 * groups * state_size
+    projection_size = 2 * ssm_inner + 2 * groups * state_size + ssm_heads
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_q.weight": (q_dim, hidden),
+                prefix + "attn_k.weight": (kv_dim, hidden),
+                prefix + "attn_v.weight": (kv_dim, hidden),
+                prefix + "attn_output.weight": (hidden, q_dim),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+                prefix + "ssm_in.weight": (projection_size, hidden),
+                prefix + "ssm_conv1d.weight": (conv_dim, conv_kernel),
+                prefix + "ssm_dt.bias": (ssm_heads,),
+                prefix + "ssm_a": (ssm_heads, 1),
+                prefix + "ssm_d": (ssm_heads, 1),
+                prefix + "ssm_out.weight": (hidden, ssm_inner),
+            }
+        )
+        optional.update(
+            {
+                prefix + "attn_q.bias": (q_dim,),
+                prefix + "attn_k.bias": (kv_dim,),
+                prefix + "attn_v.bias": (kv_dim,),
+                prefix + "attn_output.bias": (hidden,),
+                prefix + "ffn_gate.bias": (intermediate,),
+                prefix + "ffn_up.bias": (intermediate,),
+                prefix + "ffn_down.bias": (hidden,),
+                prefix + "ssm_conv1d.bias": (conv_dim,),
+                prefix + "ssm_norm.weight": (groups, ssm_inner // groups),
+                prefix + "rope_freqs.weight": (key_dim // 2,),
+            }
+        )
+
+    families = {
+        "attention projection biases": {
+            f"blk.{layer}.attn_{projection}.bias"
+            for layer in range(layers)
+            for projection in ("q", "k", "v", "output")
+        },
+        "feed-forward biases": {
+            f"blk.{layer}.ffn_{projection}.bias"
+            for layer in range(layers)
+            for projection in ("gate", "up", "down")
+        },
+        "Mamba convolution biases": {
+            f"blk.{layer}.ssm_conv1d.bias" for layer in range(layers)
+        },
+        "Mamba RMSNorm weights": {f"blk.{layer}.ssm_norm.weight" for layer in range(layers)},
+    }
+    actual_names = set(actual)
+    for family_name, family in families.items():
+        present = family & actual_names
+        if present and present != family:
+            raise ValueError(
+                f"falcon-h1 {family_name} must be present in every layer or absent entirely"
+            )
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - actual_names)
+    unexpected = sorted(actual_names - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & actual_names
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid falcon-h1 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+    for layer in range(layers):
+        decay_name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(decay_name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Falcon-H1 GGUF Mamba decay tensor {decay_name!r}: "
+                "ssm_a must contain only finite negative -exp(A_log) values"
+            )
+
+
+def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
+    """Reject any PLaMo2 metadata/tensor topology not implemented exactly."""
+    if gguf_model.architecture != "plamo2":
+        return
+
+    import numpy as np
+
+    metadata = gguf_model.metadata
+    arch = "plamo2"
+    if int(gguf_model.format_version) != 3:
+        raise ValueError(
+            f"PLaMo2 supports only pinned GGUF v3, got v{gguf_model.format_version}"
+        )
+    layers = int(metadata[f"{arch}.block_count"])
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    state = int(metadata[f"{arch}.ssm.state_size"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    group_count = int(metadata[f"{arch}.ssm.group_count"])
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    if min(layers, hidden, intermediate, inner, state, conv, ssm_heads) <= 0:
+        raise ValueError("PLaMo2 dimensions must all be positive")
+    if inner % ssm_heads:
+        raise ValueError("PLaMo2 requires an exact SSM head split")
+    if group_count != 0:
+        raise ValueError("PLaMo2 supports only ssm.group_count=0")
+    if not math.isclose(epsilon, 1e-6, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("PLaMo2 requires attention.layer_norm_rms_epsilon=1e-6")
+    activation = metadata.get(f"{arch}.feed_forward.activation", "silu")
+    if activation not in {"silu", "swiglu"}:
+        raise ValueError(f"PLaMo2 supports only fused SwiGLU, got {activation!r}")
+    if bool(metadata.get(f"{arch}.ssm.use_predefined_initial_state", False)):
+        raise ValueError("PLaMo2 predefined initial state is unsupported")
+
+    head_counts = metadata[f"{arch}.attention.head_count"]
+    kv_counts = metadata[f"{arch}.attention.head_count_kv"]
+    head_counts_are_arrays = isinstance(head_counts, (list, tuple, np.ndarray))
+    kv_counts_are_arrays = isinstance(kv_counts, (list, tuple, np.ndarray))
+    if head_counts_are_arrays and len(head_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+    if kv_counts_are_arrays and len(kv_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+    if kv_counts_are_arrays:
+        attention_layers = [int(value) > 0 for value in kv_counts]
+    elif head_counts_are_arrays:
+        attention_layers = [int(value) > 0 for value in head_counts]
+    else:
+        # Early llama.cpp PLaMo2 converters serialized the attention dimensions
+        # as scalars. The mutually exclusive tensor families still encode the
+        # exact layer schedule, so expand it only when every layer is unambiguous.
+        tensor_names = set(gguf_model.tensor_names)
+        attention_layers = []
+        for layer in range(layers):
+            has_attention = f"blk.{layer}.attn_qkv.weight" in tensor_names
+            has_mamba = f"blk.{layer}.ssm_in.weight" in tensor_names
+            if has_attention == has_mamba:
+                raise ValueError(
+                    "PLaMo2 scalar head metadata requires exactly one attention or "
+                    f"Mamba tensor family in layer {layer}"
+                )
+            attention_layers.append(has_attention)
+    if not head_counts_are_arrays:
+        attention_heads = int(head_counts)
+        if attention_heads <= 0:
+            raise ValueError("PLaMo2 scalar attention head_count must be positive")
+        head_counts = metadata[f"{arch}.attention.head_count"] = [
+            attention_heads if is_attention else 0 for is_attention in attention_layers
+        ]
+    if not kv_counts_are_arrays:
+        attention_kv_heads = int(kv_counts)
+        if attention_kv_heads <= 0:
+            raise ValueError("PLaMo2 scalar attention head_count_kv must be positive")
+        kv_counts = metadata[f"{arch}.attention.head_count_kv"] = [
+            attention_kv_heads if is_attention else 0 for is_attention in attention_layers
+        ]
+    head_counts = [int(value) for value in head_counts]
+    kv_counts = [int(value) for value in kv_counts]
+
+    actual_shapes = {
+        name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))
+        for name in gguf_model.tensor_names
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (
+            int(
+                metadata.get(
+                    f"{arch}.vocab_size",
+                    actual_shapes.get("token_embd.weight", (0,))[0],
+                )
+            ),
+            hidden,
+        ),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (required["token_embd.weight"][0], hidden)
+    }
+    dt_rank = max(64, hidden // 16)
+    inferred_widths: set[tuple[int, int]] = set()
+    for layer, (heads, kv_heads) in enumerate(zip(head_counts, kv_counts)):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "post_attention_norm": (hidden,),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "post_ffw_norm": (hidden,),
+                prefix + "ffn_up.weight": (2 * intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+        )
+        if kv_heads == 0:
+            if heads != 0:
+                raise ValueError(
+                    f"PLaMo2 layer {layer} has head_count={heads} but head_count_kv=0"
+                )
+            required.update(
+                {
+                    prefix + "ssm_in.weight": (2 * inner, hidden),
+                    prefix + "ssm_conv1d.weight": (inner, conv),
+                    prefix + "ssm_x.weight": (2 * state + dt_rank, inner),
+                    prefix + "ssm_dt.weight": (ssm_heads, dt_rank),
+                    prefix + "ssm_dt.bias": (ssm_heads,),
+                    prefix + "ssm_a": (ssm_heads,),
+                    prefix + "ssm_d": (ssm_heads,),
+                    prefix + "ssm_dt_norm": (dt_rank,),
+                    prefix + "ssm_b_norm": (state,),
+                    prefix + "ssm_c_norm": (state,),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+        else:
+            if heads <= 0 or heads % kv_heads:
+                raise ValueError(f"PLaMo2 layer {layer} has invalid attention head geometry")
+            qkv_name = prefix + "attn_qkv.weight"
+            output_name = prefix + "attn_output.weight"
+            if qkv_name not in actual_shapes or output_name not in actual_shapes:
+                continue
+            value_width, value_remainder = divmod(actual_shapes[output_name][1], heads)
+            key_width, key_remainder = divmod(
+                actual_shapes[qkv_name][0] - kv_heads * value_width,
+                heads + kv_heads,
+            )
+            if value_remainder or key_remainder or min(key_width, value_width) <= 0:
+                raise ValueError(
+                    f"PLaMo2 layer {layer} key/value widths cannot be inferred exactly"
+                )
+            inferred_widths.add((key_width, value_width))
+            required.update(
+                {
+                    qkv_name: (
+                        heads * key_width + kv_heads * key_width + kv_heads * value_width,
+                        hidden,
+                    ),
+                    prefix + "attn_q_norm.weight": (heads, key_width),
+                    prefix + "attn_k_norm.weight": (kv_heads, key_width),
+                    output_name: (hidden, heads * value_width),
+                }
+            )
+
+    if len(inferred_widths) != 1:
+        raise ValueError("PLaMo2 attention tensor widths are missing or contradictory")
+    key_width, value_width = inferred_widths.pop()
+    if key_width != value_width or key_width * max(head_counts) != hidden:
+        raise ValueError("PLaMo2 attention widths do not reconstruct embedding_length")
+    if inner != ssm_heads * key_width:
+        raise ValueError(
+            "PLaMo2 ssm.inner_size must equal ssm.time_step_rank * attention key width"
+        )
+    for suffix, expected in (
+        ("attention.key_length", key_width),
+        ("attention.value_length", value_width),
+    ):
+        explicit = metadata.get(f"{arch}.{suffix}")
+        if explicit is not None and int(explicit) != expected:
+            raise ValueError(f"PLaMo2 {suffix} contradicts exact tensor shapes")
+
+    actual = set(actual_shapes)
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual_shapes[name])
+        for name in allowed & actual
+        if actual_shapes[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid PLaMo2 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+    for layer, kv_heads in enumerate(kv_counts):
+        if kv_heads:
+            continue
+        decay_name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(decay_name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed PLaMo2 decay tensor {decay_name!r}: "
+                "ssm_a must contain finite negative -exp(A_log) values"
+            )
+
+
+def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
+    """Enforce pinned per-layer mixer closure before any graph is constructed."""
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+    architecture = gguf_model.architecture
+    if architecture in {"jamba", "nemotron_h", "nemotron_h_moe", "granitehybrid"}:
+        _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model)
+        return
+    if architecture not in {"lfm2", "lfm2moe", "qwen35", "qwen35moe", "qwen3next"}:
+        return
+
+    metadata = gguf_model.metadata
+    trunk_layers, layer_types, mtp_count = _derive_hybrid_layout(architecture, metadata)
+    assert layer_types is not None
+    if mtp_count > 1:
+        raise ValueError(
+            f"{architecture} GGUF has {mtp_count} MTP blocks; pinned llama.cpp "
+            "supports exactly one appended MTP block"
+        )
+    if mtp_count and architecture in {"qwen35moe", "qwen3next"}:
+        raise NotImplementedError(
+            f"{architecture} GGUF MTP blocks use routed experts, but the Mobius MTP "
+            "sidecar currently supports only dense Qwen3.5 heads; refusing to omit "
+            "the MTP expert tensors"
+        )
+
+    actual = set(gguf_model.tensor_names)
+    total_layers = int(metadata[f"{architecture}.block_count"])
+    for name in actual:
+        match = re.match(r"^blk\.(\d+)\.", name)
+        if match is not None and int(match.group(1)) >= total_layers:
+            raise ValueError(
+                f"{architecture} GGUF tensor {name!r} references out-of-range layer "
+                f"{match.group(1)} (block_count={total_layers})"
+            )
+
+    if architecture in {"lfm2", "lfm2moe"}:
+        required_global = {"token_embd.weight", "token_embd_norm.weight"}
+        auxiliary = sorted(
+            name
+            for name in actual
+            if name.startswith("dense_2_out.") or name == "output_norm.weight"
+        )
+        if auxiliary:
+            raise ValueError(
+                "lfm2 causal-LM import does not support embedding/ColBERT head "
+                f"tensor(s): {auxiliary}"
+            )
+        common_suffixes = {"attn_norm.weight", "ffn_norm.weight"}
+        full_suffixes = {
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+        }
+        recurrent_suffixes = {
+            "shortconv.conv.weight",
+            "shortconv.in_proj.weight",
+            "shortconv.out_proj.weight",
+        }
+    else:
+        required_global = {"token_embd.weight", "output_norm.weight"}
+        common_suffixes = {"attn_norm.weight"}
+        if architecture == "qwen3next":
+            common_suffixes.add("attn_post_norm.weight")
+        else:
+            common_suffixes.add("post_attention_norm.weight")
+        if architecture == "qwen35":
+            common_suffixes.update({"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+        else:
+            common_suffixes.update(
+                {
+                    "ffn_gate_inp.weight",
+                    "ffn_down_exps.weight",
+                    "ffn_gate_inp_shexp.weight",
+                    "ffn_gate_shexp.weight",
+                    "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight",
+                }
+            )
+        full_suffixes = {
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+        }
+        recurrent_suffixes = {
+            "ssm_conv1d.weight",
+            "ssm_dt.bias",
+            "ssm_a",
+            "ssm_norm.weight",
+            "ssm_out.weight",
+        }
+        if architecture == "qwen3next":
+            recurrent_suffixes.add("ssm_ba.weight")
+        else:
+            recurrent_suffixes.update({"ssm_beta.weight", "ssm_alpha.weight"})
+
+    missing_global = sorted(required_global - actual)
+    if missing_global:
+        raise ValueError(
+            f"{architecture} GGUF is missing required global tensor(s): {missing_global}"
+        )
+
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        layer_names = {name[len(prefix) :] for name in actual if name.startswith(prefix)}
+        required = set(common_suffixes)
+        required.update(
+            full_suffixes if layer_type == "full_attention" else recurrent_suffixes
+        )
+        if architecture == "lfm2":
+            required.update({"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+        elif architecture == "lfm2moe":
+            dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+            routed_ffn = {
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "exp_probs_b.bias",
+            }
+            dense_layers = int(metadata.get("lfm2moe.leading_dense_block_count", 0))
+            if layer < dense_layers:
+                required.update(dense_ffn)
+                wrong_ffn = sorted(layer_names & routed_ffn)
+            else:
+                required.update(routed_ffn)
+                wrong_ffn = sorted(layer_names & dense_ffn)
+            if wrong_ffn:
+                raise ValueError(
+                    f"lfm2moe layer {layer} contains tensor(s) from the wrong "
+                    f"{'routed' if layer < dense_layers else 'dense'} FFN family: "
+                    f"{wrong_ffn}"
+                )
+
+        if architecture in {"qwen35moe", "qwen3next"}:
+            fused = "ffn_gate_up_exps.weight" in layer_names
+            separate_members = {
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+            }
+            separate = separate_members.issubset(layer_names)
+            if fused and layer_names & separate_members:
+                raise ValueError(
+                    f"{architecture} layer {layer} mixes fused and separate routed-expert "
+                    "gate/up tensors"
+                )
+            if not fused and not separate:
+                raise ValueError(
+                    f"{architecture} layer {layer} must contain exactly one routed-expert "
+                    "gate/up representation (fused or separate)"
+                )
+            required.add("ffn_gate_up_exps.weight" if fused else "ffn_gate_exps.weight")
+            if not fused:
+                required.add("ffn_up_exps.weight")
+
+        if layer_type != "full_attention":
+            if architecture == "qwen3next":
+                modern_members = {
+                    "attn_qkv.weight",
+                    "attn_gate.weight",
+                }
+                modern = modern_members.issubset(layer_names)
+                legacy = "ssm_in.weight" in layer_names
+                if legacy and layer_names & modern_members:
+                    raise ValueError(
+                        f"qwen3next layer {layer} mixes legacy ssm_in with modern "
+                        "attn_qkv/attn_gate tensors"
+                    )
+                if not legacy and not modern:
+                    raise ValueError(
+                        f"qwen3next layer {layer} must contain exactly one recurrent input "
+                        "representation (attn_qkv+attn_gate or ssm_in)"
+                    )
+                required.update(
+                    {"attn_qkv.weight", "attn_gate.weight"} if modern else {"ssm_in.weight"}
+                )
+            elif architecture not in {"lfm2", "lfm2moe"}:
+                required.update({"attn_qkv.weight", "attn_gate.weight"})
+
+        missing = sorted(required - layer_names)
+        if missing:
+            raise ValueError(
+                f"{architecture} {layer_type} layer {layer} is missing required "
+                f"tensor(s): {missing}"
+            )
+
+        wrong_family = recurrent_suffixes if layer_type == "full_attention" else full_suffixes
+        wrong = sorted(layer_names & wrong_family)
+        if layer_type == "full_attention":
+            wrong.extend(
+                sorted(
+                    layer_names
+                    & {
+                        "attn_qkv.weight",
+                        "attn_gate.weight",
+                        "ssm_in.weight",
+                    }
+                )
+            )
+        if wrong:
+            raise ValueError(
+                f"{architecture} layer {layer} contains tensor(s) from the wrong "
+                f"{layer_type} mixer family: {sorted(set(wrong))}"
+            )
+
+    if mtp_count:
+        mtp_layer = trunk_layers
+        prefix = f"blk.{mtp_layer}."
+        layer_names = {name[len(prefix) :] for name in actual if name.startswith(prefix)}
+        wrong_mixer = sorted(layer_names & recurrent_suffixes)
+        if wrong_mixer:
+            raise ValueError(
+                f"{architecture} MTP block contains recurrent-mixer tensor(s) "
+                f"{wrong_mixer}; appended MTP blocks must be full attention"
+            )
+        required_block = set(common_suffixes) | set(full_suffixes)
+        if architecture in {"qwen35moe", "qwen3next"}:
+            fused = "ffn_gate_up_exps.weight" in layer_names
+            separate_members = {
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+            }
+            separate = separate_members.issubset(layer_names)
+            if fused and layer_names & separate_members:
+                raise ValueError(
+                    f"{architecture} MTP block mixes fused and separate routed-expert "
+                    "gate/up tensors"
+                )
+            if not fused and not separate:
+                raise ValueError(
+                    f"{architecture} MTP block must contain exactly one routed-expert "
+                    "gate/up representation (fused or separate)"
+                )
+            required_block.add("ffn_gate_up_exps.weight" if fused else "ffn_gate_exps.weight")
+            if not fused:
+                required_block.add("ffn_up_exps.weight")
+        missing_block = sorted(required_block - layer_names)
+        if missing_block:
+            raise ValueError(
+                f"{architecture} MTP block is missing full-attention/FFN tensor(s): "
+                f"{missing_block}"
+            )
+        required_mtp = {
+            f"blk.{mtp_layer}.nextn.eh_proj.weight",
+            f"blk.{mtp_layer}.nextn.enorm.weight",
+            f"blk.{mtp_layer}.nextn.hnorm.weight",
+        }
+        missing_mtp = sorted(required_mtp - actual)
+        if missing_mtp:
+            raise ValueError(
+                f"{architecture} GGUF declares an MTP block but is missing tensor(s): "
+                f"{missing_mtp}"
+            )
+        known_nextn = {
+            "nextn.eh_proj.weight",
+            "nextn.enorm.weight",
+            "nextn.hnorm.weight",
+            "nextn.embed_tokens.weight",
+            "nextn.shared_head_norm.weight",
+            "nextn.shared_head_head.weight",
+        }
+        unknown_nextn = sorted(
+            name
+            for name in layer_names
+            if name.startswith("nextn.") and name not in known_nextn
+        )
+        if unknown_nextn:
+            raise ValueError(
+                f"{architecture} MTP block contains unsupported nextn tensor(s): "
+                f"{unknown_nextn}"
+            )
+
+
+def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
+    """Reject optional llama.cpp encoder heads that the token-output graph omits."""
+    if gguf_model.architecture not in {"bert", "modern-bert"}:
+        return
+    head_tensors = [
+        name
+        for name in gguf_model.tensor_names
+        if name.startswith(("cls.", "cls_out.", "cls_norm."))
+    ]
+    if head_tensors:
+        raise ValueError(
+            f"{gguf_model.architecture} GGUF contains unsupported pooler/classifier "
+            f"tensor(s): {head_tensors}. Mobius will not silently discard encoder heads."
+        )
+
+
+def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
+    """Validate required encoder tensors and their exact logical ranks/shapes."""
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    architecture = gguf_model.architecture
+    if architecture not in {"bert", "modern-bert"}:
+        return
+
+    metadata = gguf_model.metadata
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    num_heads = int(metadata[f"{architecture}.attention.head_count"])
+    num_kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", num_heads))
+    if num_kv_heads != num_heads:
+        raise ValueError(
+            f"{architecture} GGUF grouped-query attention is not supported: "
+            f"attention.head_count={num_heads}, attention.head_count_kv={num_kv_heads}"
+        )
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    context = int(metadata[f"{architecture}.context_length"])
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+    }
+    if architecture == "bert":
+        token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+        required.update(
+            {
+                "token_types.weight": (token_types, hidden),
+                "position_embd.weight": (context, hidden),
+                "token_embd_norm.weight": (hidden,),
+                "token_embd_norm.bias": (hidden,),
+            }
+        )
+        layer_shapes = {
+            "attn_output.weight": (hidden, hidden),
+            "attn_output.bias": (hidden,),
+            "attn_output_norm.weight": (hidden,),
+            "attn_output_norm.bias": (hidden,),
+            "ffn_up.weight": (intermediate, hidden),
+            "ffn_up.bias": (intermediate,),
+            "ffn_down.weight": (hidden, intermediate),
+            "ffn_down.bias": (hidden,),
+            "layer_output_norm.weight": (hidden,),
+            "layer_output_norm.bias": (hidden,),
+        }
+    else:
+        required.update(
+            {
+                "token_embd_norm.weight": (hidden,),
+                "output_norm.weight": (hidden,),
+            }
+        )
+        layer_shapes = {
+            "attn_qkv.weight": (3 * hidden, hidden),
+            "attn_output.weight": (hidden, hidden),
+            "ffn_up.weight": (2 * intermediate, hidden),
+            "ffn_down.weight": (hidden, intermediate),
+            "ffn_norm.weight": (hidden,),
+        }
+
+    actual_items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dim) for dim in shape) for name, _raw, _qtype, shape in actual_items
+    }
+    qtypes = {name: qtype for name, _raw, qtype, _shape in actual_items}
+
+    for layer in range(layers):
+        for suffix, shape in layer_shapes.items():
+            required[f"blk.{layer}.{suffix}"] = shape
+        if architecture == "bert":
+            fused_weight = f"blk.{layer}.attn_qkv.weight"
+            fused_bias = f"blk.{layer}.attn_qkv.bias"
+            split_names = {
+                f"blk.{layer}.attn_{projection}.{suffix}"
+                for projection in ("q", "k", "v")
+                for suffix in ("weight", "bias")
+            }
+            has_fused = fused_weight in actual or fused_bias in actual
+            has_split = bool(split_names & set(actual))
+            if has_fused and has_split:
+                raise ValueError(
+                    f"bert GGUF layer {layer} contains both fused and split Q/K/V tensors; "
+                    "the import contract requires one unambiguous representation"
+                )
+            if has_fused:
+                required[fused_weight] = (3 * hidden, hidden)
+                required[fused_bias] = (3 * hidden,)
+                qtype = qtypes.get(fused_weight)
+                qtype_id = getattr(qtype, "value", qtype)
+                if qtype is not None and qtype_id not in float_storage_type_ids():
+                    raise ValueError(
+                        "Quantized fused BERT attn_qkv.weight cannot be split losslessly; "
+                        "use a GGUF with split Q/K/V tensors or float fused QKV"
+                    )
+            else:
+                for projection in ("q", "k", "v"):
+                    required[f"blk.{layer}.attn_{projection}.weight"] = (hidden, hidden)
+                    required[f"blk.{layer}.attn_{projection}.bias"] = (hidden,)
+        if architecture == "modern-bert" and layer > 0:
+            required[f"blk.{layer}.attn_norm.weight"] = (hidden,)
+
+    missing = sorted(set(required) - set(actual))
+    if missing:
+        raise ValueError(
+            f"{architecture} GGUF is missing required encoder tensor(s): {missing}"
+        )
+    malformed = {
+        name: (required[name], actual[name])
+        for name in required
+        if actual[name] != required[name]
+    }
+    if malformed:
+        raise ValueError(
+            f"{architecture} GGUF has invalid encoder tensor shape(s): {malformed}"
+        )
+    if architecture == "modern-bert" and "blk.0.attn_norm.weight" in actual:
+        raise ValueError(
+            "modern-bert blk.0.attn_norm.weight is present, but Mobius models layer 0 "
+            "as the pinned identity-norm variant and will not ignore the tensor"
+        )
+
+
+def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
+    """Require the exact dense tensor family for each audited hybrid layer."""
+    import numpy as np
+
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+    architecture = gguf_model.architecture
+    metadata = gguf_model.metadata
+    layer_count, layer_types, mtp_count = _derive_hybrid_layout(
+        architecture, metadata, gguf_model.tensor_names
+    )
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError(f"{architecture} GGUF auxiliary/MTP blocks are not supported")
+
+    actual = set(gguf_model.tensor_names)
+    required_global = {"token_embd.weight", "output_norm.weight"}
+    optional_global = {"output.weight"}
+    required_by_type: dict[str, set[str]]
+    optional_by_type: dict[str, set[str]]
+    common: set[str]
+    if architecture == "jamba":
+        common = {"attn_norm.weight", "ffn_norm.weight"}
+        num_experts = int(metadata.get("jamba.expert_count", 0))
+        top_k = int(metadata.get("jamba.expert_used_count", 0))
+        if bool(num_experts) != bool(top_k):
+            raise ValueError(
+                "Jamba expert_count and expert_used_count must both be zero or both positive"
+            )
+        if num_experts and not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"Jamba expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        if num_experts == 1:
+            raise ValueError(
+                "Jamba expert_count=1 is not a routed-MoE layout; use dense FFN tensors"
+            )
+        required_by_type = {
+            "mamba": {
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_conv1d.bias",
+                "ssm_x.weight",
+                "ssm_dt_norm.weight",
+                "ssm_dt.weight",
+                "ssm_dt.bias",
+                "ssm_b_norm.weight",
+                "ssm_c_norm.weight",
+                "ssm_a",
+                "ssm_d",
+                "ssm_out.weight",
+            },
+            "full_attention": {
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            },
+        }
+        optional_by_type = {"mamba": set(), "full_attention": set()}
+    elif architecture in {"nemotron_h", "nemotron_h_moe"}:
+        common = {"attn_norm.weight"}
+        required_by_type = {
+            "mamba2": {
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_d",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+            },
+            "full_attention": {
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            },
+            "mlp": {"ffn_up.weight", "ffn_down.weight"},
+            "moe": {
+                "ffn_gate_inp.weight",
+                "exp_probs_b.bias",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            },
+        }
+        optional_by_type = {
+            "mamba2": {"ssm_conv1d.bias"},
+            "full_attention": {"attn_output.bias"},
+            "mlp": {"ffn_up.bias", "ffn_down.bias"},
+            "moe": {
+                "ffn_latent_down.weight",
+                "ffn_latent_up.weight",
+            },
+        }
+    else:
+        common = {"attn_norm.weight", "ffn_norm.weight"}
+        num_experts = int(metadata.get("granitehybrid.expert_count", 0))
+        top_k = int(metadata.get("granitehybrid.expert_used_count", 0))
+        if bool(num_experts) != bool(top_k):
+            raise ValueError(
+                "GraniteHybrid expert_count and expert_used_count must both be zero "
+                "or both positive"
+            )
+        dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+        dense_ffn_biases = {"ffn_gate.bias", "ffn_up.bias", "ffn_down.bias"}
+        routed_ffn = {
+            "ffn_gate_inp.weight",
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        }
+        shared_ffn = {
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+        }
+        shared_width = int(metadata.get("granitehybrid.expert_shared_feed_forward_length", 0))
+        common |= routed_ffn if num_experts else dense_ffn
+        if num_experts and shared_width > 0:
+            common |= shared_ffn
+        required_by_type = {
+            "mamba2": {
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_d",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+            },
+            "full_attention": {
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            },
+        }
+        optional_by_type = {
+            "mamba2": {"ssm_conv1d.bias"},
+            "full_attention": {
+                "attn_q.bias",
+                "attn_k.bias",
+                "attn_v.bias",
+                "attn_output.bias",
+                "rope_freqs.weight",
+            },
+        }
+        if not num_experts:
+            for optional in optional_by_type.values():
+                optional.update(dense_ffn_biases)
+        forbidden_ffn = dense_ffn if num_experts else routed_ffn | shared_ffn
+        present_forbidden = sorted(
+            f"blk.{index}.{suffix}"
+            for index in range(layer_count)
+            for suffix in forbidden_ffn
+            if f"blk.{index}.{suffix}" in actual
+        )
+        if present_forbidden:
+            raise ValueError(
+                "GraniteHybrid GGUF mixes dense and routed/shared MoE representations: "
+                f"{present_forbidden}"
+            )
+
+    expected = set(required_global)
+    allowed = required_global | optional_global
+
+    def require_all_or_none(label: str, names: list[str]) -> None:
+        present = sorted(set(names) & actual)
+        if present and len(present) != len(names):
+            missing_family = sorted(set(names) - actual)
+            raise ValueError(
+                f"{architecture} GGUF has a partial {label} bias family: "
+                f"present={present}, missing={missing_family}"
+            )
+
+    recurrent_layers = [
+        index
+        for index, layer_type in enumerate(layer_types)
+        if layer_type in {"mamba", "mamba2"}
+    ]
+    attention_layers = [
+        index for index, layer_type in enumerate(layer_types) if layer_type == "full_attention"
+    ]
+    require_all_or_none(
+        "recurrent convolution",
+        [f"blk.{index}.ssm_conv1d.bias" for index in recurrent_layers],
+    )
+    if architecture in {"nemotron_h", "nemotron_h_moe", "granitehybrid"}:
+        require_all_or_none(
+            "attention output projection",
+            [f"blk.{index}.attn_output.bias" for index in attention_layers],
+        )
+    if architecture == "granitehybrid":
+        require_all_or_none(
+            "attention Q/K/V projection",
+            [
+                f"blk.{index}.attn_{projection}.bias"
+                for index in attention_layers
+                for projection in ("q", "k", "v")
+            ],
+        )
+    if architecture == "granitehybrid" and not int(
+        metadata.get("granitehybrid.expert_count", 0)
+    ):
+        require_all_or_none(
+            "dense shared-MLP",
+            [
+                f"blk.{index}.ffn_{projection}.bias"
+                for index in range(layer_count)
+                for projection in ("gate", "up", "down")
+            ],
+        )
+    if architecture in {"nemotron_h", "nemotron_h_moe"}:
+        mlp_layers = [
+            index for index, layer_type in enumerate(layer_types) if layer_type == "mlp"
+        ]
+        require_all_or_none(
+            "dense MLP",
+            [
+                f"blk.{index}.ffn_{projection}.bias"
+                for index in mlp_layers
+                for projection in ("up", "down")
+            ],
+        )
+        moe_layers = [
+            index for index, layer_type in enumerate(layer_types) if layer_type == "moe"
+        ]
+        require_all_or_none(
+            "MoE latent projection",
+            [
+                f"blk.{index}.ffn_latent_{direction}.weight"
+                for index in moe_layers
+                for direction in ("down", "up")
+            ],
+        )
+        has_latent_metadata = f"{architecture}.moe_latent_size" in metadata
+        has_latent_tensors = any(
+            f"blk.{index}.ffn_latent_down.weight" in actual for index in moe_layers
+        )
+        if has_latent_metadata != has_latent_tensors:
+            raise ValueError(
+                f"{architecture} moe_latent_size metadata and latent projection tensors "
+                "must either both be present or both be absent"
+            )
+
+    for index, layer_type in enumerate(layer_types):
+        prefix = f"blk.{index}."
+        required = common | required_by_type[layer_type]
+        optional = set(optional_by_type[layer_type])
+        if architecture == "jamba":
+            has_router = f"{prefix}ffn_gate_inp.weight" in actual
+            dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+            moe_ffn = {
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            }
+            if has_router:
+                if not num_experts:
+                    raise ValueError(
+                        f"Jamba layer {index} has routed experts without expert metadata"
+                    )
+                required |= moe_ffn
+                optional |= {
+                    suffix
+                    for stem in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
+                    for suffix in (f"{stem}.scale", f"{stem}.input_scale")
+                }
+            else:
+                required |= dense_ffn
+                optional |= {
+                    suffix
+                    for stem in ("ffn_gate", "ffn_up", "ffn_down")
+                    for suffix in (f"{stem}.scale", f"{stem}.input_scale")
+                }
+        expected.update(prefix + suffix for suffix in required)
+        allowed.update(prefix + suffix for suffix in required | optional)
+
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - allowed)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layer_count
+    )
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, out_of_range={out_of_range}"
+        )
+
+    if not hasattr(gguf_model, "tensor_items_raw"):
+        return
+
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    if architecture in {"nemotron_h", "nemotron_h_moe"}:
+        _validate_nemotron_h_tensor_shapes(gguf_model, layer_types, actual)
+        return
+    if architecture == "granitehybrid":
+        _validate_granitehybrid_tensor_shapes(gguf_model, layer_types, actual)
+        return
+
+    hidden = int(metadata["jamba.embedding_length"])
+    intermediate = int(metadata["jamba.feed_forward_length"])
+    vocab = int(metadata.get("jamba.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    raw_head_counts = metadata["jamba.attention.head_count"]
+    head_counts = (
+        [int(value) for value in raw_head_counts]
+        if isinstance(raw_head_counts, (list, tuple))
+        else [int(raw_head_counts)]
+    )
+    positive_head_counts = {value for value in head_counts if value > 0}
+    if len(positive_head_counts) != 1:
+        raise ValueError("Jamba GGUF attention layers must use one consistent head count")
+    heads = positive_head_counts.pop()
+    if hidden <= 0 or intermediate <= 0 or vocab <= 0 or hidden % heads:
+        raise ValueError(
+            "Jamba GGUF has inconsistent embedding, FFN, vocabulary, or head geometry"
+        )
+    head_dim = hidden // heads
+    state = int(metadata["jamba.ssm.state_size"])
+    inner = int(metadata["jamba.ssm.inner_size"])
+    rank = int(metadata["jamba.ssm.time_step_rank"])
+    conv = int(metadata["jamba.ssm.conv_kernel"])
+    if inner != 2 * hidden or min(state, rank, conv) <= 0:
+        raise ValueError("Jamba GGUF has inconsistent Mamba-1 geometry")
+
+    expected_shapes: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    if "output.weight" in actual:
+        expected_shapes["output.weight"] = (vocab, hidden)
+    for index, layer_type in enumerate(layer_types):
+        prefix = f"blk.{index}."
+        expected_shapes[prefix + "attn_norm.weight"] = (hidden,)
+        expected_shapes[prefix + "ffn_norm.weight"] = (hidden,)
+        if layer_type == "mamba":
+            expected_shapes.update(
+                {
+                    prefix + "ssm_in.weight": (2 * inner, hidden),
+                    prefix + "ssm_conv1d.weight": (inner, conv),
+                    prefix + "ssm_conv1d.bias": (inner,),
+                    prefix + "ssm_x.weight": (rank + 2 * state, inner),
+                    prefix + "ssm_dt_norm.weight": (rank,),
+                    prefix + "ssm_dt.weight": (inner, rank),
+                    prefix + "ssm_dt.bias": (inner,),
+                    prefix + "ssm_b_norm.weight": (state,),
+                    prefix + "ssm_c_norm.weight": (state,),
+                    prefix + "ssm_a": (inner, state),
+                    prefix + "ssm_d": (inner,),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+        else:
+            kv_heads = int(metadata["jamba.attention.head_count_kv"][index])
+            if kv_heads <= 0 or heads % kv_heads:
+                raise ValueError(f"Jamba attention layer {index} has invalid KV head count")
+            kv_width = kv_heads * head_dim
+            expected_shapes.update(
+                {
+                    prefix + "attn_q.weight": (hidden, hidden),
+                    prefix + "attn_k.weight": (kv_width, hidden),
+                    prefix + "attn_v.weight": (kv_width, hidden),
+                    prefix + "attn_output.weight": (hidden, hidden),
+                }
+            )
+        if prefix + "ffn_gate_inp.weight" in actual:
+            expected_shapes.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (num_experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        num_experts,
+                        intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        num_experts,
+                        intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        num_experts,
+                        hidden,
+                        intermediate,
+                    ),
+                }
+            )
+        else:
+            expected_shapes.update(
+                {
+                    prefix + "ffn_gate.weight": (intermediate, hidden),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+    malformed = sorted(
+        f"{name}: expected {expected_shape}, got {shapes[name]}"
+        for name, expected_shape in expected_shapes.items()
+        if name in shapes and shapes[name] != expected_shape
+    )
+    if malformed:
+        raise ValueError(f"Invalid Jamba GGUF tensor shape(s): {malformed}")
+    for index, layer_type in enumerate(layer_types):
+        if layer_type != "mamba":
+            continue
+        decay_name = f"blk.{index}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(decay_name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Jamba GGUF Mamba decay tensor {decay_name!r}: "
+                "ssm_a must contain only finite negative -exp(A_log) values"
+            )
+
+
+def _validate_nemotron_h_tensor_shapes(gguf_model, layer_types, actual: set[str]) -> None:
+    """Validate logical Nemotron-H tensor shapes before graph construction."""
+    metadata = gguf_model.metadata
+    arch = gguf_model.architecture
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    heads_raw = metadata[f"{arch}.attention.head_count"]
+    heads_by_layer = (
+        [int(value) for value in heads_raw]
+        if isinstance(heads_raw, (list, tuple, np.ndarray))
+        else [int(heads_raw)] * len(layer_types)
+    )
+    kv_raw = metadata[f"{arch}.attention.head_count_kv"]
+    kv_by_layer = [int(value) for value in kv_raw]
+    head_dim = int(
+        metadata.get(
+            f"{arch}.attention.key_length",
+            hidden // next(value for value in heads_by_layer if value > 0),
+        )
+    )
+    state = int(metadata[f"{arch}.ssm.state_size"])
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    groups = int(metadata[f"{arch}.ssm.group_count"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+
+    expected: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    if "output.weight" in actual:
+        expected["output.weight"] = (vocab, hidden)
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        expected[prefix + "attn_norm.weight"] = (hidden,)
+        if layer_type == "mamba2":
+            conv_width = inner + 2 * groups * state
+            expected.update(
+                {
+                    prefix + "ssm_in.weight": (
+                        2 * inner + 2 * groups * state + ssm_heads,
+                        hidden,
+                    ),
+                    prefix + "ssm_conv1d.weight": (conv_width, conv),
+                    prefix + "ssm_dt.bias": (ssm_heads,),
+                    prefix + "ssm_a": (ssm_heads, 1),
+                    prefix + "ssm_d": (ssm_heads, 1),
+                    prefix + "ssm_norm.weight": (groups, inner // groups),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+            if prefix + "ssm_conv1d.bias" in actual:
+                expected[prefix + "ssm_conv1d.bias"] = (conv_width,)
+        elif layer_type == "full_attention":
+            heads = heads_by_layer[layer]
+            kv_heads = kv_by_layer[layer]
+            expected.update(
+                {
+                    prefix + "attn_q.weight": (heads * head_dim, hidden),
+                    prefix + "attn_k.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_v.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_output.weight": (hidden, heads * head_dim),
+                }
+            )
+            if prefix + "attn_output.bias" in actual:
+                expected[prefix + "attn_output.bias"] = (hidden,)
+        elif layer_type == "mlp":
+            width = int(metadata[f"{arch}.feed_forward_length"][layer])
+            expected.update(
+                {
+                    prefix + "ffn_up.weight": (width, hidden),
+                    prefix + "ffn_down.weight": (hidden, width),
+                }
+            )
+            for projection, size in (("up", width), ("down", hidden)):
+                name = prefix + f"ffn_{projection}.bias"
+                if name in actual:
+                    expected[name] = (size,)
+        else:
+            experts = int(metadata[f"{arch}.expert_count"])
+            expert_width = int(metadata[f"{arch}.expert_feed_forward_length"])
+            shared_width = int(metadata[f"{arch}.expert_shared_feed_forward_length"])
+            latent = metadata.get(f"{arch}.moe_latent_size")
+            expert_input = int(latent) if latent is not None else hidden
+            expected.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "exp_probs_b.bias": (experts,),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_width,
+                        expert_input,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        expert_input,
+                        expert_width,
+                    ),
+                    prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                }
+            )
+            if latent is not None:
+                expected[prefix + "ffn_latent_down.weight"] = (int(latent), hidden)
+                expected[prefix + "ffn_latent_up.weight"] = (hidden, int(latent))
+
+    malformed = sorted(
+        f"{name}: expected {expected_shape}, got {shapes[name]}"
+        for name, expected_shape in expected.items()
+        if name in shapes and shapes[name] != expected_shape
+    )
+    if malformed:
+        raise ValueError(f"Invalid Nemotron-H GGUF tensor shape(s): {malformed}")
+
+
+def _validate_granitehybrid_tensor_shapes(gguf_model, layer_types, actual: set[str]) -> None:
+    """Validate logical GraniteHybrid tensor shapes before graph construction."""
+    metadata = gguf_model.metadata
+    arch = gguf_model.architecture
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    heads_raw = metadata[f"{arch}.attention.head_count"]
+    heads_by_layer = (
+        [int(value) for value in heads_raw]
+        if isinstance(heads_raw, (list, tuple, np.ndarray))
+        else [int(heads_raw)] * len(layer_types)
+    )
+    kv_by_layer = [int(value) for value in metadata[f"{arch}.attention.head_count_kv"]]
+    attention_heads = next(
+        (
+            heads_by_layer[index]
+            for index, kind in enumerate(layer_types)
+            if kind == "full_attention"
+        ),
+        0,
+    )
+    head_dim = int(
+        metadata.get(
+            f"{arch}.attention.key_length",
+            hidden // attention_heads if attention_heads else 0,
+        )
+    )
+    state = int(metadata[f"{arch}.ssm.state_size"])
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    groups = int(metadata[f"{arch}.ssm.group_count"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    expert_count = int(metadata.get(f"{arch}.expert_count", 0))
+    expert_width = int(metadata[f"{arch}.feed_forward_length"])
+    shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+
+    expected: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    if "output.weight" in actual:
+        expected["output.weight"] = (vocab, hidden)
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        expected[prefix + "attn_norm.weight"] = (hidden,)
+        expected[prefix + "ffn_norm.weight"] = (hidden,)
+        if layer_type == "mamba2":
+            conv_width = inner + 2 * groups * state
+            expected.update(
+                {
+                    prefix + "ssm_in.weight": (
+                        2 * inner + 2 * groups * state + ssm_heads,
+                        hidden,
+                    ),
+                    prefix + "ssm_conv1d.weight": (conv_width, conv),
+                    prefix + "ssm_dt.bias": (ssm_heads,),
+                    prefix + "ssm_a": (ssm_heads, 1),
+                    prefix + "ssm_d": (ssm_heads, 1),
+                    prefix + "ssm_norm.weight": (groups, inner // groups),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+            if prefix + "ssm_conv1d.bias" in actual:
+                expected[prefix + "ssm_conv1d.bias"] = (conv_width,)
+        else:
+            heads = heads_by_layer[layer]
+            kv_heads = kv_by_layer[layer]
+            expected.update(
+                {
+                    prefix + "attn_q.weight": (heads * head_dim, hidden),
+                    prefix + "attn_q.bias": (heads * head_dim,),
+                    prefix + "attn_k.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_k.bias": (kv_heads * head_dim,),
+                    prefix + "attn_v.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_v.bias": (kv_heads * head_dim,),
+                    prefix + "attn_output.weight": (hidden, heads * head_dim),
+                }
+            )
+            if prefix + "attn_output.bias" in actual:
+                expected[prefix + "attn_output.bias"] = (hidden,)
+
+        if expert_count:
+            expected.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (expert_count, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        expert_count,
+                        expert_width,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        expert_count,
+                        expert_width,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        expert_count,
+                        hidden,
+                        expert_width,
+                    ),
+                }
+            )
+            if shared_width:
+                expected.update(
+                    {
+                        prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                    }
+                )
+        else:
+            expected.update(
+                {
+                    prefix + "ffn_gate.weight": (expert_width, hidden),
+                    prefix + "ffn_up.weight": (expert_width, hidden),
+                    prefix + "ffn_down.weight": (hidden, expert_width),
+                }
+            )
+            for projection, size in (
+                ("gate", expert_width),
+                ("up", expert_width),
+                ("down", hidden),
+            ):
+                name = prefix + f"ffn_{projection}.bias"
+                if name in actual:
+                    expected[name] = (size,)
+
+    malformed = sorted(
+        f"{name}: expected {expected_shape}, got {shapes[name]}"
+        for name, expected_shape in expected.items()
+        if name in shapes and shapes[name] != expected_shape
+    )
+    if malformed:
+        raise ValueError(f"Invalid GraniteHybrid GGUF tensor shape(s): {malformed}")
+
+
+def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:
+    """Validate the pinned T5/T5-encoder tensor closure and logical shapes."""
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    architecture = gguf_model.architecture
+    if architecture not in {"t5", "t5encoder"}:
+        return
+
+    metadata = gguf_model.metadata
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    encoder_layers = int(metadata[f"{architecture}.block_count"])
+    decoder_layers = (
+        int(metadata.get("t5.decoder_block_count", encoder_layers))
+        if architecture == "t5"
+        else 0
+    )
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    key_length = int(metadata.get(f"{architecture}.attention.key_length", hidden // heads))
+    value_length = int(metadata.get(f"{architecture}.attention.value_length", hidden // heads))
+    buckets = int(metadata[f"{architecture}.attention.relative_buckets_count"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+
+    actual_items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dim) for dim in shape) for name, _raw, _qtype, shape in actual_items
+    }
+    qtypes = {name: qtype for name, _raw, qtype, _shape in actual_items}
+    layer_limits = {"enc": encoder_layers, "dec": decoder_layers}
+    invalid_layer_indices = []
+    for name in actual:
+        match = re.match(r"^(enc|dec)\.blk\.([^.]+)\.", name)
+        if match is None:
+            continue
+        stack, raw_index = match.groups()
+        if not re.fullmatch(r"0|[1-9][0-9]*", raw_index):
+            invalid_layer_indices.append(
+                f"{name} (layer index {raw_index!r} is not canonical)"
+            )
+            continue
+        layer = int(raw_index)
+        if layer >= layer_limits[stack]:
+            invalid_layer_indices.append(
+                f"{name} (layer index {layer} is outside declared {stack} layer "
+                f"count {layer_limits[stack]})"
+            )
+    if invalid_layer_indices:
+        raise ValueError(
+            f"{architecture} GGUF has invalid T5 layer tensor index(es): "
+            f"{sorted(invalid_layer_indices)}"
+        )
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "enc.output_norm.weight": (hidden,),
+        "enc.blk.0.attn_rel_b.weight": (buckets, heads),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (vocab, hidden),
+    }
+    if architecture == "t5":
+        required.update(
+            {
+                "dec.output_norm.weight": (hidden,),
+                "dec.blk.0.attn_rel_b.weight": (buckets, heads),
+            }
+        )
+
+    def add_stack(prefix: str, layers: int, *, decoder: bool) -> None:
+        for layer in range(layers):
+            base = f"{prefix}.blk.{layer}"
+            required.update(
+                {
+                    f"{base}.attn_norm.weight": (hidden,),
+                    f"{base}.attn_q.weight": (heads * key_length, hidden),
+                    f"{base}.attn_k.weight": (heads * key_length, hidden),
+                    f"{base}.attn_v.weight": (heads * value_length, hidden),
+                    f"{base}.attn_o.weight": (hidden, heads * value_length),
+                    f"{base}.ffn_norm.weight": (hidden,),
+                    f"{base}.ffn_up.weight": (intermediate, hidden),
+                    f"{base}.ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional[f"{base}.attn_rel_b.weight"] = (buckets, heads)
+            optional[f"{base}.ffn_gate.weight"] = (intermediate, hidden)
+            if decoder:
+                required.update(
+                    {
+                        f"{base}.cross_attn_norm.weight": (hidden,),
+                        f"{base}.cross_attn_q.weight": (heads * key_length, hidden),
+                        f"{base}.cross_attn_k.weight": (heads * key_length, hidden),
+                        f"{base}.cross_attn_v.weight": (heads * value_length, hidden),
+                        f"{base}.cross_attn_o.weight": (hidden, heads * value_length),
+                    }
+                )
+                # llama.cpp loads this tensor but deliberately does not consume
+                # it in the cross-attention graph.
+                optional[f"{base}.cross_attn_rel_b.weight"] = (buckets, heads)
+
+    add_stack("enc", encoder_layers, decoder=False)
+    add_stack("dec", decoder_layers, decoder=True)
+
+    missing = sorted(set(required) - set(actual))
+    if missing:
+        raise ValueError(f"{architecture} GGUF is missing required T5 tensor(s): {missing}")
+    expected = {**optional, **required}
+    malformed = {
+        name: (expected[name], actual[name])
+        for name in actual
+        if name in expected and actual[name] != expected[name]
+    }
+    if malformed:
+        raise ValueError(f"{architecture} GGUF has invalid T5 tensor shape(s): {malformed}")
+
+    float_type_ids = float_storage_type_ids()
+    small_non_float = []
+    for name, qtype in qtypes.items():
+        if name.endswith(("_norm.weight", "attn_rel_b.weight")):
+            qtype_id = getattr(qtype, "value", qtype)
+            if qtype_id not in float_type_ids:
+                small_non_float.append(name)
+    if small_non_float:
+        raise ValueError(
+            f"{architecture} GGUF relative-bias and norm tensors must remain float: "
+            f"{sorted(small_non_float)}"
+        )
+    ignored_names = (
+        {"output.weight"}
+        if architecture == "t5encoder"
+        else {f"dec.blk.{layer}.cross_attn_rel_b.weight" for layer in range(decoder_layers)}
+    )
+    ignored = sorted(set(actual) & ignored_names)
+    if ignored:
+        logger.warning(
+            "Ignoring pinned llama.cpp T5 tensor(s) that do not participate in "
+            "the architecture's output graph: %s",
+            ignored,
+        )
+
+
+def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
+    """Reject suffixes not created by the pinned C++ tensor loaders."""
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+    from mobius.integrations.gguf._upstream import upstream_architecture
+
+    upstream = upstream_architecture(gguf_model.architecture)
+    if upstream is None or not upstream.tensor_names:
+        return
+
+    expected = set(upstream.tensor_names)
+    malformed = []
+    for name in gguf_model.tensor_names:
+        template = re.sub(
+            r"^((?:enc\.|dec\.)?blk)\.\d+\.",
+            r"\1.{bid}.",
+            name,
+        )
+        mapped_sidecar = name.endswith((".scale", ".input_scale")) and (
+            map_gguf_to_hf_names(name, gguf_model.architecture) is not None
+        )
+        if template not in expected and not mapped_sidecar:
+            malformed.append(name)
+    if malformed:
+        raise ValueError(
+            f"Malformed {gguf_model.architecture} GGUF tensor name(s): {malformed}. "
+            "The suffixes do not match the pinned llama.cpp tensor creation sites."
+        )
+
+
+def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
+    """Reject scale sidecars whose semantics the target quantization ABI cannot express."""
+    from mobius.integrations.gguf._mtp import map_gguf_mtp_to_hf_names
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    architecture = gguf_model.architecture
+    if architecture == MMPROJ_ARCHITECTURE:
+        # The mmproj registry validates role-specific tensor closure. Running
+        # text tensor mapping here would misclassify clip sidecars as standalone
+        # language models before the more actionable projector error can fire.
+        return
+    expert_count = gguf_model.get_metadata(f"{architecture}.expert_count")
+    block_count = int(gguf_model.get_metadata(f"{architecture}.block_count", 0))
+    mtp_count = int(gguf_model.get_metadata(f"{architecture}.nextn_predict_layers", 0))
+    mtp_block_indices = range(max(0, block_count - mtp_count), block_count)
+    for gguf_name, _raw, _qtype, shape in gguf_model.tensor_items_raw():
+        suffix = next(
+            (
+                candidate
+                for candidate in (".input_scale", ".scale")
+                if gguf_name.endswith(candidate)
+            ),
+            None,
+        )
+        if suffix is None:
+            continue
+        hf_name = map_gguf_to_hf_names(gguf_name, architecture)
+        if hf_name is None:
+            hf_name = next(
+                (
+                    mapped
+                    for block_index in mtp_block_indices
+                    if (mapped := map_gguf_mtp_to_hf_names(gguf_name, block_index)) is not None
+                ),
+                None,
+            )
+        if hf_name is None:
+            continue
+
+        is_expert_scale = ".mlp.experts." in hf_name
+        expected = (int(expert_count),) if is_expert_scale and expert_count else (1,)
+        actual = tuple(int(dim) for dim in shape)
+        if actual != expected:
+            raise ValueError(
+                f"Invalid GGUF auxiliary quantization tensor {gguf_name!r}: "
+                f"expected shape {expected}, got {actual}"
+            )
+        raise ValueError(
+            f"GGUF auxiliary quantization tensor {gguf_name!r} maps to {hf_name!r}, "
+            "but Mobius cannot represent GGUF scale/input_scale sidecars "
+            "(including NVFP4 scale2) in its expert/projection quantization ABI. "
+            "This file is rejected before graph construction to avoid silently "
+            "dropping required quantization data."
+        )
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -364,8 +3151,8 @@ def _looks_like_hf_repo_id(value: str) -> bool:
     return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
 
 
-def _resolve_gguf_path(gguf_path: str | Path) -> str:
-    """Resolve a GGUF reference to a local file path.
+def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bool) -> str:
+    """Resolve a GGUF reference with an internal primary/companion context.
 
     Accepts:
     - An existing local filesystem path (returned unchanged).
@@ -380,7 +3167,11 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
 
     # Split the optional ":filename" suffix before classifying so HF refs like
     # "owner/repo:weights.gguf" are not mistaken for a local path ending in .gguf.
-    repo_id, _, filename = raw.partition(":")
+    repo_revision, _, filename = raw.partition(":")
+    repo_id, revision_separator, requested_revision = repo_revision.partition("@")
+    revision = requested_revision if revision_separator else "main"
+    if not revision:
+        raise ValueError(f"HF GGUF reference {raw!r} has an empty revision")
     if not _looks_like_hf_repo_id(repo_id):
         # Looks like a local path that doesn't exist; let GGUFModel raise
         # FileNotFoundError with the original path.
@@ -388,7 +3179,9 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
 
     api = HfApi()
     if not filename:
-        files = [f for f in api.list_repo_files(repo_id) if f.endswith(".gguf")]
+        files = [
+            f for f in api.list_repo_files(repo_id, revision=revision) if f.endswith(".gguf")
+        ]
         if not files:
             raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
         if len(files) > 1:
@@ -398,9 +3191,55 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
             )
         filename = files[0]
 
-    _preflight_hf_gguf(api, repo_id, filename)
+    resolved_revision: str | None
+    if allow_mmproj_companion:
+        resolved_revision = _preflight_hf_mmproj_companion_file(
+            repo_id,
+            filename,
+            revision=revision,
+        )
+    else:
+        resolved_revision = _preflight_hf_gguf_file(
+            repo_id,
+            filename,
+            revision=revision,
+        )
     logger.info("Downloading %s from %s", filename, repo_id)
-    return hf_hub_download(repo_id=repo_id, filename=filename)
+    if resolved_revision is None:
+        raise RuntimeError(
+            f"Hub did not resolve an immutable revision for {repo_id}:{filename}"
+        )
+    return hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        revision=resolved_revision,
+    )
+
+
+def _resolve_gguf_path(gguf_path: str | Path) -> str:
+    """Resolve a primary GGUF reference without allowing mmproj sidecars."""
+    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=False)
+
+
+def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
+    """Resolve an internal mmproj companion, allowing only ``clip`` Hub metadata."""
+    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
+
+
+def _logical_source_filename(reference: str | Path, resolved_path: str | Path) -> str:
+    """Preserve an explicitly selected Hub-relative filename for evidence."""
+    raw = str(reference)
+    repo_revision, _, requested_filename = raw.partition(":")
+    repo_id = repo_revision.partition("@")[0]
+    if requested_filename and _looks_like_hf_repo_id(repo_id):
+        return requested_filename
+    resolved = Path(resolved_path)
+    parts = resolved.parts
+    if _looks_like_hf_repo_id(repo_id) and "snapshots" in parts:
+        snapshot_index = parts.index("snapshots")
+        if len(parts) > snapshot_index + 2:
+            return Path(*parts[snapshot_index + 2 :]).as_posix()
+    return resolved.name
 
 
 def build_from_gguf(
@@ -414,6 +3253,9 @@ def build_from_gguf(
     static_cache: bool = False,
     max_seq_len: int | None = None,
     allow_dense_moe: bool | None = None,
+    reuse_gguf_weights: bool = False,
+    target_config: str | Path | Mapping[str, object] | None = None,
+    _gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -427,9 +3269,9 @@ def build_from_gguf(
     8. Apply weights to the ONNX model
 
     By default, supported affine tensors are repacked into MatMulNBits format.
-    For text-only builds, runtime-supported native IQ/MXFP4 projection blocks
+    For text-only builds, operator-native IQ/MXFP4 projection blocks
     are retained byte-for-byte for BlockQuantizedMatMul. Multimodal text
-    backbones normalize quantized projections to a common affine layout. GGUFs
+    backbones require a lossless route for every quantized projection. GGUFs
     containing only F32, F16, or BF16 weights use the float path because there
     is no quantization to preserve.
     Quantized files with no supported preservation target raise an actionable
@@ -450,9 +3292,9 @@ def build_from_gguf(
         keep_quantized: Preserve quantization when quantized tensors are
             present. This is the default. Supported affine blocks are repacked,
             text-only runtime-supported native IQ/MXFP4 projection blocks
-            retain their bytes, and mixed or multimodal source types can be
-            normalized to a common affine layout. Set to ``False`` to
-            dequantize all weights.
+            retain their bytes, and any projection requiring lossy
+            requantization is rejected. Set to ``False`` to dequantize all
+            weights.
         execution_provider: Target execution provider for EP-aware
             optimisations (e.g. ``"cpu"`` to apply the
             GroupQueryAttention rewrite). Defaults to ``"default"``
@@ -480,6 +3322,14 @@ def build_from_gguf(
             ``False`` — the build fails closed with a typed capability error
             rather than silently shipping a dense graph. This is a research /
             correctness knob and makes no throughput claim.
+        reuse_gguf_weights: Reuse compatible tensor payloads directly from the
+            original GGUF via ONNX external-data ranges. The GGUF must be a real
+            file in the final flat output directory. Converted tensors are
+            written once to ``model.onnx.data``.
+        target_config: Exact target model directory, config path, or explicit
+            config mapping for a ``dflash``/``eagle3`` speculative draft. A
+            mapping must include the complete ``tokenizer_json`` object. Required for draft GGUFs
+            and rejected for standalone architectures.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -492,21 +3342,29 @@ def build_from_gguf(
             if a quantized input has no supported preservation target.
     """
     import dataclasses
+    import hashlib
+    import json
 
     # A companion mmproj GGUF turns this into a multimodal build: the text +
     # vision/audio encoders are assembled by the dedicated VLM builder. Keep
     # build_from_gguf as the single public entry point (text-only or multimodal).
     if mmproj is not None:
+        if reuse_gguf_weights:
+            raise ValueError(
+                "reuse_gguf_weights=True does not yet support multimodal/mmproj packages."
+            )
         if static_cache:
             raise ValueError("static_cache=True is not supported with a companion mmproj.")
         from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
 
+        parsed_source = {"_text_gguf_model": _gguf_model} if _gguf_model is not None else {}
         return build_vlm_from_gguf(
             gguf_path,
             mmproj,
             dtype=dtype,
             execution_provider=execution_provider,
             keep_quantized=keep_quantized,
+            **parsed_source,
         )
 
     from mobius._builder import (
@@ -514,11 +3372,12 @@ def build_from_gguf(
         resolve_dtype,
     )
     from mobius._registry import registry
+    from mobius.integrations.gguf._arch_registry import get_arch_spec
     from mobius.integrations.gguf._config_mapping import (
         GGUF_ARCH_TO_MODEL_TYPE,
         gguf_to_config,
     )
-    from mobius.integrations.gguf._shard_set import open_gguf_model
+    from mobius.integrations.gguf._shard_set import GgufShardSet, open_gguf_model
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
@@ -540,20 +3399,209 @@ def build_from_gguf(
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]").
     #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
     #    (never merged into a second on-disk GGUF); a plain file opens as before.
+    source_reference = str(gguf_path)
     gguf_path = _resolve_gguf_path(gguf_path)
-    gguf_model = open_gguf_model(gguf_path)
+    logical_source_filename = _logical_source_filename(source_reference, gguf_path)
+    source_path = Path(gguf_path)
+    if source_path.is_symlink():
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        try:
+            source_path.absolute().relative_to(Path(HF_HUB_CACHE).absolute())
+        except ValueError:
+            pass
+        else:
+            # Snapshot links point into the immutable content-addressed blob store.
+            source_path = source_path.resolve(strict=True)
+            gguf_path = str(source_path)
+    gguf_model = _gguf_model if _gguf_model is not None else open_gguf_model(gguf_path)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
+    if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
+        raise ValueError(
+            "reuse_gguf_weights=True does not yet support multi-shard GGUF sets. "
+            "Build without reuse to preserve current multi-shard import behavior."
+        )
+    if reuse_gguf_weights and not gguf_model.is_little_endian:
+        raise ValueError(
+            "reuse_gguf_weights=True requires a little-endian GGUF because ONNX "
+            "external tensors interpret the referenced bytes as little-endian. "
+            "Build without reuse to convert this file."
+        )
+    from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+    tokenizer_verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
+    if static_cache and int(gguf_model.metadata.get(f"{gguf_arch}.nextn_predict_layers", 0)):
+        raise ValueError(
+            "static_cache=True cannot represent the GGUF MTP head's independent "
+            "dynamic concat-grow KV cache; refusing to silently omit the sidecar"
+        )
     logger.info("Loaded GGUF model: %s (arch=%s)", gguf_path, gguf_arch)
     preserve_quantization = keep_quantized and _has_quantized_weights(gguf_model, gguf_arch)
+    arch_spec = try_get_arch_spec(gguf_arch)
+    if (
+        preserve_quantization
+        and arch_spec is not None
+        and arch_spec.quantized_import is not Support.SUPPORTED
+    ):
+        raise ValueError(
+            f"GGUF architecture {gguf_arch!r} does not support keep_quantized=True: "
+            f"{arch_spec.reason}"
+        )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
-
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
+    spec = get_arch_spec(gguf_arch)
+    from mobius.integrations.gguf._draft import (
+        is_draft_architecture,
+        validate_draft_pairing,
+    )
+
+    if target_config is not None and not is_draft_architecture(gguf_arch):
+        raise ValueError(
+            f"target_config is only valid for dflash/eagle3 draft GGUFs, got {gguf_arch!r}"
+        )
+    draft_manifest = (
+        validate_draft_pairing(gguf_model, config, target_config)
+        if is_draft_architecture(gguf_arch)
+        else None
+    )
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
+    if gguf_arch in {"dream", "llada", "llada-moe", "rnd1"}:
+        from mobius.tasks import MaskedDiffusionTask
+
+        if static_cache:
+            raise ValueError(
+                f"static_cache=True is not valid for masked-diffusion {gguf_arch} GGUF; "
+                "the model is bidirectional and has no KV cache"
+            )
+        if (
+            task is not None
+            and task != "masked-diffusion"
+            and not isinstance(task, MaskedDiffusionTask)
+        ):
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports task='masked-diffusion', got {task!r}"
+            )
+    if static_cache and model_type in {"mamba", "mamba2"}:
+        raise ValueError(
+            f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
+            "they carry per-layer conv_state and ssm_state rather than a KV cache."
+        )
+    if static_cache and gguf_arch in {"kimi-linear", "kimi-k3"}:
+        raise ValueError(
+            f"{gguf_arch} does not support static cache: KDA layers carry three "
+            "convolution histories and one recurrent matrix state"
+        )
+    if gguf_arch in {"kimi-linear", "kimi-k3"}:
+        from mobius.tasks import KimiK3CausalLMTask, KimiLinearCausalLMTask
+
+        expected_task, task_class = (
+            ("kimi-linear-text-generation", KimiLinearCausalLMTask)
+            if gguf_arch == "kimi-linear"
+            else ("kimi-k3-text-generation", KimiK3CausalLMTask)
+        )
+        if task is not None and task != expected_task and not isinstance(task, task_class):
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports the dedicated {expected_task!r} "
+                "heterogeneous-state task"
+            )
+    if gguf_arch == "falcon-h1":
+        from mobius.tasks import FalconH1CausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for falcon-h1 GGUF models; "
+                "every layer requires a dynamic four-state K, V, convolution, and SSM ABI"
+            )
+        if preserve_quantization:
+            raise ValueError(
+                "keep_quantized=True is not supported for falcon-h1: recurrent and "
+                "state-sensitive tensors must be dequantized while only exact "
+                "attention/FFN MatMul roles may remain quantized"
+            )
+        if (
+            task is not None
+            and task != "falcon-h1-text-generation"
+            and not isinstance(task, FalconH1CausalLMTask)
+        ):
+            raise ValueError(
+                "falcon-h1 GGUF only supports the dedicated "
+                "'falcon-h1-text-generation' four-state task"
+            )
+    if gguf_arch == "plamo2":
+        from mobius.tasks import Plamo2CausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for plamo2 GGUF models; "
+                "heterogeneous per-layer recurrent and KV states require the dynamic ABI"
+            )
+        if (
+            task is not None
+            and task != "plamo2-text-generation"
+            and not isinstance(task, Plamo2CausalLMTask)
+        ):
+            raise ValueError(
+                "plamo2 GGUF only supports the dedicated 'plamo2-text-generation' task"
+            )
+    if gguf_arch in {
+        "lfm2",
+        "lfm2moe",
+        "qwen35",
+        "qwen35moe",
+        "qwen3next",
+        "jamba",
+        "nemotron_h",
+        "nemotron_h_moe",
+        "granitehybrid",
+    }:
+        from mobius.tasks import HybridCausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                f"static_cache=True is not supported for hybrid {gguf_arch} GGUF models; "
+                "attention layers carry KV while recurrent layers carry architecture-"
+                "specific conv/recurrent state."
+            )
+        if (
+            task is not None
+            and task != "hybrid-text-generation"
+            and not isinstance(task, HybridCausalLMTask)
+        ):
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports the mixed-state "
+                f"'hybrid-text-generation' task, got {task!r}"
+            )
+    if model_type in {"bert", "modernbert", "t5encoder"}:
+        if static_cache:
+            raise ValueError("static_cache is not valid for encoder-only GGUF architectures")
+        expected_task = (
+            "t5-text-encoding" if model_type == "t5encoder" else "feature-extraction"
+        )
+        if task is not None and task != expected_task:
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports task={expected_task!r}, got {task!r}"
+            )
+    if model_type == "t5":
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not valid for T5 seq2seq GGUF; use the "
+                "encoder/decoder cache contract"
+            )
+        if task is not None and task != "seq2seq":
+            raise ValueError(f"t5 GGUF only supports task='seq2seq', got {task!r}")
+    if is_draft_architecture(gguf_arch):
+        if static_cache:
+            raise ValueError(f"static_cache=True is not supported for {gguf_arch} drafts")
+        expected_task = f"{gguf_arch}-draft"
+        if task is not None and task != expected_task:
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports task={expected_task!r}, got {task!r}"
+            )
 
     # 2b. Architecture-resolution safety rail. When the GGUF architecture string
     # bridges to a specialised registry key, verify the metadata-derived config
@@ -623,9 +3671,17 @@ def build_from_gguf(
         )
 
     # 4. Look up module class and resolve task
-    module_class = registry.get(model_type)
+    module_type = spec.module_type or model_type
+    module_class = registry.get(module_type)
     resolved_task: str | ModelTask
-    if static_cache:
+    if model_type == "t5":
+        from mobius.tasks import Seq2SeqTask
+
+        resolved_task = Seq2SeqTask(
+            use_cross_attention_cache=True,
+            use_attention_masks=True,
+        )
+    elif static_cache:
         from mobius.tasks import CausalLMTask
 
         resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
@@ -640,43 +3696,57 @@ def build_from_gguf(
     # ``blk.<N>.nextn.*`` tensors), always emit the MTP sidecar — it is a purely
     # additive artifact that text-only consumers ignore. No opt-in flag: the
     # decision is driven entirely by presence in the source. When present, expose
-    # the backbone's final-layer hidden state as a graph output so the
-    # orchestrator can seed the head with it (must be set before the graph is
-    # built). Direct field assignment (not dataclasses.replace) preserves the
-    # ``_gguf_*`` metadata attributes on the config. Skipped under static_cache
-    # (the head needs the dynamic concat-grow cache), leaving those exports
-    # byte-identical to today.
+    # the post-final-norm ``mtp_seed`` output consumed by the orchestrator. Keep
+    # the final layer's ordinary ``hidden_states.N`` capture as the distinct
+    # pre-final-norm ABI; neither output may stand in for the other. These fields
+    # must be set before graph construction. Direct assignment preserves the
+    # ``_gguf_*`` metadata attributes on the config. Static-cache requests fail
+    # closed because the sidecar requires its own dynamic concat-grow cache.
     from mobius.integrations.gguf._mtp import build_mtp_head_from_gguf, has_mtp_head
 
-    # Re-attach the MTP metadata dropped by the dtype/quantization
+    # Re-attach the GGUF metadata dropped by the dtype/quantization
     # ``dataclasses.replace`` calls above so auto-detection sees it on the final
     # config instance (and ``derive_mtp_config`` can read model_type/quant/dtype).
+    # ``_gguf_arch`` matters most: it is the key ``process_tensors`` dispatches
+    # on, so losing it here would silently demote every non-float32 and every
+    # quantized import to the ``model_type`` fallback.
+    config._gguf_arch = gguf_arch
     config._gguf_model_type = model_type
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices
-
-    emit_mtp_head = has_mtp_head(config) and not static_cache
+    emit_mtp_head = has_mtp_head(config)
     if has_mtp_head(config) and static_cache:
-        logger.info(
-            "GGUF ships an MTP/nextn head but static_cache=True is incompatible "
-            "with the head's dynamic cache; skipping the self-speculative sidecar."
+        raise ValueError(
+            "static_cache=True cannot represent the GGUF MTP head's independent "
+            "dynamic concat-grow KV cache; refusing to silently omit the sidecar"
         )
 
     if emit_mtp_head:
+        config.output_final_hidden_state = True
         seed_index = int(config.num_hidden_layers) - 1
         existing = list(config.output_layer_indices or [])
         if seed_index not in existing:
             existing.append(seed_index)
         config.output_layer_indices = existing
         logger.info(
-            "MTP head detected in source: exposing backbone hidden-state seed "
-            "output hidden_states.%d",
+            "MTP head detected in source: exposing post-final-norm mtp_seed and "
+            "pre-final-norm hidden_states.%d",
             seed_index,
         )
 
     # 5. Build ONNX graph
     module = module_class(config)
+    float_linear_dequantization_types = _float_linear_dequantization_types(
+        module,
+        gguf_arch,
+    )
     if preserve_quantization:
+        _reject_unsupported_quantization_preservation(
+            gguf_model,
+            gguf_arch,
+            preserve_quantization=True,
+            dequantize_float_linear_types=float_linear_dequantization_types,
+        )
         _replace_native_block_linears(module, gguf_model, gguf_arch)
         # The sparse-MoE honesty gate runs post-export on the final graph state
         # (see step 9b): routed native-block experts are first collapsed into a
@@ -694,10 +3764,22 @@ def build_from_gguf(
     )
 
     # 6. Load tensors from GGUF → state_dict
+    reuse_candidates_by_id = {} if reuse_gguf_weights else None
     if preserve_quantization:
-        state_dict = _load_quantized_state_dict(gguf_model, gguf_arch, module, config)
+        state_dict = _load_quantized_state_dict(
+            gguf_model,
+            gguf_arch,
+            module,
+            config,
+            reuse_candidates=reuse_candidates_by_id,
+            dequantize_float_linear_types=float_linear_dequantization_types,
+        )
     else:
-        state_dict = _load_dequantized_state_dict(gguf_model, gguf_arch)
+        state_dict = _load_dequantized_state_dict(
+            gguf_model,
+            gguf_arch,
+            reuse_candidates=reuse_candidates_by_id,
+        )
 
     logger.info(
         "Mapped %d state_dict entries from GGUF tensors",
@@ -720,10 +3802,26 @@ def build_from_gguf(
         }
         float_dict = {k: state_dict[k] for k in float_keys}
         quant_dict = {k: state_dict[k] for k in state_dict if k not in float_keys}
+        before_processing = dict(float_dict)
         float_dict = process_tensors(float_dict, config)
+        if reuse_candidates_by_id is not None:
+            _record_reuse_process_transforms(
+                before_processing,
+                float_dict,
+                reuse_candidates_by_id,
+                config,
+            )
         state_dict = {**float_dict, **quant_dict}
     else:
+        before_processing = dict(state_dict)
         state_dict = process_tensors(state_dict, config)
+        if reuse_candidates_by_id is not None:
+            _record_reuse_process_transforms(
+                before_processing,
+                state_dict,
+                reuse_candidates_by_id,
+                config,
+            )
 
     # 7b. Normalize GGUF-specific weight shapes to match HF conventions.
     # This converts GGUF tensor quirks (stacked experts, 1D gates, 2D
@@ -734,10 +3832,29 @@ def build_from_gguf(
     # 8. Run model-specific preprocess_weights (HF → ONNX names)
     if hasattr(module, "preprocess_weights"):
         state_dict = module.preprocess_weights(state_dict)
+    if is_draft_architecture(gguf_arch):
+        state_dict.pop("d2t", None)
 
     # 9. Apply weights to ONNX model
     prefix_map = getattr(module, "weight_prefix_map", None)
-    pkg.apply_weights(state_dict, prefix_map=prefix_map)
+    pkg.apply_weights(
+        state_dict,
+        prefix_map=prefix_map,
+        fold_constants=not reuse_gguf_weights,
+    )
+    if reuse_gguf_weights:
+        from mobius.integrations.gguf._reuse import attach_reused_initializers
+
+        if emit_mtp_head:
+            raise ValueError(
+                "reuse_gguf_weights=True does not yet support packages with an MTP sidecar."
+            )
+        final_candidates = {
+            name: reuse_candidates_by_id[id(tensor)]
+            for name, tensor in state_dict.items()
+            if id(tensor) in reuse_candidates_by_id
+        }
+        attach_reused_initializers(pkg, gguf_path, final_candidates)
 
     # 9b. Sparse-MoE fusion + honesty gate (final graph state).
     # Now that every native block carries its real packed bytes, collapse the
@@ -753,23 +3870,132 @@ def build_from_gguf(
     # attach it to the package so the CLI can save it into a ``mtp/`` subdir.
     # Auto-detected from source-tensor presence (see step 4b).
     if emit_mtp_head:
-        try:
-            mtp_pkg = build_mtp_head_from_gguf(
-                gguf_model,
-                config,
-                preserve_quantization=preserve_quantization,
-                execution_provider=execution_provider,
-            )
-        except Exception:  # pragma: no cover - defensive: never fail the backbone
-            logger.exception(
-                "Failed to build the Qwen3.5/3.8 MTP head sidecar; the backbone "
-                "model was exported without a self-speculative drafter."
-            )
-            mtp_pkg = None
+        mtp_pkg = build_mtp_head_from_gguf(
+            gguf_model,
+            config,
+            preserve_quantization=preserve_quantization,
+            execution_provider=execution_provider,
+        )
         if mtp_pkg is not None:
             pkg.mtp_head = mtp_pkg
 
+    if draft_manifest is not None:
+        pkg.draft_manifest = draft_manifest
+    pkg.gguf_source_path = str(Path(gguf_path).resolve())
+    pkg.gguf_source_filename = logical_source_filename
+    pkg.gguf_architecture = spec.gguf_arch
+    pkg.gguf_execution_provider = execution_provider
+    if dataclasses.is_dataclass(resolved_task) and not isinstance(resolved_task, type):
+        task_state: object = dataclasses.asdict(resolved_task)
+    elif isinstance(resolved_task, str):
+        task_state = resolved_task
+    else:
+        task_state = dict(sorted(vars(resolved_task).items()))
+    graph_config = json.dumps(
+        dataclasses.asdict(config),
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    pkg.gguf_import_route = json.dumps(
+        {
+            "architecture": spec.gguf_arch,
+            "config_sha256": hashlib.sha256(graph_config.encode()).hexdigest(),
+            "execution_provider": execution_provider,
+            "model_type": spec.model_type,
+            "module_type": module_type,
+            "preserve_quantization": preserve_quantization,
+            "registry_import": {
+                "config_key_map": spec.config_key_map,
+                "config_postprocessor": spec.config_postprocessor,
+                "llama_qk_permute": spec.llama_qk_permute,
+                "offset_norm": spec.offset_norm,
+                "required_metadata": spec.required_metadata,
+                "rope_interleave": spec.rope_interleave,
+                "tensor_processor": spec.tensor_processor,
+                "v_head_reorder": spec.v_head_reorder,
+                "vlm_builder": spec.vlm_builder,
+            },
+            "route_schema": 1,
+            "static_cache": static_cache,
+            "task": {
+                "class": f"{type(resolved_task).__module__}.{type(resolved_task).__qualname__}",
+                "state": task_state,
+            },
+            "tensor_map_recipe": spec.tensor_map_recipe,
+        },
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if spec.runtime is Support.SUPPORTED:
+        if not gguf_model.source_matches_path():
+            raise ValueError(
+                "GGUF source changed after the reader opened it; refusing to bind the graph "
+                "to a different artifact identity."
+            )
+        from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+        pkg.gguf_artifact_identity = gguf_artifact_identity(
+            Path(gguf_path),
+            gguf_model,
+            architecture=spec.gguf_arch,
+            filename=logical_source_filename,
+        )
+        if not gguf_model.source_matches_path():
+            raise ValueError(
+                "GGUF source changed while its graph and artifact identity were being built."
+            )
+    pkg.gguf_tokenizer_verdict = tokenizer_verdict
+
     return pkg
+
+
+def _record_reuse_process_transforms(
+    before: dict,
+    after: dict,
+    candidates: dict,
+    config,
+) -> None:
+    """Carry exact-byte candidates through known graph-expressible transforms."""
+    import dataclasses
+
+    from mobius.integrations.gguf._tensor_processors import needs_llama_qk_permute
+
+    for name, transformed in after.items():
+        original = before.get(name)
+        if original is None or id(original) == id(transformed):
+            continue
+        candidate = candidates.get(id(original))
+        if candidate is None:
+            continue
+
+        transform: str | None = None
+        parameter: int | None = None
+        if needs_llama_qk_permute(getattr(config, "model_type", None)) and (
+            ".q_proj." in name or ".k_proj." in name
+        ):
+            transform = "llama_qk_permute"
+            parameter = (
+                config.num_attention_heads
+                if ".q_proj." in name
+                else config.num_key_value_heads
+            )
+        elif "A_log" in name:
+            transform = "log_neg"
+        elif "norm" in name and original.shape == transformed.shape:
+            transform = "subtract_one"
+        elif tuple(reversed(original.shape)) == tuple(transformed.shape):
+            transform = "transpose"
+        elif original.numel() == transformed.numel():
+            transform = "reshape"
+
+        if transform is not None:
+            candidates[id(transformed)] = dataclasses.replace(
+                candidate,
+                transform=transform,
+                transform_parameter=parameter,
+            )
 
 
 def _is_quantized_weight(key: str, state_dict: dict) -> bool:
@@ -829,6 +4055,25 @@ def _native_block_target_stems(
     return []
 
 
+def _fused_projection_target_stems(hf_name: str, available_stems: set[str]) -> list[str]:
+    """Return separate quantized targets for a fused GGUF projection."""
+    if hf_name.endswith(".qkv_proj.weight"):
+        stem = hf_name[: -len(".qkv_proj.weight")]
+        candidates = [f"{stem}.{projection}_proj" for projection in ("q", "k", "v")]
+    elif hf_name.endswith(".attn.Wqkv.weight"):
+        stem = hf_name[: -len(".Wqkv.weight")]
+        candidates = [f"{stem}.{projection}_proj" for projection in ("q", "k", "v")]
+    elif hf_name.endswith(".attention.self.qkv.weight"):
+        stem = hf_name[: -len(".qkv.weight")]
+        candidates = [f"{stem}.{projection}" for projection in ("query", "key", "value")]
+    elif hf_name.endswith(".mlp.Wi.weight"):
+        stem = hf_name[: -len(".Wi.weight")]
+        candidates = [f"{stem}.{projection}_proj" for projection in ("gate", "up")]
+    else:
+        return []
+    return candidates if all(candidate in available_stems for candidate in candidates) else []
+
+
 def _replace_child_module(root, path: str, replacement) -> None:
     """Replace a named ONNXScript child module while retaining its graph name."""
     parts = path.split(".")
@@ -848,10 +4093,19 @@ def _replace_child_module(root, path: str, replacement) -> None:
     setattr(parent, child_name, replacement)
 
 
-def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
+def _replace_native_block_linears(
+    module,
+    gguf_model,
+    gguf_arch: str,
+    *,
+    name_mapper: Callable[[str, str], str | None] | None = None,
+) -> None:
     """Swap MatMulNBits scaffolding for runtime-supported native linears."""
     from mobius.components import BlockQuantizedLinear, QuantizedLinear
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    if name_mapper is None:
+        name_mapper = map_gguf_to_hf_names
 
     module_map = dict(module.named_modules())
     quantized_stems = {
@@ -862,8 +4116,12 @@ def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
         format_name = _native_block_format(qtype)
         if format_name is None:
             continue
-        hf_name = map_gguf_to_hf_names(gguf_name, gguf_arch)
+        hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
+            continue
+        if gguf_arch in {"kimi-linear", "kimi-k3"} and hf_name.endswith(
+            (".k_b_proj.weight", ".v_b_proj.weight")
+        ):
             continue
         for stem in _native_block_target_stems(hf_name, np_shape, quantized_stems):
             replacements[stem] = format_name
@@ -885,12 +4143,40 @@ def _replace_native_block_linears(module, gguf_model, gguf_arch: str) -> None:
         )
 
 
+def _float_linear_dequantization_types(
+    module,
+    gguf_arch: str,
+) -> Mapping[str, Collection[str]] | None:
+    """Return explicitly float projection types for mixed quantized imports."""
+    if gguf_arch != "jamba":
+        return None
+
+    from mobius.integrations.gguf._quant_registry import iter_quant_specs
+
+    quantized_types = frozenset(
+        spec.name
+        for spec in iter_quant_specs()
+        if spec.is_quantized_storage and spec.dequantize is Support.SUPPORTED
+    )
+    mamba_projection_suffixes = (
+        ".mamba.in_proj",
+        ".mamba.out_proj",
+        ".mamba.ssm.x_proj",
+        ".mamba.ssm.dt_proj",
+    )
+    return {
+        name: quantized_types
+        for name, _child in module.named_modules()
+        if name.endswith(mamba_projection_suffixes)
+    }
+
+
 #: GGUF architectures whose transformer RMSNorms are zero-centered
 #: (``output = norm(x) * (1 + weight)``, mobius :class:`OffsetRMSNorm`). Their
 #: llama.cpp converter bakes the ``+1`` into every ``*norm.weight`` *except* the
 #: Gated-DeltaNet internal ``linear_attn.norm`` (a plain gated RMSNorm), so the
 #: GGUF path must undo it — see :func:`_normalize_gguf_weights`.
-_OFFSET_NORM_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
+_OFFSET_NORM_GGUF_ARCHS: frozenset[str] = arch_names_with(lambda spec: spec.offset_norm)
 
 #: GGUF architectures whose llama.cpp converter reorders Gated-DeltaNet V-heads
 #: from HuggingFace *grouped* order (``head = group * v_per_k + j``) into ggml
@@ -898,7 +4184,7 @@ _OFFSET_NORM_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
 #: is grouped (``num_value_heads != num_key_heads``). mobius's ``GatedDeltaNet``
 #: forward consumes the HF grouped order, so the GGUF path must undo the tiling —
 #: see :func:`_reorder_deltanet_v_heads`.
-_V_HEAD_REORDER_GGUF_ARCHS: frozenset[str] = frozenset({"qwen35", "qwen35moe"})
+_V_HEAD_REORDER_GGUF_ARCHS: frozenset[str] = arch_names_with(lambda spec: spec.v_head_reorder)
 
 
 def _normalize_gguf_weights(
@@ -955,15 +4241,83 @@ def _normalize_gguf_weights(
 
     result: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
-        # Stacked expert weights [num_experts, out, in] → per-expert
+        if config is not None:
+            _validate_moe_weight_shape(key, tuple(value.shape), config)
+        if gguf_arch in {"dream", "llada-moe", "rnd1"} and ".self_attn.qkv_proj." in key:
+            suffix = key.rsplit(".", 1)[-1]
+            q_width = int(config.num_attention_heads) * int(config.head_dim)
+            kv_width = int(config.num_key_value_heads) * int(config.head_dim)
+            expected_width = q_width + 2 * kv_width
+            if value.shape[0] != expected_width:
+                raise ValueError(
+                    f"Invalid fused {gguf_arch} QKV {suffix} width: expected "
+                    f"{expected_width}, got {value.shape[0]}"
+                )
+            query, key_projection, value_projection = value.split(
+                [q_width, kv_width, kv_width], dim=0
+            )
+            stem = key.rsplit(".qkv_proj.", 1)[0]
+            result[f"{stem}.q_proj.{suffix}"] = query
+            result[f"{stem}.k_proj.{suffix}"] = key_projection
+            result[f"{stem}.v_proj.{suffix}"] = value_projection
+            continue
+        if gguf_arch == "bert" and ".attention.self.qkv." in key:
+            suffix = key.rsplit(".", 1)[-1]
+            expected_width = 3 * int(config.hidden_size)
+            if value.shape[0] != expected_width:
+                raise ValueError(
+                    f"Invalid fused BERT QKV {suffix} width: expected {expected_width}, "
+                    f"got {value.shape[0]}"
+                )
+            query, key_value, value_projection = value.chunk(3, dim=0)
+            stem = key.rsplit(".qkv.", 1)[0]
+            result[f"{stem}.query.{suffix}"] = query
+            result[f"{stem}.key.{suffix}"] = key_value
+            result[f"{stem}.value.{suffix}"] = value_projection
+            continue
+        # Fused stacked gate/up experts [num_experts, 2*out, ...] are split
+        # before ordinary stacked-expert unpacking. This handles float weights
+        # and packed MatMulNBits companions without dropping either half.
+        fused_marker = next(
+            (
+                marker
+                for marker in (
+                    ".mlp.experts.gate_up_proj.",
+                    ".feed_forward.experts.gate_up_proj.",
+                )
+                if marker in key
+            ),
+            None,
+        )
+        if fused_marker is not None and value.dim() >= 3:
+            prefix, suffix = key.rsplit(fused_marker, 1)
+            container = fused_marker.removesuffix(".gate_up_proj.")
+            if value.shape[1] % 2:
+                raise ValueError(
+                    f"Fused expert tensor {key!r} has odd gate/up width {value.shape[1]}"
+                )
+            gate, up = value.chunk(2, dim=1)
+            for i in range(value.shape[0]):
+                result[f"{prefix}{container}.{i}.gate_proj.{suffix}"] = gate[i]
+                result[f"{prefix}{container}.{i}.up_proj.{suffix}"] = up[i]
+            continue
+
+        # Stacked expert weights [num_experts, out, ...] → per-expert.
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            suffix = f".mlp.experts.{proj}.weight"
-            if key.endswith(suffix) and value.dim() == 3:
-                prefix = key[: -len(suffix)]
-                for i in range(value.shape[0]):
-                    result[f"{prefix}.mlp.experts.{i}.{proj}.weight"] = value[i]
-                unpacked = True
+            for container in (
+                ".mlp.experts",
+                ".feed_forward.experts",
+                ".block_sparse_moe.moe.experts",
+            ):
+                marker = f"{container}.{proj}."
+                if marker in key and value.dim() >= 3:
+                    prefix, suffix = key.rsplit(marker, 1)
+                    for i in range(value.shape[0]):
+                        result[f"{prefix}{container}.{i}.{proj}.{suffix}"] = value[i]
+                    unpacked = True
+                    break
+            if unpacked:
                 break
         if unpacked:
             continue
@@ -975,6 +4329,9 @@ def _normalize_gguf_weights(
 
         # 2D conv1d → [channels, 1, kernel]
         if key.endswith(".conv1d.weight") and value.dim() == 2:
+            result[key] = value.unsqueeze(1)
+            continue
+        if key.endswith(".conv.conv.weight") and value.dim() == 2:
             result[key] = value.unsqueeze(1)
             continue
 
@@ -1182,25 +4539,206 @@ def _reorder_out_proj_cols(state_dict: dict, stem: str, head_perm, head_v_dim: i
 
 
 def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
-    """Return whether a GGUF has mapped weights with a quantized tensor type."""
-    from gguf import GGMLQuantizationType
+    """Return whether a GGUF has stored weights with a quantized tensor type."""
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
 
-    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
-
-    float_types = {
-        GGMLQuantizationType.F32,
-        GGMLQuantizationType.F16,
-        GGMLQuantizationType.BF16,
-    }
-    f64_type = getattr(GGMLQuantizationType, "F64", None)
-    if f64_type is not None:
-        float_types.add(f64_type)
+    float_type_ids = float_storage_type_ids()
 
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
-        hf_name = map_gguf_to_hf_names(name, gguf_arch)
-        if hf_name is not None and hf_name.endswith(".weight") and qtype not in float_types:
+        type_id = getattr(qtype, "value", qtype)
+        if name.endswith(".weight") and type_id not in float_type_ids:
             return True
     return False
+
+
+def _uses_explicit_float_route(
+    gguf_arch: str,
+    tensor_name: str,
+) -> bool:
+    """Return whether a quantized source weight is intentionally loaded as float."""
+    if gguf_arch in {"bert", "modern-bert"} and tensor_name in {
+        "token_embd.weight",
+        "token_embd_norm.weight",
+        "token_types.weight",
+        "position_embd.weight",
+    }:
+        return True
+    if tensor_name.endswith(("_norm.weight", ".norm.weight")):
+        return True
+    return gguf_arch == "jamba" and tensor_name.endswith(
+        (
+            "ssm_in.weight",
+            "ssm_out.weight",
+            "ssm_x.weight",
+            "ssm_dt.weight",
+            "ssm_conv1d.weight",
+        )
+    )
+
+
+def _reject_unsupported_quantization_preservation(
+    gguf_model,
+    gguf_arch: str,
+    *,
+    preserve_quantization: bool,
+    allow_native_blocks: bool = True,
+    allow_quantized_embeddings: bool = True,
+    allow_quantized_lm_head: bool = True,
+    dequantize_float_linear_types: Mapping[str, Collection[str]] | None = None,
+) -> None:
+    """Reject architectures that cannot preserve all compatible quantized weights.
+
+    The diffusion graph owns separate QuantizedLinear Q/K/V modules, while the
+    fused GGUF family maps to a synthetic ``qkv_proj`` stem that is not a graph
+    target. The quantized loader therefore cannot attach packed blocks to it.
+    Dequantizing the fused tensor and splitting it later is also invalid because
+    the graph still expects packed parameters. This applies even when the fused
+    tensor itself is float: any other quantized mapped tensor selects the packed
+    graph, so the split Q/K/V targets remain quantized.
+    """
+    if not preserve_quantization:
+        return
+    if gguf_arch in {"chatglm", "phi2"}:
+        reason = {
+            "chatglm": (
+                "its fused QKV and gate/up tensors must be split into separate packed "
+                "graph targets"
+            ),
+            "phi2": (
+                "the Phi-2 attention, MLP, and output graph currently uses float-only "
+                "linear modules"
+            ),
+        }[gguf_arch]
+        raise ValueError(
+            f"Quantization-preserving {gguf_arch} import is unsupported because {reason}. "
+            "Use keep_quantized=False (or --dequantize) for a float import."
+        )
+
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+        lossless_preservation_type_names,
+    )
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    float_type_ids = float_storage_type_ids()
+    lossless_types = lossless_preservation_type_names()
+    affine_targets: dict[tuple[int, int], tuple[str, str]] = {}
+    metadata = getattr(gguf_model, "metadata", {})
+    block_count = int(metadata.get(f"{gguf_arch}.block_count", 0))
+    mtp_count = int(metadata.get(f"{gguf_arch}.nextn_predict_layers", 0))
+    mtp_blocks = set(range(max(0, block_count - mtp_count), block_count))
+    for tensor_name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
+        type_id = getattr(qtype, "value", qtype)
+        type_name = getattr(qtype, "name", str(qtype))
+        if not tensor_name.endswith(".weight") or type_id in float_type_ids:
+            continue
+        hf_name = map_gguf_to_hf_names(tensor_name, gguf_arch)
+        module_stem = (
+            hf_name[: -len(".weight")]
+            if hf_name is not None and hf_name.endswith(".weight")
+            else None
+        )
+        if gguf_arch == "bert" and module_stem is not None and module_stem.startswith("bert."):
+            module_stem = module_stem[len("bert.") :]
+        explicitly_dequantized = (
+            dequantize_float_linear_types is not None
+            and module_stem in dequantize_float_linear_types
+            and type_name in dequantize_float_linear_types[module_stem]
+        )
+        if explicitly_dequantized or _uses_explicit_float_route(gguf_arch, tensor_name):
+            continue
+        if tensor_name.endswith(".ffn_gate_up_exps.weight"):
+            raise ValueError(
+                "Quantization-preserving GGUF import cannot split packed fused expert "
+                f"tensor {tensor_name} ({type_name}) into separate gate/up graph "
+                "targets without changing its stored representation. Use "
+                "keep_quantized=False (API) or --dequantize (CLI) for explicit "
+                "float import."
+            )
+        if not allow_quantized_embeddings and tensor_name in {
+            "token_embd.weight",
+            "shared.weight",
+        }:
+            raise ValueError(
+                "Quantization-preserving GGUF import cannot retain packed embedding "
+                f"{tensor_name} ({type_name}) in this graph. Use keep_quantized=False "
+                "(API) or --dequantize (CLI) for explicit float import."
+            )
+        if not allow_quantized_lm_head and tensor_name == "output.weight":
+            raise ValueError(
+                "Quantization-preserving GGUF import cannot retain packed LM head "
+                f"{tensor_name} ({type_name}) in this graph. Use keep_quantized=False "
+                "(API) or --dequantize (CLI) for explicit float import."
+            )
+        if type_name not in lossless_types:
+            raise ValueError(
+                "Quantization-preserving GGUF import would change the dequantized "
+                f"values of {tensor_name} ({type_name}). The current ORT "
+                "MatMulNBits route cannot represent this source block format "
+                "losslessly; mixed presets such as Q4_K_M must not be normalized "
+                "to a common 4-bit affine layout. Use keep_quantized=False (API) "
+                "or --dequantize (CLI) for explicit float import."
+            )
+        spec = get_quant_spec(qtype)
+        block_match = re.match(r"blk\.(\d+)\.", tensor_name)
+        is_mtp_block = block_match is not None and int(block_match.group(1)) in mtp_blocks
+        if (
+            spec is not None
+            and spec.native_preserve is not None
+            and (not allow_native_blocks or ".nextn." in tensor_name or is_mtp_block)
+        ):
+            raise ValueError(
+                "Quantization-preserving GGUF import cannot retain native block "
+                f"format {type_name} for {tensor_name} in this graph. Use "
+                "keep_quantized=False (API) or --dequantize (CLI) for explicit "
+                "float import."
+            )
+        if (
+            spec is not None
+            and spec.native_preserve is not None
+            and tensor_name
+            in {
+                "token_embd.weight",
+                "shared.weight",
+            }
+        ):
+            raise ValueError(
+                "Quantization-preserving GGUF import cannot retain native block "
+                f"format {type_name} for embedding tensor {tensor_name}; "
+                "GatherBlockQuantized does not consume that layout. Use "
+                "keep_quantized=False (API) or --dequantize (CLI) for explicit "
+                "float import."
+            )
+        if spec is not None and spec.affine_repack is not None:
+            affine_targets.setdefault(spec.affine_repack.as_params(), (tensor_name, type_name))
+
+    if len(affine_targets) > 1:
+        details = ", ".join(
+            f"{name} ({qtype}: {bits}-bit/block-{block_size})"
+            for (bits, block_size), (name, qtype) in sorted(affine_targets.items())
+        )
+        raise ValueError(
+            "Quantization-preserving GGUF import requires one affine MatMulNBits "
+            f"contract across projection modules, but found incompatible targets: {details}. "
+            "Use keep_quantized=False (API) or --dequantize (CLI) for explicit float import."
+        )
+
+    if gguf_arch not in {"dream", "llada-moe", "rnd1"}:
+        return
+
+    fused = sorted(
+        name
+        for name in gguf_model.tensor_names
+        if re.fullmatch(r"blk\.\d+\.attn_qkv\.weight", name)
+    )
+    if fused:
+        raise ValueError(
+            f"Quantization-preserving import of fused QKV is not supported for "
+            f"{gguf_arch} GGUF ({fused[0]}). The graph has separate packed Q/K/V "
+            "targets, so splitting after weight loading would leave them uninitialized. "
+            "Use keep_quantized=False (or --dequantize) for a float import."
+        )
 
 
 def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
@@ -1217,47 +4755,28 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     """
     from gguf import GGMLQuantizationType
 
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+    )
     from mobius.integrations.gguf._repacker import can_repack, repack_quant_params
+    from mobius.integrations.gguf._spec import QuantImportRoute
     from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
     from mobius.integrations.gguf._tensor_mapping import (
         map_gguf_to_hf_names,
     )
 
-    # Whether the graph can omit zero_points for each supported GGUF type.
-    #
-    # Mainline Q1_0 (1-bit binary) is repacked into 2-bit MatMulNBits
-    # with zp=1 — see _repack_q1_0. Tencent's custom Q1_0 (2-bit SEQ,
-    # 512-elt blocks) is inflated to 4-bit MatMulNBits with zp=3 — see
-    # parse_tencent_q1_0_tensor — because the ORT CPU unpacked-float-zp
-    # path is currently only implemented for bits=4, and the half-integer
-    # SEQ offset 1.5 cannot be expressed with integer zp at bits=2.
-    #
-    # Q4_0 and Q8_0 are symmetric formats, but their GGUF dequantization
-    # formulas are still ``(q - 8) * scale`` and ``(q - 128) * scale``.
-    # Emit those zero_points explicitly: GatherBlockQuantized has diverging
-    # CPU/CUDA defaults when the input is omitted, which corrupts embeddings
-    # on CUDA before the first decoder layer runs.
-    # Whether the repacked form can omit zero points. Every entry here is a
-    # *repack target* property, not a source-format property: Q4_K and Q6_K both
-    # requantize through the asymmetric affine path, so both need zero points
-    # even though Q6_K's source form is symmetric around 32.
-    # Keep in sync with `_REPACK_PARAMS` in `_repacker.py` — a type that can be
-    # repacked but is missing here raises `KeyError` at build time.
-    type_can_omit_zero_points: dict = {
-        GGMLQuantizationType.Q4_0: False,
-        GGMLQuantizationType.Q4_1: False,
-        GGMLQuantizationType.Q4_K: False,
-        GGMLQuantizationType.Q6_K: False,
-        GGMLQuantizationType.Q8_0: False,
-        GGMLQuantizationType.Q1_0: False,
-    }
-
     counts: Counter = Counter()
+    float_type_ids = float_storage_type_ids()
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
         hf_name = map_gguf_to_hf_names(name, gguf_arch)
         if hf_name is None or not hf_name.endswith(".weight"):
             continue
-        counts[qtype] += 1
+        if _uses_explicit_float_route(gguf_arch, name):
+            continue
+        type_id = getattr(qtype, "value", qtype)
+        if type_id not in float_type_ids:
+            counts[qtype] += 1
 
     if not counts:
         raise ValueError(
@@ -1265,30 +4784,66 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
             "Use keep_quantized=False for dequantized import."
         )
 
+    quant_specs = {qtype: get_quant_spec(qtype) for qtype in counts}
+    unknown = [qtype for qtype, spec in quant_specs.items() if spec is None]
+    if unknown:
+        names = ", ".join(sorted(getattr(qtype, "name", str(qtype)) for qtype in unknown))
+        raise ValueError(
+            f"GGUF contains qtypes outside the pinned llama.cpp census: {names}. "
+            "Update the importer policy before loading this file."
+        )
+    rejected = [
+        spec
+        for spec in quant_specs.values()
+        if spec is not None and spec.import_route is QuantImportRoute.REJECTED
+    ]
+    if rejected:
+        details = "; ".join(
+            f"{spec.name}: {spec.reason or 'no supported importer route'}" for spec in rejected
+        )
+        raise ValueError(
+            "GGUF contains stored qtypes that cannot be imported safely: "
+            f"{details} Re-quantize those tensors to a supported qtype."
+        )
+
     native_counts = Counter(
         {qtype: count for qtype, count in counts.items() if _native_block_format(qtype)}
     )
     if native_counts:
-        explicit_zero_point_types = {
-            "Q1_0",
-            "Q2_K",
-            "Q4_0",
-            "Q4_1",
-            "Q4_K",
-            "Q5_1",
-            "Q5_K",
-            "Q8_0",
-        }
-        can_omit_zero_points = not any(
-            getattr(qtype, "name", None) in explicit_zero_point_types
+        affine_specs = {
+            spec.affine_repack
             for qtype in counts
             if qtype not in native_counts
-        )
+            if (spec := get_quant_spec(qtype)) is not None and spec.affine_repack is not None
+        }
+        if len(affine_specs) > 1:
+            raise ValueError(
+                "Native-block GGUF contains incompatible affine projection targets; "
+                "use keep_quantized=False for explicit float import."
+            )
+        if affine_specs:
+            target = next(iter(affine_specs))
+            bits, block_size = target.as_params()
+            can_omit_zero_points = target.omit_zero_points
+        else:
+            bits, block_size, can_omit_zero_points = 4, 32, True
         logger.info(
-            "Native GGUF quant types present; using 4-bit/block-32 module "
-            "scaffolding for non-native quantized tensors",
+            "Native GGUF quant types present; using %d-bit/block-%d module "
+            "scaffolding for affine tensors",
+            bits,
+            block_size,
         )
-        return 4, 32, can_omit_zero_points
+        return bits, block_size, can_omit_zero_points
+
+    if any(
+        spec is not None and spec.import_route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        for spec in quant_specs.values()
+    ):
+        logger.info(
+            "GGUF contains qtypes requiring dequantize/requantize; using the "
+            "supported 4-bit/block-32 affine target"
+        )
+        return 4, 32, False
 
     # Q4_K_M is deliberately a mixed preset. Depending on tensor dimensions
     # and importance it may contain mostly Q5_0 plus Q4_K, Q6_K, and Q8_0.
@@ -1319,7 +4874,16 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     params = repack_quant_params(dominant_value)
     assert params is not None
     bits, block_size = params
-    is_sym = type_can_omit_zero_points[dominant]
+    # Whether the repacked form may drop zero points is a property of the repack
+    # *target*, not of the source format: Q4_K and Q6_K both requantize through
+    # the asymmetric affine path, so both need zero points even though Q6_K's
+    # source form is symmetric around 32. Q4_0/Q8_0 look symmetric too, but
+    # their GGUF dequantization is still ``(q - 8) * scale`` / ``(q - 128) *
+    # scale``, and GatherBlockQuantized has diverging CPU/CUDA defaults when the
+    # input is omitted, which corrupts embeddings before the first decoder layer.
+    dominant_spec = get_quant_spec(dominant)
+    assert dominant_spec is not None and dominant_spec.affine_repack is not None
+    is_sym = dominant_spec.affine_repack.omit_zero_points
 
     # Tencent Q1_0 files reuse the Q1_0 type id but ship a different
     # on-disk layout (2-bit SEQ, 512-element blocks, fp16 scale per block).
@@ -1359,9 +4923,17 @@ def _can_quantize_embedding(
     modules. Preserve the GGUF embedding only when its repacked representation
     uses the same bit width and block size as the projection weights.
     """
+    from mobius.integrations.gguf._quant_registry import quant_import_decision
     from mobius.integrations.gguf._repacker import repack_quant_params
+    from mobius.integrations.gguf._spec import QuantImportRoute, TensorRole
     from mobius.integrations.gguf._tencent_q1_0 import is_tencent_q1_0_layout
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    # Encoder modules currently expose plain Embedding parameters. Keep their
+    # token tables explicitly dequantized until they have a QuantizedEmbedding
+    # factory and a validated GatherBlockQuantized ABI.
+    if gguf_arch in {"bert", "modern-bert", "t5", "t5encoder"}:
+        return False
 
     # Tencent files reuse the Q1_0 type id for a custom layout that gguf-py
     # cannot size correctly. Embeddings from those files must stay dequantized.
@@ -1369,46 +4941,37 @@ def _can_quantize_embedding(
         return False
 
     for tensor in gguf_model.reader_tensors():
-        if map_gguf_to_hf_names(tensor.name, gguf_arch) != "model.embed_tokens.weight":
+        mapped_name = map_gguf_to_hf_names(tensor.name, gguf_arch)
+        if mapped_name is None or not mapped_name.endswith(
+            ("model.embed_tokens.weight", "shared.weight")
+        ):
             continue
         shape = tuple(reversed(tensor.shape))
         if len(shape) != 2:
             return False
         qtype = tensor.tensor_type
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
-        return repack_quant_params(qtype_val) == (bits, block_size)
+        if repack_quant_params(qtype_val) == (bits, block_size):
+            return True
+        route, _, _ = quant_import_decision(
+            qtype,
+            TensorRole.EMBEDDING,
+            target_bits=bits,
+            target_block_size=block_size,
+        )
+        return route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
     return False
 
 
 def _can_quantize_lm_head(gguf_model, gguf_arch: str) -> bool:
     """Return whether an untied GGUF output head can be kept quantized."""
+    from mobius.integrations.gguf._quant_registry import lm_head_preserve_type_names
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
-    supported_types = {
-        "Q1_0",
-        "Q2_K",
-        "Q3_K",
-        "Q4_0",
-        "Q4_1",
-        "Q4_K",
-        "Q5_0",
-        "Q5_1",
-        "Q5_K",
-        "Q6_K",
-        "Q8_0",
-        "MXFP4",
-        "IQ4_NL",
-        "IQ4_XS",
-        "IQ3_S",
-        "IQ3_XXS",
-        "IQ2_XXS",
-        "IQ2_XS",
-        "IQ2_S",
-        "IQ1_S",
-        "IQ1_M",
-    }
+    supported_types = lm_head_preserve_type_names()
     for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
-        if map_gguf_to_hf_names(name, gguf_arch) != "lm_head.weight":
+        mapped = map_gguf_to_hf_names(name, gguf_arch)
+        if mapped is None or not mapped.endswith("lm_head.weight"):
             continue
         return len(shape) == 2 and getattr(qtype, "name", None) in supported_types
     return False
@@ -1439,6 +5002,7 @@ def repack_gguf_weight_to_target(
     target_block_size: int,
     target_symmetric: bool,
     tensor_name: str,
+    tensor_role=None,
 ):
     """Repack one 2-D GGUF weight to the graph's common MatMulNBits target.
 
@@ -1464,14 +5028,31 @@ def repack_gguf_weight_to_target(
     """
     import numpy as np
 
+    from mobius.integrations.gguf._quant_registry import quant_import_decision
     from mobius.integrations.gguf._repacker import (
         can_repack,
         repack_dequantized_tensor,
         repack_gguf_tensor,
     )
+    from mobius.integrations.gguf._spec import QuantImportRoute, TensorRole
+
+    if tensor_role is None:
+        tensor_role = TensorRole.PROJECTION
+    route, _exactness, reason = quant_import_decision(
+        qtype,
+        tensor_role,
+        target_bits=target_bits,
+        target_block_size=target_block_size,
+    )
+    if route is QuantImportRoute.REJECTED:
+        qtype_name = getattr(qtype, "name", str(qtype))
+        raise ValueError(
+            f"Cannot import GGUF tensor {tensor_name} ({qtype_name}, "
+            f"role={tensor_role.value}): {reason}"
+        )
 
     qtype_val = qtype.value if hasattr(qtype, "value") else qtype
-    if can_repack(qtype_val):
+    if route is QuantImportRoute.AFFINE_REPACK and can_repack(qtype_val):
         shape_2d = (int(np_shape[0]), int(np_shape[1]))
         repacked = repack_gguf_tensor(raw.ravel().view(np.uint8), qtype_val, shape_2d)
         if repacked.bits == target_bits and repacked.block_size == target_block_size:
@@ -1496,6 +5077,7 @@ def _load_dequantized_state_dict(
     gguf_arch: str,
     name_mapper: Callable[[str, str], str | None] | None = None,
     warn_unmapped: bool = True,
+    reuse_candidates: dict | None = None,
 ) -> dict:
     """Load all tensors dequantized to float (Phase 1 path).
 
@@ -1514,9 +5096,21 @@ def _load_dequantized_state_dict(
     if name_mapper is None:
         name_mapper = map_gguf_to_hf_names
 
+    if gguf_arch in {"dflash", "eagle3"}:
+        # d2t is an integer orchestration table, not an ONNX initializer. The
+        # gguf package intentionally has no I64 "dequantizer", so exclude it
+        # before asking the reader to materialize neural tensors.
+        tensors = (
+            (name, gguf_model.dequantize_raw_tensor(raw, qtype, shape))
+            for name, raw, qtype, shape in gguf_model.tensor_items_raw()
+            if name != "d2t"
+        )
+    else:
+        tensors = gguf_model.tensor_items()
+
     state_dict = {}
     for gguf_name, np_array in tqdm.tqdm(
-        gguf_model.tensor_items(),
+        tensors,
         desc="Dequantizing tensors",
         total=gguf_model.num_tensors,
     ):
@@ -1526,7 +5120,21 @@ def _load_dequantized_state_dict(
             # writable so PyTorch can mutate if needed.
             if not np_array.flags.writeable:
                 np_array = np.array(np_array)
-            state_dict[hf_name] = torch.from_numpy(np_array)
+            tensor = torch.from_numpy(np_array)
+            state_dict[hf_name] = tensor
+            if reuse_candidates is not None:
+                qtype = gguf_model.get_tensor_type(gguf_name)
+                if getattr(qtype, "name", None) in {"F32", "F16"}:
+                    from mobius.integrations.gguf._reuse import GGUFReuseCandidate
+
+                    offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
+                    reuse_candidates[id(tensor)] = GGUFReuseCandidate(
+                        gguf_name,
+                        offset,
+                        length,
+                        qtype_name,
+                        tuple(int(dim) for dim in np_array.shape),
+                    )
         else:
             if warn_unmapped:
                 logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
@@ -1540,6 +5148,8 @@ def _load_quantized_state_dict(
     config,
     name_mapper: Callable[[str, str], str | None] | None = None,
     warn_unmapped: bool = True,
+    reuse_candidates: dict | None = None,
+    dequantize_float_linear_types: Mapping[str, Collection[str]] | None = None,
 ) -> dict:
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
@@ -1558,13 +5168,25 @@ def _load_quantized_state_dict(
     import torch
     from gguf import GGMLQuantizationType, dequantize
 
-    from mobius.components import BlockQuantizedLinear, QuantizedEmbedding, QuantizedLinear
+    from mobius.components import (
+        BlockQuantizedLinear,
+        Embedding,
+        Linear,
+        QuantizedEmbedding,
+        QuantizedLinear,
+    )
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+        quant_import_decision,
+    )
     from mobius.integrations.gguf._repacker import (
         can_repack,
         preserve_native_blocks,
         repack_dequantized_tensor,
         repack_gguf_tensor,
     )
+    from mobius.integrations.gguf._spec import QuantImportRoute, RepackExactness, TensorRole
     from mobius.integrations.gguf._tencent_q1_0 import (
         is_tencent_q1_0_layout,
         parse_tencent_q1_0_tensor,
@@ -1582,15 +5204,24 @@ def _load_quantized_state_dict(
     # Collect module paths that use QuantizedLinear so we know
     # which .weight parameters should receive repacked data.
     quantized_stems = set()
+    quantized_output_sizes: dict[str, int] = {}
     native_block_stems: dict[str, str] = {}
     quantized_embedding_stems = set()
+    float_linear_stems = set()
+    embedding_stems = set()
     for mod_name, mod in module.named_modules():
         if isinstance(mod, QuantizedLinear) or getattr(mod, "_gguf_quantized_linear", False):
             quantized_stems.add(mod_name)
+            quantized_output_sizes[mod_name] = mod._n
         elif isinstance(mod, BlockQuantizedLinear):
             native_block_stems[mod_name] = mod._format
         elif isinstance(mod, QuantizedEmbedding):
             quantized_embedding_stems.add(mod_name)
+            embedding_stems.add(mod_name)
+        elif isinstance(mod, Linear):
+            float_linear_stems.add(mod_name)
+        elif isinstance(mod, Embedding):
+            embedding_stems.add(mod_name)
 
     num_heads = getattr(config, "num_attention_heads", None)
     num_kv_heads = getattr(config, "num_key_value_heads", None)
@@ -1615,29 +5246,121 @@ def _load_quantized_state_dict(
     target_bits = config.quantization.bits
     target_block_size = config.quantization.group_size
     target_symmetric = config.quantization.sym
+    float_type_ids = float_storage_type_ids()
 
     for gguf_name, raw, qtype, np_shape in tqdm.tqdm(
         gguf_model.tensor_items_raw(),
         desc="Repacking tensors",
         total=gguf_model.num_tensors,
     ):
+        if gguf_arch in {"dflash", "eagle3"} and gguf_name == "d2t":
+            continue
         hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
             if warn_unmapped:
                 logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
             continue
+        _validate_moe_weight_shape(hf_name, tuple(int(dim) for dim in np_shape), config)
+        module_hf_name = hf_name
+        if gguf_arch == "bert" and module_hf_name.startswith("bert."):
+            module_hf_name = module_hf_name[len("bert.") :]
+        elif gguf_arch == "modern-bert" and module_hf_name.startswith("model."):
+            module_hf_name = module_hf_name[len("model.") :]
+        elif gguf_arch in {"t5", "t5encoder"}:
+            from mobius.models.t5 import _rename_t5_weight
+
+            renamed = _rename_t5_weight(
+                module_hf_name,
+                is_gated_act=bool(getattr(config, "is_gated_act", False)),
+            )
+            if renamed is not None:
+                module_hf_name = renamed
 
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
+
+        if gguf_arch == "kimi-k3" and module_hf_name.endswith(".kv_b_proj.weight"):
+            # K3 may serialize MLA K/V-B as one head-major matrix, while the
+            # graph has distinct quantized projections. Preserve each source
+            # row exactly while splitting and reordering the head-major blocks.
+            route, exactness, _reason = quant_import_decision(
+                qtype,
+                TensorRole.PROJECTION,
+                target_bits=target_bits,
+                target_block_size=target_block_size,
+            )
+            if (
+                route is not QuantImportRoute.AFFINE_REPACK
+                or exactness is not RepackExactness.EXACT
+                or not can_repack(qtype_val)
+            ):
+                quant_name = get_quant_spec(qtype)
+                quant_name = quant_name.name if quant_name is not None else str(qtype)
+                raise ValueError(
+                    "Quantization-preserving GGUF import would change the dequantized "
+                    f"values of {gguf_name} ({quant_name}). Use keep_quantized=False "
+                    "(API) or --dequantize (CLI) for explicit float import."
+                )
+            repacked = repack_gguf_tensor(
+                raw.ravel().view(np.uint8),
+                qtype_val,
+                (int(np_shape[0]), int(np_shape[1])),
+            )
+            if repacked.bits != target_bits or repacked.block_size != target_block_size:
+                raise ValueError(
+                    f"Kimi-K3 fused KV-B tensor {gguf_name} does not match the "
+                    f"{target_bits}-bit/block-{target_block_size} target"
+                )
+            heads = int(config.num_attention_heads)
+            nope_dim = int(config.qk_nope_head_dim)
+            value_dim = int(config.v_head_dim)
+            prefix = module_hf_name.removesuffix("kv_b_proj.weight")
+            split_ranges = {
+                prefix + "k_b_proj": (0, nope_dim),
+                prefix + "v_b_proj": (nope_dim, nope_dim + value_dim),
+            }
+            for target_stem, (start, end) in split_ranges.items():
+                if target_stem not in quantized_stems:
+                    raise ValueError(
+                        f"Kimi-K3 fused KV-B target {target_stem!r} is not quantized"
+                    )
+                weight = repacked.weight.reshape(
+                    heads, nope_dim + value_dim, *repacked.weight.shape[1:]
+                )[:, start:end].reshape(-1, *repacked.weight.shape[1:])
+                scales = repacked.scales.reshape(
+                    heads, nope_dim + value_dim, *repacked.scales.shape[1:]
+                )[:, start:end].reshape(-1, *repacked.scales.shape[1:])
+                zero_points = (
+                    repacked.zero_points.reshape(
+                        heads,
+                        nope_dim + value_dim,
+                        *repacked.zero_points.shape[1:],
+                    )[:, start:end].reshape(-1, *repacked.zero_points.shape[1:])
+                    if repacked.zero_points is not None
+                    else None
+                )
+                state_dict[f"{target_stem}.weight"] = torch.from_numpy(weight.copy())
+                state_dict[f"{target_stem}.scales"] = torch.from_numpy(scales.copy())
+                if zero_points is not None:
+                    state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
+                        zero_points.copy()
+                    )
+            n_repacked += 2
+            continue
 
         # Repack every target QuantizedLinear weight. Mixed GGUF presets
         # otherwise leave unsupported source types as full float matrices,
         # which cannot fit the graph's packed MatMulNBits initializer shape.
         stem = hf_name[: -len(".weight")] if hf_name.endswith(".weight") else None
+        module_stem = (
+            module_hf_name[: -len(".weight")] if module_hf_name.endswith(".weight") else None
+        )
         is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
-        is_quantized_embedding = stem is not None and stem in quantized_embedding_stems
-        should_repack = stem is not None and (
-            stem in quantized_stems or is_quantized_embedding
+        is_quantized_embedding = (
+            module_stem is not None and module_stem in quantized_embedding_stems
+        )
+        should_repack = module_stem is not None and (
+            module_stem in quantized_stems or is_quantized_embedding
         )
 
         native_targets = _native_block_target_stems(
@@ -1645,8 +5368,166 @@ def _load_quantized_state_dict(
             np_shape,
             set(native_block_stems),
         )
+        affine_targets = _native_block_target_stems(
+            module_hf_name,
+            np_shape,
+            quantized_stems,
+        )
+        is_kimi_reshaped_projection = gguf_arch in {
+            "kimi-linear",
+            "kimi-k3",
+        } and module_hf_name.endswith((".k_b_proj.weight", ".v_b_proj.weight"))
+        if is_kimi_reshaped_projection:
+            # These tensors are rank-3 in GGUF. They target one flattened
+            # projection rather than an expert-major collection.
+            affine_targets = []
+            native_targets = []
+        fused_projection_targets = _fused_projection_target_stems(
+            module_hf_name, quantized_stems
+        )
         native_spec = _native_block_spec(qtype)
-        if native_targets and native_spec is not None:
+        quant_spec = get_quant_spec(qtype)
+        is_embedding_tensor = module_stem is not None and module_stem in embedding_stems
+        is_encoder_embedding = is_embedding_tensor and gguf_arch in {
+            "bert",
+            "modern-bert",
+        }
+        tensor_role = (
+            TensorRole.EMBEDDING
+            if is_embedding_tensor
+            else TensorRole.EXPERT
+            if len(np_shape) == 3 and ".experts." in hf_name
+            else TensorRole.OUTPUT
+            if hf_name == "lm_head.weight"
+            else TensorRole.PROJECTION
+            if fused_projection_targets
+            or (
+                module_stem is not None
+                and (
+                    module_stem in quantized_stems
+                    or module_stem in native_block_stems
+                    or module_stem in float_linear_stems
+                )
+            )
+            else TensorRole.NON_MATMUL
+        )
+        route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        if quant_spec is not None and quant_spec.is_quantized_storage:
+            route, _exactness, reason = quant_import_decision(
+                qtype,
+                tensor_role,
+                target_bits=target_bits,
+                target_block_size=target_block_size,
+            )
+            explicitly_dequantized = (
+                dequantize_float_linear_types is not None
+                and module_stem in dequantize_float_linear_types
+                and quant_spec.name in dequantize_float_linear_types[module_stem]
+            )
+            if explicitly_dequantized and quant_spec.dequantize is Support.SUPPORTED:
+                route = QuantImportRoute.DEQUANTIZE_FLOAT
+            if is_kimi_reshaped_projection:
+                if quant_spec.dequantize is not Support.SUPPORTED:
+                    raise ValueError(
+                        f"Cannot reshape quantized {quant_spec.name} tensor {hf_name}: "
+                        "the stored format has no supported dequantization route."
+                    )
+                route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
+            if is_encoder_embedding and quant_spec.dequantize is Support.SUPPORTED:
+                route = QuantImportRoute.DEQUANTIZE_FLOAT
+            if route is QuantImportRoute.REJECTED:
+                raise ValueError(
+                    f"Cannot import GGUF tensor {gguf_name} mapped to {hf_name} "
+                    f"({quant_spec.name}, role={tensor_role.value}): {reason}"
+                )
+            if route is QuantImportRoute.DEQUANTIZE_REQUANTIZE or (
+                _exactness is RepackExactness.LOSSY
+                and route is not QuantImportRoute.DEQUANTIZE_FLOAT
+            ):
+                raise ValueError(
+                    "Quantization-preserving GGUF import would change the dequantized "
+                    f"values of {gguf_name} ({quant_spec.name}). Use "
+                    "keep_quantized=False (API) or --dequantize (CLI) for explicit "
+                    "float import."
+                )
+            if route is QuantImportRoute.NATIVE_BYTES and not native_targets:
+                raise ValueError(
+                    f"Cannot preserve native {quant_spec.name} bytes for {hf_name}: "
+                    "the mapped module does not expose a compatible "
+                    "BlockQuantizedMatMul target."
+                )
+            if (
+                tensor_role is TensorRole.EMBEDDING
+                and route is not QuantImportRoute.DEQUANTIZE_FLOAT
+                and not is_quantized_embedding
+                and not is_encoder_embedding
+            ):
+                raise ValueError(
+                    f"Cannot keep {quant_spec.name} embedding {hf_name} quantized: "
+                    "the model graph does not expose GatherBlockQuantized. Use "
+                    "keep_quantized=False for explicit float import."
+                )
+            if (
+                tensor_role in {TensorRole.PROJECTION, TensorRole.OUTPUT}
+                and route
+                in {
+                    QuantImportRoute.AFFINE_REPACK,
+                    QuantImportRoute.DEQUANTIZE_REQUANTIZE,
+                }
+                and not should_repack
+                and not fused_projection_targets
+                and (
+                    dequantize_float_linear_types is None
+                    or module_stem not in dequantize_float_linear_types
+                    or quant_spec.name not in dequantize_float_linear_types[module_stem]
+                )
+            ):
+                raise ValueError(
+                    f"Cannot keep {quant_spec.name} {tensor_role.value} {hf_name} "
+                    "quantized: the model graph does not expose MatMulNBits. Use "
+                    "keep_quantized=False for explicit float import."
+                )
+        if qtype_val in float_type_ids and (
+            fused_projection_targets or affine_targets or should_repack
+        ):
+            raise ValueError(
+                "Quantization-preserving GGUF import would quantize float projection "
+                f"{gguf_name} ({getattr(qtype, 'name', qtype)}) to the graph's "
+                f"{target_bits}-bit/block-{target_block_size} MatMulNBits contract. "
+                "Use keep_quantized=False (API) or --dequantize (CLI) for an "
+                "explicit float import."
+            )
+        if fused_projection_targets:
+            if route is not QuantImportRoute.AFFINE_REPACK or not can_repack(qtype_val):
+                raise ValueError(
+                    "Quantization-preserving GGUF import cannot split fused projection "
+                    f"{gguf_name} ({getattr(qtype, 'name', qtype)}) without changing "
+                    "its dequantized values. Use keep_quantized=False (API) or "
+                    "--dequantize (CLI) for explicit float import."
+                )
+            repacked = repack_gguf_tensor(raw, qtype_val, tuple(int(dim) for dim in np_shape))
+            offset = 0
+            for target_stem in fused_projection_targets:
+                n_out = quantized_output_sizes[target_stem]
+                end = offset + n_out
+                state_dict[f"{target_stem}.weight"] = torch.from_numpy(
+                    np.array(repacked.weight[offset:end], copy=True)
+                )
+                state_dict[f"{target_stem}.scales"] = torch.from_numpy(
+                    np.array(repacked.scales[offset:end], copy=True)
+                )
+                if repacked.zero_points is not None:
+                    state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
+                        np.array(repacked.zero_points[offset:end], copy=True)
+                    )
+                offset = end
+            if offset != int(np_shape[0]):
+                raise ValueError(
+                    f"Fused QKV tensor {hf_name!r} has {np_shape[0]} rows, "
+                    f"but Q/K/V targets require {offset}"
+                )
+            n_repacked += len(fused_projection_targets)
+        elif native_targets and native_spec is not None:
             n_out = int(np_shape[-2])
             k_in = int(np_shape[-1])
             packed = preserve_native_blocks(
@@ -1663,12 +5544,14 @@ def _load_quantized_state_dict(
             for index, native_stem in enumerate(native_targets):
                 w = torch.from_numpy(np.array(packed[index], copy=True))
                 target_name = f"{native_stem}.weight"
-                if _needs_qk_permute(
+                needs_permute = _needs_qk_permute(
                     target_name,
                     num_heads,
                     num_kv_heads,
                     model_type,
-                ):
+                    gguf_arch,
+                )
+                if needs_permute:
                     n_head = (
                         num_heads
                         if ".q_proj." in target_name or ".qkv_proj." in target_name
@@ -1676,7 +5559,103 @@ def _load_quantized_state_dict(
                     )
                     w = _reverse_permute(w, n_head)
                 state_dict[target_name] = w
+                if (
+                    reuse_candidates is not None
+                    and len(native_targets) == 1
+                    and not needs_permute
+                ):
+                    from mobius.integrations.gguf._reuse import GGUFReuseCandidate
+
+                    offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
+                    reuse_candidates[id(w)] = GGUFReuseCandidate(
+                        gguf_name,
+                        offset,
+                        length,
+                        qtype_name,
+                        tuple(int(dim) for dim in w.shape),
+                    )
             n_repacked += len(native_targets)
+        elif affine_targets:
+            # GGUF stores routed experts as one expert-major 3-D tensor
+            # [E, N, K]. MatMulNBits parameters remain per expert, so repack
+            # the contiguous [E*N, K] matrix once and split only after packing.
+            num_experts = len(affine_targets)
+            n_out = int(np_shape[-2])
+            k_in = int(np_shape[-1])
+            aggregate_shape = (num_experts * n_out, k_in)
+            if can_repack(qtype_val):
+                repacked = repack_gguf_tensor(
+                    raw.ravel().view(np.uint8),
+                    qtype_val,
+                    aggregate_shape,
+                )
+                if repacked.bits != target_bits or repacked.block_size != target_block_size:
+                    _require_supported_requantization(
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        tensor_name=hf_name,
+                    )
+                    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                    repacked = repack_dequantized_tensor(
+                        values.reshape(aggregate_shape),
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        symmetric=target_symmetric,
+                    )
+                    n_requantized += 1
+            else:
+                _require_supported_requantization(
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    tensor_name=hf_name,
+                )
+                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                repacked = repack_dequantized_tensor(
+                    values.reshape(aggregate_shape),
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                n_requantized += 1
+
+            packed = repacked.weight.reshape(num_experts, n_out, *repacked.weight.shape[1:])
+            scales = repacked.scales.reshape(num_experts, n_out, *repacked.scales.shape[1:])
+            zero_points = (
+                repacked.zero_points.reshape(
+                    num_experts,
+                    n_out,
+                    *repacked.zero_points.shape[1:],
+                )
+                if repacked.zero_points is not None
+                else None
+            )
+            for index, target_stem in enumerate(affine_targets):
+                target_name = f"{target_stem}.weight"
+                weight = torch.from_numpy(np.array(packed[index], copy=True))
+                scale = torch.from_numpy(np.array(scales[index], copy=True))
+                zero_point = (
+                    torch.from_numpy(np.array(zero_points[index], copy=True))
+                    if zero_points is not None
+                    else None
+                )
+                if _needs_qk_permute(
+                    target_name,
+                    num_heads,
+                    num_kv_heads,
+                    model_type,
+                    gguf_arch,
+                ):
+                    n_head = num_heads if ".q_proj." in target_name else num_kv_heads
+                    weight = _reverse_permute(weight, n_head)
+                    scale = _reverse_permute(scale, n_head)
+                    if zero_point is not None:
+                        zero_point = _reverse_permute(zero_point, n_head)
+                state_dict[target_name] = weight
+                state_dict[f"{target_stem}.scales"] = scale
+                if zero_points is not None:
+                    assert zero_point is not None
+                    state_dict[f"{target_stem}.zero_points"] = zero_point
+            n_repacked += num_experts
         elif should_repack:
             if is_tencent_q1_0_tensor:
                 repacked = parse_tencent_q1_0_tensor(
@@ -1684,7 +5663,24 @@ def _load_quantized_state_dict(
                     data_section_offset,
                     tensors_by_name[gguf_name],
                 )
-            elif can_repack(qtype_val):
+            elif is_kimi_reshaped_projection:
+                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                if hf_name.endswith(".k_b_proj.weight"):
+                    values = values.transpose(0, 2, 1).reshape(
+                        int(np_shape[0]) * int(np_shape[2]), int(np_shape[1])
+                    )
+                else:
+                    values = values.reshape(
+                        int(np_shape[0]) * int(np_shape[1]), int(np_shape[2])
+                    )
+                repacked = repack_dequantized_tensor(
+                    values,
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                n_requantized += 1
+            elif route is QuantImportRoute.AFFINE_REPACK and can_repack(qtype_val):
                 shape_2d = (int(np_shape[0]), int(np_shape[1]))
                 repacked = repack_gguf_tensor(
                     raw.ravel().view(np.uint8),
@@ -1726,7 +5722,7 @@ def _load_quantized_state_dict(
             # (same transform as _process_llama, on all arrays). Only
             # llama-family archs use the interleaved-rope permute; Qwen
             # and others must NOT be permuted.
-            if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
+            if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type, gguf_arch):
                 n_head = (
                     num_heads
                     if ".q_proj." in hf_name or ".qkv_proj." in hf_name
@@ -1742,12 +5738,12 @@ def _load_quantized_state_dict(
             state_dict[f"{stem}.scales"] = s
             if repacked.zero_points is not None:
                 zp = torch.from_numpy(repacked.zero_points)
-                if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type):
+                if _needs_qk_permute(hf_name, num_heads, num_kv_heads, model_type, gguf_arch):
                     zp = _reverse_permute(zp, n_head)
                 state_dict[f"{stem}.zero_points"] = zp
             n_repacked += 1
         else:
-            # Dequantize to float
+            # Dequantize weights whose graph target is intentionally float.
             if qtype in (
                 GGMLQuantizationType.F32,
                 GGMLQuantizationType.F16,
@@ -1758,7 +5754,22 @@ def _load_quantized_state_dict(
                     arr = np.array(arr)
             else:
                 arr = dequantize(raw, qtype).reshape(np_shape)
-            state_dict[hf_name] = torch.from_numpy(arr)
+            tensor = torch.from_numpy(arr)
+            state_dict[hf_name] = tensor
+            if reuse_candidates is not None and qtype in (
+                GGMLQuantizationType.F32,
+                GGMLQuantizationType.F16,
+            ):
+                from mobius.integrations.gguf._reuse import GGUFReuseCandidate
+
+                offset, length, qtype_name = gguf_model.tensor_storage_range(gguf_name)
+                reuse_candidates[id(tensor)] = GGUFReuseCandidate(
+                    gguf_name,
+                    offset,
+                    length,
+                    qtype_name,
+                    tuple(int(dim) for dim in arr.shape),
+                )
 
     logger.info(
         "Loaded %d state_dict entries (%d GGUF tensors repacked for quantized ops, "
@@ -1770,11 +5781,47 @@ def _load_quantized_state_dict(
     return state_dict
 
 
+def _validate_moe_weight_shape(
+    name: str,
+    shape: tuple[int, ...],
+    config,
+) -> None:
+    """Reject router/expert tensors that could otherwise be partially routed."""
+    num_experts = getattr(config, "num_local_experts", None)
+    if num_experts is None:
+        return
+    expert_size = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+    expert_marker = next(
+        (marker for marker in (".mlp.experts.", ".feed_forward.experts.") if marker in name),
+        None,
+    )
+    if expert_marker is not None:
+        projection = name.rsplit(expert_marker, 1)[1].split(".", 1)[0]
+        if projection not in {"gate_proj", "up_proj", "down_proj"}:
+            return
+        expected = (
+            (num_experts, config.hidden_size, expert_size)
+            if projection == "down_proj"
+            else (num_experts, expert_size, config.hidden_size)
+        )
+        if shape != expected:
+            raise ValueError(
+                f"Invalid stacked expert shape for {name}: expected {expected}, got {shape}"
+            )
+    elif name.endswith((".mlp.gate.weight", ".feed_forward.gate.weight")):
+        expected = (num_experts, config.hidden_size)
+        if shape != expected:
+            raise ValueError(
+                f"Invalid router shape for {name}: expected {expected}, got {shape}"
+            )
+
+
 def _needs_qk_permute(
     hf_name: str,
     num_heads: int | None,
     num_kv_heads: int | None,
     model_type: str | None = None,
+    gguf_arch: str | None = None,
 ) -> bool:
     """Check if this tensor needs Q/K reverse-permutation.
 
@@ -1785,13 +5832,14 @@ def _needs_qk_permute(
     plain HF order (NEOX rope) and must NOT be permuted, or their
     attention heads get scrambled and the model emits garbage.
     """
-    from mobius.integrations.gguf._tensor_processors import (
-        needs_llama_qk_permute,
-    )
+    from mobius.integrations.gguf._arch_registry import try_get_arch_spec
+    from mobius.integrations.gguf._tensor_processors import needs_llama_qk_permute
 
     if num_heads is None or num_kv_heads is None:
         return False
-    if not needs_llama_qk_permute(model_type):
+    spec = try_get_arch_spec(gguf_arch) if gguf_arch is not None else None
+    permute = spec.llama_qk_permute if spec is not None else needs_llama_qk_permute(model_type)
+    if not permute:
         return False
     return (
         ".q_proj." in hf_name or ".k_proj." in hf_name or ".qkv_proj." in hf_name

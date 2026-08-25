@@ -1,0 +1,18 @@
+model_id: "pfnet/plamo-2-1b"
+model_type: "plamo2"
+revision: "92c75fd6eea9018bcb9c33ee8921589febe071fa"
+task_type: "text-generation"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "The pinned source checkpoint and public F32 GGUF pass raw ORT prefill, all cached decode steps, rollback/replay, and exact 20-token generation. ORT GenAI 0.15.2 also passes exact token-ID generation through its sparse KV+recurrent ABI on a CPU-specialized GQA package; unspecialized Attention plus recurrent state is rejected during package config generation. Text tokenization remains deferred because the official custom tokenizer has no identity-preserving tokenizer.json representation."

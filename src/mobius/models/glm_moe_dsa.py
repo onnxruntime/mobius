@@ -651,6 +651,14 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
             config = dataclasses.replace(config, indexer_types=_indexer_types(config))
         nn.Module.__init__(self)
         self.config = config
+        if config.export_paged_attention and config.use_dsa:
+            # Feature-on must error rather than silently exporting the DSA graph.
+            from mobius.components._paged_mla import paged_attention_rejection
+
+            raise ValueError(
+                paged_attention_rejection(config)
+                or "PagedAttention export requires dense MLA (--glm-full-attention)."
+            )
         self.model = (
             GlmMoeDsaTextModel(config) if config.use_dsa else DeepSeekV3TextModel(config)
         )

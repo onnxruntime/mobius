@@ -16,13 +16,16 @@ import pytest
 import torch
 
 from mobius._builder import build_from_module
+from mobius._configs import QuantizationConfig
 from mobius._registry import (
     MODEL_MAP,
     ModelRegistry,
     registry,
 )
 from mobius._testing import make_config
+from mobius.components import LayerNorm, Linear, QuantizedLinear, RMSNormBias
 from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.moe import Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
 
 
@@ -64,6 +67,44 @@ class TestCausalLMModel:
         sd = {"lm_head.weight": torch.zeros(100, 64)}
         sd = model.preprocess_weights(sd)
         assert "model.embed_tokens.weight" not in sd
+
+    def test_phimoe_norm_matches_checkpoint_format(self):
+        config = make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            partial_rotary_factor=0.5,
+        )
+        native = Phi3MoECausalLMModel(config)
+        gguf = PhiMoEGGUFCausalLMModel(config)
+        assert isinstance(native.model.layers[0].input_layernorm, LayerNorm)
+        assert isinstance(gguf.model.layers[0].input_layernorm, RMSNormBias)
+
+    @pytest.mark.parametrize(
+        ("quantize_lm_head", "head_type"),
+        [(False, Linear), (True, QuantizedLinear)],
+    )
+    def test_phimoe_gguf_honors_quantized_head_contract(self, quantize_lm_head, head_type):
+        config = make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            partial_rotary_factor=0.5,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=32,
+                quant_method="gguf",
+                sym=True,
+                quantize_lm_head=quantize_lm_head,
+            ),
+        )
+        module = PhiMoEGGUFCausalLMModel(config)
+
+        assert isinstance(module.model.layers[0].self_attn.q_proj, QuantizedLinear)
+        assert isinstance(module.lm_head, head_type)
+
+        model = build_from_module(module, config, task=CausalLMTask())["model"]
+        op_types = [node.op_type for node in model.graph]
+        assert "MatMulNBits" in op_types
+        assert ("lm_head.scales" in model.graph.initializers) is quantize_lm_head
 
 
 class TestBuildFromModule:

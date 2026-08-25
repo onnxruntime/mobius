@@ -8,7 +8,13 @@ on:
     inputs:
       affected_models:
         description: >-
-          JSON array of model names. Empty string or empty array runs all models.
+          JSON array of model types.
+          Empty string or empty array runs all models.
+        required: false
+        type: string
+        default: ""
+      affected_cases:
+        description: JSON array of exact golden case IDs.
         required: false
         type: string
         default: ""
@@ -16,8 +22,13 @@ on:
     inputs:
       affected_models:
         description: >-
-          JSON array of affected model names (e.g. '["qwen2", "llama"]').
+          JSON array of affected model types (e.g. '["qwen2", "llama"]').
           Empty string or empty array means run all models.
+        required: false
+        type: string
+        default: ""
+      affected_cases:
+        description: JSON array of exact golden case IDs.
         required: false
         type: string
         default: ""
@@ -72,9 +83,13 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MOBIUS_TEST_DEVICE: cuda
+          AFFECTED_MODELS: ${{ inputs.affected_models }}
+          AFFECTED_CASES: ${{ inputs.affected_cases }}
         run: |
-          AFFECTED='${{ inputs.affected_models }}'
-          if [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; then
+          AFFECTED="$AFFECTED_MODELS"
+          CASES="$AFFECTED_CASES"
+          if { [ -z "$AFFECTED" ] || [ "$AFFECTED" = "[]" ]; } && \
+             { [ -z "$CASES" ] || [ "$CASES" = "[]" ]; }; then
             echo "Running all L5 generation E2E tests"
             pytest tests/e2e_golden_test.py \
               -m generation \
@@ -84,21 +99,31 @@ jobs:
               --cov=src --cov-report=xml --cov-branch \
               --tb=short
           else
-            echo "Running L5 generation tests for affected models: $AFFECTED"
-            # Convert JSON array to comma-separated list for --models
-            MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
-            if [ -n "$MODELS" ]; then
-              pytest tests/e2e_golden_test.py \
+            if [ -n "$AFFECTED" ] && [ "$AFFECTED" != "[]" ]; then
+              echo "Running L5 generation tests for affected models: $AFFECTED"
+              # Convert JSON array to comma-separated list for --models
+              MODELS=$(echo "$AFFECTED" | python -c "import json, sys; print(','.join(json.load(sys.stdin)))")
+              if [ -n "$MODELS" ]; then
+                pytest tests/e2e_golden_test.py \
+                  -m generation \
+                  -v \
+                  --models "$MODELS" \
+                  --timeout=300 \
+                  --junitxml=junit-l5-models.xml \
+                  --cov=src --cov-report=xml --cov-branch \
+                  --tb=short \
+                  || { rc=$?; if [ $rc -eq 5 ]; then echo "No matching tests found — skipping"; else exit $rc; fi; }
+              fi
+            fi
+            if [ -n "$CASES" ] && [ "$CASES" != "[]" ]; then
+              echo "Running L5 generation tests for exact cases: $CASES"
+              MOBIUS_GOLDEN_CASES="$CASES" pytest tests/e2e_golden_test.py \
                 -m generation \
                 -v \
-                --models "$MODELS" \
                 --timeout=300 \
-                --junitxml=junit-l5.xml \
-                --cov=src --cov-report=xml --cov-branch \
-                --tb=short \
-                || { rc=$?; if [ $rc -eq 5 ]; then echo "No matching tests found — skipping"; else exit $rc; fi; }
-            else
-              echo "No affected models — skipping"
+                --junitxml=junit-l5-cases.xml \
+                --cov=src --cov-append --cov-report=xml --cov-branch \
+                --tb=short
             fi
           fi
         timeout-minutes: 60
@@ -116,12 +141,12 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           flags: gpu-l5
           report-type: test_results
-          files: junit-l5.xml
+          files: junit-l5*.xml
 
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: gpu-l5-test-results
-          path: junit-l5.xml
+          path: junit-l5*.xml
           retention-days: 30

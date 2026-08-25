@@ -295,6 +295,60 @@ def test_lfm2_vl_huggingface_weight_alignment() -> None:
     assert not missing, f"LFM2-VL preprocessing missed: {sorted(missing)}"
 
 
+def _lfm2moe_module():
+    overrides = next(
+        overrides for mt, overrides, _ in ALL_CAUSAL_LM_CONFIGS if mt == "lfm2_moe"
+    )
+    return registry.get("lfm2_moe")(
+        _base_config(**{**overrides, "tie_word_embeddings": False})
+    )
+
+
+def test_lfm2moe_individual_expert_weight_alignment() -> None:
+    """The published checkpoint's w1/w2/w3 experts map to the dedicated MoE graph."""
+    module = _lfm2moe_module()
+    state_dict = {
+        "model.layers.1.feed_forward.experts.0.w1.weight": torch.ones(32, 64),
+        "model.layers.1.feed_forward.experts.0.w2.weight": torch.ones(64, 32),
+        "model.layers.1.feed_forward.experts.0.w3.weight": torch.ones(32, 64),
+    }
+
+    aligned = module.preprocess_weights(state_dict)
+
+    assert set(aligned) == {
+        "model.layers.1.feed_forward.experts.0.gate_proj.weight",
+        "model.layers.1.feed_forward.experts.0.down_proj.weight",
+        "model.layers.1.feed_forward.experts.0.up_proj.weight",
+    }
+
+
+def test_lfm2moe_fused_expert_weight_alignment() -> None:
+    """Current Transformers fused expert tensors split into per-expert projections."""
+    module = _lfm2moe_module()
+    gate_up = torch.arange(4 * 64 * 64).reshape(4, 64, 64)
+    down = torch.arange(4 * 64 * 32).reshape(4, 64, 32)
+    state_dict = {
+        "model.layers.1.feed_forward.experts.gate_up_proj.weight": gate_up,
+        "model.layers.1.feed_forward.experts.down_proj.weight": down,
+    }
+
+    aligned = module.preprocess_weights(state_dict)
+
+    assert len(aligned) == 12
+    assert torch.equal(
+        aligned["model.layers.1.feed_forward.experts.3.gate_proj.weight"],
+        gate_up[3, :32],
+    )
+    assert torch.equal(
+        aligned["model.layers.1.feed_forward.experts.3.up_proj.weight"],
+        gate_up[3, 32:],
+    )
+    assert torch.equal(
+        aligned["model.layers.1.feed_forward.experts.3.down_proj.weight"],
+        down[3],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Detection model weight alignment
 # ---------------------------------------------------------------------------

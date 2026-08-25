@@ -47,6 +47,49 @@ from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 logger = logging.getLogger(__name__)
 
 
+def effective_tie_word_embeddings(config: ArchitectureConfig) -> bool:
+    """Return the effective embedding/head tie declared by model or quantizer metadata.
+
+    Olive may clear the top-level flag after quantizing a tied table, while
+    preserving the tie in ``quantization.tie_word_embeddings``. A top-level
+    false value therefore does not override an explicit quantization-level tie.
+    """
+    quantization = getattr(config, "quantization", None)
+    return bool(
+        getattr(config, "tie_word_embeddings", False)
+        or (quantization is not None and getattr(quantization, "tie_word_embeddings", False))
+    )
+
+
+def linear_class_for_config(config: ArchitectureConfig):
+    """Return the configured quantized linear factory, or ``None`` for float."""
+    qc = getattr(config, "quantization", None)
+    if qc is None or qc.quant_method == "none":
+        return None
+    zp_dtype = config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=qc.bits,
+        block_size=qc.group_size,
+        has_zero_point=not qc.sym,
+        zero_point_dtype=zp_dtype,
+    )
+
+
+def embedding_for_config(config: ArchitectureConfig):
+    """Create the float or block-quantized token embedding declared by config."""
+    qc = getattr(config, "quantization", None)
+    if qc is not None and getattr(qc, "quantize_embeddings", False):
+        return QuantizedEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            bits=qc.bits,
+            block_size=qc.group_size,
+            has_zero_point=not qc.sym,
+            padding_idx=config.pad_token_id,
+        )
+    return Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+
+
 class TextModel(nn.Module):
     """Base text model with embedding, decoder layers, and final norm."""
 
@@ -65,33 +108,8 @@ class TextModel(nn.Module):
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
-        linear_class = None
-        qc = getattr(config, "quantization", None)
-        if qc is not None and qc.quant_method != "none":
-            zp_dtype = (
-                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
-            )
-            linear_class = make_quantized_linear_factory(
-                bits=qc.bits,
-                block_size=qc.group_size,
-                has_zero_point=not qc.sym,
-                zero_point_dtype=zp_dtype,
-            )
-
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
-        if qc is not None and getattr(qc, "quantize_embeddings", False):
-            # Keep the block-quantized embedding table packed and dequantize
-            # only the selected token rows.
-            self.embed_tokens = QuantizedEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                bits=qc.bits,
-                block_size=qc.group_size,
-                has_zero_point=not qc.sym,
-                padding_idx=config.pad_token_id,
-            )
+        linear_class = linear_class_for_config(config)
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(config, linear_class=linear_class, mlp_class=mlp_class)
@@ -394,9 +412,13 @@ class CausalLMModel(nn.Module):
         embed_quantized = qc is not None and getattr(qc, "quantize_embeddings", False)
         # Olive RTN may quantize+tie the head while clearing the model's
         # top-level tie flag; recover it from the quantization config.
-        tie = config.tie_word_embeddings or (
-            qc is not None and getattr(qc, "tie_word_embeddings", False)
-        )
+        tie = effective_tie_word_embeddings(config)
+        if tie and quantize_lm_head != embed_quantized:
+            raise ValueError(
+                "Tied embeddings and LM heads must use compatible storage: "
+                "quantize_embeddings and quantize_lm_head must either both be true "
+                "or both be false."
+            )
 
         if quantize_lm_head and embed_quantized and tie:
             # Tied quantized head: share the embedding's packed table and quant
@@ -423,8 +445,24 @@ class CausalLMModel(nn.Module):
             # graph. Only valid when both are unquantized float tables;
             # quantized embed/head use different packed layouts and are tied
             # by sharing Parameters in TiedQuantizedLMHead above.
-            if config.tie_word_embeddings and not embed_quantized:
+            if tie and not embed_quantized:
                 self.lm_head.weight = self.model.embed_tokens.weight
+
+    def _replace_text_model(self, model: nn.Module) -> None:
+        """Replace the text model while preserving tied embedding/head parameters."""
+        self.model = model
+        if isinstance(self.lm_head, TiedQuantizedLMHead):
+            self.lm_head = TiedQuantizedLMHead(
+                self.model.embed_tokens,
+                self.config.hidden_size,
+                self.config.vocab_size,
+            )
+        elif (
+            effective_tie_word_embeddings(self.config)
+            and isinstance(self.lm_head, Linear)
+            and isinstance(self.model.embed_tokens, Embedding)
+        ):
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,
@@ -441,14 +479,19 @@ class CausalLMModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
         )
+        emit_final_hidden = self.config.output_final_hidden_state
         if len(result) == 3:
             hidden_states, present_key_values, intermediate_hidden_states = result
             hidden_states = _retain_last_sequence_token(op, hidden_states)
             logits = self.lm_head(op, hidden_states)
+            if emit_final_hidden:
+                return logits, present_key_values, intermediate_hidden_states, hidden_states
             return logits, present_key_values, intermediate_hidden_states
         hidden_states, present_key_values = result
         hidden_states = _retain_last_sequence_token(op, hidden_states)
         logits = self.lm_head(op, hidden_states)
+        if emit_final_hidden:
+            return logits, present_key_values, None, hidden_states
         return logits, present_key_values
 
     def preprocess_weights(
@@ -459,7 +502,7 @@ class CausalLMModel(nn.Module):
         return preprocess_quantized_weights(
             state_dict,
             qc,
-            tie_embeddings=self.config.tie_word_embeddings,
+            tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=None,
         )
 

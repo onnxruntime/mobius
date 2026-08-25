@@ -32,7 +32,7 @@ class TestGenaiConfigGeneratorLLM:
         )
         config = gen.generate()
 
-        assert config["model"]["type"] == "llama"
+        assert config["model"]["type"] == "decoder"
         assert config["model"]["vocab_size"] == 32000
         assert config["model"]["context_length"] == 4096
 
@@ -43,6 +43,65 @@ class TestGenaiConfigGeneratorLLM:
         assert decoder["num_key_value_heads"] == 8
         assert decoder["head_size"] == 128
         assert decoder["filename"] == "model.onnx"
+
+    @pytest.mark.parametrize("model_type", ["llama", "qwen2", "gemma4_text", "custom"])
+    def test_decoder_only_types_are_normalized(self, model_type):
+        gen = GenaiConfigGenerator(
+            model_type,
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+        )
+        assert gen.generate()["model"]["type"] == "decoder"
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected"),
+        [("gpt2", "gpt2"), ("lfm2", "lfm2"), ("lfm2_vl", "lfm2")],
+    )
+    def test_specialized_decoder_types_are_preserved(self, model_type, expected):
+        gen = GenaiConfigGenerator(
+            model_type,
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+        )
+        assert gen.generate()["model"]["type"] == expected
+
+    def test_auxiliary_graph_topology_preserves_runtime_type(self):
+        gen = GenaiConfigGenerator(
+            "qwen2",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            has_specialized_topology=True,
+        )
+        assert gen.generate()["model"]["type"] == "qwen2"
+
+    def test_phi3_type_is_preserved_only_for_longrope(self):
+        common = {
+            "vocab_size": 256,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+        }
+        assert GenaiConfigGenerator("phi3", **common).generate()["model"]["type"] == "decoder"
+        assert (
+            GenaiConfigGenerator("phi3", uses_longrope=True, **common).generate()["model"][
+                "type"
+            ]
+            == "phi3"
+        )
 
     def test_llm_decoder_inputs_have_input_ids(self):
         """LLM decoders receive input_ids, not inputs_embeds."""
@@ -739,7 +798,7 @@ class TestGenaiConfigWrite:
 
         with open(path) as f:
             loaded = json.load(f)
-        assert loaded["model"]["type"] == "llama"
+        assert loaded["model"]["type"] == "decoder"
         assert "search" in loaded
 
     def test_write_roundtrips_vlm(self, tmp_path):

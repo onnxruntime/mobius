@@ -636,17 +636,20 @@ class Gemma4Task(ModelTask):
         """Build vision encoder: pixel_values + pixel_position_ids -> image_features.
 
         Inputs:
-        - ``pixel_values [B, N, 3*P^2]``: pre-patchified image data where
-          ``B`` is the number of images and ``N`` is the number of patches
-          (padded to ``max_soft_tokens``, typically 280).
-        - ``pixel_position_ids [B, N, 2]``: (x, y) patch coordinates.
+        - ``pixel_values [1, N, 3*P^2]``: one pre-patchified image with ``N``
+          patches (padded to ``max_soft_tokens``, typically 280).
+        - ``pixel_position_ids [1, N, 2]``: (x, y) patch coordinates.
           Unused patch slots (from images smaller than the maximum) use
           ``(-1, -1)`` as a sentinel value — no explicit mask is needed.
 
         Output:
-        - ``image_features [B*N, text_hidden_size]``: projected vision features
+        - ``image_features [N_pooled, text_hidden_size]``: projected vision features
+
+        The position-based pooler emits a variable token count determined by one
+        image's valid coordinate extent. Its scalar OneHot depth cannot represent
+        different pooled counts per batch row, so the graph contract is explicitly
+        single-image rather than advertising false dynamic-batch support.
         """
-        batch = ir.SymbolicDim("batch")
         num_patches = ir.SymbolicDim("num_patches")
         patch_size = config.vision.patch_size or 16 if config.vision else 16
         pixel_dim = 3 * patch_size * patch_size
@@ -657,12 +660,12 @@ class Gemma4Task(ModelTask):
         pixel_values = builder.input(
             "pixel_values",
             dtype=config.dtype,
-            shape=[batch, num_patches, pixel_dim],
+            shape=[1, num_patches, pixel_dim],
         )
         pixel_position_ids = builder.input(
             "pixel_position_ids",
             dtype=ir.DataType.INT64,
-            shape=[batch, num_patches, 2],
+            shape=[1, num_patches, 2],
         )
 
         image_features = vision(

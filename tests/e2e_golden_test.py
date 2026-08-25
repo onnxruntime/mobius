@@ -28,10 +28,12 @@ import ast
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import json
 import os
 import shutil
 import warnings
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -428,6 +430,23 @@ _L5_ONLY_XFAIL_REASONS: dict[str, str] = {
 }
 
 
+@functools.cache
+def _selected_golden_case_ids() -> set[str] | None:
+    """Return exact case IDs requested by CI, rejecting malformed selectors."""
+    raw = os.environ.get("MOBIUS_GOLDEN_CASES")
+    if raw is None:
+        return None
+    try:
+        selected = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise pytest.UsageError("MOBIUS_GOLDEN_CASES must be a JSON array") from error
+    if not isinstance(selected, list) or not all(
+        isinstance(case_id, str) and case_id for case_id in selected
+    ):
+        raise pytest.UsageError("MOBIUS_GOLDEN_CASES must be a JSON array of case IDs")
+    return set(selected)
+
+
 def _discover_cases(
     level: str,
     xfails: dict[str, str] | None = None,
@@ -439,6 +458,14 @@ def _discover_cases(
     rather than failing at run time.
     """
     cases = discover_test_cases(level=level)
+    selected = _selected_golden_case_ids()
+    if selected is not None:
+        known_case_ids = {case.case_id for case in discover_test_cases()}
+        if unknown := selected - known_case_ids:
+            raise pytest.UsageError(
+                f"Unknown MOBIUS_GOLDEN_CASES selectors: {sorted(unknown)}"
+            )
+        cases = [case for case in cases if case.case_id in selected]
     params: list[pytest.ParameterSet] = []
     for case in cases:
         marks: list[pytest.MarkDecorator] = []
@@ -493,6 +520,51 @@ def test_huggingface_artifact_loads_are_revision_pinned():
 
 def _build_model_package(case: GoldenTestCase) -> ModelPackage:
     """Build an ONNX ModelPackage with real weights from HuggingFace."""
+    if case.gguf_source is not None:
+        from huggingface_hub import hf_hub_download
+
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        source = case.gguf_source
+        gguf_path = Path(
+            hf_hub_download(
+                repo_id=str(source["repository"]),
+                revision=str(source["revision"]),
+                filename=str(source["filename"]),
+            )
+        )
+        assert gguf_path.stat().st_size == source["size"], (
+            f"GGUF size changed for {source['repository']}:{source['filename']}"
+        )
+        digest = hashlib.sha256()
+        with gguf_path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        assert digest.hexdigest() == source["lfs_sha256"], (
+            f"GGUF SHA-256 changed for {source['repository']}:{source['filename']}"
+        )
+        artifact = GGUFModel(gguf_path)
+        qtypes = Counter(qtype.name for _, _, qtype, _ in artifact.tensor_items_raw())
+        assert len(artifact._reader.tensors) == source["tensor_count"]
+        assert dict(sorted(qtypes.items())) == source["tensor_qtypes"]
+        dtype = {
+            "float32": "f32",
+            "float16": "f16",
+            "bfloat16": "bf16",
+        }[case.dtype]
+        package = build_from_gguf(
+            gguf_path,
+            dtype=dtype,
+            keep_quantized=bool(source.get("keep_quantized", True)),
+            execution_provider=str(source["execution_provider"]),
+        )
+        route = json.loads(package.gguf_import_route)
+        assert route["execution_provider"] == source["execution_provider"]
+        assert route["config_sha256"] == source["config_sha256"]
+        assert route["preserve_quantization"] == source["preserve_quantization"]
+        return package
+
     module_class = None
     task = None
     if case.architecture:
@@ -629,6 +701,16 @@ def _prepare_image_to_text_inputs(
     )
     pixel_values = processed["pixel_values"].float().cpu().numpy()
     return pixel_values, processed["input_ids"].cpu().numpy().astype(np.int64)
+
+
+def _assert_gguf_golden_provenance(case: GoldenTestCase, golden_path: Path) -> None:
+    if case.gguf_source is None:
+        return
+    data = json.loads(golden_path.read_text(encoding="utf-8"))
+    assert data.get("provenance") == {
+        "reference": {"repository": case.model_id, "revision": case.revision},
+        "gguf": case.gguf_source,
+    }, f"Golden provenance does not match the pinned GGUF case: {golden_path}"
 
 
 def _run_image_to_text_prefill(
@@ -2115,6 +2197,7 @@ class TestL4CheckpointVerified:
         golden = load_golden_ref(golden_path)
         if golden is None:
             pytest.skip(f"Golden file missing: {golden_path}")
+        _assert_gguf_golden_provenance(case, golden_path)
 
         tolerances = load_tolerances("L4", case.dtype)
         pkg = _build_model_package(case)
@@ -2932,12 +3015,15 @@ class TestL5GenerationE2E:
         golden = load_golden_ref(golden_path)
         if golden is None:
             pytest.skip(f"Golden file missing: {golden_path}")
+        _assert_gguf_golden_provenance(case, golden_path)
 
         # L5 generation golden is stored in the separate *_generation.json file.
         gen_path = generation_json_path_for_case(case)
+        _assert_gguf_golden_provenance(case, gen_path)
         expected_token_ids = load_generation_golden(case)
         if expected_token_ids is None:
             pytest.skip(f"Generation golden file missing: {gen_path}")
+        _assert_gguf_golden_provenance(case, gen_path)
 
         tolerances = load_tolerances("L5", case.dtype)
         # Per-case tolerance override (e.g. VL multi-model pipeline has known

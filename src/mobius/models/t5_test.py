@@ -9,8 +9,43 @@ import math
 
 import numpy as np
 import pytest
+import torch
 
 from mobius.models.t5 import _rename_t5_weight
+
+
+def test_standard_t5_graph_contract_is_stable():
+    """Ordinary T5 keeps the pre-GGUF deterministic graph size and cache shape."""
+    from mobius._configs import ArchitectureConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+    from mobius.tasks import Seq2SeqTask
+
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        num_decoder_layers=2,
+        vocab_size=256,
+        max_position_embeddings=64,
+        hidden_act="gelu",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        pad_token_id=0,
+    )
+    package = Seq2SeqTask().build(T5ForConditionalGeneration(config), config)
+    decoder = package["decoder"]
+
+    assert sum(len(list(model.graph)) for model in package.values()) == 176
+    assert len(list(package["encoder"].graph)) == 81
+    assert len(list(decoder.graph)) == 95
+    decoder_inputs = {value.name: value for value in decoder.graph.inputs}
+    assert "encoder_attention_mask" not in decoder_inputs
+    assert str(decoder_inputs["past_key_values.0.cross.key"].shape) == (
+        "[batch,4,encoder_sequence_len,16]"
+    )
 
 
 def test_t5_encoder_is_public_and_consumes_attention_mask():
@@ -117,20 +152,90 @@ class TestRelativePositionBucket:
 class TestT5WeightRename:
     """Test weight name mapping from HuggingFace to ONNX."""
 
-    def test_relative_attention_bias_lifted_to_encoder(self):
-        """Block 0's relative_attention_bias maps to encoder level."""
+    def test_relative_attention_bias_keeps_encoder_layer_index(self):
+        """Relative bias remains attached to its source encoder layer."""
         hf = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        assert _rename_t5_weight(hf) == "encoder.relative_attention_bias.weight"
+        assert _rename_t5_weight(hf) == "encoder.block.0.relative_attention_bias.weight"
 
-    def test_relative_attention_bias_lifted_to_decoder(self):
-        """Block 0's relative_attention_bias maps to decoder level."""
+    def test_relative_attention_bias_keeps_decoder_layer_index(self):
+        """Relative bias remains attached to its source decoder layer."""
         hf = "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        assert _rename_t5_weight(hf) == "decoder.relative_attention_bias.weight"
+        assert _rename_t5_weight(hf) == "decoder.block.0.relative_attention_bias.weight"
 
     def test_self_attention_projections(self):
         """Self-attention projections rename correctly."""
         hf = "encoder.block.2.layer.0.SelfAttention.q.weight"
         assert _rename_t5_weight(hf) == "encoder.block.2.self_attn.q_proj.weight"
+
+    def test_preprocess_preserves_values_and_ties_shared_weights(self):
+        from mobius._configs import ArchitectureConfig
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config = ArchitectureConfig(
+            vocab_size=8,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_decoder_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+            hidden_act="relu",
+            tie_word_embeddings=True,
+        )
+        model = T5ForConditionalGeneration(config)
+        shared = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        projection = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        relative_bias = torch.arange(64, dtype=torch.float32).reshape(32, 2)
+        transformed = model.preprocess_weights(
+            {
+                "shared.weight": shared,
+                "encoder.block.0.layer.0.SelfAttention.q.weight": projection,
+                "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight": (
+                    relative_bias
+                ),
+            }
+        )
+
+        assert transformed["encoder.block.0.self_attn.q_proj.weight"] is projection
+        assert transformed["encoder.block.0.relative_attention_bias.weight"] is relative_bias
+        assert transformed["encoder.embed_tokens.weight"] is shared
+        assert transformed["decoder.embed_tokens.weight"] is shared
+        assert transformed["decoder.lm_head.weight"] is shared
+
+    @pytest.mark.parametrize("bias_layers", [[0], [0, 1]])
+    def test_relative_bias_initializer_ownership_matches_source_layers(
+        self, bias_layers: list[int]
+    ):
+        from mobius import build_from_module
+        from mobius._configs import ArchitectureConfig
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config = ArchitectureConfig(
+            vocab_size=8,
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=2,
+            num_decoder_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+            hidden_act="relu",
+            encoder_relative_attention_bias_layers=bias_layers,
+            decoder_relative_attention_bias_layers=bias_layers,
+        )
+        package = build_from_module(T5ForConditionalGeneration(config), config, task="seq2seq")
+
+        encoder_names = set(package["encoder"].graph.initializers)
+        decoder_names = set(package["decoder"].graph.initializers)
+        assert "encoder.block.0.relative_attention_bias.weight" in encoder_names
+        assert "decoder.block.0.relative_attention_bias.weight" in decoder_names
+        assert ("encoder.block.1.relative_attention_bias.weight" in encoder_names) == (
+            1 in bias_layers
+        )
+        assert ("decoder.block.1.relative_attention_bias.weight" in decoder_names) == (
+            1 in bias_layers
+        )
 
     def test_cross_attention_projections(self):
         """Cross-attention projections rename correctly."""

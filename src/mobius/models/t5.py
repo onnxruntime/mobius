@@ -6,21 +6,21 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, ClassVar
+from typing import ClassVar
 
+import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, Linear
 from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._rms_norm import RMSNorm
-
-if TYPE_CHECKING:
-    import onnx_ir as ir
+from mobius.models.base import embedding_for_config, linear_class_for_config
 
 # ---------------------------------------------------------------------------
 # T5 Relative Position Bias
@@ -171,20 +171,49 @@ def _compute_position_bias(
 class T5EncoderBlock(nn.Module):
     """T5 encoder block: pre-norm self-attention + pre-norm FFN."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, *, has_relative_attention_bias: bool):
         super().__init__()
+        linear_class = linear_class_for_config(config) or Linear
         # T5 does not scale attention scores by 1/sqrt(d_k)
-        self.self_attn = EncoderDecoderAttention(config, bias=False, scale=1.0)
+        self.self_attn = EncoderDecoderAttention(
+            config, bias=False, scale=1.0, linear_class=linear_class
+        )
         self.self_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn = _T5FFN(config)
+        self.ffn = _T5FFN(config, linear_class=linear_class)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.relative_attention_bias = (
+            Embedding(config.relative_attention_num_buckets, config.num_attention_heads)
+            if has_relative_attention_bias
+            else None
+        )
+        self._num_buckets = config.relative_attention_num_buckets
+        self._max_distance = config.relative_attention_max_distance
+        self._num_heads = config.num_attention_heads
 
     def forward(
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value | None = None,
+        attention_mask: ir.Value | None = None,
     ):
+        if self.relative_attention_bias is not None:
+            seq_len = op.Shape(hidden_states, start=1, end=2)
+            attention_bias = _compute_position_bias(
+                op,
+                self.relative_attention_bias,
+                seq_len,
+                seq_len,
+                bidirectional=True,
+                num_buckets=self._num_buckets,
+                max_distance=self._max_distance,
+                num_heads=self._num_heads,
+            )
+            if attention_mask is not None:
+                attention_bias = _add_padding_bias(op, attention_bias, attention_mask)
+        if attention_bias is None:
+            raise ValueError("T5 encoder block requires a relative-attention bias")
+
         residual = hidden_states
         hidden_states = self.self_attn_norm(op, hidden_states)
         hidden_states, _ = self.self_attn(op, hidden_states, attention_bias=attention_bias)
@@ -195,30 +224,41 @@ class T5EncoderBlock(nn.Module):
         hidden_states = self.ffn(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
 
-        return hidden_states
+        return hidden_states, attention_bias
 
 
 class T5DecoderBlock(nn.Module):
     """T5 decoder block: self-attn + cross-attn + FFN, all pre-norm."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, *, has_relative_attention_bias: bool):
         super().__init__()
+        linear_class = linear_class_for_config(config) or Linear
         # T5 does not scale attention scores by 1/sqrt(d_k)
         self.self_attn = EncoderDecoderAttention(
             config,
             is_causal=True,
             bias=False,
             scale=1.0,
+            linear_class=linear_class,
         )
         self.self_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.cross_attn = EncoderDecoderAttention(
             config,
             bias=False,
             scale=1.0,
+            linear_class=linear_class,
         )
         self.cross_attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn = _T5FFN(config)
+        self.ffn = _T5FFN(config, linear_class=linear_class)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.relative_attention_bias = (
+            Embedding(config.relative_attention_num_buckets, config.num_attention_heads)
+            if has_relative_attention_bias
+            else None
+        )
+        self._num_buckets = config.relative_attention_num_buckets
+        self._max_distance = config.relative_attention_max_distance
+        self._num_heads = config.num_attention_heads
 
     def forward(
         self,
@@ -226,9 +266,34 @@ class T5DecoderBlock(nn.Module):
         hidden_states: ir.Value,
         encoder_hidden_states: ir.Value,
         attention_bias: ir.Value | None = None,
+        cross_attention_bias: ir.Value | None = None,
         past_key_value: tuple | None = None,
         cross_past_key_value: ir.Value | None = None,
+        query_length: ir.Value | None = None,
+        key_length: ir.Value | None = None,
+        query_offset: ir.Value | None = None,
+        attention_mask: ir.Value | None = None,
+        use_cross_attention_cache: bool = False,
     ):
+        if self.relative_attention_bias is not None:
+            if query_length is None or key_length is None:
+                raise ValueError("T5 decoder bias owner requires query/key lengths")
+            attention_bias = _compute_position_bias(
+                op,
+                self.relative_attention_bias,
+                query_length,
+                key_length,
+                bidirectional=False,
+                num_buckets=self._num_buckets,
+                max_distance=self._max_distance,
+                num_heads=self._num_heads,
+                query_offset=query_offset,
+            )
+            if attention_mask is not None:
+                attention_bias = _add_padding_bias(op, attention_bias, attention_mask)
+        if attention_bias is None:
+            raise ValueError("T5 decoder block requires a relative-attention bias")
+
         # Self-attention
         residual = hidden_states
         hidden_states = self.self_attn_norm(op, hidden_states)
@@ -244,7 +309,9 @@ class T5DecoderBlock(nn.Module):
             op,
             hidden_states,
             key_value_states=encoder_hidden_states,
+            attention_bias=cross_attention_bias,
             past_key_value=cross_past_key_value,
+            use_cross_attention_cache=use_cross_attention_cache,
         )
         hidden_states = op.Add(residual, hidden_states)
 
@@ -254,7 +321,7 @@ class T5DecoderBlock(nn.Module):
         hidden_states = self.ffn(op, hidden_states)
         hidden_states = op.Add(residual, hidden_states)
 
-        return hidden_states, self_kv, cross_kv
+        return hidden_states, self_kv, cross_kv, attention_bias
 
 
 class _T5FFN(nn.Module):
@@ -265,16 +332,16 @@ class _T5FFN(nn.Module):
     where wi_0 is the gate and wi_1 is the up-projection.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, *, linear_class: type = Linear):
         super().__init__()
         self._is_gated = config.is_gated_act
         if self._is_gated:
             # Gated FFN: gate (wi_0) and up-projection (wi_1)
-            self.wi_0 = Linear(config.hidden_size, config.intermediate_size, bias=False)
-            self.wi_1 = Linear(config.hidden_size, config.intermediate_size, bias=False)
+            self.wi_0 = linear_class(config.hidden_size, config.intermediate_size, bias=False)
+            self.wi_1 = linear_class(config.hidden_size, config.intermediate_size, bias=False)
         else:
-            self.wi = Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.wo = Linear(config.intermediate_size, config.hidden_size, bias=False)
+            self.wi = linear_class(config.hidden_size, config.intermediate_size, bias=False)
+        self.wo = linear_class(config.intermediate_size, config.hidden_size, bias=False)
         self._act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -297,19 +364,16 @@ class T5Encoder(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
-        # Relative position bias: learned embedding shared across all blocks.
-        # Only block 0 has this weight in HF, but we lift it to the
-        # encoder level so the onnxscript parameter name resolves correctly.
-        self.relative_attention_bias = Embedding(
-            config.relative_attention_num_buckets, config.num_attention_heads
-        )
-        self._num_buckets = config.relative_attention_num_buckets
-        self._max_distance = config.relative_attention_max_distance
-        self._num_heads = config.num_attention_heads
+        self.embed_tokens = embedding_for_config(config)
+        relative_bias_layers = set(config.encoder_relative_attention_bias_layers or [0])
         self.block = nn.ModuleList(
-            [T5EncoderBlock(config) for _ in range(config.num_hidden_layers)]
+            [
+                T5EncoderBlock(config, has_relative_attention_bias=i in relative_bias_layers)
+                for i in range(config.num_hidden_layers)
+            ]
         )
+        if not self.block or self.block[0].relative_attention_bias is None:
+            raise ValueError("T5 encoder layer 0 must own a relative-attention bias tensor")
         self.final_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -321,32 +385,20 @@ class T5Encoder(nn.Module):
         hidden_states = self.embed_tokens(op, input_ids)
         # Compute T5 relative position bias (bidirectional for encoder).
         # Shape: [1, num_heads, seq_len, seq_len]
-        seq_len = op.Shape(input_ids, start=1, end=2)
-        position_bias = _compute_position_bias(
-            op,
-            self.relative_attention_bias,
-            seq_len,
-            seq_len,
-            bidirectional=True,
-            num_buckets=self._num_buckets,
-            max_distance=self._max_distance,
-            num_heads=self._num_heads,
-        )
-        if attention_mask is not None:
-            # HF T5 adds a broadcastable padding bias to the learned relative
-            # bias: [B, S] -> [B, 1, 1, S]. Masked keys receive a large
-            # negative value so every query ignores padding tokens.
-            valid = op.CastLike(attention_mask, position_bias)
-            padding = op.Mul(
-                op.Sub(op.CastLike(op.Constant(value_float=1.0), position_bias), valid),
-                op.CastLike(op.Constant(value_float=-10000.0), position_bias),
-            )
-            position_bias = op.Add(
-                position_bias,
-                op.Unsqueeze(padding, op.Constant(value_ints=[1, 2])),
-            )
+        fallback_position_bias = None
         for block in self.block:
-            hidden_states = block(op, hidden_states, attention_bias=position_bias)
+            hidden_states, position_bias = block(
+                op,
+                hidden_states,
+                attention_bias=(
+                    None
+                    if block.relative_attention_bias is not None
+                    else fallback_position_bias
+                ),
+                attention_mask=attention_mask,
+            )
+            if fallback_position_bias is None:
+                fallback_position_bias = position_bias
         hidden_states = self.final_layer_norm(op, hidden_states)
         return hidden_states
 
@@ -356,23 +408,28 @@ class T5Decoder(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
-        # Relative position bias: learned embedding for decoder self-attention.
-        self.relative_attention_bias = Embedding(
-            config.relative_attention_num_buckets, config.num_attention_heads
-        )
-        self._num_buckets = config.relative_attention_num_buckets
-        self._max_distance = config.relative_attention_max_distance
-        self._num_heads = config.num_attention_heads
+        self.embed_tokens = embedding_for_config(config)
         self._hidden_size = config.hidden_size
         # HF T5 recently introduced scale_decoder_outputs (decoupled from
         # tie_word_embeddings). Original T5 sets it True; FLAN-T5/UL2 set
         # it False. MT5 doesn't have this field and never scales.
         self._scale_decoder_outputs = bool(config.scale_decoder_outputs)
-        num_decoder_layers = getattr(config, "num_decoder_layers", config.num_hidden_layers)
-        self.block = nn.ModuleList([T5DecoderBlock(config) for _ in range(num_decoder_layers)])
+        num_decoder_layers = config.num_decoder_layers or config.num_hidden_layers
+        relative_bias_layers = set(config.decoder_relative_attention_bias_layers or [0])
+        self.block = nn.ModuleList(
+            [
+                T5DecoderBlock(config, has_relative_attention_bias=i in relative_bias_layers)
+                for i in range(num_decoder_layers)
+            ]
+        )
+        if not self.block or self.block[0].relative_attention_bias is None:
+            raise ValueError("T5 decoder layer 0 must own a relative-attention bias tensor")
         self.final_layer_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        quantization = config.quantization
+        quantize_lm_head = quantization is not None and quantization.quantize_lm_head
+        linear_class = linear_class_for_config(config) if quantize_lm_head else Linear
+        assert linear_class is not None
+        self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
         self,
@@ -380,8 +437,11 @@ class T5Decoder(nn.Module):
         input_ids: ir.Value,
         encoder_hidden_states: ir.Value,
         attention_mask: ir.Value | None = None,
+        encoder_attention_mask: ir.Value | None = None,
         past_key_values: list | None = None,
         cross_past_key_values: ir.Value | None = None,
+        use_cross_attention_cache: bool = False,
+        use_attention_masks: bool = False,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
 
@@ -396,32 +456,41 @@ class T5Decoder(nn.Module):
         else:
             past_len = None
             key_length = query_length
-        position_bias = _compute_position_bias(
-            op,
-            self.relative_attention_bias,
-            query_length,
-            key_length,
-            bidirectional=False,
-            num_buckets=self._num_buckets,
-            max_distance=self._max_distance,
-            num_heads=self._num_heads,
-            query_offset=past_len,
-        )
-
         past_kvs = past_key_values or [None] * len(self.block)
         cross_past_kvs = cross_past_key_values or [None] * len(self.block)
         present_self_kvs = []
         present_cross_kvs = []
 
+        fallback_position_bias = None
         for block, past_kv, cross_kv in zip(self.block, past_kvs, cross_past_kvs):
-            hidden_states, self_kv, cross_kv_out = block(
+            cross_attention_bias = None
+            if use_attention_masks and encoder_attention_mask is not None:
+                cross_attention_bias = _padding_bias(
+                    op,
+                    hidden_states,
+                    encoder_attention_mask,
+                    query_length=query_length,
+                )
+            hidden_states, self_kv, cross_kv_out, position_bias = block(
                 op,
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                attention_bias=position_bias,
+                attention_bias=(
+                    None
+                    if block.relative_attention_bias is not None
+                    else fallback_position_bias
+                ),
+                cross_attention_bias=cross_attention_bias,
                 past_key_value=past_kv,
                 cross_past_key_value=cross_kv,
+                query_length=query_length,
+                key_length=key_length,
+                query_offset=past_len,
+                attention_mask=attention_mask if use_attention_masks else None,
+                use_cross_attention_cache=use_cross_attention_cache,
             )
+            if fallback_position_bias is None:
+                fallback_position_bias = position_bias
             present_self_kvs.append(self_kv)
             present_cross_kvs.append(cross_kv_out)
 
@@ -471,7 +540,7 @@ class T5ForConditionalGeneration(nn.Module):
     ) -> dict[str, torch.Tensor]:
         new_state_dict = {}
         for name, tensor in state_dict.items():
-            new_name = _rename_t5_weight(name)
+            new_name = _rename_t5_weight(name, is_gated_act=self.config.is_gated_act)
             if new_name is not None:
                 new_state_dict[new_name] = tensor
         # Shared embeddings: encoder and decoder use the same embedding
@@ -485,7 +554,13 @@ class T5ForConditionalGeneration(nn.Module):
             embed = new_state_dict.get("encoder.embed_tokens.weight")
             if embed is not None:
                 new_state_dict["decoder.lm_head.weight"] = embed
-        return new_state_dict
+        return preprocess_quantized_weights(
+            new_state_dict,
+            self.config.quantization,
+            tie_embeddings=self.config.tie_word_embeddings,
+            embed_key="encoder.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
 
 
 class T5EncoderModel(nn.Module):
@@ -512,7 +587,7 @@ class T5EncoderModel(nn.Module):
     ) -> dict[str, torch.Tensor]:
         new_state_dict = {}
         for name, tensor in state_dict.items():
-            new_name = _rename_t5_weight(name)
+            new_name = _rename_t5_weight(name, is_gated_act=self.config.is_gated_act)
             if new_name is not None and new_name.startswith("encoder."):
                 new_state_dict[new_name] = tensor
         if "encoder.embed_tokens.weight" not in new_state_dict:
@@ -561,7 +636,7 @@ _T5_DECODER_RENAMES = {
 }
 
 
-def _rename_t5_weight(name: str) -> str | None:
+def _rename_t5_weight(name: str, *, is_gated_act: bool = False) -> str | None:
     """Rename a HF T5 weight to our naming convention.
 
     Encoder sublayers: layer.0=self-attn, layer.1=FFN.
@@ -591,13 +666,25 @@ def _rename_t5_weight(name: str) -> str | None:
                 return None
             block_idx = parts[1]
             remainder = parts[2]
+            if remainder.startswith(
+                (
+                    "relative_attention_bias.",
+                    "self_attn.",
+                    "self_attn_norm.",
+                    "cross_attn.",
+                    "cross_attn_norm.",
+                    "ffn.",
+                    "ffn_norm.",
+                )
+            ):
+                return name
 
-            # Relative position bias is lifted from block.0 to the
-            # encoder/decoder level (only block 0 has it in HF).
+            # Keep relative bias on its source layer. llama.cpp permits later
+            # layers to override layer 0, which is otherwise the stack fallback.
             rel_bias_key = "layer.0.SelfAttention.relative_attention_bias."
             if remainder.startswith(rel_bias_key):
                 suffix = remainder[len(rel_bias_key) :]
-                return f"{prefix}relative_attention_bias.{suffix}"
+                return f"{prefix}block.{block_idx}.relative_attention_bias.{suffix}"
 
             # Pick context-specific rename table
             extra = _T5_ENCODER_RENAMES if prefix == "encoder." else _T5_DECODER_RENAMES
@@ -607,6 +694,40 @@ def _rename_t5_weight(name: str) -> str | None:
                 for old, new in table.items():
                     if remainder.startswith(old):
                         suffix = remainder[len(old) :]
+                        if not is_gated_act and new == "ffn.wi_1.":
+                            new = "ffn.wi."
                         return f"{prefix}block.{block_idx}.{new}{suffix}"
 
     return None
+
+
+def _padding_bias(
+    op: OpBuilder,
+    like: ir.Value,
+    attention_mask: ir.Value,
+    *,
+    query_length: ir.Value | None = None,
+) -> ir.Value:
+    """Convert a 1/0 key mask to a broadcastable additive attention bias."""
+    valid = op.CastLike(attention_mask, like)
+    padding = op.Mul(
+        op.Sub(op.CastLike(op.Constant(value_float=1.0), like), valid),
+        op.CastLike(op.Constant(value_float=-10000.0), like),
+    )
+    padding = op.Unsqueeze(padding, op.Constant(value_ints=[1, 2]))
+    if query_length is not None:
+        target_shape = op.Concat(
+            op.Shape(attention_mask, start=0, end=1),
+            op.Constant(value_ints=[1]),
+            query_length,
+            op.Shape(attention_mask, start=1, end=2),
+            axis=0,
+        )
+        padding = op.Expand(padding, target_shape)
+    return padding
+
+
+def _add_padding_bias(
+    op: OpBuilder, position_bias: ir.Value, attention_mask: ir.Value
+) -> ir.Value:
+    return op.Add(position_bias, _padding_bias(op, position_bias, attention_mask))

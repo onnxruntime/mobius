@@ -11,13 +11,34 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import onnx
 import pytest
 
 from mobius.__main__ import _save_package, main
+
+
+def _write_gated_gguf(path: Path, *, architecture: str, quantized: bool) -> None:
+    """Write just enough of a GGUF to exercise the header architecture gate."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    writer = GGUFWriter(str(path), architecture)
+    if quantized:
+        writer.add_tensor(
+            "token_embd.weight",
+            np.zeros((1, 18), dtype=np.uint8),
+            raw_dtype=GGMLQuantizationType.Q4_0,
+        )
+    else:
+        writer.add_tensor("token_embd.weight", np.ones((1, 1), dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
+    writer.close()
 
 
 class TestCLIList:
@@ -590,6 +611,74 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_features_paged_attention_passed_through(self):
+        """--features paged-attention threads the flag + paged task into build."""
+        from mobius.tasks import CausalLMTask
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "paged-attention",
+                ]
+            )
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs.get("export_paged_attention") is True
+        task = kwargs.get("task")
+        assert isinstance(task, CausalLMTask)
+        assert task._paged_cache is True
+
+    def test_paged_attention_with_task_errors(self):
+        """--features paged-attention owns the task; it cannot combine with --task."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"paged-attention.*--task"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "paged-attention",
+                    "--task",
+                    "text-generation",
+                ]
+            )
+
+    def test_paged_attention_with_static_cache_errors(self):
+        """PagedAttention and static cache are distinct, exclusive cache modes."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"paged-attention.*static-cache"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "paged-attention,static-cache",
+                ]
+            )
+
     def test_non_positive_max_seq_len_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(
@@ -946,3 +1035,116 @@ class TestCLIBuildRuntime:
                     "tensorrt",  # not a supported value
                 ]
             )
+
+
+class TestCLIBuildGGUF:
+    """The CLI must preserve the public GGUF architecture gate for every mode."""
+
+    def test_runtime_requires_explicit_pinned_tokenizer_before_output_creation(
+        self, tmp_path: Path
+    ) -> None:
+        gguf_path = tmp_path / "llama.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="llama", quantized=False)
+
+        with pytest.raises(SystemExit, match="requires --tokenizer-repository"):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
+                    "--runtime",
+                    "onnx-genai",
+                    "--dequantize",
+                ]
+            )
+
+        assert not output_dir.exists()
+
+    def test_runtime_rejects_mutable_tokenizer_revision_before_build(
+        self, tmp_path: Path
+    ) -> None:
+        gguf_path = tmp_path / "llama.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="llama", quantized=False)
+
+        with pytest.raises(SystemExit, match="immutable 40-hex"):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
+                    "--runtime",
+                    "onnx-genai",
+                    "--runtime-version",
+                    "1.29.0",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "main",
+                    "--dequantize",
+                ]
+            )
+
+        assert not output_dir.exists()
+
+    @pytest.mark.parametrize(
+        ("quantized", "options"),
+        [
+            pytest.param(False, ["--dequantize"], id="float"),
+            pytest.param(True, [], id="quantized"),
+            pytest.param(True, ["--dtype", "f16"], id="dtype"),
+            pytest.param(True, ["--static-cache"], id="static-cache"),
+            pytest.param(True, ["--runtime", "onnx-genai"], id="onnx-genai-runtime"),
+            pytest.param(True, ["--runtime", "ort-genai"], id="ort-genai-runtime"),
+            pytest.param(True, ["--release"], id="release"),
+        ],
+    )
+    def test_deferred_architecture_fails_before_output_creation(
+        self, quantized: bool, options: list[str], tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
+
+        gguf_path = tmp_path / "talkie.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="talkie", quantized=quantized)
+
+        with pytest.raises(
+            UnsupportedGGUFArchitectureError,
+            match=r"talkie.*before config extraction",
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
+                    *options,
+                ]
+            )
+
+        assert not output_dir.exists()
+
+    def test_standalone_clip_rejects_before_output_creation(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf._errors import DisabledGGUFArchitectureError
+
+        gguf_path = tmp_path / "mmproj.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="clip", quantized=True)
+
+        with pytest.raises(
+            DisabledGGUFArchitectureError,
+            match=r"clip.*intentionally disabled",
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
+                ]
+            )
+
+        assert not output_dir.exists()

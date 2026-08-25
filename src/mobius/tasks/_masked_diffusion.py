@@ -52,6 +52,12 @@ class MaskedDiffusionTask(ModelTask):
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
 
         logits = module(op, input_ids=input_ids)
+        if config.diffusion_shift_logits:
+            # llama.cpp's diffusion ABI aligns token p with raw logits p-1,
+            # retaining raw position zero for p=0.
+            first = op.Slice(logits, starts=[0], ends=[1], axes=[1])
+            previous = op.Slice(logits, starts=[0], ends=[-1], axes=[1])
+            logits = op.Concat(first, previous, axis=1)
         proposed_tokens = op.ArgMax(logits, axis=-1, keepdims=0)
 
         builder.add_output(logits, "logits")

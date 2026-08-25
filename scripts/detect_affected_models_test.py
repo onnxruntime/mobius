@@ -25,6 +25,7 @@ from detect_affected_models import (  # noqa: E402
     _build_reexport_map,
     _build_registry_class_to_types,
     _build_source_module_to_types,
+    _detect_changed_golden_cases,
     _find_reverse_dependents,
     _parse_imports,
     classify_file,
@@ -48,7 +49,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/components/_attention.py") == "traceable"
 
     def test_task_file(self):
-        assert classify_file("src/mobius/tasks/_causal_lm.py") == "traceable"
+        assert classify_file("src/mobius/tasks/_causal_lm.py") == "shared_infra"
 
     def test_configs_file(self):
         assert classify_file("src/mobius/_configs.py") == "other"
@@ -57,7 +58,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/_registry.py") == "other"
 
     def test_builder_file(self):
-        assert classify_file("src/mobius/_builder.py") == "other"
+        assert classify_file("src/mobius/_builder.py") == "shared_infra"
 
     def test_exporter_file(self):
         assert classify_file("src/mobius/_exporter.py") == "other"
@@ -74,11 +75,25 @@ class TestClassifyFile:
     def test_test_infra_configs(self):
         assert classify_file("tests/_test_configs.py") == "test_config"
 
+    def test_golden_case(self):
+        assert classify_file("testdata/cases/causal-lm/gpt2.yaml") == "golden_case"
+
+    def test_golden_data(self):
+        assert classify_file("testdata/golden/causal-lm/gpt2_generation.json") == "golden_data"
+
     def test_readme(self):
         assert classify_file("README.md") == "other"
 
     def test_pyproject(self):
-        assert classify_file("pyproject.toml") == "other"
+        assert classify_file("pyproject.toml") == "shared_infra"
+
+    def test_ort_genai_integration_file(self):
+        assert (
+            classify_file("src/mobius/integrations/ort_genai/ep_config.py") == "shared_infra"
+        )
+
+    def test_ort_genai_workflow(self):
+        assert classify_file(".github/workflows/ort_genai_e2e.yml") == "shared_infra"
 
     def test_windows_paths(self):
         assert classify_file("src\\mobius\\models\\falcon.py") == "model"
@@ -119,11 +134,11 @@ class TestRegistryParsing:
         assert "FalconCausalLMModel" in mapping
         types = mapping["FalconCausalLMModel"]
         assert "falcon" in types
-        assert "falcon_h1" in types
+        assert "falcon_h1" not in types
 
     def test_source_module_to_types(self):
         mapping = _build_source_module_to_types()
-        # falcon.py should map to falcon, bloom, mpt, falcon_h1
+        # Falcon-H1 is a parallel attention+Mamba2 architecture, not a Falcon alias.
         falcon_key = "mobius.models.falcon"
         assert falcon_key in mapping
         types = mapping[falcon_key]
@@ -176,6 +191,40 @@ class TestImportGraph:
 
 
 class TestDetectAffectedModels:
+    def test_golden_case_does_not_expand_model_scope(self):
+        changed = ["testdata/cases/causal-lm/smollm-135m-gguf-f16.yaml"]
+        assert detect_affected_models(changed) == {"affected": [], "run_all": False}
+        assert _detect_changed_golden_cases(changed) == (
+            ["smollm-135m-gguf-f16"],
+            ["smollm-135m-gguf-f16"],
+            False,
+        )
+
+    def test_golden_cases_are_split_by_level(self):
+        assert _detect_changed_golden_cases(
+            ["testdata/cases/encoder/camembert-base.yaml"]
+        ) == (["camembert-base"], [], False)
+        assert _detect_changed_golden_cases(
+            ["testdata/cases/causal-lm/muse-glimmer-30b-text.yaml"]
+        ) == ([], ["muse-glimmer-30b-text"], False)
+
+    def test_golden_json_selects_every_workflow_that_consumes_it(self):
+        assert _detect_changed_golden_cases(
+            ["testdata/golden/causal-lm/smollm-135m-gguf-f16.json"]
+        ) == (
+            ["smollm-135m-gguf-f16"],
+            ["smollm-135m-gguf-f16"],
+            False,
+        )
+        assert _detect_changed_golden_cases(
+            ["testdata/golden/causal-lm/smollm-135m-gguf-f16_generation.json"]
+        ) == ([], ["smollm-135m-gguf-f16"], False)
+
+    def test_deleted_golden_data_fails_closed(self):
+        changed = ["testdata/golden/causal-lm/deleted_generation.json"]
+        assert _detect_changed_golden_cases(changed) == ([], [], True)
+        assert detect_affected_models(changed) == {"affected": [], "run_all": True}
+
     def test_component_change_traces_affected_models(self):
         """A component change traces through the import graph to find affected models."""
         result = detect_affected_models(["src/mobius/components/_attention.py"])
@@ -183,16 +232,19 @@ class TestDetectAffectedModels:
         # _attention.py is imported by many models — should find affected types
         assert len(result["affected"]) > 0
 
-    def test_task_change_does_not_trigger_run_all(self):
-        """Task files are traceable but produce an empty affected set.
-
-        No model imports ``mobius.tasks`` directly (tasks are looked up at
-        runtime by string keys), so tracing through the import graph finds
-        no dependents. Documented limitation — see PR description.
-        """
+    def test_task_change_triggers_runtime_matrix(self):
         result = detect_affected_models(["src/mobius/tasks/_causal_lm.py"])
-        assert result["run_all"] is False
-        assert result["affected"] == []
+        assert result == {"affected": [], "run_all": True}
+
+    def test_ort_genai_change_triggers_runtime_matrix(self):
+        result = detect_affected_models(
+            ["src/mobius/integrations/ort_genai/_execution_providers.py"]
+        )
+        assert result == {"affected": [], "run_all": True}
+
+    def test_dependency_change_triggers_runtime_matrix(self):
+        result = detect_affected_models(["pyproject.toml"])
+        assert result == {"affected": [], "run_all": True}
 
     def test_configs_change_no_run_all(self):
         """_configs.py no longer triggers run_all (shared_infra disabled)."""
@@ -212,7 +264,7 @@ class TestDetectAffectedModels:
             ]
         )
         assert result["run_all"] is False
-        assert result["affected"] == ["lfm2"]
+        assert result["affected"] == ["lfm2", "lfm2_moe", "lfm2_vl"]
 
     def test_test_configs_with_unmapped_task_still_runs_all(self):
         result = detect_affected_models(
@@ -307,18 +359,23 @@ class TestDetectAffectedModels:
         # _common.py defines Linear, Embedding, LayerNorm — used everywhere
         assert len(result["affected"]) > 10
 
-    def test_former_shared_infra_no_run_all(self):
-        """Former shared_infra files no longer trigger run_all."""
+    def test_runtime_shared_infra_runs_all(self):
         for path in [
-            "src/mobius/_configs.py",
-            "src/mobius/_registry.py",
-            "src/mobius/_builder.py",
-            "src/mobius/_weight_loading.py",
             "src/mobius/_model_package.py",
-            "src/mobius/models/__init__.py",
+            "src/mobius/integrations/ort_genai/auto_export.py",
+            "src/mobius/integrations/ort_genai/genai_config.py",
+            "src/mobius/integrations/gguf/_runtime_package.py",
+            "src/mobius/integrations/gguf/_tokenizer.py",
+            "src/mobius/integrations/gguf/_builder.py",
+            "src/mobius/integrations/gguf/_quant_registry.py",
+            "src/mobius/integrations/gguf/_repacker.py",
+            "src/mobius/_builder.py",
+            "src/mobius/_optimizations.py",
+            "src/mobius/_weight_loading.py",
+            "testdata/cases/schema.json",
         ]:
             result = detect_affected_models([path])
-            assert result["run_all"] is False, f"{path} should NOT trigger run_all"
+            assert result["run_all"] is True, f"{path} should trigger run_all"
 
     def test_traceable_and_model_combined(self):
         """A component + model file change returns union of affected types."""
@@ -576,8 +633,37 @@ class TestCLI:
         assert result.returncode == 0
         lines = result.stdout.strip().split("\n")
         assert any(line.startswith("affected=") for line in lines)
+        assert any(line.startswith("golden_l4_cases=") for line in lines)
+        assert any(line.startswith("golden_l5_cases=") for line in lines)
         assert any(line.startswith("run_all=") for line in lines)
         assert any(line.startswith("has_affected=") for line in lines)
+        assert any(line.startswith("has_l4_affected=") for line in lines)
+        assert any(line.startswith("has_l5_affected=") for line in lines)
+
+    def test_github_output_activates_only_the_changed_level(self):
+        def outputs(path: str) -> dict[str, str]:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(_SCRIPTS_DIR / "detect_affected_models.py"),
+                    "--changed-files",
+                    path,
+                    "--output-format",
+                    "github",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0
+            return dict(line.split("=", 1) for line in result.stdout.strip().splitlines())
+
+        l4 = outputs("testdata/cases/encoder/camembert-base.yaml")
+        assert l4["has_l4_affected"] == "true"
+        assert l4["has_l5_affected"] == "false"
+
+        l5 = outputs("testdata/cases/causal-lm/muse-glimmer-30b-text.yaml")
+        assert l5["has_l4_affected"] == "false"
+        assert l5["has_l5_affected"] == "true"
 
     def test_stdin_mode(self):
         result = subprocess.run(

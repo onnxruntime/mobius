@@ -26,12 +26,18 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components._activations import ACT2FN
-from mobius.components._common import Embedding, LayerNorm, Linear
+from mobius.components._common import (
+    Embedding,
+    LayerNorm,
+    LayerNormNoBias,
+    Linear,
+    create_padding_mask,
+)
 from mobius.components._rotary_embedding import (
     apply_rotary_pos_emb,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, linear_class_for_config
 from mobius.models.base import TextModel as _TextModel
 
 if TYPE_CHECKING:
@@ -50,13 +56,20 @@ class _ModernBertAttention(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        linear_class = linear_class_for_config(config) or Linear
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
 
-        self.q_proj = Linear(config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias)
-        self.k_proj = Linear(config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias)
-        self.v_proj = Linear(config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias)
-        self.Wo = Linear(config.hidden_size, config.hidden_size, bias=config.attn_o_bias)
+        self.q_proj = linear_class(
+            config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.k_proj = linear_class(
+            config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.v_proj = linear_class(
+            config.hidden_size, config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.Wo = linear_class(config.hidden_size, config.hidden_size, bias=config.attn_o_bias)
 
     def forward(
         self,
@@ -107,13 +120,16 @@ class _ModernBertMLP(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.gate_proj = Linear(
+        linear_class = linear_class_for_config(config) or Linear
+        self.gate_proj = linear_class(
             config.hidden_size, config.intermediate_size, bias=config.mlp_bias
         )
-        self.up_proj = Linear(
+        self.up_proj = linear_class(
             config.hidden_size, config.intermediate_size, bias=config.mlp_bias
         )
-        self.Wo = Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.Wo = linear_class(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
         self._act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -133,10 +149,10 @@ class _ModernBertLayer(nn.Module):
         # Layer 0 has no attn_norm (Identity in HF)
         self._skip_attn_norm = layer_id == 0
         if not self._skip_attn_norm:
-            self.attn_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.attn_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
 
         self.attn = _ModernBertAttention(config)
-        self.mlp_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = _ModernBertMLP(config)
 
     def forward(
@@ -184,11 +200,11 @@ class ModernBertModel(nn.Module):
             config.hidden_size,
             config.pad_token_id,
         )
-        self.embeddings_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embeddings_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = nn.ModuleList(
             [_ModernBertLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.final_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_norm = LayerNormNoBias(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
 
     def forward(
@@ -212,8 +228,9 @@ class ModernBertModel(nn.Module):
         position_ids = op.Unsqueeze(position_ids, [0])
         position_embeddings = self.rotary_emb(op, position_ids)
 
+        padding_mask = create_padding_mask(op, input_ids, attention_mask)
         for layer in self.layers:
-            hidden_states = layer(op, hidden_states, attention_mask, position_embeddings)
+            hidden_states = layer(op, hidden_states, padding_mask, position_embeddings)
 
         hidden_states = self.final_norm(op, hidden_states)
         return hidden_states
@@ -279,6 +296,11 @@ def _rename_modernbert_weight(
             out[f"{prefix}.v_proj.{param_type}"] = v
             return None  # Already added to out
 
+        # Quantized GGUF loading splits fused projections before this model-level
+        # rename so each MatMulNBits module receives its packed companions.
+        if remainder.startswith(("attn.q_proj.", "attn.k_proj.", "attn.v_proj.")):
+            return name
+
         # Output proj: attn.Wo now matches directly
         if remainder.startswith("attn.Wo."):
             return name
@@ -292,6 +314,9 @@ def _rename_modernbert_weight(
             out[f"{prefix}.gate_proj.{param_type}"] = gate
             out[f"{prefix}.up_proj.{param_type}"] = up
             return None
+
+        if remainder.startswith(("mlp.gate_proj.", "mlp.up_proj.")):
+            return name
 
         # MLP output: mlp.Wo now matches directly
         if remainder.startswith("mlp.Wo."):

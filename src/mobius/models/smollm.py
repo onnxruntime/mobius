@@ -10,12 +10,11 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
     DecoderLayer,
-    Embedding,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, embedding_for_config, linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -33,11 +32,13 @@ class SmolLM3TextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        linear_class = linear_class_for_config(config)
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
-            [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                DecoderLayer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
@@ -107,4 +108,4 @@ class SmolLM3CausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = SmolLM3TextModel(config)
+        self._replace_text_model(SmolLM3TextModel(config))
