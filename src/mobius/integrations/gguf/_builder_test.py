@@ -341,6 +341,9 @@ def _write_quantized_gguf(
             add_float(f"blk.{i}.attn_k_norm.weight", (num_kv_heads * head_dim,))
         elif architecture == "cohere2":
             add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
+        elif architecture == "seed_oss":
+            add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
+            add_float(f"blk.{i}.post_attention_norm.weight", (hidden_size,))
         elif architecture != "olmo":
             add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
             add_float(f"blk.{i}.ffn_norm.weight", (hidden_size,))

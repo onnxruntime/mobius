@@ -946,6 +946,102 @@ def _gemma2_postprocess(
     )
 
 
+def _baichuan_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    del metadata, model
+    if config.num_hidden_layers != 32:
+        raise ValueError(
+            "Baichuan GGUF import supports only the pinned 32-layer/7B RoPE profile; "
+            f"got block_count={config.num_hidden_layers}. The 40-layer/13B loader uses "
+            "a hardcoded ALiBi path that the Mobius graph does not represent."
+        )
+    return dataclasses.replace(
+        config,
+        num_key_value_heads=config.num_attention_heads,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        tie_word_embeddings=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        hidden_act="silu",
+    )
+
+
+def _chatglm_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    names = set(model.tensor_names)
+    head_dim = int(
+        metadata.get(
+            "chatglm.attention.key_length",
+            config.hidden_size // config.num_attention_heads,
+        )
+    )
+    rope_dim = int(metadata.get("chatglm.rope.dimension_count", head_dim))
+    qkv_biases = [
+        f"blk.{layer}.attn_qkv.bias" in names
+        or all(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        for layer in range(config.num_hidden_layers)
+    ]
+    return dataclasses.replace(
+        config,
+        head_dim=head_dim,
+        partial_rotary_factor=rope_dim / head_dim,
+        rope_type="default",
+        hidden_act="silu",
+        tie_word_embeddings="output.weight" not in names,
+        attn_qkv_bias=all(qkv_biases),
+        attn_o_bias=False,
+        mlp_bias=False,
+    )
+
+
+def _phi2_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    del model
+    head_dim = int(
+        metadata.get(
+            "phi2.attention.key_length",
+            config.hidden_size // config.num_attention_heads,
+        )
+    )
+    rope_dim = int(metadata.get("phi2.rope.dimension_count", head_dim))
+    return dataclasses.replace(
+        config,
+        head_dim=head_dim,
+        partial_rotary_factor=rope_dim / head_dim,
+        intermediate_size=4 * config.hidden_size,
+        num_key_value_heads=config.num_attention_heads,
+        rope_type="default",
+        hidden_act="gelu_new",
+        tie_word_embeddings=False,
+        attn_qkv_bias=True,
+        attn_o_bias=True,
+        mlp_bias=True,
+    )
+
+
+def _seed_oss_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    del metadata
+    return dataclasses.replace(
+        config,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        tie_word_embeddings="output.weight" not in set(model.tensor_names),
+        attn_qkv_bias=_infer_attn_qkv_bias(model),
+        attn_o_bias=False,
+        mlp_bias=False,
+        hidden_act="silu",
+    )
+
+
 def _moe_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2124,6 +2220,10 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "phimoe": _phimoe_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
     "gemma2": _gemma2_postprocess,
+    "baichuan": _baichuan_postprocess,
+    "chatglm": _chatglm_postprocess,
+    "phi2": _phi2_postprocess,
+    "seed_oss": _seed_oss_postprocess,
     "gemma3": _gemma3_postprocess,
     "gemma4": _gemma4_postprocess,
     "muse_glimmer": _muse_glimmer_postprocess,

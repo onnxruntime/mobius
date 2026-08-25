@@ -152,11 +152,14 @@ reason.
 
 | GGUF architecture | Accepted aliases | mobius `model_type` | Float import | Quantized import |
 |---|---|---|---|---|
+| `apertus` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `arcee` | — | `arcee` | runtime deferred | supported |
 | `arwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `baichuan` | — | `baichuan` | runtime deferred | supported |
 | `bailingmoe3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `bert` | — | `bert` | runtime deferred | supported |
 | `bloom` | — | `bloom` | tensor_map deferred | unreachable |
+| `chatglm` | — | `chatglm` | runtime deferred | rejected |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
 | `deci` | — | `llama` | supported | supported |
@@ -190,8 +193,10 @@ reason.
 | `llama` | `mistral` | `llama` | supported | supported |
 | `mamba` | — | `mamba` | runtime deferred | rejected |
 | `mamba2` | — | `mamba2` | runtime deferred | rejected |
+| `minicpm3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `minimax-01` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `modern-bert` | — | `modernbert` | runtime deferred | supported |
+| `mpt` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
 | `nemotron` | — | `nemotron` | supported | supported |
 | `nemotron_h` | — | `nemotron_h` | runtime deferred | rejected |
@@ -202,6 +207,8 @@ reason.
 | `olmo` | — | `olmo` | supported | supported |
 | `olmo2` | — | `olmo2` | supported | supported |
 | `olmoe` | — | `olmoe` | runtime deferred | supported |
+| `openelm` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `phi2` | — | `phi` | runtime deferred | rejected |
 | `phi3` | — | `phi3` | supported | supported |
 | `phimoe` | — | `phimoe` | runtime deferred | supported |
 | `plamo2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -218,6 +225,7 @@ reason.
 | `rwkv6` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rwkv6qwen2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `seed_oss` | — | `seed_oss` | runtime deferred | supported |
 | `smollm3` | — | `smollm3` | supported | supported |
 | `stablelm` | — | `stablelm` | supported | supported |
 | `starcoder2` | — | `starcoder2` | supported | supported |
@@ -225,12 +233,35 @@ reason.
 | `t5encoder` | — | `t5encoder` | runtime deferred | supported |
 | `talkie` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `wavtokenizer-dec` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+
 <!-- END GGUF SUPPORT MATRIX -->
 
 Canonical names are the strings llama.cpp writes into `general.architecture`,
 validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
+
+### Dense C01 cohort
+
+The pinned llama.cpp `8d9af256337d1a501250f9bbf4c0859a654bddd6` dense cohort
+adds bounded graph import for 32-layer `baichuan`, modern `chatglm`, `phi2`, and
+64-layer `seed_oss`. Runtime remains deferred until a pinned real GGUF has
+independent full-logit and generation parity.
+
+- Baichuan accepts only the 7B RoPE graph, reverses the converter Q/K permutation,
+  and rejects the 40-layer hardcoded-ALiBi path. Phi-2 requires its complete bias
+  closure, 4H tanh-approximated GELU MLP, full MHA, and an untied output.
+- ChatGLM accepts only contiguous fused QKV and fused gate/up tensors. Quantized
+  fused forms are rejected because splitting their packed values and sidecars is
+  not yet losslessly covered. Seed-OSS maps `post_attention_norm` exactly and permits
+  either an explicit output or effective ownership by the token embedding, and
+  accepts Q/K/V biases only as a complete all-layer family.
+- `apertus`, `minicpm3`, `openelm`, and `mpt` are explicit pre-config deferrals.
+  Apertus's serialized Llama-3 `rope_freqs` tensor supplies per-dimension factors
+  that the current scalar-config Mobius RoPE graph cannot consume. The others'
+  MLA/scaling topology, per-layer fused/tied topology, and optional learned
+  positions/QK norms/clipping/AWQ/bias closure are likewise not represented by
+  current Mobius graphs.
 
 ### Second hybrid cohort
 

@@ -225,6 +225,40 @@ _PHI3_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+_CHATGLM_MAPPING: dict[str, str] = {
+    "token_embd": "transformer.embedding.word_embeddings",
+    "output": "transformer.output_layer",
+    "output_norm": "transformer.encoder.final_layernorm",
+    "blk.{bid}.attn_norm": "transformer.encoder.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_qkv": "transformer.encoder.layers.{bid}.self_attention.query_key_value",
+    "blk.{bid}.attn_q": "transformer.encoder.layers.{bid}.self_attention.q_proj",
+    "blk.{bid}.attn_k": "transformer.encoder.layers.{bid}.self_attention.k_proj",
+    "blk.{bid}.attn_v": "transformer.encoder.layers.{bid}.self_attention.v_proj",
+    "blk.{bid}.attn_output": "transformer.encoder.layers.{bid}.self_attention.dense",
+    "blk.{bid}.ffn_norm": "transformer.encoder.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_up": "transformer.encoder.layers.{bid}.mlp.dense_h_to_4h",
+    "blk.{bid}.ffn_down": "transformer.encoder.layers.{bid}.mlp.dense_4h_to_h",
+}
+
+_PHI2_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.final_layernorm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
+_SEED_OSS_EXTRAS: dict[str, str] = {
+    "blk.{bid}.post_attention_norm": "model.layers.{bid}.post_attention_layernorm",
+}
+
 # Falcon uses transformer.h.* naming.
 _FALCON_MAPPING: dict[str, str] = {
     "token_embd": "transformer.word_embeddings",
@@ -646,6 +680,9 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "arcee": _ARCEE_MAPPING,
         "olmo2_extras": _OLMO2_EXTRAS,
         "phi3": _PHI3_MAPPING,
+        "chatglm": _CHATGLM_MAPPING,
+        "phi2": _PHI2_MAPPING,
+        "seed_oss_extras": _SEED_OSS_EXTRAS,
         "falcon": _FALCON_MAPPING,
         "gpt2": _GPT2_MAPPING,
         "mamba": _MAMBA_MAPPING,

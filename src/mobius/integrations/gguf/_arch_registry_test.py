@@ -64,6 +64,7 @@ _EXPECTED_SUPPORTED_COUNT = 41
 _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
     {
         "arcee",
+        "baichuan",
         "bert",
         "cohere2",
         "deci",
@@ -99,6 +100,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "qwen3moe",
         "qwen3next",
         "rnd1",
+        "seed_oss",
         "smollm3",
         "stablelm",
         "starcoder2",
@@ -153,7 +155,7 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 6
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 10
 
     def test_falcon_h1_is_not_a_generic_falcon_alias(self) -> None:
         """Falcon-H1 must fail before constructing the incompatible Falcon graph."""
@@ -181,12 +183,14 @@ class TestCapabilityClosure:
         }
         assert set(actual) == set(supported_architectures())
         rejected = {
+            "chatglm",
             "granitehybrid",
             "internlm2",
             "jamba",
             "mamba",
             "mamba2",
             "nemotron_h",
+            "phi2",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
@@ -318,6 +322,10 @@ class TestPinnedTensorClosure:
         "llada",
         "llada-moe",
         "rnd1",
+        "baichuan",
+        "chatglm",
+        "phi2",
+        "seed_oss",
     )
 
     @staticmethod
