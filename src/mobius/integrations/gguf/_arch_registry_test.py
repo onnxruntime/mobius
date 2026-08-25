@@ -268,6 +268,7 @@ class TestCapabilityClosure:
             "granitehybrid",
             "internlm2",
             "jamba",
+            "lfm2moe",
             "mamba",
             "mamba2",
             "nemotron_h",
@@ -970,8 +971,10 @@ class TestPinnedRemainingHybridCohort:
         assert spec.tensor_map is Support.SUPPORTED
         assert spec.graph is Support.SUPPORTED
         assert spec.runtime is Support.DEFERRED
+        assert spec.quantized_import is Support.REJECTED
         assert spec.reason is not None
         assert "representative real-weight GGUF" in spec.reason
+        assert "keep_quantized=False" in spec.reason
 
     def test_hugging_face_deepseek_v4_registration_remains_valid(self) -> None:
         assert "deepseek_v4" in _REGISTRATIONS

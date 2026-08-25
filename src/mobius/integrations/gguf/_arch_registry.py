@@ -1144,7 +1144,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "expert_gating_func",
         ),
         runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="minimax-01",

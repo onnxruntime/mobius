@@ -216,6 +216,8 @@ class Lfm2MoEFeedForward(MoELayer):
             if config.use_expert_bias
             else None
         )
+        if self.expert_bias is not None:
+            self.expert_bias._keep_float32 = True
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         return super().forward(op, hidden_states, self.expert_bias)
