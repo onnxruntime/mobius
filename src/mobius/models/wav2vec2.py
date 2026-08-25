@@ -397,19 +397,6 @@ class Wav2Vec2Model(nn.Module):
         )
         self.encoder = encoder_class(config, eps=eps)
 
-    @property
-    def batch_padding_sensitive(self) -> bool:
-        """Whether a row's outputs depend on the padded width of its batch.
-
-        ``feat_extract_norm="group"`` puts a ``GroupNorm`` with one group per
-        channel on the first convolution, which reduces over the *time* axis.
-        Its statistics therefore include whatever padding was appended to reach
-        the batch width, so co-batching rows of unequal length perturbs every
-        frame of the shorter rows.  ``"layer"`` reduces over channels instead
-        and leaves rows independent.
-        """
-        return getattr(self.config, "feat_extract_norm", None) == "group"
-
     def frame_lengths(self, op: OpBuilder, attention_mask: ir.Value) -> ir.Value:
         """Return the per-row valid frame count for a sample-level mask.
 
