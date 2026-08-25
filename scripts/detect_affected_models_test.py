@@ -25,6 +25,7 @@ from detect_affected_models import (  # noqa: E402
     _build_reexport_map,
     _build_registry_class_to_types,
     _build_source_module_to_types,
+    _detect_changed_golden_cases,
     _find_reverse_dependents,
     _parse_imports,
     classify_file,
@@ -73,6 +74,12 @@ class TestClassifyFile:
 
     def test_test_infra_configs(self):
         assert classify_file("tests/_test_configs.py") == "test_config"
+
+    def test_golden_case(self):
+        assert classify_file("testdata/cases/causal-lm/gpt2.yaml") == "golden_case"
+
+    def test_golden_data(self):
+        assert classify_file("testdata/golden/causal-lm/gpt2_generation.json") == "golden_data"
 
     def test_readme(self):
         assert classify_file("README.md") == "other"
@@ -176,6 +183,40 @@ class TestImportGraph:
 
 
 class TestDetectAffectedModels:
+    def test_golden_case_does_not_expand_model_scope(self):
+        changed = ["testdata/cases/causal-lm/smollm-135m-gguf-f16.yaml"]
+        assert detect_affected_models(changed) == {"affected": [], "run_all": False}
+        assert _detect_changed_golden_cases(changed) == (
+            ["smollm-135m-gguf-f16"],
+            ["smollm-135m-gguf-f16"],
+            False,
+        )
+
+    def test_golden_cases_are_split_by_level(self):
+        assert _detect_changed_golden_cases(
+            ["testdata/cases/encoder/camembert-base.yaml"]
+        ) == (["camembert-base"], [], False)
+        assert _detect_changed_golden_cases(
+            ["testdata/cases/causal-lm/muse-glimmer-30b-text.yaml"]
+        ) == ([], ["muse-glimmer-30b-text"], False)
+
+    def test_golden_json_selects_every_workflow_that_consumes_it(self):
+        assert _detect_changed_golden_cases(
+            ["testdata/golden/causal-lm/smollm-135m-gguf-f16.json"]
+        ) == (
+            ["smollm-135m-gguf-f16"],
+            ["smollm-135m-gguf-f16"],
+            False,
+        )
+        assert _detect_changed_golden_cases(
+            ["testdata/golden/causal-lm/smollm-135m-gguf-f16_generation.json"]
+        ) == ([], ["smollm-135m-gguf-f16"], False)
+
+    def test_deleted_golden_data_fails_closed(self):
+        changed = ["testdata/golden/causal-lm/deleted_generation.json"]
+        assert _detect_changed_golden_cases(changed) == ([], [], True)
+        assert detect_affected_models(changed) == {"affected": [], "run_all": True}
+
     def test_component_change_traces_affected_models(self):
         """A component change traces through the import graph to find affected models."""
         result = detect_affected_models(["src/mobius/components/_attention.py"])
@@ -576,8 +617,37 @@ class TestCLI:
         assert result.returncode == 0
         lines = result.stdout.strip().split("\n")
         assert any(line.startswith("affected=") for line in lines)
+        assert any(line.startswith("golden_l4_cases=") for line in lines)
+        assert any(line.startswith("golden_l5_cases=") for line in lines)
         assert any(line.startswith("run_all=") for line in lines)
         assert any(line.startswith("has_affected=") for line in lines)
+        assert any(line.startswith("has_l4_affected=") for line in lines)
+        assert any(line.startswith("has_l5_affected=") for line in lines)
+
+    def test_github_output_activates_only_the_changed_level(self):
+        def outputs(path: str) -> dict[str, str]:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(_SCRIPTS_DIR / "detect_affected_models.py"),
+                    "--changed-files",
+                    path,
+                    "--output-format",
+                    "github",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0
+            return dict(line.split("=", 1) for line in result.stdout.strip().splitlines())
+
+        l4 = outputs("testdata/cases/encoder/camembert-base.yaml")
+        assert l4["has_l4_affected"] == "true"
+        assert l4["has_l5_affected"] == "false"
+
+        l5 = outputs("testdata/cases/causal-lm/muse-glimmer-30b-text.yaml")
+        assert l5["has_l4_affected"] == "false"
+        assert l5["has_l5_affected"] == "true"
 
     def test_stdin_mode(self):
         result = subprocess.run(

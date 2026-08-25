@@ -113,7 +113,9 @@ def _install_dynamic_cache_legacy_shims() -> None:
         transformers.DynamicCache.get_usable_length = _get_usable_length  # type: ignore[method-assign]
 
 
-def _fix_nemotron_h_init_weights(model: torch.nn.Module, model_id: str) -> None:
+def _fix_nemotron_h_init_weights(
+    model: torch.nn.Module, model_id: str, revision: str | None = None
+) -> None:
     """Restore Mamba2 params from checkpoint after HF clobbers them.
 
     The NemotronH remote-code ``_init_weights`` re-initialises several
@@ -145,7 +147,7 @@ def _fix_nemotron_h_init_weights(model: torch.nn.Module, model_id: str) -> None:
     # Resolve the exact snapshot directory used by HF for this model,
     # avoiding lexicographic guessing across multiple cached revisions.
     try:
-        snapshot = snapshot_download(model_id, local_files_only=True)
+        snapshot = snapshot_download(model_id, revision=revision, local_files_only=True)
     except Exception:
         logger.warning(
             "NemotronH init_weights fix: could not resolve snapshot for %s",
@@ -198,6 +200,7 @@ def load_torch_model(
     dtype: torch.dtype = torch.float32,
     device: str = "cpu",
     trust_remote_code: bool = True,
+    revision: str | None = None,
 ):
     """Load a HuggingFace causal LM model for reference inference.
 
@@ -211,6 +214,8 @@ def load_torch_model(
             natively supported by the installed transformers, so the
             transformers-5.x-compatible implementation is used instead of an
             older bundled ``modeling_*.py`` that relies on removed cache APIs.
+        revision: Immutable HuggingFace revision used for the tokenizer,
+            config, weights, and any Nemotron-H weight repair.
 
     Returns:
         Tuple of (model, tokenizer).
@@ -220,14 +225,14 @@ def load_torch_model(
     _install_dynamic_cache_legacy_shims()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_id, trust_remote_code=trust_remote_code
+        model_id, revision=revision, trust_remote_code=trust_remote_code
     )
 
     # NemotronH: disable rescale_prenorm_residual before loading to
     # prevent _init_weights from corrupting out_proj.weight with
     # random kaiming_uniform_ initialization after checkpoint loading.
     config = transformers.AutoConfig.from_pretrained(
-        model_id, trust_remote_code=trust_remote_code
+        model_id, revision=revision, trust_remote_code=trust_remote_code
     )
     if getattr(config, "model_type", None) == "nemotron_h":
         config.rescale_prenorm_residual = False
@@ -237,9 +242,10 @@ def load_torch_model(
         config=config,
         dtype=dtype,
         device_map=device,
+        revision=revision,
         trust_remote_code=trust_remote_code,
     )
-    _fix_nemotron_h_init_weights(model, model_id)
+    _fix_nemotron_h_init_weights(model, model_id, revision)
     model.eval()
 
     if tokenizer.pad_token is None:

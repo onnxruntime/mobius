@@ -75,6 +75,88 @@
       ],
       "description": "Weight and activation dtype."
     },
+    "gguf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "revision",
+        "filename",
+        "size",
+        "lfs_sha256",
+        "tensor_count",
+        "tensor_qtypes",
+        "execution_provider",
+        "config_sha256",
+        "preserve_quantization"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "description": "HuggingFace repository containing the GGUF artifact."
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Immutable GGUF repository revision."
+        },
+        "filename": {
+          "type": "string",
+          "pattern": "\\.gguf$",
+          "description": "Exact Hub-relative GGUF filename."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Expected GGUF byte size."
+        },
+        "lfs_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Expected LFS object SHA-256."
+        },
+        "tensor_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Expected number of GGUF tensors."
+        },
+        "tensor_qtypes": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "description": "Expected GGUF tensor census keyed by qtype name."
+        },
+        "execution_provider": {
+          "type": "string",
+          "enum": [
+            "cpu",
+            "cuda",
+            "dml",
+            "default"
+          ],
+          "description": "Exact execution provider used when constructing the evidenced route."
+        },
+        "config_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Expected canonical hash of the config extracted from GGUF metadata."
+        },
+        "preserve_quantization": {
+          "type": "boolean",
+          "description": "Expected import-route result after considering the source qtypes."
+        },
+        "keep_quantized": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether to preserve supported GGUF quantization."
+        }
+      },
+      "description": "Pinned GGUF import source. The top-level model_id remains the independent HuggingFace reference."
+    },
     "level": {
       "type": "string",
       "enum": [

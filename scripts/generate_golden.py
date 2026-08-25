@@ -267,7 +267,10 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         )
     else:
         model, tokenizer = load_torch_model(
-            case.model_id, device=device, trust_remote_code=case.trust_remote_code
+            case.model_id,
+            device=device,
+            trust_remote_code=case.trust_remote_code,
+            revision=case.revision,
         )
 
     encoded = tokenizer(case.prompts[0], return_tensors="np", padding=False)
@@ -318,6 +321,14 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
                 )
         generated_ids = gen_output[0, seq_len:].cpu().numpy()
 
+    provenance = (
+        {
+            "reference": {"repository": case.model_id, "revision": case.revision},
+            "gguf": case.gguf_source,
+        }
+        if case.gguf_source is not None
+        else None
+    )
     save_golden_ref(
         json_path,
         top1_id=golden["top1_id"],
@@ -326,6 +337,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
         top10_logits=golden["top10_logits"],
         logits_summary=golden["logits_summary"],
         input_ids=input_ids,
+        provenance=provenance,
     )
 
     # Save a separate *_generation.json marker for L5 dashboard detection.
@@ -338,6 +350,7 @@ def _generate_causal_lm(case: TestCase, json_path: Path, device: str) -> None:
             prompt=case.prompts[0],
             generated_tokens=generated_ids.tolist(),
             generated_text=generated_text,
+            provenance=provenance,
         )
 
 

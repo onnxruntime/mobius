@@ -1,0 +1,63 @@
+{
+  "top1_id": 198,
+  "top2_id": 1116,
+  "top10_ids": [
+    198,
+    1116,
+    476,
+    3717,
+    11181,
+    3805,
+    39892,
+    1004,
+    216,
+    472
+  ],
+  "top10_logits": [
+    "0x1.4353c40000000p+4",
+    "0x1.1d22ce0000000p+4",
+    "0x1.02e7000000000p+4",
+    "0x1.feca880000000p+3",
+    "0x1.e76e560000000p+3",
+    "0x1.d72a2e0000000p+3",
+    "0x1.d3545e0000000p+3",
+    "0x1.d33bd40000000p+3",
+    "0x1.d0dd6c0000000p+3",
+    "0x1.c5bda00000000p+3"
+  ],
+  "logits_summary": [
+    "0x1.4353c40000000p+4",
+    "-0x1.5917ae0000000p+3",
+    "0x1.089493e7a6f7dp+0",
+    "0x1.5407af8e34ca9p+1"
+  ],
+  "input_ids": [
+    4590,
+    314,
+    957,
+    8216,
+    42
+  ],
+  "provenance": {
+    "reference": {
+      "repository": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac"
+    },
+    "gguf": {
+      "repository": "unsloth/SmolLM2-135M-Instruct-GGUF",
+      "revision": "9e6855bc4be717fca1ef21360a1db4b29d5c559a",
+      "filename": "SmolLM2-135M-Instruct-F16.gguf",
+      "size": 270885952,
+      "lfs_sha256": "5157ca60744d21631818364854ac8e4452e1b8022d2ab4c8a2f9cda2344afb30",
+      "tensor_count": 272,
+      "tensor_qtypes": {
+        "F16": 211,
+        "F32": 61
+      },
+      "execution_provider": "cpu",
+      "config_sha256": "c62123baf4e95656cdc9f5b798c14319bbaafec594526c462b10555f561969f9",
+      "preserve_quantization": false,
+      "keep_quantized": true
+    }
+  }
+}
