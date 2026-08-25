@@ -110,6 +110,9 @@ class TestResolveOrtGenaiModelType:
         # decoder-only causal LM not in its built-in registry.
         assert _resolve_ort_genai_model_type("hunyuan_v1_dense") == "decoder"
 
+    def test_plamo2_maps_to_generic_decoder(self):
+        assert _resolve_ort_genai_model_type("plamo2") == "decoder"
+
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 

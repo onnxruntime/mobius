@@ -2244,6 +2244,14 @@ def _plamo2_postprocess(
     fields.update(
         hidden_act="silu",
         head_dim=key_length,
+        # The released PLaMo2 converter wrote 1e6 here even though the pinned
+        # reference architecture uses its 1e4 local-RoPE default for every
+        # attention layer. Preserve other explicit bases for future variants.
+        rope_theta=(
+            10_000.0
+            if float(metadata[f"{arch}.rope.freq_base"]) == 1_000_000.0  # noqa: RUF069
+            else config.rope_theta
+        ),
         attention_head_counts=head_counts,
         attention_kv_head_counts=kv_head_counts,
         mamba_num_heads=ssm_heads,

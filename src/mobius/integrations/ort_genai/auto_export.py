@@ -108,6 +108,9 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
     "deepseek_v4": "decoder",
+    # PLaMo2 is a decoder-only hybrid. Released ORT GenAI does not have a
+    # model-specific registry entry, so emit its generic decoder type.
+    "plamo2": "decoder",
     # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",

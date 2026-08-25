@@ -140,8 +140,7 @@ class Plamo2Mamba(nn.Module):
         # dt participates in Softplus and remains float even for quantized GGUF imports.
         self.dt_proj = Linear(self.dt_rank, self.num_heads, bias=False)
         self.dt_bias = nn.Parameter([self.num_heads])
-        # GGUF stores the already transformed negative decay directly.
-        self.A = nn.Parameter([self.num_heads])
+        self.A_log = nn.Parameter([self.num_heads])
         self.D = nn.Parameter([self.num_heads])
         self.dt_norm_weight = nn.Parameter([self.dt_rank])
         self.B_norm_weight = nn.Parameter([self.state_size])
@@ -198,7 +197,10 @@ class Plamo2Mamba(nn.Module):
             )
         )
         dt = op.Mul(dt, op.CastLike(padding_mask, dt))
-        decay = op.Mul(dt, op.Cast(self.A, to=ir.DataType.FLOAT))
+        # Match the reference's float32 discretization at runtime rather than
+        # baking a rounded -exp(A_log) into imported weights.
+        a = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
+        decay = op.Mul(dt, a)
         x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
         x_heads = op.Reshape(x_f32, [0, 0, self.num_heads, self.head_dim])
         value = op.Reshape(
@@ -414,7 +416,7 @@ class Plamo2ForCausalLM(nn.Module):
         self,
         state_dict: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
-        """Convert the official offset norms and Mamba decay to graph values."""
+        """Convert official and GGUF offset norms and Mamba decay names."""
         result: dict[str, torch.Tensor] = {}
         norm_offsets = {
             ".pre_mixer_norm.weight": 1.0,
@@ -423,9 +425,16 @@ class Plamo2ForCausalLM(nn.Module):
             ".post_mlp_norm.weight": 1.0 / (5.0**1.5),
         }
         norms_are_folded = bool(getattr(self.config, "_plamo2_norms_are_folded", False))
+        tied_embeddings = effective_tie_word_embeddings(self.config)
         for name, value in state_dict.items():
             name = name.replace("model.layers.layers.", "model.layers.")
-            if name == "lm_head.weight" and self.config.tie_word_embeddings:
+            if name == "model.embed_tokens.weight" and tied_embeddings:
+                result[name] = value
+                # onnxscript materializes the shared Parameter under both use
+                # sites, while the official checkpoint stores only the embedding.
+                result["lm_head.weight"] = value
+                continue
+            if name == "lm_head.weight" and tied_embeddings:
                 continue
             if name == "model.norm.weight":
                 result[name] = value if norms_are_folded else value + 1.0
@@ -436,8 +445,9 @@ class Plamo2ForCausalLM(nn.Module):
             )
             if offset is not None:
                 result[name] = value if norms_are_folded else value + offset
-            elif name.endswith(".mixer.A_log"):
-                result[name.removesuffix("A_log") + "A"] = -torch.exp(value)
+            elif name.endswith(".mixer.A"):
+                # llama.cpp serializes PLaMo2's A_log as -exp(A_log).
+                result[name.removesuffix("A") + "A_log"] = torch.log(-value)
             else:
                 result[name] = value
         return result
