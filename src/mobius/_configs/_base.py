@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -21,6 +22,9 @@ from mobius._configs._sub_configs import (
     TTSConfig,
     VisionConfig,
 )
+
+if TYPE_CHECKING:
+    from mobius.integrations._block_quant import BlockQuantScheme
 
 DEFAULT_INT = -42
 
@@ -494,6 +498,17 @@ class ArchitectureConfig(BaseModelConfig):
     num_hash_layers: int = 0
     swiglu_limit: float = 0.0
     num_nextn_predict_layers: int = 0
+    # DeepSeek-V4 native compressed-sparse-attention export toggle. Not an
+    # upstream HF field -- a Mobius export-time opt-in (default False) that
+    # replaces the dense CSA/HCA correctness fallback with the frozen
+    # ``pkg.nxrt::CompressedSparseAttention`` v1 op for property-matching
+    # ratio-128 (HCA) layers. Off by default so every shipped graph stays
+    # byte-identical and ``pkg.nxrt``-free unless explicitly requested via
+    # ``config_overrides={"native_csa": True}``. When requested, layers that
+    # do not satisfy the frozen op contract raise a typed export error rather
+    # than silently emitting the dense fallback (see
+    # ``mobius.models._deepseek_v4_csa``).
+    native_csa: bool = False
 
     # GLM-5.2 (``glm_moe_dsa``) DeepSeek Sparse Attention (DSA).
     #
@@ -626,7 +641,16 @@ class ArchitectureConfig(BaseModelConfig):
     codec_decoder: CodecDecoderConfig | None = None
     codec_encoder: CodecEncoderConfig | None = None
     quantization: QuantizationConfig | None = None
-
+    # Deferred block-scaled FP8 / packed-FP4 scheme (DeepSeek-V4-Flash native
+    # CSA). Recorded by ``from_transformers`` when ``native_csa`` opts into
+    # deferring #602's config-resolution block-quant reject so that graph
+    # construction can progress past the former generic weight-shape mismatch.
+    # The runtime-capability gate
+    # (``mobius.models._deepseek_v4_csa.assert_native_runtime_supports_block_quant``)
+    # then fails closed on the *runnable* full export until nxrt advertises real
+    # block-FP8 / planar-FP4 format strings. ``None`` for every ordinary,
+    # per-tensor-fp8, or non-native path.
+    block_quant_scheme: BlockQuantScheme | None = None
     # HuggingFace model_type and special token IDs — populated by from_transformers()
     # so that genai_config.json can be written without re-fetching the HF config.
     model_type: str | None = None
@@ -969,6 +993,11 @@ class ArchitectureConfig(BaseModelConfig):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", 0.0),
             num_nextn_predict_layers=getattr(config, "num_nextn_predict_layers", 0),
+            # DeepSeek-V4 native CSA/HCA export opt-in. No HF equivalent --
+            # every checkpoint defaults to the dense correctness fallback;
+            # ``config_overrides={"native_csa": True}`` opts a build into the
+            # frozen ``pkg.nxrt::CompressedSparseAttention`` v1 ratio-128 path.
+            native_csa=getattr(config, "native_csa", False),
             # GLM-5.2 DSA. ``use_dsa`` has no HF equivalent -- every checkpoint
             # defaults to the sparse path; ``--glm-full-attention`` overrides
             # it afterwards via ``dataclasses.replace``/``config_overrides``.
@@ -1197,8 +1226,28 @@ class ArchitectureConfig(BaseModelConfig):
         if resolved is not None:
             options["dtype"] = resolved
 
-        # Quantization config
-        quant = QuantizationConfig.from_transformers(config)
+        # Quantization config. Block-scaled FP8 / packed-FP4 checkpoints
+        # (DeepSeek-V4-Flash) are rejected here by #602's typed
+        # ``BlockQuantExportError`` (the INT4/per-tensor path cannot load them).
+        # For a native-CSA export we *defer* that reject so graph construction
+        # can progress past the former generic weight-shape mismatch; the
+        # runtime-capability gate
+        # (``mobius.models._deepseek_v4_csa.assert_native_runtime_supports_block_quant``,
+        # invoked at weight-load / full-export) then fails closed until nxrt
+        # advertises real block-FP8 / planar-FP4 format strings. Every non-native
+        # path keeps #602's early, loud reject.
+        from mobius.integrations._block_quant import (
+            BlockQuantExportError,
+            BlockQuantScheme,
+        )
+
+        try:
+            quant = QuantizationConfig.from_transformers(config)
+        except BlockQuantExportError:
+            if not getattr(config, "native_csa", False):
+                raise
+            options["block_quant_scheme"] = BlockQuantScheme.from_hf_config(config)
+            quant = None
         if quant is None and parent_config is not None:
             quant = QuantizationConfig.from_transformers(parent_config)
         if quant is not None:
