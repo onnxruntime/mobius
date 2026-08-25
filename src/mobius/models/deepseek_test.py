@@ -7,11 +7,12 @@ import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
+import torch
 from onnxscript import GraphBuilder
 
 from mobius._constants import OPSET_VERSION
 from mobius._testing import create_test_builder, create_test_input, make_config
-from mobius.models.deepseek import DeepSeekMoEGate, _DeepSeekMoEFFN
+from mobius.models.deepseek import DeepSeekMoEGate, DeepSeekV3CausalLMModel, _DeepSeekMoEFFN
 
 
 def _silu(value: np.ndarray) -> np.ndarray:
@@ -24,7 +25,8 @@ def _mlp(hidden_states: np.ndarray, weights: dict[str, np.ndarray], prefix: str)
     return (_silu(gate) * up) @ weights[f"{prefix}down_proj.weight"].T
 
 
-def test_deepseek_dense_moe_fallback_matches_numpy_reference():
+@pytest.mark.parametrize("scoring_func", ["sigmoid", "softmax"])
+def test_deepseek_dense_moe_fallback_matches_numpy_reference(scoring_func: str):
     """Tiny grouped, bias-corrected MoE export is a portable correctness oracle."""
     rng = np.random.default_rng(7)
     config = make_config(
@@ -36,7 +38,7 @@ def test_deepseek_dense_moe_fallback_matches_numpy_reference():
         n_group=2,
         topk_group=1,
         n_shared_experts=1,
-        scoring_func="sigmoid",
+        scoring_func=scoring_func,
         topk_method="noaux_tc",
         norm_topk_prob=True,
         routed_scaling_factor=1.25,
@@ -82,8 +84,8 @@ def test_deepseek_dense_moe_fallback_matches_numpy_reference():
     hidden_values = rng.standard_normal((1, 3, config.hidden_size)).astype(np.float32)
     actual = session.run(None, {"hidden_states": hidden_values})[0]
 
-    # Router logits are zero, so all original sigmoid aggregation scores are 0.5.
-    # Bias-corrected grouped TopK selects experts 1 and 0 from group 0.
+    # Uniform unbiased scores are normalized after bias-corrected group selection,
+    # so both score functions select experts 1 and 0 with equal aggregation weight.
     selected_experts = (1, 0)
     routing_weight = (0.5 / (0.5 + 0.5)) * config.routed_scaling_factor
     expected = sum(
@@ -95,6 +97,47 @@ def test_deepseek_dense_moe_fallback_matches_numpy_reference():
     np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
     assert any(node.op_type == "MatMul" for node in graph)
     assert all(node.domain != "com.microsoft" for node in graph)
+
+
+def test_sigmoid_gate_without_optional_correction_bias_has_no_bias_parameter():
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        scoring_func="sigmoid",
+        use_expert_bias=False,
+    )
+    gate = DeepSeekMoEGate(config)
+
+    assert [name for name, _ in gate.named_parameters()] == ["weight"]
+
+
+def test_gguf_expanded_expert_values_are_renamed_without_repacking():
+    config = make_config(
+        hidden_size=4,
+        intermediate_size=8,
+        moe_intermediate_size=3,
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        n_shared_experts=1,
+    )
+    model = DeepSeekV3CausalLMModel(config)
+    gate = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    down = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    processed = model.preprocess_weights(
+        {
+            "model.layers.0.mlp.experts.1.gate_proj.weight": gate,
+            "model.layers.0.mlp.experts.1.down_proj.weight": down,
+        }
+    )
+
+    torch.testing.assert_close(
+        processed["model.layers.0.mlp.moe.experts.1.gate_proj.weight"], gate
+    )
+    torch.testing.assert_close(
+        processed["model.layers.0.mlp.moe.experts.1.down_proj.weight"], down
+    )
 
 
 def test_deepseek_moe_ffn_linear_class_reaches_routed_experts():

@@ -19,7 +19,6 @@ from mobius._weight_utils import pack_qmoe_expert_weights
 from mobius.components import (
     MLP,
     Attention,
-    Embedding,
     Linear,
     MoELayer,
     RMSNorm,
@@ -34,7 +33,7 @@ from mobius.components._paged_mla import (
     mla_paged_geometry,
 )
 from mobius.components._quantized_linear import make_quantized_linear_factory
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, embedding_for_config
 
 
 def _linear_factory(config: ArchitectureConfig):
@@ -75,6 +74,7 @@ class DeepSeekMoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.scoring_func = config.scoring_func
         self.topk_method = config.topk_method
+        self.use_expert_bias = getattr(config, "use_expert_bias", True)
         if self.n_group <= 0 or self.num_experts % self.n_group:
             raise ValueError(
                 "DeepSeek grouped routing requires num_local_experts to be evenly "
@@ -87,8 +87,9 @@ class DeepSeekMoEGate(nn.Module):
             )
 
         self.weight = nn.Parameter([self.num_experts, config.hidden_size])
-        # Correction bias only used with sigmoid scoring (V3)
-        if self.scoring_func == "sigmoid":
+        # Correction bias changes selection only and is valid for both the
+        # softmax and sigmoid Dots1 routes.
+        if self.use_expert_bias:
             self.e_score_correction_bias = nn.Parameter([self.num_experts])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -151,12 +152,14 @@ class DeepSeekMoEGate(nn.Module):
         # Score computation depends on scoring function
         if self.scoring_func == "sigmoid":
             scores = op.Sigmoid(router_logits)  # (B*S, num_experts)
-            # Add correction bias for expert selection (V3)
-            scores_for_choice = op.Add(scores, self.e_score_correction_bias)
         else:
             # Softmax scoring (V2)
             scores = op.Softmax(router_logits, axis=-1)
-            scores_for_choice = scores
+        # Aggregation always gathers unbiased probabilities. Some Dots1 files
+        # omit this optional selection-only correction tensor.
+        scores_for_choice = (
+            op.Add(scores, self.e_score_correction_bias) if self.use_expert_bias else scores
+        )
 
         # Expert selection: group-based or simple TopK
         if self.n_group > 1 and self.topk_method != "greedy":
@@ -389,7 +392,7 @@ class DeepSeekV3TextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = embedding_for_config(config)
         self._dtype = config.dtype
 
         # Detect MLA vs standard attention
@@ -511,7 +514,13 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = DeepSeekV3TextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        quantization = config.quantization
+        linear_class = (
+            _linear_factory(config)
+            if quantization is not None and quantization.quantize_lm_head
+            else Linear
+        )
+        self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -533,12 +542,20 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
         renamed = {}
         # Same predicate as MoELayer/_supported_qmoe_quantization so the
         # repacked weights and the emitted graph never disagree.
-        use_qmoe = _supported_qmoe_quantization(self.config.quantization) is not None
+        use_qmoe = (
+            not self.config.disable_qmoe
+            and _supported_qmoe_quantization(self.config.quantization) is not None
+        )
         for key, value in state_dict.items():
             new_key = key
 
             # Remap MoE layer names: mlp.gate.* → mlp.moe.gate.*
             new_key = new_key.replace(".mlp.gate.", ".mlp.moe.gate.")
+            # GGUF expert-major tensors are expanded before model preprocessing.
+            if ".mlp.experts." in new_key:
+                expert_suffix = new_key.split(".mlp.experts.", 1)[1]
+                if expert_suffix.split(".", 1)[0].isdigit():
+                    new_key = new_key.replace(".mlp.experts.", ".mlp.moe.experts.")
 
             # HF stores all routed experts in fused tensors:
             # layers.N.mlp.experts.gate_up_proj  (n_experts, 2*mid, hidden)

@@ -240,6 +240,10 @@ _KIMI_K3_KEY_MAP = {
     "activation.situ_linear_beta": "activation_situ_linear_beta",
 }
 
+_CONVENTIONAL_SHARED_MOE_KEY_MAP = {
+    "leading_dense_block_count": "first_k_dense_replace",
+}
+
 _T5_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.relative_buckets_count": "relative_attention_num_buckets",
@@ -265,6 +269,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minimax": _MINIMAX_KEY_MAP,
         "kimi_linear": _KIMI_LINEAR_KEY_MAP,
         "kimi_k3": _KIMI_K3_KEY_MAP,
+        "conventional_shared_moe": _CONVENTIONAL_SHARED_MOE_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
 )
@@ -1106,12 +1111,11 @@ def _lfm2moe_postprocess(
         scoring_func="sigmoid",
         norm_topk_prob=True,
         routed_scaling_factor=1.0,
+        use_expert_bias=True,
     )
     return Lfm2MoeConfig(
         **fields,
         num_dense_layers=num_dense_layers,
-        # The pinned loader requires exp_probs_b for every routed layer.
-        use_expert_bias=True,
     )
 
 
@@ -1316,6 +1320,115 @@ def _moe_postprocess(
         updates["norm_topk_prob"] = False
 
     return dataclasses.replace(config, **updates)
+
+
+def _conventional_shared_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the exact BailingMoE/DeepSeek/Dots1 routed/shared MoE contract."""
+    config = _moe_postprocess(config, metadata, model)
+    arch = model.architecture
+    names = set(model.tensor_names)
+    assert config.num_local_experts is not None
+    assert config.num_experts_per_tok is not None
+    assert config.moe_intermediate_size is not None
+
+    dense_prefix = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if arch == "bailingmoe":
+        # The pinned graph is all-MoE and does not branch on this optional key.
+        # Reject contradictory metadata instead of silently changing its meaning.
+        if dense_prefix != 0:
+            raise ValueError(
+                "bailingmoe.leading_dense_block_count must be zero for the "
+                "pinned all-layer MoE graph"
+            )
+    if not 0 <= dense_prefix <= config.num_hidden_layers:
+        raise ValueError(
+            f"{arch}.leading_dense_block_count must be in [0, "
+            f"{config.num_hidden_layers}], got {dense_prefix}"
+        )
+
+    n_shared = int(metadata[f"{arch}.expert_shared_count"])
+    if n_shared <= 0:
+        raise ValueError(f"{arch}.expert_shared_count must be greater than zero")
+    shared_width = config.moe_intermediate_size * n_shared
+    serialized_shared_width = metadata.get(f"{arch}.expert_shared_feed_forward_length")
+    if serialized_shared_width is not None and int(serialized_shared_width) != shared_width:
+        raise ValueError(
+            f"{arch}.expert_shared_feed_forward_length must equal "
+            f"expert_feed_forward_length * expert_shared_count ({shared_width}), "
+            f"got {serialized_shared_width}"
+        )
+
+    gating = int(metadata.get(f"{arch}.expert_gating_func", 1))
+    if gating not in (1, 2):
+        raise ValueError(
+            f"{arch}.expert_gating_func must be SOFTMAX (1) or SIGMOID (2), got {gating}"
+        )
+    if arch in {"bailingmoe", "deepseek"} and gating != 1:
+        raise ValueError(f"{arch}.expert_gating_func must be SOFTMAX (1), got {gating}")
+
+    bias_layers = {
+        layer
+        for layer in range(dense_prefix, config.num_hidden_layers)
+        if f"blk.{layer}.exp_probs_b.bias" in names
+    }
+    routed_layers = set(range(dense_prefix, config.num_hidden_layers))
+    if bias_layers and bias_layers != routed_layers:
+        raise ValueError(
+            f"{arch} correction bias must be present for every routed layer or none; "
+            f"found layers {sorted(bias_layers)}, expected {sorted(routed_layers)}"
+        )
+    use_expert_bias = bool(bias_layers)
+
+    norm_topk_prob = (
+        False if arch == "deepseek" else bool(metadata.get(f"{arch}.expert_weights_norm"))
+    )
+    if arch == "deepseek" and metadata.get(f"{arch}.expert_weights_norm"):
+        raise ValueError("deepseek.expert_weights_norm=True is not used by the pinned graph")
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+    # llama.cpp uses zero as the serialized default sentinel.
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+
+    qkv_bias_layers = []
+    for layer in range(config.num_hidden_layers):
+        fused = f"blk.{layer}.attn_qkv.bias" in names
+        split_count = sum(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        if split_count not in (0, 3) or (fused and split_count):
+            raise ValueError(f"{arch} layer {layer} has a partial or ambiguous Q/K/V bias set")
+        qkv_bias_layers.append(fused or split_count == 3)
+    if any(qkv_bias_layers) and not all(qkv_bias_layers):
+        raise ValueError(f"{arch} Q/K/V bias presence must be uniform across all layers")
+
+    return dataclasses.replace(
+        config,
+        rope_type=config.rope_type or "default",
+        hidden_act="silu",
+        tie_word_embeddings=arch == "deepseek" and "output.weight" not in names,
+        attn_qkv_bias=all(qkv_bias_layers),
+        attn_o_bias=False,
+        mlp_bias=False,
+        first_k_dense_replace=dense_prefix,
+        n_shared_experts=n_shared,
+        shared_expert_intermediate_size=shared_width,
+        scoring_func="softmax" if gating == 1 else "sigmoid",
+        topk_method="greedy",
+        n_group=1,
+        topk_group=1,
+        attn_qk_norm=arch == "dots1",
+        attn_qk_norm_full=False,
+        use_expert_bias=use_expert_bias,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=route_scale,
+        # QMoE's CUDA ABI cannot preserve sigmoid/correction-bias aggregation.
+        # Keep quantized Dots1 on the gate-agnostic dense/block fallback.
+        disable_qmoe=arch == "dots1",
+    )
 
 
 def _diffusion_common_postprocess(
@@ -3078,6 +3191,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "rnd1": _rnd1_postprocess,
     "olmo": _olmo_postprocess,
     "moe": _moe_postprocess,
+    "conventional_shared_moe": _conventional_shared_moe_postprocess,
     "granitemoe": _granitemoe_postprocess,
     "phimoe": _phimoe_postprocess,
     "dense_sliding": _dense_sliding_postprocess,

@@ -819,6 +819,17 @@ _MOE_QK_NORM_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
 }
 
+_DEEPSEEK_SHARED_MOE_EXTRAS: dict[str, str] = {
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias@",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
+}
+
 _DIFFUSION_FUSED_QKV: dict[str, str] = {
     "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
 }
@@ -1047,6 +1058,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "gemma4_extras": _GEMMA4_EXTRAS,
         "moe_extras": _MOE_EXTRAS,
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
+        "deepseek_shared_moe_extras": _DEEPSEEK_SHARED_MOE_EXTRAS,
         "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
         "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
         "qwen3next_hybrid_extras": _QWEN3NEXT_HYBRID_EXTRAS,

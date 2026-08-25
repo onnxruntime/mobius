@@ -708,6 +708,23 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("xverse", {}, False),
     # === DeepSeek (MLA + MoE) ===
     (
+        "deepseek",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "norm_topk_prob": False,
+            "scoring_func": "softmax",
+            "topk_method": "greedy",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+        },
+        False,
+    ),
+    (
         "deepseek_v3",
         {
             # MLA: kv heads must equal attn heads (see MLA note near top of file).
@@ -1169,6 +1186,16 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     # === Additional MoE aliases ===
+    (
+        "bailing_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
+        False,
+    ),
     (
         "ernie4_5_moe",
         {

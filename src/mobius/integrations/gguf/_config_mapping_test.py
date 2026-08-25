@@ -978,6 +978,141 @@ class TestDenseCohortConfigContinued:
             gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
 
 
+class TestConventionalSharedMoeConfig:
+    @staticmethod
+    def _metadata(architecture: str) -> dict:
+        metadata = _dense_metadata(architecture)
+        metadata.update(
+            {
+                f"{architecture}.attention.layer_norm_rms_epsilon": 1e-5,
+                f"{architecture}.expert_count": 4,
+                f"{architecture}.expert_used_count": 2,
+                f"{architecture}.expert_feed_forward_length": 32,
+                f"{architecture}.expert_shared_count": 2,
+                f"{architecture}.expert_weights_scale": 1.25,
+                f"{architecture}.expert_weights_norm": architecture != "deepseek",
+                f"{architecture}.leading_dense_block_count": 1,
+            }
+        )
+        if architecture == "dots1":
+            metadata["dots1.expert_gating_func"] = 1
+        return metadata
+
+    @pytest.mark.parametrize(
+        ("architecture", "model_type", "dense_prefix", "qk_norm"),
+        [
+            ("bailingmoe", "bailing_moe", 0, False),
+            ("deepseek", "deepseek", 1, False),
+            ("dots1", "dots1", 1, True),
+        ],
+    )
+    def test_exact_shared_moe_contract(
+        self, architecture: str, model_type: str, dense_prefix: int, qk_norm: bool
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        if architecture == "bailingmoe":
+            metadata["bailingmoe.leading_dense_block_count"] = 0
+        names = ["token_embd.weight", "output.weight", "blk.1.ffn_gate_inp.weight"]
+        config = gguf_to_config(_FakeDenseGGUF(architecture, metadata, names))
+
+        assert config.model_type == model_type
+        assert config.first_k_dense_replace == dense_prefix
+        assert config.moe_intermediate_size == 32
+        assert config.n_shared_experts == 2
+        assert config.shared_expert_intermediate_size == 64
+        assert config.scoring_func == "softmax"
+        assert config.topk_method == "greedy"
+        assert config.n_group == config.topk_group == 1
+        assert config.norm_topk_prob is (architecture != "deepseek")
+        assert config.routed_scaling_factor == pytest.approx(1.25)
+        assert config.attn_qk_norm is qk_norm
+        assert config.tie_word_embeddings is False
+
+    def test_dots1_sigmoid_correction_bias_is_selection_only(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("dots1")
+        metadata["dots1.expert_gating_func"] = 2
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "dots1",
+                metadata,
+                ["output.weight", "blk.1.exp_probs_b.bias"],
+            )
+        )
+        assert config.scoring_func == "sigmoid"
+        assert config.use_expert_bias is True
+
+        config_without_bias = gguf_to_config(
+            _FakeDenseGGUF("dots1", metadata, ["output.weight"])
+        )
+        assert config_without_bias.use_expert_bias is False
+
+    @pytest.mark.parametrize("architecture", ["bailingmoe", "dots1"])
+    def test_optional_routing_defaults_match_pinned_loader(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata.pop(f"{architecture}.expert_weights_norm")
+        metadata[f"{architecture}.expert_weights_scale"] = 0.0
+        if architecture == "bailingmoe":
+            metadata["bailingmoe.leading_dense_block_count"] = 0
+        config = gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+        assert config.norm_topk_prob is False
+        assert config.routed_scaling_factor == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek"])
+    def test_fixed_softmax_architectures_reject_sigmoid(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata[f"{architecture}.expert_gating_func"] = 2
+        if architecture == "bailingmoe":
+            metadata["bailingmoe.leading_dense_block_count"] = 0
+        with pytest.raises(ValueError, match="SOFTMAX"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+
+    def test_inconsistent_shared_width_is_rejected(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("deepseek")
+        metadata["deepseek.expert_shared_feed_forward_length"] = 63
+        with pytest.raises(ValueError, match="expert_shared_feed_forward_length"):
+            gguf_to_config(_FakeDenseGGUF("deepseek", metadata, ["output.weight"]))
+
+    def test_bailingmoe_rejects_dense_prefix_metadata(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        with pytest.raises(ValueError, match="all-layer MoE"):
+            gguf_to_config(
+                _FakeDenseGGUF("bailingmoe", self._metadata("bailingmoe"), ["output.weight"])
+            )
+
+    def test_dots1_requires_explicit_gating_enum(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("dots1")
+        del metadata["dots1.expert_gating_func"]
+        with pytest.raises(ValueError, match="expert_gating_func"):
+            gguf_to_config(_FakeDenseGGUF("dots1", metadata, ["output.weight"]))
+
+    def test_mixed_correction_bias_presence_is_rejected(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("dots1")
+        metadata["dots1.block_count"] = 3
+        with pytest.raises(ValueError, match="every routed layer or none"):
+            gguf_to_config(
+                _FakeDenseGGUF(
+                    "dots1",
+                    metadata,
+                    ["output.weight", "blk.1.exp_probs_b.bias"],
+                )
+            )
+
+
 class TestGemma3Postprocess:
     """Gemma3 config postprocessing fills fields GGUF omits."""
 

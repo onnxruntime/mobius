@@ -565,7 +565,13 @@ class Ernie45MoECausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = MoETextModel(config, layer_class=UngatedSharedMoEDecoderLayer)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        quantization = config.quantization
+        linear_class = (
+            _quantized_linear_class(config)
+            if quantization is not None and quantization.quantize_lm_head
+            else Linear
+        )
+        self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

@@ -670,3 +670,28 @@ class TestProcessMuseGlimmer:
 
         name = "model.layers.0.self_attn.q_proj.weight"
         assert _needs_qk_permute(name, 32, 2, "muse_glimmer_text") is True
+
+    def test_promoted_moe_fused_qkv_split_matches_separate_value_transform(self) -> None:
+        config = SimpleNamespace(
+            _gguf_arch="dots1",
+            model_type="dots1",
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+        fused = torch.arange(32.0).reshape(16, 2)
+        result = process_tensors(
+            {"model.layers.0.self_attn.qkv_proj.weight": fused.clone()},
+            config,
+        )
+        expected = process_tensors(
+            {
+                "model.layers.0.self_attn.q_proj.weight": fused[:8].clone(),
+                "model.layers.0.self_attn.k_proj.weight": fused[8:12].clone(),
+                "model.layers.0.self_attn.v_proj.weight": fused[12:].clone(),
+            },
+            config,
+        )
+        assert set(result) == set(expected)
+        for name in result:
+            torch.testing.assert_close(result[name], expected[name])

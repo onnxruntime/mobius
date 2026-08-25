@@ -158,6 +158,27 @@ def _process_llama(
             "num_attention_heads or num_key_value_heads not in config"
         )
         return state_dict
+    # Some pinned loaders accept a fused QKV tensor as an alternative to the
+    # split projections. Split it before applying the same inverse Q/K RoPE
+    # permutation used by the separate layout.
+    fused_qkv = [(name, tensor) for name, tensor in state_dict.items() if ".qkv_proj." in name]
+    if fused_qkv:
+        head_dim = int(config.head_dim)
+        q_width = int(num_heads) * head_dim
+        kv_width = int(num_kv_heads) * head_dim
+    for name, tensor in fused_qkv:
+        if tensor.shape[0] != q_width + 2 * kv_width:
+            raise ValueError(
+                f"Invalid fused QKV width for {name}: expected "
+                f"{q_width + 2 * kv_width}, got {tensor.shape[0]}"
+            )
+        query, key, value = tensor.split([q_width, kv_width, kv_width], dim=0)
+        prefix, suffix = name.rsplit(".qkv_proj.", 1)
+        state_dict[f"{prefix}.q_proj.{suffix}"] = query
+        state_dict[f"{prefix}.k_proj.{suffix}"] = key
+        state_dict[f"{prefix}.v_proj.{suffix}"] = value
+        del state_dict[name]
+
     for name, tensor in state_dict.items():
         if ".q_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_heads)
