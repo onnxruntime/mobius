@@ -6308,6 +6308,14 @@ class TestKimiLinearGGUFBuild:
         with pytest.raises(ValueError, match="does not support static cache"):
             build_from_gguf(path, static_cache=True)
 
+    def test_generic_task_override_is_rejected(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-task.gguf"
+        _write_kimi_linear_gguf(path, quantized=False)
+        with pytest.raises(ValueError, match="heterogeneous-state task"):
+            build_from_gguf(path, task="text-generation")
+
     def test_cli_build(self, tmp_path: Path) -> None:
         from mobius.__main__ import main
         from mobius._model_package import ModelPackage

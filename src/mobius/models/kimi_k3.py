@@ -164,6 +164,10 @@ class KimiK3DeltaAttention(nn.Module):
             op.Constant(value_ints=[1]),
         )
         current_mask_3d = op.Unsqueeze(op.CastLike(current_mask, hidden_states), [-1])
+        current_mask_float = op.Unsqueeze(
+            op.Cast(current_mask, to=ir.DataType.FLOAT),
+            [-1],
+        )
         x = op.Mul(hidden_states, current_mask_3d)
 
         q, present_q = self._project_conv(
@@ -202,9 +206,9 @@ class KimiK3DeltaAttention(nn.Module):
         )
         decay = op.Reshape(z, head_shape)
         decay = op.Neg(op.Mul(float(self._lower_bound), op.Sigmoid(op.Mul(a, decay))))
-        decay = op.Mul(op.Reshape(decay, [0, 0, self._projection_size]), current_mask_3d)
+        decay = op.Mul(op.Reshape(decay, [0, 0, self._projection_size]), current_mask_float)
         beta = op.Sigmoid(op.Cast(self.b_proj(op, x), to=ir.DataType.FLOAT))
-        beta = op.Mul(beta, current_mask_3d)
+        beta = op.Mul(beta, current_mask_float)
 
         output, present_recurrent = op.LinearAttention(
             q,

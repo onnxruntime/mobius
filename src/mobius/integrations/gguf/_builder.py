@@ -3579,6 +3579,19 @@ def build_from_gguf(
             f"{gguf_arch} does not support static cache: KDA layers carry three "
             "convolution histories and one recurrent matrix state"
         )
+    if gguf_arch in {"kimi-linear", "kimi-k3"}:
+        from mobius.tasks import KimiK3CausalLMTask, KimiLinearCausalLMTask
+
+        expected_task, task_class = (
+            ("kimi-linear-text-generation", KimiLinearCausalLMTask)
+            if gguf_arch == "kimi-linear"
+            else ("kimi-k3-text-generation", KimiK3CausalLMTask)
+        )
+        if task is not None and task != expected_task and not isinstance(task, task_class):
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports the dedicated {expected_task!r} "
+                "heterogeneous-state task"
+            )
     if gguf_arch == "falcon-h1":
         from mobius.tasks import FalconH1CausalLMTask
 

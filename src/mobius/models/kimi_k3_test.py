@@ -160,6 +160,13 @@ def test_half_precision_routing_weights_match_expert_output_dtype() -> None:
         {value.dtype for value in node.inputs if value is not None} == {ir.DataType.FLOAT16}
         for node in routed_muls
     )
+    mixed_muls = [
+        (node.name, [value.dtype for value in node.inputs if value is not None])
+        for node in graph
+        if node.op_type == "Mul"
+        and len({value.dtype for value in node.inputs if value is not None}) > 1
+    ]
+    assert not mixed_muls
 
 
 def test_preprocess_strips_multimodal_prefix_and_aligns_experts() -> None:
