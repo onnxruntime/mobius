@@ -91,6 +91,10 @@ class _Gemma3VisionEncoderModel(nn.Module):
         )
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
+        pixel_values = op.CastLike(
+            pixel_values,
+            self.vision_tower.vision_model.embeddings.patch_embedding,
+        )
         vision_features = self.vision_tower(op, pixel_values)
         image_features = self.multi_modal_projector(op, vision_features)
         # Projector returns (batch, tokens, hidden); squeeze the leading

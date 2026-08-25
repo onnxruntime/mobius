@@ -875,13 +875,17 @@ def gguf_to_config(
             "beta_slow": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_slow", 1.0),
         }
 
-    if canonical_arch in {"qwen35", "qwen35moe"}:
+    if canonical_arch in {"qwen2vl", "qwen35", "qwen35moe"}:
         mrope_section = metadata[f"{gguf_arch}.rope.dimension_sections"]
         if not isinstance(mrope_section, (list, tuple, np.ndarray)) or len(mrope_section) != 4:
             raise ValueError(
                 f"{gguf_arch}.rope.dimension_sections must contain exactly four entries"
             )
         mrope_section = [int(value) for value in mrope_section]
+        if canonical_arch == "qwen2vl":
+            if mrope_section[-1] != 0:
+                raise ValueError("qwen2vl.rope.dimension_sections reserved entry must be zero")
+            mrope_section = mrope_section[:3]
     else:
         mrope_section = None
 

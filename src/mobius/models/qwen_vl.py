@@ -281,6 +281,9 @@ class Qwen25VLVisionEncoderModel(nn.Module):
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
+        # HF processors emit packed patches as float32. Cast once at the graph
+        # boundary so reduced-precision encoder weights remain type-compatible.
+        pixel_values = op.CastLike(pixel_values, self.visual.patch_embed.weight)
         image_features = self.visual(
             op,
             pixel_values,
@@ -323,52 +326,50 @@ class Qwen25VLEmbeddingModel(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.image_token_id = config.image_token_id or 151655
+        self.video_token_id = config.video_token_id or 151656
 
     def forward(
         self,
         op: OpBuilder,
         input_ids: ir.Value,
         image_features: ir.Value,
+        video_features: ir.Value | None = None,
     ):
         # Token embedding lookup
-        text_embeds = self.embed_tokens(op, input_ids)
+        inputs_embeds = self.embed_tokens(op, input_ids)
 
-        # Create mask for image token positions
-        image_mask = op.Equal(
-            input_ids,
-            op.Constant(value_int=self.image_token_id),
-        )
-        # Expand mask to 3D for broadcasting: (batch, seq, 1)
-        image_mask_3d = op.Unsqueeze(image_mask, [-1])
+        def _scatter(
+            features: ir.Value,
+            token_id: int,
+            fallback: ir.Value,
+        ) -> ir.Value:
+            mask = op.Equal(input_ids, op.Constant(value_int=token_id))
+            flat_mask = op.Reshape(op.Cast(mask, to=7), op.Constant(value_ints=[-1]))
+            indices = op.Clip(
+                op.Sub(
+                    op.CumSum(flat_mask, op.Constant(value_int=0)),
+                    op.Constant(value_int=1),
+                ),
+                op.Constant(value_int=0),
+            )
+            indices = op.Reshape(indices, op.Shape(input_ids))
 
-        # Cumulative sum to map flat image_features indices
-        # image_mask is (batch, seq), cast to int
-        mask_int = op.Cast(image_mask, to=7)  # INT64
-        cumsum = op.CumSum(mask_int, op.Constant(value_int=1))
-        # Zero-based index: subtract 1, clip to 0
-        indices = op.Sub(cumsum, op.Constant(value_int=1))
-        indices = op.Clip(indices, op.Constant(value_int=0))
+            # One padding row makes empty image/video streams valid for text-only
+            # and single-modality prompts; Where discards that gathered row.
+            pad_row = op.Expand(
+                op.CastLike(0.0, features),
+                op.Concat(
+                    op.Constant(value_ints=[1]),
+                    op.Shape(features, start=1, end=2),
+                    axis=0,
+                ),
+            )
+            gathered = op.Gather(op.Concat(features, pad_row, axis=0), indices, axis=0)
+            return op.Where(op.Unsqueeze(mask, [-1]), gathered, fallback)
 
-        # Pad image_features with one zero row so Gather is valid even when
-        # image_features is empty (text-only input: num_image_tokens == 0).
-        # The Where mask ensures the padding row is never used in the output.
-        pad_row = op.Expand(
-            op.CastLike(0.0, image_features),
-            op.Concat(
-                op.Constant(value_ints=[1]),
-                op.Shape(image_features, start=1, end=2),
-                axis=0,
-            ),
-        )
-        padded_features = op.Concat(image_features, pad_row, axis=0)
-
-        # Gather from padded_features using indices
-        # padded_features: (num_image_tokens + 1, hidden)
-        # indices: (batch, seq) → gather → (batch, seq, hidden)
-        gathered = op.Gather(padded_features, indices, axis=0)
-
-        # Where image_mask → use gathered features, else text_embeds
-        inputs_embeds = op.Where(image_mask_3d, gathered, text_embeds)
+        inputs_embeds = _scatter(image_features, self.image_token_id, inputs_embeds)
+        if video_features is not None:
+            inputs_embeds = _scatter(video_features, self.video_token_id, inputs_embeds)
 
         return inputs_embeds
 

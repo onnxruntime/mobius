@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 58
+_EXPECTED_SUPPORTED_COUNT = 59
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -180,6 +180,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "phimoe",
         "plamo2",
         "qwen2",
+        "qwen2vl",
         "qwen2moe",
         "qwen3",
         "qwen35",
@@ -1195,7 +1196,6 @@ class TestPinnedRemainingVLMTextCohort:
         "llama4",
         "mistral3",
         "paddleocr",
-        "qwen2vl",
         "qwen3vl",
         "qwen3vlmoe",
     )
@@ -1457,7 +1457,6 @@ class TestPinnedRemainingVLMTextCohort:
             ("llama4", ("routed experts", "llama4 clip", "text-backbone")),
             ("mistral3", ("dense or routed-expert", "temperature", "Pixtral")),
             ("paddleocr", ("optional bias", "image-token", "ordinary Qwen2")),
-            ("qwen2vl", ("Qwen2.5-Omni", "projector strings", "target identity")),
             ("qwen3vl", ("multimodal position IDs", "deep-stack", "text-only")),
             ("qwen3vlmoe", ("routed experts", "effective tied head", "cache ABI")),
         ],
@@ -1492,7 +1491,6 @@ class TestPinnedRemainingVLMTextCohort:
             "gemma3n_text",
             "llama4_text",
             "mistral3",
-            "qwen2_vl_text",
             "qwen3_vl_text",
             "qwen3_vl_moe",
         } <= set(_REGISTRATIONS)
@@ -1509,6 +1507,7 @@ class TestPinnedRemainingVLMTextCohort:
             "gemma3": "gemma3",
             "gemma4": "gemma4",
             "muse-glimmer": "muse_glimmer",
+            "qwen2vl": "qwen_vl",
         }
 
 

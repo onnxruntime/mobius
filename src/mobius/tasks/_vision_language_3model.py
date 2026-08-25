@@ -95,6 +95,30 @@ class VisionLanguageTask(ModelTask):
         return _make_model(graph)
 
 
+class Gemma3VisionLanguageTask(VisionLanguageTask):
+    """Gemma 3 split with the processor-native, single-image vision boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build one Gemma 3 image per invocation; callers split processor image rows."""
+        image_size = (config.vision.image_size if config.vision else None) or 896
+
+        graph, builder = _make_graph(name="vision_encoder")
+        op = builder.op
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[1, 3, image_size, image_size],
+        )
+        image_features = vision(op, pixel_values=pixel_values)
+
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class Cosmos3EdgeVLTask(VisionLanguageTask):
     """NVIDIA Cosmos3-Edge VL 3-model split.
 
@@ -195,7 +219,7 @@ class QwenVLTask(VisionLanguageTask):
         op = builder.op
         pixel_values = builder.input(
             "pixel_values",
-            dtype=config.dtype,
+            dtype=ir.DataType.FLOAT,
             shape=[total_patches, pixel_dim],
         )
         image_grid_thw = builder.input(
@@ -216,6 +240,58 @@ class QwenVLTask(VisionLanguageTask):
             builder.add_output(deepstack_features, "deepstack_features")
         else:
             builder.add_output(outputs, "image_features")
+        return _make_model(graph)
+
+
+class Qwen2VLMultimediaTask(QwenVLTask):
+    """Qwen2/Qwen2.5 task preserving independent image and video streams."""
+
+    def build(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ModelPackage:
+        self._validate_components(module)
+        models = {
+            "decoder": build_decoder_from_embeds(module.decoder, config, mrope=True),
+            "vision_encoder": self._build_vision(module.vision_encoder, config),
+            "embedding": self._build_multimedia_embedding(module.embedding, config),
+        }
+        return ModelPackage(models, config=config)
+
+    @staticmethod
+    def _build_multimedia_embedding(
+        embedding: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_len")
+        num_image_tokens = ir.SymbolicDim("num_image_tokens")
+        num_video_tokens = ir.SymbolicDim("num_video_tokens")
+
+        graph, builder = _make_graph(name="embedding")
+        input_ids = builder.input(
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, seq_len],
+        )
+        image_features = builder.input(
+            "image_features",
+            dtype=config.dtype,
+            shape=[num_image_tokens, config.hidden_size],
+        )
+        video_features = builder.input(
+            "video_features",
+            dtype=config.dtype,
+            shape=[num_video_tokens, config.hidden_size],
+        )
+        inputs_embeds = embedding(
+            builder.op,
+            input_ids=input_ids,
+            image_features=image_features,
+            video_features=video_features,
+        )
+        builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)
 
 

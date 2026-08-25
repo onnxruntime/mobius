@@ -38,6 +38,7 @@ from mobius.integrations.gguf._config_mapping import (
 from mobius.integrations.gguf._mmproj import (
     build_gemma3_vlm_from_gguf,
     build_gemma4_vlm_from_gguf,
+    build_qwen_vlm_from_gguf,
 )
 from mobius.integrations.gguf._preflight import (
     GgufPreflightReport,
@@ -66,6 +67,7 @@ __all__ = [
     "build_from_gguf",
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
+    "build_qwen_vlm_from_gguf",
     "GGUFTokenizerAsset",
     "GGUFTokenizerSource",
     "materialize_gguf_tokenizer",

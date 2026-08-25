@@ -11,7 +11,7 @@ from onnxscript import GraphBuilder
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius.components import Gemma3MultiModalProjector, OffsetRMSNorm
 from mobius.models.gemma3 import Gemma3MultiModalModel, _Gemma3EmbeddingModel
-from mobius.tasks import VisionLanguageTask
+from mobius.tasks import Gemma3VisionLanguageTask
 from mobius.tasks._base import build_embedding_from_features
 
 
@@ -132,5 +132,8 @@ class TestGemma3VisionEncoder:
                 mm_tokens_per_image=1,
             ),
         )
-        package = VisionLanguageTask().build(Gemma3MultiModalModel(config), config)
+        package = Gemma3VisionLanguageTask().build(Gemma3MultiModalModel(config), config)
         assert set(package) == {"decoder", "vision_encoder", "embedding"}
+        pixel_values = package["vision_encoder"].graph.inputs[0]
+        assert pixel_values.dtype == ir.DataType.FLOAT
+        assert list(pixel_values.shape) == [1, 3, 16, 16]

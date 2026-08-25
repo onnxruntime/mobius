@@ -103,12 +103,20 @@ def test_registry_and_verdict_views_are_immutable() -> None:
 
 
 def test_graph_import_is_conservative_and_artifact_backed() -> None:
-    assert supported_projector_types() == ("gemma3", "gemma4v", "muse-glimmer")
+    assert supported_projector_types() == (
+        "qwen2vl_merger",
+        "qwen2.5vl_merger",
+        "gemma3",
+        "gemma4v",
+        "muse-glimmer",
+    )
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
     assert set(pins) == {
         "gemma3-4b-f16",
         "gemma4-e2b-f16",
         "muse-glimmer-30b-bf16",
+        "qwen2-vl-2b-f16",
+        "qwen25-vl-3b-f16",
     }
     for projector_type in supported_projector_types():
         spec = get_projector_spec(projector_type)
@@ -133,10 +141,63 @@ def test_gemma3_real_artifact_pin_matches_huggingface_api_metadata() -> None:
     assert pin.tensor_count == 439
 
 
+def test_qwen_processor_assets_and_real_contracts_are_exactly_pinned() -> None:
+    pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
+    qwen2 = pins["qwen2-vl-2b-f16"]
+    qwen25 = pins["qwen25-vl-3b-f16"]
+
+    assert qwen2.processor_repository == "Qwen/Qwen2-VL-2B-Instruct"
+    assert qwen2.processor_revision == "895c3a49bc3fa70a340399125c650a463535e71c"
+    assert qwen25.processor_repository == "Qwen/Qwen2.5-VL-3B-Instruct"
+    assert qwen25.processor_revision == "66285546d2b821cf421d4f5eb2576359d3770cd3"
+    assert qwen2.processor_files == qwen25.processor_files == (
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+        "chat_template.json",
+    )
+    for pin in (qwen2, qwen25):
+        contract = dict(pin.processor_contract)
+        assert contract["pixel_values"] == "float32[total_image_patches,1176]"
+        assert contract["image_grid_thw"] == "int64[num_images,3]"
+        assert contract["pixel_values_videos"] == "float32[total_video_patches,1176]"
+        assert contract["video_grid_thw"] == "int64[num_videos,3]"
+        assert contract["ordering"] == (
+            "batch-major within independent image and video streams"
+        )
+        assert contract["empty_media"].startswith("omit ")
+    assert dict(qwen25.processor_contract)["second_per_grid_ts"] == "float64[num_videos]"
+
+
+def test_gemma3_processor_assets_and_real_contract_are_exactly_pinned() -> None:
+    pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
+    pin = pins["gemma3-4b-f16"]
+
+    assert pin.processor_repository == "google/gemma-3-4b-it"
+    assert pin.processor_revision == "093f9f388b31de276ce2de164bdc2081324b9767"
+    assert pin.processor_class == "Gemma3Processor"
+    assert pin.processor_files == (
+        "chat_template.json",
+        "config.json",
+        "generation_config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+    )
+    assert dict(pin.processor_contract) == {
+        "pixel_values": "float32[num_images,3,896,896]",
+        "vision_invocation": "split to one image row per vision graph call",
+        "image_features": "concatenate 256 rows per image in processor row order",
+        "empty_media": "omit pixel_values",
+        "ordering": "batch-major image rows",
+    }
+
+
 def test_vlm_text_cohort_records_exact_companion_identity_without_support_claims() -> None:
     expected_targets = {
-        "qwen2vl_merger": {"qwen2vl"},
-        "qwen2.5vl_merger": {"qwen2vl"},
         "qwen3vl_merger": {"qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe"},
         "qwen3a": {"qwen3vl", "qwen3vlmoe"},
         "gemma3nv": {"gemma3n"},
