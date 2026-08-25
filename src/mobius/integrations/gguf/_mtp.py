@@ -173,6 +173,7 @@ def build_mtp_head_from_gguf(
         _load_dequantized_state_dict,
         _load_quantized_state_dict,
         _normalize_gguf_weights,
+        _replace_native_block_linears,
     )
     from mobius.integrations.gguf._tensor_processors import process_tensors
     from mobius.models.qwen35_mtp import Qwen35MtpModel
@@ -182,23 +183,30 @@ def build_mtp_head_from_gguf(
     if not mtp_blocks:
         return None
     if len(mtp_blocks) > 1:
-        logger.warning(
-            "GGUF declares %d MTP blocks; only the first (block %d) is exported "
-            "as the self-speculative head.",
-            len(mtp_blocks),
-            mtp_blocks[0],
+        raise ValueError(
+            f"GGUF declares {len(mtp_blocks)} MTP blocks, but mobius can export "
+            "exactly one MTP sidecar head. Multi-head MTP export is not supported; "
+            "no partial sidecar was produced."
         )
     mtp_block_index = int(mtp_blocks[0])
     gguf_arch = gguf_model.architecture
 
     mtp_config = derive_mtp_config(config)
     module = Qwen35MtpModel(mtp_config)
-    pkg = build_from_module(
-        module, mtp_config, Qwen35MtpTask(), execution_provider=execution_provider
-    )
 
     def _mapper(gguf_name: str, _arch: str) -> str | None:
         return map_gguf_mtp_to_hf_names(gguf_name, mtp_block_index)
+
+    if preserve_quantization:
+        _replace_native_block_linears(
+            module,
+            gguf_model,
+            gguf_arch,
+            name_mapper=_mapper,
+        )
+    pkg = build_from_module(
+        module, mtp_config, Qwen35MtpTask(), execution_provider=execution_provider
+    )
 
     if preserve_quantization:
         state_dict = _load_quantized_state_dict(

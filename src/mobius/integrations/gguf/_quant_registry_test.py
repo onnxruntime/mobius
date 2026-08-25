@@ -16,6 +16,8 @@ Two jobs:
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 
 from mobius.integrations.gguf import _repacker
@@ -25,9 +27,17 @@ from mobius.integrations.gguf._quant_registry import (
     get_quant_spec,
     iter_quant_specs,
     lm_head_preserve_type_names,
+    quant_import_decision,
     quant_spec_by_name,
+    render_quant_support_matrix,
 )
-from mobius.integrations.gguf._spec import StorageRole, Support
+from mobius.integrations.gguf._spec import (
+    QuantImportRoute,
+    RepackExactness,
+    StorageRole,
+    Support,
+    TensorRole,
+)
 from mobius.integrations.gguf._upstream import upstream_quant_types
 
 # --------------------------------------------------------------------------
@@ -73,8 +83,8 @@ _LEGACY_EXPLICIT_ZERO_POINT_TYPES = frozenset(
     {"Q1_0", "Q2_K", "Q4_0", "Q4_1", "Q4_K", "Q5_1", "Q5_K", "Q8_0"}
 )
 
-#: ``_builder._can_quantize_lm_head.supported_types``
-_LEGACY_LM_HEAD_PRESERVE = frozenset(
+#: Every non-rejected projection/output route may stay quantized.
+_EXPECTED_LM_HEAD_PRESERVE = frozenset(
     {
         "Q1_0",
         "Q2_K",
@@ -87,6 +97,9 @@ _LEGACY_LM_HEAD_PRESERVE = frozenset(
         "Q5_K",
         "Q6_K",
         "Q8_0",
+        "TQ1_0",
+        "TQ2_0",
+        "NVFP4",
         "MXFP4",
         "IQ4_NL",
         "IQ4_XS",
@@ -103,6 +116,34 @@ _LEGACY_LM_HEAD_PRESERVE = frozenset(
 #: ``_builder._has_quantized_weights.float_types`` — F32, F16, BF16, plus F64
 #: when the installed ``gguf`` exposes it.
 _LEGACY_FLOAT_TYPE_IDS = frozenset({0, 1, 30, 28})
+
+_PINNED_STORED_ROUTES = {
+    "Q4_0": ("affine repack", "exact"),
+    "Q4_1": ("affine repack", "lossy"),
+    "Q5_0": ("dequantize/requantize", None),
+    "Q5_1": ("dequantize/requantize", None),
+    "Q8_0": ("affine repack", "exact"),
+    "Q2_K": ("dequantize/requantize", None),
+    "Q3_K": ("dequantize/requantize", None),
+    "Q4_K": ("affine repack", "lossy"),
+    "Q5_K": ("dequantize/requantize", None),
+    "Q6_K": ("affine repack", "lossy"),
+    "TQ1_0": ("dequantize/requantize", None),
+    "TQ2_0": ("dequantize/requantize", None),
+    "IQ4_NL": ("native byte-preserved", None),
+    "IQ4_XS": ("native byte-preserved", None),
+    "IQ3_S": ("native byte-preserved", None),
+    "IQ3_XXS": ("native byte-preserved", None),
+    "IQ2_XXS": ("native byte-preserved", None),
+    "IQ2_XS": ("native byte-preserved", None),
+    "IQ2_S": ("native byte-preserved", None),
+    "IQ1_S": ("native byte-preserved", None),
+    "IQ1_M": ("native byte-preserved", None),
+    "MXFP4": ("native byte-preserved", None),
+    "NVFP4": ("dequantize/requantize", None),
+    "Q1_0": ("affine repack", "exact"),
+    "Q2_0": ("rejected", None),
+}
 
 
 class TestBehaviorPreservation:
@@ -143,7 +184,7 @@ class TestBehaviorPreservation:
         assert explicit_zero_point_type_names() == _LEGACY_EXPLICIT_ZERO_POINT_TYPES
 
     def test_lm_head_preserve_types(self) -> None:
-        assert lm_head_preserve_type_names() == _LEGACY_LM_HEAD_PRESERVE
+        assert lm_head_preserve_type_names() == _EXPECTED_LM_HEAD_PRESERVE
 
     def test_float_storage_types(self) -> None:
         assert float_storage_type_ids() == _LEGACY_FLOAT_TYPE_IDS
@@ -164,6 +205,36 @@ class TestCensusCoverage:
     def test_all_slots_are_registered(self) -> None:
         assert len(iter_quant_specs()) == 43
         assert len(upstream_quant_types()) == 43
+
+    def test_every_active_stored_qtype_has_one_pinned_route(self) -> None:
+        actual = {
+            spec.name: (
+                spec.import_route.value,
+                None if spec.repack_exactness is None else spec.repack_exactness.value,
+            )
+            for spec in iter_quant_specs()
+            if spec.is_quantized_storage
+        }
+        assert actual == _PINNED_STORED_ROUTES
+        assert len(actual) == 25
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            spec
+            for spec in iter_quant_specs()
+            if spec.import_route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        ],
+        ids=lambda spec: spec.name,
+    )
+    def test_declared_float_decoders_execute_one_pinned_block(self, spec) -> None:
+        import numpy as np
+        from gguf import GGMLQuantizationType, quants
+
+        qtype = GGMLQuantizationType(spec.ggml_type_id)
+        values = quants.dequantize(np.zeros(spec.block_bytes, dtype=np.uint8), qtype)
+        assert values.size == spec.block_elements
+        assert np.isfinite(values).all()
 
     @pytest.mark.parametrize("spec", iter_quant_specs(), ids=lambda s: s.name)
     def test_geometry_matches_upstream(self, spec) -> None:
@@ -237,3 +308,71 @@ class TestStorageInvariants:
         assert spec.affine_repack is not None
         assert spec.repack_params == (2, 128)
         assert spec.lm_head_preserve
+
+    @pytest.mark.parametrize("spec", iter_quant_specs(), ids=lambda s: s.name)
+    def test_runtime_stays_deferred_without_real_execution_evidence(self, spec) -> None:
+        if spec.is_quantized_storage:
+            assert spec.runtime is Support.DEFERRED
+            assert "runtime" in spec.runtime_reason.lower()
+
+    def test_native_projection_does_not_imply_native_embedding(self) -> None:
+        projection = quant_import_decision(20, TensorRole.PROJECTION)
+        embedding = quant_import_decision(20, TensorRole.EMBEDDING)
+        assert projection[0] is QuantImportRoute.NATIVE_BYTES
+        assert embedding[0] is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        assert "GatherBlockQuantized" in embedding[2]
+
+    def test_native_experts_require_contiguous_expert_major_layout(self) -> None:
+        route, exactness, reason = quant_import_decision(39, TensorRole.EXPERT)
+        assert route is QuantImportRoute.NATIVE_BYTES
+        assert exactness is None
+        assert "contiguous" in reason
+
+    def test_non_matmul_q1_0_is_rejected_without_a_decoder(self) -> None:
+        route, _, reason = quant_import_decision(41, TensorRole.NON_MATMUL)
+        assert route is QuantImportRoute.REJECTED
+        assert "decoder" in reason
+
+    def test_non_native_expert_major_route_is_rejected(self) -> None:
+        route, _, reason = quant_import_decision(3, TensorRole.EXPERT)
+        assert route is QuantImportRoute.REJECTED
+        assert "keep_quantized=False" in reason
+
+    def test_exact_q8_route_becomes_lossy_for_four_bit_target(self) -> None:
+        route, exactness, reason = quant_import_decision(
+            8,
+            TensorRole.PROJECTION,
+            target_bits=4,
+            target_block_size=32,
+        )
+        assert route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        assert exactness is RepackExactness.LOSSY
+        assert "lossy" in reason
+
+    def test_q1_route_rejects_an_incompatible_target_without_decoder(self) -> None:
+        route, _, reason = quant_import_decision(
+            41,
+            TensorRole.PROJECTION,
+            target_bits=4,
+            target_block_size=32,
+        )
+        assert route is QuantImportRoute.REJECTED
+        assert "no trusted decoder" in reason
+
+    @pytest.mark.parametrize("name", ["Q4_0", "Q8_0", "Q1_0"])
+    def test_exact_affine_routes_are_declared(self, name: str) -> None:
+        spec = quant_spec_by_name(name)
+        assert spec is not None
+        assert spec.import_route is QuantImportRoute.AFFINE_REPACK
+        assert spec.repack_exactness is RepackExactness.EXACT
+
+
+class TestDocumentedQuantizationMatrix:
+    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
+    _BEGIN = "<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->"
+    _END = "<!-- END GGUF QUANTIZATION MATRIX -->"
+
+    def test_generated_matrix_is_current(self) -> None:
+        text = self._DOC.read_text(encoding="utf-8")
+        documented = text.split(self._BEGIN, 1)[1].split(self._END, 1)[0].strip()
+        assert documented == render_quant_support_matrix()

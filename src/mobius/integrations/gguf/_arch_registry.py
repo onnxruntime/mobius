@@ -98,6 +98,12 @@ _RUNTIME_VALIDATION_PENDING = (
     "generation validation. Runtime packaging remains deferred until that evidence exists."
 )
 
+_NO_QUANTIZED_PROJECTION_REASON = (
+    "The mobius graph uses floating Linear modules for this architecture, so no "
+    "MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection "
+    "weights. Use keep_quantized=False for explicit float import."
+)
+
 
 _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     # ---------------------------------------------------------------- Llama
@@ -232,6 +238,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
         llama_qk_permute=True,
+        quantized_import=Support.REJECTED,
+        reason=_NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="olmo",
@@ -343,12 +351,14 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="bloom",
         model_type="bloom",
         tensor_map=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
         reason=_NO_TENSOR_MAP,
     ),
     GGUFArchitectureSpec(
         gguf_arch="t5",
         model_type="t5",
         tensor_map=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
         reason=(
             "T5 is an encoder-decoder with separate enc.*/dec.* tensor namespaces, "
             "relative attention bias, and cross-attention, none of which the "
@@ -361,6 +371,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map=Support.REJECTED,
         graph=Support.REJECTED,
         runtime=Support.REJECTED,
+        quantized_import=Support.REJECTED,
         reason=_NEMOTRON_H_MOE_REASON,
     ),
     GGUFArchitectureSpec(
@@ -369,6 +380,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map=Support.REJECTED,
         graph=Support.REJECTED,
         runtime=Support.REJECTED,
+        quantized_import=Support.REJECTED,
         reason=_MMPROJ_REASON,
     ),
 )

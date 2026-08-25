@@ -365,6 +365,7 @@ def _text_gguf_to_hf_multimodal_quantized(
     import torch
 
     from mobius.integrations.gguf._builder import repack_gguf_weight_to_target
+    from mobius.integrations.gguf._spec import TensorRole
 
     quantize_embeddings = bool(getattr(config.quantization, "quantize_embeddings", False))
     quantize_lm_head = bool(getattr(config.quantization, "quantize_lm_head", False))
@@ -404,6 +405,11 @@ def _text_gguf_to_hf_multimodal_quantized(
                 target_block_size=block_size,
                 target_symmetric=symmetric,
                 tensor_name=hf_name,
+                tensor_role=(
+                    TensorRole.EMBEDDING
+                    if is_quant_embedding
+                    else TensorRole.AFFINE_PROJECTION
+                ),
             )
             stem = hf_name[: -len(".weight")]
             if is_quant_embedding:

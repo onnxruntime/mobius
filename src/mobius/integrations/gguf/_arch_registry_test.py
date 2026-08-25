@@ -58,6 +58,42 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: accidentally losing an architecture is a failure rather than a silence.
 _EXPECTED_SUPPORTED_COUNT = 29
 
+# Quantized reachability is separately pinned from float importability. A new
+# architecture must explicitly prove that its graph exposes packed projection
+# modules before joining this set.
+_EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
+    {
+        "arcee",
+        "cohere2",
+        "deci",
+        "deepseek4",
+        "exaone",
+        "falcon",
+        "gemma",
+        "gemma2",
+        "gemma3",
+        "gemma4",
+        "gpt2",
+        "hunyuan-dense",
+        "llama",
+        "mamba",
+        "muse-glimmer",
+        "nemotron",
+        "olmo",
+        "olmo2",
+        "phi3",
+        "qwen2",
+        "qwen2moe",
+        "qwen3",
+        "qwen35",
+        "qwen35moe",
+        "qwen3moe",
+        "smollm3",
+        "stablelm",
+        "starcoder2",
+    }
+)
+
 
 class TestCapabilityClosure:
     """The four capability verdicts must not contradict each other."""
@@ -85,7 +121,9 @@ class TestCapabilityClosure:
     def test_every_unsupported_capability_carries_a_reason(self, spec) -> None:
         """Support must never be denied silently."""
         unsupported = [
-            name for name, verdict in spec.verdicts.items() if verdict is not Support.SUPPORTED
+            name
+            for name, verdict in spec.capabilities.items()
+            if verdict is not Support.SUPPORTED
         ]
         if unsupported:
             assert spec.reason, f"{spec.gguf_arch}: {unsupported} lack a reason"
@@ -103,6 +141,30 @@ class TestCapabilityClosure:
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
         assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT
+
+    def test_quantized_import_set_is_pinned(self) -> None:
+        """Builder acceptance and rejection must come from an explicit policy set."""
+        actual = frozenset(
+            spec.gguf_arch
+            for spec in iter_arch_specs()
+            if spec.is_importable and spec.quantized_import is Support.SUPPORTED
+        )
+        assert actual == _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES
+
+    def test_every_float_importable_architecture_has_a_quantized_verdict(self) -> None:
+        """Float graph support must not be mistaken for quantized graph reachability."""
+        actual = {
+            spec.gguf_arch: spec.quantized_import
+            for spec in iter_arch_specs()
+            if spec.is_importable
+        }
+        assert set(actual) == set(supported_architectures())
+        assert actual["internlm2"] is Support.REJECTED
+        assert all(
+            verdict is Support.SUPPORTED
+            for arch, verdict in actual.items()
+            if arch != "internlm2"
+        )
 
 
 class TestNameResolutionClosure:
@@ -291,16 +353,24 @@ class TestDocumentedSupportMatrix:
         for spec in sorted(iter_arch_specs(), key=lambda s: s.gguf_arch):
             aliases = ", ".join(f"`{a}`" for a in sorted(spec.aliases)) or "—"
             model_type = f"`{spec.model_type}`" if spec.model_type else "—"
+            core_verdicts = {
+                name: verdict
+                for name, verdict in spec.verdicts.items()
+                if name != "quantized_import"
+            }
             status = (
                 "supported"
                 if all(verdict is Support.SUPPORTED for verdict in spec.verdicts.values())
                 else "; ".join(
                     f"{name} {verdict.value}"
-                    for name, verdict in spec.verdicts.items()
+                    for name, verdict in core_verdicts.items()
                     if verdict is not Support.SUPPORTED
                 )
             )
-            rows.append(f"| `{spec.gguf_arch}` | {aliases} | {model_type} | {status} |")
+            quantized = spec.quantized_import.value if spec.is_importable else "unreachable"
+            rows.append(
+                f"| `{spec.gguf_arch}` | {aliases} | {model_type} | {status} | {quantized} |"
+            )
         return rows
 
     def test_the_doc_table_matches_the_registry(self) -> None:

@@ -54,9 +54,12 @@ __all__ = [
     "AffineRepackSpec",
     "GGUFArchitectureSpec",
     "GGUFQuantSpec",
+    "QuantImportRoute",
+    "RepackExactness",
     "NativeBlockSpec",
     "StorageRole",
     "Support",
+    "TensorRole",
 ]
 
 import dataclasses
@@ -98,9 +101,37 @@ class StorageRole(enum.Enum):
     REMOVED = "removed-unreadable"
 
 
+class QuantImportRoute(enum.Enum):
+    """How a stored quantized tensor reaches the ONNX graph."""
+
+    NATIVE_BYTES = "native byte-preserved"
+    AFFINE_REPACK = "affine repack"
+    DEQUANTIZE_REQUANTIZE = "dequantize/requantize"
+    DEQUANTIZE_FLOAT = "dequantize to float"
+    REJECTED = "rejected"
+
+
+class RepackExactness(enum.Enum):
+    """Whether an affine conversion preserves every represented source value."""
+
+    EXACT = "exact"
+    LOSSY = "lossy"
+
+
+class TensorRole(enum.Enum):
+    """Runtime ABI selected for a mapped GGUF tensor."""
+
+    PROJECTION = "projection"
+    AFFINE_PROJECTION = "projection (affine-only graph)"
+    OUTPUT = "output"
+    EMBEDDING = "embedding"
+    EXPERT = "expert-major"
+    NON_MATMUL = "non-MatMul"
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class NativeBlockSpec:
-    """Serialized GGUF block layout the runtime accepts without conversion.
+    """Serialized GGUF block layout matching the custom operator input ABI.
 
     Attributes:
         format: Runtime format string (e.g. ``"mxfp4"``).
@@ -178,6 +209,8 @@ class GGUFArchitectureSpec:
         tensor_map: Whether GGUF tensor names can be mapped to HuggingFace names.
         graph: Whether mobius can build the graph for ``model_type``.
         runtime: Whether a loadable runtime package can be written.
+        quantized_import: Whether the graph exposes packed projection modules
+            that can consume a preserved GGUF quantization route.
         reason: Why any non-``SUPPORTED`` verdict is what it is. Required
             whenever at least one verdict is not ``SUPPORTED``.
         config_key_map: Name of the architecture-specific GGUF-key → config-field
@@ -207,6 +240,7 @@ class GGUFArchitectureSpec:
     tensor_map: Support = Support.SUPPORTED
     graph: Support = Support.SUPPORTED
     runtime: Support = Support.SUPPORTED
+    quantized_import: Support = Support.SUPPORTED
     reason: str | None = None
     config_key_map: str | None = None
     config_postprocessor: str | None = None
@@ -224,7 +258,9 @@ class GGUFArchitectureSpec:
             raise ValueError("GGUFArchitectureSpec.gguf_arch must be non-empty")
         if self.gguf_arch in self.aliases:
             raise ValueError(f"{self.gguf_arch!r}: canonical name must not repeat in aliases")
-        _require_reason(f"GGUF architecture {self.gguf_arch!r}", self.verdicts, self.reason)
+        _require_reason(
+            f"GGUF architecture {self.gguf_arch!r}", self.capabilities, self.reason
+        )
         if self.graph is Support.SUPPORTED and not self.model_type:
             raise ValueError(
                 f"{self.gguf_arch!r}: graph=SUPPORTED requires a model_type to build with"
@@ -247,12 +283,20 @@ class GGUFArchitectureSpec:
 
     @property
     def verdicts(self) -> dict[str, Support]:
-        """The four capability verdicts, keyed by capability name."""
+        """The core float-import verdicts, keyed by capability name."""
         return {
             "config": self.config,
             "tensor_map": self.tensor_map,
             "graph": self.graph,
             "runtime": self.runtime,
+        }
+
+    @property
+    def capabilities(self) -> dict[str, Support]:
+        """All architecture verdicts, including quantized-import reachability."""
+        return {
+            **self.verdicts,
+            "quantized_import": self.quantized_import,
         }
 
     @property
@@ -287,6 +331,10 @@ class GGUFQuantSpec:
             handed to the runtime unchanged.
         affine_repack: ``MatMulNBits`` target, when the block data can be
             repacked into an affine layout.
+        import_route: Primary importer route for projection/output weights.
+        repack_exactness: Whether ``affine_repack`` preserves represented values.
+        runtime: Runtime execution verdict. Graph construction or ABI matching
+            alone is not runtime evidence.
         requires_explicit_zero_point: Whether a file containing this type forces
             the shared graph scaffolding to carry explicit ``zero_points``.
         lm_head_preserve: Whether an untied output head stored in this type may
@@ -302,6 +350,10 @@ class GGUFQuantSpec:
     dequantize: Support = Support.SUPPORTED
     native_preserve: NativeBlockSpec | None = None
     affine_repack: AffineRepackSpec | None = None
+    import_route: QuantImportRoute = QuantImportRoute.REJECTED
+    repack_exactness: RepackExactness | None = None
+    runtime: Support = Support.DEFERRED
+    runtime_reason: str = "No real-weight ONNX Runtime execution evidence is recorded."
     requires_explicit_zero_point: bool = False
     lm_head_preserve: bool = False
     reason: str | None = None
@@ -311,6 +363,7 @@ class GGUFQuantSpec:
         if not self.name:
             raise ValueError(f"GGML type id {self.ggml_type_id} must have a name")
         _require_reason(label, {"dequantize": self.dequantize}, self.reason)
+        _require_reason(label, {"runtime": self.runtime}, self.runtime_reason)
         # Upstream rejects a tensor whose type has blck_size == 0 in gguf.cpp
         # before any model logic runs, so readability is not an independent
         # choice — it is a consequence of the pinned block size.
@@ -329,6 +382,23 @@ class GGUFQuantSpec:
                 f"{label}: a type is either preserved natively or repacked into an "
                 "affine layout, never both — two paths would silently disagree"
             )
+        if self.import_route is QuantImportRoute.NATIVE_BYTES and self.native_preserve is None:
+            raise ValueError(f"{label}: native-byte route requires native_preserve")
+        if self.import_route is QuantImportRoute.AFFINE_REPACK and self.affine_repack is None:
+            raise ValueError(f"{label}: affine route requires affine_repack")
+        if (
+            self.import_route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+            and self.dequantize is not Support.SUPPORTED
+        ):
+            raise ValueError(f"{label}: dequantize/requantize route requires a dequantizer")
+        if self.import_route is QuantImportRoute.REJECTED and (
+            self.native_preserve is not None or self.affine_repack is not None
+        ):
+            raise ValueError(f"{label}: rejected route cannot expose a preservation path")
+        if self.affine_repack is None and self.repack_exactness is not None:
+            raise ValueError(f"{label}: repack exactness requires an affine repack target")
+        if self.affine_repack is not None and self.repack_exactness is None:
+            raise ValueError(f"{label}: affine repack target must declare exact or lossy")
         if self.native_preserve is not None:
             if self.native_preserve.elements != self.block_elements:
                 raise ValueError(
