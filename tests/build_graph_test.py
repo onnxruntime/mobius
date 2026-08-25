@@ -182,8 +182,6 @@ _SEMANTIC_IDS: dict[tuple[str, int], str] = {
     ("qwen3_next", 0): "qwen3_next_hybrid",
     ("qwen3_next", 1): "qwen3_next_all_full_attn",
     ("qwen3_next", 2): "qwen3_next_all_linear_attn",
-    ("falcon_h1", 0): "falcon_h1_alibi",
-    ("falcon_h1", 1): "falcon_h1_parallel_attn",
     ("jamba", 0): "jamba_hybrid_moe",
     ("jamba", 1): "jamba_all_attention",
     ("bamba", 0): "bamba_hybrid",

@@ -33,9 +33,12 @@ from mobius._configs import (
     ArchitectureConfig,
     Gemma2Config,
     Gemma4Config,
+    GraniteMoeHybridConfig,
+    JambaConfig,
     Mamba2Config,
     MambaConfig,
     MuseGlimmerConfig,
+    NemotronHConfig,
     _shallow_fields,
 )
 from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
@@ -170,6 +173,37 @@ _MAMBA_KEY_MAP = {
     "ssm.time_step_rank": "time_step_rank",
 }
 
+_JAMBA_KEY_MAP = {
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "mamba_d_conv",
+    "ssm.inner_size": "mamba_d_inner",
+    "ssm.state_size": "mamba_d_state",
+    "ssm.time_step_rank": "mamba_dt_rank",
+}
+
+_NEMOTRON_H_KEY_MAP = {
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "conv_kernel",
+    "ssm.group_count": "n_groups",
+    "ssm.state_size": "state_size",
+    "ssm.time_step_rank": "mamba_num_heads",
+}
+
+_GRANITEHYBRID_KEY_MAP = {
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "conv_kernel",
+    "ssm.group_count": "n_groups",
+    "ssm.inner_size": "mamba_intermediate_size",
+    "ssm.state_size": "state_size",
+    "ssm.time_step_rank": "mamba_num_heads",
+}
+
 _T5_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.relative_buckets_count": "relative_attention_num_buckets",
@@ -188,6 +222,9 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "deepseek4": _DEEPSEEK4_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
         "mamba": _MAMBA_KEY_MAP,
+        "jamba": _JAMBA_KEY_MAP,
+        "nemotron_h": _NEMOTRON_H_KEY_MAP,
+        "granitehybrid": _GRANITEHYBRID_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
 )
@@ -327,26 +364,67 @@ def _derive_hybrid_layout(
             f"nextn predict layers ({mtp_count}) for architecture {gguf_arch}."
         )
 
-    if gguf_arch == "lfm2":
+    if gguf_arch in {"lfm2", "jamba", "granitehybrid"}:
         raw_kv_heads = metadata.get(f"{gguf_arch}.attention.head_count_kv")
         if not isinstance(raw_kv_heads, (list, tuple, np.ndarray)):
             raise ValueError(
-                "lfm2.attention.head_count_kv must be a per-layer array; "
+                f"{gguf_arch}.attention.head_count_kv must be a per-layer array; "
                 "a scalar cannot reconstruct the hybrid attention/conv schedule"
             )
         kv_heads = [int(value) for value in raw_kv_heads]
         if len(kv_heads) != total_layers:
             raise ValueError(
-                "lfm2.attention.head_count_kv must contain exactly "
+                f"{gguf_arch}.attention.head_count_kv must contain exactly "
                 f"{total_layers} entries, got {len(kv_heads)}"
             )
         if any(value < 0 for value in kv_heads):
-            raise ValueError("lfm2.attention.head_count_kv entries must be non-negative")
+            raise ValueError(
+                f"{gguf_arch}.attention.head_count_kv entries must be non-negative"
+            )
+        recurrent_type = {
+            "lfm2": "conv",
+            "jamba": "mamba",
+            "granitehybrid": "mamba2",
+        }[gguf_arch]
         return (
             trunk_layers,
-            ["conv" if value == 0 else "full_attention" for value in kv_heads[:trunk_layers]],
+            [
+                recurrent_type if value == 0 else "full_attention"
+                for value in kv_heads[:trunk_layers]
+            ],
             mtp_count,
         )
+
+    if gguf_arch == "nemotron_h":
+        if mtp_count:
+            raise ValueError("nemotron_h GGUF import does not support folded MTP blocks")
+        kv_raw = metadata.get(f"{gguf_arch}.attention.head_count_kv")
+        ffn_raw = metadata.get(f"{gguf_arch}.feed_forward_length")
+        if not isinstance(kv_raw, (list, tuple, np.ndarray)) or not isinstance(
+            ffn_raw, (list, tuple, np.ndarray)
+        ):
+            raise ValueError(
+                "nemotron_h requires per-layer attention.head_count_kv and "
+                "feed_forward_length arrays"
+            )
+        kv_heads = [int(value) for value in kv_raw]
+        ffn_lengths = [int(value) for value in ffn_raw]
+        if len(kv_heads) != total_layers or len(ffn_lengths) != total_layers:
+            raise ValueError(
+                f"nemotron_h schedule arrays must each contain exactly {total_layers} entries"
+            )
+        if any(value < 0 for value in (*kv_heads, *ffn_lengths)):
+            raise ValueError("nemotron_h schedule entries must be non-negative")
+        uses_moe = int(metadata.get(f"{gguf_arch}.expert_count", 0)) > 0
+        layer_types = []
+        for kv_heads_i, ffn_length_i in zip(kv_heads, ffn_lengths):
+            if ffn_length_i:
+                layer_types.append("moe" if uses_moe else "mlp")
+            elif kv_heads_i == 0:
+                layer_types.append("mamba2")
+            else:
+                layer_types.append("full_attention")
+        return trunk_layers, layer_types, mtp_count
 
     if gguf_arch not in _DELTA_NET_ARCHITECTURES:
         return trunk_layers, None, mtp_count
@@ -355,6 +433,12 @@ def _derive_hybrid_layout(
     recurrent = metadata.get(recurrent_key)
     if recurrent is not None:
         if isinstance(recurrent, (list, tuple, np.ndarray)):
+            if any(
+                not isinstance(value, (bool, np.bool_, int, np.integer))
+                or int(value) not in (0, 1)
+                for value in recurrent
+            ):
+                raise ValueError(f"{recurrent_key} entries must be booleans or 0/1")
             recurrent_layers = [bool(value) for value in recurrent]
             if len(recurrent_layers) != total_layers:
                 raise ValueError(
@@ -507,15 +591,16 @@ def gguf_to_config(
     num_kv_heads = hf_fields.get("num_key_value_heads", num_attention_heads)
     if isinstance(num_kv_heads, (list, np.ndarray)):
         values = [int(value) for value in num_kv_heads]
-        if canonical_arch == "lfm2":
+        if canonical_arch in {"lfm2", "jamba", "nemotron_h", "granitehybrid"}:
             nonzero = {value for value in values if value}
             if len(nonzero) != 1:
                 raise ValueError(
-                    "lfm2 attention layers must use one consistent non-zero KV-head count, "
+                    f"{canonical_arch} attention layers must use one consistent non-zero "
+                    "KV-head count, "
                     f"got {sorted(nonzero)}"
                 )
             if not nonzero:
-                raise ValueError("lfm2 GGUF has no attention layer KV-head count")
+                raise ValueError(f"{canonical_arch} GGUF has no attention layer KV-head count")
             num_kv_heads = nonzero.pop()
         else:
             # Per-layer array → pick the majority value (sliding layers dominate)
@@ -537,7 +622,16 @@ def gguf_to_config(
     full_attention_interval = hf_fields.get("full_attention_interval")
     num_hidden_layers = hf_fields["num_hidden_layers"]
     layer_types: list[str] | None = None
-    if canonical_arch == "lfm2" or canonical_arch in _DELTA_NET_ARCHITECTURES:
+    if (
+        canonical_arch
+        in {
+            "lfm2",
+            "jamba",
+            "nemotron_h",
+            "granitehybrid",
+        }
+        or canonical_arch in _DELTA_NET_ARCHITECTURES
+    ):
         derived_layers, layer_types, derived_mtp_count = _derive_hybrid_layout(
             canonical_arch, metadata
         )
@@ -547,6 +641,17 @@ def gguf_to_config(
             full_attention_interval = int(
                 metadata.get(f"{canonical_arch}.full_attention_interval", 4)
             )
+
+    if canonical_arch == "nemotron_h":
+        ffn_lengths = metadata[f"{gguf_arch}.feed_forward_length"]
+        nonzero_ffn_lengths = {int(value) for value in ffn_lengths if int(value)}
+        if len(nonzero_ffn_lengths) > 1:
+            raise ValueError(
+                "nemotron_h dense FFN layers must use one consistent feed-forward length"
+            )
+        hf_fields["intermediate_size"] = (
+            nonzero_ffn_lengths.pop() if nonzero_ffn_lengths else 4 * hidden_size
+        )
 
     # Derive DeltaNet head dimensions from SSM metadata.
     # Key width comes from state_size. Value width is independently derived from
@@ -1145,6 +1250,115 @@ def _granitemoe_postprocess(
         logits_scaling=logit_scale,
         residual_multiplier=float(metadata.get(f"{arch}.residual_scale", 1.0)),
         norm_topk_prob=True,
+    )
+
+
+def _jamba_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> JambaConfig:
+    """Build the dense Jamba subset from the serialized per-layer schedule."""
+    inner_size = int(metadata["jamba.ssm.inner_size"])
+    if inner_size != 2 * config.hidden_size:
+        raise ValueError(
+            "jamba.ssm.inner_size must equal 2 * embedding_length for the pinned loader"
+        )
+    if int(metadata.get("jamba.expert_count", 0)) or any(
+        ".ffn_gate_inp." in name for name in model.tensor_names
+    ):
+        raise ValueError(
+            "Jamba GGUF MoE layers are deferred until stacked-expert parity is established"
+        )
+    return JambaConfig(
+        **_shallow_fields(config),
+        mamba_d_state=int(metadata["jamba.ssm.state_size"]),
+        mamba_d_conv=int(metadata["jamba.ssm.conv_kernel"]),
+        mamba_expand=2,
+        mamba_dt_rank=int(metadata["jamba.ssm.time_step_rank"]),
+        mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
+        mamba_proj_bias=False,
+    )
+
+
+def _nemotron_h_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> NemotronHConfig:
+    """Build the dense, no-MTP Nemotron-H subset."""
+    if int(metadata.get("nemotron_h.expert_count", 0)):
+        raise ValueError(
+            "Nemotron-H MoE GGUF import is deferred; fused softmax MoE is incompatible "
+            "with its sigmoid correction-bias routing"
+        )
+    inner_size = int(metadata["nemotron_h.ssm.inner_size"])
+    num_heads = int(metadata["nemotron_h.ssm.time_step_rank"])
+    if min(inner_size, num_heads) <= 0 or inner_size % num_heads:
+        raise ValueError(
+            "nemotron_h.ssm.inner_size must be positive and divisible by ssm.time_step_rank"
+        )
+    fields = _shallow_fields(config)
+    fields["hidden_act"] = "relu2"
+    return NemotronHConfig(
+        **fields,
+        mamba_n_heads=num_heads,
+        mamba_d_head=inner_size // num_heads,
+        mamba_d_state=int(metadata["nemotron_h.ssm.state_size"]),
+        mamba_n_groups=int(metadata["nemotron_h.ssm.group_count"]),
+        mamba_d_conv=int(metadata["nemotron_h.ssm.conv_kernel"]),
+        mamba_expand=inner_size // config.hidden_size,
+        mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
+        mamba_proj_bias=False,
+    )
+
+
+def _granitehybrid_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> GraniteMoeHybridConfig:
+    """Build the dense GraniteHybrid subset with exact scaling metadata."""
+    if int(metadata.get("granitehybrid.expert_count", 0)):
+        raise ValueError(
+            "GraniteHybrid MoE GGUF import is deferred until 3-D expert fusion and "
+            "quantized expert ordering have independent value tests"
+        )
+    inner_size = int(metadata["granitehybrid.ssm.inner_size"])
+    num_heads = int(metadata["granitehybrid.ssm.time_step_rank"])
+    groups = int(metadata["granitehybrid.ssm.group_count"])
+    if inner_size != 2 * config.hidden_size:
+        raise ValueError("granitehybrid.ssm.inner_size must equal 2 * embedding_length")
+    if min(num_heads, groups) <= 0 or inner_size % num_heads or num_heads % groups:
+        raise ValueError("GraniteHybrid Mamba2 head and group dimensions are inconsistent")
+
+    fields = _shallow_fields(config)
+    fields.update(
+        num_local_experts=None,
+        num_experts_per_tok=None,
+        rope_type=(
+            fields["rope_type"]
+            if bool(metadata.get("granitehybrid.rope.scaling.finetuned", True))
+            else None
+        ),
+        embedding_multiplier=float(metadata.get("granitehybrid.embedding_scale", 0.0)) or 1.0,
+        residual_multiplier=float(metadata.get("granitehybrid.residual_scale", 0.0)) or 1.0,
+        attention_multiplier=(
+            float(metadata.get("granitehybrid.attention.scale", 0.0)) or None
+        ),
+        logits_scaling=float(metadata.get("granitehybrid.logit_scale", 0.0)) or 1.0,
+    )
+    return GraniteMoeHybridConfig(
+        **fields,
+        mamba_n_heads=num_heads,
+        mamba_d_head=inner_size // num_heads,
+        mamba_d_state=int(metadata["granitehybrid.ssm.state_size"]),
+        mamba_n_groups=groups,
+        mamba_d_conv=int(metadata["granitehybrid.ssm.conv_kernel"]),
+        mamba_expand=2,
+        mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
+        mamba_proj_bias=False,
+        shared_intermediate_size=config.intermediate_size,
     )
 
 
@@ -1941,6 +2155,9 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "muse_glimmer": _muse_glimmer_postprocess,
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
+    "jamba": _jamba_postprocess,
+    "nemotron_h": _nemotron_h_postprocess,
+    "granitehybrid": _granitehybrid_postprocess,
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
     "t5": _t5_postprocess,

@@ -586,6 +586,9 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
     from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
 
     architecture = gguf_model.architecture
+    if architecture in {"jamba", "nemotron_h", "granitehybrid"}:
+        _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model)
+        return
     if architecture not in {"lfm2", "qwen35", "qwen35moe", "qwen3next"}:
         return
 
@@ -972,6 +975,192 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
         raise ValueError(
             "modern-bert blk.0.attn_norm.weight is present, but Mobius models layer 0 "
             "as the pinned identity-norm variant and will not ignore the tensor"
+        )
+
+
+def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
+    """Require the exact dense tensor family for each audited hybrid layer."""
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+    architecture = gguf_model.architecture
+    metadata = gguf_model.metadata
+    layer_count, layer_types, mtp_count = _derive_hybrid_layout(architecture, metadata)
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError(f"{architecture} GGUF auxiliary/MTP blocks are not supported")
+
+    actual = set(gguf_model.tensor_names)
+    required_global = {"token_embd.weight", "output_norm.weight"}
+    optional_global = {"output.weight"}
+    required_by_type: dict[str, set[str]]
+    optional_by_type: dict[str, set[str]]
+    common: set[str]
+    if architecture == "jamba":
+        common = {
+            "attn_norm.weight",
+            "ffn_norm.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        }
+        required_by_type = {
+            "mamba": {
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_conv1d.bias",
+                "ssm_x.weight",
+                "ssm_dt_norm.weight",
+                "ssm_dt.weight",
+                "ssm_dt.bias",
+                "ssm_b_norm.weight",
+                "ssm_c_norm.weight",
+                "ssm_a",
+                "ssm_d",
+                "ssm_out.weight",
+            },
+            "full_attention": {
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            },
+        }
+        optional_by_type = {"mamba": set(), "full_attention": set()}
+    elif architecture == "nemotron_h":
+        common = {"attn_norm.weight"}
+        required_by_type = {
+            "mamba2": {
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_d",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+            },
+            "full_attention": {
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            },
+            "mlp": {"ffn_up.weight", "ffn_down.weight"},
+        }
+        optional_by_type = {
+            "mamba2": {"ssm_conv1d.bias"},
+            "full_attention": {"attn_output.bias"},
+            "mlp": {"ffn_up.bias", "ffn_down.bias"},
+        }
+    else:
+        common = {
+            "attn_norm.weight",
+            "ffn_norm.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        }
+        required_by_type = {
+            "mamba2": {
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_d",
+                "ssm_norm.weight",
+                "ssm_out.weight",
+            },
+            "full_attention": {
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            },
+        }
+        optional_by_type = {
+            "mamba2": {"ssm_conv1d.bias"},
+            "full_attention": {
+                "attn_q.bias",
+                "attn_k.bias",
+                "attn_v.bias",
+                "attn_output.bias",
+                "rope_freqs.weight",
+            },
+        }
+
+    expected = set(required_global)
+    allowed = required_global | optional_global
+    if architecture == "nemotron_h" and "moe" in layer_types:
+        raise ValueError(
+            "Nemotron-H MoE GGUF import is deferred; fused softmax MoE is incompatible "
+            "with its sigmoid correction-bias routing"
+        )
+
+    def require_all_or_none(label: str, names: list[str]) -> None:
+        present = sorted(set(names) & actual)
+        if present and len(present) != len(names):
+            missing_family = sorted(set(names) - actual)
+            raise ValueError(
+                f"{architecture} GGUF has a partial {label} bias family: "
+                f"present={present}, missing={missing_family}"
+            )
+
+    recurrent_layers = [
+        index
+        for index, layer_type in enumerate(layer_types)
+        if layer_type in {"mamba", "mamba2"}
+    ]
+    attention_layers = [
+        index for index, layer_type in enumerate(layer_types) if layer_type == "full_attention"
+    ]
+    require_all_or_none(
+        "recurrent convolution",
+        [f"blk.{index}.ssm_conv1d.bias" for index in recurrent_layers],
+    )
+    if architecture == "granitehybrid":
+        require_all_or_none(
+            "attention Q/K/V projection",
+            [
+                f"blk.{index}.attn_{projection}.bias"
+                for index in attention_layers
+                for projection in ("q", "k", "v")
+            ],
+        )
+    if architecture in {"nemotron_h", "granitehybrid"}:
+        require_all_or_none(
+            "attention output projection",
+            [f"blk.{index}.attn_output.bias" for index in attention_layers],
+        )
+    if architecture == "nemotron_h":
+        mlp_layers = [
+            index for index, layer_type in enumerate(layer_types) if layer_type == "mlp"
+        ]
+        require_all_or_none(
+            "dense MLP",
+            [
+                f"blk.{index}.ffn_{projection}.bias"
+                for index in mlp_layers
+                for projection in ("up", "down")
+            ],
+        )
+
+    for index, layer_type in enumerate(layer_types):
+        prefix = f"blk.{index}."
+        required = common | required_by_type[layer_type]
+        optional = optional_by_type[layer_type]
+        expected.update(prefix + suffix for suffix in required)
+        allowed.update(prefix + suffix for suffix in required | optional)
+
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - allowed)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layer_count
+    )
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, out_of_range={out_of_range}"
         )
 
 
@@ -1501,7 +1690,15 @@ def build_from_gguf(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
             "they carry per-layer conv_state and ssm_state rather than a KV cache."
         )
-    if gguf_arch in {"lfm2", "qwen35", "qwen35moe", "qwen3next"}:
+    if gguf_arch in {
+        "lfm2",
+        "qwen35",
+        "qwen35moe",
+        "qwen3next",
+        "jamba",
+        "nemotron_h",
+        "granitehybrid",
+    }:
         from mobius.tasks import HybridCausalLMTask
 
         if static_cache:

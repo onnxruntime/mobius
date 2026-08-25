@@ -58,6 +58,20 @@ class TestProcessTensorsLlama:
             original_k,
         )
 
+    def test_qk_bias_roundtrip(self) -> None:
+        config = self._make_config(num_heads=4, num_kv_heads=2)
+        original_q = torch.randn(64)
+        original_k = torch.randn(32)
+        state_dict = {
+            "model.layers.0.self_attn.q_proj.bias": self._forward_permute(original_q, 4),
+            "model.layers.0.self_attn.k_proj.bias": self._forward_permute(original_k, 2),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["model.layers.0.self_attn.q_proj.bias"], original_q)
+        torch.testing.assert_close(result["model.layers.0.self_attn.k_proj.bias"], original_k)
+
     def test_gqa_different_head_counts(self) -> None:
         """Test GQA with num_kv_heads < num_attention_heads."""
         config = self._make_config(num_heads=8, num_kv_heads=2)
@@ -375,6 +389,38 @@ class TestProcessTensorsMamba:
             result["backbone.layers.0.mixer.norm.weight"],
             torch.tensor([3.0, 4.0]),
         )
+
+    def test_granitehybrid_dense_gate_up_fusion_preserves_order(self) -> None:
+        config = SimpleNamespace(
+            model_type="granitemoehybrid",
+            _gguf_arch="granitehybrid",
+            layer_types=["mamba2"],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+        )
+        gate = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        up = torch.arange(8, 16, dtype=torch.float32).reshape(2, 4)
+        a_log = torch.tensor([[-1.0], [-2.0]])
+        state_dict = {
+            "model.layers.0.shared_mlp.gate_proj.weight": gate,
+            "model.layers.0.shared_mlp.up_proj.weight": up,
+            "model.layers.0.mamba.A_log": a_log,
+            "model.layers.0.mamba.D": torch.ones(2, 1),
+            "model.layers.0.mamba.norm.weight": torch.ones(1, 4),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(
+            result["model.layers.0.shared_mlp.input_linear.weight"],
+            torch.cat((gate, up), dim=0),
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.mamba.A_log"], torch.log(-a_log).flatten()
+        )
+        assert result["model.layers.0.mamba.D"].shape == (2,)
+        assert result["model.layers.0.mamba.norm.weight"].shape == (4,)
 
 
 class TestProcessTensorsNoop:

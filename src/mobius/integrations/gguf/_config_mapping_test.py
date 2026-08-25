@@ -49,6 +49,109 @@ def _t5_metadata(architecture: str) -> dict:
     }
 
 
+class TestSecondHybridCohortConfig:
+    @staticmethod
+    def _metadata(architecture: str) -> dict:
+        metadata = {
+            f"{architecture}.embedding_length": 64,
+            f"{architecture}.feed_forward_length": 128,
+            f"{architecture}.block_count": 3,
+            f"{architecture}.attention.head_count": 4,
+            f"{architecture}.attention.head_count_kv": [0, 2, 0],
+            f"{architecture}.attention.layer_norm_rms_epsilon": 1e-5,
+            f"{architecture}.context_length": 512,
+            f"{architecture}.vocab_size": 256,
+            f"{architecture}.ssm.conv_kernel": 4,
+            f"{architecture}.ssm.inner_size": 128,
+            f"{architecture}.ssm.state_size": 8,
+            f"{architecture}.ssm.time_step_rank": 8,
+        }
+        if architecture in {"nemotron_h", "granitehybrid"}:
+            metadata[f"{architecture}.ssm.group_count"] = 2
+        if architecture == "nemotron_h":
+            metadata[f"{architecture}.feed_forward_length"] = [0, 128, 0]
+        return metadata
+
+    @pytest.mark.parametrize(
+        ("architecture", "config_type", "expected"),
+        [
+            ("jamba", "JambaConfig", ["mamba", "full_attention", "mamba"]),
+            ("nemotron_h", "NemotronHConfig", ["mamba2", "mlp", "mamba2"]),
+            (
+                "granitehybrid",
+                "GraniteMoeHybridConfig",
+                ["mamba2", "full_attention", "mamba2"],
+            ),
+        ],
+    )
+    def test_exact_serialized_schedule(self, architecture, config_type, expected) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        config = gguf_to_config(
+            _FakeDenseGGUF(architecture, self._metadata(architecture), ["token_embd.weight"])
+        )
+        assert type(config).__name__ == config_type
+        assert config.layer_types == expected
+        if architecture in {"nemotron_h", "granitehybrid"}:
+            assert config.mamba_conv_bias is False
+
+    def test_jamba_nope_config_builds_hybrid_graph(self) -> None:
+        import torch
+
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+        from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+        from mobius.models import JambaCausalLMModel
+        from mobius.tasks import HybridCausalLMTask
+
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "jamba",
+                self._metadata("jamba"),
+                ["token_embd.weight", "output.weight"],
+            )
+        )
+        assert config.rope_type is None
+        module = JambaCausalLMModel(config)
+        package = HybridCausalLMTask().build(module, config)
+        assert "model" in package
+
+        mapped = {
+            map_gguf_to_hf_names(name, "jamba"): torch.ones(1)
+            for name in (
+                "blk.0.ssm_dt_norm.weight",
+                "blk.0.ssm_b_norm.weight",
+                "blk.0.ssm_c_norm.weight",
+            )
+        }
+        processed = module.preprocess_weights(mapped)
+        expected = {
+            "model.layers.0.mamba.ssm.dt_layernorm.weight",
+            "model.layers.0.mamba.ssm.b_layernorm.weight",
+            "model.layers.0.mamba.ssm.c_layernorm.weight",
+        }
+        assert set(processed) == expected
+        assert expected <= set(package["model"].graph.initializers)
+
+    @pytest.mark.parametrize("architecture", ["jamba", "nemotron_h", "granitehybrid"])
+    def test_wrong_schedule_length_rejects(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata[f"{architecture}.attention.head_count_kv"] = [0, 2]
+        with pytest.raises(ValueError, match=r"exactly 3|each contain exactly 3"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+
+    @pytest.mark.parametrize("architecture", ["jamba", "nemotron_h", "granitehybrid"])
+    def test_moe_modes_fail_closed(self, architecture: str) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata[f"{architecture}.expert_count"] = 4
+        metadata[f"{architecture}.expert_used_count"] = 2
+        with pytest.raises(ValueError, match="MoE"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+
+
 def _diffusion_names(architecture: str, *, output: bool = True) -> list[str]:
     names = ["token_embd.weight", "output_norm.weight"]
     if output:

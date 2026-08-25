@@ -143,7 +143,7 @@ def _process_llama(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Reverse-permute Q/K weights for Llama/Mistral.
+    """Reverse-permute Q/K weights and biases for Llama/Mistral.
 
     Reference: ``LlamaTensorProcessor`` in HF's
     ``modeling_gguf_pytorch_utils.py``.
@@ -160,9 +160,9 @@ def _process_llama(
         return state_dict
 
     for name, tensor in state_dict.items():
-        if ".q_proj." in name and name.endswith(".weight"):
+        if ".q_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_heads)
-        elif ".k_proj." in name and name.endswith(".weight"):
+        elif ".k_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_kv_heads)
 
     return state_dict
@@ -296,6 +296,8 @@ def _process_mamba(
     Reference: ``MambaTensorProcessor`` in HF's
     ``modeling_gguf_pytorch_utils.py``.
     """
+    layer_types = getattr(config, "layer_types", None) or ()
+    is_mamba2 = config.model_type == "mamba2" or "mamba2" in layer_types
     for name, tensor in list(state_dict.items()):
         if "conv1d" in name and name.endswith(".weight"):
             if tensor.dim() == 2:
@@ -307,22 +309,33 @@ def _process_mamba(
                     "ssm_a must contain only negative -exp(A_log) values"
                 )
             tensor = torch.log(-tensor)
-            if config.model_type == "mamba2" and tensor.dim() == 2 and tensor.shape[-1] == 1:
+            if is_mamba2 and tensor.dim() == 2 and tensor.shape[-1] == 1:
                 tensor = tensor.squeeze(-1)
             state_dict[name] = tensor
-        elif (
-            config.model_type == "mamba2"
-            and name.endswith(".D")
-            and tensor.dim() == 2
-            and tensor.shape[-1] == 1
-        ):
+        elif is_mamba2 and name.endswith(".D") and tensor.dim() == 2 and tensor.shape[-1] == 1:
             state_dict[name] = tensor.squeeze(-1)
-        elif (
-            config.model_type == "mamba2"
-            and name.endswith(".norm.weight")
-            and tensor.dim() == 2
-        ):
+        elif is_mamba2 and name.endswith(".norm.weight") and tensor.dim() == 2:
             state_dict[name] = tensor.flatten()
+    return state_dict
+
+
+def _process_granitehybrid(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert Granite attention/Mamba transforms and fuse its dense gate/up input."""
+    state_dict = _process_llama(state_dict, config)
+    state_dict = _process_mamba(state_dict, config)
+    for name in list(state_dict):
+        if not name.endswith(".shared_mlp.gate_proj.weight"):
+            continue
+        prefix = name.removesuffix("gate_proj.weight")
+        up_name = f"{prefix}up_proj.weight"
+        if up_name not in state_dict:
+            raise ValueError(f"GraniteHybrid dense FFN is missing paired tensor {up_name!r}")
+        state_dict[f"{prefix}input_linear.weight"] = torch.cat(
+            (state_dict.pop(name), state_dict.pop(up_name)), dim=0
+        )
     return state_dict
 
 
@@ -343,6 +356,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "muse_glimmer": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
+    "granitehybrid": _process_granitehybrid,
 }
 
 #: mobius ``model_type`` values that no GGUF architecture maps to, but that a

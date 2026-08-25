@@ -268,9 +268,6 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         # constructed here.  Text parity is covered by the real-weight
         # integration test (test_gemma4_unified_12b_text_prefill).
         "gemma4_unified_text",
-        # falcon_h1: our ONNX uses FalconCausalLMModel (ALiBi attention), not the
-        # real HF FalconH1 (Mamba2+SSM hybrid).  Comparing against HF would be apples-to-oranges.
-        "falcon_h1",
     }
 )
 

@@ -202,11 +202,17 @@ class _JambaTextModel(nn.Module):
         )
 
         layer_types = config.layer_types or []
+        if len(layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "Jamba layer_types must contain exactly num_hidden_layers entries"
+            )
+        if any(layer_type not in {"mamba", "full_attention"} for layer_type in layer_types):
+            raise ValueError(f"Unknown Jamba layer type in {layer_types!r}")
         self.layers = nn.ModuleList([])
         expert_period = getattr(config, "expert_layer_period", 1)
         expert_offset = getattr(config, "expert_layer_offset", 0)
         for i in range(config.num_hidden_layers):
-            ltype = layer_types[i] if i < len(layer_types) else "full_attention"
+            ltype = layer_types[i]
             use_moe = (
                 config.num_local_experts is not None
                 and config.num_local_experts > 1
@@ -229,7 +235,9 @@ class _JambaTextModel(nn.Module):
         past_key_values: list | None = None,
     ):
         hidden_states = self.embed_tokens(op, input_ids)
-        position_embeddings = self.rotary_emb(op, position_ids)
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
 
         attention_bias = create_attention_bias(
             op,

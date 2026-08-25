@@ -166,15 +166,18 @@ reason.
 | `eurobert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `exaone` | — | `exaone` | runtime deferred | supported |
 | `falcon` | — | `falcon` | supported | supported |
+| `falcon-h1` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `gemma` | — | `gemma` | supported | supported |
 | `gemma2` | — | `gemma2` | supported | supported |
 | `gemma3` | — | `gemma3_text` | supported | supported |
 | `gemma4` | — | `gemma4_text` | supported | supported |
 | `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred | unreachable |
 | `gpt2` | — | `gpt2` | supported | supported |
+| `granitehybrid` | — | `granitemoehybrid` | runtime deferred | rejected |
 | `granitemoe` | — | `granitemoe` | runtime deferred | supported |
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
+| `jamba` | — | `jamba` | runtime deferred | rejected |
 | `jina-bert-v2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `jina-bert-v3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `lfm2` | — | `lfm2` | runtime deferred | supported |
@@ -183,9 +186,11 @@ reason.
 | `llama` | `mistral` | `llama` | supported | supported |
 | `mamba` | — | `mamba` | runtime deferred | rejected |
 | `mamba2` | — | `mamba2` | runtime deferred | rejected |
+| `minimax-01` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `modern-bert` | — | `modernbert` | runtime deferred | supported |
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
 | `nemotron` | — | `nemotron` | supported | supported |
+| `nemotron_h` | — | `nemotron_h` | runtime deferred | rejected |
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `neo-bert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `nomic-bert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -195,6 +200,7 @@ reason.
 | `olmoe` | — | `olmoe` | runtime deferred | supported |
 | `phi3` | — | `phi3` | supported | supported |
 | `phimoe` | — | `phimoe` | runtime deferred | supported |
+| `plamo2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `pockettts` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `qwen2` | — | `qwen2` | supported | supported |
 | `qwen2moe` | `qwen2_moe` | `qwen2_moe` | runtime deferred | supported |
@@ -221,6 +227,41 @@ Canonical names are the strings llama.cpp writes into `general.architecture`,
 validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
+
+### Second hybrid cohort
+
+`jamba`, `nemotron_h`, and `granitehybrid` have graph-import support for exact
+dense subsets only; runtime packaging remains deferred pending independent
+real-artifact full-logit and stateful-generation parity.
+
+- Schedules come from suffix-exact per-layer metadata. Jamba and GraniteHybrid
+  use `attention.head_count_kv` (`0` selects Mamba/Mamba2). Nemotron-H combines
+  that array with per-layer `feed_forward_length` to select exactly one of
+  Mamba2, attention, or dense ReLU² MLP.
+- Jamba requires `ssm.inner_size == 2 * embedding_length`. Nemotron-H rejects
+  MTP and all MoE files. GraniteHybrid rejects routed-MoE files until 3-D expert
+  fusion, ordering, and quantized preservation have independent value tests.
+- Every layer must provide exactly its pinned loader tensor family. Missing,
+  wrong-mixer, partial, auxiliary, scale/input-scale, and out-of-range tensors
+  are rejected before graph construction. GGUF Mamba decay values are inverted
+  from `-exp(A_log)`; convolution and grouped Mamba2 tensors are restored to
+  graph shapes.
+- State inputs and outputs are caller-owned. Mamba1 uses conv
+  `[B, d_inner, conv_kernel-1]` and SSM `[B, d_inner, d_state]`; Mamba2 uses
+  conv `[B, d_inner + 2*groups*d_state, conv_kernel-1]` and SSM
+  `[B, heads, d_state, head_dim]`. Rollback restores a previously saved complete
+  state tuple; reorder gathers every state on the batch axis. This does not
+  claim llama.cpp's in-place snapshot/copy-on-write rollback manager.
+- `static_cache=True` and non-hybrid task dispatch are rejected for these mixed
+  state ABIs.
+
+`minimax-01`, `plamo2`, and `falcon-h1` are deferred before config extraction.
+MiniMax-01's pinned Lightning schedule and decay/scaling semantics do not match
+the current graph; PLaMo2 needs a dedicated fused-QKV Mamba1/attention graph;
+Falcon-H1 executes attention and Mamba2 in parallel in every block and therefore
+needs KV plus conv/SSM states simultaneously. It is not an alias of ordinary
+Falcon. `nemotron_h_moe` remains rejected because its folded MTP attention+MoE
+head has no equivalent package contract.
 
 ### Audio/TTS/codec cohort
 

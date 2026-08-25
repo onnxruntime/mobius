@@ -154,7 +154,15 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 4
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 7
+
+    def test_falcon_h1_is_not_a_generic_falcon_alias(self) -> None:
+        """Falcon-H1 must fail before constructing the incompatible Falcon graph."""
+        spec = try_get_arch_spec("falcon-h1")
+        assert spec is not None
+        assert spec.model_type is None
+        assert spec.graph is Support.DEFERRED
+        assert "falcon_h1" not in _REGISTRATIONS
 
     def test_quantized_import_set_is_pinned(self) -> None:
         """Builder acceptance and rejection must come from an explicit policy set."""
@@ -173,7 +181,14 @@ class TestCapabilityClosure:
             if spec.is_importable
         }
         assert set(actual) == set(supported_architectures())
-        rejected = {"internlm2", "mamba", "mamba2"}
+        rejected = {
+            "granitehybrid",
+            "internlm2",
+            "jamba",
+            "mamba",
+            "mamba2",
+            "nemotron_h",
+        }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
             verdict is Support.SUPPORTED
