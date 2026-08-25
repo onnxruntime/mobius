@@ -36,7 +36,8 @@ def _fixture(
     fused_qkv: bool = False,
 ) -> _FakeGGUF:
     hidden, intermediate = 8, 16
-    heads, kv_heads, head_dim = 2, 1, 4
+    heads, head_dim = 2, 4
+    kv_heads = heads if architecture == "dots1" else 1
     experts, expert_intermediate, shared_experts = 4, 6, 1
     layers, vocab = 2, 24
     metadata: dict[str, object] = {
@@ -178,3 +179,38 @@ def test_deepseek_allows_tied_output_but_other_promotions_require_head() -> None
     dots1.tensor_names = list(dots1._tensors)
     with pytest.raises(ValueError, match="missing="):
         _raise_for_invalid_conventional_moe_tensor_contract(dots1)
+
+
+@pytest.mark.parametrize("architecture", ["deepseek", "dots1"])
+def test_conventional_moe_all_dense_schedule_is_valid(architecture: str) -> None:
+    model = _fixture(architecture, dense_prefix=2)
+
+    _raise_for_invalid_conventional_moe_tensor_contract(model)
+
+
+@pytest.mark.parametrize("dense_prefix", [-1, 3])
+def test_conventional_moe_rejects_dense_prefix_outside_layer_range(
+    dense_prefix: int,
+) -> None:
+    model = _fixture("deepseek")
+    model.metadata["deepseek.leading_dense_block_count"] = dense_prefix
+
+    with pytest.raises(ValueError, match="invalid conventional MoE geometry"):
+        _raise_for_invalid_conventional_moe_tensor_contract(model)
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "value"),
+    [
+        ("dots1.attention.head_count_kv", 1),
+        ("dots1.rope.dimension_count", 2),
+    ],
+)
+def test_dots1_rejects_non_authoritative_attention_geometry(
+    metadata_key: str, value: int
+) -> None:
+    model = _fixture("dots1")
+    model.metadata[metadata_key] = value
+
+    with pytest.raises(ValueError, match="invalid attention geometry"):
+        _raise_for_invalid_conventional_moe_tensor_contract(model)

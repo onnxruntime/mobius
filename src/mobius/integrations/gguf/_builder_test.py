@@ -2051,7 +2051,7 @@ def _write_moe_gguf(
     shared_size = 128 if architecture == "qwen2moe" else 32
     num_experts = 4
     num_heads = 4
-    num_kv_heads = 2
+    num_kv_heads = num_heads if architecture == "dots1" else 2
     head_dim = 16
     vocab_size = 256
 
@@ -3395,8 +3395,14 @@ class TestBuildQuantizedGguf:
                 "input_ids": np.array([[1, 2]], dtype=np.int64),
                 "attention_mask": np.ones((1, 2), dtype=np.int64),
                 "position_ids": np.array([[0, 1]], dtype=np.int64),
-                "past_key_values.0.key": np.empty((1, 2, 0, 16), dtype=np.float32),
-                "past_key_values.0.value": np.empty((1, 2, 0, 16), dtype=np.float32),
+                "past_key_values.0.key": np.empty(
+                    (1, 4 if architecture == "dots1" else 2, 0, 16),
+                    dtype=np.float32,
+                ),
+                "past_key_values.0.value": np.empty(
+                    (1, 4 if architecture == "dots1" else 2, 0, 16),
+                    dtype=np.float32,
+                ),
             },
         )[0]
         assert logits.shape == (1, 2, 256)
@@ -3445,7 +3451,13 @@ class TestBuildQuantizedGguf:
             fused_zero_points = torch.from_numpy(repacked.zero_points)
 
         offset = 0
-        for projection, rows, heads in (("q", 64, 4), ("k", 32, 2), ("v", 32, None)):
+        kv_rows = 64 if architecture == "dots1" else 32
+        kv_heads = 4 if architecture == "dots1" else 2
+        for projection, rows, heads in (
+            ("q", 64, 4),
+            ("k", kv_rows, kv_heads),
+            ("v", kv_rows, None),
+        ):
             stem = f"model.layers.0.self_attn.{projection}_proj"
             assert f"{stem}.weight" in names or f"{stem}.weight_t" in names
             assert f"{stem}.bias" in names

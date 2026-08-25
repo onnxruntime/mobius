@@ -1668,7 +1668,7 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         or heads % kv_heads
         or experts <= 1
         or top_k > experts
-        or not 0 <= dense_prefix < layers
+        or not 0 <= dense_prefix <= layers
         or (architecture == "bailingmoe" and dense_prefix)
     ):
         raise ValueError(f"{architecture} GGUF has invalid conventional MoE geometry")
@@ -1683,6 +1683,10 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         or rope_dim <= 0
         or rope_dim > head_dim
         or rope_dim % 2
+        or (
+            architecture == "dots1"
+            and (kv_heads != heads or rope_dim != head_dim)
+        )
     ):
         raise ValueError(f"{architecture} GGUF has invalid attention geometry")
 
