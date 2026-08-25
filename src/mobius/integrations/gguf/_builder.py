@@ -544,7 +544,7 @@ def build_from_gguf(
         GGUF_ARCH_TO_MODEL_TYPE,
         gguf_to_config,
     )
-    from mobius.integrations.gguf._shard_set import open_gguf_model
+    from mobius.integrations.gguf._shard_set import GgufShardSet, open_gguf_model
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
@@ -569,6 +569,11 @@ def build_from_gguf(
     gguf_path = _resolve_gguf_path(gguf_path)
     gguf_model = open_gguf_model(gguf_path)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
+    if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
+        raise ValueError(
+            "reuse_gguf_weights=True does not yet support multi-shard GGUF sets. "
+            "Build without reuse to preserve current multi-shard import behavior."
+        )
     if reuse_gguf_weights and not gguf_model.is_little_endian:
         raise ValueError(
             "reuse_gguf_weights=True requires a little-endian GGUF because ONNX "
