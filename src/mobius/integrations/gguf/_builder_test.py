@@ -713,6 +713,177 @@ def _write_recurrent_gguf(
     writer.close()
 
 
+def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
+    """Write a tiny two-layer LFM2 GGUF with one conv and one attention layer."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    head_dim = hidden // heads
+    kernel = 3
+    rng = np.random.default_rng(23)
+
+    writer = GGUFWriter(str(path), "lfm2")
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(2)
+    writer.add_head_count(heads)
+    writer.add_head_count_kv([0, kv_heads])
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_rope_dimension_count(head_dim)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab)
+    writer.add_uint32("lfm2.shortconv.l_cache", kernel)
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, rng.normal(0, 0.03, shape).astype(np.float32))
+
+    def add_q4(name: str, shape: tuple[int, int]) -> None:
+        rows, columns = shape
+        assert columns % 32 == 0
+        raw = np.zeros((rows, columns // 32 * 18), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(columns // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    add_projection = add_q4 if quantized else add_float
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("token_embd_norm.weight", (hidden,))
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+        add_projection(prefix + "ffn_gate.weight", (intermediate, hidden))
+        add_projection(prefix + "ffn_up.weight", (intermediate, hidden))
+        add_projection(prefix + "ffn_down.weight", (hidden, intermediate))
+
+    add_float("blk.0.shortconv.conv.weight", (hidden, kernel))
+    add_projection("blk.0.shortconv.in_proj.weight", (3 * hidden, hidden))
+    add_projection("blk.0.shortconv.out_proj.weight", (hidden, hidden))
+
+    add_projection("blk.1.attn_q.weight", (heads * head_dim, hidden))
+    add_projection("blk.1.attn_k.weight", (kv_heads * head_dim, hidden))
+    add_projection("blk.1.attn_v.weight", (kv_heads * head_dim, hidden))
+    add_projection("blk.1.attn_output.weight", (hidden, heads * head_dim))
+    add_float("blk.1.attn_q_norm.weight", (head_dim,))
+    add_float("blk.1.attn_k_norm.weight", (head_dim,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def _write_qwen35_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    inner_size: int = 256,
+    quantized_embedding: bool = False,
+) -> None:
+    """Write a tiny Qwen3.5 GGUF with three DeltaNet layers and one attention layer."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    head_dim = 8
+    key_heads = 2
+    value_heads = 4
+    state_size = inner_size // value_heads
+    kernel = 3
+    key_dim = key_heads * state_size
+    value_dim = inner_size
+    conv_dim = 2 * key_dim + value_dim
+    rng = np.random.default_rng(29)
+
+    writer = GGUFWriter(str(path), "qwen35")
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(4)
+    writer.add_head_count(heads)
+    writer.add_head_count_kv(kv_heads)
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_rope_dimension_count(head_dim)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab)
+    writer.add_ssm_conv_kernel(kernel)
+    writer.add_ssm_inner_size(inner_size)
+    writer.add_ssm_state_size(state_size)
+    writer.add_ssm_time_step_rank(value_heads)
+    writer.add_ssm_group_count(key_heads)
+    writer.add_uint32("qwen35.full_attention_interval", 4)
+    writer.add_array("qwen35.rope.dimension_sections", [2, 2, 0, 0])
+
+    def add_float(name: str, shape: tuple[int, ...], *, negative_exp: bool = False) -> None:
+        values = rng.normal(0, 0.03, shape).astype(np.float32)
+        if negative_exp:
+            values = -np.exp(values)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, int]) -> None:
+        rows, columns = shape
+        assert columns % 32 == 0
+        raw = np.zeros((rows, columns // 32 * 18), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(columns // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    add_projection = add_q4 if quantized else add_float
+    (add_q4 if quantized_embedding else add_float)("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    for layer in range(4):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "post_attention_norm.weight", (hidden,))
+        add_projection(prefix + "ffn_gate.weight", (intermediate, hidden))
+        add_projection(prefix + "ffn_up.weight", (intermediate, hidden))
+        add_projection(prefix + "ffn_down.weight", (hidden, intermediate))
+        if layer == 3:
+            add_projection(prefix + "attn_q.weight", (2 * heads * head_dim, hidden))
+            add_projection(prefix + "attn_k.weight", (kv_heads * head_dim, hidden))
+            add_projection(prefix + "attn_v.weight", (kv_heads * head_dim, hidden))
+            add_projection(prefix + "attn_output.weight", (hidden, heads * head_dim))
+            add_float(prefix + "attn_q_norm.weight", (head_dim,))
+            add_float(prefix + "attn_k_norm.weight", (head_dim,))
+        else:
+            add_projection(prefix + "attn_qkv.weight", (conv_dim, hidden))
+            add_projection(prefix + "attn_gate.weight", (value_dim, hidden))
+            add_float(prefix + "ssm_conv1d.weight", (conv_dim, kernel))
+            add_float(prefix + "ssm_dt.bias", (value_heads,))
+            add_float(prefix + "ssm_a", (value_heads,), negative_exp=True)
+            add_projection(prefix + "ssm_beta.weight", (value_heads, hidden))
+            add_projection(prefix + "ssm_alpha.weight", (value_heads, hidden))
+            add_float(prefix + "ssm_norm.weight", (inner_size // value_heads,))
+            add_projection(prefix + "ssm_out.weight", (hidden, value_dim))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_moe_gguf(
     path: Path,
     architecture: str,
@@ -3369,6 +3540,206 @@ class TestT5GGUFBuild:
             build_from_gguf(path)
 
 
+class TestHybridGGUFBuild:
+    @staticmethod
+    def _run_lfm2(model) -> list[dict[str, np.ndarray]]:
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        session = OnnxModelSession(model)
+        states = {
+            "past_key_values.0.conv_state": np.zeros((1, 32, 2), dtype=np.float32),
+            "past_key_values.1.key": np.zeros((1, 2, 0, 8), dtype=np.float32),
+            "past_key_values.1.value": np.zeros((1, 2, 0, 8), dtype=np.float32),
+        }
+        outputs = []
+        try:
+            for tokens in ([1, 2, 3], [4]):
+                total = states["past_key_values.1.key"].shape[2] + len(tokens)
+                output = session.run(
+                    {
+                        "input_ids": np.asarray([tokens], dtype=np.int64),
+                        "attention_mask": np.ones((1, total), dtype=np.int64),
+                        "position_ids": np.arange(total - len(tokens), total, dtype=np.int64)[
+                            None
+                        ],
+                        **states,
+                    }
+                )
+                outputs.append(output)
+                states = {
+                    "past_key_values.0.conv_state": output["present.0.conv_state"],
+                    "past_key_values.1.key": output["present.1.key"],
+                    "past_key_values.1.value": output["present.1.value"],
+                }
+        finally:
+            session.close()
+        return outputs
+
+    @staticmethod
+    def _run_qwen35(model) -> list[dict[str, np.ndarray]]:
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        session = OnnxModelSession(model)
+        states = {}
+        for layer in range(3):
+            states[f"past_key_values.{layer}.conv_state"] = np.zeros(
+                (1, 512, 2), dtype=np.float32
+            )
+            states[f"past_key_values.{layer}.recurrent_state"] = np.zeros(
+                (1, 4, 64, 64), dtype=np.float32
+            )
+        states["past_key_values.3.key"] = np.zeros((1, 2, 0, 8), dtype=np.float32)
+        states["past_key_values.3.value"] = np.zeros((1, 2, 0, 8), dtype=np.float32)
+        outputs = []
+        try:
+            for tokens in ([1, 2, 3], [4]):
+                total = states["past_key_values.3.key"].shape[2] + len(tokens)
+                output = session.run(
+                    {
+                        "input_ids": np.asarray([tokens], dtype=np.int64),
+                        "attention_mask": np.ones((1, total), dtype=np.int64),
+                        "position_ids": np.arange(total - len(tokens), total, dtype=np.int64)[
+                            None
+                        ],
+                        **states,
+                    }
+                )
+                outputs.append(output)
+                for layer in range(3):
+                    states[f"past_key_values.{layer}.conv_state"] = output[
+                        f"present.{layer}.conv_state"
+                    ]
+                    states[f"past_key_values.{layer}.recurrent_state"] = output[
+                        f"present.{layer}.recurrent_state"
+                    ]
+                states["past_key_values.3.key"] = output["present.3.key"]
+                states["past_key_values.3.value"] = output["present.3.value"]
+        finally:
+            session.close()
+        return outputs
+
+    def test_lfm2_float_prefill_decode_threads_only_mixer_specific_state(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2-f32.gguf"
+        _write_lfm2_gguf(path, quantized=False)
+        model = build_from_gguf(path)["model"]
+
+        assert [value.name for value in model.graph.inputs if "past_" in value.name] == [
+            "past_key_values.0.conv_state",
+            "past_key_values.1.key",
+            "past_key_values.1.value",
+        ]
+        outputs = self._run_lfm2(model)
+        assert outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
+        assert outputs[0]["present.1.key"].shape == (1, 2, 3, 8)
+        assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
+        assert all(np.isfinite(output["logits"]).all() for output in outputs)
+
+    def test_lfm2_quantized_preservation_fails_closed_and_float_import_executes(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2-q4.gguf"
+        _write_lfm2_gguf(path, quantized=True)
+        with pytest.raises(
+            ValueError,
+            match=r"Cannot keep Q4_0 projection .*MatMulNBits",
+        ):
+            build_from_gguf(path, keep_quantized=True)
+
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+
+        assert "MatMulNBits" not in {node.op_type for node in explicit_float.graph}
+        outputs = self._run_lfm2(explicit_float)
+        assert outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
+        assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
+        assert all(np.isfinite(output["logits"]).all() for output in outputs)
+
+    def test_qwen35_float_and_quantized_prefill_decode_thread_mixed_state(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        float_path = tmp_path / "qwen35-f32.gguf"
+        quantized_path = tmp_path / "qwen35-q4.gguf"
+        _write_qwen35_gguf(float_path, quantized=False)
+        _write_qwen35_gguf(quantized_path, quantized=True)
+
+        float_steps = self._run_qwen35(build_from_gguf(float_path)["model"])
+        quantized_model = build_from_gguf(quantized_path, keep_quantized=True)["model"]
+        quantized_steps = self._run_qwen35(quantized_model)
+
+        assert "MatMulNBits" in {node.op_type for node in quantized_model.graph}
+        for steps in (float_steps, quantized_steps):
+            assert steps[0]["present.0.conv_state"].shape == (1, 512, 2)
+            assert steps[0]["present.0.recurrent_state"].shape == (1, 4, 64, 64)
+            assert steps[0]["present.3.key"].shape == (1, 2, 3, 8)
+            assert steps[1]["present.3.key"].shape == (1, 2, 4, 8)
+            assert all(np.isfinite(output["logits"]).all() for output in steps)
+
+    def test_qwen35_tied_quantized_embedding_owns_head_and_saves(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen35-tied-embedding-q4.gguf"
+        _write_qwen35_gguf(path, quantized=True, quantized_embedding=True)
+        package = build_from_gguf(path, keep_quantized=True)
+        model = package["model"]
+
+        initializer_names = set(model.graph.initializers)
+        assert {
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
+        } <= initializer_names
+        assert not any(name.startswith("lm_head.") for name in initializer_names)
+        assert all(
+            value.const_value is not None for value in model.graph.initializers.values()
+        )
+        op_types = {node.op_type for node in model.graph}
+        assert "GatherBlockQuantized" in op_types
+        assert "MatMulNBits" in op_types
+
+        saved = tmp_path / "saved-qwen35"
+        package.save(str(saved), progress_bar=False, check_weights=True)
+        reloaded = ModelPackage.load(str(saved))["model"]
+        assert set(reloaded.graph.initializers) == initializer_names
+        assert all(
+            value.const_value is not None for value in reloaded.graph.initializers.values()
+        )
+
+    def test_qwen35_packed_v_head_reorder_fails_closed_when_not_repackable(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen35-narrow-q4.gguf"
+        _write_qwen35_gguf(path, quantized=True, inner_size=32)
+        with pytest.raises(ValueError, match=r"cannot map .* quant blocks"):
+            build_from_gguf(path, keep_quantized=True)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"static_cache": True}, "architecture-specific"),
+            ({"task": "text-generation"}, "hybrid-text-generation"),
+        ],
+    )
+    def test_lfm2_cache_task_misdispatch_is_rejected(
+        self, tmp_path: Path, kwargs: dict, message: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2-misdispatch.gguf"
+        _write_lfm2_gguf(path, quantized=False)
+        with pytest.raises(ValueError, match=re.escape(message)):
+            build_from_gguf(path, **kwargs)
+
+
 class TestRecurrentGGUFBuild:
     """Mamba GGUF imports preserve recurrent state and tensor-role semantics."""
 
@@ -4211,6 +4582,143 @@ class TestGGUFPreflightGuards:
             _raise_for_sharded_gguf(source="model-00001-of-00002.gguf", split_count=2)
 
 
+class TestHybridTensorContract:
+    class _FakeGGUF:
+        def __init__(self, architecture, metadata, tensor_names):
+            self.architecture = architecture
+            self.metadata = metadata
+            self.tensor_names = tensor_names
+
+    @staticmethod
+    def _lfm2_names() -> list[str]:
+        names = ["token_embd.weight", "token_embd_norm.weight"]
+        common = [
+            "attn_norm.weight",
+            "ffn_norm.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ]
+        mixers = [
+            [
+                "shortconv.conv.weight",
+                "shortconv.in_proj.weight",
+                "shortconv.out_proj.weight",
+            ],
+            [
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+            ],
+        ]
+        for layer, conditional in enumerate(mixers):
+            names.extend(f"blk.{layer}.{suffix}" for suffix in [*common, *conditional])
+        return names
+
+    def test_lfm2_exact_mixer_closure_passes(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        model = self._FakeGGUF(
+            "lfm2",
+            {
+                "lfm2.block_count": 2,
+                "lfm2.attention.head_count_kv": [0, 2],
+            },
+            self._lfm2_names(),
+        )
+        _raise_for_invalid_hybrid_tensor_contract(model)
+
+    def test_wrong_mixer_tensor_is_rejected(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        names = self._lfm2_names()
+        names.append("blk.0.attn_q.weight")
+        model = self._FakeGGUF(
+            "lfm2",
+            {
+                "lfm2.block_count": 2,
+                "lfm2.attention.head_count_kv": [0, 2],
+            },
+            names,
+        )
+        with pytest.raises(ValueError, match="wrong conv mixer family"):
+            _raise_for_invalid_hybrid_tensor_contract(model)
+
+    def test_missing_recurrent_tensor_and_extra_layer_are_rejected(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        metadata = {
+            "lfm2.block_count": 2,
+            "lfm2.attention.head_count_kv": [0, 2],
+        }
+        missing = [
+            name for name in self._lfm2_names() if name != "blk.0.shortconv.conv.weight"
+        ]
+        with pytest.raises(ValueError, match=r"shortconv\.conv\.weight"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF("lfm2", metadata, missing)
+            )
+
+        with pytest.raises(ValueError, match="out-of-range"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(
+                    "lfm2", metadata, [*self._lfm2_names(), "blk.2.ffn_norm.weight"]
+                )
+            )
+
+    def test_partial_fused_and_separate_experts_are_rejected(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        model = self._FakeGGUF(
+            "qwen35moe",
+            {
+                "qwen35moe.block_count": 1,
+                "qwen35moe.attention.recurrent_layers": [False],
+            },
+            [
+                "token_embd.weight",
+                "output_norm.weight",
+                "blk.0.ffn_gate_up_exps.weight",
+                "blk.0.ffn_gate_exps.weight",
+            ],
+        )
+        with pytest.raises(ValueError, match="mixes fused and separate"):
+            _raise_for_invalid_hybrid_tensor_contract(model)
+
+    def test_partial_modern_and_legacy_recurrent_inputs_are_rejected(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        model = self._FakeGGUF(
+            "qwen3next",
+            {
+                "qwen3next.block_count": 1,
+                "qwen3next.attention.recurrent_layers": [True],
+            },
+            [
+                "token_embd.weight",
+                "output_norm.weight",
+                "blk.0.ffn_gate_up_exps.weight",
+                "blk.0.ssm_in.weight",
+                "blk.0.attn_qkv.weight",
+            ],
+        )
+        with pytest.raises(ValueError, match="mixes legacy ssm_in with modern"):
+            _raise_for_invalid_hybrid_tensor_contract(model)
+
+
 class TestNormalizeGgufWeights:
     """Tests for GGUF-specific weight shape/value normalization."""
 
@@ -4296,6 +4804,37 @@ class TestNormalizeGgufWeights:
             out["model.layers.0.input_layernorm.weight"], torch.tensor([1.0, 1.0])
         )
         assert torch.allclose(out["model.norm.weight"], torch.tensor([1.0]))
+
+    @pytest.mark.parametrize(
+        ("suffix", "shape"),
+        [
+            ("weight", (2, 6, 4)),
+            ("qweight", (2, 6, 4, 2)),
+            ("scales", (2, 6, 4)),
+            ("zero_points", (2, 6, 4)),
+        ],
+    )
+    def test_fused_experts_are_split_without_tensor_loss(self, suffix, shape):
+        import torch
+
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        key = f"model.layers.0.mlp.experts.gate_up_proj.{suffix}"
+        value = torch.arange(np.prod(shape)).reshape(shape)
+        out = _normalize_gguf_weights({key: value}, gguf_arch="qwen35moe")
+
+        assert key not in out
+        assert len(out) == 4
+        gate, up = value.chunk(2, dim=1)
+        for expert in range(2):
+            assert torch.equal(
+                out[f"model.layers.0.mlp.experts.{expert}.gate_proj.{suffix}"],
+                gate[expert],
+            )
+            assert torch.equal(
+                out[f"model.layers.0.mlp.experts.{expert}.up_proj.{suffix}"],
+                up[expert],
+            )
 
 
 class TestReorderDeltaNetVHeads:

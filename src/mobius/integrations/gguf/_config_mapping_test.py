@@ -887,6 +887,13 @@ class TestQwen35MtpBlockExclusion:
             "qwen35.vocab_size": 248320,
             "qwen35.full_attention_interval": 4,
             "qwen35.rope.dimension_count": 64,
+            "qwen35.rope.dimension_sections": [11, 11, 10, 0],
+            "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+            "qwen35.ssm.conv_kernel": 4,
+            "qwen35.ssm.group_count": 4,
+            "qwen35.ssm.inner_size": 4096,
+            "qwen35.ssm.state_size": 128,
+            "qwen35.ssm.time_step_rank": 32,
         }
 
     def test_nextn_layers_excluded_from_decoder_count(self) -> None:
@@ -916,7 +923,7 @@ class TestQwen35MtpBlockExclusion:
 
         md = self._base_metadata(block_count=1)
         md["qwen35.nextn_predict_layers"] = 1
-        with pytest.raises(ValueError, match="nextn_predict_layers"):
+        with pytest.raises(ValueError, match=r"nextn[_ ]predict[_ ]layers"):
             gguf_to_config(self._fake_model(md))
 
 
@@ -958,23 +965,116 @@ class TestQwen35RopeInterleave:
             "qwen35.full_attention_interval": 4,
             "qwen35.rope.dimension_count": 64,
             "qwen35.rope.freq_base": 1e7,
+            "qwen35.rope.dimension_sections": [11, 11, 10, 0],
+            "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+            "qwen35.ssm.conv_kernel": 4,
+            "qwen35.ssm.group_count": 4,
+            "qwen35.ssm.inner_size": 4096,
+            "qwen35.ssm.state_size": 128,
+            "qwen35.ssm.time_step_rank": 32,
         }
 
     def test_dimension_sections_do_not_force_interleave(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 
         md = self._base_metadata()
-        md["qwen35.rope.dimension_sections"] = [11, 11, 10, 0]
         config = gguf_to_config(self._fake_model(md))
 
         assert config.rope_interleave is False
 
-    def test_no_sections_still_not_interleaved(self) -> None:
+    def test_missing_sections_fail_closed(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 
-        config = gguf_to_config(self._fake_model(self._base_metadata()))
+        md = self._base_metadata()
+        del md["qwen35.rope.dimension_sections"]
 
-        assert config.rope_interleave is False
+        with pytest.raises(ValueError, match=r"rope\.dimension_sections"):
+            gguf_to_config(self._fake_model(md))
+
+
+class TestHybridScheduleExtraction:
+    @staticmethod
+    def _qwen_metadata(architecture: str = "qwen35") -> dict:
+        return {f"{architecture}.block_count": 5}
+
+    def test_explicit_recurrent_schedule_wins_over_interval(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        md = self._qwen_metadata()
+        md["qwen35.full_attention_interval"] = 2
+        md["qwen35.attention.recurrent_layers"] = [True, False, False, True, False]
+
+        layers, schedule, mtp = _derive_hybrid_layout("qwen35", md)
+
+        assert layers == 5
+        assert mtp == 0
+        assert schedule == [
+            "linear_attention",
+            "full_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ]
+
+    def test_default_interval_is_four_and_mtp_is_full_attention(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        md = self._qwen_metadata("qwen3next")
+        md["qwen3next.nextn_predict_layers"] = 1
+
+        layers, schedule, mtp = _derive_hybrid_layout("qwen3next", md)
+
+        assert (layers, mtp) == (4, 1)
+        assert schedule == [
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ]
+
+    def test_dotted_nextn_metadata_is_rejected(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        md = self._qwen_metadata("qwen3next")
+        md["qwen3next.nextn.predict_layers"] = 1
+
+        with pytest.raises(ValueError, match="non-pinned MTP metadata key"):
+            _derive_hybrid_layout("qwen3next", md)
+
+    @pytest.mark.parametrize(
+        ("updates", "message"),
+        [
+            ({"qwen35.attention.recurrent_layers": [True]}, "exactly 5"),
+            ({"qwen35.full_attention_interval": 0}, "must be positive"),
+            (
+                {
+                    "qwen35.nextn_predict_layers": 1,
+                    "qwen35.attention.recurrent_layers": [True] * 5,
+                },
+                "MTP block as recurrent",
+            ),
+        ],
+    )
+    def test_malformed_qwen_schedule_is_rejected(self, updates, message) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        md = {**self._qwen_metadata(), **updates}
+        with pytest.raises(ValueError, match=message):
+            _derive_hybrid_layout("qwen35", md)
+
+    def test_lfm2_schedule_comes_only_from_kv_head_array(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        md = {
+            "lfm2.block_count": 4,
+            "lfm2.attention.head_count_kv": [0, 2, 0, 2],
+        }
+        _, schedule, _ = _derive_hybrid_layout("lfm2", md)
+        assert schedule == ["conv", "full_attention", "conv", "full_attention"]
+
+        md["lfm2.attention.head_count_kv"] = 2
+        with pytest.raises(ValueError, match="per-layer array"):
+            _derive_hybrid_layout("lfm2", md)
 
 
 class TestMuseGlimmerPostprocess:

@@ -37,6 +37,12 @@ def _write_qwen35_mtp_gguf(
     quantized: bool = False,
     mtp_count: int = 1,
     mtp_aux_suffix: str | None = None,
+    dedicated_embedding: bool = False,
+    dedicated_norm: bool = True,
+    dedicated_head: bool = False,
+    tied_output: bool = True,
+    unknown_nextn: bool = False,
+    quantized_backbone_embedding: bool = False,
 ) -> None:
     """Write a tiny Qwen3.5 GGUF with a trailing ``blk.1.nextn.*`` MTP head."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -54,6 +60,16 @@ def _write_qwen35_mtp_gguf(
     # UINT32 == GGUFValueType 4.
     writer.add_key_value(f"{architecture}.nextn_predict_layers", mtp_count, 4)
     writer.add_key_value(f"{architecture}.attention.key_length", _HD, 4)
+    writer.add_array(
+        f"{architecture}.attention.recurrent_layers",
+        [False] * (1 + mtp_count),
+    )
+    writer.add_array(f"{architecture}.rope.dimension_sections", [4, 4, 0, 0])
+    writer.add_ssm_conv_kernel(3)
+    writer.add_ssm_inner_size(32)
+    writer.add_ssm_state_size(16)
+    writer.add_ssm_time_step_rank(2)
+    writer.add_ssm_group_count(2)
 
     def f32(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
@@ -101,11 +117,23 @@ def _write_qwen35_mtp_gguf(
             f32(f"blk.{index}.nextn.eh_proj.{mtp_aux_suffix}", (1,))
         f32(f"blk.{index}.nextn.enorm.weight", (_H,))
         f32(f"blk.{index}.nextn.hnorm.weight", (_H,))
-        f32(f"blk.{index}.nextn.shared_head_norm.weight", (_H,))
+        if dedicated_embedding:
+            matrix(f"blk.{index}.nextn.embed_tokens.weight", (_VOCAB, _H))
+        if dedicated_norm:
+            f32(f"blk.{index}.nextn.shared_head_norm.weight", (_H,))
+        if dedicated_head:
+            matrix(f"blk.{index}.nextn.shared_head_head.weight", (_VOCAB, _H))
+        if unknown_nextn:
+            f32(f"blk.{index}.nextn.unknown.weight", (_H,))
         _add_decoder_block(index)
 
-    f32("token_embd.weight", (_VOCAB, _H))
+    if quantized_backbone_embedding:
+        matrix("token_embd.weight", (_VOCAB, _H))
+    else:
+        f32("token_embd.weight", (_VOCAB, _H))
     f32("output_norm.weight", (_H,))
+    if not tied_output:
+        matrix("output.weight", (_VOCAB, _H))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -133,6 +161,14 @@ class TestMtpNameMapping:
         )
         assert (
             map_gguf_mtp_to_hf_names("blk.1.nextn.shared_head_norm.weight", 1) == "norm.weight"
+        )
+        assert (
+            map_gguf_mtp_to_hf_names("blk.1.nextn.embed_tokens.weight", 1)
+            == "embed_tokens.weight"
+        )
+        assert (
+            map_gguf_mtp_to_hf_names("blk.1.nextn.shared_head_head.weight", 1)
+            == "lm_head.weight"
         )
         assert map_gguf_mtp_to_hf_names("blk.1.nextn.eh_proj.bias", 1) == "fc.bias"
         assert map_gguf_mtp_to_hf_names("blk.1.nextn.eh_proj.scale", 1) == "fc.scale"
@@ -261,10 +297,82 @@ class TestBuildMtpHead:
         monkeypatch.setattr(core_builder, "build_from_module", _unexpected_build)
         with pytest.raises(
             ValueError,
-            match=r"nextn_predict_layers=2.*exactly one MTP sidecar head",
+            match=r"has 2 MTP blocks.*exactly one appended MTP block",
         ):
             build_from_gguf(str(path))
         assert built is False
+
+    @pytest.mark.parametrize("dedicated_embedding", [False, True])
+    @pytest.mark.parametrize("dedicated_norm", [False, True])
+    @pytest.mark.parametrize("dedicated_head", [False, True])
+    @pytest.mark.parametrize("tied_output", [False, True])
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_optional_tables_use_exact_dedicated_or_fallback_contract(
+        self,
+        tmp_path: Path,
+        dedicated_embedding: bool,
+        dedicated_norm: bool,
+        dedicated_head: bool,
+        tied_output: bool,
+        quantized: bool,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "mtp-tables.gguf"
+        _write_qwen35_mtp_gguf(
+            path,
+            quantized=quantized,
+            dedicated_embedding=dedicated_embedding,
+            dedicated_norm=dedicated_norm,
+            dedicated_head=dedicated_head,
+            tied_output=tied_output,
+        )
+        preserve_quantization = quantized and not (dedicated_embedding or dedicated_head)
+        if quantized and not preserve_quantization:
+            with pytest.raises(
+                ValueError,
+                match=r"Cannot keep Q4_0 (?:embedding|output) .* quantized",
+            ):
+                build_from_gguf(path, keep_quantized=True)
+        package = build_from_gguf(path, keep_quantized=preserve_quantization)
+        head = package.mtp_head
+        assert head is not None
+        target_initializers = package["model"].graph.initializers
+        assert "model.embed_tokens.weight" in target_initializers
+        if tied_output:
+            assert not any(name.startswith("lm_head.") for name in target_initializers)
+        elif preserve_quantization:
+            assert {
+                "lm_head.weight",
+                "lm_head.scales",
+                "lm_head.zero_points",
+            }.issubset(target_initializers)
+        else:
+            assert "lm_head.weight_t" in target_initializers
+        model = head["model"]
+        inputs = {value.name for value in model.graph.inputs}
+        outputs = {value.name for value in model.graph.outputs}
+        initializers = model.graph.initializers
+
+        assert ("input_ids" in inputs) is dedicated_embedding
+        assert ("inputs_embeds" in inputs) is not dedicated_embedding
+        assert ("embed_tokens.weight" in initializers) is dedicated_embedding
+        assert ("logits" in outputs) is dedicated_head
+        assert ("mtp_hidden" in outputs) is not dedicated_head
+        assert ("lm_head.weight_t" in initializers) is dedicated_head
+        assert "norm.weight" in initializers
+        assert all(value.const_value is not None for value in initializers.values())
+        norm_source = (
+            "blk.1.nextn.shared_head_norm.weight" if dedicated_norm else "output_norm.weight"
+        )
+        expected_norm = GGUFModel(path).get_tensor(norm_source) - 1.0
+        np.testing.assert_allclose(
+            initializers["norm.weight"].const_value.numpy(),
+            expected_norm,
+            rtol=0,
+            atol=0,
+        )
 
     def test_no_head_when_gguf_lacks_nextn(self):
         # A config with no MTP metadata must not build a head.
@@ -280,6 +388,29 @@ class TestBuildMtpHead:
             )
             is None
         )
+
+    def test_tied_quantized_target_head_uses_embedding_initializers(self, tmp_path):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "tied-quantized-tables.gguf"
+        _write_qwen35_mtp_gguf(
+            path,
+            quantized=True,
+            tied_output=True,
+            quantized_backbone_embedding=True,
+        )
+        package = build_from_gguf(path, keep_quantized=True)
+        assert package.config.tie_word_embeddings
+        assert package.config.quantization is not None
+        assert package.config.quantization.quantize_embeddings
+        assert package.config.quantization.quantize_lm_head
+        initializers = package["model"].graph.initializers
+        assert {
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
+        }.issubset(initializers)
+        assert not any(name.startswith("lm_head.") for name in initializers)
 
 
 class TestMtpAutoDetect:
@@ -336,11 +467,76 @@ class TestMtpAutoDetect:
         assert head is not None
         output_names = {v.name for v in head["model"].graph.outputs}
         assert "mtp_hidden" in output_names
-        # The backbone must expose the final-layer hidden-state seed
-        # (hidden_states.{num_hidden_layers-1}) that the head consumes.
+        # The ordinary layer capture remains pre-final-norm, while MTP gets a
+        # dedicated post-final-norm seed.
         seed = pkg.config.num_hidden_layers - 1
         main_outputs = {v.name for v in pkg["model"].graph.outputs}
         assert f"hidden_states.{seed}" in main_outputs
+        assert "mtp_seed" in main_outputs
+
+    def test_mtp_seed_is_post_final_norm(self, qwen35_mtp_gguf: Path, tmp_path: Path):
+        import onnxruntime as ort
+
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        pkg = build_from_gguf(qwen35_mtp_gguf, keep_quantized=False)
+        output_dir = tmp_path / "model"
+        pkg.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        pre_norm, mtp_seed = session.run(
+            ["hidden_states.0", "mtp_seed"],
+            {
+                "input_ids": np.array([[1, 2]], dtype=np.int64),
+                "attention_mask": np.ones((1, 2), dtype=np.int64),
+                "position_ids": np.array([[0, 1]], dtype=np.int64),
+                "past_key_values.0.key": np.empty((1, _NKV, 0, _HD), dtype=np.float32),
+                "past_key_values.0.value": np.empty((1, _NKV, 0, _HD), dtype=np.float32),
+            },
+        )
+        norm_weight = GGUFModel(qwen35_mtp_gguf).get_tensor("output_norm.weight")
+        expected = (
+            pre_norm
+            * norm_weight
+            / np.sqrt(np.mean(np.square(pre_norm), axis=-1, keepdims=True) + 1e-5)
+        )
+        np.testing.assert_allclose(mtp_seed, expected, rtol=1e-5, atol=1e-5)
+        assert not np.allclose(mtp_seed, pre_norm)
+
+    def test_moe_mtp_is_rejected_before_graph_build(self, tmp_path: Path, monkeypatch):
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "qwen35moe-mtp.gguf"
+        _write_qwen35_mtp_gguf(path, architecture="qwen35moe")
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *_args, **_kwargs: pytest.fail("graph construction must not run"),
+        )
+
+        with pytest.raises(NotImplementedError, match="MTP blocks use routed experts"):
+            build_from_gguf(path)
+
+    def test_unknown_nextn_tensor_is_rejected_before_graph_build(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "unknown-nextn.gguf"
+        _write_qwen35_mtp_gguf(path, unknown_nextn=True)
+        monkeypatch.setattr(
+            core_builder,
+            "build_from_module",
+            lambda *_args, **_kwargs: pytest.fail("graph construction must not run"),
+        )
+
+        with pytest.raises(ValueError, match="unsupported nextn tensor"):
+            build_from_gguf(path)
 
     def test_mtp_survives_dtype_replace(self, qwen35_mtp_gguf: Path):
         # Regression: an explicit dtype triggers dataclasses.replace on the

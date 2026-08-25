@@ -2048,6 +2048,7 @@ class _MtpBackboneConfig:
     num_hidden_layers: int = 64
     hidden_size: int = 5120
     vocab_size: int = 248320
+    tie_word_embeddings: bool = False
 
 
 def _seed_backbone_metadata(directory: Path) -> str:
@@ -2200,7 +2201,7 @@ class TestMtpSpeculatorMetadata:
             "target": "decoder",
             "proposal_execution": {"kind": "block"},
             "port_bindings": {"target_hidden_context": "hidden_states"},
-            "shared_weights": ["lm_head.weight", "model.embed_tokens.weight"],
+            "shared_weights": ["lm_head.weight_t", "model.embed_tokens.weight"],
             "vocabulary": {"kind": "identical"},
             "max_proposal_width": 1,
             "distribution_preserving": True,
@@ -2242,12 +2243,138 @@ class TestMtpSpeculatorMetadata:
         roles = workflow["components"]["mtp"]["ports"]["roles"]
         assert roles["hidden_states"] == "hidden_states"
         assert roles["inputs_embeds"] == "inputs_embeds"
-        # The target output the head is seeded from is named by role, not by a
-        # free-form ``target_hidden_output`` string.
+        # Only the dedicated post-final-norm seed receives the hidden-state
+        # role; hidden_states.N remains the pre-final-norm capture ABI.
         assert (
-            workflow["components"]["decoder"]["ports"]["roles"]["hidden_states.63"]
-            == "hidden_states"
+            workflow["components"]["decoder"]["ports"]["roles"]["mtp_seed"] == "hidden_states"
         )
+        assert "hidden_states.63" not in workflow["components"]["decoder"]["ports"]["roles"]
+
+    @pytest.mark.parametrize("dedicated_embedding", [False, True])
+    @pytest.mark.parametrize("dedicated_head", [False, True])
+    @pytest.mark.parametrize("tied_output", [False, True])
+    def test_dedicated_tables_control_ports_and_shared_weights(
+        self,
+        tmp_path,
+        dedicated_embedding,
+        dedicated_head,
+        tied_output,
+    ):
+        _seed_backbone_metadata(tmp_path)
+        proposer = dataclasses.make_dataclass(
+            "ProposerConfig",
+            [
+                ("use_dedicated_embeddings", bool),
+                ("use_dedicated_lm_head", bool),
+            ],
+        )(dedicated_embedding, dedicated_head)
+        out = write_mtp_speculator_metadata(
+            str(tmp_path),
+            backbone_config=_MtpBackboneConfig(tie_word_embeddings=tied_output),
+            proposer_config=proposer,
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            metadata = yaml.safe_load(handle)
+        spec = metadata["speculative"]
+        roles = metadata["pipeline"]["workflow"]["components"]["mtp"]["ports"]["roles"]
+
+        assert ("input_ids" in roles) is dedicated_embedding
+        assert ("inputs_embeds" in roles) is not dedicated_embedding
+        assert ("logits" in roles) is dedicated_head
+        assert ("mtp_hidden" in roles) is not dedicated_head
+        expected_shared = []
+        if not dedicated_embedding:
+            expected_shared.append("model.embed_tokens.weight")
+        if not dedicated_head:
+            expected_shared.append(
+                "model.embed_tokens.weight" if tied_output else "lm_head.weight_t"
+            )
+        if expected_shared:
+            assert spec["shared_weights"] == sorted(set(expected_shared))
+        else:
+            assert "shared_weights" not in spec
+        with open(_onnx_genai_schema_path()) as handle:
+            jsonschema.validate(instance=metadata, schema=json.load(handle))
+
+    def test_quantized_fallback_lists_every_required_initializer(self, tmp_path):
+        from mobius._configs import QuantizationConfig
+
+        _seed_backbone_metadata(tmp_path)
+        backbone = _MtpBackboneConfig()
+        backbone.quantization = QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="gguf",
+            sym=False,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+        )
+        out = write_mtp_speculator_metadata(str(tmp_path), backbone_config=backbone)
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            spec = yaml.safe_load(handle)["speculative"]
+        assert spec["shared_weights"] == [
+            "lm_head.scales",
+            "lm_head.weight",
+            "lm_head.zero_points",
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
+        ]
+
+    def test_explicit_lm_head_initializer_overrides_inferred_tying(self, tmp_path):
+        _seed_backbone_metadata(tmp_path)
+        out = write_mtp_speculator_metadata(
+            str(tmp_path),
+            backbone_config=_MtpBackboneConfig(tie_word_embeddings=True),
+            lm_head_weights="decoder.shared_output.weight",
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            spec = yaml.safe_load(handle)["speculative"]
+        assert spec["shared_weights"] == [
+            "decoder.shared_output.weight",
+            "model.embed_tokens.weight",
+        ]
+
+    @pytest.mark.parametrize("dedicated_embedding", [False, True])
+    def test_tied_quantized_head_fallback_uses_embedding_initializers(
+        self, tmp_path, dedicated_embedding
+    ):
+        from mobius._configs import QuantizationConfig
+
+        _seed_backbone_metadata(tmp_path)
+        backbone = _MtpBackboneConfig(tie_word_embeddings=False)
+        backbone.quantization = QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="gguf",
+            sym=False,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+            tie_word_embeddings=True,
+        )
+        proposer = dataclasses.make_dataclass(
+            "TiedProposerConfig",
+            [
+                ("use_dedicated_embeddings", bool),
+                ("use_dedicated_lm_head", bool),
+            ],
+        )(dedicated_embedding, False)
+        out = write_mtp_speculator_metadata(
+            str(tmp_path),
+            backbone_config=backbone,
+            proposer_config=proposer,
+        )
+        assert out is not None
+        with open(out, encoding="utf-8") as handle:
+            spec = yaml.safe_load(handle)["speculative"]
+        assert spec["shared_weights"] == [
+            "model.embed_tokens.qweight",
+            "model.embed_tokens.scales",
+            "model.embed_tokens.zero_points",
+        ]
 
     def test_rollback_capacity_covers_the_proposal_width(self, tmp_path):
         workflow = self._write(tmp_path)["pipeline"]["workflow"]

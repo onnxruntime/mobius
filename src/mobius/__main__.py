@@ -704,7 +704,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             )
 
             spec_path = write_mtp_speculator_metadata(
-                output_dir, backbone_config=getattr(pkg, "config", None)
+                output_dir,
+                backbone_config=getattr(pkg, "config", None),
+                proposer_config=getattr(mtp_head, "config", None),
             )
             if spec_path is not None:
                 print(f"  speculator: {spec_path}")

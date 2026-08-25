@@ -215,7 +215,10 @@ class CausalLMTask(ModelTask):
                 past_key_values=past_key_values,
             )
         intermediate_hidden_states: list | None = None
-        if len(result) == 3:
+        final_hidden_state: ir.Value | None = None
+        if len(result) == 4:
+            logits, present_key_values, intermediate_hidden_states, final_hidden_state = result
+        elif len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
@@ -250,6 +253,8 @@ class CausalLMTask(ModelTask):
             _register_intermediate_hidden_states(
                 builder, config.output_layer_indices, intermediate_hidden_states
             )
+        if final_hidden_state is not None:
+            builder.add_output(final_hidden_state, "mtp_seed")
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
@@ -373,7 +378,10 @@ class HybridCausalLMTask(ModelTask):
                 past_key_values=past_key_values,
             )
         intermediate_hidden_states: list | None = None
-        if len(result) == 3:
+        final_hidden_state: ir.Value | None = None
+        if len(result) == 4:
+            logits, present_key_values, intermediate_hidden_states, final_hidden_state = result
+        elif len(result) == 3:
             logits, present_key_values, intermediate_hidden_states = result
         else:
             logits, present_key_values = result
@@ -391,6 +399,8 @@ class HybridCausalLMTask(ModelTask):
             _register_intermediate_hidden_states(
                 builder, config.output_layer_indices, intermediate_hidden_states
             )
+        if final_hidden_state is not None:
+            builder.add_output(final_hidden_state, "mtp_seed")
 
         model = _make_model(graph)
         _register_linear_attention_functions(model, config)

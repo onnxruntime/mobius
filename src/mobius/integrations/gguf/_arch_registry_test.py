@@ -80,6 +80,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "gpt2",
         "granitemoe",
         "hunyuan-dense",
+        "lfm2",
         "llada",
         "llada-moe",
         "llama",
@@ -97,6 +98,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "qwen35",
         "qwen35moe",
         "qwen3moe",
+        "qwen3next",
         "rnd1",
         "smollm3",
         "stablelm",
@@ -152,7 +154,7 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 2
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 4
 
     def test_quantized_import_set_is_pinned(self) -> None:
         """Builder acceptance and rejection must come from an explicit policy set."""

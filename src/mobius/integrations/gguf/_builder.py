@@ -571,6 +571,7 @@ def _validate_gguf_model(
         allow_mmproj_companion=allow_mmproj_companion,
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
+    _raise_for_invalid_hybrid_tensor_contract(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
     _raise_for_unsupported_encoder_heads(gguf_model)
@@ -578,6 +579,258 @@ def _validate_gguf_model(
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
+
+
+def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
+    """Enforce pinned per-layer mixer closure before any graph is constructed."""
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+    architecture = gguf_model.architecture
+    if architecture not in {"lfm2", "qwen35", "qwen35moe", "qwen3next"}:
+        return
+
+    metadata = gguf_model.metadata
+    trunk_layers, layer_types, mtp_count = _derive_hybrid_layout(architecture, metadata)
+    assert layer_types is not None
+    if mtp_count > 1:
+        raise ValueError(
+            f"{architecture} GGUF has {mtp_count} MTP blocks; pinned llama.cpp "
+            "supports exactly one appended MTP block"
+        )
+    if mtp_count and architecture in {"qwen35moe", "qwen3next"}:
+        raise NotImplementedError(
+            f"{architecture} GGUF MTP blocks use routed experts, but the Mobius MTP "
+            "sidecar currently supports only dense Qwen3.5 heads; refusing to omit "
+            "the MTP expert tensors"
+        )
+
+    actual = set(gguf_model.tensor_names)
+    total_layers = int(metadata[f"{architecture}.block_count"])
+    for name in actual:
+        match = re.match(r"^blk\.(\d+)\.", name)
+        if match is not None and int(match.group(1)) >= total_layers:
+            raise ValueError(
+                f"{architecture} GGUF tensor {name!r} references out-of-range layer "
+                f"{match.group(1)} (block_count={total_layers})"
+            )
+
+    if architecture == "lfm2":
+        required_global = {"token_embd.weight", "token_embd_norm.weight"}
+        auxiliary = sorted(
+            name
+            for name in actual
+            if name.startswith("dense_2_out.") or name == "output_norm.weight"
+        )
+        if auxiliary:
+            raise ValueError(
+                "lfm2 causal-LM import does not support embedding/ColBERT head "
+                f"tensor(s): {auxiliary}"
+            )
+        common_suffixes = {
+            "attn_norm.weight",
+            "ffn_norm.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        }
+        full_suffixes = {
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+        }
+        recurrent_suffixes = {
+            "shortconv.conv.weight",
+            "shortconv.in_proj.weight",
+            "shortconv.out_proj.weight",
+        }
+    else:
+        required_global = {"token_embd.weight", "output_norm.weight"}
+        common_suffixes = {"attn_norm.weight"}
+        if architecture == "qwen3next":
+            common_suffixes.add("attn_post_norm.weight")
+        else:
+            common_suffixes.add("post_attention_norm.weight")
+        if architecture == "qwen35":
+            common_suffixes.update({"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+        else:
+            common_suffixes.update(
+                {
+                    "ffn_gate_inp.weight",
+                    "ffn_down_exps.weight",
+                    "ffn_gate_inp_shexp.weight",
+                    "ffn_gate_shexp.weight",
+                    "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight",
+                }
+            )
+        full_suffixes = {
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+        }
+        recurrent_suffixes = {
+            "ssm_conv1d.weight",
+            "ssm_dt.bias",
+            "ssm_a",
+            "ssm_norm.weight",
+            "ssm_out.weight",
+        }
+        if architecture == "qwen3next":
+            recurrent_suffixes.add("ssm_ba.weight")
+        else:
+            recurrent_suffixes.update({"ssm_beta.weight", "ssm_alpha.weight"})
+
+    missing_global = sorted(required_global - actual)
+    if missing_global:
+        raise ValueError(
+            f"{architecture} GGUF is missing required global tensor(s): {missing_global}"
+        )
+
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        layer_names = {name[len(prefix) :] for name in actual if name.startswith(prefix)}
+        required = set(common_suffixes)
+        required.update(
+            full_suffixes if layer_type == "full_attention" else recurrent_suffixes
+        )
+
+        if architecture in {"qwen35moe", "qwen3next"}:
+            fused = "ffn_gate_up_exps.weight" in layer_names
+            separate_members = {
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+            }
+            separate = separate_members.issubset(layer_names)
+            if fused and layer_names & separate_members:
+                raise ValueError(
+                    f"{architecture} layer {layer} mixes fused and separate routed-expert "
+                    "gate/up tensors"
+                )
+            if not fused and not separate:
+                raise ValueError(
+                    f"{architecture} layer {layer} must contain exactly one routed-expert "
+                    "gate/up representation (fused or separate)"
+                )
+            required.add("ffn_gate_up_exps.weight" if fused else "ffn_gate_exps.weight")
+            if not fused:
+                required.add("ffn_up_exps.weight")
+
+        if layer_type != "full_attention":
+            if architecture == "qwen3next":
+                modern_members = {
+                    "attn_qkv.weight",
+                    "attn_gate.weight",
+                }
+                modern = modern_members.issubset(layer_names)
+                legacy = "ssm_in.weight" in layer_names
+                if legacy and layer_names & modern_members:
+                    raise ValueError(
+                        f"qwen3next layer {layer} mixes legacy ssm_in with modern "
+                        "attn_qkv/attn_gate tensors"
+                    )
+                if not legacy and not modern:
+                    raise ValueError(
+                        f"qwen3next layer {layer} must contain exactly one recurrent input "
+                        "representation (attn_qkv+attn_gate or ssm_in)"
+                    )
+                required.update(
+                    {"attn_qkv.weight", "attn_gate.weight"} if modern else {"ssm_in.weight"}
+                )
+            elif architecture != "lfm2":
+                required.update({"attn_qkv.weight", "attn_gate.weight"})
+
+        missing = sorted(required - layer_names)
+        if missing:
+            raise ValueError(
+                f"{architecture} {layer_type} layer {layer} is missing required "
+                f"tensor(s): {missing}"
+            )
+
+        wrong_family = recurrent_suffixes if layer_type == "full_attention" else full_suffixes
+        wrong = sorted(layer_names & wrong_family)
+        if layer_type == "full_attention":
+            wrong.extend(
+                sorted(
+                    layer_names
+                    & {
+                        "attn_qkv.weight",
+                        "attn_gate.weight",
+                        "ssm_in.weight",
+                    }
+                )
+            )
+        if wrong:
+            raise ValueError(
+                f"{architecture} layer {layer} contains tensor(s) from the wrong "
+                f"{layer_type} mixer family: {sorted(set(wrong))}"
+            )
+
+    if mtp_count:
+        mtp_layer = trunk_layers
+        prefix = f"blk.{mtp_layer}."
+        layer_names = {name[len(prefix) :] for name in actual if name.startswith(prefix)}
+        required_block = set(common_suffixes) | set(full_suffixes)
+        if architecture in {"qwen35moe", "qwen3next"}:
+            fused = "ffn_gate_up_exps.weight" in layer_names
+            separate_members = {
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+            }
+            separate = separate_members.issubset(layer_names)
+            if fused and layer_names & separate_members:
+                raise ValueError(
+                    f"{architecture} MTP block mixes fused and separate routed-expert "
+                    "gate/up tensors"
+                )
+            if not fused and not separate:
+                raise ValueError(
+                    f"{architecture} MTP block must contain exactly one routed-expert "
+                    "gate/up representation (fused or separate)"
+                )
+            required_block.add("ffn_gate_up_exps.weight" if fused else "ffn_gate_exps.weight")
+            if not fused:
+                required_block.add("ffn_up_exps.weight")
+        missing_block = sorted(required_block - layer_names)
+        if missing_block:
+            raise ValueError(
+                f"{architecture} MTP block is missing full-attention/FFN tensor(s): "
+                f"{missing_block}"
+            )
+        required_mtp = {
+            f"blk.{mtp_layer}.nextn.eh_proj.weight",
+            f"blk.{mtp_layer}.nextn.enorm.weight",
+            f"blk.{mtp_layer}.nextn.hnorm.weight",
+        }
+        missing_mtp = sorted(required_mtp - actual)
+        if missing_mtp:
+            raise ValueError(
+                f"{architecture} GGUF declares an MTP block but is missing tensor(s): "
+                f"{missing_mtp}"
+            )
+        known_nextn = {
+            "nextn.eh_proj.weight",
+            "nextn.enorm.weight",
+            "nextn.hnorm.weight",
+            "nextn.embed_tokens.weight",
+            "nextn.shared_head_norm.weight",
+            "nextn.shared_head_head.weight",
+        }
+        unknown_nextn = sorted(
+            name
+            for name in layer_names
+            if name.startswith("nextn.") and name not in known_nextn
+        )
+        if unknown_nextn:
+            raise ValueError(
+                f"{architecture} MTP block contains unsupported nextn tensor(s): "
+                f"{unknown_nextn}"
+            )
 
 
 def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
@@ -1248,6 +1501,24 @@ def build_from_gguf(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
             "they carry per-layer conv_state and ssm_state rather than a KV cache."
         )
+    if gguf_arch in {"lfm2", "qwen35", "qwen35moe", "qwen3next"}:
+        from mobius.tasks import HybridCausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                f"static_cache=True is not supported for hybrid {gguf_arch} GGUF models; "
+                "attention layers carry KV while recurrent layers carry architecture-"
+                "specific conv/recurrent state."
+            )
+        if (
+            task is not None
+            and task != "hybrid-text-generation"
+            and not isinstance(task, HybridCausalLMTask)
+        ):
+            raise ValueError(
+                f"{gguf_arch} GGUF only supports the mixed-state "
+                f"'hybrid-text-generation' task, got {task!r}"
+            )
     if model_type in {"bert", "modernbert", "t5encoder"}:
         if static_cache:
             raise ValueError("static_cache is not valid for encoder-only GGUF architectures")
@@ -1368,9 +1639,10 @@ def build_from_gguf(
     # ``blk.<N>.nextn.*`` tensors), always emit the MTP sidecar — it is a purely
     # additive artifact that text-only consumers ignore. No opt-in flag: the
     # decision is driven entirely by presence in the source. When present, expose
-    # the backbone's final-layer hidden state as a graph output so the
-    # orchestrator can seed the head with it (must be set before the graph is
-    # built). Direct field assignment (not dataclasses.replace) preserves the
+    # the post-final-norm ``mtp_seed`` output consumed by the orchestrator. Keep
+    # the final layer's ordinary ``hidden_states.N`` capture as the distinct
+    # pre-final-norm ABI; neither output may stand in for the other. These fields
+    # must be set before graph construction. Direct assignment preserves the
     # ``_gguf_*`` metadata attributes on the config. Skipped under static_cache
     # (the head needs the dynamic concat-grow cache), leaving those exports
     # byte-identical to today.
@@ -1394,14 +1666,15 @@ def build_from_gguf(
         )
 
     if emit_mtp_head:
+        config.output_final_hidden_state = True
         seed_index = int(config.num_hidden_layers) - 1
         existing = list(config.output_layer_indices or [])
         if seed_index not in existing:
             existing.append(seed_index)
         config.output_layer_indices = existing
         logger.info(
-            "MTP head detected in source: exposing backbone hidden-state seed "
-            "output hidden_states.%d",
+            "MTP head detected in source: exposing post-final-norm mtp_seed and "
+            "pre-final-norm hidden_states.%d",
             seed_index,
         )
 
@@ -1837,14 +2110,30 @@ def _normalize_gguf_weights(
             result[f"{stem}.key.{suffix}"] = key_value
             result[f"{stem}.value.{suffix}"] = value_projection
             continue
-        # Stacked expert weights [num_experts, out, in] → per-expert
+        # Fused stacked gate/up experts [num_experts, 2*out, ...] are split
+        # before ordinary stacked-expert unpacking. This handles float weights
+        # and packed MatMulNBits companions without dropping either half.
+        fused_marker = ".mlp.experts.gate_up_proj."
+        if fused_marker in key and value.dim() >= 3:
+            prefix, suffix = key.rsplit(fused_marker, 1)
+            if value.shape[1] % 2:
+                raise ValueError(
+                    f"Fused expert tensor {key!r} has odd gate/up width {value.shape[1]}"
+                )
+            gate, up = value.chunk(2, dim=1)
+            for i in range(value.shape[0]):
+                result[f"{prefix}.mlp.experts.{i}.gate_proj.{suffix}"] = gate[i]
+                result[f"{prefix}.mlp.experts.{i}.up_proj.{suffix}"] = up[i]
+            continue
+
+        # Stacked expert weights [num_experts, out, ...] → per-expert.
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            suffix = f".mlp.experts.{proj}.weight"
-            if key.endswith(suffix) and value.dim() == 3:
-                prefix = key[: -len(suffix)]
+            marker = f".mlp.experts.{proj}."
+            if marker in key and value.dim() >= 3:
+                prefix, suffix = key.rsplit(marker, 1)
                 for i in range(value.shape[0]):
-                    result[f"{prefix}.mlp.experts.{i}.{proj}.weight"] = value[i]
+                    result[f"{prefix}.mlp.experts.{i}.{proj}.{suffix}"] = value[i]
                 unpacked = True
                 break
         if unpacked:
@@ -1857,6 +2146,9 @@ def _normalize_gguf_weights(
 
         # 2D conv1d → [channels, 1, kernel]
         if key.endswith(".conv1d.weight") and value.dim() == 2:
+            result[key] = value.unsqueeze(1)
+            continue
+        if key.endswith(".conv.conv.weight") and value.dim() == 2:
             result[key] = value.unsqueeze(1)
             continue
 

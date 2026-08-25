@@ -17,16 +17,18 @@ The head graph mirrors llama.cpp's NEXTN tensors and vLLM's
     blk.<N>.nextn.enorm            -> pre_fc_norm_embedding   (OffsetRMSNorm)
     blk.<N>.nextn.hnorm            -> pre_fc_norm_hidden       (OffsetRMSNorm)
     blk.<N>.nextn.eh_proj          -> fc                       (2H -> H GEMM)
-    blk.<N>.nextn.shared_head_norm -> norm                     (OffsetRMSNorm)
+    blk.<N>.nextn.embed_tokens     -> embed_tokens             (optional)
+    blk.<N>.nextn.shared_head_norm -> norm                     (optional)
+    blk.<N>.nextn.shared_head_head -> lm_head                  (optional)
     blk.<N>.attn_norm              -> layers.0.input_layernorm
     blk.<N>.attn_q/k/v/output      -> layers.0.self_attn.{q,k,v,o}_proj
     blk.<N>.attn_q_norm/k_norm     -> layers.0.self_attn.{q,k}_norm
     blk.<N>.post_attention_norm    -> layers.0.post_attention_layernorm
     blk.<N>.ffn_gate/up/down       -> layers.0.mlp.{gate,up,down}_proj
 
-The head borrows the target's shared ``embed_tokens`` / ``lm_head`` (it has
-none of its own), so the orchestrator embeds the drafted token, runs the
-head, and decodes ``mtp_hidden`` through the target LM head.
+Absent optional tables fall back exactly to the target embedding, final norm,
+and output head. Dedicated embedding/head tables become sidecar modules;
+fallback embedding/head ownership remains explicit in runtime metadata.
 """
 
 from __future__ import annotations
@@ -50,7 +52,9 @@ _MTP_STEM_MAP: dict[str, str] = {
     "nextn.enorm": "pre_fc_norm_embedding",
     "nextn.hnorm": "pre_fc_norm_hidden",
     "nextn.eh_proj": "fc",
+    "nextn.embed_tokens": "embed_tokens",
     "nextn.shared_head_norm": "norm",
+    "nextn.shared_head_head": "lm_head",
     # The single full-attention decoder layer.
     "attn_norm": "layers.0.input_layernorm",
     "attn_q": "layers.0.self_attn.q_proj",
@@ -108,7 +112,12 @@ def has_mtp_head(config) -> bool:
     return bool(getattr(config, "_gguf_mtp_block_indices", None))
 
 
-def derive_mtp_config(config):
+def derive_mtp_config(
+    config,
+    *,
+    use_dedicated_embeddings: bool = False,
+    use_dedicated_lm_head: bool = False,
+):
     """Derive a :class:`Qwen35MtpConfig` from the resolved backbone *config*.
 
     All dimensions (hidden size, head dim, KV heads, rope, quantization,
@@ -128,6 +137,9 @@ def derive_mtp_config(config):
     fields["num_hidden_layers"] = 1
     fields["layer_types"] = ["full_attention"]
     fields["output_layer_indices"] = None
+    fields["output_final_hidden_state"] = False
+    fields["use_dedicated_embeddings"] = use_dedicated_embeddings
+    fields["use_dedicated_lm_head"] = use_dedicated_lm_head
     mtp_config = Qwen35MtpConfig(**fields)
     # Preserve the model_type so tensor processors / quantization dispatch the
     # same way as the backbone.
@@ -193,11 +205,22 @@ def build_mtp_head_from_gguf(
         )
     mtp_block_index = int(mtp_blocks[0])
     gguf_arch = gguf_model.architecture
+    tensor_names = set(gguf_model.tensor_names)
+    mtp_prefix = f"blk.{mtp_block_index}.nextn."
+    use_dedicated_embeddings = f"{mtp_prefix}embed_tokens.weight" in tensor_names
+    use_dedicated_norm = f"{mtp_prefix}shared_head_norm.weight" in tensor_names
+    use_dedicated_lm_head = f"{mtp_prefix}shared_head_head.weight" in tensor_names
 
-    mtp_config = derive_mtp_config(config)
+    mtp_config = derive_mtp_config(
+        config,
+        use_dedicated_embeddings=use_dedicated_embeddings,
+        use_dedicated_lm_head=use_dedicated_lm_head,
+    )
     module = Qwen35MtpModel(mtp_config)
 
     def _mapper(gguf_name: str, _arch: str) -> str | None:
+        if not use_dedicated_norm and gguf_name == "output_norm.weight":
+            return "norm.weight"
         return map_gguf_mtp_to_hf_names(gguf_name, mtp_block_index)
 
     if preserve_quantization:
