@@ -163,11 +163,26 @@ class GGUFModel:
         if _stat_identity(self._path) != source_identity:
             raise ValueError("GGUF source changed while the reader was opening it")
         self._source_identity = source_identity
+        with self._path.open("rb") as stream:
+            header = stream.read(8)
+        if len(header) != 8 or header[:4] != b"GGUF":
+            raise ValueError(f"Invalid GGUF header in {self._path}")
+        little_version = int.from_bytes(header[4:], byteorder="little")
+        self._format_version = (
+            little_version
+            if little_version <= 0xFFFF
+            else int.from_bytes(header[4:], byteorder="big")
+        )
         self._metadata: dict[str, Any] | None = None
         # Build tensor name → index map for O(1) lookup
         self._tensor_index: dict[str, int] = {
             t.name: i for i, t in enumerate(self._reader.tensors)
         }
+
+    @property
+    def format_version(self) -> int:
+        """GGUF container version parsed from the file header."""
+        return self._format_version
 
     def source_matches_path(self) -> bool:
         """Return whether the path still names the exact file opened by this reader."""

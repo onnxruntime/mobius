@@ -2836,6 +2836,152 @@ class FalconH1Config(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class Plamo2Config(ArchitectureConfig):
+    """Configuration for PLaMo2 alternating Mamba/attention decoder layers."""
+
+    attention_head_counts: tuple[int, ...] = ()
+    attention_kv_head_counts: tuple[int, ...] = ()
+    mamba_num_heads: int = 32
+    mamba_d_state: int = 64
+    mamba_d_conv: int = 4
+    mamba_dt_rank: int = 128
+    mamba_group_count: int = 0
+    attention_window_size: int = 2048
+    use_predefined_initial_state: bool = False
+
+    def __post_init__(self) -> None:
+        if self.hidden_act != "silu":
+            raise ValueError("PLaMo2 supports only hidden_act='silu'")
+        if not math.isclose(self.rms_norm_eps, 1e-6, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("PLaMo2 requires rms_norm_eps=1e-6")
+        if self.mamba_group_count != 0:
+            raise ValueError("PLaMo2 supports only ssm.group_count=0")
+        if self.use_predefined_initial_state:
+            raise ValueError("PLaMo2 predefined initial state is unsupported")
+        if len(self.attention_head_counts) != self.num_hidden_layers:
+            raise ValueError(
+                "PLaMo2 attention_head_counts must contain exactly num_hidden_layers entries"
+            )
+        if len(self.attention_kv_head_counts) != self.num_hidden_layers:
+            raise ValueError(
+                "PLaMo2 attention_kv_head_counts must contain exactly num_hidden_layers entries"
+            )
+        layer_types: list[str] = []
+        for layer, (heads, kv_heads) in enumerate(
+            zip(self.attention_head_counts, self.attention_kv_head_counts)
+        ):
+            if kv_heads == 0:
+                if heads != 0:
+                    raise ValueError(
+                        f"PLaMo2 layer {layer} has head_count={heads} but head_count_kv=0"
+                    )
+                layer_types.append("mamba")
+            else:
+                if heads <= 0 or heads % kv_heads:
+                    raise ValueError(
+                        f"PLaMo2 layer {layer} has invalid attention head geometry "
+                        f"head_count={heads}, head_count_kv={kv_heads}"
+                    )
+                if heads != self.num_attention_heads or kv_heads != self.num_key_value_heads:
+                    raise ValueError(
+                        "PLaMo2 currently requires one shared attention geometry across "
+                        "all attention layers"
+                    )
+                layer_types.append("full_attention")
+        if (
+            not layer_types
+            or "mamba" not in layer_types
+            or "full_attention" not in layer_types
+        ):
+            raise ValueError("PLaMo2 requires both Mamba and attention layers")
+        self.layer_types = layer_types
+        if self.head_dim <= 0 or self.hidden_size != self.num_attention_heads * self.head_dim:
+            raise ValueError("PLaMo2 hidden_size must equal num_attention_heads * head_dim")
+        if self.mamba_num_heads <= 0:
+            raise ValueError("PLaMo2 mamba_num_heads must be positive")
+        if self.mamba_d_state <= 0 or self.mamba_d_conv <= 1 or self.mamba_dt_rank <= 0:
+            raise ValueError(
+                "PLaMo2 Mamba state, convolution, and dt dimensions must be positive"
+            )
+        if self.attention_window_size <= 0:
+            raise ValueError("PLaMo2 attention_window_size must be positive")
+
+    @property
+    def mamba_inner_size(self) -> int:
+        return self.mamba_num_heads * self.head_dim
+
+    @property
+    def mamba_head_dim(self) -> int:
+        return self.head_dim
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Plamo2Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields["hidden_act"] = getattr(config, "hidden_act", None) or "silu"
+        fields["rope_type"] = getattr(config, "rope_type", None) or "default"
+        fields["rope_theta"] = float(
+            getattr(config, "rope_local_theta", getattr(config, "rope_theta", 10_000.0))
+        )
+        fields["head_dim"] = int(getattr(config, "hidden_size_per_head", base.head_dim))
+        fields["partial_rotary_factor"] = 1.0
+        if getattr(config, "full_attention_idx", None):
+            raise ValueError("PLaMo2 full_attention_idx layers are unsupported")
+        layers = base.num_hidden_layers
+        explicit_heads = getattr(config, "attention_head_counts", None)
+        explicit_kv_heads = getattr(config, "attention_kv_head_counts", None)
+        if explicit_heads is not None or explicit_kv_heads is not None:
+            if explicit_heads is None or explicit_kv_heads is None:
+                raise ValueError(
+                    "PLaMo2 per-layer attention head arrays must be supplied together"
+                )
+            head_counts = tuple(int(value) for value in explicit_heads)
+            kv_head_counts = tuple(int(value) for value in explicit_kv_heads)
+        else:
+            mamba_enabled = bool(getattr(config, "mamba_enabled", True))
+            mamba_step = int(getattr(config, "mamba_step", 2))
+            if mamba_enabled and mamba_step <= 1:
+                raise ValueError("PLaMo2 mamba_step must be greater than one")
+
+            def is_mamba(layer: int) -> bool:
+                if not mamba_enabled:
+                    return False
+                if layers <= mamba_step // 2:
+                    return layer != layers - 1
+                return layer % mamba_step != mamba_step // 2
+
+            head_counts = tuple(
+                0 if is_mamba(i) else base.num_attention_heads for i in range(layers)
+            )
+            kv_head_counts = tuple(
+                0 if is_mamba(i) else base.num_key_value_heads for i in range(layers)
+            )
+
+        return cls(
+            **fields,
+            attention_head_counts=head_counts,
+            attention_kv_head_counts=kv_head_counts,
+            mamba_num_heads=int(getattr(config, "mamba_num_heads", 32)),
+            mamba_d_state=int(getattr(config, "mamba_d_state", 64)),
+            mamba_d_conv=int(getattr(config, "mamba_d_conv", 4)),
+            mamba_dt_rank=int(
+                getattr(config, "mamba_dt_rank", max(64, base.hidden_size // 16))
+            ),
+            mamba_group_count=int(getattr(config, "mamba_group_count", 0)),
+            attention_window_size=int(
+                getattr(
+                    config,
+                    "attention_window_size",
+                    getattr(config, "sliding_window", 2048),
+                )
+            ),
+            use_predefined_initial_state=bool(
+                getattr(config, "use_predefined_initial_state", False)
+            ),
+        )
+
+
+@dataclasses.dataclass
 class GraniteMoeHybridConfig(BambaConfig):
     """Configuration for GraniteMoeHybrid: Mamba2+Attention hybrid with MoE on all layers.
 

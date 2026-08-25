@@ -318,6 +318,21 @@ def _process_mamba(
     return state_dict
 
 
+def _process_plamo2(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Apply PLaMo2's exact GGUF-to-graph value and shape transforms."""
+    state_dict = _process_mamba(state_dict, config)
+    # llama.cpp has already folded the official additive norm constants.
+    # Preserve those serialized float values exactly through model preprocessing.
+    config._plamo2_norms_are_folded = True
+    for name in tuple(state_dict):
+        if name.endswith(".dt_proj.bias"):
+            state_dict[name.removesuffix(".dt_proj.bias") + ".dt_bias"] = state_dict.pop(name)
+    return state_dict
+
+
 def _process_granitehybrid(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -355,6 +370,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "muse_glimmer": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
+    "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
 }
 

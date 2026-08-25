@@ -1,0 +1,19 @@
+model_id: "pfnet/plamo-2-1b"
+model_type: "plamo2"
+revision: "92c75fd6eea9018bcb9c33ee8921589febe071fa"
+task_type: "text-generation"
+dtype: "float32"
+trust_remote_code: true
+
+inputs:
+  prompts:
+    - "The future of local inference is"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Dedicated alternating Mamba1 and local-attention graph with mixed recurrent/KV state."
+skip_reason: "The smallest public checkpoint is 5.16 GB, and released ORT GenAI cannot represent the heterogeneous state ABI; runtime validation is deferred to onnxruntime/mobius#605."

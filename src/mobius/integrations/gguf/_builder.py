@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = ["build_from_gguf"]
 
 import logging
+import math
 import re
 import struct
 from collections import Counter
@@ -613,6 +614,7 @@ def _validate_gguf_model(
     validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
+    _raise_for_invalid_plamo2_tensor_contract(gguf_model)
     _raise_for_invalid_hybrid_tensor_contract(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
@@ -1066,6 +1068,178 @@ def _raise_for_invalid_falcon_h1_tensor_contract(gguf_model) -> None:
             raise ValueError(
                 f"Malformed Falcon-H1 GGUF Mamba decay tensor {decay_name!r}: "
                 "ssm_a must contain only finite negative -exp(A_log) values"
+            )
+
+
+def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
+    """Reject any PLaMo2 metadata/tensor topology not implemented exactly."""
+    if gguf_model.architecture != "plamo2":
+        return
+
+    import numpy as np
+
+    metadata = gguf_model.metadata
+    arch = "plamo2"
+    if int(gguf_model.format_version) != 3:
+        raise ValueError(
+            f"PLaMo2 supports only pinned GGUF v3, got v{gguf_model.format_version}"
+        )
+    layers = int(metadata[f"{arch}.block_count"])
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    state = int(metadata[f"{arch}.ssm.state_size"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    group_count = int(metadata[f"{arch}.ssm.group_count"])
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    if min(layers, hidden, intermediate, inner, state, conv, ssm_heads) <= 0:
+        raise ValueError("PLaMo2 dimensions must all be positive")
+    if inner % ssm_heads:
+        raise ValueError("PLaMo2 requires an exact SSM head split")
+    if group_count != 0:
+        raise ValueError("PLaMo2 supports only ssm.group_count=0")
+    if not math.isclose(epsilon, 1e-6, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError("PLaMo2 requires attention.layer_norm_rms_epsilon=1e-6")
+    activation = metadata.get(f"{arch}.feed_forward.activation", "silu")
+    if activation not in {"silu", "swiglu"}:
+        raise ValueError(f"PLaMo2 supports only fused SwiGLU, got {activation!r}")
+    if bool(metadata.get(f"{arch}.ssm.use_predefined_initial_state", False)):
+        raise ValueError("PLaMo2 predefined initial state is unsupported")
+
+    head_counts = metadata[f"{arch}.attention.head_count"]
+    kv_counts = metadata[f"{arch}.attention.head_count_kv"]
+    if not isinstance(head_counts, (list, tuple, np.ndarray)) or not isinstance(
+        kv_counts, (list, tuple, np.ndarray)
+    ):
+        raise TypeError("PLaMo2 attention head counts must be per-layer arrays")
+    head_counts = [int(value) for value in head_counts]
+    kv_counts = [int(value) for value in kv_counts]
+    if len(head_counts) != layers or len(kv_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+
+    actual_shapes = {
+        name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))
+        for name in gguf_model.tensor_names
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (
+            int(
+                metadata.get(
+                    f"{arch}.vocab_size",
+                    actual_shapes.get("token_embd.weight", (0,))[0],
+                )
+            ),
+            hidden,
+        ),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (required["token_embd.weight"][0], hidden)
+    }
+    dt_rank = max(64, hidden // 16)
+    inferred_widths: set[tuple[int, int]] = set()
+    for layer, (heads, kv_heads) in enumerate(zip(head_counts, kv_counts)):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "post_attention_norm": (hidden,),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "post_ffw_norm": (hidden,),
+                prefix + "ffn_up.weight": (2 * intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+        )
+        if kv_heads == 0:
+            if heads != 0:
+                raise ValueError(
+                    f"PLaMo2 layer {layer} has head_count={heads} but head_count_kv=0"
+                )
+            required.update(
+                {
+                    prefix + "ssm_in.weight": (2 * inner, hidden),
+                    prefix + "ssm_conv1d.weight": (inner, conv),
+                    prefix + "ssm_x.weight": (2 * state + dt_rank, inner),
+                    prefix + "ssm_dt.weight": (ssm_heads, dt_rank),
+                    prefix + "ssm_dt.bias": (ssm_heads,),
+                    prefix + "ssm_a": (ssm_heads,),
+                    prefix + "ssm_d": (ssm_heads,),
+                    prefix + "ssm_dt_norm": (dt_rank,),
+                    prefix + "ssm_b_norm": (state,),
+                    prefix + "ssm_c_norm": (state,),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+        else:
+            if heads <= 0 or heads % kv_heads:
+                raise ValueError(f"PLaMo2 layer {layer} has invalid attention head geometry")
+            qkv_name = prefix + "attn_qkv.weight"
+            output_name = prefix + "attn_output.weight"
+            if qkv_name not in actual_shapes or output_name not in actual_shapes:
+                continue
+            value_width, value_remainder = divmod(actual_shapes[output_name][1], heads)
+            key_width, key_remainder = divmod(
+                actual_shapes[qkv_name][0] - kv_heads * value_width,
+                heads + kv_heads,
+            )
+            if value_remainder or key_remainder or min(key_width, value_width) <= 0:
+                raise ValueError(
+                    f"PLaMo2 layer {layer} key/value widths cannot be inferred exactly"
+                )
+            inferred_widths.add((key_width, value_width))
+            required.update(
+                {
+                    qkv_name: (
+                        heads * key_width + kv_heads * key_width + kv_heads * value_width,
+                        hidden,
+                    ),
+                    prefix + "attn_q_norm.weight": (heads, key_width),
+                    prefix + "attn_k_norm.weight": (kv_heads, key_width),
+                    output_name: (hidden, heads * value_width),
+                }
+            )
+
+    if len(inferred_widths) != 1:
+        raise ValueError("PLaMo2 attention tensor widths are missing or contradictory")
+    key_width, value_width = inferred_widths.pop()
+    if key_width != value_width or key_width * max(head_counts) != hidden:
+        raise ValueError("PLaMo2 attention widths do not reconstruct embedding_length")
+    if inner != ssm_heads * key_width:
+        raise ValueError(
+            "PLaMo2 ssm.inner_size must equal ssm.time_step_rank * attention key width"
+        )
+    for suffix, expected in (
+        ("attention.key_length", key_width),
+        ("attention.value_length", value_width),
+    ):
+        explicit = metadata.get(f"{arch}.{suffix}")
+        if explicit is not None and int(explicit) != expected:
+            raise ValueError(f"PLaMo2 {suffix} contradicts exact tensor shapes")
+
+    actual = set(actual_shapes)
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual_shapes[name])
+        for name in allowed & actual
+        if actual_shapes[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid PLaMo2 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+    for layer, kv_heads in enumerate(kv_counts):
+        if kv_heads:
+            continue
+        decay_name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(decay_name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed PLaMo2 decay tensor {decay_name!r}: "
+                "ssm_a must contain finite negative -exp(A_log) values"
             )
 
 
@@ -2279,6 +2453,22 @@ def build_from_gguf(
             raise ValueError(
                 "falcon-h1 GGUF only supports the dedicated "
                 "'falcon-h1-text-generation' four-state task"
+            )
+    if gguf_arch == "plamo2":
+        from mobius.tasks import Plamo2CausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for plamo2 GGUF models; "
+                "heterogeneous per-layer recurrent and KV states require the dynamic ABI"
+            )
+        if (
+            task is not None
+            and task != "plamo2-text-generation"
+            and not isinstance(task, Plamo2CausalLMTask)
+        ):
+            raise ValueError(
+                "plamo2 GGUF only supports the dedicated 'plamo2-text-generation' task"
             )
     if gguf_arch in {
         "lfm2",

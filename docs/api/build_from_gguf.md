@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 89, 'rejected': 3, 'supported': 55}; importable: 53; quantized import: {'rejected': 12, 'supported': 135}; runtime: {'deferred': 144, 'rejected': 3} |
+| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 3, 'supported': 56}; importable: 54; quantized import: {'rejected': 12, 'supported': 135}; runtime: {'deferred': 144, 'rejected': 3} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become exact-copy only with a validated embedded `tokenizer.huggingface.json` |
@@ -457,7 +457,7 @@ before graph construction or durable output.
 | `phi3` | — | model=`phi3`; tensor=`phi3` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `phimoe` | — | model=`phimoe`; module=`phimoe_gguf`; tensor=`llama`+`phi3`+`moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `plamo` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | PLaMo uses one RMSNorm feeding attention and FFN in parallel, fixed grouped-query geometry, and converter-specific Q/output projection shuffles. Sequential Llama topology and direct external tensor reuse would both be incorrect. |
-| `plamo2` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned PLaMo2 loader requires a dedicated fused-QKV Mamba1/attention graph with sandwich norms and offset transforms that Mobius does not have. |
+| `plamo2` | — | model=`plamo2`; tensor=`plamo2` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The dedicated graph and GGUF importer preserve PLaMo2's alternating Mamba1/attention layers and mixed state ABI, but released ORT GenAI cannot represent heterogeneous per-layer state. Runtime packaging remains deferred to onnxruntime/mobius#605. |
 | `plamo3` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | PLaMo3 requires fused QKV and fused SwiGLU, four norm sites with architecture-specific offset transforms, Q/K norm before RoPE, and alternating full/sliding attention state. Mobius has no exact iSWA schedule or value transform. |
 | `plm` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | PLM uses latent KV projections and normalization with shared RoPE keys, expanded K/V state, tied output, and a non-gated ReLU-squared FFN. Generic MLA cache dimensions do not supply the missing graph or tensor contract. |
 | `pockettts` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. |
@@ -583,9 +583,11 @@ real-artifact full-logit and stateful-generation parity.
 - `static_cache=True` and non-hybrid task dispatch are rejected for these mixed
   state ABIs.
 
-`minimax-01` and `plamo2` are deferred before config extraction. MiniMax-01's
-pinned Lightning schedule and decay/scaling semantics do not match the current
-graph; PLaMo2 needs a dedicated fused-QKV Mamba1/attention graph.
+`minimax-01` remains deferred before config extraction because its pinned
+Lightning schedule and decay/scaling semantics do not match the current graph.
+PLaMo2 has a dedicated alternating Mamba1/attention graph and strict GGUF
+tensor closure. Its mixed per-layer recurrent/KV runtime package remains
+deferred to [`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605).
 
 Falcon-H1 graph/import support is dedicated rather than aliased to Falcon. Every
 layer exposes `(key, value, conv_state, ssm_state)` in that order. Static cache is
