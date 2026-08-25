@@ -77,7 +77,7 @@ _CASES = (
         reference_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
         prompt="Once upon a time,",
         tensor_qtypes={"F16": 211, "F32": 61},
-        config_sha256="134f95e6a635d978737d712ed61ac8959acebdf080eafae838cf97f12c416430",
+        config_sha256="b999a219ddf6046f1b6e5c082dab2d00b7ba1682169914430b1a3672fc735498",
         generated_tokens=(
             665,
             436,

@@ -283,11 +283,11 @@
           "type": "array",
           "items": {
             "enum": [
-              "0.14.1",
               "0.15.2"
             ]
           },
           "minItems": 1,
+          "maxItems": 1,
           "uniqueItems": true,
           "description": "Released onnxruntime-genai versions validated for this route."
         },
@@ -315,13 +315,9 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "0.14.1",
             "0.15.2"
           ],
           "properties": {
-            "0.14.1": {
-              "$ref": "#/$defs/ortGenaiCapabilities"
-            },
             "0.15.2": {
               "$ref": "#/$defs/ortGenaiCapabilities"
             }

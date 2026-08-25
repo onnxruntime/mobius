@@ -21,13 +21,9 @@ concurrency:
 
 jobs:
   fast:
-    name: Fast CPU / OGA ${{ matrix.ort_genai }}
+    name: Fast CPU / OGA 0.15.2
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        ort_genai: ["0.14.1", "0.15.2"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -40,7 +36,7 @@ jobs:
       - name: Install pinned runtime and test dependencies
         run: |
           python -m pip install --disable-pip-version-check \
-            "onnxruntime-genai==${{ matrix.ort_genai }}" \
+            "onnxruntime-genai==0.15.2" \
             "pytest==8.4.2" \
             "pytest-timeout==2.4.0"
           python -m pip install --disable-pip-version-check -e .
@@ -48,7 +44,7 @@ jobs:
         env:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
-          MOBIUS_EXPECTED_ORT_GENAI_VERSION: ${{ matrix.ort_genai }}
+          MOBIUS_EXPECTED_ORT_GENAI_VERSION: "0.15.2"
         run: |
           python -m pytest tests/ort_genai_e2e_test.py \
             -m ort_genai_fast -v --timeout=120 --junitxml=junit-ort-genai-fast.xml
@@ -56,13 +52,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ort-genai-fast-${{ matrix.ort_genai }}
+          name: ort-genai-fast-0.15.2
           path: junit-ort-genai-fast.xml
           retention-days: 14
 
   real-smollm:
     name: Pinned SmolLM F16 CPU / OGA 0.15.2
-    if: github.event_name != 'workflow_call' || inputs.run_real
+    if: inputs.run_real || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:

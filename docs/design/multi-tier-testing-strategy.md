@@ -866,7 +866,7 @@ The test must verify:
 
 | Lane | What it tests | Runtime | CI cadence |
 |------|---------------|---------|------------|
-| Fast | Generated generic `decoder` package, tokenizer load, model creation, prefill, four cache-threaded decode steps, deterministic tokens, save/reload, and malformed config rejection | CPU; `onnxruntime-genai==0.14.1` and `==0.15.2` | Relevant PRs, main, scheduled/manual |
+| Fast | Generated generic `decoder` package, tokenizer load, model creation, prefill, four cache-threaded decode steps, deterministic tokens, save/reload, and malformed config rejection | CPU; latest stable `onnxruntime-genai==0.15.2` | Relevant PRs, main, scheduled/manual |
 | Real | YAML-enrolled immutable artifacts with exact tokenizer provenance, byte budget, deterministic full-length generation, and disposable per-test Hub/Xet caches | CPU; currently `onnxruntime-genai==0.15.2` | Weekly and manual |
 
 Run the lanes locally:
@@ -883,11 +883,11 @@ matching evidence ID. Released lanes use the architecture-neutral
 `model.type=decoder`; main-only `state_groups` metadata is explicitly excluded.
 Changes to graph construction, task wiring, ORT GenAI config generation,
 tokenizer packaging, and GGUF qtype/runtime helpers conservatively select the
-fast E2E matrix through `detect_affected_models.py`.
+fast E2E lane through `detect_affected_models.py`.
 
 CUDA is not a required PR claim. The existing self-hosted GPU lane uses a
-CUDA-12-specific pre-release ORT feed, so adding it to this released-wheel
-matrix would conflate runtime and EP coverage. CUDA runtime E2E remains suitable
+CUDA-12-specific pre-release ORT feed, so adding it to this stable-wheel
+lane would conflate runtime and EP coverage. CUDA runtime E2E remains suitable
 for scheduled/manual validation once that runner can install an equivalently
 pinned released stack.
 

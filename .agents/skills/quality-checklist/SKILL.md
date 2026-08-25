@@ -165,8 +165,8 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 Downstream evidence:
 
-- [ ] The network-free generic decoder test passes with pinned
-      `onnxruntime-genai==0.14.1` and `onnxruntime-genai==0.15.2`.
+- [ ] The network-free generic decoder test passes with the pinned latest stable
+      `onnxruntime-genai==0.15.2`.
 - [ ] Every runtime-supported real route has an `ort_genai` YAML marker with an
       immutable evidence ID, exact tokenizer provenance, bounded download size,
       CPU provider claim, and explicit released-version capabilities.

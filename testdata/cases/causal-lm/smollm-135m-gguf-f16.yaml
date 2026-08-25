@@ -15,7 +15,7 @@ gguf:
     F16: 211
     F32: 61
   execution_provider: "cpu"
-  config_sha256: "134f95e6a635d978737d712ed61ac8959acebdf080eafae838cf97f12c416430"
+  config_sha256: "b999a219ddf6046f1b6e5c082dab2d00b7ba1682169914430b1a3672fc735498"
   preserve_quantization: false
   keep_quantized: true
   tokenizer:
@@ -42,9 +42,6 @@ ort_genai:
   execution_provider: "cpu"
   max_download_bytes: 300000000
   released_capabilities:
-    "0.14.1":
-      generic_decoder: true
-      state_groups: false
     "0.15.2":
       generic_decoder: true
       state_groups: false

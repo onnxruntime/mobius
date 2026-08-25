@@ -264,7 +264,7 @@ class TestDetectAffectedModels:
             ]
         )
         assert result["run_all"] is False
-        assert result["affected"] == ["lfm2", "lfm2_vl"]
+        assert result["affected"] == ["lfm2", "lfm2_moe", "lfm2_vl"]
 
     def test_test_configs_with_unmapped_task_still_runs_all(self):
         result = detect_affected_models(

@@ -14,7 +14,6 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import onnx_ir as ir
 import pytest
 from onnxscript import GraphBuilder
@@ -22,7 +21,7 @@ from onnxscript import GraphBuilder
 from mobius._model_package import ModelPackage
 from mobius.integrations.ort_genai import write_ort_genai_config
 
-_SUPPORTED_ORT_GENAI_VERSIONS = {"0.14.1", "0.15.2"}
+_EXPECTED_ORT_GENAI_VERSION = "0.15.2"
 
 
 @dataclasses.dataclass
@@ -209,7 +208,7 @@ def test_generic_decoder_end_to_end_and_reload(
     installed_version = version("onnxruntime-genai")
     if expected_version:
         assert installed_version == expected_version
-    assert installed_version in _SUPPORTED_ORT_GENAI_VERSIONS
+    assert installed_version == _EXPECTED_ORT_GENAI_VERSION
 
     package_dir = tmp_path / "synthetic-decoder"
     package = _synthetic_decoder_package()
@@ -268,5 +267,5 @@ def test_malformed_genai_config_is_rejected(
     del config["model"]["decoder"]["filename"]
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="filename|model path is a directory"):
+    with pytest.raises(RuntimeError, match=r"filename|model path is a directory"):
         ort_genai_module.Model(str(package_dir))

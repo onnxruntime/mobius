@@ -201,7 +201,7 @@ the PR description).  The full checklist with explanations lives in the
 
 **Runtime and deployment**
 - [ ] CLI build: `mobius build --model <hf-model-id> /tmp/out` succeeds
-- [ ] ORT GenAI fast lane passes on both pinned released runtimes:
+- [ ] ORT GenAI fast lane passes on the pinned latest stable runtime:
   `pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v`
 - [ ] Runtime-supported real routes declare `ort_genai` evidence in their
   `testdata/cases/` YAML and pass:
