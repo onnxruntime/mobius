@@ -552,7 +552,12 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         required_metadata=("attention.layer_norm_rms_epsilon",),
         rope_interleave=True,
         runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because fused QKV and gate/up "
+            "tensors must be split into separate packed graph targets."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="phi2",
@@ -561,7 +566,12 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         config_postprocessor="phi2",
         required_metadata=("attention.layer_norm_epsilon",),
         runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because the Phi-2 attention, "
+            "MLP, and output graph uses float-only linear modules."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="seed_oss",

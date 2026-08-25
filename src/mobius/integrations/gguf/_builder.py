@@ -704,27 +704,68 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
 
     q_dim = heads * head_dim
     kv_dim = kv_heads * head_dim
+    qkv_biases: list[str] = []
     for layer in range(layers):
         prefix = f"blk.{layer}."
+        fused_weight = prefix + "attn_qkv.weight"
+        separate_weights = {
+            prefix + "attn_q.weight": (q_dim, hidden),
+            prefix + "attn_k.weight": (kv_dim, hidden),
+            prefix + "attn_v.weight": (kv_dim, hidden),
+        }
+        if architecture in {"chatglm", "phi2"}:
+            has_fused = fused_weight in actual
+            present_separate = set(separate_weights) & set(actual)
+            if has_fused == bool(present_separate) or (
+                present_separate and present_separate != set(separate_weights)
+            ):
+                raise ValueError(
+                    f"{architecture} layer {layer} must contain exactly one complete QKV "
+                    "layout: one fused attn_qkv tensor or all separate attn_q/attn_k/attn_v "
+                    "tensors"
+                )
+        else:
+            has_fused = False
+
+        if not has_fused:
+            required.update(separate_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_dim,),
+                prefix + "attn_k.bias": (kv_dim,),
+                prefix + "attn_v.bias": (kv_dim,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        else:
+            required[fused_weight] = (q_dim + 2 * kv_dim, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_dim + 2 * kv_dim,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        mismatched_biases = sorted(alternate_biases & set(actual))
+        if mismatched_biases:
+            raise ValueError(
+                f"{architecture} layer {layer} QKV bias layout does not match its "
+                f"weight layout: {mismatched_biases}"
+            )
+
         if architecture == "chatglm":
             required.update(
                 {
                     prefix + "attn_norm.weight": (hidden,),
-                    prefix + "attn_qkv.weight": (q_dim + 2 * kv_dim, hidden),
                     prefix + "attn_output.weight": (hidden, q_dim),
                     prefix + "ffn_norm.weight": (hidden,),
                     prefix + "ffn_up.weight": (2 * intermediate, hidden),
                     prefix + "ffn_down.weight": (hidden, intermediate),
                 }
             )
-            optional[prefix + "attn_qkv.bias"] = (q_dim + 2 * kv_dim,)
+            optional.update(selected_biases)
+            qkv_biases.extend(selected_biases)
         else:
             required.update(
                 {
                     prefix + "attn_norm.weight": (hidden,),
-                    prefix + "attn_q.weight": (q_dim, hidden),
-                    prefix + "attn_k.weight": (kv_dim, hidden),
-                    prefix + "attn_v.weight": (kv_dim, hidden),
                     prefix + "attn_output.weight": (hidden, q_dim),
                 }
             )
@@ -743,9 +784,6 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
             required.update(
                 {
                     prefix + "attn_norm.bias": (hidden,),
-                    prefix + "attn_q.bias": (q_dim,),
-                    prefix + "attn_k.bias": (kv_dim,),
-                    prefix + "attn_v.bias": (kv_dim,),
                     prefix + "attn_output.bias": (hidden,),
                     prefix + "ffn_up.weight": (intermediate, hidden),
                     prefix + "ffn_up.bias": (intermediate,),
@@ -753,6 +791,7 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
                     prefix + "ffn_down.bias": (hidden,),
                 }
             )
+            required.update(selected_biases)
         elif architecture == "seed_oss":
             required.update(
                 {
@@ -791,10 +830,9 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
             )
 
     if architecture == "chatglm":
-        fused_biases = [f"blk.{layer}.attn_qkv.bias" for layer in range(layers)]
-        present_biases = set(fused_biases) & set(actual)
-        if present_biases and len(present_biases) != layers:
-            raise ValueError("ChatGLM fused QKV bias must be present in every layer or none")
+        present_biases = set(qkv_biases) & set(actual)
+        if present_biases and present_biases != set(qkv_biases):
+            raise ValueError("ChatGLM QKV bias must be present in every layer or none")
 
     allowed = set(required) | set(optional)
     shape_checked = set(allowed)

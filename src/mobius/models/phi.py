@@ -202,6 +202,18 @@ class PhiCausalLMModel(CausalLMModel):
                 (".mlp.fc2.", ".mlp.down_proj."),
             ],
         )
+        for key in list(new_state_dict):
+            if ".self_attn.qkv_proj." not in key:
+                continue
+            q, k, v = split_fused_qkv(
+                new_state_dict.pop(key),
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            )
+            new_state_dict[key.replace("qkv_proj", "q_proj")] = q
+            new_state_dict[key.replace("qkv_proj", "k_proj")] = k
+            new_state_dict[key.replace("qkv_proj", "v_proj")] = v
         return super().preprocess_weights(new_state_dict)
 
 

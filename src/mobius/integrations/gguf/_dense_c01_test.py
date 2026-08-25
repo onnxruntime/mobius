@@ -22,6 +22,7 @@ from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
 from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 from mobius.integrations.gguf._tensor_processors import process_tensors
 from mobius.models.chatglm import ChatGLMCausalLMModel
+from mobius.models.phi import PhiCausalLMModel
 
 
 class _FakeGGUF:
@@ -101,6 +102,40 @@ def _chatglm_tensors(metadata: dict) -> dict[str, tuple[int, ...]]:
     return tensors
 
 
+def _phi2_tensors(metadata: dict) -> dict[str, tuple[int, ...]]:
+    hidden = metadata["phi2.embedding_length"]
+    intermediate = metadata["phi2.feed_forward_length"]
+    q_dim = hidden
+    tensors = {
+        "token_embd.weight": (32, hidden),
+        "output_norm.weight": (hidden,),
+        "output_norm.bias": (hidden,),
+        "output.weight": (32, hidden),
+        "output.bias": (32,),
+    }
+    for layer in range(metadata["phi2.block_count"]):
+        prefix = f"blk.{layer}."
+        tensors.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_norm.bias": (hidden,),
+                prefix + "attn_q.weight": (q_dim, hidden),
+                prefix + "attn_q.bias": (q_dim,),
+                prefix + "attn_k.weight": (q_dim, hidden),
+                prefix + "attn_k.bias": (q_dim,),
+                prefix + "attn_v.weight": (q_dim, hidden),
+                prefix + "attn_v.bias": (q_dim,),
+                prefix + "attn_output.weight": (hidden, q_dim),
+                prefix + "attn_output.bias": (hidden,),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_up.bias": (intermediate,),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+                prefix + "ffn_down.bias": (hidden,),
+            }
+        )
+    return tensors
+
+
 def _seed_oss_tensors(
     metadata: dict, *, include_qkv_bias: bool = False
 ) -> dict[str, tuple[int, ...]]:
@@ -143,19 +178,22 @@ def _seed_oss_tensors(
 
 
 @pytest.mark.parametrize(
-    ("architecture", "model_type"),
+    ("architecture", "model_type", "quantized_import"),
     [
-        ("baichuan", "baichuan"),
-        ("chatglm", "chatglm"),
-        ("phi2", "phi"),
-        ("seed_oss", "seed_oss"),
+        ("baichuan", "baichuan", "supported"),
+        ("chatglm", "chatglm", "rejected"),
+        ("phi2", "phi", "rejected"),
+        ("seed_oss", "seed_oss", "supported"),
     ],
 )
-def test_dense_cohort_registry_runtime_is_deferred(architecture, model_type) -> None:
+def test_dense_cohort_registry_runtime_is_deferred(
+    architecture, model_type, quantized_import
+) -> None:
     spec = get_arch_spec(architecture)
     assert spec.model_type == model_type
     assert spec.is_importable
     assert spec.runtime.value == "deferred"
+    assert spec.quantized_import.value == quantized_import
     assert not spec.aliases
 
 
@@ -256,6 +294,53 @@ def test_chatglm_fused_projection_order_is_q_then_k_then_v_and_gate_then_up() ->
     torch.testing.assert_close(result["model.layers.0.mlp.up_proj.weight"], gate_up[6:])
 
 
+def test_chatglm_accepts_complete_split_qkv_layout() -> None:
+    metadata = _metadata("chatglm", layers=1, kv_heads=1)
+    metadata["chatglm.attention.layer_norm_rms_epsilon"] = 1e-5
+    tensors = _chatglm_tensors(metadata)
+    tensors.pop("blk.0.attn_qkv.weight")
+    tensors.update(
+        {
+            "blk.0.attn_q.weight": (8, 8),
+            "blk.0.attn_k.weight": (4, 8),
+            "blk.0.attn_v.weight": (4, 8),
+            "blk.0.attn_q.bias": (8,),
+            "blk.0.attn_k.bias": (4,),
+            "blk.0.attn_v.bias": (4,),
+        }
+    )
+    model = _FakeGGUF("chatglm", metadata, tensors)
+    _raise_for_invalid_dense_c01_tensor_contract(model)
+    assert gguf_to_config(model).attn_qkv_bias
+
+
+def test_phi2_fused_qkv_is_split_for_the_float_graph() -> None:
+    metadata = _metadata("phi2", intermediate=32, layers=1)
+    metadata["phi2.attention.layer_norm_epsilon"] = 1e-5
+    tensors = _phi2_tensors(metadata)
+    for suffix in ("q", "k", "v"):
+        tensors.pop(f"blk.0.attn_{suffix}.weight")
+        tensors.pop(f"blk.0.attn_{suffix}.bias")
+    tensors["blk.0.attn_qkv.weight"] = (24, 8)
+    tensors["blk.0.attn_qkv.bias"] = (24,)
+    _raise_for_invalid_dense_c01_tensor_contract(_FakeGGUF("phi2", metadata, tensors))
+
+    config = gguf_to_config(_FakeGGUF("phi2", metadata, tensors))
+    module = PhiCausalLMModel(config)
+    qkv_weight = torch.arange(24 * 8, dtype=torch.float32).reshape(24, 8)
+    qkv_bias = torch.arange(24, dtype=torch.float32)
+    result = module.preprocess_weights(
+        {
+            "model.layers.0.self_attn.qkv_proj.weight": qkv_weight,
+            "model.layers.0.self_attn.qkv_proj.bias": qkv_bias,
+        }
+    )
+    for projection in ("q", "k", "v"):
+        assert f"model.layers.0.self_attn.{projection}_proj.weight" in result
+        assert f"model.layers.0.self_attn.{projection}_proj.bias" in result
+    assert not any("qkv_proj" in name for name in result)
+
+
 def test_quantized_chatglm_fused_tensors_can_only_dequantize() -> None:
     metadata = _metadata("chatglm", kv_heads=1)
     metadata["chatglm.attention.layer_norm_rms_epsilon"] = 1e-5
@@ -313,27 +398,7 @@ def test_phi2_rejects_quantization_preservation() -> None:
 def test_phi2_requires_complete_bias_closure() -> None:
     metadata = _metadata("phi2", intermediate=32, layers=1)
     metadata["phi2.attention.layer_norm_epsilon"] = 1e-5
-    tensors = {
-        "token_embd.weight": (32, 8),
-        "output_norm.weight": (8,),
-        "output_norm.bias": (8,),
-        "output.weight": (32, 8),
-        "output.bias": (32,),
-        "blk.0.attn_norm.weight": (8,),
-        "blk.0.attn_norm.bias": (8,),
-        "blk.0.attn_q.weight": (8, 8),
-        "blk.0.attn_q.bias": (8,),
-        "blk.0.attn_k.weight": (8, 8),
-        "blk.0.attn_k.bias": (8,),
-        "blk.0.attn_v.weight": (8, 8),
-        "blk.0.attn_v.bias": (8,),
-        "blk.0.attn_output.weight": (8, 8),
-        "blk.0.attn_output.bias": (8,),
-        "blk.0.ffn_up.weight": (32, 8),
-        "blk.0.ffn_up.bias": (32,),
-        "blk.0.ffn_down.weight": (8, 32),
-        "blk.0.ffn_down.bias": (8,),
-    }
+    tensors = _phi2_tensors(metadata)
     _raise_for_invalid_dense_c01_tensor_contract(_FakeGGUF("phi2", metadata, tensors))
     tensors.pop("blk.0.ffn_down.bias")
     with pytest.raises(ValueError, match=r"ffn_down\.bias"):

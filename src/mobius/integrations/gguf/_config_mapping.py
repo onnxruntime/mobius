@@ -981,7 +981,11 @@ def _chatglm_postprocess(
     )
     rope_dim = int(metadata.get("chatglm.rope.dimension_count", head_dim))
     qkv_biases = [
-        f"blk.{layer}.attn_qkv.bias" in names for layer in range(config.num_hidden_layers)
+        f"blk.{layer}.attn_qkv.bias" in names
+        or all(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        for layer in range(config.num_hidden_layers)
     ]
     return dataclasses.replace(
         config,

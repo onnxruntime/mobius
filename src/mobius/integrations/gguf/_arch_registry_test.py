@@ -64,6 +64,7 @@ _EXPECTED_SUPPORTED_COUNT = 41
 _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
     {
         "arcee",
+        "baichuan",
         "bert",
         "cohere2",
         "deci",
@@ -99,6 +100,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "qwen3moe",
         "qwen3next",
         "rnd1",
+        "seed_oss",
         "smollm3",
         "stablelm",
         "starcoder2",
@@ -181,12 +183,14 @@ class TestCapabilityClosure:
         }
         assert set(actual) == set(supported_architectures())
         rejected = {
+            "chatglm",
             "granitehybrid",
             "internlm2",
             "jamba",
             "mamba",
             "mamba2",
             "nemotron_h",
+            "phi2",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
