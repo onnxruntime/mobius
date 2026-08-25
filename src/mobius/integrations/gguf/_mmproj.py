@@ -32,10 +32,12 @@ needs validation against llama.cpp's ``clip.cpp`` gemma4a reference.  Pass
 from __future__ import annotations
 
 __all__ = [
+    "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
     "build_vlm_from_gguf",
     "build_muse_glimmer_vlm_from_gguf",
     "read_mmproj_audio_config",
+    "read_mmproj_gemma3_vision_config",
     "read_mmproj_muse_glimmer_vision_config",
     "read_mmproj_vision_config",
 ]
@@ -69,6 +71,7 @@ _GEMMA4_VISION_ROPE_THETA = 100.0
 # Gemma4 vision pooler spatial average pooling kernel (k x k). Not present in
 # mmproj metadata; the SigLIP encoder pools N patches to N/k^2 soft tokens.
 _DEFAULT_POOLING_KERNEL_SIZE = 3
+_GEMMA3_POOLING_KERNEL_SIZE = 4
 
 # Muse Glimmer's vision tower uses ordinary 2D RoPE. The mmproj stores no
 # rope.freq_base, so use the published vision config value.
@@ -237,6 +240,41 @@ def read_mmproj_vision_config(gguf_model: Any):
     )
 
 
+def read_mmproj_gemma3_vision_config(gguf_model: Any):
+    """Extract the pinned Gemma3 SigLIP configuration from ``clip.vision.*``."""
+    from mobius._configs._sub_configs import VisionConfig
+
+    md = gguf_model.metadata
+    if not md.get("clip.has_vision_encoder"):
+        return None
+    image_size = int(md["clip.vision.image_size"])
+    patch_size = int(md["clip.vision.patch_size"])
+    patches_per_side = image_size // patch_size
+    if image_size % patch_size or patches_per_side % _GEMMA3_POOLING_KERNEL_SIZE:
+        raise ValueError(
+            "Gemma3 image/patch grid must be divisible by the 4x4 projector pool."
+        )
+    position_rows = int(gguf_model.get_tensor_shape("v.position_embd.weight")[0])
+    if position_rows != patches_per_side**2:
+        raise ValueError(
+            "Gemma3 position embedding rows do not match the image patch grid: "
+            f"{position_rows} != {patches_per_side**2}."
+        )
+    return VisionConfig(
+        hidden_size=int(md["clip.vision.embedding_length"]),
+        intermediate_size=int(md["clip.vision.feed_forward_length"]),
+        num_hidden_layers=int(md["clip.vision.block_count"]),
+        num_attention_heads=int(md["clip.vision.attention.head_count"]),
+        image_size=image_size,
+        patch_size=patch_size,
+        norm_eps=float(md["clip.vision.attention.layer_norm_epsilon"]),
+        mm_tokens_per_image=(patches_per_side // _GEMMA3_POOLING_KERNEL_SIZE) ** 2,
+        position_embedding_size=position_rows,
+        hidden_act="gelu_pytorch_tanh",
+        pooling_kernel_size=_GEMMA3_POOLING_KERNEL_SIZE,
+    )
+
+
 def read_mmproj_audio_config(gguf_model: Any):
     """Extract a Gemma4 :class:`Gemma4AudioConfig` from ``clip.audio.*``.
 
@@ -331,6 +369,25 @@ def _normalized_repository(value: object) -> str:
 
 def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
     """Require stable name and repository bindings independent of file location."""
+    # llama.cpp's pinned Gemma3 converter predates mmproj identity metadata.
+    # Scope this compatibility path to the exact architecture/projector pair;
+    # every other sidecar retains the stronger identity binding below.
+    legacy_gemma3 = (
+        _canonical_text_architecture(text_gguf.architecture) == "gemma3"
+        and projector_type_for_modality(
+            mmproj_gguf.metadata, MMProjModality.VISION
+        )
+        == "gemma3"
+        and "general.name" not in mmproj_gguf.metadata
+    )
+    if legacy_gemma3:
+        general_type = mmproj_gguf.metadata.get("general.type")
+        if general_type not in (None, "mmproj"):
+            raise ValueError(
+                f"clip sidecar general.type must be 'mmproj', got {general_type!r}."
+            )
+        return
+
     bindings: tuple[tuple[str, Callable[[object], str]], ...] = (
         ("general.name", _normalized_identity),
         ("general.base_model.0.name", _normalized_identity),
@@ -633,6 +690,49 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         )
 
     patch_shape = mmproj_gguf.get_tensor_shape("v.patch_embd.weight")
+    if spec.projector_type == "gemma3":
+        expected_patch_shape = (hidden, 3, patch, patch)
+        if patch_shape != expected_patch_shape:
+            raise ValueError(
+                "Gemma3 v.patch_embd.weight must have graph-compatible shape "
+                f"{expected_patch_shape}, got {patch_shape}."
+            )
+        patches_per_side = int(md["clip.vision.image_size"]) // patch
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            "v.position_embd.weight",
+            (patches_per_side**2, hidden),
+        )
+        for name in (
+            "v.patch_embd.bias",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.soft_emb_norm.weight",
+        ):
+            _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf, "mm.input_projection.weight", (hidden, projection)
+        )
+        for layer in range(layers):
+            prefix = f"v.blk.{layer}."
+            for stem in ("ln1", "ln2"):
+                for kind in ("weight", "bias"):
+                    _expect_mmproj_shape(mmproj_gguf, prefix + stem + "." + kind, (hidden,))
+            for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+            # llama.cpp stores these matrices in inference orientation. The
+            # loader transposes them into HF Linear [out, in] orientation.
+            _expect_mmproj_shape(
+                mmproj_gguf, prefix + "ffn_up.weight", (hidden, intermediate)
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (intermediate,))
+            _expect_mmproj_shape(
+                mmproj_gguf, prefix + "ffn_down.weight", (intermediate, hidden)
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+        return
+
     if spec.projector_type == "gemma4v":
         expected_patch_shape = (hidden, 3, patch, patch)
         if patch_shape != expected_patch_shape:
@@ -1042,6 +1142,185 @@ def _mmproj_vision_to_hf(mmproj_gguf: Any) -> dict:
             values = values.reshape(())
         state_dict[hf_name] = torch.from_numpy(values)
     return state_dict
+
+
+def _mmproj_gemma3_vision_to_hf(mmproj_gguf: Any) -> dict:
+    """Load the exact Gemma3 vision/projector closure under HF names."""
+    import torch
+
+    from mobius.integrations.gguf._mmproj_mapping import (
+        map_mmproj_gemma3_vision_to_hf,
+    )
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for name in mmproj_gguf.tensor_names:
+        hf_name = map_mmproj_gemma3_vision_to_hf(name)
+        if hf_name is None:
+            continue
+        values = np.array(mmproj_gguf.get_tensor(name)).astype(np.float32)
+        if name.endswith(("ffn_up.weight", "ffn_down.weight")):
+            values = values.T
+        state_dict[hf_name] = torch.from_numpy(values.copy())
+    return state_dict
+
+
+def _gemma3_multimodal_name(hf_name: str) -> str:
+    """Nest Gemma3 text-only HF names under the composite HF namespace."""
+    if hf_name.startswith("model."):
+        return "language_model.model." + hf_name[len("model.") :]
+    if hf_name.startswith("lm_head."):
+        return "language_model." + hf_name
+    return hf_name
+
+
+def build_gemma3_vlm_from_gguf(
+    text_gguf_path: str | Path,
+    mmproj_gguf_path: str | Path,
+    *,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    image_token_id: int | None = None,
+    keep_quantized: bool = True,
+    _text_gguf_model: Any | None = None,
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build Gemma3 decoder, vision encoder, and embedding graphs from GGUFs.
+
+    This is graph-import support only. It does not assert that a downstream
+    multimodal runtime can execute the resulting package.
+    """
+    import dataclasses
+
+    import torch
+
+    from mobius._builder import build_from_module, resolve_dtype
+    from mobius._configs import QuantizationConfig
+    from mobius.integrations.gguf._builder import (
+        _detect_quant_params,
+        _has_quantized_weights,
+        _load_dequantized_state_dict,
+        _load_quantized_state_dict,
+        _normalize_gguf_weights,
+        _reject_unsupported_quantization_preservation,
+        _replace_native_block_linears,
+        _validate_gguf_model,
+    )
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+    from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.integrations.gguf._tensor_processors import process_tensors
+    from mobius.models.gemma3 import Gemma3MultiModalModel
+    from mobius.tasks import VisionLanguageTask
+
+    resolved_text_path = _resolve_local_path(text_gguf_path)
+    text_gguf = (
+        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+    )
+    if text_gguf.architecture != "gemma3":
+        raise ValueError(
+            "Gemma3 VLM package construction requires a gemma3 text GGUF; "
+            f"got {text_gguf.architecture!r}"
+        )
+    _validate_gguf_model(text_gguf, source=str(text_gguf_path))
+
+    resolved_mmproj_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model
+        if _mmproj_gguf_model is not None
+        else GGUFModel(resolved_mmproj_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    _preflight_mmproj_pair(text_gguf, mmproj_gguf, modalities=(MMProjModality.VISION,))
+
+    config = gguf_to_config(text_gguf)
+    vision_config = read_mmproj_gemma3_vision_config(mmproj_gguf)
+    if vision_config is None:
+        raise ValueError(
+            "mmproj GGUF has no vision encoder (clip.has_vision_encoder is unset)."
+        )
+    resolved_image_token_id = (
+        image_token_id
+        if image_token_id is not None
+        else config.image_token_id
+        if config.image_token_id is not None
+        else _token_id(text_gguf, "<start_of_image>")
+    )
+    config = dataclasses.replace(
+        config,
+        vision=vision_config,
+        image_token_id=resolved_image_token_id,
+    )
+    if dtype is not None:
+        resolved_dtype = resolve_dtype(dtype)
+        if resolved_dtype is not None:
+            config = dataclasses.replace(config, dtype=resolved_dtype)
+    _validate_projector_output_and_media_tokens(config, text_gguf, mmproj_gguf)
+
+    preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, "gemma3")
+    _reject_unsupported_quantization_preservation(
+        text_gguf,
+        "gemma3",
+        preserve_quantization=preserve_quantization,
+        allow_quantized_embeddings=False,
+        allow_quantized_lm_head=False,
+    )
+    if preserve_quantization:
+        bits, block_size, symmetric = _detect_quant_params(text_gguf, "gemma3")
+        config = dataclasses.replace(
+            config,
+            quantization=QuantizationConfig(
+                bits=bits,
+                group_size=block_size,
+                quant_method="gguf",
+                sym=symmetric,
+                quantize_embeddings=False,
+                quantize_lm_head=False,
+                tie_word_embeddings=False,
+            ),
+        )
+
+    module = Gemma3MultiModalModel(config)
+    if preserve_quantization:
+        _replace_native_block_linears(module.decoder, text_gguf, "gemma3")
+    pkg = build_from_module(
+        module,
+        config,
+        task=VisionLanguageTask(),
+        execution_provider=execution_provider,
+    )
+
+    if preserve_quantization:
+        text_state = _load_quantized_state_dict(
+            text_gguf, "gemma3", module.decoder, config
+        )
+    else:
+        text_state = _load_dequantized_state_dict(text_gguf, "gemma3")
+    float_state = {
+        key: value
+        for key, value in text_state.items()
+        if not key.endswith((".scales", ".zero_points", ".qweight"))
+        and value.dtype != torch.uint8
+    }
+    retained_state = {key: value for key, value in text_state.items() if key not in float_state}
+    config._gguf_arch = text_gguf.architecture
+    float_state = _normalize_gguf_weights(process_tensors(float_state, config))
+    text_state = {**float_state, **retained_state}
+
+    state_dict = {_gemma3_multimodal_name(key): value for key, value in text_state.items()}
+    state_dict.update(_mmproj_gemma3_vision_to_hf(mmproj_gguf))
+    state_dict = module.preprocess_weights(state_dict)
+    pkg.apply_weights(state_dict)
+
+    from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+    pkg.gguf_source_path = str(Path(resolved_text_path).resolve())
+    pkg.gguf_tokenizer_verdict = inspect_gguf_tokenizer(
+        text_gguf.metadata, source=str(resolved_text_path)
+    )
+    return pkg
 
 
 def build_gemma4_vlm_from_gguf(
@@ -1530,6 +1809,7 @@ def build_vlm_from_gguf(
 #: Every name here must be referenced by a spec and every name a spec references
 #: must exist here; ``_arch_registry_test`` checks both directions.
 _VLM_BUILDERS: dict[str, str] = {
+    "gemma3": "build_gemma3_vlm_from_gguf",
     "gemma4": "build_gemma4_vlm_from_gguf",
     "muse_glimmer": "build_muse_glimmer_vlm_from_gguf",
 }

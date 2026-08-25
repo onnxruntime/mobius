@@ -138,10 +138,14 @@ class _Gemma3EmbeddingModel(nn.Module):
         )
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
+        # Number image placeholders over the flattened batch so row 2 starts
+        # after row 1's features rather than reusing feature row zero.
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, 1)
+        flat_mask = op.Reshape(mask_int, op.Constant(value_ints=[-1]))
+        cumsum = op.CumSum(flat_mask, 0)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
+        indices = op.Reshape(indices, op.Shape(input_ids))
 
         # Decode steps may pass empty image features ([0, hidden]); append one
         # zero row so the Gather below has a valid row that Where will not use.

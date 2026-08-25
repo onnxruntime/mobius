@@ -22,7 +22,7 @@ Usage::
     # import route, runtime version, and pinned tokenizer evidence record.
 
 :func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
-to :func:`build_gemma4_vlm_from_gguf` for the multimodal assembly.
+to the matching architecture-specific multimodal builder.
 """
 
 from __future__ import annotations
@@ -35,7 +35,10 @@ from mobius.integrations.gguf._config_mapping import (
     GgufArchResolutionError,
     resolve_model_type,
 )
-from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+from mobius.integrations.gguf._mmproj import (
+    build_gemma3_vlm_from_gguf,
+    build_gemma4_vlm_from_gguf,
+)
 from mobius.integrations.gguf._preflight import (
     GgufPreflightReport,
     GgufTypeStat,
@@ -61,6 +64,7 @@ from mobius.integrations.gguf._tokenizer import (
 
 __all__ = [
     "build_from_gguf",
+    "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
     "GGUFTokenizerAsset",
     "GGUFTokenizerSource",

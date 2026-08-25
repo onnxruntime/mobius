@@ -921,6 +921,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         # `+1` baked into every *norm.weight must be removed on import.
         tensor_processor="unoffset_norm",
         config_postprocessor="gemma3",
+        vlm_builder="gemma3",
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),

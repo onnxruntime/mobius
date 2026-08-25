@@ -376,6 +376,12 @@ _MUSE_GLIMMER_BLOCK_SUFFIXES = tuple(
     for kind in ("weight", "bias")
 )
 
+_GEMMA3_BLOCK_SUFFIXES = tuple(
+    f"{stem}.{kind}"
+    for stem in ("ln1", "ln2", "attn_q", "attn_k", "attn_v", "attn_out", "ffn_up", "ffn_down")
+    for kind in ("weight", "bias")
+)
+
 _COMMON_REQUIRED_VISION_METADATA = (
     "clip.has_vision_encoder",
     "clip.vision.embedding_length",
@@ -496,11 +502,37 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _VISION_BASE,
         "Step3-VL vision and projector graph are not implemented.",
     ),
-    _deferred(
-        "gemma3",
-        "PROJECTOR_TYPE_GEMMA3",
-        _VISION_BASE,
-        "Gemma3 mmproj feature selection and projector tensor map are not implemented.",
+    ProjectorSpec(
+        projector_type="gemma3",
+        enum_name="PROJECTOR_TYPE_GEMMA3",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"gemma3"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata, exact tensor closure, graph construction, and component parity "
+            "are covered, but downstream multimodal runtime support is not claimed."
+        ),
+        builder="gemma3",
+        required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.soft_emb_norm.weight",
+            "mm.input_projection.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GEMMA3_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("gemma3-4b-f16",),
     ),
     _deferred(
         "gemma3nv",
@@ -886,6 +918,27 @@ _INDEX: Mapping[str, ProjectorSpec] = MappingProxyType(
 )
 
 MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
+    MMProjArtifactPin(
+        artifact_id="gemma3-4b-f16",
+        repository="ggml-org/gemma-3-4b-it-GGUF",
+        revision="ab31416aceb30cd095cb34cc27eea120940964e4",
+        filename="mmproj-model-f16.gguf",
+        size=851_251_104,
+        lfs_sha256="8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb",
+        projector_types=("gemma3",),
+        paired_text_architecture="gemma3",
+        paired_text_target="gemma-3-4b-it-Q4_K_M.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1152),
+            ("clip.vision.projection_dim", 2560),
+            ("clip.vision.block_count", 27),
+            ("clip.vision.image_size", 896),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 276), ("F16", 163)),
+        tensor_count=439,
+        parity_test="TestGemma3VisionEncoder.test_projector_matches_numpy_reference",
+    ),
     MMProjArtifactPin(
         artifact_id="gemma4-e2b-f16",
         repository="unsloth/gemma-4-E2B-it-GGUF",
