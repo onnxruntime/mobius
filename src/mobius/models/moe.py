@@ -329,8 +329,12 @@ class PhiMoEGGUFCausalLMModel(Phi3MoECausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = MoETextModel(config, norm_class=RMSNormBias)
-        linear_class = _quantized_linear_class(config) or Linear
-        self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=True)
+        quantization = getattr(config, "quantization", None)
+        quantized_head = quantization is not None and bool(
+            getattr(quantization, "quantize_lm_head", False)
+        )
+        head_class = _quantized_linear_class(config) if quantized_head else None
+        self.lm_head = (head_class or Linear)(config.hidden_size, config.vocab_size, bias=True)
 
 
 class MoECausalLMModel(CausalLMModel):

@@ -2032,6 +2032,7 @@ def _write_moe_gguf(
     diffusion_fused_qkv: bool = False,
     fused_qkv_float: bool = False,
     quantize_tied_embedding: bool = False,
+    output_quantization: str | None = None,
     expert_scale_suffix: str | None = None,
     malformed_expert_scale: bool = False,
 ) -> None:
@@ -2116,6 +2117,11 @@ def _write_moe_gguf(
         "mxfp4": add_mxfp4,
         "q4_0": add_q4,
     }[projection_quantization]
+    add_output = {
+        "f32": add_float,
+        "mxfp4": add_mxfp4,
+        "q4_0": add_q4,
+    }[output_quantization or projection_quantization]
 
     if quantize_tied_embedding:
         assert architecture in {"qwen3moe", "granitemoe"}
@@ -2192,7 +2198,7 @@ def _write_moe_gguf(
     if architecture == "phimoe":
         add_float("output_norm.bias", (hidden_size,))
     if architecture not in {"qwen3moe", "granitemoe"}:
-        add_projection("output.weight", (vocab_size, hidden_size))
+        add_output("output.weight", (vocab_size, hidden_size))
         if architecture == "phimoe":
             add_float("output.bias", (vocab_size,))
 
@@ -3446,6 +3452,51 @@ class TestBuildQuantizedGguf:
                     repacked.zero_points[offset:end],
                 )
                 offset = end
+
+    @pytest.mark.parametrize("output_quantization", ["f32", "q4_0"])
+    def test_phimoe_output_head_honors_storage_and_values(
+        self, output_quantization: str, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._repacker import repack_gguf_tensor
+
+        path = tmp_path / f"phimoe-output-{output_quantization}.gguf"
+        _write_moe_gguf(
+            path,
+            "phimoe",
+            "q4_0",
+            output_quantization=output_quantization,
+        )
+        source = GGUFModel(path)
+        package = build_from_gguf(path, keep_quantized=True)
+        model = package["model"]
+        raw, qtype, shape = next(
+            (raw, qtype, shape)
+            for name, raw, qtype, shape in source.tensor_items_raw()
+            if name == "output.weight"
+        )
+
+        if output_quantization == "q4_0":
+            assert package.config.quantization is not None
+            assert package.config.quantization.quantize_lm_head
+            repacked = repack_gguf_tensor(raw, qtype.value, shape)
+            np.testing.assert_array_equal(
+                model.graph.initializers["lm_head.weight"].const_value.numpy(),
+                repacked.weight,
+            )
+            np.testing.assert_array_equal(
+                model.graph.initializers["lm_head.scales"].const_value.numpy(),
+                repacked.scales,
+            )
+        else:
+            assert package.config.quantization is not None
+            assert not package.config.quantization.quantize_lm_head
+            assert "lm_head.scales" not in model.graph.initializers
+            np.testing.assert_array_equal(
+                model.graph.initializers["lm_head.weight_t"].const_value.numpy(),
+                source.get_tensor("output.weight").T,
+            )
 
     @pytest.mark.parametrize("architecture", ["qwen3moe", "granitemoe"])
     def test_tied_quantized_embedding_is_shared_with_output_head(
