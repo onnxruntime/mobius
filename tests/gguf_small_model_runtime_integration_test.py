@@ -629,3 +629,79 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
         np.testing.assert_allclose(ort_logits, reference_logits, rtol=1e-4, atol=2e-4)
 
     np.testing.assert_array_equal(generated, case.generated_tokens)
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_smollm_generic_ort_genai_generation(tmp_path: Path) -> None:
+    """The one evidenced GGUF route loads through ORT GenAI's generic decoder."""
+    from importlib.metadata import version
+
+    ort_genai = pytest.importorskip("onnxruntime_genai")
+    from mobius.integrations.ort_genai import write_ort_genai_config
+
+    case = _CASES[0]
+    gguf_path = Path(
+        hf_hub_download(
+            repo_id=case.gguf_repository,
+            revision=case.gguf_revision,
+            filename=case.gguf_filename,
+        )
+    )
+    output_dir = tmp_path / "smollm-ort-genai"
+    captured: list[ModelPackage] = []
+    original_save = ModelPackage.save
+
+    def capture_save(package: ModelPackage, *args: object, **kwargs: object) -> None:
+        captured.append(package)
+        original_save(package, *args, **kwargs)
+
+    with mock.patch.object(ModelPackage, "save", capture_save):
+        main(
+            [
+                "build-gguf",
+                str(gguf_path),
+                "--output",
+                str(output_dir),
+                "--dtype",
+                "f32",
+                "--execution-provider",
+                "cpu",
+                "--runtime",
+                "onnx-genai",
+                "--runtime-version",
+                "1.29.0",
+                "--tokenizer-repository",
+                case.tokenizer_repository,
+                "--tokenizer-revision",
+                case.tokenizer_revision,
+                "--local-files-only",
+            ]
+        )
+
+    assert len(captured) == 1
+    write_ort_genai_config(
+        captured[0],
+        str(output_dir),
+        runtime_version=version("onnxruntime-genai"),
+    )
+    config = json.loads((output_dir / "genai_config.json").read_text())
+    assert config["model"]["type"] == "decoder"
+
+    model = ort_genai.Model(str(output_dir))
+    tokenizer = ort_genai.Tokenizer(model)
+    prompt_ids = tokenizer.encode(case.prompt)
+    params = ort_genai.GeneratorParams(model)
+    params.set_search_options(
+        max_length=len(prompt_ids) + len(case.generated_tokens),
+        do_sample=False,
+    )
+    generator = ort_genai.Generator(model, params)
+    generator.append_tokens(prompt_ids)
+
+    generated: list[int] = []
+    for _ in case.generated_tokens:
+        generator.generate_next_token()
+        generated.append(generator.get_next_tokens()[0])
+
+    assert generated == list(case.generated_tokens)

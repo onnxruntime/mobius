@@ -22,7 +22,9 @@ from mobius.integrations.ort_genai.auto_export import (
     _fix_chat_template,
     _fix_tokenizer_config,
     _graph_input_names,
+    _inspect_decoder_abi,
     _introspect_outputs,
+    _is_single_model_decoder_package,
     _resolve_ort_genai_model_type,
     _select_ort_model_type,
     _write_audio_processor_config,
@@ -55,6 +57,19 @@ def _mock_model_with_inputs(names: list[str]) -> ir.Model:
 def _mock_model_with_outputs(names: list[str]) -> ir.Model:
     """Create a minimal ir.Model whose graph outputs have the given names."""
     return _mock_model(outputs=names)
+
+
+def _mock_decoder_model(
+    *,
+    semantic_inputs: list[str] | None = None,
+    layer_indices: tuple[int, ...] = (0, 1),
+) -> ir.Model:
+    inputs = list(semantic_inputs or ["input_ids", "attention_mask", "position_ids"])
+    outputs = ["logits"]
+    for index in layer_indices:
+        inputs.extend([f"past_key_values.{index}.key", f"past_key_values.{index}.value"])
+        outputs.extend([f"present.{index}.key", f"present.{index}.value"])
+    return _mock_model(inputs=inputs, outputs=outputs)
 
 
 def test_moonshine_native_runtime_is_rejected(tmp_path):
@@ -94,7 +109,7 @@ def _make_fake_llm_pkg(model_type: str = "qwen2"):
         max_position_embeddings: int = 128
 
     return ModelPackage(
-        {"model": _mock_model()},
+        {"model": _mock_decoder_model()},
         config=FakeConfig(model_type=model_type),
     )
 
@@ -148,14 +163,12 @@ class TestResolveOrtGenaiModelType:
 class TestSelectOrtModelType:
     """Text-only / multimodal ORT model type selection (PR: text_only export)."""
 
-    def test_decoder_only_prefers_config_type(self):
-        # Text-only gemma-4-12B: package config carries the text sibling, HF
-        # reports the multimodal type. Decoder-only -> follow the package.
+    def test_decoder_only_uses_generic_decoder(self):
         assert (
             _select_ort_model_type(
                 "gemma4_unified_text", "gemma4_unified", is_decoder_only=True
             )
-            == "gemma4_text"
+            == "decoder"
         )
 
     def test_multimodal_keeps_hf_type(self):
@@ -170,23 +183,32 @@ class TestSelectOrtModelType:
         )
 
     def test_decoder_only_falls_back_to_hf_when_config_missing(self):
-        assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "qwen2"
+        assert _select_ort_model_type(None, "qwen3", is_decoder_only=True) == "decoder"
 
-    def test_decoder_only_qwen3_moe_resolves_to_supported_type(self):
-        # hf_model_id mode: both the package config and the HF config report
-        # "qwen3_moe"; the decoder-only preference must still resolve through
-        # the alias rather than emitting the unsupported HF type.
+    def test_decoder_only_unknown_config_uses_generic_decoder(self):
         assert (
-            _select_ort_model_type("qwen3_moe", "qwen3_moe", is_decoder_only=True) == "qwen3"
+            _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True)
+            == "decoder"
         )
 
-    def test_decoder_only_unknown_config_falls_back_to_hf(self):
-        # An unrecognised config.model_type (not in _ORT_GENAI_MODEL_TYPE) must
-        # not pass straight through as an invalid ORT type; fall back to the
-        # known HF-derived mapping instead.
+    def test_decoder_only_preserves_specialized_hf_fallback(self):
         assert (
-            _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True) == "qwen2"
+            _select_ort_model_type("not_a_real_type", "gpt2", is_decoder_only=True) == "gpt2"
         )
+
+    @pytest.mark.parametrize(
+        ("model_type", "expected"),
+        [
+            ("gpt2", "gpt2"),
+            ("lfm2", "lfm2"),
+            ("lfm2_vl", "lfm2"),
+            ("phi3", "phi3"),
+            ("phi3small", "phi3small"),
+            ("phimoe", "phimoe"),
+        ],
+    )
+    def test_specialized_decoder_type_is_preserved(self, model_type, expected):
+        assert _select_ort_model_type(model_type, model_type, is_decoder_only=True) == expected
 
 
 class TestWriteProcessorConfig:
@@ -1136,7 +1158,9 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             data = json.load(f)
         assert "model" in data
-        assert data["model"]["type"] == "qwen2"
+        assert data["model"]["type"] == "decoder"
+        assert data["model"]["decoder"]["inputs"]["position_ids"] == "position_ids"
+        assert (tmp_path / "runtime_compatibility.json").is_file()
 
     def test_rejects_generic_vision_encoder_decoder_package(self, tmp_path):
         import dataclasses
@@ -1644,7 +1668,7 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "model": _mock_model(),
+                "model": _mock_decoder_model(),
                 "vision": _mock_model(),
                 "embedding": _mock_model(),
             },
@@ -1754,7 +1778,7 @@ class TestExportForOrtGenai:
             num_key_value_heads: int = 1
             head_dim: int = 256
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path))
 
         assert "audio_processor" not in result
@@ -2110,13 +2134,12 @@ class TestExportForOrtGenai:
             head_dim: int = 16
             max_position_embeddings: int = 128
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        # "gemma2" maps to "gemma" in _ORT_GENAI_MODEL_TYPE
-        assert data["model"]["type"] == "gemma"
+        assert data["model"]["type"] == "decoder"
 
     def test_config_mode_qwen3_moe_emits_supported_decoder_type(self, tmp_path):
         """Qwen3-MoE --config exports must not emit the unsupported HF type.
@@ -2450,7 +2473,7 @@ class TestExportForOrtGenai:
             eos_token_id: int = 2
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -2668,7 +2691,7 @@ class TestExportForOrtGenai:
             eos_token_id: list = dataclasses.field(default_factory=lambda: [1, 106])
             pad_token_id: int = 0
 
-        pkg = ModelPackage({"model": _mock_model()}, config=FakeConfig())
+        pkg = ModelPackage({"model": _mock_decoder_model()}, config=FakeConfig())
         result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
 
         with open(result["genai_config"]) as f:
@@ -3037,9 +3060,29 @@ class TestHybridAttentionShareBufferGuard:
             ir.Node(op_type=op_type, domain=domain, inputs=[], num_outputs=1)
             for op_type, domain in node_op_types
         ]
+        inputs = [
+            ir.Value(name=name)
+            for name in (
+                "input_ids",
+                "past_key_values.0.key",
+                "past_key_values.0.value",
+                "past_key_values.1.conv_state",
+                "past_key_values.1.recurrent_state",
+            )
+        ]
+        outputs = [
+            ir.Value(name=name)
+            for name in (
+                "logits",
+                "present.0.key",
+                "present.0.value",
+                "present.1.conv_state",
+                "present.1.recurrent_state",
+            )
+        ]
         graph = ir.Graph(
-            inputs=[ir.Value(name="input_ids")],
-            outputs=[ir.Value(name="logits")],
+            inputs=inputs,
+            outputs=outputs,
             nodes=nodes,
             name="decoder",
         )
@@ -3235,6 +3278,212 @@ class TestCountCacheLayerSlots:
         assert _count_cache_layer_slots(None) is None
 
 
+class TestGenericDecoderAbi:
+    def test_requires_a_single_decoder_graph(self):
+        from mobius._model_package import ModelPackage
+
+        decoder = _mock_decoder_model()
+        assert _is_single_model_decoder_package(ModelPackage({"model": decoder}))
+        assert not _is_single_model_decoder_package(
+            ModelPackage({"model": decoder, "encoder": _mock_model()})
+        )
+
+    def test_sparse_cache_indices_preserve_global_slots_and_exact_names(self):
+        model = _mock_model(
+            inputs=[
+                "input_ids",
+                "attention_mask",
+                "cache.1.k",
+                "cache.1.v",
+                "cache.3.k",
+                "cache.3.v",
+            ],
+            outputs=[
+                "logits",
+                "next.1.k",
+                "next.1.v",
+                "next.3.k",
+                "next.3.v",
+            ],
+        )
+        # Rename suffixes to the released semantic key/value vocabulary while
+        # retaining non-default prefixes.
+        for value in model.graph.inputs:
+            if value.name is not None:
+                value.name = value.name.replace(".k", ".key").replace(".v", ".value")
+        for value in model.graph.outputs:
+            if value.name is not None:
+                value.name = value.name.replace(".k", ".key").replace(".v", ".value")
+
+        abi = _inspect_decoder_abi(model, model_type="decoder")
+
+        assert abi.cache_slots == 4
+        assert abi.inputs["past_key_names"] == "cache.%d.key"
+        assert abi.outputs["present_value_names"] == "next.%d.value"
+
+    def test_omits_optimized_away_optional_inputs(self):
+        abi = _inspect_decoder_abi(
+            _mock_decoder_model(semantic_inputs=["input_ids"]), model_type="decoder"
+        )
+        assert set(abi.inputs) == {"input_ids", "past_key_names", "past_value_names"}
+
+    def test_accepts_released_recurrent_state_pair(self):
+        model = _mock_decoder_model(layer_indices=(1,))
+        model.graph.inputs.extend(
+            [
+                ir.Value(name="past_key_values.0.conv_state"),
+                ir.Value(name="past_key_values.0.recurrent_state"),
+            ]
+        )
+        model.graph.outputs.extend(
+            [
+                ir.Value(name="present.0.conv_state"),
+                ir.Value(name="present.0.recurrent_state"),
+            ]
+        )
+        abi = _inspect_decoder_abi(model, model_type="decoder")
+        assert abi.has_recurrent_state
+        assert abi.cache_slots == 2
+
+    def test_accepts_paired_sequence_length_inputs(self):
+        abi = _inspect_decoder_abi(
+            _mock_decoder_model(
+                semantic_inputs=[
+                    "input_ids",
+                    "current_sequence_length",
+                    "past_sequence_length",
+                ]
+            ),
+            model_type="decoder",
+        )
+        assert abi.inputs["current_sequence_length"] == "current_sequence_length"
+        assert abi.inputs["past_sequence_length"] == "past_sequence_length"
+
+    def test_rejects_unpaired_sequence_length_input(self):
+        with pytest.raises(ValueError, match="only as a pair"):
+            _inspect_decoder_abi(
+                _mock_decoder_model(semantic_inputs=["input_ids", "past_sequence_length"]),
+                model_type="decoder",
+            )
+
+    def test_rejects_mobius_gpt2_separate_cache_abi(self):
+        with pytest.raises(ValueError, match="rank-5 combined KV-cache"):
+            _inspect_decoder_abi(_mock_decoder_model(), model_type="gpt2")
+
+    @pytest.mark.parametrize(
+        "inputs,outputs,message",
+        [
+            (
+                ["input_ids", "key_cache.0", "value_cache.0"],
+                ["logits", "present_key_cache.0", "present_value_cache.0"],
+                "cannot automatically supply",
+            ),
+            (
+                [
+                    "input_ids",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                    "past_key_values.1.ssm_state",
+                ],
+                ["logits", "present.0.key", "present.0.value", "present.1.ssm_state"],
+                "state kinds",
+            ),
+        ],
+    )
+    def test_rejects_unreleased_state_topologies(self, inputs, outputs, message):
+        with pytest.raises(ValueError, match=message):
+            _inspect_decoder_abi(
+                _mock_model(inputs=inputs, outputs=outputs), model_type="decoder"
+            )
+
+
+def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
+    result = write_ort_genai_config(
+        _make_fake_llm_pkg("unknown_architecture"),
+        str(tmp_path),
+        runtime_version="0.15.2",
+    )
+    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    assert metadata == {
+        "runtime": "onnxruntime-genai",
+        "model_type": "decoder",
+        "minimum_version": "0.14.0",
+        "tested_versions": ["0.14.1", "0.15.2"],
+        "uses_main_only_state_groups": False,
+        "heterogeneous_state_manifest": (
+            "deferred: https://github.com/onnxruntime/mobius/issues/605"
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("model_type", "config_overrides"),
+    [
+        pytest.param("llama", {}, id="dense"),
+        pytest.param("qwen3_moe", {}, id="moe"),
+        pytest.param("gemma", {"tie_word_embeddings": True}, id="tied"),
+        pytest.param(
+            "qwen2",
+            {"quantization_config": {"quant_method": "matmul_nbits"}},
+            id="quantized",
+        ),
+    ],
+)
+def test_generic_decoder_schema_is_architecture_and_weight_agnostic(
+    tmp_path, model_type, config_overrides
+):
+    pkg = _make_fake_llm_pkg(model_type)
+    for name, value in config_overrides.items():
+        setattr(pkg.config, name, value)
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    assert config["model"]["type"] == "decoder"
+    assert config["model"]["vocab_size"] == 256
+    assert config["model"]["context_length"] == 4096
+    assert config["model"]["decoder"]["num_hidden_layers"] == 2
+    assert config["model"]["decoder"]["inputs"] == {
+        "input_ids": "input_ids",
+        "attention_mask": "attention_mask",
+        "position_ids": "position_ids",
+        "past_key_names": "past_key_values.%d.key",
+        "past_value_names": "past_key_values.%d.value",
+    }
+    assert config["model"]["decoder"]["outputs"] == {
+        "logits": "logits",
+        "present_key_names": "present.%d.key",
+        "present_value_names": "present.%d.value",
+    }
+    assert config["search"]["past_present_share_buffer"] is False
+
+
+def test_generic_decoder_rejects_pre_014_runtime(tmp_path):
+    with pytest.raises(ValueError, match=r">= 0\.14\.0"):
+        write_ort_genai_config(
+            _make_fake_llm_pkg("qwen2"),
+            str(tmp_path),
+            runtime_version="0.13.0",
+        )
+    assert not (tmp_path / "genai_config.json").exists()
+
+
+def test_gpt2_specialized_runtime_rejects_separate_cache_graph(tmp_path):
+    with pytest.raises(ValueError, match="rank-5 combined KV-cache"):
+        write_ort_genai_config(_make_fake_llm_pkg("gpt2"), str(tmp_path))
+    assert not (tmp_path / "genai_config.json").exists()
+
+
+@pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+def test_phi3_longrope_runtime_type_is_preserved(tmp_path, model_type):
+    result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+    assert config["model"]["type"] == model_type
+
+
 class TestGemma4RealModel:
     """Build a real tiny Gemma4 model and verify genai config inputs."""
 
@@ -3401,13 +3650,17 @@ class TestGemma4RealModel:
         with open(result["genai_config"]) as f:
             data = json.load(f)
 
-        # ORT-GenAI type resolved from pkg.config.model_type (gemma4_text),
-        # NOT the multimodal HF gemma4_unified -> gemma4.
-        assert data["model"]["type"] == "gemma4_text"
+        assert data["model"]["type"] == "decoder"
         # Decoder-only: input_ids decoder, no multimodal sections.
         assert "vision" not in data["model"]
         assert "audio" not in data["model"]
         assert "input_ids" in data["model"]["decoder"]["inputs"]
+        assert data["model"]["decoder"]["sliding_window"] == {
+            "window_size": 8,
+            "slide_key_value_cache": False,
+            "slide_inputs": False,
+            "layers": [0],
+        }
         # No multimodal processor artifacts.
         assert "processor_config" not in result
         assert "audio_processor" not in result
