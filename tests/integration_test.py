@@ -22,7 +22,9 @@ Run only prefill tests::
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -45,6 +47,50 @@ from mobius._testing.torch_reference import (
     load_torch_multimodal_model,
     torch_forward,
 )
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_plamo2_pinned_real_gguf_import_roundtrip(tmp_path: Path):
+    """Import and serialize the exact public PLaMo2 F32 artifact on explicit opt-in."""
+    source = os.environ.get("MOBIUS_PLAMO2_REAL_GGUF")
+    if source is None:
+        pytest.skip("set MOBIUS_PLAMO2_REAL_GGUF to the pinned 5.16 GB F32 artifact")
+
+    from mobius._model_package import ModelPackage
+    from mobius.integrations.gguf import build_from_gguf
+
+    source_path = Path(source)
+    expected_sha256 = "c5deb94bcd21f516db2b00ba4e923e02cc1dede4b7531ef81a15899130b0e5ef"
+    digest = hashlib.sha256()
+    with source_path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    assert digest.hexdigest() == expected_sha256
+
+    package = build_from_gguf(
+        source_path,
+        keep_quantized=False,
+        execution_provider="cpu",
+    )
+    assert (
+        package.config.layer_types
+        == [
+            "mamba",
+            "full_attention",
+        ]
+        * 8
+    )
+    assert package.gguf_tokenizer_verdict.route == "deferred"
+
+    output_dir = tmp_path / "plamo2-real"
+    package.save(str(output_dir), progress_bar=False)
+    reloaded = ModelPackage.load(str(output_dir))
+    graph = reloaded["model"].graph
+    assert len(graph.inputs) == 34
+    assert len(graph.outputs) == 33
+    assert graph.inputs[2].name == "past_key_values.0.conv_state"
+    assert graph.inputs[4].name == "past_key_values.1.key"
 
 
 @pytest.mark.integration

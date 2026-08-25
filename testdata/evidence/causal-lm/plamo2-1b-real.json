@@ -1,0 +1,189 @@
+{
+  "schema_version": 1,
+  "validated_at_utc": "2026-08-25T06:14:35Z",
+  "validated_parent_commit": "64aa8fb55d10d3097d944e44231f0301d2527113",
+  "validation_change_set": "the compatibility and evidence changes committed with this record",
+  "status": "runtime-deferred",
+  "source_checkpoint": {
+    "repository": "pfnet/plamo-2-1b",
+    "revision": "92c75fd6eea9018bcb9c33ee8921589febe071fa",
+    "files": [
+      {
+        "filename": "model-00001-of-00007.safetensors",
+        "bytes": 4060618320,
+        "lfs_sha256": "306bfd09ff22b5c044abfbc310b0a916a85a450ff52beaa90e245bb67b4cb1e9"
+      },
+      {
+        "filename": "model-00002-of-00007.safetensors",
+        "bytes": 285214592,
+        "lfs_sha256": "759d54a62b8f8124031bf4048b2b7e9b9fe3439e75ce772e48562369768836a8"
+      },
+      {
+        "filename": "model-00003-of-00007.safetensors",
+        "bytes": 819200136,
+        "lfs_sha256": "c7172210250c2b4030b1bc9c75a68224844e770838159e939bb6c68593d2e235"
+      },
+      {
+        "filename": "model-00004-of-00007.safetensors",
+        "bytes": 621448,
+        "lfs_sha256": "017d164149a8e31acdde2f8c6dd45568d7a8900951f83cb5fbcebac64c662695"
+      },
+      {
+        "filename": "model-00005-of-00007.safetensors",
+        "bytes": 131976,
+        "lfs_sha256": "6bfe7b7d45c40c75d7ff7b362fd88bf34e23aedf6a637df4eafc9f7d6231f8ca"
+      },
+      {
+        "filename": "model-00006-of-00007.safetensors",
+        "bytes": 5296,
+        "lfs_sha256": "3dadc185925d0be7f495c51924546b0f07f93550cf4222da96dedd335beb3b8f"
+      },
+      {
+        "filename": "model-00007-of-00007.safetensors",
+        "bytes": 40,
+        "lfs_sha256": "60d95b10b6e140a9626a7058d5038528f2ff80148dc4569b881db56052046509"
+      }
+    ],
+    "config_sha256": "7cd00447566283be63bf20efac313f02423129586c5b348466f09d15082053e9",
+    "tokenizer_jsonl_sha256": "9fa8276a87dd2440bb9496f1d569c05ded6274fd2854de802e12dc6545804b95",
+    "tokenizer_config_sha256": "3472dc70138f3d98161b0d54ca424519f031d865882e85efc75e30c349879050",
+    "tokenization_code_sha256": "ebddaf4cd8c4f7cde47d9e94a227a1cec7eccfbf303a70f520a3fda7c060abef",
+    "modeling_code_sha256": "21c0e1d8ba2f777c69305259254da865cf79145c1e06fee4fd26ed926b82451e"
+  },
+  "gguf": {
+    "repository": "yt-koike/plamo-2-1b-gguf",
+    "revision": "184326afcef7232d94df09a33279598255890325",
+    "filename": "plamo-2-1B-F32.gguf",
+    "bytes": 5168220288,
+    "lfs_sha256": "c5deb94bcd21f516db2b00ba4e923e02cc1dede4b7531ef81a15899130b0e5ef",
+    "format_version": 3,
+    "tensor_count": 218,
+    "qtypes": {
+      "F32": 218
+    }
+  },
+  "provenance_comparison": {
+    "method": "streamed comparison of every GGUF tensor against the pinned safetensors after documented norm-offset, convolution-shape, and Mamba-decay transforms",
+    "compared_tensors": 218,
+    "exact_tensors": 213,
+    "missing_tensors": 0,
+    "elements": 1291441920,
+    "max_abs_error": 9.5367431640625e-07,
+    "mean_abs_error": 3.323056466858475e-15,
+    "non_exact_tensors": "five ssm_a tensors differ only by float32 -exp(A_log) rounding"
+  },
+  "architecture": {
+    "layers": 16,
+    "schedule": "alternating mamba and attention, starting with mamba",
+    "hidden_size": 2048,
+    "feed_forward_size": 8192,
+    "attention_heads": 16,
+    "kv_heads": 1,
+    "mamba_inner_size": 4096,
+    "mamba_heads": 32,
+    "mamba_state_size": 64,
+    "mamba_conv_kernel": 4
+  },
+  "mobius_package": {
+    "import": "passed",
+    "save_check_reload": "passed",
+    "files": [
+      "model.onnx",
+      "model.onnx.data"
+    ],
+    "sha256": "5a9a6638087d4b76fff79e102e665fb963e505cd17812f909cfc33e42a29b640",
+    "state_interfaces": 16,
+    "state_abi": "even layers: conv_state+ssm_state; odd layers: key+value"
+  },
+  "independent_reference": {
+    "implementation": "pinned HuggingFace remote model with upstream pure-PyTorch causal_conv1d_ref and selective_state_update_ref equivalents",
+    "transformers_version": "5.12.1",
+    "torch_version": "2.12.1",
+    "compatibility_shims": [
+      "adapt Transformers 5 tied-weight metadata and tie lm_head to embed_tokens",
+      "rebuild non-persistent RoPE caches after meta-device loading",
+      "provide pure-PyTorch causal convolution and selective state update"
+    ],
+    "prompt": "Hello",
+    "prompt_tokens": [
+      1,
+      6721
+    ],
+    "generated_tokens": [
+      44,
+      24514,
+      45119,
+      7982,
+      45114,
+      2166,
+      353,
+      1468,
+      15658,
+      1090,
+      2596,
+      1031,
+      73,
+      1170,
+      1090,
+      2596,
+      45114,
+      2166,
+      353,
+      1468
+    ],
+    "generated_text": ", my name is Alex and I'm a software engineer at Google.\n\nI work at Google and I'm a software",
+    "generated_length": 20,
+    "rollback_replay_exact": true
+  },
+  "ort_cpu": {
+    "onnxruntime_version": "1.29.0",
+    "execution_provider": "CPUExecutionProvider",
+    "fused_and_portable_results_equal": true,
+    "prefill_max_abs_error": 0.011388778686523438,
+    "prefill_mean_abs_error": 0.000737154199364013,
+    "decode_steps": 19,
+    "decode_max_abs_error": 23.476438999176025,
+    "decode_mean_abs_error": 1.668023172595157,
+    "generated_tokens": [
+      44,
+      2268,
+      1101,
+      1080,
+      1087,
+      8789,
+      45114,
+      2002,
+      2569,
+      3035,
+      8435,
+      46,
+      7525,
+      2004,
+      1078,
+      1652,
+      290,
+      15143,
+      45116,
+      2057
+    ],
+    "generated_length": 20,
+    "token_equality": false,
+    "rollback_replay_exact": true,
+    "promotion_decision": "blocked: cached decode does not meet numerical or token-equality gates"
+  },
+  "ort_genai": {
+    "released_version": "0.15.2",
+    "generated_model_type": "plamo2",
+    "generated_state_schema": "homogeneous past_key_names/past_value_names templates",
+    "model_load": "failed: Unsupported model_type in config.json: plamo2",
+    "tokenizer_load_after_forcing_llama": "failed: Invalid file: tokenizer.json",
+    "generation_after_forcing_llama_and_supplying_prompt_tokens": "failed: Model input was not found: past_key_values.0.recurrent_state",
+    "upstream_main_commit": "a8e0fdf81b061e67c1c3f9485bfdc06735ccd473",
+    "upstream_main_install": "not feasible from the Python source package: pip built UNKNOWN-0.0.0 without an onnxruntime_genai module",
+    "promotion_decision": "blocked: no released heterogeneous-state schema, no compatible tokenizer artifact, and no successful end-to-end generation"
+  },
+  "l4_l5": {
+    "goldens_committed": false,
+    "reason": "real prefill exceeds the parity gate and cached generation diverges; committing passing goldens would misrepresent support"
+  }
+}
