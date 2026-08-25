@@ -275,6 +275,7 @@ class TestCapabilityClosure:
             "mamba",
             "mamba2",
             "nemotron_h",
+            "nemotron_h_moe",
             "phi2",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
@@ -1532,6 +1533,7 @@ class TestRejectionsAreActionable:
         assert spec.tensor_map is Support.SUPPORTED
         assert spec.graph is Support.SUPPORTED
         assert spec.runtime is Support.DEFERRED
+        assert spec.quantized_import is Support.REJECTED
         assert spec.reason is not None
         assert "onnxruntime/mobius#605" in spec.reason
 

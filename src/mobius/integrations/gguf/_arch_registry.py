@@ -1101,12 +1101,16 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "expert_shared_feed_forward_length",
         ),
         runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
         reason=(
             "Exact mixed attention/Mamba2/dense/MoE scheduling, sigmoid correction-bias "
             "routing, shared experts, optional latent projections, and strict GGUF tensor "
             "closure are supported. Generic ORT GenAI runtime packaging remains deferred "
             "because its released cache schema cannot represent heterogeneous KV, "
-            "convolution, and recurrent state slots; tracked by onnxruntime/mobius#605."
+            "convolution, and recurrent state slots; tracked by onnxruntime/mobius#605. "
+            "Quantization preservation is unsupported because mixed Mamba2 recurrent "
+            "parameters must remain dequantized and correction-biased sigmoid experts "
+            "cannot use the fused MoE ABI. Use keep_quantized=False for explicit float import."
         ),
     ),
     GGUFArchitectureSpec(
