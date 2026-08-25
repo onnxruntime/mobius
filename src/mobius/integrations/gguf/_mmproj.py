@@ -929,11 +929,13 @@ def _text_gguf_to_hf_multimodal_quantized(
     import torch
 
     from mobius.integrations.gguf._builder import repack_gguf_weight_to_target
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
     from mobius.integrations.gguf._spec import TensorRole
 
     quantize_embeddings = bool(getattr(config.quantization, "quantize_embeddings", False))
     quantize_lm_head = bool(getattr(config.quantization, "quantize_lm_head", False))
     tie_word_embeddings = bool(config.tie_word_embeddings)
+    float_type_ids = float_storage_type_ids()
 
     def _emit_linear(state_dict: dict, stem: str, repacked) -> None:
         state_dict[f"{stem}.weight"] = torch.from_numpy(repacked.weight)
@@ -960,6 +962,14 @@ def _text_gguf_to_hf_multimodal_quantized(
         is_quant_embedding = quantize_embeddings and hf_name in _QUANTIZED_EMBEDDING_NAMES
 
         if (is_quant_linear or is_quant_embedding) and len(np_shape) == 2:
+            qtype_id = getattr(qtype, "value", qtype)
+            if qtype_id in float_type_ids:
+                raise ValueError(
+                    "Quantization-preserving Gemma4 GGUF import would quantize float "
+                    f"projection {gguf_name} ({getattr(qtype, 'name', qtype)}) to "
+                    f"the graph's {bits}-bit/block-{block_size} MatMulNBits contract. "
+                    "Use keep_quantized=False (API) for explicit float import."
+                )
             repacked = repack_gguf_weight_to_target(
                 text_gguf,
                 raw,
@@ -992,6 +1002,13 @@ def _text_gguf_to_hf_multimodal_quantized(
             continue
 
         # Everything else (norms, float per-layer projections) stays float.
+        qtype_id = getattr(qtype, "value", qtype)
+        if qtype_id not in float_type_ids:
+            raise ValueError(
+                "Quantization-preserving Gemma4 GGUF import cannot retain packed tensor "
+                f"{gguf_name} ({getattr(qtype, 'name', qtype)}) because its graph "
+                "target is float. Use keep_quantized=False (API) for explicit float import."
+            )
         values = np.array(text_gguf.dequantize_raw_tensor(raw, qtype, np_shape)).astype(
             np.float32
         )
@@ -1080,6 +1097,7 @@ def build_gemma4_vlm_from_gguf(
     from mobius._builder import resolve_dtype
     from mobius.integrations.gguf._builder import (
         _has_quantized_weights,
+        _reject_unsupported_quantization_preservation,
         _validate_gguf_model,
     )
     from mobius.integrations.gguf._config_mapping import gguf_to_config
@@ -1099,6 +1117,12 @@ def build_gemma4_vlm_from_gguf(
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
 
     preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, "gemma4")
+    _reject_unsupported_quantization_preservation(
+        text_gguf,
+        "gemma4",
+        preserve_quantization=preserve_quantization,
+        allow_native_blocks=False,
+    )
     if keep_quantized and not preserve_quantization:
         logger.info(
             "Text GGUF contains no mapped quantized weights; using the float import path"
@@ -1312,6 +1336,7 @@ def build_muse_glimmer_vlm_from_gguf(
         _load_dequantized_state_dict,
         _load_quantized_state_dict,
         _normalize_gguf_weights,
+        _reject_unsupported_quantization_preservation,
         _replace_native_block_linears,
         _validate_gguf_model,
     )
@@ -1364,6 +1389,13 @@ def build_muse_glimmer_vlm_from_gguf(
     _validate_projector_output_and_media_tokens(config, text_gguf, mmproj_gguf)
 
     preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, text_arch)
+    _reject_unsupported_quantization_preservation(
+        text_gguf,
+        text_arch,
+        preserve_quantization=preserve_quantization,
+        allow_quantized_embeddings=False,
+        allow_quantized_lm_head=False,
+    )
     if keep_quantized and not preserve_quantization:
         logger.info(
             "Text GGUF contains no mapped quantized weights; using the float import path"

@@ -34,6 +34,7 @@ __all__ = [
     "get_quant_spec",
     "iter_quant_specs",
     "lm_head_preserve_type_names",
+    "lossless_preservation_type_names",
     "native_block_format",
     "quant_import_decision",
     "quant_spec_by_name",
@@ -89,16 +90,18 @@ _NATIVE_BLOCK_FORMATS: MappingProxyType[str, str] = MappingProxyType(
 #: affine path. So every target here emits zero points explicitly.
 _AFFINE_REPACK_TARGETS: MappingProxyType[str, AffineRepackSpec] = MappingProxyType(
     {
-        "Q4_0": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
+        "Q4_0": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False, lossless=True),
         "Q4_1": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
-        "Q8_0": AffineRepackSpec(bits=8, block_size=32, omit_zero_points=False),
+        "Q8_0": AffineRepackSpec(bits=8, block_size=32, omit_zero_points=False, lossless=True),
         "Q4_K": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
         "Q6_K": AffineRepackSpec(bits=4, block_size=32, omit_zero_points=False),
         # Mainline Q1_0 is 1-bit binary over 128-element blocks, repacked into
         # 2-bit MatMulNBits with zp=1. Tencent's custom Q1_0 reuses the same
         # type id with a different on-disk layout and is handled separately in
         # ``_tencent_q1_0``.
-        "Q1_0": AffineRepackSpec(bits=2, block_size=128, omit_zero_points=False),
+        "Q1_0": AffineRepackSpec(
+            bits=2, block_size=128, omit_zero_points=False, lossless=True
+        ),
     }
 )
 
@@ -162,9 +165,21 @@ _REQUIRES_EXPLICIT_ZERO_POINT: frozenset[str] = frozenset(
 #: the two tables above because the head is also allowed to ride the generic
 #: requantization path.
 _LM_HEAD_PRESERVE: frozenset[str] = frozenset(
-    name
-    for name, (route, _) in _STORED_ROUTE_POLICY.items()
-    if route is not QuantImportRoute.REJECTED
+    {
+        "Q1_0",
+        "Q4_0",
+        "Q8_0",
+        "MXFP4",
+        "IQ4_NL",
+        "IQ4_XS",
+        "IQ3_S",
+        "IQ3_XXS",
+        "IQ2_XXS",
+        "IQ2_XS",
+        "IQ2_S",
+        "IQ1_S",
+        "IQ1_M",
+    }
 )
 
 #: Upstream ``gguf_role`` strings → :class:`StorageRole`. The census stores the
@@ -491,3 +506,9 @@ def render_quant_support_matrix() -> str:
             f"{spec.runtime.value} |"
         )
     return "\n".join(rows)
+
+
+@functools.lru_cache(maxsize=1)
+def lossless_preservation_type_names() -> frozenset[str]:
+    """Return types whose quantized route preserves source dequantized values."""
+    return frozenset(spec.name for spec in iter_quant_specs() if spec.preserves_values)

@@ -206,7 +206,7 @@ def _write_minimal_gguf(
     writer.close()
 
 
-def _write_quantized_gemma4_text_gguf(path: Path) -> None:
+def _write_quantized_gemma4_text_gguf(path: Path, *, float_projection: bool = False) -> None:
     """Write a tiny Gemma4 text GGUF with Q4 projections and a float embedding."""
     from gguf import GGMLQuantizationType, GGUFWriter
 
@@ -274,7 +274,10 @@ def _write_quantized_gemma4_text_gguf(path: Path) -> None:
 
     for layer in range(num_layers):
         prefix = f"blk.{layer}"
-        _q4_0(f"{prefix}.attn_q.weight", num_heads * head_dim, hidden_size)
+        if float_projection and layer == 0:
+            _f32(f"{prefix}.attn_q.weight", (num_heads * head_dim, hidden_size))
+        else:
+            _q4_0(f"{prefix}.attn_q.weight", num_heads * head_dim, hidden_size)
         _q4_0(f"{prefix}.attn_k.weight", num_kv_heads * head_dim, hidden_size)
         _q4_0(f"{prefix}.attn_v.weight", num_kv_heads * head_dim, hidden_size)
         _q4_0(f"{prefix}.attn_output.weight", hidden_size, num_heads * head_dim)
@@ -1029,6 +1032,63 @@ class TestKeepQuantizedMixedPrecision:
             for model in reloaded.values()
             for initializer in model.graph.initializers.values()
         )
+
+    def test_float_projection_in_quantized_text_fails_closed(
+        self, clip_mmproj_gguf: Path, tmp_path: Path
+    ):
+        from mobius.integrations.gguf import build_gemma4_vlm_from_gguf
+
+        text_gguf = tmp_path / "gemma4-q4-f32-projection.gguf"
+        _write_quantized_gemma4_text_gguf(text_gguf, float_projection=True)
+
+        with pytest.raises(ValueError, match=r"would quantize float projection"):
+            build_gemma4_vlm_from_gguf(text_gguf, clip_mmproj_gguf, image_token_id=63)
+
+        package = build_gemma4_vlm_from_gguf(
+            text_gguf,
+            clip_mmproj_gguf,
+            image_token_id=63,
+            keep_quantized=False,
+        )
+        assert "MatMulNBits" not in _component_op_types(package["decoder"])
+
+    @pytest.mark.parametrize(
+        "tensor_name",
+        ["per_layer_token_embd.weight", "per_layer_model_proj.weight"],
+    )
+    def test_quantized_per_layer_table_fails_closed(self, tensor_name: str):
+        from types import SimpleNamespace
+
+        from gguf import GGMLQuantizationType
+
+        from mobius.integrations.gguf._mmproj import (
+            _text_gguf_to_hf_multimodal_quantized,
+        )
+
+        class _PackedPerLayerModel:
+            def tensor_items_raw(self):
+                yield (
+                    tensor_name,
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q4_0,
+                    (2, 32, 32),
+                )
+
+        config = SimpleNamespace(
+            quantization=SimpleNamespace(
+                quantize_embeddings=False,
+                quantize_lm_head=False,
+            ),
+            tie_word_embeddings=False,
+        )
+        with pytest.raises(ValueError, match=r"cannot retain packed tensor"):
+            _text_gguf_to_hf_multimodal_quantized(
+                _PackedPerLayerModel(),
+                config,
+                bits=4,
+                block_size=32,
+                symmetric=True,
+            )
 
     def test_quantized_decoder_loads_in_onnxruntime(
         self, clip_mmproj_gguf: Path, tmp_path: Path
