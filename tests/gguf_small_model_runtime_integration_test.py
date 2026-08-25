@@ -130,7 +130,7 @@ _CASES = (
         reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
         prompt="Here is my poem:",
         tensor_qtypes={"F16": 211, "F32": 61},
-        config_sha256="c62123baf4e95656cdc9f5b798c14319bbaafec594526c462b10555f561969f9",
+        config_sha256="e8ca654a7c9180821b588ad167eaccf45a14869883789911e4481b755dc97164",
         generated_tokens=(
             198,
             198,
@@ -190,7 +190,7 @@ _Q4_K_M_CASE = _RuntimeCase(
     reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
     prompt="Here is my poem:",
     tensor_qtypes={"F32": 61, "Q4_K": 16, "Q5_0": 166, "Q6_K": 14, "Q8_0": 15},
-    config_sha256="c62123baf4e95656cdc9f5b798c14319bbaafec594526c462b10555f561969f9",
+    config_sha256="e8ca654a7c9180821b588ad167eaccf45a14869883789911e4481b755dc97164",
     generated_tokens=(198, 198, 18, 504, 2388, 13685, 284, 5208, 28, 198),
     tokenizer_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
     tokenizer_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
