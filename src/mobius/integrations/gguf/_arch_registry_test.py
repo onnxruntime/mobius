@@ -95,6 +95,8 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "smollm3",
         "stablelm",
         "starcoder2",
+        "t5",
+        "t5encoder",
     }
 )
 
