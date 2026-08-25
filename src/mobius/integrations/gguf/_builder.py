@@ -4348,6 +4348,22 @@ def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
     return False
 
 
+def _uses_explicit_float_route(
+    gguf_arch: str,
+    tensor_name: str,
+) -> bool:
+    """Return whether a quantized source weight is intentionally loaded as float."""
+    if gguf_arch in {"bert", "modern-bert"} and tensor_name in {
+        "token_embd.weight",
+        "token_embd_norm.weight",
+        "token_types.weight",
+    }:
+        return True
+    return gguf_arch == "jamba" and tensor_name.endswith(
+        ("ssm_in.weight", "ssm_out.weight", "ssm_x.weight", "ssm_dt.weight")
+    )
+
+
 def _reject_unsupported_quantization_preservation(
     gguf_model,
     gguf_arch: str,
@@ -4418,12 +4434,7 @@ def _reject_unsupported_quantization_preservation(
             and module_stem in dequantize_float_linear_types
             and type_name in dequantize_float_linear_types[module_stem]
         )
-        is_encoder_embedding = gguf_arch in {"bert", "modern-bert"} and tensor_name in {
-            "token_embd.weight",
-            "token_embd_norm.weight",
-            "token_types.weight",
-        }
-        if explicitly_dequantized or is_encoder_embedding:
+        if explicitly_dequantized or _uses_explicit_float_route(gguf_arch, tensor_name):
             continue
         if tensor_name.endswith(".ffn_gate_up_exps.weight"):
             raise ValueError(
@@ -4548,6 +4559,8 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
         hf_name = map_gguf_to_hf_names(name, gguf_arch)
         if hf_name is None or not hf_name.endswith(".weight"):
+            continue
+        if _uses_explicit_float_route(gguf_arch, name):
             continue
         type_id = getattr(qtype, "value", qtype)
         if type_id not in float_type_ids:

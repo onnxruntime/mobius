@@ -4078,6 +4078,7 @@ class TestBuildQuantizedGguf:
         from gguf import GGMLQuantizationType
 
         from mobius.integrations.gguf._builder import (
+            _detect_quant_params,
             _reject_unsupported_quantization_preservation,
         )
 
@@ -4099,12 +4100,14 @@ class TestBuildQuantizedGguf:
         _reject_unsupported_quantization_preservation(
             _EncoderModel(), "bert", preserve_quantization=True
         )
+        assert _detect_quant_params(_EncoderModel(), "bert") == (4, 32, False)
 
     def test_explicit_float_linear_does_not_constrain_projection_target(self):
         """A hybrid float-only linear may use a different source qtype."""
         from gguf import GGMLQuantizationType
 
         from mobius.integrations.gguf._builder import (
+            _detect_quant_params,
             _reject_unsupported_quantization_preservation,
         )
 
@@ -4131,6 +4134,7 @@ class TestBuildQuantizedGguf:
                 "model.layers.0.mamba.in_proj": {"Q8_0"},
             },
         )
+        assert _detect_quant_params(_HybridModel(), "jamba") == (4, 32, False)
 
     def test_native_blocks_use_the_exact_affine_companion_target(self):
         """Native projections do not force exact Q8_0 companions through INT4."""
