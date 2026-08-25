@@ -194,6 +194,7 @@ def _insert_external_transform(
     uses = list(initializer.uses())
     if not uses:
         return
+    earliest_consumer = min((node for node, _ in uses), key=graph.index)
     dtype = initializer.dtype
     final_shape = initializer.shape
     assert dtype is not None and final_shape is not None
@@ -334,7 +335,7 @@ def _insert_external_transform(
     else:
         raise ValueError(f"Unknown GGUF external transform {candidate.transform!r}.")
 
-    graph.insert_before(uses[0][0], nodes)
+    graph.insert_before(earliest_consumer, nodes)
 
 
 def _validate_source(plan: GGUFReusePlan, output_directory: Path) -> None:
