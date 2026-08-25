@@ -4357,10 +4357,19 @@ def _uses_explicit_float_route(
         "token_embd.weight",
         "token_embd_norm.weight",
         "token_types.weight",
+        "position_embd.weight",
     }:
         return True
+    if tensor_name.endswith(("_norm.weight", ".norm.weight")):
+        return True
     return gguf_arch == "jamba" and tensor_name.endswith(
-        ("ssm_in.weight", "ssm_out.weight", "ssm_x.weight", "ssm_dt.weight")
+        (
+            "ssm_in.weight",
+            "ssm_out.weight",
+            "ssm_x.weight",
+            "ssm_dt.weight",
+            "ssm_conv1d.weight",
+        )
     )
 
 

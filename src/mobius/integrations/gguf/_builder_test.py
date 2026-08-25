@@ -4085,10 +4085,16 @@ class TestBuildQuantizedGguf:
         class _EncoderModel:
             def tensor_items_raw(self):
                 yield (
-                    "token_embd.weight",
+                    "position_embd.weight",
                     np.empty(0, dtype=np.uint8),
                     GGMLQuantizationType.Q8_0,
                     (256, 64),
+                )
+                yield (
+                    "blk.0.attn_norm.weight",
+                    np.empty(0, dtype=np.uint8),
+                    GGMLQuantizationType.Q8_0,
+                    (64,),
                 )
                 yield (
                     "blk.0.attn_q.weight",
