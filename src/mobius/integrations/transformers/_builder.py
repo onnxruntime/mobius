@@ -159,6 +159,7 @@ def build_transformers_model(
     kv_cache_scales: dict[int, tuple[float, float]] | None = None,
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
+    export_paged_attention: bool = False,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -246,6 +247,16 @@ def build_transformers_model(
                 "('glm_moe_dsa') checkpoints."
             )
         config = dataclasses.replace(config, use_dsa=False)
+    if export_paged_attention:
+        from mobius.components._paged_mla import paged_attention_rejection
+
+        config = dataclasses.replace(config, export_paged_attention=True)
+        reason = paged_attention_rejection(config)
+        if reason is not None:
+            raise ValueError(
+                "export_paged_attention=True (--features paged-attention) is not "
+                f"supported for model_type '{model_type}': {reason}"
+            )
     if task is None:
         task = _default_task_for_model(model_type)
 

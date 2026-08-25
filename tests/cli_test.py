@@ -590,6 +590,74 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_features_paged_attention_passed_through(self):
+        """--features paged-attention threads the flag + paged task into build."""
+        from mobius.tasks import CausalLMTask
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "paged-attention",
+                ]
+            )
+        kwargs = mock_build.call_args.kwargs
+        assert kwargs.get("export_paged_attention") is True
+        task = kwargs.get("task")
+        assert isinstance(task, CausalLMTask)
+        assert task._paged_cache is True
+
+    def test_paged_attention_with_task_errors(self):
+        """--features paged-attention owns the task; it cannot combine with --task."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"paged-attention.*--task"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "paged-attention",
+                    "--task",
+                    "text-generation",
+                ]
+            )
+
+    def test_paged_attention_with_static_cache_errors(self):
+        """PagedAttention and static cache are distinct, exclusive cache modes."""
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"paged-attention.*static-cache"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "paged-attention,static-cache",
+                ]
+            )
+
     def test_non_positive_max_seq_len_errors(self):
         with tempfile.TemporaryDirectory() as tmpdir, pytest.raises(SystemExit):
             main(

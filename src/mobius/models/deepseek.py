@@ -28,6 +28,11 @@ from mobius.components import (
 )
 from mobius.components._deepseek_mla import DeepSeekMLA
 from mobius.components._moe import _supported_qmoe_quantization
+from mobius.components._paged_mla import (
+    PagedLatentMLA,
+    absorb_mla_weights,
+    mla_paged_geometry,
+)
 from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.models.base import CausalLMModel
 
@@ -216,7 +221,12 @@ class DeepSeekMLADecoderLayer(nn.Module):
     def __init__(self, config: ArchitectureConfig, is_moe: bool = False):
         super().__init__()
         linear_class = _linear_factory(config)
-        self.self_attn = DeepSeekMLA(config, linear_class=linear_class)
+        if config.export_paged_attention:
+            # Feature-on: emit LATENT PagedAttention. An ineligible geometry
+            # raises here (typed reason) rather than silently falling back.
+            self.self_attn = PagedLatentMLA(config, linear_class=linear_class)
+        else:
+            self.self_attn = DeepSeekMLA(config, linear_class=linear_class)
         if is_moe:
             gate = DeepSeekMoEGate(config)
             self.mlp = _DeepSeekMoEFFN(config, gate, linear_class=linear_class)
@@ -236,13 +246,20 @@ class DeepSeekMLADecoderLayer(nn.Module):
         # Self attention with pre-norm
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
-        hidden_states, present_kv = self.self_attn(
-            op,
-            hidden_states=hidden_states,
-            attention_bias=attention_bias,
-            position_embeddings=position_embeddings,
-            past_key_value=past_key_value,
-        )
+        if isinstance(self.self_attn, PagedLatentMLA):
+            hidden_states, present_kv = self.self_attn(
+                op,
+                hidden_states=hidden_states,
+                cache=past_key_value,
+            )
+        else:
+            hidden_states, present_kv = self.self_attn(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=attention_bias,
+                position_embeddings=position_embeddings,
+                past_key_value=past_key_value,
+            )
         hidden_states = op.Add(residual, hidden_states)
 
         # FFN with pre-norm
@@ -391,6 +408,7 @@ class DeepSeekV3TextModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._export_paged_attention = config.export_paged_attention
 
         # For MLA, RoPE applies only to the qk_rope_head_dim portion of Q and K,
         # not the full head_dim. Create a modified config so the cos/sin cache
@@ -414,6 +432,10 @@ class DeepSeekV3TextModel(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_tokens(op, input_ids)
+
+        if self._export_paged_attention:
+            return self._forward_paged(op, hidden_states, past_key_values)
+
         position_embeddings = self.rotary_emb(op, position_ids)
         attention_bias = create_attention_bias(
             op,
@@ -431,6 +453,44 @@ class DeepSeekV3TextModel(nn.Module):
                 attention_bias=attention_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
+            )
+            present_key_values.append(present_kv)
+
+        hidden_states = self.norm(op, hidden_states)
+        return hidden_states, present_key_values
+
+    def _forward_paged(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        past_key_values: list | None,
+    ):
+        """Paged LATENT forward: RoPE is applied inside ``PagedAttention``.
+
+        The RoPE cos/sin tables come from this model's ``rotary_emb`` parameters
+        (cast to the compute dtype) and are injected into every layer's
+        caller-owned :class:`PagedCacheState`.
+        """
+        if past_key_values is None:
+            raise ValueError(
+                "export_paged_attention requires caller-owned paged cache state; "
+                "use CausalLMTask(paged_cache=True)."
+            )
+        cos = self.rotary_emb.cos_cache
+        sin = self.rotary_emb.sin_cache
+        if self._dtype != ir.DataType.FLOAT:
+            cos = op.Cast(cos, to=self._dtype)
+            sin = op.Cast(sin, to=self._dtype)
+
+        present_key_values = []
+        for layer, cache in zip(self.layers, past_key_values):
+            cache = dataclasses.replace(cache, cos_cache=cos, sin_cache=sin)
+            hidden_states, present_kv = layer(
+                op,
+                hidden_states=hidden_states,
+                attention_bias=None,
+                position_embeddings=None,
+                past_key_value=cache,
             )
             present_key_values.append(present_kv)
 
@@ -499,9 +559,53 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
 
             renamed[new_key] = value
 
+        # Absorb kv_b_proj into the query/output projections for the opt-in
+        # LATENT PagedAttention export (feature-off leaves weights untouched).
+        if self.config.export_paged_attention:
+            renamed = self._absorb_paged_mla_weights(renamed)
+
         # Handle weight tying and GPTQ/AWQ conversion before flattening the
         # expert-major MatMulNBits blobs into the QMoE ABI.
         processed = super().preprocess_weights(renamed)
         if use_qmoe:
             processed = pack_qmoe_expert_weights(processed)
         return processed
+
+    def _absorb_paged_mla_weights(
+        self, weights: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Fold each layer's ``kv_b_proj`` into ``q_(b_)proj`` and ``o_proj``.
+
+        Produces the absorbed shapes consumed by :class:`PagedLatentMLA` and
+        drops ``kv_b_proj`` (fully absorbed). Matches the numeric contract in
+        :func:`mobius.components._paged_mla.absorb_mla_weights`.
+        """
+        # Validate eligibility (raises a typed reason if ineligible).
+        mla_paged_geometry(self.config)
+        out = dict(weights)
+        kv_b_suffix = ".self_attn.kv_b_proj.weight"
+        for key in list(weights):
+            if not key.endswith(kv_b_suffix):
+                continue
+            prefix = key[: -len(kv_b_suffix)]
+            q_key = f"{prefix}.self_attn.q_b_proj.weight"
+            if q_key not in weights:
+                q_key = f"{prefix}.self_attn.q_proj.weight"
+            o_key = f"{prefix}.self_attn.o_proj.weight"
+            if q_key not in weights or o_key not in weights:
+                raise ValueError(
+                    f"Cannot absorb paged MLA weights for '{prefix}': missing "
+                    f"query or output projection."
+                )
+            q_t, o_t = weights[q_key], weights[o_key]
+            absorbed = absorb_mla_weights(
+                {q_key: q_t, key: weights[key], o_key: o_t},
+                self.config,
+                q_key=q_key,
+                kv_b_key=key,
+                o_key=o_key,
+            )
+            out[q_key] = torch.as_tensor(absorbed[q_key]).to(q_t.dtype)
+            out[o_key] = torch.as_tensor(absorbed[o_key]).to(o_t.dtype)
+            del out[key]  # kv_b_proj fully absorbed
+        return out

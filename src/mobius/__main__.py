@@ -44,6 +44,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "prune-prefill-prefix": "prune_prefill_prefix",
     "text-only": "text_only",
     "glm-full-attention": "glm_full_attention",
+    "paged-attention": "export_paged_attention",
 }
 
 
@@ -269,6 +270,23 @@ def _cmd_build(args: argparse.Namespace) -> None:
         }
     else:
         static_cache_params = None
+
+    # PagedAttention (LATENT dense-MLA) export uses the paged-cache task with
+    # caller-owned page buffers. It is a distinct cache authority, so it cannot
+    # be combined with the static-cache task or an explicit --task.
+    export_paged_attention = getattr(args, "export_paged_attention", False)
+    if export_paged_attention:
+        if static_cache_params is not None:
+            raise SystemExit(
+                "Error: --features paged-attention cannot be combined with "
+                "--features static-cache."
+            )
+        if task is not None:
+            raise SystemExit(
+                "Error: --features paged-attention cannot be combined with --task. "
+                "Remove --task to use --features paged-attention."
+            )
+        task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
     output_dir = args.output_dir
@@ -358,6 +376,16 @@ def _cmd_build(args: argparse.Namespace) -> None:
                     f"model_type 'glm_moe_dsa' (got '{model_type}')."
                 )
             config = dataclasses.replace(config, use_dsa=False)
+        if export_paged_attention:
+            from mobius.components._paged_mla import paged_attention_rejection
+
+            config = dataclasses.replace(config, export_paged_attention=True)
+            reason = paged_attention_rejection(config)
+            if reason is not None:
+                raise SystemExit(
+                    f"Error: --features paged-attention is not supported for this "
+                    f"model: {reason}"
+                )
         if static_cache_params is not None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
@@ -406,6 +434,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             kv_cache_scales=kv_cache_scales,
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
+            export_paged_attention=export_paged_attention,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)

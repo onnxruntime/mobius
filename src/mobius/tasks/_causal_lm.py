@@ -95,10 +95,14 @@ class CausalLMTask(ModelTask):
         self,
         *,
         static_cache: bool = False,
+        paged_cache: bool = False,
         max_seq_len: int | None = None,
         prune_prefill_prefix: bool = False,
     ):
+        if static_cache and paged_cache:
+            raise ValueError("static_cache and paged_cache are mutually exclusive.")
         self._static_cache = static_cache
+        self._paged_cache = paged_cache
         self._max_seq_len = max_seq_len
         self._prune_prefill_prefix = prune_prefill_prefix
 
@@ -132,6 +136,10 @@ class CausalLMTask(ModelTask):
 
         # --- Inputs common to both modes ---
         input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+
+        # --- Paged-cache mode: caller-owned LATENT PagedAttention cache. ---
+        if self._paged_cache:
+            return self._build_paged(module, config, graph, builder, op, input_ids, batch)
 
         # --- Cache setup (static vs dynamic) ---
         if static:
@@ -243,6 +251,57 @@ class CausalLMTask(ModelTask):
                 builder, config.output_layer_indices, intermediate_hidden_states
             )
 
+        return ModelPackage({"model": _make_model(graph)}, config=config)
+
+    def _build_paged(
+        self,
+        module: nn.Module,
+        config: ArchitectureConfig,
+        graph,
+        builder: GraphBuilder,
+        op,
+        input_ids: ir.Value,
+        batch: ir.SymbolicDim,
+    ) -> ModelPackage:
+        """Emit a decoder that binds caller-owned LATENT ``PagedAttention``.
+
+        The page/cache tensors (``block_table``, ``slot_mapping``, cumulative
+        lengths, past lengths, per-layer ``key_cache.N``) are graph inputs owned
+        by the native page manager; this task never allocates or manages pages.
+        """
+        from mobius.components._paged_mla import (
+            mla_paged_geometry,
+        )
+
+        # Eligibility must hold; an incompatible geometry is a typed error here
+        # (never a silent dense fallback).
+        geom = mla_paged_geometry(config)
+
+        # LATENT PagedAttention applies RoPE in-op and derives each token's
+        # absolute position from past_seqlens + cumulative_sequence_length, so
+        # the graph takes no position_ids input.
+        paged_states = _make_paged_cache_inputs(
+            builder,
+            config.num_hidden_layers,
+            geom.head_size,
+            config.dtype,
+            batch,
+        )
+
+        result = module(
+            op,
+            input_ids=input_ids,
+            attention_mask=None,
+            position_ids=None,
+            past_key_values=paged_states,
+        )
+        if len(result) == 3:
+            logits, present_key_values, _intermediate = result
+        else:
+            logits, present_key_values = result
+
+        builder.add_output(logits, "logits")
+        _register_paged_cache_outputs(builder, present_key_values)
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
 
@@ -466,6 +525,71 @@ def _register_static_cache_outputs(
     for i, (updated_key, updated_value) in enumerate(present_key_values):
         builder.add_output(updated_key, f"updated_key_cache.{i}")
         builder.add_output(updated_value, f"updated_value_cache.{i}")
+
+
+def _make_paged_cache_inputs(
+    builder: GraphBuilder,
+    num_layers: int,
+    head_size: int,
+    dtype: ir.DataType,
+    batch: ir.SymbolicDim,
+):
+    """Create caller-owned LATENT ``PagedAttention`` cache inputs.
+
+    Per-layer ``key_cache.{i}`` LATENT buffers plus the shared index inputs
+    (``block_table``, ``slot_mapping``, ``cumulative_sequence_length``,
+    ``past_seqlens``). ``cos_cache``/``sin_cache`` are supplied by the model
+    from its RoPE parameters, so the returned states leave them ``None``.
+
+    All buffers are graph inputs owned by the native page manager; this task
+    allocates none of them and never creates a second cache authority.
+    """
+    from mobius.components._paged_mla import PagedCacheState
+
+    num_blocks = ir.SymbolicDim("num_blocks")
+    block_size = ir.SymbolicDim("block_size")
+    max_blocks = ir.SymbolicDim("max_blocks_per_seq")
+    num_tokens = ir.SymbolicDim("num_tokens")
+
+    # Shared, sequence-level index inputs (int32 positional constraint S).
+    block_table = builder.input(
+        "block_table", dtype=ir.DataType.INT32, shape=[batch, max_blocks]
+    )
+    slot_mapping = builder.input("slot_mapping", dtype=ir.DataType.INT32, shape=[num_tokens])
+    cumulative_sequence_length = builder.input(
+        "cumulative_sequence_length", dtype=ir.DataType.INT32, shape=["batch + 1"]
+    )
+    past_seqlens = builder.input("past_seqlens", dtype=ir.DataType.INT32, shape=[batch])
+
+    states = []
+    for i in range(num_layers):
+        key_cache = builder.input(
+            f"key_cache.{i}",
+            dtype=dtype,
+            shape=[num_blocks, block_size, 1, head_size],
+        )
+        states.append(
+            PagedCacheState(
+                key_cache=key_cache,
+                block_table=block_table,
+                slot_mapping=slot_mapping,
+                cumulative_sequence_length=cumulative_sequence_length,
+                past_seqlens=past_seqlens,
+                cos_cache=None,
+                sin_cache=None,
+            )
+        )
+    return states
+
+
+def _register_paged_cache_outputs(
+    builder: GraphBuilder,
+    present_key_values,
+) -> None:
+    """Name the in-place LATENT cache outputs (each aliases its ``key_cache``)."""
+    for i, present in enumerate(present_key_values):
+        updated_key = present[0] if isinstance(present, (tuple, list)) else present
+        builder.add_output(updated_key, f"updated_key_cache.{i}")
 
 
 def _validate_static_cache_support(module: nn.Module) -> None:
