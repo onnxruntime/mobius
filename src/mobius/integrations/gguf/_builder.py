@@ -2862,6 +2862,10 @@ def build_from_gguf(
             module,
             config,
             reuse_candidates=reuse_candidates_by_id,
+            dequantize_float_linear_types=_float_linear_dequantization_types(
+                module,
+                gguf_arch,
+            ),
         )
     else:
         state_dict = _load_dequantized_state_dict(
@@ -3226,6 +3230,34 @@ def _replace_native_block_linears(
             "Preserving %d GGUF projection weights as runtime-native IQ/MXFP4 blocks",
             len(replacements),
         )
+
+
+def _float_linear_dequantization_types(
+    module,
+    gguf_arch: str,
+) -> Mapping[str, Collection[str]] | None:
+    """Return explicitly float projection types for mixed quantized imports."""
+    if gguf_arch != "jamba":
+        return None
+
+    from mobius.integrations.gguf._quant_registry import iter_quant_specs
+
+    quantized_types = frozenset(
+        spec.name
+        for spec in iter_quant_specs()
+        if spec.is_quantized_storage and spec.dequantize is Support.SUPPORTED
+    )
+    mamba_projection_suffixes = (
+        ".mamba.in_proj",
+        ".mamba.out_proj",
+        ".mamba.ssm.x_proj",
+        ".mamba.ssm.dt_proj",
+    )
+    return {
+        name: quantized_types
+        for name, _child in module.named_modules()
+        if name.endswith(mamba_projection_suffixes)
+    }
 
 
 #: GGUF architectures whose transformer RMSNorms are zero-centered
@@ -4241,6 +4273,13 @@ def _load_quantized_state_dict(
                 target_bits=target_bits,
                 target_block_size=target_block_size,
             )
+            explicitly_dequantized = (
+                dequantize_float_linear_types is not None
+                and module_stem in dequantize_float_linear_types
+                and quant_spec.name in dequantize_float_linear_types[module_stem]
+            )
+            if explicitly_dequantized and quant_spec.dequantize is Support.SUPPORTED:
+                route = QuantImportRoute.DEQUANTIZE_FLOAT
             if route is QuantImportRoute.REJECTED:
                 raise ValueError(
                     f"Cannot import GGUF tensor {gguf_name} mapped to {hf_name} "
