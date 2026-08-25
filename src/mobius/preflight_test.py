@@ -196,11 +196,10 @@ class TestBudget:
 
 
 class TestRunPreflight:
-    def test_available_ram_probe_returns_positive_value(self):
-        available = preflight._available_ram_bytes()
+    def test_available_ram_bytes_forwards_probe_value(self, monkeypatch):
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (123, "test"))
 
-        assert available is not None
-        assert available > 0
+        assert preflight._available_ram_bytes() == 123
 
     def test_ram_probe_reports_windows_source(self, monkeypatch):
         monkeypatch.setattr(preflight.os, "name", "nt")
@@ -218,13 +217,21 @@ class TestRunPreflight:
     def test_vm_stat_parser_does_not_double_count_purgeable_pages(self):
         output = """\
 Mach Virtual Memory Statistics: (page size of 4096 bytes)
-Pages free:                                  10.
+  Pages free:                             1,000.
 Pages inactive:                              20.
 Pages speculative:                            3.
 Pages purgeable:                            100.
 """
 
-        assert preflight._parse_vm_stat_available_bytes(output) == 33 * 4096
+        assert preflight._parse_vm_stat_available_bytes(output) == 1023 * 4096
+
+    def test_vm_stat_parser_returns_none_without_available_fields(self):
+        output = """\
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages wired down:                           100.
+"""
+
+        assert preflight._parse_vm_stat_available_bytes(output) is None
 
     def test_ram_probe_reports_sysconf_fallback_source(self, monkeypatch):
         monkeypatch.setattr(preflight.os, "name", "posix")
