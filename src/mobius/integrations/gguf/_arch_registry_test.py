@@ -1590,11 +1590,7 @@ class TestDocumentedSupportMatrix:
         for spec in sorted(iter_arch_specs(), key=lambda s: s.gguf_arch):
             aliases = ", ".join(f"`{a}`" for a in sorted(spec.aliases)) or "—"
             model_type = f"`{spec.model_type}`" if spec.model_type else "—"
-            core_verdicts = {
-                name: verdict
-                for name, verdict in spec.verdicts.items()
-                if name != "quantized_import"
-            }
+            core_verdicts = spec.verdicts
             status = (
                 "supported"
                 if all(verdict is Support.SUPPORTED for verdict in spec.verdicts.values())

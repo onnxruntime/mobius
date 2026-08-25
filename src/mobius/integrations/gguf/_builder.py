@@ -49,7 +49,7 @@ from mobius.integrations.gguf._errors import (
     UnsupportedGGUFArchitectureError,
 )
 from mobius.integrations.gguf._header import _gguf_architecture_from_header
-from mobius.integrations.gguf._spec import Support
+from mobius.integrations.gguf._spec import Support, TensorRole
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
 try:
@@ -1638,7 +1638,10 @@ def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
         raise ValueError("PLaMo2 requires attention.layer_norm_rms_epsilon=1e-6")
     activation = metadata.get(f"{arch}.feed_forward.activation", "silu")
     if activation not in {"silu", "swiglu"}:
-        raise ValueError(f"PLaMo2 supports only fused SwiGLU, got {activation!r}")
+        raise ValueError(
+            "PLaMo2 feed_forward.activation must be 'silu' or 'swiglu' "
+            f"(both select fused SwiGLU), got {activation!r}"
+        )
     if bool(metadata.get(f"{arch}.ssm.use_predefined_initial_state", False)):
         raise ValueError("PLaMo2 predefined initial state is unsupported")
 
@@ -1690,6 +1693,15 @@ def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
         name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))
         for name in gguf_model.tensor_names
     }
+    from mobius.integrations.gguf._config_mapping import (
+        _infer_plamo2_attention_widths,
+    )
+
+    key_width, value_width = _infer_plamo2_attention_widths(
+        gguf_model,
+        tuple(head_counts),
+        tuple(kv_counts),
+    )
     required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (
             int(
@@ -1706,7 +1718,6 @@ def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
         "output.weight": (required["token_embd.weight"][0], hidden)
     }
     dt_rank = max(64, hidden // 16)
-    inferred_widths: set[tuple[int, int]] = set()
     for layer, (heads, kv_heads) in enumerate(zip(head_counts, kv_counts)):
         prefix = f"blk.{layer}."
         required.update(
@@ -1744,18 +1755,6 @@ def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
                 raise ValueError(f"PLaMo2 layer {layer} has invalid attention head geometry")
             qkv_name = prefix + "attn_qkv.weight"
             output_name = prefix + "attn_output.weight"
-            if qkv_name not in actual_shapes or output_name not in actual_shapes:
-                continue
-            value_width, value_remainder = divmod(actual_shapes[output_name][1], heads)
-            key_width, key_remainder = divmod(
-                actual_shapes[qkv_name][0] - kv_heads * value_width,
-                heads + kv_heads,
-            )
-            if value_remainder or key_remainder or min(key_width, value_width) <= 0:
-                raise ValueError(
-                    f"PLaMo2 layer {layer} key/value widths cannot be inferred exactly"
-                )
-            inferred_widths.add((key_width, value_width))
             required.update(
                 {
                     qkv_name: (
@@ -1768,9 +1767,6 @@ def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
                 }
             )
 
-    if len(inferred_widths) != 1:
-        raise ValueError("PLaMo2 attention tensor widths are missing or contradictory")
-    key_width, value_width = inferred_widths.pop()
     if key_width != value_width or key_width * max(head_counts) != hidden:
         raise ValueError("PLaMo2 attention widths do not reconstruct embedding_length")
     if inner != ssm_heads * key_width:
@@ -5040,7 +5036,7 @@ def repack_gguf_weight_to_target(
     target_block_size: int,
     target_symmetric: bool,
     tensor_name: str,
-    tensor_role=None,
+    tensor_role: TensorRole | None = None,
 ):
     """Repack one 2-D GGUF weight to the graph's common MatMulNBits target.
 
@@ -5072,7 +5068,7 @@ def repack_gguf_weight_to_target(
         repack_dequantized_tensor,
         repack_gguf_tensor,
     )
-    from mobius.integrations.gguf._spec import QuantImportRoute, TensorRole
+    from mobius.integrations.gguf._spec import QuantImportRoute
 
     if tensor_role is None:
         tensor_role = TensorRole.PROJECTION
@@ -5561,8 +5557,8 @@ def _load_quantized_state_dict(
                 offset = end
             if offset != int(np_shape[0]):
                 raise ValueError(
-                    f"Fused QKV tensor {hf_name!r} has {np_shape[0]} rows, "
-                    f"but Q/K/V targets require {offset}"
+                    f"Fused projection tensor {hf_name!r} has {np_shape[0]} rows, "
+                    f"but its split targets require {offset}"
                 )
             n_repacked += len(fused_projection_targets)
         elif native_targets and native_spec is not None:

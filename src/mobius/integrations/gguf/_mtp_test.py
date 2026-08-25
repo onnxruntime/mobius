@@ -456,7 +456,7 @@ class TestBuildMtpHead:
         monkeypatch.setattr(core_builder, "build_from_module", _unexpected_build)
         with pytest.raises(
             ValueError,
-            match=r"has 2 MTP blocks.*exactly one appended MTP block",
+            match=r"nextn_predict_layers=2.*exactly one appended MTP block",
         ):
             build_from_gguf(str(path))
         assert built is False
@@ -779,7 +779,7 @@ class TestMtpAutoDetect:
     @pytest.mark.parametrize(
         ("kwargs", "message"),
         [
-            ({"nextn_count": 2}, "declares 2 MTP heads"),
+            ({"nextn_count": 2}, r"nextn_predict_layers=2"),
             ({"omit_nextn_stem": "hnorm"}, "missing required tensor stem"),
             ({"mtp_block_index": 2}, "trailing block 1"),
             (

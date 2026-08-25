@@ -215,7 +215,7 @@ forces the Unfused fallback.
 > CPU+CUDA kernels are a *stricter* subset of what stock ORT supports:
 > historically both rejected `attention_bias`, and only the CUDA kernel
 > implemented `head_sink` (see
-> `crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`,
+> [`justinchuby/onnx-genai/crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs`](https://github.com/justinchuby/onnx-genai/blob/main/crates/onnx-runtime-ep-cpu/src/kernels/group_query_attention.rs),
 > which now also implements `head_sink` on CPU; `attention_bias` remains
 > unimplemented there by design, matching the CUDA fused-kernel
 > limitation above, not an oversight).

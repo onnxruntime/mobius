@@ -350,9 +350,9 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
         )
     if count != 1:
         raise ValueError(
-            f"{architecture} GGUF declares {count} MTP heads and has {count} MTP blocks, "
-            "but only exactly one appended MTP block can be represented; refusing to "
-            "silently truncate the remaining heads"
+            f"{architecture} GGUF declares {exact_key}={count}, but only exactly one "
+            "appended MTP block can be represented; refusing to silently truncate "
+            "the remaining heads"
         )
     if legacy_tensors:
         raise ValueError(

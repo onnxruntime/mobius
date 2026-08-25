@@ -11,6 +11,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import Plamo2Config
 from mobius.components import (
+    INT64_MAX,
     FusedGateUpMLP,
     Linear,
     RMSNorm,
@@ -104,13 +105,13 @@ class Plamo2Attention(nn.Module):
         present_key = op.Slice(
             present_key,
             [-self.window_size],
-            [9223372036854775807],
+            [INT64_MAX],
             [2],
         )
         present_value = op.Slice(
             present_value,
             [-self.window_size],
-            [9223372036854775807],
+            [INT64_MAX],
             [2],
         )
         return self.o_proj(op, output), present_key, present_value
@@ -341,7 +342,7 @@ class Plamo2Model(nn.Module):
             op.Slice(
                 attention_mask,
                 op.Neg(current_length),
-                [9223372036854775807],
+                [INT64_MAX],
                 [1],
             ),
             [-1],
