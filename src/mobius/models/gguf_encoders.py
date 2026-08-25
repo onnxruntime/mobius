@@ -304,9 +304,7 @@ class _PostNormEncoderLayer(nn.Module):
                 down_bias=config.encoder_ffn_down_bias,
             )
         else:
-            self.mlp = _ParallelGatedMLP(
-                config, "gelu_pytorch_tanh" if jina else "silu"
-            )
+            self.mlp = _ParallelGatedMLP(config, "gelu_pytorch_tanh" if jina else "silu")
         self.layer_output_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, op, hidden_states, attention_mask, position_embeddings=None):
