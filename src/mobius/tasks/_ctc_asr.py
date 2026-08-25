@@ -19,23 +19,6 @@ from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
-#: Graph metadata key recording whether a row's outputs depend on the padded
-#: width of its batch.  Carried on the ONNX model so a metadata producer can
-#: publish the fact without knowing anything about the architecture, and so it
-#: survives a round trip through the serialized file.
-BATCH_PADDING_SENSITIVE_KEY = "mobius.batch_padding_sensitive"
-
-
-def _record_batch_padding_sensitivity(model: ir.Model, module: object) -> None:
-    """Copy a module's batch-padding sensitivity onto the built ONNX model.
-
-    Modules that do not answer the question leave the key absent, which readers
-    must treat as unstated rather than as "rows are independent".
-    """
-    sensitive = getattr(module, "batch_padding_sensitive", None)
-    if isinstance(sensitive, bool):
-        model.metadata_props[BATCH_PADDING_SENSITIVE_KEY] = "true" if sensitive else "false"
-
 
 class CTCAsrTask(ModelTask):
     """Build ONNX graph for CTC-based ASR (raw waveform → frame logits).
@@ -88,9 +71,7 @@ class CTCAsrTask(ModelTask):
             frame_lengths = frame_lengths_fn(builder.op, attention_mask)
             builder.add_output(frame_lengths, "frame_lengths")
 
-        model = _make_model(graph)
-        _record_batch_padding_sensitivity(model, module)
-        return ModelPackage({"model": model}, config=config)
+        return ModelPackage({"model": _make_model(graph)}, config=config)
 
 
 class FeatureCTCAsrTask(ModelTask):

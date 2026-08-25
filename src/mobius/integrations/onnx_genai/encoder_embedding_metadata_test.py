@@ -11,9 +11,12 @@ loop, a sampler or a KV cache.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from mobius._passes import RemoveDeadGraphInputsPass
 from mobius.integrations.onnx_genai.auto_export import (
@@ -42,6 +45,10 @@ def _protbert_package():
 
 
 _PACKAGES = {"esm2": _esm2_package, "protbert": _protbert_package}
+_FIXTURE_ROOT = (
+    Path(__file__).resolve().parents[4] / "tests" / "fixtures" / "onnx_genai_workflows"
+)
+_SCHEMA_PATH = Path(__file__).with_name("_schema") / "inference_metadata.schema.json"
 
 
 @pytest.fixture(scope="module")
@@ -112,7 +119,14 @@ class TestEncoderEmbeddingWorkflow:
         workflow = metadata["pipeline"]["workflow"]
         assert profile["pooling"] == {"kind": "mean", "axis": 1, "normalize": False}
         assert "request.attention_mask" in workflow["inputs"]
-        assert profile["batch_invariance"] == "row_independent"
+
+    def test_request_axis_does_not_grant_grouped_execution(self, metadata) -> None:
+        """Dynamic row shape is not evidence that co-batching preserves results."""
+        profile = metadata["profiles"]["embedding"]
+        component = metadata["pipeline"]["workflow"]["components"]["encoder"]
+        assert "batch_invariance" not in profile
+        assert "batch_capacity" not in component
+        assert metadata["schema_version"] == "v1"
 
     def test_every_bound_port_exists_in_the_artifact(self, metadata, package) -> None:
         graph = package["model"].graph
@@ -169,6 +183,22 @@ class TestDispatch:
             text = handle.read()
         assert "kind: embedding" in text
         assert "max_output_tokens" not in text
+
+
+class TestBatchingContractConformance:
+    def test_schema_exposes_only_component_batch_capacity(self) -> None:
+        schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        workflow_component = schema["$defs"]["WorkflowComponent"]["properties"]
+        assert "batch_capacity" in workflow_component
+        assert "batch_invariance" not in schema["$defs"]["TaskProfile"]["properties"]
+        assert "continuous_batching" not in json.dumps(schema)
+
+    @pytest.mark.parametrize("name", sorted(_PACKAGES))
+    def test_checked_in_hf_example_fixture_matches_generation(self, name, built) -> None:
+        generated = build_encoder_embedding_workflow_metadata(built[name], built[name].config)
+        fixture_path = _FIXTURE_ROOT / f"{name}_protein_embeddings" / "inference_metadata.yaml"
+        fixture = yaml.safe_load(fixture_path.read_text(encoding="utf-8"))
+        assert fixture == generated
 
 
 class TestRejections:
