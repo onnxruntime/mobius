@@ -20,13 +20,17 @@ from mobius._constants import OPSET_VERSION
 from mobius._testing import count_op_type, make_config
 from mobius.components import create_attention_bias
 from mobius.components._rotary_embedding import initialize_rope
+from mobius.integrations._block_quant import BlockQuantExportError, BlockQuantScheme
 from mobius.integrations.ort_genai import export_package
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.models._deepseek_v4_csa import (
     CSA_COMPRESSION_RATIO,
     CSA_DOMAIN,
+    CSA_OP_TYPE,
     HCA_COMPRESSION_RATIO,
     NativeCsaExportError,
+    assert_native_runtime_supports_block_quant,
+    native_runtime_block_quant_gap,
     plan_native_csa,
 )
 from mobius.models.deepseek_v4 import (
@@ -1259,3 +1263,263 @@ def test_plan_native_csa_ratio4_layer_matches_contract():
     assert plan.past_index_key_name == "past_index_key.1"
     assert plan.present_index_carry_name == "present_index_carry.1"
     assert plan.selected_indices_name == "selected_indices.1"
+
+
+# ---------------------------------------------------------------------------
+# Composition: native CSA export (this module, #593) x the block-FP8 /
+# packed-FP4 loading contract (``mobius.integrations._block_quant``, #602, now
+# on main). The official DeepSeek-V4-Flash checkpoint @
+# 60d8d70770c6776ff598c94bb586a859a38244f1 is a *block-scaled fp8* backbone
+# (E4M3 weight + 2D UE8M0 [128, 128] block scale) with *packed-fp4* routed
+# experts (top-level ``expert_dtype=fp4``).
+#
+# The two slices compose in TWO stages, mandated by the directive
+# "graph construction should progress past the former generic shape mismatch,
+# full export must typed-reject at the runtime capability gate":
+#
+#   * A non-native export keeps #602's early, loud config-resolution reject.
+#   * A native-CSA export DEFERS that reject (records ``block_quant_scheme``)
+#     so graph construction PROGRESSES -- CSA nodes + compressed state IO are
+#     built and inspectable -- and the runnable *full export* then fails closed
+#     at the runtime-capability gate (``assert_native_runtime_supports_block_quant``
+#     / ``preprocess_weights``) until nxrt advertises the real block-FP8 /
+#     planar-FP4 format strings. Never a silent dense fallback, never a partial
+#     native + silent dense graph.
+# ---------------------------------------------------------------------------
+
+# Frozen verbatim from the official config.json @
+# 60d8d70770c6776ff598c94bb586a859a38244f1 (metadata only; no weights).
+_REAL_BLOCK_FP8_QUANT_CONFIG = {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "scale_fmt": "ue8m0",
+    "weight_block_size": [128, 128],
+}
+
+
+def _v4_hf_config(**overrides):
+    """A real-shaped DeepSeek-V4-Flash HF config (mirrors the official rev).
+
+    Same field set proven to resolve by ``test_real_config_fields_extract``
+    (``compress_ratios == [0, 0, 4, 128]``); overrides layer in the block-quant
+    / ``native_csa`` properties under test.
+    """
+    values = dict(
+        model_type="deepseek_v4",
+        vocab_size=129280,
+        hidden_size=4096,
+        intermediate_size=None,
+        num_hidden_layers=43,
+        num_attention_heads=64,
+        num_key_value_heads=1,
+        head_dim=512,
+        max_position_embeddings=1048576,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        rope_theta=10000,
+        rope_scaling={
+            "type": "yarn",
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        },
+        q_lora_rank=1024,
+        qk_rope_head_dim=64,
+        o_groups=8,
+        o_lora_rank=1024,
+        n_routed_experts=256,
+        num_experts_per_tok=6,
+        moe_intermediate_size=2048,
+        n_shared_experts=1,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.5,
+        scoring_func="sqrtsoftplus",
+        num_hash_layers=None,
+        mlp_layer_types=["hash_moe", "hash_moe", "hash_moe", "moe"],
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        hc_eps=1e-6,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=512,
+        compress_ratios=None,
+        layer_types=[
+            "sliding_attention",
+            "sliding_attention",
+            "compressed_sparse_attention",
+            "heavily_compressed_attention",
+        ],
+        compress_rates={
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        },
+        compress_rope_theta=160000,
+        sliding_window=128,
+        swiglu_limit=10.0,
+        tie_word_embeddings=False,
+        num_nextn_predict_layers=1,
+        attention_bias=False,
+        pad_token_id=0,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_non_native_export_fails_closed_on_block_fp8_fp4_checkpoint():
+    # A non-native (default) export of the official block-fp8 + fp4-expert
+    # checkpoint keeps #602's early, loud config-resolution reject -- fail-closed
+    # before any graph/CSA node exists. Preserves the merged default behavior.
+    hf = _v4_hf_config(
+        quantization_config=_REAL_BLOCK_FP8_QUANT_CONFIG,
+        expert_dtype="fp4",
+    )
+    with pytest.raises(BlockQuantExportError) as exc:
+        ArchitectureConfig.from_transformers(hf)
+    msg = str(exc.value)
+    # Names the real layout, the block geometry, the property-based contract
+    # module, and the runtime ABI emission gate -- never a model-name allowlist.
+    assert "Block-scaled FP8" in msg
+    assert "[128, 128]" in msg
+    assert "expert_dtype='fp4'" in msg
+    assert "mobius.integrations._block_quant" in msg
+    assert "plan_routed_expert_bank" in msg
+
+
+def test_fp4_experts_alone_fail_closed_even_without_block_fp8():
+    # The fp4 routed-expert property alone (top-level expert_dtype, no fp8
+    # quantization_config block) still trips the fail-closed config-resolution
+    # gate for a non-native export: the packed planar-fp4 expert bank has no
+    # nxrt BlockFormat either. Proves the gate is owned by the *property*, not
+    # by the fp8 block geometry.
+    hf = _v4_hf_config(
+        quantization_config={"quant_method": "none"},
+        expert_dtype="fp4",
+    )
+    with pytest.raises(BlockQuantExportError) as exc:
+        ArchitectureConfig.from_transformers(hf)
+    assert "expert_dtype='fp4'" in str(exc.value)
+
+
+def test_native_csa_defers_block_quant_so_graph_construction_can_progress():
+    # native_csa opts into DEFERRING #602's config-resolution reject: the config
+    # resolves (rather than raising) and records the block-quant scheme so graph
+    # construction can progress. The quantization path stays None (the INT4/
+    # per-tensor path never owns these weights).
+    hf = _v4_hf_config(
+        quantization_config=_REAL_BLOCK_FP8_QUANT_CONFIG,
+        expert_dtype="fp4",
+        native_csa=True,
+    )
+    config = ArchitectureConfig.from_transformers(hf)
+    assert config.native_csa is True
+    assert config.quantization is None
+    assert config.block_quant_scheme is not None
+    assert config.block_quant_scheme.is_owned
+    assert config.block_quant_scheme.is_block_scaled_fp8
+    assert config.block_quant_scheme.has_packed_fp4_experts
+
+
+def test_native_csa_full_export_typed_rejects_at_runtime_capability_gate():
+    # The deferred config still fails closed at the runtime-capability gate:
+    # the runnable full export (assert_native_runtime_supports_block_quant, and
+    # therefore preprocess_weights) raises the typed BlockQuantExportError while
+    # nxrt cannot execute block-FP8 / planar-FP4 weights. Never silent dense.
+    hf = _v4_hf_config(
+        quantization_config=_REAL_BLOCK_FP8_QUANT_CONFIG,
+        expert_dtype="fp4",
+        native_csa=True,
+    )
+    config = ArchitectureConfig.from_transformers(hf)
+    with pytest.raises(BlockQuantExportError) as exc:
+        assert_native_runtime_supports_block_quant(config)
+    msg = str(exc.value)
+    assert "block-FP8" in msg or "block-fp8" in msg.lower()
+    assert "planar" in msg.lower()
+    # The gap string is sourced from the #602 runtime contract, so the gate
+    # tracks the real format strings and opens with no change here.
+    gap = native_runtime_block_quant_gap(config.block_quant_scheme)
+    assert gap is not None
+    assert "nxrt" in gap
+
+
+def test_native_csa_graph_construction_progresses_past_block_quant():
+    # With the deferred block-quant scheme present, graph construction PROGRESSES
+    # past the former generic weight-shape mismatch: build_from_module emits the
+    # frozen CSA node and its compressed state IO instead of raising. The gate
+    # lives on the *full export* (weight load), not on construction, so the same
+    # config that builds a graph still rejects the runnable export.
+    scheme = BlockQuantScheme.from_quantization_config(
+        _REAL_BLOCK_FP8_QUANT_CONFIG, expert_dtype="fp4"
+    )
+    assert scheme is not None and scheme.is_owned
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+        block_quant_scheme=scheme,
+    )
+    graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
+        "model"
+    ].graph
+    csa = [n for n in _csa_nodes(graph) if n.domain == CSA_DOMAIN]
+    assert len(csa) == 1
+    assert csa[0].op_type == CSA_OP_TYPE
+    # ... but the runnable full export of that same config still fails closed.
+    with pytest.raises(BlockQuantExportError):
+        assert_native_runtime_supports_block_quant(config)
+
+
+def test_preprocess_weights_enforces_runtime_capability_gate():
+    # The weight-load hook (full export) enforces the same gate: a native-CSA
+    # module whose config carries a deferred block-quant scheme rejects in
+    # preprocess_weights before mapping a single tensor -- the typed blocker
+    # replaces the former generic "Weight shape mismatch".
+    scheme = BlockQuantScheme.from_quantization_config(
+        _REAL_BLOCK_FP8_QUANT_CONFIG, expert_dtype="fp4"
+    )
+    config = _tiny_config(
+        num_hidden_layers=2,
+        compress_ratios=[0, 128],
+        native_csa=True,
+        block_quant_scheme=scheme,
+    )
+    module = DeepSeekV4CausalLMModel(config)
+    with pytest.raises(BlockQuantExportError):
+        module.preprocess_weights({})
+
+
+def test_native_csa_is_property_gated_not_a_blanket_v4_refusal():
+    # The SAME DeepSeek-V4 schedule WITHOUT block-quant properties resolves
+    # normally, records no scheme, and still plans native CSA for both ratios --
+    # proving the deferral/gate fire on the block-quant *properties*, not on the
+    # model or on native_csa itself.
+    hf = _v4_hf_config(native_csa=True)
+    config = ArchitectureConfig.from_transformers(hf)
+    assert config.quantization is None
+    assert config.block_quant_scheme is None
+    assert config.native_csa is True
+    assert config.compress_ratios[:4] == [0, 0, 4, 128]
+    ratio4 = plan_native_csa(config, 2)
+    ratio128 = plan_native_csa(config, 3)
+    assert ratio4 is not None and ratio4.compression_ratio == CSA_COMPRESSION_RATIO
+    assert ratio128 is not None and ratio128.compression_ratio == HCA_COMPRESSION_RATIO
+    # No deferred scheme -> the full-export gate is a no-op.
+    assert_native_runtime_supports_block_quant(config)
+
+
+def test_per_tensor_fp8_v4_is_not_owned_by_block_quant_gate():
+    # Per-tensor fp8 (no weight_block_size, no fp4 experts) is NOT the
+    # block-quant contract's concern: it falls through to the normal dtype-cast
+    # path (QuantizationConfig None, no deferred scheme), so the DeepSeek-V4
+    # config resolves and native CSA still plans. Guards against over-firing.
+    hf = _v4_hf_config(
+        quantization_config={"quant_method": "fp8", "bits": 8},
+        native_csa=True,
+    )
+    config = ArchitectureConfig.from_transformers(hf)
+    assert config.quantization is None
+    assert config.block_quant_scheme is None
+    assert plan_native_csa(config, 2) is not None
+    assert_native_runtime_supports_block_quant(config)

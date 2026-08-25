@@ -45,6 +45,7 @@ from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models._deepseek_v4_csa import (
     CsaLayerPlan,
     NativeCsaExportError,
+    assert_native_runtime_supports_block_quant,
     emit_csa_attention,
     plan_native_csa,
 )
@@ -1403,6 +1404,13 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Map the official DeepSeek checkpoint names to mobius modules."""
+        # Full-export runtime-capability gate. When a native-CSA export deferred
+        # #602's block-quant reject (so graph construction could progress), the
+        # runnable export still fails closed here -- before any weight is
+        # mapped/assigned, replacing the former generic "Weight shape mismatch"
+        # with a typed, actionable blocker -- until nxrt advertises the real
+        # block-FP8 / planar-FP4 format strings. No-op on every ordinary path.
+        assert_native_runtime_supports_block_quant(self.config)
         # Same predicate as MoELayer/_supported_qmoe_quantization so the
         # repacked weights and the emitted graph never disagree.
         use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None

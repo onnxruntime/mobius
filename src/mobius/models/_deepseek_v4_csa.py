@@ -68,6 +68,14 @@ import onnx_ir as ir
 from onnxscript import OpBuilder
 
 from mobius._configs import ArchitectureConfig
+from mobius.integrations._block_quant import (
+    MXFP4_MICROSCALE_BLOCK,
+    BlockQuantExportError,
+    BlockQuantScheme,
+    QuantizedTensorDescriptor,
+    QuantKind,
+    runtime_representation_gap,
+)
 
 # Frozen op identity -------------------------------------------------------
 CSA_OP_TYPE = "CompressedSparseAttention"
@@ -412,6 +420,125 @@ def plan_native_csa(
     if ratio == HCA_COMPRESSION_RATIO:
         return _plan_ratio128(config, layer_id, num_heads, head_dim, qk_rope_head_dim)
     return _plan_ratio4(config, layer_id, num_heads, head_dim, qk_rope_head_dim)
+
+
+# Runtime-capability gate --------------------------------------------------
+#
+# Graph construction for a native-CSA export of the block-scaled-FP8 /
+# packed-FP4 DeepSeek-V4-Flash checkpoint is allowed to *progress* (the
+# ``ArchitectureConfig`` records the deferred ``block_quant_scheme`` rather than
+# rejecting at config resolution), so the CSA nodes and their compressed state
+# IO are built and inspectable. The *runnable* full export, however, must fail
+# closed until the native ``nxrt`` runtime can actually execute the block-quant
+# weights. That capability is owned by ``mobius.integrations._block_quant``
+# (#602): ``runtime_representation_gap`` returns a precise ABI-gap string while
+# ``nxrt`` lacks a block-FP8 / planar-FP4 ``BlockFormat`` and ``None`` once the
+# real format strings land -- at which point this gate opens automatically with
+# no change here.
+
+
+def _representative_block_fp8_descriptor(
+    scheme: BlockQuantScheme,
+) -> QuantizedTensorDescriptor:
+    """A property-faithful stand-in for a block-FP8 projection tensor.
+
+    Only the fields ``runtime_representation_gap`` reads for a ``BLOCK_FP8``
+    tensor need be meaningful; the shapes are placeholders (the gate is a
+    capability probe, not an emission).
+    """
+    block = tuple(int(x) for x in scheme.weight_block_size) or (128, 128)
+    return QuantizedTensorDescriptor(
+        name="model.layers.*.self_attn.kv_proj.weight",
+        kind=QuantKind.BLOCK_FP8,
+        weight_dtype=scheme.weight_fmt or "e4m3",
+        logical_shape=(0, 0),
+        packed_shape=(0, 0),
+        weight_num_bytes=0,
+        is_routed_expert=False,
+        is_shared_expert=False,
+        block_shape=block,
+        scale_dtype=scheme.scale_fmt or "ue8m0",
+        scale_shape=(0, 0),
+        scale_layout="2d_block",
+    )
+
+
+def _representative_fp4_expert_descriptor(
+    scheme: BlockQuantScheme,
+) -> QuantizedTensorDescriptor:
+    """A property-faithful stand-in for a packed-FP4 routed-expert tensor."""
+    return QuantizedTensorDescriptor(
+        name="model.layers.*.mlp.experts.*.gate_proj.weight",
+        kind=QuantKind.FP4_PACKED,
+        weight_dtype=scheme.expert_dtype or "fp4",
+        logical_shape=(0, 0),
+        packed_shape=(0, 0),
+        weight_num_bytes=0,
+        is_routed_expert=True,
+        is_shared_expert=False,
+        block_shape=(MXFP4_MICROSCALE_BLOCK,),
+        scale_dtype="ue8m0",
+        scale_shape=(0, 0),
+        scale_layout="planar_microscale",
+        microscale_kind="mxfp4",
+    )
+
+
+def native_runtime_block_quant_gap(
+    scheme: BlockQuantScheme | None, *, runtime: str = "nxrt"
+) -> str | None:
+    """Return a runtime ABI-gap string if *runtime* cannot execute *scheme*.
+
+    ``None`` means the gate is open (either there is no owned block-quant
+    scheme, or the runtime can now represent every family it needs). Consumes
+    ``mobius.integrations._block_quant.runtime_representation_gap`` so this gate
+    tracks the real ``nxrt`` format strings and opens with no change here.
+    """
+    if scheme is None or not scheme.is_owned:
+        return None
+    gaps: list[str] = []
+    if scheme.is_block_scaled_fp8:
+        gaps.append(
+            runtime_representation_gap(
+                _representative_block_fp8_descriptor(scheme), runtime=runtime
+            )
+            or ""
+        )
+    if scheme.has_packed_fp4_experts:
+        gaps.append(
+            runtime_representation_gap(
+                _representative_fp4_expert_descriptor(scheme), runtime=runtime
+            )
+            or ""
+        )
+    gaps = [g for g in gaps if g]
+    return "\n".join(gaps) if gaps else None
+
+
+def assert_native_runtime_supports_block_quant(
+    config: ArchitectureConfig, *, runtime: str = "nxrt"
+) -> None:
+    """Full-export runtime-capability gate for a deferred block-quant scheme.
+
+    No-op unless ``config.block_quant_scheme`` is set (only ``from_transformers``
+    records it, and only when ``native_csa`` deferred #602's config-resolution
+    reject). Raises the typed :class:`BlockQuantExportError` -- fail-closed,
+    never a silent dense fallback -- while *runtime* cannot execute the
+    checkpoint's block-FP8 / planar-FP4 weights.
+    """
+    scheme = getattr(config, "block_quant_scheme", None)
+    gap = native_runtime_block_quant_gap(scheme, runtime=runtime)
+    if gap is None:
+        return
+    raise BlockQuantExportError(
+        "native CSA full export requires a runtime that can execute the "
+        f"checkpoint's block-quant weights, but {runtime!r} cannot yet. Graph "
+        "construction progressed (CSA nodes + compressed state IO are built), "
+        "but the runnable export is blocked until the native block-FP8 / "
+        "planar-FP4 format strings land (mobius.integrations._block_quant."
+        "runtime_representation_gap / plan_routed_expert_bank). ABI gap:\n"
+        f"{gap}"
+    )
 
 
 def _register_domain(op: OpBuilder) -> None:
