@@ -459,13 +459,9 @@ def _write_qwen_vl_pair(
             for stem in ("ln1", "ln2"):
                 _sidecar_tensor(prefix + stem + ".weight", (vision_hidden,))
                 _sidecar_tensor(prefix + stem + ".bias", (vision_hidden,))
-            _sidecar_tensor(
-                prefix + "ffn_up.weight", (vision_hidden, vision_intermediate)
-            )
+            _sidecar_tensor(prefix + "ffn_up.weight", (vision_hidden, vision_intermediate))
             _sidecar_tensor(prefix + "ffn_up.bias", (vision_hidden,))
-            _sidecar_tensor(
-                prefix + "ffn_down.weight", (vision_intermediate, vision_hidden)
-            )
+            _sidecar_tensor(prefix + "ffn_down.weight", (vision_intermediate, vision_hidden))
             _sidecar_tensor(prefix + "ffn_down.bias", (vision_intermediate,))
         else:
             for stem in ("ln1", "ln2"):
@@ -475,9 +471,7 @@ def _write_qwen_vl_pair(
                     prefix + stem + ".weight", (vision_intermediate, vision_hidden)
                 )
                 _sidecar_tensor(prefix + stem + ".bias", (vision_intermediate,))
-            _sidecar_tensor(
-                prefix + "ffn_down.weight", (vision_hidden, vision_intermediate)
-            )
+            _sidecar_tensor(prefix + "ffn_down.weight", (vision_hidden, vision_intermediate))
             _sidecar_tensor(prefix + "ffn_down.bias", (vision_hidden,))
     _sidecar_tensor("v.post_ln.weight", (vision_hidden,))
     if projector_type == "qwen2vl_merger":
@@ -995,6 +989,7 @@ class TestGemma3Preflight:
             mmproj.get_tensor("mm.soft_emb_norm.weight") - 1.0,
         )
 
+
 class TestQwenVLMMProj:
     @pytest.mark.parametrize(
         "projector_type,expected_intermediate,expected_full_attention",
@@ -1157,6 +1152,7 @@ class TestQwenVLMMProj:
         )[0]
         assert text_only.shape == (2, 1, 16)
         assert np.isfinite(text_only).all()
+
 
 class TestReadVisionConfig:
     def test_extracts_expected_fields(self, clip_mmproj_gguf: Path):

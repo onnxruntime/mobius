@@ -150,11 +150,15 @@ def test_qwen_processor_assets_and_real_contracts_are_exactly_pinned() -> None:
     assert qwen2.processor_revision == "895c3a49bc3fa70a340399125c650a463535e71c"
     assert qwen25.processor_repository == "Qwen/Qwen2.5-VL-3B-Instruct"
     assert qwen25.processor_revision == "66285546d2b821cf421d4f5eb2576359d3770cd3"
-    assert qwen2.processor_files == qwen25.processor_files == (
-        "config.json",
-        "preprocessor_config.json",
-        "tokenizer_config.json",
-        "chat_template.json",
+    assert (
+        qwen2.processor_files
+        == qwen25.processor_files
+        == (
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+            "chat_template.json",
+        )
     )
     for pin in (qwen2, qwen25):
         contract = dict(pin.processor_contract)

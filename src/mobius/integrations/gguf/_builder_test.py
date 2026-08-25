@@ -7209,7 +7209,6 @@ class TestGGUFPreflightGuards:
             "llama4",
             "mistral3",
             "paddleocr",
-            "qwen2vl",
             "qwen3vl",
             "qwen3vlmoe",
         ],

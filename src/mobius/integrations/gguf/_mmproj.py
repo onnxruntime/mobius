@@ -801,9 +801,7 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         qwen2 = spec.projector_type == "qwen2vl_merger"
         ffn_shape = mmproj_gguf.get_tensor_shape("v.blk.0.ffn_up.weight")
         vision_intermediate = (
-            ffn_shape[1]
-            if qwen2 and ffn_shape[0] == hidden
-            else ffn_shape[0]
+            ffn_shape[1] if qwen2 and ffn_shape[0] == hidden else ffn_shape[0]
         )
         for layer in range(layers):
             prefix = f"v.blk.{layer}."
@@ -1409,9 +1407,7 @@ def build_qwen_vlm_from_gguf(
         source=str(mmproj_gguf_path),
         allow_mmproj_companion=True,
     )
-    specs = _preflight_mmproj_pair(
-        text_gguf, mmproj_gguf, modalities=(MMProjModality.VISION,)
-    )
+    specs = _preflight_mmproj_pair(text_gguf, mmproj_gguf, modalities=(MMProjModality.VISION,))
     projector_type = specs[MMProjModality.VISION].projector_type
 
     config = gguf_to_config(text_gguf)
@@ -1494,9 +1490,7 @@ def build_qwen_vlm_from_gguf(
         )
 
     module_class = (
-        Qwen2VLCausalLMModel
-        if projector_type == "qwen2vl_merger"
-        else Qwen25VLCausalLMModel
+        Qwen2VLCausalLMModel if projector_type == "qwen2vl_merger" else Qwen25VLCausalLMModel
     )
     module = module_class(config)
     if preserve_quantization:
@@ -1519,7 +1513,9 @@ def build_qwen_vlm_from_gguf(
         if not key.endswith((".scales", ".zero_points", ".qweight"))
         and value.dtype != torch.uint8
     }
-    retained_state = {key: value for key, value in text_state.items() if key not in float_state}
+    retained_state = {
+        key: value for key, value in text_state.items() if key not in float_state
+    }
     config._gguf_arch = text_gguf.architecture
     float_state = _normalize_gguf_weights(
         process_tensors(float_state, config), "qwen2vl", config
