@@ -190,7 +190,7 @@ _Q4_K_M_CASE = _RuntimeCase(
     reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
     prompt="Here is my poem:",
     tensor_qtypes={"F32": 61, "Q4_K": 16, "Q5_0": 166, "Q6_K": 14, "Q8_0": 15},
-    config_sha256="303a313b8a2544e6338e30d388406d245ff208ba2e1fa21ea3e4a6304a032459",
+    config_sha256="c62123baf4e95656cdc9f5b798c14319bbaafec594526c462b10555f561969f9",
     generated_tokens=(198, 198, 18, 504, 2388, 13685, 284, 5208, 28, 198),
     tokenizer_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
     tokenizer_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
@@ -479,6 +479,16 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
     gguf_model = GGUFModel(gguf_path)
     qtypes = Counter(qtype.name for _, _, qtype, _ in gguf_model.tensor_items_raw())
     assert dict(sorted(qtypes.items())) == case.tensor_qtypes
+    for filename, size, sha256 in case.tokenizer_assets:
+        asset_path = Path(
+            hf_hub_download(
+                repo_id=case.tokenizer_repository,
+                revision=case.tokenizer_revision,
+                filename=filename,
+            )
+        )
+        assert asset_path.stat().st_size == size
+        assert _sha256(asset_path) == sha256
 
     with pytest.raises(
         ValueError,
@@ -515,11 +525,66 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
     assert len(captured) == 1
     package = captured[0]
     route = json.loads(package.gguf_import_route)
-    assert route["preserve_quantization"] is False
+    assert route == {
+        "architecture": "llama",
+        "config_sha256": case.config_sha256,
+        "execution_provider": "cpu",
+        "model_type": "llama",
+        "module_type": "llama",
+        "preserve_quantization": False,
+        "registry_import": {
+            "config_key_map": None,
+            "config_postprocessor": None,
+            "llama_qk_permute": True,
+            "offset_norm": False,
+            "required_metadata": [],
+            "rope_interleave": False,
+            "tensor_processor": "llama",
+            "v_head_reorder": False,
+            "vlm_builder": None,
+        },
+        "route_schema": 1,
+        "static_cache": False,
+        "task": {"class": "builtins.str", "state": "text-generation"},
+        "tensor_map_recipe": ["llama"],
+    }
     assert all(node.op_type != "MatMulNBits" for node in package["model"].graph)
 
     reloaded = ModelPackage.load(output_dir)
     assert tuple(reloaded) == ("model",)
+    rejected_package = tmp_path / f"{case.name}-runtime"
+    with pytest.raises(ValueError, match="No unique GGUF runtime evidence"):
+        write_gguf_runtime_package(
+            package,
+            gguf_path,
+            rejected_package,
+            runtime="onnx-genai",
+            runtime_version="1.29.0",
+            tokenizer_repository=case.tokenizer_repository,
+            tokenizer_revision=case.tokenizer_revision,
+            local_files_only=True,
+        )
+    assert not rejected_package.exists()
+    source = GGUFTokenizerSource(
+        repository=case.tokenizer_repository,
+        revision=case.tokenizer_revision,
+        metadata_sha256=case.tokenizer_metadata_sha256,
+        assets=tuple(GGUFTokenizerAsset(*asset) for asset in case.tokenizer_assets),
+    )
+    rejected_output = tmp_path / f"{case.name}-tokenizer"
+    assert (
+        inspect_gguf_tokenizer(gguf_model.metadata, require_complete=True).metadata_sha256
+        == case.tokenizer_metadata_sha256
+    )
+    with pytest.raises(ValueError, match="pad_token id differs from GGUF"):
+        materialize_gguf_tokenizer(
+            gguf_path,
+            rejected_output,
+            source=source,
+            metadata=gguf_model.metadata,
+            local_files_only=True,
+        )
+    assert not rejected_output.exists()
     session = ort.InferenceSession(
         str(output_dir / "model.onnx"), providers=["CPUExecutionProvider"]
     )

@@ -3260,12 +3260,6 @@ def build_from_gguf(
         )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
-    _reject_unsupported_quantization_preservation(
-        gguf_model,
-        gguf_arch,
-        preserve_quantization=preserve_quantization,
-    )
-
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
     spec = get_arch_spec(gguf_arch)
@@ -3539,7 +3533,17 @@ def build_from_gguf(
 
     # 5. Build ONNX graph
     module = module_class(config)
+    float_linear_dequantization_types = _float_linear_dequantization_types(
+        module,
+        gguf_arch,
+    )
     if preserve_quantization:
+        _reject_unsupported_quantization_preservation(
+            gguf_model,
+            gguf_arch,
+            preserve_quantization=True,
+            dequantize_float_linear_types=float_linear_dequantization_types,
+        )
         _replace_native_block_linears(module, gguf_model, gguf_arch)
         # The sparse-MoE honesty gate runs post-export on the final graph state
         # (see step 9b): routed native-block experts are first collapsed into a
@@ -3565,10 +3569,7 @@ def build_from_gguf(
             module,
             config,
             reuse_candidates=reuse_candidates_by_id,
-            dequantize_float_linear_types=_float_linear_dequantization_types(
-                module,
-                gguf_arch,
-            ),
+            dequantize_float_linear_types=float_linear_dequantization_types,
         )
     else:
         state_dict = _load_dequantized_state_dict(
@@ -4355,6 +4356,7 @@ def _reject_unsupported_quantization_preservation(
     allow_native_blocks: bool = True,
     allow_quantized_embeddings: bool = True,
     allow_quantized_lm_head: bool = True,
+    dequantize_float_linear_types: Mapping[str, Collection[str]] | None = None,
 ) -> None:
     """Reject architectures that cannot preserve all compatible quantized weights.
 
@@ -4389,6 +4391,7 @@ def _reject_unsupported_quantization_preservation(
         get_quant_spec,
         lossless_preservation_type_names,
     )
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
     float_type_ids = float_storage_type_ids()
     lossless_types = lossless_preservation_type_names()
@@ -4401,6 +4404,26 @@ def _reject_unsupported_quantization_preservation(
         type_id = getattr(qtype, "value", qtype)
         type_name = getattr(qtype, "name", str(qtype))
         if not tensor_name.endswith(".weight") or type_id in float_type_ids:
+            continue
+        hf_name = map_gguf_to_hf_names(tensor_name, gguf_arch)
+        module_stem = (
+            hf_name[: -len(".weight")]
+            if hf_name is not None and hf_name.endswith(".weight")
+            else None
+        )
+        if gguf_arch == "bert" and module_stem is not None and module_stem.startswith("bert."):
+            module_stem = module_stem[len("bert.") :]
+        explicitly_dequantized = (
+            dequantize_float_linear_types is not None
+            and module_stem in dequantize_float_linear_types
+            and type_name in dequantize_float_linear_types[module_stem]
+        )
+        is_encoder_embedding = gguf_arch in {"bert", "modern-bert"} and tensor_name in {
+            "token_embd.weight",
+            "token_embd_norm.weight",
+            "token_types.weight",
+        }
+        if explicitly_dequantized or is_encoder_embedding:
             continue
         if tensor_name.endswith(".ffn_gate_up_exps.weight"):
             raise ValueError(
@@ -4510,7 +4533,6 @@ def _detect_quant_params(gguf_model, gguf_arch: str) -> tuple[int, int, bool]:
     from gguf import GGMLQuantizationType
 
     from mobius.integrations.gguf._quant_registry import (
-        explicit_zero_point_type_names,
         float_storage_type_ids,
         get_quant_spec,
     )
@@ -4939,7 +4961,7 @@ def _load_quantized_state_dict(
         repack_dequantized_tensor,
         repack_gguf_tensor,
     )
-    from mobius.integrations.gguf._spec import QuantImportRoute, TensorRole
+    from mobius.integrations.gguf._spec import QuantImportRoute, RepackExactness, TensorRole
     from mobius.integrations.gguf._tencent_q1_0 import (
         is_tencent_q1_0_layout,
         parse_tencent_q1_0_tensor,
@@ -5083,11 +5105,14 @@ def _load_quantized_state_dict(
             else TensorRole.OUTPUT
             if hf_name == "lm_head.weight"
             else TensorRole.PROJECTION
-            if module_stem is not None
-            and (
-                module_stem in quantized_stems
-                or module_stem in native_block_stems
-                or module_stem in float_linear_stems
+            if fused_projection_targets
+            or (
+                module_stem is not None
+                and (
+                    module_stem in quantized_stems
+                    or module_stem in native_block_stems
+                    or module_stem in float_linear_stems
+                )
             )
             else TensorRole.NON_MATMUL
         )
@@ -5113,10 +5138,22 @@ def _load_quantized_state_dict(
                         "the stored format has no supported dequantization route."
                     )
                 route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
+            if is_encoder_embedding and quant_spec.dequantize is Support.SUPPORTED:
+                route = QuantImportRoute.DEQUANTIZE_FLOAT
             if route is QuantImportRoute.REJECTED:
                 raise ValueError(
                     f"Cannot import GGUF tensor {gguf_name} mapped to {hf_name} "
                     f"({quant_spec.name}, role={tensor_role.value}): {reason}"
+                )
+            if route is QuantImportRoute.DEQUANTIZE_REQUANTIZE or (
+                _exactness is RepackExactness.LOSSY
+                and route is not QuantImportRoute.DEQUANTIZE_FLOAT
+            ):
+                raise ValueError(
+                    "Quantization-preserving GGUF import would change the dequantized "
+                    f"values of {gguf_name} ({quant_spec.name}). Use "
+                    "keep_quantized=False (API) or --dequantize (CLI) for explicit "
+                    "float import."
                 )
             if route is QuantImportRoute.NATIVE_BYTES and not native_targets:
                 raise ValueError(
@@ -5166,31 +5203,35 @@ def _load_quantized_state_dict(
                 "explicit float import."
             )
         if fused_projection_targets:
-            values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+            if route is not QuantImportRoute.AFFINE_REPACK or not can_repack(qtype_val):
+                raise ValueError(
+                    "Quantization-preserving GGUF import cannot split fused projection "
+                    f"{gguf_name} ({getattr(qtype, 'name', qtype)}) without changing "
+                    "its dequantized values. Use keep_quantized=False (API) or "
+                    "--dequantize (CLI) for explicit float import."
+                )
+            repacked = repack_gguf_tensor(raw, qtype_val, tuple(int(dim) for dim in np_shape))
             offset = 0
             for target_stem in fused_projection_targets:
                 n_out = quantized_output_sizes[target_stem]
-                target_values = values[offset : offset + n_out]
-                offset += n_out
-                repacked = repack_dequantized_tensor(
-                    target_values,
-                    bits=target_bits,
-                    block_size=target_block_size,
-                    symmetric=target_symmetric,
+                end = offset + n_out
+                state_dict[f"{target_stem}.weight"] = torch.from_numpy(
+                    np.array(repacked.weight[offset:end], copy=True)
                 )
-                state_dict[f"{target_stem}.weight"] = torch.from_numpy(repacked.weight)
-                state_dict[f"{target_stem}.scales"] = torch.from_numpy(repacked.scales)
+                state_dict[f"{target_stem}.scales"] = torch.from_numpy(
+                    np.array(repacked.scales[offset:end], copy=True)
+                )
                 if repacked.zero_points is not None:
                     state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
-                        repacked.zero_points
+                        np.array(repacked.zero_points[offset:end], copy=True)
                     )
+                offset = end
             if offset != int(np_shape[0]):
                 raise ValueError(
                     f"Fused QKV tensor {hf_name!r} has {np_shape[0]} rows, "
                     f"but Q/K/V targets require {offset}"
                 )
             n_repacked += len(fused_projection_targets)
-            n_requantized += 1
         elif native_targets and native_spec is not None:
             n_out = int(np_shape[-2])
             k_in = int(np_shape[-1])
