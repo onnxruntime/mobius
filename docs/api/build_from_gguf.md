@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 73, 'rejected': 2, 'supported': 72}; importable: 71; quantized import: {'rejected': 20, 'supported': 127}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
+| Architectures | 147 | graph verdicts: {'deferred': 70, 'rejected': 2, 'supported': 75}; importable: 74; quantized import: {'rejected': 20, 'supported': 127}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 5, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
