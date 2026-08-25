@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import FCMLP
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, linear_class_for_config
 
 
 class ArceeCausalLMModel(CausalLMModel):
@@ -33,4 +33,5 @@ class ArceeCausalLMModel(CausalLMModel):
                 config.intermediate_size,
                 activation=config.hidden_act,
                 bias=config.mlp_bias,
+                linear_class=linear_class_for_config(config),
             )

@@ -186,6 +186,8 @@ class GGUFArchitectureSpec:
             ``_config_mapping``, or ``None``.
         tensor_map_recipe: Ordered names of the tensor-name mapping tables owned
             by ``_tensor_mapping``. Later entries override earlier ones.
+        required_metadata: Architecture-scoped GGUF metadata suffixes that must
+            be present before config extraction can claim success.
         tensor_processor: Name of the weight-value processor owned by
             ``_tensor_processors``, or ``None``.
         vlm_builder: Name of the multimodal assembly entry point owned by
@@ -209,6 +211,7 @@ class GGUFArchitectureSpec:
     config_key_map: str | None = None
     config_postprocessor: str | None = None
     tensor_map_recipe: tuple[str, ...] = ()
+    required_metadata: tuple[str, ...] = ()
     tensor_processor: str | None = None
     vlm_builder: str | None = None
     llama_qk_permute: bool = False
@@ -235,6 +238,11 @@ class GGUFArchitectureSpec:
             raise ValueError(
                 f"{self.gguf_arch!r}: tensor_map is {self.tensor_map.value} but a "
                 "tensor_map_recipe was given, which would imply it works"
+            )
+        if self.config is not Support.SUPPORTED and self.required_metadata:
+            raise ValueError(
+                f"{self.gguf_arch!r}: config is {self.config.value} but required "
+                "metadata was declared, which would imply config extraction works"
             )
 
     @property

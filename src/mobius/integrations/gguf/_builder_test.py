@@ -114,7 +114,14 @@ def _write_quantized_gguf(
     writer.add_head_count(num_heads)
     writer.add_head_count_kv(num_kv_heads)
     writer.add_rope_freq_base(10000.0)
-    writer.add_layer_norm_rms_eps(1e-5)
+    if architecture in {"olmo", "cohere2"}:
+        writer.add_layer_norm_eps(1e-5)
+    else:
+        writer.add_layer_norm_rms_eps(1e-5)
+    if architecture == "cohere2":
+        writer.add_sliding_window(128)
+        writer.add_logit_scale(0.0625)
+        writer.add_rope_dimension_count(head_dim := hidden_size // num_heads)
     writer.add_vocab_size(vocab_size)
 
     head_dim = hidden_size // num_heads
@@ -264,16 +271,25 @@ def _write_quantized_gguf(
             hidden_size,
             num_heads * head_dim,
         )
-        add_projection(f"blk.{i}.ffn_gate.weight", intermediate_size, hidden_size)
+        if architecture != "arcee":
+            add_projection(f"blk.{i}.ffn_gate.weight", intermediate_size, hidden_size)
         add_projection(f"blk.{i}.ffn_up.weight", intermediate_size, hidden_size)
         add_projection(f"blk.{i}.ffn_down.weight", hidden_size, intermediate_size)
-        # Norms (float32)
-        add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
-        add_float(f"blk.{i}.ffn_norm.weight", (hidden_size,))
+        if architecture == "olmo2":
+            add_float(f"blk.{i}.post_attention_norm.weight", (hidden_size,))
+            add_float(f"blk.{i}.post_ffw_norm.weight", (hidden_size,))
+            add_float(f"blk.{i}.attn_q_norm.weight", (num_heads * head_dim,))
+            add_float(f"blk.{i}.attn_k_norm.weight", (num_kv_heads * head_dim,))
+        elif architecture == "cohere2":
+            add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
+        elif architecture != "olmo":
+            add_float(f"blk.{i}.attn_norm.weight", (hidden_size,))
+            add_float(f"blk.{i}.ffn_norm.weight", (hidden_size,))
 
     # Output norm + optional untied lm_head
-    add_float("output_norm.weight", (hidden_size,))
-    if not tie_embeddings:
+    if architecture != "olmo":
+        add_float("output_norm.weight", (hidden_size,))
+    if architecture != "cohere2" and not tie_embeddings:
         if output_quantization == "q4_0":
             _add_q4_0("output.weight", vocab_size, hidden_size)
         elif output_quantization == "q8_0":
@@ -1080,6 +1096,53 @@ class TestBuildQuantizedGguf:
         assert "MatMulNBits" not in op_types
         assert "GatherBlockQuantized" not in op_types
         assert "BlockQuantizedMatMul" not in op_types
+
+    @pytest.mark.parametrize(
+        "architecture",
+        ["olmo", "olmo2", "cohere2", "arcee", "smollm3", "exaone"],
+    )
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_dense_cohort_builds_complete_graphs(
+        self,
+        architecture: str,
+        projection_quantization: str,
+        tmp_path: Path,
+    ) -> None:
+        """Exact per-architecture tensor sets satisfy the full graph."""
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-{projection_quantization}.gguf"
+        _write_quantized_gguf(
+            path,
+            architecture=architecture,
+            projection_quantization=projection_quantization,
+        )
+
+        model = build_from_gguf(path)["model"]
+        op_types = {node.op_type for node in model.graph}
+        if projection_quantization == "q4_0":
+            assert "MatMulNBits" in op_types
+        else:
+            assert "MatMulNBits" not in op_types
+
+        output_dir = tmp_path / f"{architecture}-{projection_quantization}-onnx"
+        build_from_gguf(path).save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        feeds = {
+            "input_ids": np.array([[1, 2]], dtype=np.int64),
+            "attention_mask": np.ones((1, 2), dtype=np.int64),
+            "position_ids": np.array([[0, 1]], dtype=np.int64),
+            "past_key_values.0.key": np.empty((1, 2, 0, 16), dtype=np.float32),
+            "past_key_values.0.value": np.empty((1, 2, 0, 16), dtype=np.float32),
+        }
+        first = session.run(["logits"], feeds)[0]
+        second = session.run(["logits"], feeds)[0]
+        assert first.shape == (1, 2, 256)
+        assert np.isfinite(first).all()
+        np.testing.assert_array_equal(first, second)
 
     def test_q4_0_matmulnbits_has_explicit_zero_points(self, q4_0_gguf: Path):
         """GGUF Q4_0 projections explicitly encode zp=8 instead of EP defaults."""

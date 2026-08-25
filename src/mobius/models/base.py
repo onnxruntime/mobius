@@ -47,6 +47,35 @@ from mobius.components._rotary_embedding import BaseRope, _MRopeBase
 logger = logging.getLogger(__name__)
 
 
+def linear_class_for_config(config: ArchitectureConfig):
+    """Return the configured quantized linear factory, or ``None`` for float."""
+    qc = getattr(config, "quantization", None)
+    if qc is None or qc.quant_method == "none":
+        return None
+    zp_dtype = config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
+    return make_quantized_linear_factory(
+        bits=qc.bits,
+        block_size=qc.group_size,
+        has_zero_point=not qc.sym,
+        zero_point_dtype=zp_dtype,
+    )
+
+
+def embedding_for_config(config: ArchitectureConfig):
+    """Create the float or block-quantized token embedding declared by config."""
+    qc = getattr(config, "quantization", None)
+    if qc is not None and getattr(qc, "quantize_embeddings", False):
+        return QuantizedEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            bits=qc.bits,
+            block_size=qc.group_size,
+            has_zero_point=not qc.sym,
+            padding_idx=config.pad_token_id,
+        )
+    return Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+
+
 class TextModel(nn.Module):
     """Base text model with embedding, decoder layers, and final norm."""
 
@@ -65,33 +94,8 @@ class TextModel(nn.Module):
 
         # If the config has quantization, swap Linear for QuantizedLinear
         # in all decoder layer projections (Attention Q/K/V/O + MLP).
-        linear_class = None
-        qc = getattr(config, "quantization", None)
-        if qc is not None and qc.quant_method != "none":
-            zp_dtype = (
-                config.dtype if getattr(qc, "float_zero_point", False) else ir.DataType.UINT8
-            )
-            linear_class = make_quantized_linear_factory(
-                bits=qc.bits,
-                block_size=qc.group_size,
-                has_zero_point=not qc.sym,
-                zero_point_dtype=zp_dtype,
-            )
-
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
-        if qc is not None and getattr(qc, "quantize_embeddings", False):
-            # Keep the block-quantized embedding table packed and dequantize
-            # only the selected token rows.
-            self.embed_tokens = QuantizedEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                bits=qc.bits,
-                block_size=qc.group_size,
-                has_zero_point=not qc.sym,
-                padding_idx=config.pad_token_id,
-            )
+        linear_class = linear_class_for_config(config)
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [
                 DecoderLayer(config, linear_class=linear_class, mlp_class=mlp_class)
@@ -425,6 +429,18 @@ class CausalLMModel(nn.Module):
             # by sharing Parameters in TiedQuantizedLMHead above.
             if config.tie_word_embeddings and not embed_quantized:
                 self.lm_head.weight = self.model.embed_tokens.weight
+
+    def _replace_text_model(self, model: nn.Module) -> None:
+        """Replace the text model while preserving tied embedding/head parameters."""
+        self.model = model
+        if isinstance(self.lm_head, TiedQuantizedLMHead):
+            self.lm_head = TiedQuantizedLMHead(
+                self.model.embed_tokens,
+                self.config.hidden_size,
+                self.config.vocab_size,
+            )
+        elif self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
         self,

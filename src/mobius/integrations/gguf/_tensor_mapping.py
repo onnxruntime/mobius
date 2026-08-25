@@ -71,6 +71,45 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+# OLMo 1 uses weight-free LayerNorm throughout. Its GGUF therefore has no
+# normalization tensors: using the broader Llama recipe would obscure that
+# architectural invariant even though no extra source tensors happen to arrive.
+_OLMO_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
+# Arcee uses a non-gated ReLU-squared MLP, so its exact recipe deliberately has
+# no ffn_gate mapping.
+_ARCEE_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+}
+
+# OLMo 2/3 apply RMSNorm after each branch, not before it.
+_OLMO2_EXTRAS: dict[str, str] = {
+    "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
+    "blk.{bid}.post_ffw_norm": "model.layers.{bid}.post_feedforward_layernorm",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 # Gemma2 uses the llama.cpp Gemma tensor names (the same norm subset as
 # Gemma3/4, minus the per-head Q/K norms): ``ffn_norm`` is the pre-feedforward
 # norm (overriding the Llama post-attention mapping), ``post_attention_norm`` is
@@ -326,6 +365,9 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "olmo": _OLMO_MAPPING,
+        "arcee": _ARCEE_MAPPING,
+        "olmo2_extras": _OLMO2_EXTRAS,
         "phi3": _PHI3_MAPPING,
         "falcon": _FALCON_MAPPING,
         "gpt2": _GPT2_MAPPING,

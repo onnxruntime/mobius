@@ -64,12 +64,16 @@ class UpstreamArchitecture:
             one architecture where this is ``False``, so no tool can load it.
         dual_moe: Whether tensor shapes switch on ``expert_count`` rather than
             on the architecture name. True for 47 architectures.
+        tensor_families: Exact entries from the pinned
+            ``gguf-py/gguf/constants.py::MODEL_TENSORS`` table. Vendored only
+            for architectures whose tensor-map support mobius claims.
     """
 
     gguf_arch: str
     cohort: str
     cpp_loader: bool
     dual_moe: bool
+    tensor_families: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -121,7 +125,13 @@ def _payload() -> dict[str, Any]:
 def upstream_architectures() -> dict[str, UpstreamArchitecture]:
     """Return every pinned upstream architecture keyed by GGUF architecture string."""
     return {
-        name: UpstreamArchitecture(gguf_arch=name, **fields)
+        name: UpstreamArchitecture(
+            gguf_arch=name,
+            cohort=fields["cohort"],
+            cpp_loader=fields["cpp_loader"],
+            dual_moe=fields["dual_moe"],
+            tensor_families=tuple(fields.get("tensor_families", ())),
+        )
         for name, fields in _payload()["architectures"].items()
     }
 
