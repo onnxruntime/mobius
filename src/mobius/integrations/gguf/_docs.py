@@ -7,9 +7,9 @@ from __future__ import annotations
 
 __all__ = ["DOC_PATH", "check_document", "render_blocks", "update_document"]
 
+import re
 from collections import Counter
 from pathlib import Path
-import re
 
 from mobius.integrations.gguf._arch_registry import iter_arch_specs
 from mobius.integrations.gguf._mmproj_registry import iter_projector_specs
@@ -61,9 +61,7 @@ def _summary() -> str:
     qtypes = iter_quant_specs()
     projectors = iter_projector_specs()
     tokenizers = tokenizer_pre_policies()
-    stored = [
-        spec for spec in qtypes if spec.readable and spec.role is StorageRole.QUANTIZED
-    ]
+    stored = [spec for spec in qtypes if spec.readable and spec.role is StorageRole.QUANTIZED]
     routed = [
         spec
         for spec in stored
@@ -73,49 +71,59 @@ def _summary() -> str:
     ]
     graph_counts = Counter(spec.graph.value for spec in architectures)
     runtime_counts = Counter(spec.runtime.value for spec in architectures)
-    quantized_import_counts = Counter(
-        spec.quantized_import.value for spec in architectures
-    )
+    quantized_import_counts = Counter(spec.quantized_import.value for spec in architectures)
     projector_counts = {
         "graph-importable": sum(spec.is_importable for spec in projectors),
         "runtime-supported": sum(spec.runtime is Support.SUPPORTED for spec in projectors),
     }
     return "\n".join(
         (
-            f"**Pinned source:** `ggml-org/llama.cpp@{UPSTREAM_COMMIT}` "
-            f"({UPSTREAM_DATE}).",
+            f"**Pinned source:** `ggml-org/llama.cpp@{UPSTREAM_COMMIT}` ({UPSTREAM_DATE}).",
             "",
             "| Census | Total | Closure |",
             "|---|---:|---|",
-            f"| Architectures | {len(architectures)} | "
-            f"graph verdicts: {dict(sorted(graph_counts.items()))}; "
-            f"importable: {sum(spec.is_importable for spec in architectures)}; "
-            f"quantized import: {dict(sorted(quantized_import_counts.items()))}; "
-            f"runtime: {dict(sorted(runtime_counts.items()))} |",
-            f"| Active stored qtypes | {len(stored)} | {len(routed)} have an import route; "
-            f"{len(stored) - len(routed)} are explicitly deferred with no route |",
-            f"| Serialized projector strings | {len(projectors)} | "
-            f"{dict(sorted(projector_counts.items()))} |",
-            f"| Tokenizer pre identifiers | {len(tokenizers)} | "
-            f"{len({policy.canonical for policy in tokenizers.values()})} semantic groups; "
-            "all default to deferred and become exact-copy only with a validated embedded "
-            "`tokenizer.huggingface.json` |",
+            (
+                f"| Architectures | {len(architectures)} | "
+                f"graph verdicts: {dict(sorted(graph_counts.items()))}; "
+                f"importable: {sum(spec.is_importable for spec in architectures)}; "
+                f"quantized import: {dict(sorted(quantized_import_counts.items()))}; "
+                f"runtime: {dict(sorted(runtime_counts.items()))} |"
+            ),
+            (
+                f"| Active stored qtypes | {len(stored)} | {len(routed)} have an import route; "
+                f"{len(stored) - len(routed)} are explicitly deferred with no route |"
+            ),
+            (
+                f"| Serialized projector strings | {len(projectors)} | "
+                f"{dict(sorted(projector_counts.items()))} |"
+            ),
+            (
+                f"| Tokenizer pre identifiers | {len(tokenizers)} | "
+                f"{len({policy.canonical for policy in tokenizers.values()})} semantic groups; "
+                "all default to deferred and become exact-copy only with a validated embedded "
+                "`tokenizer.huggingface.json` |"
+            ),
             "",
-            "`SUPPORTED` means the named capability is implemented and mechanically tested. "
-            "`DEFERRED` means it is intentionally unavailable pending the stated work. "
-            "`REJECTED` means the input or route is invalid by policy. Graph support proves "
-            "construction/execution only; runtime support additionally requires a pinned real "
-            "artifact, independent parity, and deterministic generation or stateful semantics. "
-            "Tokenizer `copy` delegates algorithm semantics to an embedded, vocabulary-identical "
-            "tokenizer JSON; it is not a reconstructed or independently proven tokenizer.",
+            (
+                "`SUPPORTED` means the named capability is implemented and mechanically tested. "
+                "`DEFERRED` means it is intentionally unavailable pending the stated work. "
+                "`REJECTED` means the input or route is invalid by policy. Graph support proves "
+                "construction/execution only; runtime support additionally requires a pinned real "
+                "artifact, independent parity, and deterministic generation or stateful semantics. "
+                "Tokenizer `copy` delegates algorithm semantics to an embedded, "
+                "vocabulary-identical tokenizer JSON; it is not a reconstructed or independently "
+                "proven tokenizer."
+            ),
         )
     )
 
 
 def _architectures() -> str:
     rows = [
-        "| Canonical architecture | Aliases | Import route | Tensor exactness | "
-        "Config/tensor/graph/runtime/quantized import | Restriction or evidence gap |",
+        (
+            "| Canonical architecture | Aliases | Import route | Tensor exactness | "
+            "Config/tensor/graph/runtime/quantized import | Restriction or evidence gap |"
+        ),
         "|---|---|---|---|---|---|",
     ]
     upstream = upstream_architectures()
@@ -155,8 +163,10 @@ def _qtypes() -> str:
 
 def _projectors() -> str:
     rows = [
-        "| Projector string | Modality | Paired text architecture | "
-        "Metadata/tensor/graph/runtime | Exactness/evidence |",
+        (
+            "| Projector string | Modality | Paired text architecture | "
+            "Metadata/tensor/graph/runtime | Exactness/evidence |"
+        ),
         "|---|---|---|---|---|",
     ]
     for spec in sorted(iter_projector_specs(), key=lambda item: item.projector_type):
@@ -180,16 +190,19 @@ def _projectors() -> str:
 
 def _tokenizers() -> str:
     rows = [
-        "| Exact identifier | Canonical semantic group | Pinned pre-type | Default route | "
-        "Exactness/restriction |",
+        (
+            "| Exact identifier | Canonical semantic group | Pinned pre-type | Default route | "
+            "Exactness/restriction |"
+        ),
         "|---|---|---|---|---|",
     ]
     for identifier, policy in sorted(tokenizer_pre_policies().items()):
-        rows.append(
+        row = (
             f"| `{identifier}` | `{policy.canonical}` | `{policy.pre_type}` | "
             f"`{policy.default_route}` | Exact-copy only after embedded tokenizer JSON and "
             "ordered vocabulary validation; otherwise runtime packaging is deferred. |"
         )
+        rows.append(row)
     return "\n".join(rows)
 
 
@@ -206,7 +219,9 @@ def render_blocks() -> dict[str, str]:
 
 def _replace(text: str, begin: str, end: str, body: str) -> str:
     if text.count(begin) != 1 or text.count(end) != 1:
-        raise ValueError(f"Expected exactly one generated block delimited by {begin!r}/{end!r}")
+        raise ValueError(
+            f"Expected exactly one generated block delimited by {begin!r}/{end!r}"
+        )
     before, remainder = text.split(begin, 1)
     _, after = remainder.split(end, 1)
     return f"{before}{begin}\n\n{body}\n\n{end}{after}"

@@ -126,7 +126,9 @@ class GGUFRuntimeEvidence:
                 "GGUF runtime evidence requires immutable 40-hex revisions and LFS SHA-256"
             )
         if self.parity_kind not in {"full-logit", "component"}:
-            raise ValueError("GGUF runtime evidence parity_kind must be full-logit or component")
+            raise ValueError(
+                "GGUF runtime evidence parity_kind must be full-logit or component"
+            )
         if (
             not self.graph_files
             or tuple(sorted(self.graph_files)) != self.graph_files
@@ -286,6 +288,7 @@ def _hash_regular_file(path: Path) -> tuple[os.stat_result, str]:
         while chunk := os.read(descriptor, 1024 * 1024):
             digest.update(chunk)
         after = os.fstat(descriptor)
+
         def identity(value: os.stat_result) -> tuple[int, int, int, int]:
             return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
 

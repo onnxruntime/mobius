@@ -32,7 +32,7 @@ def test_stale_at_style_pin_is_rejected(tmp_path: Path) -> None:
         + "\nllama.cpp@1111111111111111111111111111111111111111\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="Stale llama.cpp pins"):
+    with pytest.raises(ValueError, match=r"Stale llama\.cpp pins"):
         update_document(document)
 
 

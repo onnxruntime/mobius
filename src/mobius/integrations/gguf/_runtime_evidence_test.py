@@ -80,9 +80,7 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             runtime="onnx-genai",
             source_path=source,
             gguf_model=_model(),
-            built_identity=gguf_artifact_identity(
-                source, _model(), architecture="llama"
-            ),
+            built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
             import_route=record.import_route,
             runtime_version="1.0.0",
         )
@@ -96,9 +94,7 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             runtime="ort-genai",
             source_path=source,
             gguf_model=_model(),
-            built_identity=gguf_artifact_identity(
-                source, _model(), architecture="llama"
-            ),
+            built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
             import_route=record.import_route,
             runtime_version="1.0.0",
         )
