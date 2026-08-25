@@ -175,10 +175,17 @@ class TestTokenizerPreCensus:
         table = documentation.split("| Canonical | Exact identifiers |", 1)[1].split(
             "### Metadata audit", 1
         )[0]
-        rows = re.findall(r"^\| `([^`]+)` \| (.+) \|$", table, re.MULTILINE)
+        documented_rows = re.findall(r"^\| `([^`]+)` \| (.+) \|$", table, re.MULTILINE)
+        expected_groups: dict[str, list[str]] = {}
+        for identifier, policy in policies.items():
+            expected_groups.setdefault(policy.canonical, []).append(identifier)
+        assert documented_rows == [
+            (canonical, ", ".join(f"`{identifier}`" for identifier in identifiers))
+            for canonical, identifiers in expected_groups.items()
+        ]
         documented = {
             identifier: canonical
-            for canonical, identifiers in rows
+            for canonical, identifiers in documented_rows
             for identifier in re.findall(r"`([^`]+)`", identifiers)
         }
         assert documented == {
@@ -295,6 +302,9 @@ def test_write_exact_tokenizer_assets_preserves_templates_and_flags(tmp_path: Pa
     result = write_gguf_tokenizer_json(source, output)
 
     assert result == str(output / "tokenizer.json")
+    assert (output / "tokenizer.json").read_bytes() == metadata[
+        "tokenizer.huggingface.json"
+    ].encode("utf-8")
     config = json.loads((output / "tokenizer_config.json").read_text(encoding="utf-8"))
     assert config["add_bos_token"] is True
     assert config["add_eos_token"] is False

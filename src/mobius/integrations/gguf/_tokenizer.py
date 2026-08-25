@@ -434,7 +434,7 @@ def write_gguf_tokenizer_json(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     tokenizer_path = output / "tokenizer.json"
-    tokenizer_path.write_text(metadata["tokenizer.huggingface.json"], encoding="utf-8")
+    tokenizer_path.write_bytes(metadata["tokenizer.huggingface.json"].encode("utf-8"))
     config, special_map = _tokenizer_config(metadata)
     (output / "tokenizer_config.json").write_text(
         json.dumps(config, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
