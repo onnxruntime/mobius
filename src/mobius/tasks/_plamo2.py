@@ -74,7 +74,7 @@ class Plamo2CausalLMTask(ModelTask):
                     [batch, config.mamba_inner_size, config.mamba_d_conv - 1],
                 )
                 state_b = builder.input(
-                    f"past_key_values.{layer}.ssm_state",
+                    f"past_key_values.{layer}.recurrent_state",
                     ir.DataType.FLOAT,
                     [
                         batch,
@@ -130,7 +130,7 @@ class Plamo2CausalLMTask(ModelTask):
                         config.mamba_d_state,
                     ]
                 )
-                names = ("conv_state", "ssm_state")
+                names = ("conv_state", "recurrent_state")
                 state_b.type = ir.TensorType(ir.DataType.FLOAT)
             state_a.type = ir.TensorType(config.dtype)
             builder.add_output(state_a, f"present.{layer}.{names[0]}")
@@ -139,15 +139,14 @@ class Plamo2CausalLMTask(ModelTask):
         model = _make_model(graph)
         self._register_functions(model, config)
         model.metadata_props["mobius.cache_abi"] = (
-            "per-layer:attention=key,value;mamba=conv_state,ssm_state-f32"
+            "per-layer:attention=key,value;mamba=conv_state,recurrent_state-f32"
         )
         model.metadata_props["mobius.state_semantics"] = (
             "batch-axis reorder;copy-for-rollback;deterministic replay"
         )
         model.metadata_props["mobius.max_verified_context"] = str(config.attention_window_size)
         model.metadata_props["mobius.runtime_support"] = (
-            "deferred: released ORT GenAI cannot represent heterogeneous recurrent/KV "
-            "state; see onnxruntime/mobius#605"
+            "ORT GenAI 0.15.2 state ABI; package requires GQA-specialized attention"
         )
         return ModelPackage({"model": model}, config=config)
 

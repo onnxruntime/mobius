@@ -60,7 +60,7 @@ def _empty_states(config: Plamo2Config, batch: int) -> dict[str, np.ndarray]:
         "past_key_values.0.conv_state": np.zeros(
             (batch, config.mamba_inner_size, config.mamba_d_conv - 1), np.float32
         ),
-        "past_key_values.0.ssm_state": np.zeros(
+        "past_key_values.0.recurrent_state": np.zeros(
             (
                 batch,
                 config.mamba_num_heads,
@@ -226,7 +226,9 @@ def test_plamo2_mamba_matches_independent_reduced_reference() -> None:
         rtol=1e-6,
         atol=1e-7,
     )
-    np.testing.assert_allclose(outputs["present.0.ssm_state"], state, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(
+        outputs["present.0.recurrent_state"], state, rtol=2e-5, atol=2e-6
+    )
 
 
 def test_plamo2_attention_and_mlp_match_independent_reduced_reference() -> None:
@@ -404,7 +406,9 @@ def test_plamo2_left_padding_does_not_change_recurrent_state_or_valid_logits() -
         padded["present.0.conv_state"], unpadded["present.0.conv_state"], atol=1e-7
     )
     np.testing.assert_allclose(
-        padded["present.0.ssm_state"], unpadded["present.0.ssm_state"], atol=1e-7
+        padded["present.0.recurrent_state"],
+        unpadded["present.0.recurrent_state"],
+        atol=1e-7,
     )
 
 

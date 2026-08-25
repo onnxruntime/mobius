@@ -93,7 +93,7 @@
     ],
     "sha256": "5a9a6638087d4b76fff79e102e665fb963e505cd17812f909cfc33e42a29b640",
     "state_interfaces": 16,
-    "state_abi": "even layers: conv_state+ssm_state; odd layers: key+value"
+    "state_abi": "even layers: conv_state+recurrent_state (semantic SSM state); odd layers: key+value"
   },
   "independent_reference": {
     "implementation": "pinned HuggingFace remote model with upstream pure-PyTorch causal_conv1d_ref and selective_state_update_ref equivalents",
@@ -209,18 +209,46 @@
   },
   "ort_genai": {
     "released_version": "0.15.2",
+    "released_source_tree": "ed5f4e87147731e5b07810f9f5c90103b3603cdf",
     "generated_model_type": "decoder",
-    "generated_state_schema": "homogeneous past_key_names/past_value_names templates",
+    "attention_graph": "CPU-specialized export with all eight attention layers lowered to GroupQueryAttention; unspecialized Attention plus recurrent state is rejected by package config generation",
+    "generated_state_schema": "sparse global layer indices with key/value on odd layers and conv_state/recurrent_state on even layers",
     "model_load": "passed with type=decoder and num_hidden_layers=16 discovered from sparse global state indices",
-    "tokenizer_load": "failed: the exact packaged tokenizer.jsonl format is not accepted by ORT GenAI 0.15.2",
-    "generation_with_prompt_tokens": "failed: Model input was not found: past_key_values.0.recurrent_state",
+    "state_contract_proof": "v0.15.2 src/models/kv_cache.cpp independently discovers sparse key inputs; src/models/recurrent_state.cpp independently discovers sparse conv_state inputs and derives paired recurrent_state names",
+    "generation_with_prompt_tokens": "passed: [1,6721] generated the exact verified 20-token continuation",
+    "generated_tokens": [
+      44,
+      2268,
+      1101,
+      1080,
+      1087,
+      8789,
+      45114,
+      2002,
+      3104,
+      1131,
+      1385,
+      1031,
+      73,
+      39,
+      109,
+      2569,
+      3648,
+      353,
+      32,
+      79135
+    ],
+    "tokenizer_source_revision": "92c75fd6eea9018bcb9c33ee8921589febe071fa",
+    "tokenizer_jsonl_sha256": "9fa8276a87dd2440bb9496f1d569c05ded6274fd2854de802e12dc6545804b95",
+    "tokenizer_identity": "all 100000 ordered tokens, token types, float32 scores, and special IDs 0/1/2/3 match the pinned GGUF exactly; the official tokenizer has no normalizer or pre-tokenizer",
+    "tokenizer_load": "deferred with exact rejection: ORT GenAI 0.15.2 requires tokenizer.json and reports Invalid file; a standard Unigram(byte_fallback=true) conversion is not identical because official encoding of literal <0xFA> is [60,48,120,5109,62] while the standard tokenizer emits byte token [250]",
     "upstream_main_commit": "a8e0fdf81b061e67c1c3f9485bfdc06735ccd473",
     "upstream_main_install": "not feasible from the Python source package: pip built UNKNOWN-0.0.0 without an onnxruntime_genai module",
-    "promotion_decision": "blocked: no released heterogeneous-state schema, no compatible tokenizer artifact, and no successful end-to-end generation"
+    "promotion_decision": "token-ID generation passed; text-tokenizer entry points remain deferred because no identity-preserving tokenizer.json representation was proven"
   },
   "l4_l5": {
     "raw_ort_parity": "passed",
     "generated_tokens_committed": true,
-    "ort_genai_e2e": "deferred because released ORT GenAI cannot represent the alternating state ABI"
+    "ort_genai_e2e": "passed on the CPU-specialized GQA package with exact prompt token IDs; text tokenization remains deferred by the proven tokenizer-format mismatch"
   }
 }

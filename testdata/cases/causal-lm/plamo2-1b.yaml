@@ -15,4 +15,4 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-notes: "The pinned source checkpoint and public F32 GGUF pass raw ORT prefill, all cached decode steps, rollback/replay, and exact 20-token generation. ORT GenAI remains deferred because 0.15.2 cannot bind the heterogeneous recurrent/KV state ABI."
+notes: "The pinned source checkpoint and public F32 GGUF pass raw ORT prefill, all cached decode steps, rollback/replay, and exact 20-token generation. ORT GenAI 0.15.2 also passes exact token-ID generation through its sparse KV+recurrent ABI on a CPU-specialized GQA package; unspecialized Attention plus recurrent state is rejected during package config generation. Text tokenization remains deferred because the official custom tokenizer has no identity-preserving tokenizer.json representation."
