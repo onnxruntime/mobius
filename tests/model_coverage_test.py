@@ -161,6 +161,11 @@ _COVERAGE_SKIP: dict[str, str] = {
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
     "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
     "real-weight L4/L5 parity remains pending.",
+    "kimi_k3": "Kimi-K3 is a large remote-code KDA/NoPE-MLA/attention-residual "
+    "latent-MoE decoder; L1-L2 and synthetic GGUF execution are covered, while "
+    "real-weight L4/L5 parity remains pending.",
+    "lfm2_moe": "LFM2-MoE (8B-A1B) — L1-L2 config validation is covered, while "
+    "real-weight L4/L5 golden-data parity requires GPU and remains pending.",
     "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
     "and GGUF integration tests; generic encoder tests require token_type_ids",
     # --- Internal / duplicate aliases ---

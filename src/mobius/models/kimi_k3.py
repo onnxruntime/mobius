@@ -11,7 +11,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, KimiK3Config
 from mobius.components import Linear, RMSNorm, create_attention_bias
 from mobius.models.base import (
     CausalLMModel,
@@ -570,6 +570,7 @@ class KimiK3CausalLMModel(CausalLMModel):
 
     default_task = "kimi-k3-text-generation"
     category = "Mixture of Experts"
+    config_class = KimiK3Config
 
     def __init__(self, config: ArchitectureConfig):
         if config.tie_word_embeddings:
