@@ -139,6 +139,7 @@ def test_every_runtime_supported_route_has_ort_genai_e2e_enrollment() -> None:
         if spec.runtime is Support.SUPPORTED
         for evidence_id in spec.runtime_evidence_ids
         if (evidence := runtime_evidence(evidence_id)) is not None
+        if evidence.runtime == "ort-genai"
     }
     enrolled_routes = set()
     for evidence_id, marker in enrolled.items():

@@ -407,7 +407,7 @@ class HybridCausalLMTask(ModelTask):
         if config.model_type == "jamba":
             model.metadata_props["mobius.runtime_support"] = (
                 "Deferred: heterogeneous attention KV and Mamba recurrent state "
-                "discovery is tracked by https://github.com/onnxruntime/mobius#605"
+                "discovery is tracked by https://github.com/onnxruntime/mobius/issues/605"
             )
         return ModelPackage({"model": model}, config=config)
 

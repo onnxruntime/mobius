@@ -169,6 +169,60 @@ def _write_clip_mmproj_gguf(
     writer.close()
 
 
+def _write_gemma3_mmproj_gguf(
+    path: Path,
+    *,
+    extra_tensor: str | None = None,
+) -> None:
+    """Write the exact 1-block Gemma3 closure in llama.cpp orientation."""
+    from gguf import GGUFWriter
+
+    hidden = _VISION_HIDDEN
+    intermediate = _VISION_FFN
+    writer = GGUFWriter(str(path), "clip")
+    writer.add_string("clip.projector_type", "gemma3")
+    writer.add_bool("clip.has_vision_encoder", True)
+    writer.add_uint32("clip.vision.embedding_length", hidden)
+    writer.add_uint32("clip.vision.feed_forward_length", intermediate)
+    writer.add_uint32("clip.vision.block_count", 1)
+    writer.add_uint32("clip.vision.attention.head_count", _VISION_HEADS)
+    writer.add_uint32("clip.vision.image_size", _IMAGE_SIZE)
+    writer.add_uint32("clip.vision.patch_size", _PATCH_SIZE)
+    writer.add_uint32("clip.vision.projection_dim", _TEXT_HIDDEN)
+    writer.add_array("clip.vision.image_mean", [0.5, 0.5, 0.5])
+    writer.add_array("clip.vision.image_std", [0.5, 0.5, 0.5])
+    writer.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+
+    def add(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    add("v.patch_embd.weight", (hidden, 3, _PATCH_SIZE, _PATCH_SIZE))
+    add("v.patch_embd.bias", (hidden,))
+    add("v.position_embd.weight", ((_IMAGE_SIZE // _PATCH_SIZE) ** 2, hidden))
+    add("v.post_ln.weight", (hidden,))
+    add("v.post_ln.bias", (hidden,))
+    add("mm.soft_emb_norm.weight", (hidden,))
+    add("mm.input_projection.weight", (hidden, _TEXT_HIDDEN))
+    prefix = "v.blk.0."
+    for stem in ("ln1", "ln2"):
+        add(prefix + stem + ".weight", (hidden,))
+        add(prefix + stem + ".bias", (hidden,))
+    for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+        add(prefix + stem + ".weight", (hidden, hidden))
+        add(prefix + stem + ".bias", (hidden,))
+    add(prefix + "ffn_down.weight", (intermediate, hidden))
+    add(prefix + "ffn_down.bias", (intermediate,))
+    add(prefix + "ffn_up.weight", (hidden, intermediate))
+    add(prefix + "ffn_up.bias", (hidden,))
+    if extra_tensor is not None:
+        add(extra_tensor, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_minimal_gguf(
     path: Path,
     architecture: str,
@@ -299,6 +353,138 @@ def _write_quantized_gemma4_text_gguf(path: Path, *, float_projection: bool = Fa
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
+
+
+def _write_qwen_vl_pair(
+    text_path: Path,
+    mmproj_path: Path,
+    *,
+    projector_type: str,
+) -> None:
+    """Write a tiny exact Qwen2/Qwen2.5-VL text + sidecar pair."""
+    from gguf import GGUFWriter
+
+    text_hidden = 16
+    vision_hidden = 8
+    vision_intermediate = 12
+    layers = 2
+    heads = 2
+    vocab = 32
+    tokens = [f"token-{index}" for index in range(vocab)]
+    tokens[1:5] = [
+        "<|vision_start|>",
+        "<|vision_end|>",
+        "<|image_pad|>",
+        "<|video_pad|>",
+    ]
+
+    text = GGUFWriter(str(text_path), "qwen2vl")
+    text.add_string("general.name", "Tiny Qwen VL")
+    text.add_context_length(64)
+    text.add_embedding_length(text_hidden)
+    text.add_feed_forward_length(32)
+    text.add_block_count(2)
+    text.add_head_count(2)
+    text.add_head_count_kv(2)
+    text.add_rope_freq_base(1_000_000.0)
+    text.add_layer_norm_rms_eps(1e-6)
+    text.add_array("qwen2vl.rope.dimension_sections", [1, 1, 2, 0])
+    text.add_tokenizer_model("gpt2")
+    text.add_string("tokenizer.ggml.pre", "qwen2")
+    text.add_token_list(tokens)
+    text.add_token_merges(["token-5 token-6"])
+
+    rng = np.random.default_rng(17)
+
+    def _text_tensor(name: str, shape: tuple[int, ...]) -> None:
+        text.add_tensor(name, rng.normal(size=shape).astype(np.float32))
+
+    _text_tensor("token_embd.weight", (vocab, text_hidden))
+    _text_tensor("output_norm.weight", (text_hidden,))
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        _text_tensor(prefix + "attn_norm.weight", (text_hidden,))
+        _text_tensor(prefix + "ffn_norm.weight", (text_hidden,))
+        for stem in ("attn_q", "attn_k", "attn_v"):
+            _text_tensor(prefix + stem + ".weight", (text_hidden, text_hidden))
+            _text_tensor(prefix + stem + ".bias", (text_hidden,))
+        _text_tensor(prefix + "attn_output.weight", (text_hidden, text_hidden))
+        for stem in ("ffn_gate", "ffn_up"):
+            _text_tensor(prefix + stem + ".weight", (32, text_hidden))
+        _text_tensor(prefix + "ffn_down.weight", (text_hidden, 32))
+    text.write_header_to_file()
+    text.write_kv_data_to_file()
+    text.write_tensors_to_file()
+    text.close()
+
+    sidecar = GGUFWriter(str(mmproj_path), "clip")
+    sidecar.add_string("general.name", "Tiny Qwen VL")
+    sidecar.add_string("general.type", "clip-vision")
+    sidecar.add_bool("clip.has_vision_encoder", True)
+    sidecar.add_string("clip.projector_type", projector_type)
+    sidecar.add_uint32("clip.vision.embedding_length", vision_hidden)
+    sidecar.add_uint32(
+        "clip.vision.feed_forward_length",
+        text_hidden if projector_type == "qwen2vl_merger" else vision_intermediate,
+    )
+    sidecar.add_uint32("clip.vision.block_count", layers)
+    sidecar.add_uint32("clip.vision.attention.head_count", heads)
+    sidecar.add_uint32("clip.vision.image_size", 8)
+    sidecar.add_uint32("clip.vision.patch_size", 2)
+    sidecar.add_uint32("clip.vision.projection_dim", text_hidden)
+    sidecar.add_array("clip.vision.image_mean", [0.48145466, 0.4578275, 0.40821073])
+    sidecar.add_array("clip.vision.image_std", [0.26862954, 0.2613026, 0.2757771])
+    sidecar.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+    if projector_type == "qwen2.5vl_merger":
+        sidecar.add_bool("clip.use_silu", True)
+        sidecar.add_uint32("clip.vision.n_wa_pattern", 2)
+
+    sequence = 1.0
+
+    def _sidecar_tensor(name: str, shape: tuple[int, ...]) -> None:
+        nonlocal sequence
+        count = int(np.prod(shape))
+        values = np.arange(sequence, sequence + count, dtype=np.float32).reshape(shape)
+        sequence += count
+        sidecar.add_tensor(name, values)
+
+    for name in ("v.patch_embd.weight", "v.patch_embd.weight.1"):
+        _sidecar_tensor(name, (vision_hidden, 3, 2, 2))
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _sidecar_tensor(prefix + stem + ".weight", (vision_hidden, vision_hidden))
+            _sidecar_tensor(prefix + stem + ".bias", (vision_hidden,))
+        if projector_type == "qwen2vl_merger":
+            for stem in ("ln1", "ln2"):
+                _sidecar_tensor(prefix + stem + ".weight", (vision_hidden,))
+                _sidecar_tensor(prefix + stem + ".bias", (vision_hidden,))
+            _sidecar_tensor(prefix + "ffn_up.weight", (vision_hidden, vision_intermediate))
+            _sidecar_tensor(prefix + "ffn_up.bias", (vision_hidden,))
+            _sidecar_tensor(prefix + "ffn_down.weight", (vision_intermediate, vision_hidden))
+            _sidecar_tensor(prefix + "ffn_down.bias", (vision_intermediate,))
+        else:
+            for stem in ("ln1", "ln2"):
+                _sidecar_tensor(prefix + stem + ".weight", (vision_hidden,))
+            for stem in ("ffn_gate", "ffn_up"):
+                _sidecar_tensor(
+                    prefix + stem + ".weight", (vision_intermediate, vision_hidden)
+                )
+                _sidecar_tensor(prefix + stem + ".bias", (vision_intermediate,))
+            _sidecar_tensor(prefix + "ffn_down.weight", (vision_hidden, vision_intermediate))
+            _sidecar_tensor(prefix + "ffn_down.bias", (vision_hidden,))
+    _sidecar_tensor("v.post_ln.weight", (vision_hidden,))
+    if projector_type == "qwen2vl_merger":
+        _sidecar_tensor("v.post_ln.bias", (vision_hidden,))
+    merged = vision_hidden * 4
+    _sidecar_tensor("mm.0.weight", (merged, merged))
+    _sidecar_tensor("mm.0.bias", (merged,))
+    _sidecar_tensor("mm.2.weight", (text_hidden, merged))
+    _sidecar_tensor("mm.2.bias", (text_hidden,))
+    sidecar.write_header_to_file()
+    sidecar.write_kv_data_to_file()
+    sidecar.write_tensors_to_file()
+    sidecar.close()
 
 
 @pytest.fixture
@@ -704,6 +890,312 @@ class TestMultimodalPreflightGuards:
             pytest.raises(NotImplementedError, match="packed Q8_0"),
         ):
             _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+
+class TestGemma3Preflight:
+    def _pair(self, tmp_path: Path, *, extra_tensor: str | None = None):
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        text_path = tmp_path / "gemma3.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma3")
+        _write_gemma3_mmproj_gguf(mmproj_path, extra_tensor=extra_tensor)
+        return GGUFModel(str(text_path)), GGUFModel(str(mmproj_path))
+
+    def test_exact_tensor_closure_accepts_pinned_legacy_identity(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path)
+        specs = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        assert specs[MMProjModality.VISION].projector_type == "gemma3"
+        assert len(mmproj.tensor_names) == 23
+
+    def test_generic_dispatch_resolves_only_the_exact_gemma3_pair(self):
+        from mobius.integrations.gguf._mmproj import (
+            _resolve_vlm_builder,
+            build_gemma3_vlm_from_gguf,
+        )
+
+        assert _resolve_vlm_builder("gemma3", "gemma3") is build_gemma3_vlm_from_gguf
+        with pytest.raises(ValueError, match="targets"):
+            _resolve_vlm_builder("gemma4", "gemma3")
+
+    def test_exact_tensor_closure_rejects_unknown_tensor(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path, extra_tensor="v.pre_ln.weight")
+        with pytest.raises(ValueError, match=r"outside the pinned.*closure"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    @pytest.mark.parametrize("qtype", ["F32", "F16", "BF16"])
+    def test_float_storage_types_are_accepted(self, tmp_path: Path, qtype: str):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path)
+        with mock.patch.object(
+            mmproj,
+            "get_tensor_type",
+            return_value=SimpleNamespace(name=qtype),
+        ):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_packed_vision_tensor_is_rejected(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path)
+        original = mmproj.get_tensor_type
+        with (
+            mock.patch.object(
+                mmproj,
+                "get_tensor_type",
+                side_effect=lambda name: (
+                    SimpleNamespace(name="Q4_K")
+                    if name == "v.patch_embd.weight"
+                    else original(name)
+                ),
+            ),
+            pytest.raises(NotImplementedError, match="packed Q4_K"),
+        ):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_config_derives_4x4_pool_and_soft_tokens(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import (
+            read_mmproj_gemma3_vision_config,
+        )
+
+        _, mmproj = self._pair(tmp_path)
+        config = read_mmproj_gemma3_vision_config(mmproj)
+        assert config.pooling_kernel_size == 4
+        assert config.mm_tokens_per_image == 1
+        assert config.position_embedding_size == 16
+
+    def test_values_map_without_transpose_and_projector_norm_is_unoffset(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import (
+            _mmproj_gemma3_vision_to_hf,
+        )
+
+        _, mmproj = self._pair(tmp_path)
+        mapped = _mmproj_gemma3_vision_to_hf(mmproj)
+        np.testing.assert_array_equal(
+            mapped["vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight"].numpy(),
+            mmproj.get_tensor("v.blk.0.ffn_down.weight"),
+        )
+        np.testing.assert_allclose(
+            mapped["multi_modal_projector.mm_soft_emb_norm.weight"].numpy(),
+            mmproj.get_tensor("mm.soft_emb_norm.weight") - 1.0,
+        )
+
+
+class TestQwenVLMMProj:
+    @pytest.mark.parametrize(
+        "projector_type,expected_intermediate,expected_full_attention",
+        [
+            ("qwen2vl_merger", 12, None),
+            ("qwen2.5vl_merger", 12, [1]),
+        ],
+    )
+    def test_real_contract_config_and_exact_closure(
+        self,
+        tmp_path: Path,
+        projector_type: str,
+        expected_intermediate: int,
+        expected_full_attention: list[int] | None,
+    ):
+        from mobius.integrations.gguf._mmproj import (
+            _preflight_mmproj_pair,
+            read_mmproj_qwen_vision_config,
+        )
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        text_path = tmp_path / "text.gguf"
+        sidecar_path = tmp_path / "mmproj.gguf"
+        _write_qwen_vl_pair(
+            text_path,
+            sidecar_path,
+            projector_type=projector_type,
+        )
+        text = GGUFModel(str(text_path))
+        sidecar = GGUFModel(str(sidecar_path))
+
+        spec = _preflight_mmproj_pair(
+            text,
+            sidecar,
+            modalities=(MMProjModality.VISION,),
+        )[MMProjModality.VISION]
+        vision = read_mmproj_qwen_vision_config(sidecar, spec.projector_type)
+
+        assert vision is not None
+        assert vision.intermediate_size == expected_intermediate
+        assert vision.fullatt_block_indexes == expected_full_attention
+        assert vision.temporal_patch_size == 2
+        assert vision.spatial_merge_size == 2
+        assert vision.out_hidden_size == 16
+
+    @pytest.mark.parametrize("projector_type", ["qwen2vl_merger", "qwen2.5vl_merger"])
+    def test_qwen_tensor_transform_values(
+        self,
+        tmp_path: Path,
+        projector_type: str,
+    ):
+        from mobius.integrations.gguf._mmproj import _mmproj_qwen_vision_to_hf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        text_path = tmp_path / "text.gguf"
+        sidecar_path = tmp_path / "mmproj.gguf"
+        _write_qwen_vl_pair(
+            text_path,
+            sidecar_path,
+            projector_type=projector_type,
+        )
+        sidecar = GGUFModel(str(sidecar_path))
+        state = _mmproj_qwen_vision_to_hf(sidecar, projector_type)
+
+        patch0 = np.array(sidecar.get_tensor("v.patch_embd.weight"))
+        patch1 = np.array(sidecar.get_tensor("v.patch_embd.weight.1"))
+        np.testing.assert_array_equal(
+            state["visual.patch_embed.proj.weight"].numpy(),
+            np.stack([patch0, patch1], axis=2),
+        )
+        qkv = np.concatenate(
+            [
+                np.array(sidecar.get_tensor(f"v.blk.0.attn_{stem}.weight"))
+                for stem in ("q", "k", "v")
+            ],
+            axis=0,
+        )
+        np.testing.assert_array_equal(
+            state["visual.blocks.0.attn.qkv.weight"].numpy(),
+            qkv,
+        )
+        if projector_type == "qwen2vl_merger":
+            np.testing.assert_array_equal(
+                state["visual.blocks.0.mlp.down_proj.weight"].numpy(),
+                np.array(sidecar.get_tensor("v.blk.0.ffn_up.weight")),
+            )
+            np.testing.assert_array_equal(
+                state["visual.blocks.0.mlp.up_proj.weight"].numpy(),
+                np.array(sidecar.get_tensor("v.blk.0.ffn_down.weight")),
+            )
+
+    @pytest.mark.parametrize("projector_type", ["qwen2vl_merger", "qwen2.5vl_merger"])
+    def test_builds_canonical_package_and_runs_mixed_media(
+        self,
+        tmp_path: Path,
+        projector_type: str,
+    ):
+        import onnx_ir as ir
+        import onnxruntime as ort
+
+        from mobius.integrations.gguf._mmproj import build_qwen_vlm_from_gguf
+
+        text_path = tmp_path / "text.gguf"
+        sidecar_path = tmp_path / "mmproj.gguf"
+        _write_qwen_vl_pair(
+            text_path,
+            sidecar_path,
+            projector_type=projector_type,
+        )
+        package = build_qwen_vlm_from_gguf(
+            text_path,
+            sidecar_path,
+            keep_quantized=False,
+        )
+
+        assert set(package) == {"decoder", "vision_encoder", "embedding"}
+        assert [value.name for value in package["vision_encoder"].graph.inputs] == [
+            "pixel_values",
+            "image_grid_thw",
+        ]
+        assert package["vision_encoder"].graph.inputs[0].dtype == ir.DataType.FLOAT
+        assert [value.name for value in package["embedding"].graph.inputs] == [
+            "input_ids",
+            "image_features",
+            "video_features",
+        ]
+        assert package["decoder"].graph.inputs[0].name == "inputs_embeds"
+        assert package["decoder"].graph.inputs[2].shape[0] == 3
+
+        vision_session = ort.InferenceSession(
+            ir.serde.serialize_model(package["vision_encoder"]).SerializeToString(),
+            providers=["CPUExecutionProvider"],
+        )
+        vision_result = vision_session.run(
+            None,
+            {
+                "pixel_values": np.arange(96, dtype=np.float32).reshape(4, 24) / 100,
+                "image_grid_thw": np.array([[1, 2, 2]], dtype=np.int64),
+            },
+        )[0]
+        assert vision_result.shape == (1, 16)
+        assert np.isfinite(vision_result).all()
+
+        embedding_path = tmp_path / "embedding.onnx"
+        ir.save(package["embedding"], str(embedding_path))
+        session = ort.InferenceSession(
+            str(embedding_path),
+            providers=["CPUExecutionProvider"],
+        )
+        input_ids = np.array([[3, 4, 0], [4, 3, 0]], dtype=np.int64)
+        images = np.array([[10.0] * 16, [20.0] * 16], dtype=np.float32)
+        videos = np.array([[30.0] * 16, [40.0] * 16], dtype=np.float32)
+        result = session.run(
+            None,
+            {
+                "input_ids": input_ids,
+                "image_features": images,
+                "video_features": videos,
+            },
+        )[0]
+        np.testing.assert_array_equal(result[0, 0], images[0])
+        np.testing.assert_array_equal(result[1, 1], images[1])
+        np.testing.assert_array_equal(result[0, 1], videos[0])
+        np.testing.assert_array_equal(result[1, 0], videos[1])
+
+        text_only = session.run(
+            None,
+            {
+                "input_ids": np.zeros((2, 1), dtype=np.int64),
+                "image_features": np.empty((0, 16), dtype=np.float32),
+                "video_features": np.empty((0, 16), dtype=np.float32),
+            },
+        )[0]
+        assert text_only.shape == (2, 1, 16)
+        assert np.isfinite(text_only).all()
+
+        decoder_session = ort.InferenceSession(
+            ir.serde.serialize_model(package["decoder"]).SerializeToString(),
+            providers=["CPUExecutionProvider"],
+        )
+        prefill_feeds = {
+            "inputs_embeds": result[:1, :2],
+            "attention_mask": np.ones((1, 2), dtype=np.int64),
+            "position_ids": np.zeros((3, 1, 2), dtype=np.int64),
+        }
+        for layer in range(2):
+            for cache_type in ("key", "value"):
+                prefill_feeds[f"past_key_values.{layer}.{cache_type}"] = np.empty(
+                    (1, 2, 0, 8),
+                    dtype=np.float32,
+                )
+        prefill = decoder_session.run(None, prefill_feeds)
+        assert prefill[0].shape == (1, 2, 32)
+
+        decode_feeds = {
+            "inputs_embeds": text_only[:1],
+            "attention_mask": np.ones((1, 3), dtype=np.int64),
+            "position_ids": np.full((3, 1, 1), 2, dtype=np.int64),
+        }
+        for layer in range(2):
+            decode_feeds[f"past_key_values.{layer}.key"] = prefill[1 + 2 * layer]
+            decode_feeds[f"past_key_values.{layer}.value"] = prefill[2 + 2 * layer]
+        decode = decoder_session.run(None, decode_feeds)
+        assert decode[0].shape == (1, 1, 32)
+        assert all(cache.shape[2] == 3 for cache in decode[1:])
 
 
 class TestReadVisionConfig:

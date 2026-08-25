@@ -57,7 +57,10 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 58
+_EXPECTED_SUPPORTED_COUNT = 71
+_PROMOTED_CONVENTIONAL_DECODERS = frozenset(
+    {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
+)
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -163,6 +166,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "granitemoe",
         "hunyuan-dense",
         "jamba",
+        "jais2",
         "kimi-k3",
         "kimi-linear",
         "lfm2",
@@ -180,6 +184,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "phimoe",
         "plamo2",
         "qwen2",
+        "qwen2vl",
         "qwen2moe",
         "qwen3",
         "qwen35",
@@ -188,6 +193,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "qwen3next",
         "rnd1",
         "seed_oss",
+        "command-r",
         "smollm3",
         "stablelm",
         "starcoder2",
@@ -235,8 +241,9 @@ class TestCapabilityClosure:
         """A ``graph=SUPPORTED`` claim has to be backed by a real model class."""
         if spec.graph is not Support.SUPPORTED:
             return
-        assert spec.model_type in _REGISTRATIONS, (
-            f"{spec.gguf_arch}: model_type {spec.model_type!r} is not registered in "
+        module_type = spec.module_type or spec.model_type
+        assert module_type in _REGISTRATIONS, (
+            f"{spec.gguf_arch}: module type {module_type!r} is not registered in "
             "mobius._registry, so the graph cannot actually be built"
         )
 
@@ -272,14 +279,24 @@ class TestCapabilityClosure:
         assert set(actual) == set(supported_architectures())
         rejected = {
             "chatglm",
+            "eurobert",
             "granitehybrid",
             "internlm2",
+            "jina-bert-v2",
             "lfm2moe",
             "mamba",
             "mamba2",
             "nemotron_h",
             "nemotron_h_moe",
+            "neo-bert",
+            "nomic-bert",
             "phi2",
+            "bloom",
+            "codeshell",
+            "orion",
+            "qwen",
+            "starcoder",
+            "xverse",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
@@ -661,7 +678,9 @@ class TestPinnedTensorClosure:
 
 
 class TestFinalCensusClosure:
-    @pytest.mark.parametrize("architecture", sorted(_FINAL_CENSUS_CLOSURE))
+    @pytest.mark.parametrize(
+        "architecture", sorted(_FINAL_CENSUS_CLOSURE - _PROMOTED_CONVENTIONAL_DECODERS)
+    )
     def test_every_newly_closed_id_has_one_nonimportable_spec(self, architecture: str) -> None:
         spec = try_get_arch_spec(architecture)
         assert spec is not None
@@ -1195,7 +1214,6 @@ class TestPinnedRemainingVLMTextCohort:
         "llama4",
         "mistral3",
         "paddleocr",
-        "qwen2vl",
         "qwen3vl",
         "qwen3vlmoe",
     )
@@ -1457,7 +1475,6 @@ class TestPinnedRemainingVLMTextCohort:
             ("llama4", ("routed experts", "llama4 clip", "text-backbone")),
             ("mistral3", ("dense or routed-expert", "temperature", "Pixtral")),
             ("paddleocr", ("optional bias", "image-token", "ordinary Qwen2")),
-            ("qwen2vl", ("Qwen2.5-Omni", "projector strings", "target identity")),
             ("qwen3vl", ("multimodal position IDs", "deep-stack", "text-only")),
             ("qwen3vlmoe", ("routed experts", "effective tied head", "cache ABI")),
         ],
@@ -1492,7 +1509,6 @@ class TestPinnedRemainingVLMTextCohort:
             "gemma3n_text",
             "llama4_text",
             "mistral3",
-            "qwen2_vl_text",
             "qwen3_vl_text",
             "qwen3_vl_moe",
         } <= set(_REGISTRATIONS)
@@ -1505,13 +1521,18 @@ class TestPinnedRemainingVLMTextCohort:
             for spec in iter_arch_specs()
             if spec.vlm_builder is not None
         }
-        assert exact == {"gemma4": "gemma4", "muse-glimmer": "muse_glimmer"}
+        assert exact == {
+            "gemma3": "gemma3",
+            "gemma4": "gemma4",
+            "muse-glimmer": "muse_glimmer",
+            "qwen2vl": "qwen_vl",
+        }
 
 
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
 
-    @pytest.mark.parametrize("architecture", ["bloom"])
+    @pytest.mark.parametrize("architecture", [])
     def test_configurable_but_unmappable_architectures_are_refused(
         self, architecture: str
     ) -> None:
@@ -1587,11 +1608,7 @@ class TestDocumentedSupportMatrix:
         for spec in sorted(iter_arch_specs(), key=lambda s: s.gguf_arch):
             aliases = ", ".join(f"`{a}`" for a in sorted(spec.aliases)) or "—"
             model_type = f"`{spec.model_type}`" if spec.model_type else "—"
-            core_verdicts = {
-                name: verdict
-                for name, verdict in spec.verdicts.items()
-                if name != "quantized_import"
-            }
+            core_verdicts = spec.verdicts
             status = (
                 "supported"
                 if all(verdict is Support.SUPPORTED for verdict in spec.verdicts.values())
@@ -1666,7 +1683,7 @@ class TestOffsetNormCompensation:
     )
     def test_offset_norm_models_have_compensation(self, spec) -> None:
         assert spec.model_type is not None
-        if not self._model_uses_offset_norm(spec.model_type):
+        if not self._model_uses_offset_norm(spec.module_type or spec.model_type):
             return
         compensated = spec.tensor_processor == "unoffset_norm" or spec.offset_norm
         assert compensated, (

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""GGUF ``clip`` mmproj → HuggingFace tensor name mapping (Gemma4 vision/audio).
+"""GGUF ``clip`` mmproj → HuggingFace tensor name mapping.
 
 Gemma4's vision and audio encoders ship in a *companion* ``mmproj-*.gguf`` file
 whose ``general.architecture`` is ``clip`` (not ``gemma4``).  Its tensors use a
@@ -34,6 +34,8 @@ from __future__ import annotations
 
 __all__ = [
     "is_mmproj_stat_tensor",
+    "map_mmproj_gemma3_vision_to_hf",
+    "map_mmproj_qwen_vision_to_hf",
     "map_mmproj_audio_to_hf",
     "map_mmproj_muse_glimmer_vision_to_hf",
     "map_mmproj_vision_to_hf",
@@ -154,6 +156,91 @@ def map_mmproj_vision_to_hf(name: str) -> str | None:
     if name == "mm.input_projection.weight":
         return "embed_vision.embedding_projection.weight"
     return None
+
+
+_GEMMA3_VISION_BLOCK_STEMS: dict[str, str] = {
+    "ln1.weight": "layer_norm1.weight",
+    "ln1.bias": "layer_norm1.bias",
+    "ln2.weight": "layer_norm2.weight",
+    "ln2.bias": "layer_norm2.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q.bias": "self_attn.q_proj.bias",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k.bias": "self_attn.k_proj.bias",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_v.bias": "self_attn.v_proj.bias",
+    "attn_out.weight": "self_attn.out_proj.weight",
+    "attn_out.bias": "self_attn.out_proj.bias",
+    # llama.cpp names these for their data-flow direction. In the Gemma3
+    # artifact ffn_down expands hidden→intermediate and ffn_up contracts back.
+    "ffn_down.weight": "mlp.fc1.weight",
+    "ffn_down.bias": "mlp.fc1.bias",
+    "ffn_up.weight": "mlp.fc2.weight",
+    "ffn_up.bias": "mlp.fc2.bias",
+}
+
+
+def map_mmproj_gemma3_vision_to_hf(name: str) -> str | None:
+    """Map the pinned Gemma3 sidecar closure to names its HF importer consumes."""
+    blk = _VISION_BLK.match(name)
+    if blk is not None:
+        idx, stem = blk.group(1), blk.group(2)
+        hf_stem = _GEMMA3_VISION_BLOCK_STEMS.get(stem)
+        if hf_stem is None:
+            return None
+        return f"vision_tower.vision_model.encoder.layers.{idx}.{hf_stem}"
+
+    top = {
+        "v.patch_embd.weight": ("vision_tower.vision_model.embeddings.patch_embedding.weight"),
+        "v.patch_embd.bias": "vision_tower.vision_model.embeddings.patch_embedding.bias",
+        "v.position_embd.weight": (
+            "vision_tower.vision_model.embeddings.position_embedding.weight"
+        ),
+        "v.post_ln.weight": "vision_tower.vision_model.post_layernorm.weight",
+        "v.post_ln.bias": "vision_tower.vision_model.post_layernorm.bias",
+        "mm.soft_emb_norm.weight": "multi_modal_projector.mm_soft_emb_norm.weight",
+        "mm.input_projection.weight": "multi_modal_projector.mm_input_projection_weight",
+    }
+    return top.get(name)
+
+
+_QWEN_VISION_BLOCK_STEMS: dict[str, str] = {
+    "attn_out.weight": "attn.proj.weight",
+    "attn_out.bias": "attn.proj.bias",
+    "ln1.weight": "norm1.weight",
+    "ln1.bias": "norm1.bias",
+    "ln2.weight": "norm2.weight",
+    "ln2.bias": "norm2.bias",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_gate.bias": "mlp.gate_proj.bias",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_up.bias": "mlp.up_proj.bias",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "ffn_down.bias": "mlp.down_proj.bias",
+}
+
+
+def map_mmproj_qwen_vision_to_hf(name: str) -> str | None:
+    """Map non-fused Qwen2/Qwen2.5-VL sidecar tensors to HF names.
+
+    Split Q/K/V and temporal patch halves are fused by the builder because one
+    ONNX initializer consumes each group.
+    """
+    blk = _VISION_BLK.match(name)
+    if blk is not None:
+        idx, stem = blk.group(1), blk.group(2)
+        hf_stem = _QWEN_VISION_BLOCK_STEMS.get(stem)
+        return None if hf_stem is None else f"visual.blocks.{idx}.{hf_stem}"
+
+    top = {
+        "v.post_ln.weight": "visual.merger.ln_q.weight",
+        "v.post_ln.bias": "visual.merger.ln_q.bias",
+        "mm.0.weight": "visual.merger.mlp.0.weight",
+        "mm.0.bias": "visual.merger.mlp.0.bias",
+        "mm.2.weight": "visual.merger.mlp.2.weight",
+        "mm.2.bias": "visual.merger.mlp.2.bias",
+    }
+    return top.get(name)
 
 
 # ---------------------------------------------------------------------------

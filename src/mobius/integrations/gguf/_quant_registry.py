@@ -161,9 +161,8 @@ _REQUIRES_EXPLICIT_ZERO_POINT: frozenset[str] = frozenset(
     }
 )
 
-#: Types an untied ``lm_head`` may stay quantized in. Broader than the union of
-#: the two tables above because the head is also allowed to ride the generic
-#: requantization path.
+#: Value-preserving types in which an untied ``lm_head`` may stay quantized.
+#: Lossy dequantize/requantize routes fail closed.
 _LM_HEAD_PRESERVE: frozenset[str] = frozenset(
     {
         "Q1_0",

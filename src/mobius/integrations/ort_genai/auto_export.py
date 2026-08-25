@@ -2038,11 +2038,9 @@ def write_ort_genai_config(
         has_speech=has_speech,
     )
     result["genai_config"] = genai_path
-    with open(genai_path, encoding="utf-8") as handle:
-        emitted_model_type = json.load(handle)["model"]["type"]
     compatibility_path = _write_runtime_compatibility(
         directory,
-        model_type=emitted_model_type,
+        model_type=ort_model_type,
         runtime_version=runtime_version,
     )
     result["runtime_compatibility"] = compatibility_path

@@ -547,6 +547,8 @@ class TestCLIBuildGGUF:
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
         package.values.return_value = iter(())
+        package.mtp_head = None
+        package.draft_manifest = None
         with mock.patch(
             "mobius.integrations.gguf.build_from_gguf",
             return_value=package,
@@ -580,7 +582,7 @@ class TestCLIBuildGGUF:
             )
 
     def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
-        """build-gguf forwards the selected runtime after saving the graph."""
+        """build-gguf forwards one canonically opened source to build and packaging."""
         from mobius.__main__ import main
         from mobius.integrations.gguf._spec import Support
 
@@ -588,6 +590,7 @@ class TestCLIBuildGGUF:
         package.__iter__.return_value = iter(())
         package.mtp_head = None
         package.draft_manifest = None
+        gguf_model = mock.Mock(metadata={}, architecture="llama")
         output_dir = tmp_path / "output"
         with (
             mock.patch(
@@ -595,9 +598,9 @@ class TestCLIBuildGGUF:
                 return_value=str(tmp_path / "model.gguf"),
             ),
             mock.patch(
-                "mobius.integrations.gguf._reader.GGUFModel",
-                return_value=mock.Mock(metadata={}, architecture="llama"),
-            ),
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
+                return_value=gguf_model,
+            ) as open_model,
             mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
             mock.patch(
                 "mobius.integrations.gguf._arch_registry.get_arch_spec",
@@ -610,7 +613,7 @@ class TestCLIBuildGGUF:
             mock.patch(
                 "mobius.integrations.gguf.build_from_gguf",
                 return_value=package,
-            ),
+            ) as build,
             mock.patch(
                 "mobius.integrations.gguf.write_gguf_runtime_package",
                 return_value={"genai_config": str(output_dir / "genai_config.json")},
@@ -631,6 +634,8 @@ class TestCLIBuildGGUF:
                 ]
             )
 
+        open_model.assert_called_once_with(str(tmp_path / "model.gguf"))
+        assert build.call_args.kwargs["_gguf_model"] is gguf_model
         write_runtime.assert_called_once_with(
             package,
             str(tmp_path / "model.gguf"),
@@ -656,7 +661,7 @@ class TestCLIBuildGGUF:
                 return_value=str(tmp_path / "model.gguf"),
             ),
             mock.patch(
-                "mobius.integrations.gguf._reader.GGUFModel",
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
                 return_value=mock.Mock(metadata={}, architecture="llama"),
             ),
             mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
@@ -683,3 +688,178 @@ class TestCLIBuildGGUF:
             )
         build.assert_not_called()
         assert not output.exists()
+
+    @pytest.mark.parametrize(
+        ("error", "message"),
+        [
+            (
+                FileNotFoundError(
+                    "Incomplete GGUF split set 'model': declared 2 shards but 1 missing"
+                ),
+                "1 missing",
+            ),
+            (ValueError("invalid GGUF header in continuation shard"), "invalid GGUF header"),
+        ],
+    )
+    def test_runtime_shard_preflight_fails_before_build_or_output(
+        self, tmp_path, capsys, error, message
+    ):
+        from mobius.__main__ import main
+
+        output = tmp_path / "output"
+        shard = tmp_path / "model-00001-of-00002.gguf"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(shard),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
+                side_effect=error,
+            ),
+            mock.patch("mobius.integrations.gguf.build_from_gguf") as build,
+            pytest.raises(type(error), match=message),
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(shard),
+                    "--output",
+                    str(output),
+                    "--runtime",
+                    "ort-genai",
+                    "--runtime-version",
+                    "0.15.2",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "a" * 40,
+                ]
+            )
+
+        build.assert_not_called()
+        assert "Saved" not in capsys.readouterr().out
+        assert not output.exists()
+
+    def test_runtime_packaging_failure_emits_no_saved_output(self, tmp_path, capsys):
+        from mobius.__main__ import main
+        from mobius.integrations.gguf._spec import Support
+
+        output = tmp_path / "output"
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(("model",))
+        package.__len__.return_value = 1
+        gguf_model = mock.Mock(metadata={}, architecture="llama")
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
+                return_value=gguf_model,
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._arch_registry.get_arch_spec",
+                return_value=mock.Mock(
+                    gguf_arch="llama",
+                    runtime=Support.SUPPORTED,
+                    reason=None,
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                side_effect=ValueError("serialized package evidence mismatch"),
+            ),
+            pytest.raises(ValueError, match="evidence mismatch"),
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(output),
+                    "--runtime",
+                    "ort-genai",
+                    "--runtime-version",
+                    "0.15.2",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "a" * 40,
+                ]
+            )
+
+        assert "Saved" not in capsys.readouterr().out
+        assert not output.exists()
+
+    def test_runtime_success_is_reported_only_after_publication(self, tmp_path):
+        from mobius.__main__ import main
+        from mobius.integrations.gguf._spec import Support
+
+        output = tmp_path / "output"
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(("model",))
+        package.__len__.return_value = 1
+
+        def publish(*_args, **_kwargs):
+            output.mkdir()
+            (output / "model.onnx").write_bytes(b"model")
+            return {"genai_config": str(output / "genai_config.json")}
+
+        original_print = print
+
+        def assert_published_before_print(*args, **kwargs):
+            if args and str(args[0]).startswith("Saved"):
+                assert (output / "model.onnx").is_file()
+            original_print(*args, **kwargs)
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
+                return_value=mock.Mock(metadata={}, architecture="llama"),
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._arch_registry.get_arch_spec",
+                return_value=mock.Mock(
+                    gguf_arch="llama",
+                    runtime=Support.SUPPORTED,
+                    reason=None,
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                side_effect=publish,
+            ),
+            mock.patch("builtins.print", side_effect=assert_published_before_print),
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(output),
+                    "--runtime",
+                    "ort-genai",
+                    "--runtime-version",
+                    "0.15.2",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "a" * 40,
+                ]
+            )

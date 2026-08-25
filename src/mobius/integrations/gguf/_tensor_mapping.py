@@ -71,6 +71,57 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+_LEGACY_LAYERNORM_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
+_BLOOM_MAPPING: dict[str, str] = {
+    "token_embd": "transformer.word_embeddings",
+    "token_embd_norm": "transformer.word_embeddings_layernorm",
+    "output": "lm_head",
+    "output_norm": "transformer.ln_f",
+    "blk.{bid}.attn_norm": "transformer.h.{bid}.ln_attn",
+    "blk.{bid}.attn_qkv": "transformer.h.{bid}.self_attention.query_key_value",
+    "blk.{bid}.attn_output": "transformer.h.{bid}.self_attention.o_proj",
+    "blk.{bid}.ffn_norm": "transformer.h.{bid}.ln_mlp",
+    "blk.{bid}.ffn_up": "transformer.h.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "transformer.h.{bid}.mlp.down_proj",
+}
+
+_STARCODER_MAPPING: dict[str, str] = {
+    "token_embd": "transformer.wte",
+    "position_embd": "transformer.wpe",
+    "output": "lm_head",
+    "output_norm": "transformer.ln_f",
+    "blk.{bid}.attn_norm": "transformer.h.{bid}.ln_1",
+    "blk.{bid}.attn_qkv": "transformer.h.{bid}.attn.c_attn",
+    "blk.{bid}.attn_output": "transformer.h.{bid}.attn.o_proj",
+    "blk.{bid}.ffn_norm": "transformer.h.{bid}.ln_2",
+    "blk.{bid}.ffn_up": "transformer.h.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "transformer.h.{bid}.mlp.down_proj",
+}
+
+_QWEN1_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+}
+
+_COMMAND_R_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 _DFLASH_MAPPING: dict[str, str] = {
     "fc": "fc",
     "enc.output_norm": "hidden_norm",
@@ -481,6 +532,56 @@ _MODERN_BERT_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.Wi",
     "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.Wo",
     "blk.{bid}.ffn_norm": "model.layers.{bid}.mlp_norm",
+}
+
+_EUROBERT_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "output_norm": "output_norm",
+    "blk.{bid}.attn_norm": "layers.{bid}.attn_norm",
+    "blk.{bid}.attn_q": "layers.{bid}.attention.q",
+    "blk.{bid}.attn_k": "layers.{bid}.attention.k",
+    "blk.{bid}.attn_v": "layers.{bid}.attention.v",
+    "blk.{bid}.attn_output": "layers.{bid}.attention.output",
+    "blk.{bid}.ffn_norm": "layers.{bid}.ffn_norm",
+    "blk.{bid}.ffn_gate": "layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down",
+}
+
+_NEO_BERT_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "cls": "cls",
+    "cls_out": "classifier",
+    "enc.output_norm": "output_norm",
+    "blk.{bid}.attn_norm": "layers.{bid}.attn_norm",
+    "blk.{bid}.attn_qkv": "layers.{bid}.attention.qkv",
+    "blk.{bid}.attn_output": "layers.{bid}.attention.output",
+    "blk.{bid}.ffn_norm": "layers.{bid}.ffn_norm",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down",
+}
+
+_NOMIC_BERT_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "token_types": "token_type_embeddings",
+    "token_embd_norm": "token_embeddings_norm",
+    "blk.{bid}.attn_q": "layers.{bid}.attention.q",
+    "blk.{bid}.attn_k": "layers.{bid}.attention.k",
+    "blk.{bid}.attn_v": "layers.{bid}.attention.v",
+    "blk.{bid}.attn_output": "layers.{bid}.attention.output",
+    "blk.{bid}.attn_output_norm": "layers.{bid}.attention_output_norm",
+    "blk.{bid}.ffn_gate": "layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down",
+    "blk.{bid}.layer_output_norm": "layers.{bid}.layer_output_norm",
+}
+
+_JINA_BERT_V2_MAPPING: dict[str, str] = {
+    **_NOMIC_BERT_MAPPING,
+    "cls": "cls",
+    "blk.{bid}.attn_q_norm": "layers.{bid}.attention.q_norm",
+    "blk.{bid}.attn_k_norm": "layers.{bid}.attention.k_norm",
+    "blk.{bid}.attn_norm_2": "layers.{bid}.extra_attention_norm",
 }
 
 _T5_MAPPING: dict[str, str] = {
@@ -908,6 +1009,11 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "legacy_layernorm": _LEGACY_LAYERNORM_MAPPING,
+        "bloom": _BLOOM_MAPPING,
+        "starcoder": _STARCODER_MAPPING,
+        "qwen1_extras": _QWEN1_EXTRAS,
+        "command_r_extras": _COMMAND_R_EXTRAS,
         "lfm2": _LFM2_MAPPING,
         "lfm2_moe_extras": _LFM2_MOE_EXTRAS,
         "dflash": _DFLASH_MAPPING,
@@ -931,6 +1037,10 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "granitehybrid": _GRANITEHYBRID_MAPPING,
         "bert": _BERT_MAPPING,
         "modern_bert": _MODERN_BERT_MAPPING,
+        "eurobert": _EUROBERT_MAPPING,
+        "neo_bert": _NEO_BERT_MAPPING,
+        "nomic_bert": _NOMIC_BERT_MAPPING,
+        "jina_bert_v2": _JINA_BERT_V2_MAPPING,
         "t5": _T5_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,

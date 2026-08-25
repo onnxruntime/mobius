@@ -180,6 +180,11 @@ class MMProjArtifactPin:
     tensor_qtypes: tuple[tuple[str, int], ...]
     tensor_count: int
     parity_test: str
+    processor_repository: str | None = None
+    processor_revision: str | None = None
+    processor_files: tuple[str, ...] = ()
+    processor_class: str | None = None
+    processor_contract: tuple[tuple[str, str], ...] = ()
 
 
 _VISION_BASE = frozenset({MMProjModality.VISION})
@@ -376,6 +381,45 @@ _MUSE_GLIMMER_BLOCK_SUFFIXES = tuple(
     for kind in ("weight", "bias")
 )
 
+_GEMMA3_BLOCK_SUFFIXES = tuple(
+    f"{stem}.{kind}"
+    for stem in ("ln1", "ln2", "attn_q", "attn_k", "attn_v", "attn_out", "ffn_up", "ffn_down")
+    for kind in ("weight", "bias")
+)
+
+_QWEN2VL_BLOCK_SUFFIXES = tuple(
+    f"{stem}.{kind}"
+    for stem in (
+        "ln1",
+        "ln2",
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_out",
+        "ffn_up",
+        "ffn_down",
+    )
+    for kind in ("weight", "bias")
+)
+
+_QWEN25VL_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln2.weight",
+    *(
+        f"{stem}.{kind}"
+        for stem in (
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_out",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        )
+        for kind in ("weight", "bias")
+    ),
+)
+
 _COMMON_REQUIRED_VISION_METADATA = (
     "clip.has_vision_encoder",
     "clip.vision.embedding_length",
@@ -469,19 +513,76 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _VISION_BASE,
         "GLM-Edge adapter tensor closure and graph are not implemented.",
     ),
-    _deferred(
-        "qwen2vl_merger",
-        "PROJECTOR_TYPE_QWEN2VL",
-        _VISION_BASE,
-        "The existing HF Qwen2-VL graph is not wired to the pinned GGUF merger ABI.",
+    ProjectorSpec(
+        projector_type="qwen2vl_merger",
+        enum_name="PROJECTOR_TYPE_QWEN2VL",
+        modalities=_VISION_BASE,
         target_architectures=frozenset({"qwen2vl"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata, exact tensor closure, fused projector transforms, graph "
+            "construction, and processor boundary contracts are covered, but no "
+            "downstream multimodal runtime execution is claimed."
+        ),
+        builder="qwen_vl",
+        required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_QWEN2VL_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("qwen2-vl-2b-f16",),
     ),
-    _deferred(
-        "qwen2.5vl_merger",
-        "PROJECTOR_TYPE_QWEN25VL",
-        _VISION_BASE,
-        "The Qwen2.5-VL merger/window ordering has no GGUF tensor-closure parity test.",
+    ProjectorSpec(
+        projector_type="qwen2.5vl_merger",
+        enum_name="PROJECTOR_TYPE_QWEN25VL",
+        modalities=_VISION_BASE,
         target_architectures=frozenset({"qwen2vl"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata, exact tensor closure, fused projector transforms, window "
+            "schedule, graph construction, and processor boundary contracts are "
+            "covered, but no downstream multimodal runtime execution is claimed."
+        ),
+        builder="qwen_vl",
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.n_wa_pattern",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.post_ln.weight",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_QWEN25VL_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("qwen25-vl-3b-f16",),
     ),
     _deferred(
         "qwen3vl_merger",
@@ -496,11 +597,37 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _VISION_BASE,
         "Step3-VL vision and projector graph are not implemented.",
     ),
-    _deferred(
-        "gemma3",
-        "PROJECTOR_TYPE_GEMMA3",
-        _VISION_BASE,
-        "Gemma3 mmproj feature selection and projector tensor map are not implemented.",
+    ProjectorSpec(
+        projector_type="gemma3",
+        enum_name="PROJECTOR_TYPE_GEMMA3",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"gemma3"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata, exact tensor closure, graph construction, and component parity "
+            "are covered, but downstream multimodal runtime support is not claimed."
+        ),
+        builder="gemma3",
+        required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.soft_emb_norm.weight",
+            "mm.input_projection.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GEMMA3_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("gemma3-4b-f16",),
     ),
     _deferred(
         "gemma3nv",
@@ -886,6 +1013,126 @@ _INDEX: Mapping[str, ProjectorSpec] = MappingProxyType(
 )
 
 MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
+    MMProjArtifactPin(
+        artifact_id="qwen2-vl-2b-f16",
+        repository="ggml-org/Qwen2-VL-2B-Instruct-GGUF",
+        revision="bb307c036e8a1ed7b663bbd0c35b41c4c9294cfd",
+        filename="mmproj-Qwen2-VL-2B-Instruct-f16.gguf",
+        size=1_331_656_160,
+        lfs_sha256="ecb20cabcdd8dbc277de06bd6eb980aeb2adfaaba9f199a434e328d205675d03",
+        projector_types=("qwen2vl_merger",),
+        paired_text_architecture="qwen2vl",
+        paired_text_target="Qwen2-VL-2B-Instruct-Q4_K_M.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1280),
+            ("clip.vision.projection_dim", 1536),
+            ("clip.vision.block_count", 32),
+            ("clip.vision.image_size", 560),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 324), ("F16", 196)),
+        tensor_count=520,
+        parity_test=("TestQwenVLMMProj.test_qwen_tensor_transform_values[qwen2vl_merger]"),
+        processor_repository="Qwen/Qwen2-VL-2B-Instruct",
+        processor_revision="895c3a49bc3fa70a340399125c650a463535e71c",
+        processor_files=(
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+            "chat_template.json",
+        ),
+        processor_class="Qwen2VLProcessor",
+        processor_contract=(
+            ("pixel_values", "float32[total_image_patches,1176]"),
+            ("image_grid_thw", "int64[num_images,3]"),
+            ("pixel_values_videos", "float32[total_video_patches,1176]"),
+            ("video_grid_thw", "int64[num_videos,3]"),
+            ("empty_media", "omit image/video pixel and grid keys"),
+            ("ordering", "batch-major within independent image and video streams"),
+        ),
+    ),
+    MMProjArtifactPin(
+        artifact_id="qwen25-vl-3b-f16",
+        repository="ggml-org/Qwen2.5-VL-3B-Instruct-GGUF",
+        revision="5037fcf163dd95d1e41d1974465f0898ed108ca2",
+        filename="mmproj-Qwen2.5-VL-3B-Instruct-f16.gguf",
+        size=1_338_428_128,
+        lfs_sha256="b9160fe9d814d1fadf68395677468534778b39ac33c2e7561b7b218626e60d5e",
+        projector_types=("qwen2.5vl_merger",),
+        paired_text_architecture="qwen2vl",
+        paired_text_target="Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1280),
+            ("clip.vision.projection_dim", 2048),
+            ("clip.vision.block_count", 32),
+            ("clip.vision.image_size", 560),
+            ("clip.vision.patch_size", 14),
+            ("clip.vision.n_wa_pattern", 8),
+        ),
+        tensor_qtypes=(("F32", 291), ("F16", 228)),
+        tensor_count=519,
+        parity_test=("TestQwenVLMMProj.test_qwen_tensor_transform_values[qwen2.5vl_merger]"),
+        processor_repository="Qwen/Qwen2.5-VL-3B-Instruct",
+        processor_revision="66285546d2b821cf421d4f5eb2576359d3770cd3",
+        processor_files=(
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+            "chat_template.json",
+        ),
+        processor_class="Qwen2_5_VLProcessor",
+        processor_contract=(
+            ("pixel_values", "float32[total_image_patches,1176]"),
+            ("image_grid_thw", "int64[num_images,3]"),
+            ("pixel_values_videos", "float32[total_video_patches,1176]"),
+            ("video_grid_thw", "int64[num_videos,3]"),
+            ("second_per_grid_ts", "float64[num_videos]"),
+            ("empty_media", "omit image/video pixel, grid, and timing keys"),
+            ("ordering", "batch-major within independent image and video streams"),
+        ),
+    ),
+    MMProjArtifactPin(
+        artifact_id="gemma3-4b-f16",
+        repository="ggml-org/gemma-3-4b-it-GGUF",
+        revision="ab31416aceb30cd095cb34cc27eea120940964e4",
+        filename="mmproj-model-f16.gguf",
+        size=851_251_104,
+        lfs_sha256="8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb",
+        projector_types=("gemma3",),
+        paired_text_architecture="gemma3",
+        paired_text_target="gemma-3-4b-it-Q4_K_M.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1152),
+            ("clip.vision.projection_dim", 2560),
+            ("clip.vision.block_count", 27),
+            ("clip.vision.image_size", 896),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 276), ("F16", 163)),
+        tensor_count=439,
+        parity_test="TestGemma3VisionEncoder.test_projector_matches_numpy_reference",
+        processor_repository="google/gemma-3-4b-it",
+        processor_revision="093f9f388b31de276ce2de164bdc2081324b9767",
+        processor_files=(
+            "chat_template.json",
+            "config.json",
+            "generation_config.json",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer.model",
+            "tokenizer_config.json",
+        ),
+        processor_class="Gemma3Processor",
+        processor_contract=(
+            ("pixel_values", "float32[num_images,3,896,896]"),
+            ("vision_invocation", "split to one image row per vision graph call"),
+            ("image_features", "concatenate 256 rows per image in processor row order"),
+            ("empty_media", "omit pixel_values"),
+            ("ordering", "batch-major image rows"),
+        ),
+    ),
     MMProjArtifactPin(
         artifact_id="gemma4-e2b-f16",
         repository="unsloth/gemma-4-E2B-it-GGUF",

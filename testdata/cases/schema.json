@@ -510,27 +510,27 @@
       },
       "additionalProperties": false
     },
-  "architecture": {
-    "type": "string",
-    "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
-  }
-},
-"$defs": {
-  "ortGenaiCapabilities": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": [
-      "generic_decoder",
-      "state_groups"
-    ],
-    "properties": {
-      "generic_decoder": {
-        "const": true
-      },
-      "state_groups": {
-        "const": false
+    "architecture": {
+      "type": "string",
+      "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
+    }
+  },
+  "$defs": {
+    "ortGenaiCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generic_decoder",
+        "state_groups"
+      ],
+      "properties": {
+        "generic_decoder": {
+          "const": true
+        },
+        "state_groups": {
+          "const": false
+        }
       }
     }
-}
   }
 }

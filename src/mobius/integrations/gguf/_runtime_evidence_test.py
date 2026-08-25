@@ -53,13 +53,13 @@ def _record(payload: bytes) -> GGUFRuntimeEvidence:
 
 
 def _model():
+    tensors = [
+        SimpleNamespace(tensor_type=SimpleNamespace(name="Q4_K")),
+        SimpleNamespace(tensor_type=SimpleNamespace(name="F32")),
+    ]
     return SimpleNamespace(
-        _reader=SimpleNamespace(
-            tensors=[
-                SimpleNamespace(tensor_type=SimpleNamespace(name="Q4_K")),
-                SimpleNamespace(tensor_type=SimpleNamespace(name="F32")),
-            ]
-        )
+        _reader=SimpleNamespace(tensors=tensors),
+        reader_tensors=lambda: tensors,
     )
 
 
@@ -151,6 +151,42 @@ def test_matching_evidence_rejects_source_replaced_after_build(tmp_path, monkeyp
             tokenizer_repository=record.tokenizer_repository,
             tokenizer_revision=record.tokenizer_revision,
         )
+
+
+def test_sharded_artifact_identity_frames_every_shard_and_tensor(tmp_path) -> None:
+    first = tmp_path / "model-00001-of-00002.gguf"
+    second = tmp_path / "model-00002-of-00002.gguf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    tensors = [
+        SimpleNamespace(tensor_type=SimpleNamespace(name="F32")),
+        SimpleNamespace(tensor_type=SimpleNamespace(name="Q4_K")),
+    ]
+    model = SimpleNamespace(
+        shard_paths=[first, second],
+        reader_tensors=lambda: tensors,
+    )
+
+    identity = gguf_artifact_identity(
+        second,
+        model,
+        architecture="llama",
+        filename=first.name,
+    )
+
+    assert identity.filename == first.name
+    assert identity.size == len(b"firstsecond")
+    assert identity.tensor_count == 2
+    assert identity.tensor_qtypes == (("F32", 1), ("Q4_K", 1))
+
+    second.write_bytes(b"change")
+    changed = gguf_artifact_identity(
+        first,
+        model,
+        architecture="llama",
+        filename=first.name,
+    )
+    assert changed.sha256 != identity.sha256
 
 
 def test_evidence_id_cannot_cross_architectures(monkeypatch) -> None:

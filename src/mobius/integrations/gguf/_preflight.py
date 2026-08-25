@@ -110,7 +110,7 @@ class GgufTypeStat:
     (:func:`._repacker.native_block_spec` / :func:`._repacker.repack_quant_params`)
     plus the float passthrough set — never a model-name allowlist:
 
-    * ``passthrough`` — a float block kept as-is (F32/F16/BF16).
+    * ``passthrough`` — a float block kept as-is (F32/F16/BF16/F64).
     * ``native-preserve`` — byte-for-byte ``pkg.nxrt::BlockQuantizedMatMul``.
     * ``repack`` — repacked to ``com.microsoft::MatMulNBits``.
     * ``unsupported`` — no lossless path; a build would have to dequantize to

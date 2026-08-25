@@ -12,7 +12,7 @@ import logging
 import os
 import re
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import tqdm
 
@@ -660,13 +660,13 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             _resolve_gguf_path,
             _validate_gguf_model,
         )
-        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._shard_set import open_gguf_model
         from mobius.integrations.gguf._spec import Support
 
         # Resolve and validate the exact selected source before graph construction
         # so a deferred tokenizer cannot leave a graph-only directory behind.
         resolved_gguf_path = _resolve_gguf_path(gguf_path)
-        gguf_model = GGUFModel(resolved_gguf_path)
+        gguf_model = open_gguf_model(resolved_gguf_path)
         _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
         architecture_spec = get_arch_spec(gguf_model.architecture)
         if architecture_spec.runtime is not Support.SUPPORTED:
@@ -715,27 +715,24 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             ),
             max_workers=args.max_workers,
         )
-    for name in pkg:
-        use_subfolders = len(pkg) > 1
-        if use_subfolders:
-            path = os.path.join(output_dir, name, "model.onnx")
-        else:
-            path = os.path.join(output_dir, "model.onnx")
-        print(f"Saved {name} to {path}")
+        _print_saved_gguf_models(pkg, output_dir)
 
-    # Save the trailing MTP / "nextn" self-speculative head sidecar (when the
-    # GGUF shipped one). ModelPackage.save() persisted it into ``mtp/``.
-    mtp_head = getattr(pkg, "mtp_head", None)
-    if mtp_head is not None:
-        mtp_dir = os.path.join(output_dir, "mtp")
-        print(f"Saved mtp head to {os.path.join(mtp_dir, 'model.onnx')}")
+        # ModelPackage.save() persisted the MTP sidecar into its manifest-selected
+        # collision-safe directory.
+        mtp_head = getattr(pkg, "mtp_head", None)
+        if mtp_head is not None:
+            from mobius._model_package import _read_mtp_sidecar_name
 
-    draft_manifest = getattr(pkg, "draft_manifest", None)
-    if draft_manifest is not None:
-        from mobius.integrations.gguf._draft import write_draft_manifest
+            mtp_dir = _read_mtp_sidecar_name(output_dir)
+            assert mtp_dir is not None
+            print(f"Saved mtp head to {os.path.join(output_dir, mtp_dir, 'model.onnx')}")
 
-        manifest_path = write_draft_manifest(draft_manifest, output_dir)
-        print(f"Saved draft pairing manifest to {manifest_path}")
+        draft_manifest = getattr(pkg, "draft_manifest", None)
+        if draft_manifest is not None:
+            from mobius.integrations.gguf._draft import write_draft_manifest
+
+            manifest_path = write_draft_manifest(draft_manifest, output_dir)
+            print(f"Saved draft pairing manifest to {manifest_path}")
 
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
@@ -755,8 +752,23 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             ),
             max_workers=args.max_workers,
         )
+        # The writer returns only after atomically publishing the complete graph,
+        # tokenizer, and runtime configuration directory.
+        _print_saved_gguf_models(pkg, output_dir)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
+
+
+def _print_saved_gguf_models(pkg: Any, output_dir: str) -> None:
+    """Report model paths only after their containing package is durable."""
+    use_subfolders = len(pkg) > 1
+    for name in pkg:
+        path = (
+            os.path.join(output_dir, name, "model.onnx")
+            if use_subfolders
+            else os.path.join(output_dir, "model.onnx")
+        )
+        print(f"Saved {name} to {path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:

@@ -374,27 +374,9 @@ _WAVTOKENIZER_DEC_REASON = (
 )
 
 _ENCODER_GRAPH_MISMATCH = {
-    "eurobert": (
-        "EuroBERT uses pre-norm RMSNorm, RoPE, bias-free split Q/K/V attention, and a "
-        "parallel SwiGLU FFN. Neither the post-norm BertModel nor ModernBertModel graph "
-        "matches that architecture."
-    ),
-    "jina-bert-v2": (
-        "JinaBERT v2 uses ALiBi, optional full-width Q/K norms, an extra attention norm, "
-        "and either separate or fused GeGLU inputs. Mobius has no graph with that exact "
-        "combination."
-    ),
     "jina-bert-v3": (
         "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
         "BertModel has absolute positions and no MoE path."
-    ),
-    "neo-bert": (
-        "NeoBERT uses pre-norm RMSNorm, RoPE, fused QKV, and fused SwiGLU. The existing "
-        "encoder graphs differ in normalization and projection layout."
-    ),
-    "nomic-bert": (
-        "NomicBERT uses RoPE and a parallel gated FFN with BERT-style post norms. "
-        "BertModel uses absolute positions and a non-gated sequential GELU FFN."
     ),
     "nomic-bert-moe": (
         "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
@@ -921,6 +903,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         # `+1` baked into every *norm.weight must be removed on import.
         tensor_processor="unoffset_norm",
         config_postprocessor="gemma3",
+        vlm_builder="gemma3",
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
@@ -1370,6 +1353,76 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_ENCODER_RUNTIME_VALIDATION_PENDING,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="eurobert",
+        model_type="eurobert",
+        module_type="eurobert_gguf",
+        tensor_map_recipe=("eurobert",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="neo-bert",
+        model_type="neobert",
+        module_type="neo_bert_gguf",
+        tensor_map_recipe=("neo_bert",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _ENCODER_RUNTIME_VALIDATION_PENDING
+            + " Packed QKV and fused SwiGLU have no complete quantized split route; "
+            "use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="nomic-bert",
+        model_type="nomic_bert",
+        module_type="nomic_bert_gguf",
+        tensor_map_recipe=("nomic_bert",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jina-bert-v2",
+        model_type="bert",
+        module_type="jina_bert_v2_gguf",
+        tensor_map_recipe=("jina_bert_v2",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _ENCODER_RUNTIME_VALIDATION_PENDING
+            + " Optional Q/K norms and fused GeGLU inputs have no complete packed "
+            "quantization route; use keep_quantized=False."
+        ),
+    ),
     *(
         GGUFArchitectureSpec(
             gguf_arch=architecture,
@@ -1582,11 +1635,19 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen2vl",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="qwen2_vl_text",
+        tensor_map_recipe=("llama",),
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "rope.dimension_sections",
+        ),
+        vlm_builder="qwen_vl",
         runtime=Support.DEFERRED,
-        reason=_QWEN2VL_GGUF_GRAPH_REASON,
+        reason=(
+            "Text and paired Qwen2/Qwen2.5-VL projector graph import are supported "
+            "for the exact split-QKV llama.cpp artifacts, but downstream multimodal "
+            "runtime execution has not been evidenced."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen3vl",
@@ -1738,10 +1799,114 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     GGUFArchitectureSpec(
         gguf_arch="bloom",
         model_type="bloom",
-        tensor_map=Support.DEFERRED,
+        tensor_map_recipe=("bloom",),
+        tensor_processor="bloom",
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
         runtime=Support.DEFERRED,
         quantized_import=Support.REJECTED,
-        reason=_NO_TENSOR_MAP,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because canonical Bloom GGUF stores "
+            "one fused QKV projection that must be reordered and split into three graph targets."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="codeshell",
+        model_type="kclgpt",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because the pinned loader accepts a "
+            "fused QKV tensor that must be split into separate graph projections."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="command-r",
+        model_type="command_r",
+        tensor_map_recipe=("llama", "command_r_extras"),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon", "logit_scale"),
+        runtime=Support.DEFERRED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Import requires canonical logit_scale metadata and is restricted to split "
+            "Q/K/V tensors in the 40-layer Command-R profile; quantization preservation is "
+            "supported only for that split route. Pinned variants with "
+            "64 or more layers require distinct per-head Q/K LayerNorm parameters that the "
+            "current Attention graph cannot represent."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jais2",
+        model_type="jais2",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="orion",
+        model_type="orion",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Fused QKV input is rejected because its import transform is not implemented. "
+            "Quantization preservation is also rejected for this architecture."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen",
+        model_type="qwen",
+        tensor_map_recipe=("llama", "qwen1_extras"),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because Qwen v1 stores fused QKV "
+            "weights that must be split into separate graph projections."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="starcoder",
+        model_type="gpt_bigcode",
+        tensor_map_recipe=("starcoder",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because StarCoder stores one fused "
+            "biased MQA projection that must be split for the graph."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="xverse",
+        model_type="xverse",
+        tensor_map_recipe=("llama",),
+        tensor_processor="xverse",
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Fused QKV input is rejected because it cannot be combined truthfully with the "
+            "required architecture-specific Q/K row permutations. Quantization preservation "
+            "is also rejected for this architecture."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="t5",
@@ -1828,6 +1993,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             reason=reason,
         )
         for architecture, reason in _FINAL_CENSUS_DEFERRED_REASONS.items()
+        if architecture
+        not in {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
     ),
     GGUFArchitectureSpec(
         gguf_arch="arwkv7",

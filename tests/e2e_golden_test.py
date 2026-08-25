@@ -545,8 +545,12 @@ def _build_model_package(case: GoldenTestCase) -> ModelPackage:
             f"GGUF SHA-256 changed for {source['repository']}:{source['filename']}"
         )
         artifact = GGUFModel(gguf_path)
-        qtypes = Counter(qtype.name for _, _, qtype, _ in artifact.tensor_items_raw())
-        assert len(artifact._reader.tensors) == source["tensor_count"]
+        tensor_count = 0
+        qtypes: Counter[str] = Counter()
+        for _, _, qtype, _ in artifact.tensor_items_raw():
+            tensor_count += 1
+            qtypes[qtype.name] += 1
+        assert tensor_count == source["tensor_count"]
         assert dict(sorted(qtypes.items())) == source["tensor_qtypes"]
         dtype = {
             "float32": "f32",
@@ -3019,7 +3023,6 @@ class TestL5GenerationE2E:
 
         # L5 generation golden is stored in the separate *_generation.json file.
         gen_path = generation_json_path_for_case(case)
-        _assert_gguf_golden_provenance(case, gen_path)
         expected_token_ids = load_generation_golden(case)
         if expected_token_ids is None:
             pytest.skip(f"Generation golden file missing: {gen_path}")

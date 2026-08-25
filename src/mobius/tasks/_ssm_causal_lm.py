@@ -43,6 +43,7 @@ def _build_ssm_task(
         config: Model configuration.
         conv_state_shape: Per-layer conv state shape (excluding batch).
         ssm_state_shape: Per-layer SSM state shape (excluding batch).
+        sequence_length: Fixed Mamba-1 length or symbolic Mamba2 sequence length.
 
     Returns:
         A :class:`ModelPackage` containing the built model.

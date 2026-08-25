@@ -20,6 +20,7 @@ __all__ = [
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
+    "CodeShellCausalLMModel",
     "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
     "CogVideoXVAEConfig",
@@ -52,6 +53,7 @@ __all__ = [
     "GPTNeoXCausalLMModel",
     "GPTNeoXJapaneseCausalLMModel",
     "GPTOSSCausalLMModel",
+    "EuroBertGGUFModel",
     "Gemma2CausalLMModel",
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
@@ -80,6 +82,7 @@ __all__ = [
     "InternVL2Model",
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
+    "JinaBertV2GGUFModel",
     "JetMoeCausalLMModel",
     "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
@@ -89,6 +92,7 @@ __all__ = [
     "LLaDAMoEModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
+    "LegacyLayerNormCausalLMModel",
     "Lfm2CausalLMModel",
     "Lfm2MoECausalLMModel",
     "Lfm2VlForConditionalGeneration",
@@ -113,6 +117,8 @@ __all__ = [
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
+    "NeoBertGGUFModel",
+    "NomicBertGGUFModel",
     "NemotronParseForConditionalGeneration",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
@@ -244,6 +250,12 @@ from mobius.models.gemma4 import (
     Gemma4UnifiedModel,
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
+from mobius.models.gguf_encoders import (
+    EuroBertGGUFModel,
+    JinaBertV2GGUFModel,
+    NeoBertGGUFModel,
+    NomicBertGGUFModel,
+)
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
@@ -263,6 +275,10 @@ from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.kimi_k3 import KimiK3CausalLMModel
 from mobius.models.kimi_linear import KimiLinearCausalLMModel
+from mobius.models.legacy_decoder import (
+    CodeShellCausalLMModel,
+    LegacyLayerNormCausalLMModel,
+)
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model

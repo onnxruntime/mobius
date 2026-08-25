@@ -2327,6 +2327,7 @@ class TestReuseGgufWeights:
     def test_mixed_save_preserves_ranges_and_runs(self, tmp_path: Path):
         from mobius._model_package import ModelPackage
         from mobius.integrations.gguf import (
+            _reuse,
             build_from_gguf,
             verify_gguf_reuse_manifest,
         )
@@ -2334,7 +2335,9 @@ class TestReuseGgufWeights:
         gguf_path = tmp_path / "model.gguf"
         _write_quantized_gguf(gguf_path, projection_quantization="f32")
         package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
-        package.save(str(tmp_path), progress_bar=False)
+        with mock.patch.object(_reuse, "_sha256", wraps=_reuse._sha256) as sha256:
+            package.save(str(tmp_path), progress_bar=False)
+        assert sha256.call_count == 1
 
         verify_gguf_reuse_manifest(tmp_path)
         manifest = json.loads((tmp_path / "gguf-reuse.json").read_text())
@@ -2391,6 +2394,36 @@ class TestReuseGgufWeights:
         )
         reference_outputs = reference_session.run(None, feeds)
         np.testing.assert_allclose(outputs[0], reference_outputs[0], rtol=1e-5, atol=1e-5)
+
+    def test_save_rehashes_source_immediately_before_publish(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        from mobius.integrations.gguf import _reuse, build_from_gguf
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        real_write_json = _reuse._write_json_exclusive
+        mutated = False
+
+        def mutate_source_before_verification(path, payload):
+            nonlocal mutated
+            if path.name.startswith(".gguf-reuse.json.") and path.name.endswith(".tmp"):
+                source = bytearray(gguf_path.read_bytes())
+                source[-1] ^= 1
+                gguf_path.write_bytes(source)
+                mutated = True
+            return real_write_json(path, payload)
+
+        monkeypatch.setattr(_reuse, "_write_json_exclusive", mutate_source_before_verification)
+        with pytest.raises(ValueError, match="source identity mismatch"):
+            package.save(str(tmp_path), progress_bar=False)
+
+        assert mutated
+        assert not (tmp_path / "model.onnx").exists()
+        assert not (tmp_path / "gguf-reuse.json").exists()
 
     def test_native_projection_bytes_are_not_copied_to_sidecar(self, tmp_path: Path):
         from mobius.integrations.gguf import build_from_gguf
@@ -5822,7 +5855,7 @@ class TestPlamo2GGUFBuild:
             ({"invalid_decay": True}, "finite negative"),
             ({"group_count": 1}, "group_count=0"),
             ({"epsilon": 1e-5}, "rms_epsilon=1e-6"),
-            ({"activation": "gelu"}, "fused SwiGLU"),
+            ({"activation": "gelu"}, "'silu' or 'swiglu'"),
             ({"predefined_state": True}, "predefined initial state"),
             ({"head_counts": [4, 4]}, "head_count=4"),
             ({"kv_head_counts": [0]}, "match block_count"),
@@ -5882,7 +5915,7 @@ class TestJambaGGUFBuild:
         package = build_from_gguf(path)
         model = package["model"]
         assert model.metadata_props["mobius.runtime_support"].endswith(
-            "onnxruntime/mobius#605"
+            "onnxruntime/mobius/issues/605"
         )
         assert [value.name for value in model.graph.outputs] == [
             "logits",
@@ -7209,7 +7242,6 @@ class TestGGUFPreflightGuards:
             "llama4",
             "mistral3",
             "paddleocr",
-            "qwen2vl",
             "qwen3vl",
             "qwen3vlmoe",
         ],

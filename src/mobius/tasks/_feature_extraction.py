@@ -55,6 +55,21 @@ class FeatureExtractionTask(ModelTask):
             token_type_ids=token_type_ids,
         )
 
-        builder.add_output(last_hidden_state, "last_hidden_state")
+        builder.add_output(last_hidden_state, self.output_name(config))
 
         return ModelPackage({"model": _make_model(graph)}, config=config)
+
+    def output_name(self, config: BaseModelConfig) -> str:
+        """Return the standard token-level feature output name."""
+        return "last_hidden_state"
+
+
+class GGUFEncoderFeatureExtractionTask(FeatureExtractionTask):
+    """Feature extraction with the GGUF NONE/MEAN/CLS pooling output ABI."""
+
+    def output_name(self, config: BaseModelConfig) -> str:
+        return (
+            "sentence_embedding"
+            if getattr(config, "pooling_type", 0) in {1, 2}
+            else "last_hidden_state"
+        )

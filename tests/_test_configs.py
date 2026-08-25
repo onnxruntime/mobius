@@ -684,6 +684,28 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ("baichuan", {}, False),
     ("codegen2", {}, False),
     ("command_r", {}, False),
+    (
+        "jais2",
+        {
+            "hidden_act": "relu2",
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+        },
+        False,
+    ),
+    (
+        "kclgpt",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    ("xverse", {}, False),
     # === DeepSeek (MLA + MoE) ===
     (
         "deepseek_v3",
@@ -1815,6 +1837,43 @@ ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     ("modernbert", {"hidden_act": "gelu"}, True),
+    (
+        "eurobert_gguf",
+        {"hidden_act": "silu", "rope_type": "default"},
+        True,
+    ),
+    (
+        "neo_bert_gguf",
+        {"hidden_act": "silu", "rope_type": "default"},
+        True,
+    ),
+    (
+        "nomic_bert_gguf",
+        {
+            "hidden_act": "silu",
+            "rope_type": "default",
+            "type_vocab_size": 2,
+            "encoder_use_token_type_embeddings": True,
+        },
+        True,
+    ),
+    (
+        "jina_bert_v2_gguf",
+        {
+            "hidden_act": "gelu",
+            "rope_type": None,
+            "type_vocab_size": 2,
+            "encoder_use_token_type_embeddings": True,
+            "encoder_q_bias": True,
+            "encoder_k_bias": True,
+            "encoder_v_bias": True,
+            "attn_o_bias": True,
+            "encoder_ffn_up_bias": True,
+            "encoder_ffn_down_bias": True,
+            "encoder_fused_geglu": True,
+        },
+        True,
+    ),
     ("lilt", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("markuplm", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
     ("mega", {"hidden_act": "gelu", "type_vocab_size": 2}, False),

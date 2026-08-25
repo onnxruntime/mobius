@@ -171,6 +171,18 @@ _COVERAGE_SKIP: dict[str, str] = {
     "helium": "Alias for mistral — covered by mistral",
     "open-llama": "Alias for llama — covered by llama",
     "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
+    "eurobert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "jina_bert_v2_gguf": "GGUF-only specialized encoder — no native HF model_type route "
+    "for generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT "
+    "parity are covered by _specialized_encoders_test.py.",
+    "neo_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "nomic_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
     "seed_oss": "Internal model — no public HF checkpoint",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
@@ -236,8 +248,19 @@ _COVERAGE_SKIP: dict[str, str] = {
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
     "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
     "glm_moe_dsa": "Very large MoE (~1.5T, zai-org/GLM-5.2) — no small public checkpoint",
+    "jais2": "Jais2's smallest public checkpoint is 8B; L1-L3 graph, config, "
+    "weight-alignment, and synthetic parity are covered, but real-weight L4/L5 "
+    "goldens exceed the CPU CI budget.",
+    "kclgpt": "CodeShell's public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and synthetic weight-path coverage are present, but no "
+    "small public artifact exists for bounded L4/L5 golden generation.",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
+    "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
+    "covered, but no small public artifact exists for bounded L4/L5 validation.",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
+    "xverse": "Xverse's smallest public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and value-based GGUF permutation coverage are present, "
+    "but real-weight L4/L5 goldens exceed the CPU CI budget.",
     # --- Models without test_model_id ---
     "aya_vision": "VL model — no test_model_id yet",
     "chameleon": "VL model — no test_model_id yet",
