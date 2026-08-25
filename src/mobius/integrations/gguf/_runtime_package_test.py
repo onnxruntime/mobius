@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from mobius.integrations.gguf import write_gguf_runtime_package
+from mobius.integrations.gguf import _runtime_package, write_gguf_runtime_package
 from mobius.integrations.gguf._spec import Support
 
 _TOKENIZER_REPOSITORY = "owner/tokenizer"
@@ -105,6 +105,19 @@ def _runtime_supported():
 
 
 class TestWriteGgufRuntimePackage:
+    def test_atomic_publication_refuses_concurrent_destination(self, tmp_path):
+        stage = tmp_path / "stage"
+        stage.mkdir()
+        (stage / "model.onnx").write_bytes(b"staged")
+        output = tmp_path / "output"
+        output.mkdir()
+
+        with pytest.raises(FileExistsError):
+            _runtime_package._publish_directory_no_replace(stage, output)
+
+        assert (stage / "model.onnx").read_bytes() == b"staged"
+        assert not list(output.iterdir())
+
     def test_deferred_architecture_rejects_before_source_read_or_output(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"

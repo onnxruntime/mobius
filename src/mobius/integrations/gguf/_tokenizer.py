@@ -74,6 +74,28 @@ _TOKENIZER_ASSET_NAMES = frozenset(
     }
 )
 _MAX_TOKENIZER_ASSET_BYTES = 64 * 1024 * 1024
+_SMOLLM_PIPELINE = {
+    "normalizer": None,
+    "pre_tokenizer": {
+        "type": "Sequence",
+        "pretokenizers": [
+            {"type": "Digits", "individual_digits": True},
+            {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": True,
+                "use_regex": True,
+            },
+        ],
+    },
+    "post_processor": None,
+    "decoder": {
+        "type": "ByteLevel",
+        "add_prefix_space": True,
+        "trim_offsets": True,
+        "use_regex": True,
+    },
+}
 
 # Audited against the pinned C++ loader. ``tokenizer.huggingface.json`` and
 # ``tokenizer.chat_templates`` are converter/extension fields; llama.cpp does
@@ -792,11 +814,18 @@ def _validate_pinned_tokenizer(
         raise ValueError(
             "Pinned tokenizer merge order differs from GGUF tokenizer.ggml.merges"
         )
-    if (
-        metadata.get("tokenizer.ggml.pre") is not None
-        and tokenizer_json.get("pre_tokenizer") is None
-    ):
-        raise ValueError("Pinned tokenizer omits pre-tokenizer semantics required by GGUF")
+    pre = metadata.get("tokenizer.ggml.pre")
+    expected_pipeline = _SMOLLM_PIPELINE if pre == "smollm" else None
+    if expected_pipeline is None:
+        raise ValueError(
+            f"Pinned tokenizer pipeline validation is not implemented for GGUF pre {pre!r}"
+        )
+    actual_pipeline = {
+        name: tokenizer_json.get(name)
+        for name in ("normalizer", "pre_tokenizer", "post_processor", "decoder")
+    }
+    if actual_pipeline != expected_pipeline:
+        raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
     token_types = metadata.get("tokenizer.ggml.token_type")
     if token_types is not None:
         unsupported_types = sorted(set(token_types) - {1, 2, 3})
@@ -845,7 +874,7 @@ def _validate_pinned_tokenizer(
         if expected is None:
             continue
         if actual is None:
-            if expected is not False or tokenizer_json.get("post_processor") is not None:
+            if expected is not False:
                 raise ValueError(f"Pinned tokenizer cannot prove GGUF {config_name}")
         elif actual is not expected:
             raise ValueError(f"Pinned tokenizer {config_name} differs from GGUF")

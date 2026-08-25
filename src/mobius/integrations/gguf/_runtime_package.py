@@ -16,8 +16,10 @@ so both supported runtimes are reachable from one entry point.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
@@ -37,6 +39,53 @@ from mobius.integrations.gguf._tokenizer import (
 )
 
 __all__ = ["write_gguf_runtime_package"]
+
+
+def _publish_directory_no_replace(stage: Path, destination: Path) -> None:
+    """Atomically publish a directory while refusing an existing destination."""
+    if sys.platform == "linux":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(
+                "Atomic no-replace directory publication requires renameat2 on Linux"
+            )
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            os.fsencode(stage),
+            -100,
+            os.fsencode(destination),
+            1,
+        )
+    elif sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        renamex_np = libc.renamex_np
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(stage), os.fsencode(destination), 0x00000004)
+    elif os.name == "nt":
+        os.rename(stage, destination)
+        return
+    else:
+        raise OSError(
+            f"Atomic no-replace directory publication is unsupported on {sys.platform!r}"
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+
 
 Runtime = Literal["onnx-genai", "ort-genai"]
 
@@ -263,7 +312,7 @@ def write_gguf_runtime_package(
                 f"sha256={evidence.runtime_package_sha256}; "
                 f"got files={runtime_identity.files}, sha256={runtime_identity.sha256}."
             )
-        os.replace(stage, output_dir)
+        _publish_directory_no_replace(stage, output_dir)
         return {
             name: str(output_dir / Path(path).relative_to(stage))
             for name, path in artifacts.items()

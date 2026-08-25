@@ -339,7 +339,26 @@ def test_write_exact_tokenizer_assets_removes_stale_default_template(tmp_path: P
 def _pinned_payloads(metadata: dict) -> dict[str, bytes]:
     tokenizer = json.loads(_tokenizer_json(metadata["tokenizer.ggml.tokens"]))
     tokenizer["model"]["merges"] = metadata["tokenizer.ggml.merges"]
-    tokenizer["pre_tokenizer"] = {"type": "Whitespace"}
+    tokenizer["normalizer"] = None
+    tokenizer["pre_tokenizer"] = {
+        "type": "Sequence",
+        "pretokenizers": [
+            {"type": "Digits", "individual_digits": True},
+            {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": True,
+                "use_regex": True,
+            },
+        ],
+    }
+    tokenizer["post_processor"] = None
+    tokenizer["decoder"] = {
+        "type": "ByteLevel",
+        "add_prefix_space": True,
+        "trim_offsets": True,
+        "use_regex": True,
+    }
     tokenizer["added_tokens"] = [
         {
             "id": index,
@@ -418,7 +437,7 @@ def test_pinned_source_missing_tokenizer_json_rejects() -> None:
 
 
 def test_missing_pinned_hub_asset_leaves_no_output(tmp_path: Path, monkeypatch) -> None:
-    metadata = _metadata()
+    metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)
     source = _pinned_source(metadata, payloads)
     monkeypatch.setattr(
@@ -442,7 +461,7 @@ def test_missing_pinned_hub_asset_leaves_no_output(tmp_path: Path, monkeypatch) 
 def test_tokenizer_evidence_metadata_mismatch_rejects_before_download(
     tmp_path: Path, monkeypatch
 ) -> None:
-    metadata = _metadata()
+    metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)
     source = _pinned_source(metadata, payloads)
     source = GGUFTokenizerSource(
@@ -466,7 +485,7 @@ def test_tokenizer_evidence_metadata_mismatch_rejects_before_download(
 
 
 def test_semantic_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
-    metadata = _metadata()
+    metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)
     config = json.loads(payloads["tokenizer_config.json"])
     config["bos_token"] = "<eos>"
@@ -484,6 +503,52 @@ def test_semantic_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch)
         )
 
     assert not output.exists()
+
+
+def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"]["pretokenizers"].reverse()
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    source = _pinned_source(metadata, payloads)
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+        )
+
+    assert not output.exists()
+
+
+def test_post_processor_cannot_hide_matching_special_token_flags(
+    tmp_path: Path, monkeypatch
+) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["post_processor"] = {
+        "type": "TemplateProcessing",
+        "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}],
+        "pair": [{"Sequence": {"id": "A", "type_id": 0}}],
+        "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}},
+    }
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    source = _pinned_source(metadata, payloads)
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            tmp_path / "output",
+            source=source,
+            metadata=metadata,
+        )
 
 
 def test_cross_host_asset_request_strips_auth_and_rejects_redirect(monkeypatch) -> None:
