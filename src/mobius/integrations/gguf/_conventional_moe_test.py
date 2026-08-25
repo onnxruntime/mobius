@@ -123,9 +123,7 @@ def _fixture(
 
 @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
 @pytest.mark.parametrize("fused_qkv", [False, True])
-def test_conventional_moe_exact_tensor_closure(
-    architecture: str, fused_qkv: bool
-) -> None:
+def test_conventional_moe_exact_tensor_closure(architecture: str, fused_qkv: bool) -> None:
     dense_prefix = 0 if architecture == "bailingmoe" else 1
     model = _fixture(architecture, dense_prefix=dense_prefix, fused_qkv=fused_qkv)
 
