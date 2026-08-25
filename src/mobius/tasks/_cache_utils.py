@@ -414,10 +414,17 @@ def _register_linear_attention_functions(
     layer_types = getattr(config, "layer_types", None) or []
     has_deltanet = "linear_attention" in layer_types
     has_lightning = "lightning_attention" in layer_types
+    has_mamba = "mamba" in layer_types
     has_mamba2 = "mamba2" in layer_types or isinstance(config, FalconH1Config)
     has_short_conv = "conv" in layer_types
 
-    if not has_deltanet and not has_lightning and not has_mamba2 and not has_short_conv:
+    if (
+        not has_deltanet
+        and not has_lightning
+        and not has_mamba
+        and not has_mamba2
+        and not has_short_conv
+    ):
         return
 
     from mobius.functions import (
@@ -453,6 +460,24 @@ def _register_linear_attention_functions(
             stash_type=config.dtype,
         )
         model.functions[attn_func_gated.identifier()] = attn_func_gated
+
+    if has_mamba:
+        d_inner = config.hidden_size * getattr(config, "mamba_expand", 2)
+        conv_func = causal_conv_nd_with_state(
+            kernel_size=getattr(config, "mamba_d_conv", 4),
+            channels=d_inner,
+            ndim=1,
+            activation="silu",
+        )
+        attn_func = linear_attention(
+            q_num_heads=d_inner,
+            kv_num_heads=d_inner,
+            update_rule="gated",
+            scale=1.0,
+            stash_type=ir.DataType.FLOAT,
+        )
+        model.functions[conv_func.identifier()] = conv_func
+        model.functions[attn_func.identifier()] = attn_func
 
     if has_mamba2:
         mamba2_n_heads = getattr(config, "mamba_n_heads", 0)

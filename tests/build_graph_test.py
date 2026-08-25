@@ -5801,10 +5801,8 @@ class TestBuildJambaGraph:
             expert_layer_offset=1,
             num_local_experts=2,
             num_experts_per_tok=1,
-            # Jamba's attention layers use standard RoPE; enable it
-            # explicitly since ArchitectureConfig defaults ``rope_type`` to
-            # ``None`` (NoPE) to express "no RoPE" structurally.
-            rope_type="default",
+            # Jamba attention is positional-encoding-free.
+            rope_type=None,
         )
 
     def test_jamba_builds(self):
@@ -5865,6 +5863,85 @@ class TestBuildJambaGraph:
         model_cls = registry.get("jamba")
         assert model_cls.__name__ == "JambaCausalLMModel"
 
+    def test_jamba_transformers_config_uses_exact_schedules(self):
+        """Transformers periods resolve without duplicate inherited fields."""
+        from transformers import JambaConfig as HFJambaConfig
+
+        from mobius._configs import JambaConfig
+
+        config = JambaConfig.from_transformers(
+            HFJambaConfig(
+                vocab_size=TINY_VOCAB,
+                hidden_size=TINY_HIDDEN,
+                intermediate_size=TINY_INTERMEDIATE,
+                num_hidden_layers=4,
+                num_attention_heads=TINY_HEADS,
+                num_key_value_heads=TINY_KV_HEADS,
+                attn_layer_period=2,
+                attn_layer_offset=1,
+                expert_layer_period=2,
+                expert_layer_offset=1,
+                num_experts=2,
+                num_experts_per_tok=1,
+                mamba_d_state=8,
+                mamba_d_conv=4,
+                mamba_expand=2,
+                mamba_dt_rank="auto",
+            )
+        )
+        assert config.layer_types == [
+            "mamba",
+            "full_attention",
+            "mamba",
+            "full_attention",
+        ]
+        assert config.expert_layer_indices == [1, 3]
+        assert config.mamba_dt_rank == (TINY_HIDDEN + 15) // 16
+        assert config.rope_type is None
+        assert config.norm_topk_prob is False
+
+    def test_jamba_router_softmaxes_in_float32(self):
+        """Jamba routes with a full-expert float32 softmax before top-k."""
+        import dataclasses
+
+        import onnx_ir as ir
+
+        from mobius._builder import build_from_module
+        from mobius.models.jamba import JambaCausalLMModel
+        from mobius.tasks import HybridCausalLMTask
+
+        config = dataclasses.replace(self._jamba_config(), dtype=ir.DataType.FLOAT16)
+        model = build_from_module(
+            JambaCausalLMModel(config),
+            config,
+            task=HybridCausalLMTask(),
+        )["model"]
+        softmaxes = [node for node in model.graph if node.op_type == "Softmax"]
+        assert softmaxes
+        for softmax in softmaxes:
+            assert softmax.inputs[0].producer().op_type == "Cast"
+
+    def test_jamba_low_precision_state_matches_model_dtype(self):
+        """The public recurrent ABI matches Transformers cache storage dtype."""
+        import dataclasses
+
+        import onnx_ir as ir
+
+        from mobius._builder import build_from_module
+        from mobius.models.jamba import JambaCausalLMModel
+        from mobius.tasks import HybridCausalLMTask
+
+        config = dataclasses.replace(self._jamba_config(), dtype=ir.DataType.FLOAT16)
+        model = build_from_module(
+            JambaCausalLMModel(config),
+            config,
+            task=HybridCausalLMTask(),
+        )["model"]
+        inputs = {value.name: value for value in model.graph.inputs}
+        outputs = {value.name: value for value in model.graph.outputs}
+        assert inputs["past_key_values.0.ssm_state"].dtype == ir.DataType.FLOAT16
+        assert outputs["present.0.ssm_state"].dtype == ir.DataType.FLOAT16
+
     def test_jamba_preprocess_weights_moe_renames(self):
         """Verify MoE expert weight renames and SSM nesting."""
         import torch
@@ -5895,6 +5972,42 @@ class TestBuildJambaGraph:
         assert "model.layers.1.feed_forward.gate.weight" in result
         # Non-SSM stays flat
         assert "model.layers.0.mamba.in_proj.weight" in result
+
+    def test_jamba_preprocesses_fused_experts_in_numeric_order(self):
+        """Current Transformers stacks every expert in one fused parameter."""
+        import torch
+
+        from mobius.models.jamba import JambaCausalLMModel
+
+        module = JambaCausalLMModel(self._jamba_config())
+        gate_up = torch.stack(
+            [
+                torch.full((2 * TINY_INTERMEDIATE, TINY_HIDDEN), expert + 1.0)
+                for expert in range(2)
+            ]
+        )
+        down = torch.stack(
+            [torch.full((TINY_HIDDEN, TINY_INTERMEDIATE), expert + 3.0) for expert in range(2)]
+        )
+        result = module.preprocess_weights(
+            {
+                "model.layers.1.feed_forward.experts.gate_up_proj.weight": gate_up,
+                "model.layers.1.feed_forward.experts.down_proj.weight": down,
+            }
+        )
+        for expert in range(2):
+            torch.testing.assert_close(
+                result[f"model.layers.1.feed_forward.experts.{expert}.gate_proj.weight"],
+                torch.full((TINY_INTERMEDIATE, TINY_HIDDEN), expert + 1.0),
+            )
+            torch.testing.assert_close(
+                result[f"model.layers.1.feed_forward.experts.{expert}.up_proj.weight"],
+                torch.full((TINY_INTERMEDIATE, TINY_HIDDEN), expert + 1.0),
+            )
+            torch.testing.assert_close(
+                result[f"model.layers.1.feed_forward.experts.{expert}.down_proj.weight"],
+                torch.full((TINY_HIDDEN, TINY_INTERMEDIATE), expert + 3.0),
+            )
 
 
 # ===========================================================================

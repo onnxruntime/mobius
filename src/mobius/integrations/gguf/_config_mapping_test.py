@@ -107,7 +107,11 @@ class TestSecondHybridCohortConfig:
             _FakeDenseGGUF(
                 "jamba",
                 self._metadata("jamba"),
-                ["token_embd.weight", "output.weight"],
+                [
+                    "token_embd.weight",
+                    "output.weight",
+                    "blk.0.ssm_conv1d.bias",
+                ],
             )
         )
         assert config.rope_type is None
@@ -141,7 +145,7 @@ class TestSecondHybridCohortConfig:
         with pytest.raises(ValueError, match=r"exactly 3|each contain exactly 3"):
             gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
 
-    @pytest.mark.parametrize("architecture", ["jamba", "nemotron_h", "granitehybrid"])
+    @pytest.mark.parametrize("architecture", ["nemotron_h", "granitehybrid"])
     def test_moe_modes_fail_closed(self, architecture: str) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 
@@ -150,6 +154,30 @@ class TestSecondHybridCohortConfig:
         metadata[f"{architecture}.expert_used_count"] = 2
         with pytest.raises(ValueError, match="MoE"):
             gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+
+    def test_jamba_derives_exact_routed_layer_schedule(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("jamba")
+        metadata["jamba.expert_count"] = 4
+        metadata["jamba.expert_used_count"] = 2
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "jamba",
+                metadata,
+                [
+                    "token_embd.weight",
+                    "blk.2.ffn_gate_inp.weight",
+                    "blk.2.ffn_gate_exps.weight",
+                    "blk.2.ffn_up_exps.weight",
+                    "blk.2.ffn_down_exps.weight",
+                ],
+            )
+        )
+        assert config.expert_layer_indices == [2]
+        assert config.num_local_experts == 4
+        assert config.num_experts_per_tok == 2
+        assert config.norm_topk_prob is False
 
 
 def _diffusion_names(architecture: str, *, output: bool = True) -> list[str]:

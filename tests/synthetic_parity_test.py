@@ -1185,12 +1185,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         _fill_random_weights(onnx_model, rng)
 
     # 5. Prepare inputs
-    # Mamba1 (layer_type="mamba") only supports single-token decode (seq_len=1)
-    # because SelectiveScan uses a sequential recurrence that squeezes the seq
-    # dimension.  Mamba2 and attention layers handle arbitrary seq_len.
-    layer_types = getattr(config, "layer_types", None) or []
-    has_mamba1 = "mamba" in layer_types
-    prefill_seq_len = 1 if has_mamba1 else 3
+    # Exercise multi-token prefill for both recurrent and attention architectures.
+    prefill_seq_len = 3
     input_ids = rng.integers(1, config.vocab_size, size=(1, prefill_seq_len)).astype(np.int64)
     attention_mask = np.ones_like(input_ids)
     position_ids = np.arange(input_ids.shape[1], dtype=np.int64)[np.newaxis, :]

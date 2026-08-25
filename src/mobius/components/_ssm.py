@@ -188,6 +188,60 @@ class JambaSelectiveScan(SelectiveScan):
         c_mat = self.c_layernorm(op, c_mat)
         return dt_raw, b_mat, c_mat
 
+    def _repeat_for_channels(self, op: OpBuilder, value: ir.Value) -> ir.Value:
+        # Jamba Mamba-1 shares token-dependent B/C across all expanded channels.
+        value = op.Unsqueeze(value, [2])  # (B, T, 1, d_state)
+        value = op.Tile(value, [1, 1, self.d_inner, 1])
+        return op.Reshape(value, [0, 0, self.d_inner * self.d_state])
+
+    def forward(
+        self,
+        op: OpBuilder,
+        x: ir.Value,
+        ssm_state: ir.Value,
+        padding_mask: ir.Value | None = None,
+    ):
+        """Run the complete multi-token Jamba selective scan."""
+        dt_raw, b_mat, c_mat = self._project_ssm_params(op, self.x_proj(op, x))
+        dt = op.Softplus(op.Cast(self.dt_proj(op, dt_raw), to=ir.DataType.FLOAT))
+        del padding_mask
+
+        x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
+        decay = op.Mul(
+            op.Unsqueeze(dt, [-1]),
+            op.Unsqueeze(
+                op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT))),
+                [0, 1],
+            ),
+        )
+        decay = op.Reshape(decay, [0, 0, self.d_inner * self.d_state])
+        value = op.Mul(dt, x_f32)
+        internal_state = op.Unsqueeze(
+            op.Cast(ssm_state, to=ir.DataType.FLOAT),
+            [-1],
+        )
+        output, present_state = op.LinearAttention(
+            self._repeat_for_channels(op, op.Cast(c_mat, to=ir.DataType.FLOAT)),
+            self._repeat_for_channels(op, op.Cast(b_mat, to=ir.DataType.FLOAT)),
+            value,
+            internal_state,
+            decay,
+            scale=1.0,
+            q_num_heads=self.d_inner,
+            kv_num_heads=self.d_inner,
+            update_rule="gated",
+            _domain="com.microsoft",
+            _outputs=2,
+        )
+        output = op.Add(
+            output,
+            op.Mul(x_f32, op.Cast(self.D, to=ir.DataType.FLOAT)),
+        )
+        return (
+            op.CastLike(output, x),
+            op.CastLike(op.Squeeze(present_state, [-1]), ssm_state),
+        )
+
 
 class Mamba2Scan(nn.Module):
     """Multi-head selective scan for Mamba2/SSD architecture.

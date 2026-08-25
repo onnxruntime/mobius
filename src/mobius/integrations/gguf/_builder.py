@@ -1715,13 +1715,21 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
     optional_by_type: dict[str, set[str]]
     common: set[str]
     if architecture == "jamba":
-        common = {
-            "attn_norm.weight",
-            "ffn_norm.weight",
-            "ffn_gate.weight",
-            "ffn_up.weight",
-            "ffn_down.weight",
-        }
+        common = {"attn_norm.weight", "ffn_norm.weight"}
+        num_experts = int(metadata.get("jamba.expert_count", 0))
+        top_k = int(metadata.get("jamba.expert_used_count", 0))
+        if bool(num_experts) != bool(top_k):
+            raise ValueError(
+                "Jamba expert_count and expert_used_count must both be zero or both positive"
+            )
+        if num_experts and not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"Jamba expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        if num_experts == 1:
+            raise ValueError(
+                "Jamba expert_count=1 is not a routed-MoE layout; use dense FFN tensors"
+            )
         required_by_type = {
             "mamba": {
                 "ssm_in.weight",
@@ -1865,7 +1873,34 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
     for index, layer_type in enumerate(layer_types):
         prefix = f"blk.{index}."
         required = common | required_by_type[layer_type]
-        optional = optional_by_type[layer_type]
+        optional = set(optional_by_type[layer_type])
+        if architecture == "jamba":
+            has_router = f"{prefix}ffn_gate_inp.weight" in actual
+            dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+            moe_ffn = {
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            }
+            if has_router:
+                if not num_experts:
+                    raise ValueError(
+                        f"Jamba layer {index} has routed experts without expert metadata"
+                    )
+                required |= moe_ffn
+                optional |= {
+                    suffix
+                    for stem in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")
+                    for suffix in (f"{stem}.scale", f"{stem}.input_scale")
+                }
+            else:
+                required |= dense_ffn
+                optional |= {
+                    suffix
+                    for stem in ("ffn_gate", "ffn_up", "ffn_down")
+                    for suffix in (f"{stem}.scale", f"{stem}.input_scale")
+                }
         expected.update(prefix + suffix for suffix in required)
         allowed.update(prefix + suffix for suffix in required | optional)
 
@@ -1881,6 +1916,117 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
             f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
             f"unexpected={unexpected}, out_of_range={out_of_range}"
         )
+
+    if architecture != "jamba" or not hasattr(gguf_model, "tensor_items_raw"):
+        return
+
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    hidden = int(metadata["jamba.embedding_length"])
+    intermediate = int(metadata["jamba.feed_forward_length"])
+    vocab = int(metadata.get("jamba.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    raw_head_counts = metadata["jamba.attention.head_count"]
+    head_counts = (
+        [int(value) for value in raw_head_counts]
+        if isinstance(raw_head_counts, (list, tuple))
+        else [int(raw_head_counts)]
+    )
+    positive_head_counts = {value for value in head_counts if value > 0}
+    if len(positive_head_counts) != 1:
+        raise ValueError("Jamba GGUF attention layers must use one consistent head count")
+    heads = positive_head_counts.pop()
+    if hidden <= 0 or intermediate <= 0 or vocab <= 0 or hidden % heads:
+        raise ValueError(
+            "Jamba GGUF has inconsistent embedding, FFN, vocabulary, or head geometry"
+        )
+    head_dim = hidden // heads
+    state = int(metadata["jamba.ssm.state_size"])
+    inner = int(metadata["jamba.ssm.inner_size"])
+    rank = int(metadata["jamba.ssm.time_step_rank"])
+    conv = int(metadata["jamba.ssm.conv_kernel"])
+    if inner != 2 * hidden or min(state, rank, conv) <= 0:
+        raise ValueError("Jamba GGUF has inconsistent Mamba-1 geometry")
+
+    expected_shapes: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    if "output.weight" in actual:
+        expected_shapes["output.weight"] = (vocab, hidden)
+    for index, layer_type in enumerate(layer_types):
+        prefix = f"blk.{index}."
+        expected_shapes[prefix + "attn_norm.weight"] = (hidden,)
+        expected_shapes[prefix + "ffn_norm.weight"] = (hidden,)
+        if layer_type == "mamba":
+            expected_shapes.update(
+                {
+                    prefix + "ssm_in.weight": (2 * inner, hidden),
+                    prefix + "ssm_conv1d.weight": (inner, conv),
+                    prefix + "ssm_conv1d.bias": (inner,),
+                    prefix + "ssm_x.weight": (rank + 2 * state, inner),
+                    prefix + "ssm_dt_norm.weight": (rank,),
+                    prefix + "ssm_dt.weight": (inner, rank),
+                    prefix + "ssm_dt.bias": (inner,),
+                    prefix + "ssm_b_norm.weight": (state,),
+                    prefix + "ssm_c_norm.weight": (state,),
+                    prefix + "ssm_a": (inner, state),
+                    prefix + "ssm_d": (inner,),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+        else:
+            kv_heads = int(metadata["jamba.attention.head_count_kv"][index])
+            if kv_heads <= 0 or heads % kv_heads:
+                raise ValueError(f"Jamba attention layer {index} has invalid KV head count")
+            kv_width = kv_heads * head_dim
+            expected_shapes.update(
+                {
+                    prefix + "attn_q.weight": (hidden, hidden),
+                    prefix + "attn_k.weight": (kv_width, hidden),
+                    prefix + "attn_v.weight": (kv_width, hidden),
+                    prefix + "attn_output.weight": (hidden, hidden),
+                }
+            )
+        if prefix + "ffn_gate_inp.weight" in actual:
+            expected_shapes.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (num_experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        num_experts,
+                        intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        num_experts,
+                        intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        num_experts,
+                        hidden,
+                        intermediate,
+                    ),
+                }
+            )
+        else:
+            expected_shapes.update(
+                {
+                    prefix + "ffn_gate.weight": (intermediate, hidden),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+    malformed = sorted(
+        f"{name}: expected {expected_shape}, got {shapes[name]}"
+        for name, expected_shape in expected_shapes.items()
+        if name in shapes and shapes[name] != expected_shape
+    )
+    if malformed:
+        raise ValueError(f"Invalid Jamba GGUF tensor shape(s): {malformed}")
 
 
 def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:

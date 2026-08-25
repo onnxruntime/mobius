@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 3, 'supported': 56}; importable: 54; quantized import: {'rejected': 12, 'supported': 135}; runtime: {'deferred': 144, 'rejected': 3} |
+| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 3, 'supported': 56}; importable: 54; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 3} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become exact-copy only with a validated embedded `tokenizer.huggingface.json` |
@@ -411,7 +411,7 @@ before graph construction or durable output.
 | `internlm2` | — | model=`internlm2`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
 | `jais` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JAIS combines fused biased QKV, causal ALiBi, 1/head_dim attention scaling, parallel SwiGLU, and converter-baked MuP embedding/output scales. Reusing Falcon or Llama would lose required value transforms. |
 | `jais2` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JAIS2 is a distinct RoPE, bias-bearing LayerNorm decoder with split Q/K/V and a non-gated ReLU-squared FFN. It is not the ALiBi/SwiGLU JAIS graph and has no exact Mobius tensor recipe. |
-| `jamba` | — | model=`jamba`; tensor=`jamba` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
+| `jamba` | — | model=`jamba`; tensor=`jamba` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Exact mixed attention/Mamba and dense/routed-MoE schedules, strict tensor closure and shapes, GGUF value transforms, compatible projection quantization, value-checked expert ordering, reduced Transformers parity, and multi-token ORT state threading, reorder, and replay are covered. Generic ORT GenAI runtime packaging remains deferred because its released cache schema cannot represent heterogeneous KV, convolution, and recurrent state slots; tracked by #605. |
 | `jina-bert-v2` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JinaBERT v2 uses ALiBi, optional full-width Q/K norms, an extra attention norm, and either separate or fused GeGLU inputs. Mobius has no graph with that exact combination. |
 | `jina-bert-v3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. BertModel has absolute positions and no MoE path. |
 | `kimi-k3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Kimi-K3 alternates KDA recurrent and NoPE MLA layers and requires convolution plus matrix state, sigmoid routed latent MoE with SiTU experts, optional shared experts, and cross-layer residual banks. Kimi-Linear is not an alias: its gates, expert activation, latent projections, and residual contract differ. Mobius has no exact graph or mixed-state task for either ABI. |
@@ -559,19 +559,26 @@ independent full-logit and generation parity.
 ### Second hybrid cohort
 
 `jamba`, `nemotron_h`, and `granitehybrid` have graph-import support for exact
-dense subsets only; runtime packaging remains deferred pending independent
+pinned subsets. Jamba includes routed MoE layers; Nemotron-H and GraniteHybrid
+remain dense-only. Runtime packaging remains deferred pending independent
 real-artifact full-logit and stateful-generation parity.
 
 - Schedules come from suffix-exact per-layer metadata. Jamba and GraniteHybrid
   use `attention.head_count_kv` (`0` selects Mamba/Mamba2). Nemotron-H combines
   that array with per-layer `feed_forward_length` to select exactly one of
   Mamba2, attention, or dense ReLU² MLP.
-- Jamba requires `ssm.inner_size == 2 * embedding_length`. Nemotron-H rejects
-  MTP and all MoE files. GraniteHybrid rejects routed-MoE files until 3-D expert
-  fusion, ordering, and quantized preservation have independent value tests.
+- Jamba requires `ssm.inner_size == 2 * embedding_length`, SiLU experts,
+  Mamba-1 with biased depthwise convolution and bias-free projections, and
+  softmax-first top-k routing without post-top-k renormalization. Routed layers
+  are inferred exactly from `ffn_gate_inp`; stacked expert tensors are split in
+  numeric order. There are no shared experts. Nemotron-H rejects MTP and all MoE
+  files. GraniteHybrid rejects routed-MoE files until 3-D expert fusion,
+  ordering, and quantized preservation have independent value tests.
 - Every layer must provide exactly its pinned loader tensor family. Missing,
   wrong-mixer, partial, auxiliary, scale/input-scale, and out-of-range tensors
-  are rejected before graph construction. GGUF Mamba decay values are inverted
+  are rejected before graph construction. Compatible attention, dense-FFN, and
+  expert MatMul weights may remain quantized; Mamba and other state-sensitive
+  tensors are dequantized. GGUF Mamba decay values are inverted
   from `-exp(A_log)`; convolution and grouped Mamba2 tensors are restored to
   graph shapes.
 - State inputs and outputs are caller-owned. Mamba1 uses conv
