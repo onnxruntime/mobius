@@ -921,6 +921,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         # `+1` baked into every *norm.weight must be removed on import.
         tensor_processor="unoffset_norm",
         config_postprocessor="gemma3",
+        vlm_builder="gemma3",
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
@@ -1582,11 +1583,19 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen2vl",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="qwen2_vl_text",
+        tensor_map_recipe=("llama",),
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "rope.dimension_sections",
+        ),
+        vlm_builder="qwen_vl",
         runtime=Support.DEFERRED,
-        reason=_QWEN2VL_GGUF_GRAPH_REASON,
+        reason=(
+            "Text and paired Qwen2/Qwen2.5-VL projector graph import are supported "
+            "for the exact split-QKV llama.cpp artifacts, but downstream multimodal "
+            "runtime execution has not been evidenced."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen3vl",

@@ -407,8 +407,8 @@ def _register_linear_attention_functions(
     """Register CausalConvWithState and LinearAttention functions.
 
     Registers functions for DeltaNet (``linear_attention`` layers),
-    Lightning Attention (``lightning_attention`` layers), and/or
-    Mamba2 (``mamba2`` layers) as needed.
+    Lightning Attention (``lightning_attention`` layers), Mamba-1
+    (``mamba`` layers), and/or Mamba2 (``mamba2`` layers) as needed.
     Adds the ``com.microsoft`` opset import to the graph.
     """
     layer_types = getattr(config, "layer_types", None) or []

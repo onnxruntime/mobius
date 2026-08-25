@@ -129,7 +129,9 @@ class TestWriteGgufRuntimePackage:
                     reason="independent parity is missing",
                 ),
             ),
-            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model"
+            ) as read_source,
             pytest.raises(ValueError, match=r"runtime packaging.*deferred"),
         ):
             _write_runtime(pkg, tmp_path / "m.gguf", out)
@@ -141,8 +143,12 @@ class TestWriteGgufRuntimePackage:
         out = tmp_path / "out"
         with (
             mock.patch(
-                "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}, architecture="llama"),
+                "mobius.integrations.gguf._runtime_package.open_gguf_model",
+                return_value=SimpleNamespace(
+                    metadata={},
+                    architecture="llama",
+                    source_matches_path=lambda: True,
+                ),
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
@@ -164,11 +170,41 @@ class TestWriteGgufRuntimePackage:
         assert Path(artifacts["inference_metadata"]) == out / "inference_metadata.yaml"
         assert not list(tmp_path.glob(".out.*.tmp"))
 
+    def test_failure_after_graph_save_removes_staging_and_publishes_nothing(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model",
+                return_value=SimpleNamespace(
+                    metadata={},
+                    architecture="llama",
+                    source_matches_path=lambda: True,
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
+                return_value=_materialized(),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.materialize_gguf_tokenizer",
+                side_effect=OSError("tokenizer asset write failed"),
+            ),
+            pytest.raises(OSError, match="tokenizer asset write failed"),
+        ):
+            _write_runtime(pkg, tmp_path / "m.gguf", out)
+
+        assert pkg.saved_to is not None
+        assert not out.exists()
+        assert not list(tmp_path.glob(".out.*.tmp"))
+
     def test_missing_pinned_tokenizer_source_rejects_before_save_or_output(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"
         with (
-            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model"
+            ) as read_source,
             pytest.raises(ValueError, match="explicit tokenizer_repository"),
         ):
             write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out)
@@ -181,8 +217,12 @@ class TestWriteGgufRuntimePackage:
         out = tmp_path / "out"
         with (
             mock.patch(
-                "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}, architecture="llama"),
+                "mobius.integrations.gguf._runtime_package.open_gguf_model",
+                return_value=SimpleNamespace(
+                    metadata={},
+                    architecture="llama",
+                    source_matches_path=lambda: True,
+                ),
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
@@ -205,7 +245,9 @@ class TestWriteGgufRuntimePackage:
         sentinel = out / "sentinel.bin"
         sentinel.write_bytes(b"unchanged")
         with (
-            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model"
+            ) as read_source,
             pytest.raises(FileExistsError, match="non-atomic directory replacement"),
         ):
             _write_runtime(pkg, tmp_path / "m.gguf", out)
@@ -246,7 +288,9 @@ class TestWriteGgufRuntimePackage:
         pkg.mtp_head = SimpleNamespace(config=object())
         out = tmp_path / "out"
         with (
-            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model"
+            ) as read_source,
             pytest.raises(ValueError, match="runtime-evidenced GGUF MTP"),
         ):
             _write_runtime(pkg, tmp_path / "m.gguf", out, runtime=runtime)
@@ -261,7 +305,9 @@ class TestWriteGgufRuntimePackage:
 
     def test_save_model_false_is_rejected_before_source_read(self, tmp_path):
         with (
-            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model"
+            ) as read_source,
             pytest.raises(ValueError, match="save_model=False is not supported"),
         ):
             write_gguf_runtime_package(

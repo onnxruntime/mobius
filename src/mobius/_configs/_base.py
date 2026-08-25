@@ -3045,8 +3045,10 @@ class FalconH1Config(ArchitectureConfig):
     ssm_out_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
-        self.attn_qkv_bias = self.attention_bias
-        self.attn_o_bias = self.attention_bias
+        # Architecture-specific fields win when enabled; attention_bias remains
+        # the Hugging Face compatibility fallback for callers that only expose it.
+        self.attn_qkv_bias = self.attn_qkv_bias or self.attention_bias
+        self.attn_o_bias = self.attn_o_bias or self.attention_bias
         if self.hidden_act != "silu":
             raise ValueError("Falcon-H1 supports only hidden_act='silu'")
         if (

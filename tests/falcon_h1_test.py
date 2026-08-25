@@ -92,6 +92,30 @@ def test_falcon_h1_transformers_config_extracts_exact_controls() -> None:
     assert config.ssm_multipliers == (0.5, 0.75, 1.0, 1.25, 1.5)
 
 
+def test_falcon_h1_explicit_projection_biases_override_global_fallback() -> None:
+    config = _base_config(
+        **(
+            _tiny_overrides()
+            | {"attention_bias": False, "attn_qkv_bias": True, "attn_o_bias": True}
+        )
+    )
+    assert isinstance(config, FalconH1Config)
+    assert config.attn_qkv_bias is True
+    assert config.attn_o_bias is True
+
+
+def test_falcon_h1_global_attention_bias_remains_a_compatibility_fallback() -> None:
+    config = _base_config(
+        **(
+            _tiny_overrides()
+            | {"attention_bias": True, "attn_qkv_bias": False, "attn_o_bias": False}
+        )
+    )
+    assert isinstance(config, FalconH1Config)
+    assert config.attn_qkv_bias is True
+    assert config.attn_o_bias is True
+
+
 def test_falcon_h1_prefill_decode_logits_and_four_states_match_transformers() -> None:
     overrides = _tiny_overrides()
     config = _base_config(**overrides)

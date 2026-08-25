@@ -875,13 +875,17 @@ def gguf_to_config(
             "beta_slow": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_slow", 1.0),
         }
 
-    if canonical_arch in {"qwen35", "qwen35moe"}:
+    if canonical_arch in {"qwen2vl", "qwen35", "qwen35moe"}:
         mrope_section = metadata[f"{gguf_arch}.rope.dimension_sections"]
         if not isinstance(mrope_section, (list, tuple, np.ndarray)) or len(mrope_section) != 4:
             raise ValueError(
                 f"{gguf_arch}.rope.dimension_sections must contain exactly four entries"
             )
         mrope_section = [int(value) for value in mrope_section]
+        if canonical_arch == "qwen2vl":
+            if mrope_section[-1] != 0:
+                raise ValueError("qwen2vl.rope.dimension_sections reserved entry must be zero")
+            mrope_section = mrope_section[:3]
     else:
         mrope_section = None
 
@@ -2432,6 +2436,41 @@ def _falcon_h1_postprocess(
     return result
 
 
+def _infer_plamo2_attention_widths(
+    model: Any,
+    head_counts: tuple[int, ...],
+    kv_head_counts: tuple[int, ...],
+) -> tuple[int, int]:
+    """Infer PLaMo2 key/value widths from every attention layer's tensors."""
+    inferred: set[tuple[int, int]] = set()
+    tensor_names = set(model.tensor_names)
+    for layer, (q_heads, kv_heads) in enumerate(zip(head_counts, kv_head_counts)):
+        if kv_heads == 0:
+            continue
+        qkv_name = f"blk.{layer}.attn_qkv.weight"
+        output_name = f"blk.{layer}.attn_output.weight"
+        if qkv_name not in tensor_names or output_name not in tensor_names:
+            raise ValueError(
+                f"PLaMo2 layer {layer} is missing attention tensors required "
+                "to infer key/value widths"
+            )
+        qkv_shape = model.get_tensor_shape(qkv_name)
+        output_shape = model.get_tensor_shape(output_name)
+        value_width, value_remainder = divmod(int(output_shape[1]), q_heads)
+        key_width, key_remainder = divmod(
+            int(qkv_shape[0]) - kv_heads * value_width,
+            q_heads + kv_heads,
+        )
+        if value_remainder or key_remainder or min(key_width, value_width) <= 0:
+            raise ValueError(
+                f"PLaMo2 layer {layer} key/value widths cannot be inferred exactly"
+            )
+        inferred.add((key_width, value_width))
+    if len(inferred) != 1:
+        raise ValueError("PLaMo2 attention tensor widths are missing or contradictory")
+    return inferred.pop()
+
+
 def _plamo2_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2454,26 +2493,12 @@ def _plamo2_postprocess(
 
     key_length = metadata.get(f"{arch}.attention.key_length")
     value_length = metadata.get(f"{arch}.attention.value_length")
-    inferred: set[tuple[int, int]] = set()
     if model is not None:
-        for layer, kv_heads in enumerate(kv_head_counts):
-            if kv_heads == 0:
-                continue
-            q_heads = head_counts[layer]
-            qkv_shape = model.get_tensor_shape(f"blk.{layer}.attn_qkv.weight")
-            output_shape = model.get_tensor_shape(f"blk.{layer}.attn_output.weight")
-            value_width, value_remainder = divmod(int(output_shape[1]), q_heads)
-            key_width, key_remainder = divmod(
-                int(qkv_shape[0]) - kv_heads * value_width,
-                q_heads + kv_heads,
-            )
-            if value_remainder or key_remainder or min(key_width, value_width) <= 0:
-                raise ValueError("PLaMo2 key/value widths cannot be inferred exactly")
-            inferred.add((key_width, value_width))
-    if inferred and len(inferred) != 1:
-        raise ValueError("PLaMo2 attention tensor shapes contradict across layers")
-    if inferred:
-        inferred_key, inferred_value = inferred.pop()
+        inferred_key, inferred_value = _infer_plamo2_attention_widths(
+            model,
+            head_counts,
+            kv_head_counts,
+        )
         if key_length is not None and int(key_length) != inferred_key:
             raise ValueError("PLaMo2 attention.key_length contradicts tensor shapes")
         if value_length is not None and int(value_length) != inferred_value:

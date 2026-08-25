@@ -228,10 +228,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # DeepSeek MLA: deepseek_v2_0 uses group_limited_greedy routing which hits a
     # HF transformers 5.3.0 bug (DeepseekV2Moe missing num_experts attr).
     "deepseek_v2_0": "HF transformers 5.3.0 bug: DeepseekV2Moe missing num_experts attr",
-    # Additional divergences (newly registered models)
-    # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
-    # recurrence on CPU produces different results than HF's naive Mamba2.
-    # Attention-only layers match perfectly (cos=0.9999).
 }
 
 # Fields that are properties in HF configs and cannot be set directly,

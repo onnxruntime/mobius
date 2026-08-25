@@ -198,7 +198,11 @@ def _build_hash_routed_qmoe_layer(
     )
 
 
-def _run_layer(layer, hidden_values: np.ndarray, input_ids_values: np.ndarray) -> np.ndarray:
+def _run_layer(
+    layer,
+    hidden_values: np.ndarray,
+    input_ids_values: np.ndarray,
+) -> tuple[np.ndarray, ir.Graph]:
     graph = ir.Graph(
         inputs=[],
         outputs=[],

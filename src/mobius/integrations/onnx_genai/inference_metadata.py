@@ -3347,10 +3347,10 @@ def write_mtp_speculator_metadata(
     so this writer also registers the head as a workflow component and completes
     the rollback capabilities the claim depends on. Notably:
 
-    - ``proposal_execution: block``, not ``chained``: a chained proposer must
-      expose a ``logits_output``, and this sidecar emits only ``mtp_hidden``.
-      The runtime obtains draft logits by decoding it through the target's LM
-      head, which is why that initializer is listed in ``shared_weights``.
+    - ``proposal_execution: block``, not ``chained``: one invocation emits the
+      whole proposal. A sidecar without a dedicated LM head exposes
+      ``mtp_hidden`` for decoding through the target head; a dedicated head
+      exposes ``logits`` directly.
     - ``port_bindings.target_hidden_context`` names the proposer input port the
       target's hidden state lands in; its source is declared as a
       ``hidden_states`` port role on the target component.

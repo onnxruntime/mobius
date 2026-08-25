@@ -194,6 +194,7 @@ def _insert_external_transform(
     uses = list(initializer.uses())
     if not uses:
         return
+    earliest_consumer = min((node for node, _ in uses), key=graph.index)
     dtype = initializer.dtype
     final_shape = initializer.shape
     assert dtype is not None and final_shape is not None
@@ -334,10 +335,24 @@ def _insert_external_transform(
     else:
         raise ValueError(f"Unknown GGUF external transform {candidate.transform!r}.")
 
-    graph.insert_before(uses[0][0], nodes)
+    graph.insert_before(earliest_consumer, nodes)
 
 
-def _validate_source(plan: GGUFReusePlan, output_directory: Path) -> None:
+def _source_identity(path: Path) -> tuple[int, int, int, int, int]:
+    source_stat = path.stat()
+    return (
+        source_stat.st_dev,
+        source_stat.st_ino,
+        source_stat.st_size,
+        source_stat.st_mtime_ns,
+        source_stat.st_ctime_ns,
+    )
+
+
+def _validate_source(
+    plan: GGUFReusePlan,
+    output_directory: Path,
+) -> tuple[int, int, int, int, int]:
     source = plan.source_path
     if source.is_symlink():
         raise ValueError("The GGUF source became a symlink; refusing an unsafe external path.")
@@ -359,10 +374,24 @@ def _validate_source(plan: GGUFReusePlan, output_directory: Path) -> None:
                 f"The GGUF source is hard-linked to generated artifact "
                 f"{generated_name!r}. Use an independent real file."
             )
-    if source.stat().st_size != plan.size or _sha256(source) != plan.sha256:
+    identity = _source_identity(source)
+    if identity[2] != plan.size:
         raise ValueError(
             "The GGUF source no longer matches the file used to build this package "
-            "(size or SHA-256 changed). Rebuild from the intended GGUF."
+            "(size changed). Rebuild from the intended GGUF."
+        )
+    return identity
+
+
+def _require_source_identity(
+    plan: GGUFReusePlan,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    source = plan.source_path
+    if source.is_symlink() or _source_identity(source) != expected:
+        raise ValueError(
+            "The GGUF source changed while this package was being prepared. "
+            "Retry the save with an unchanged source file."
         )
 
 
@@ -796,9 +825,12 @@ def save_reuse_package(
 ) -> tuple[str, ...]:
     """Transactionally save mixed GGUF references plus a converted sidecar."""
     path = Path(path)
+    # Pin cheap file identity before taking the package-wide writer lock. The
+    # final verifier hashes the source exactly once immediately before publish.
+    source_identity = _validate_source(plan, path.parent)
     with _package_lock(path.parent):
         _recover_transaction_locked(path.parent)
-        _validate_source(plan, path.parent)
+        _require_source_identity(plan, source_identity)
         token = uuid.uuid4().hex
         staged_model = path.with_name(f".{path.name}.{token}.tmp")
         staged_sidecar = path.with_name(f".{_SIDECAR_NAME}.{token}.tmp")

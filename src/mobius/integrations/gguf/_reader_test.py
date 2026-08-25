@@ -24,6 +24,7 @@ from mobius.integrations.gguf._config_mapping import (
     _infer_tie_embeddings,
     gguf_to_config,
 )
+from mobius.integrations.gguf._header import _gguf_architecture_from_header
 from mobius.integrations.gguf._reader import GGUFModel
 
 
@@ -41,6 +42,15 @@ def _raw_gguf_architecture_entry() -> bytes:
         + struct.pack("<I", 8)
         + _raw_gguf_string(b"llama")
     )
+
+
+def test_unsupported_header_reports_both_endian_versions() -> None:
+    data = b"GGUF" + struct.pack("<I", 4) + bytes(16)
+    with pytest.raises(
+        ValueError,
+        match=r"little-endian=4, big-endian=67108864",
+    ):
+        _gguf_architecture_from_header(data, source="unsupported.gguf")
 
 
 def _raw_gguf_array_entry(

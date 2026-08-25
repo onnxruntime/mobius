@@ -37,6 +37,7 @@ __all__ = [
     "DiarizationTask",
     "FeatureExtractionTask",
     "FunASRSpeechLanguageTask",
+    "Gemma3VisionLanguageTask",
     "Gemma3nTask",
     "Gemma4AssistantTask",
     "Gemma4Task",
@@ -166,6 +167,7 @@ from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
 from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
+    Gemma3VisionLanguageTask,
     GlmOcrVLTask,
     HybridQwenVLTask,
     Lfm2VlTask,
@@ -222,6 +224,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "qwen-image-edit-vae": QwenImageEditVAETask,
     "qwen-image-text-encoding": QwenImageTextEncoderTask,
     "vision-language": VisionLanguageTask,
+    "gemma3-vision-language": Gemma3VisionLanguageTask,
     "vision-encoder-decoder": VisionEncoderDecoderTask,
     "cosmos3-edge-vl": Cosmos3EdgeVLTask,
     "pixtral-vl": PixtralVLTask,

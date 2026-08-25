@@ -21,6 +21,7 @@ from __future__ import annotations
 __all__ = ["ModelPackage"]
 
 import inspect
+import json
 import logging
 import os
 import shutil
@@ -45,6 +46,189 @@ from mobius.generation import PolicyComponent
 from mobius.integrations._weight_loading import _assign_weight
 
 logger = logging.getLogger(__name__)
+
+_PACKAGE_MANIFEST = ".mobius-package.json"
+_PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
+_MTP_SIDECAR_BASENAME = ".mobius-mtp"
+
+
+def _read_mtp_sidecar_name(directory: str) -> str | None:
+    manifest_path = os.path.join(directory, _PACKAGE_MANIFEST)
+    if not os.path.lexists(manifest_path):
+        return None
+    if os.path.islink(manifest_path):
+        raise ValueError("ModelPackage manifest must not be a symlink.")
+    if not os.path.isfile(manifest_path):
+        raise ValueError(f"ModelPackage manifest is not a file: {manifest_path}.")
+    with open(manifest_path) as file:
+        manifest = json.load(file)
+    sidecar_name = manifest.get("mtp_head") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("format") != _PACKAGE_MANIFEST_FORMAT
+        or not isinstance(sidecar_name, str)
+        or not sidecar_name
+        or sidecar_name in {".", ".."}
+        or os.path.basename(sidecar_name) != sidecar_name
+    ):
+        raise ValueError(f"Invalid ModelPackage manifest: {manifest_path}.")
+    return sidecar_name
+
+
+def _write_mtp_manifest(directory: str, sidecar_name: str) -> None:
+    payload = json.dumps(
+        {"format": _PACKAGE_MANIFEST_FORMAT, "mtp_head": sidecar_name},
+        indent=2,
+        sort_keys=True,
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.path.join(directory, _PACKAGE_MANIFEST), flags, 0o666)
+    with os.fdopen(descriptor, "w") as file:
+        file.write(payload)
+        file.write("\n")
+
+
+def _mtp_sidecar_name(package: ModelPackage) -> str:
+    """Choose a sidecar directory that cannot hide a model component."""
+    component_keys = {name.casefold() for name in package}
+    name = _MTP_SIDECAR_BASENAME
+    suffix = 0
+    while name.casefold() in component_keys:
+        suffix += 1
+        name = f"{_MTP_SIDECAR_BASENAME}-{suffix}"
+    return name
+
+
+def _validate_mtp_chain(package: ModelPackage) -> None:
+    """Reject malformed or cyclic MTP package chains before saving any files."""
+    seen: set[int] = set()
+    current = package
+    while True:
+        identity = id(current)
+        if identity in seen:
+            raise ValueError("ModelPackage mtp_head attachments must not contain a cycle.")
+        seen.add(identity)
+        component_keys: set[str] = set()
+        for name in current:
+            if (
+                not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or os.path.isabs(name)
+            ):
+                raise ValueError(
+                    f"ModelPackage component name {name!r} must be a non-empty path segment."
+                )
+            collision_key = name.casefold()
+            if collision_key in component_keys:
+                raise ValueError(
+                    "ModelPackage component names must be distinct when compared "
+                    f"case-insensitively; {name!r} collides with another component."
+                )
+            component_keys.add(collision_key)
+            if collision_key == _PACKAGE_MANIFEST.casefold():
+                raise ValueError(
+                    f"ModelPackage component name {_PACKAGE_MANIFEST!r} is reserved "
+                    "for package metadata."
+                )
+        sidecar = current.mtp_head
+        if sidecar is None:
+            return
+        if not isinstance(sidecar, ModelPackage):
+            raise TypeError("ModelPackage mtp_head must be another ModelPackage or None.")
+        current = sidecar
+
+
+def _validate_output_directory(
+    directory: str, *, kind: str, inspect_contents: bool = True
+) -> None:
+    if not os.path.lexists(directory):
+        return
+    if os.path.islink(directory) or not os.path.isdir(directory):
+        raise ValueError(f"ModelPackage {kind} output must be a real directory.")
+    if inspect_contents:
+        for root, directories, files in os.walk(directory):
+            if any(os.path.islink(os.path.join(root, entry)) for entry in directories + files):
+                raise ValueError(f"ModelPackage {kind} output must not contain symlinks.")
+
+
+def _validate_mtp_save_paths(
+    package: ModelPackage,
+    directory: str,
+    components: Callable[[str], bool] | None = None,
+    *,
+    external_data: str = "onnx",
+    include_policy_components: bool = True,
+    include_adapter_artifacts: bool = True,
+) -> None:
+    """Reject unsafe output paths throughout the package chain before any writes."""
+    _validate_output_directory(directory, kind="package", inspect_contents=False)
+    previous_sidecar_name = _read_mtp_sidecar_name(directory)
+    selected = [name for name in package if components is None or components(name)]
+    if len(selected) > 1:
+        reserved = {"policies", "adapters"}.intersection(name.casefold() for name in selected)
+        if reserved:
+            name = sorted(reserved)[0]
+            raise ValueError(
+                f"ModelPackage component name {name!r} is reserved for package artifacts."
+            )
+    if len(selected) > 1:
+        for name in selected:
+            _validate_output_directory(
+                os.path.join(directory, name),
+                kind=f"component {name!r}",
+            )
+    else:
+        for entry in os.listdir(directory) if os.path.isdir(directory) else ():
+            if (
+                entry == "model.onnx"
+                or (
+                    entry.startswith("model")
+                    and (
+                        entry.endswith(".data")
+                        or (external_data == "safetensors" and ".safetensors" in entry)
+                    )
+                )
+            ) and os.path.islink(os.path.join(directory, entry)):
+                raise ValueError("ModelPackage model output must not be a symlink.")
+    if include_policy_components and package.policy_components:
+        _validate_output_directory(
+            os.path.join(directory, "policies"),
+            kind="policy artifact",
+        )
+    if include_adapter_artifacts and package.adapter_artifacts:
+        _validate_output_directory(
+            os.path.join(directory, "adapters"),
+            kind="adapter artifact",
+        )
+    active_artifact_names = {
+        name
+        for name, active in (
+            ("policies", include_policy_components and bool(package.policy_components)),
+            ("adapters", include_adapter_artifacts and bool(package.adapter_artifacts)),
+        )
+        if active
+    }
+    if (
+        previous_sidecar_name is not None
+        and previous_sidecar_name.casefold() in active_artifact_names
+    ):
+        raise ValueError(
+            "ModelPackage manifest MTP sidecar collides with an active artifact namespace."
+        )
+    if package.mtp_head is None:
+        return
+    sidecar_directory = os.path.join(directory, _mtp_sidecar_name(package))
+    _validate_output_directory(sidecar_directory, kind="MTP sidecar")
+    _validate_mtp_save_paths(
+        package.mtp_head,
+        sidecar_directory,
+        external_data=external_data,
+        include_policy_components=include_policy_components,
+        include_adapter_artifacts=include_adapter_artifacts,
+    )
 
 
 def _adapter_dtype_name(dtype: ir.DataType) -> str:
@@ -80,8 +264,9 @@ class ModelPackage(UserDict[str, ir.Model]):
     Attributes:
         config: The architecture configuration used to build the models,
             or ``None`` if not available (e.g. after :meth:`load`).
-        mtp_head: Optional nested MTP sidecar package. :meth:`save` persists it
-            under ``mtp/`` and :meth:`load` restores it automatically.
+        mtp_head: Optional nested MTP sidecar package. :meth:`save` records its
+            collision-free directory in an explicit package manifest, and
+            :meth:`load` restores it automatically.
     """
 
     def __init__(
@@ -201,6 +386,15 @@ class ModelPackage(UserDict[str, ir.Model]):
                 *check_weights* is ``True`` and any initializer is missing its
                 ``const_value``.
         """
+        _validate_mtp_chain(self)
+        _validate_mtp_save_paths(
+            self,
+            directory,
+            components,
+            external_data=external_data,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
+        )
         if external_data not in {"onnx", "safetensors"}:
             raise ValueError(
                 f"Unknown external_data format {external_data!r}. "
@@ -220,6 +414,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                     "GGUF weight reuse writes one converted-weight sidecar and does "
                     "not support max_shard_size_bytes."
                 )
+        previous_sidecar_name = _read_mtp_sidecar_name(directory)
         os.makedirs(directory, exist_ok=True)
         selected = {
             name: model
@@ -279,8 +474,12 @@ class ModelPackage(UserDict[str, ir.Model]):
         if include_adapter_artifacts:
             self.save_adapter_artifacts(directory)
         if self.mtp_head is not None:
+            sidecar_name = _mtp_sidecar_name(self)
+            sidecar_directory = os.path.join(directory, sidecar_name)
+            if os.path.isdir(sidecar_directory):
+                shutil.rmtree(sidecar_directory)
             self.mtp_head.save(
-                os.path.join(directory, "mtp"),
+                sidecar_directory,
                 external_data=external_data,
                 max_shard_size_bytes=max_shard_size_bytes,
                 max_workers=max_workers,
@@ -289,6 +488,35 @@ class ModelPackage(UserDict[str, ir.Model]):
                 include_policy_components=include_policy_components,
                 include_adapter_artifacts=include_adapter_artifacts,
             )
+            _write_mtp_manifest(directory, sidecar_name)
+        else:
+            sidecar_name = None
+            manifest_path = os.path.join(directory, _PACKAGE_MANIFEST)
+            if os.path.isfile(manifest_path):
+                os.remove(manifest_path)
+        if previous_sidecar_name is not None and previous_sidecar_name != sidecar_name:
+            previous_sidecar = os.path.join(directory, previous_sidecar_name)
+            current_directories = (
+                [os.path.join(directory, name) for name in selected] if use_subfolders else []
+            )
+            if sidecar_name is not None:
+                current_directories.append(os.path.join(directory, sidecar_name))
+            if include_policy_components and self.policy_components:
+                current_directories.append(os.path.join(directory, "policies"))
+            if include_adapter_artifacts and self.adapter_artifacts:
+                current_directories.append(os.path.join(directory, "adapters"))
+            aliases_current_output = any(
+                os.path.exists(current)
+                and os.path.exists(previous_sidecar)
+                and os.path.samefile(previous_sidecar, current)
+                for current in current_directories
+            )
+            if (
+                not aliases_current_output
+                and os.path.isdir(previous_sidecar)
+                and not os.path.islink(previous_sidecar)
+            ):
+                shutil.rmtree(previous_sidecar)
 
     def add_policy_component(self, name: str, component: PolicyComponent) -> None:
         """Attach a reusable generation-policy graph to this package."""
@@ -597,8 +825,9 @@ class ModelPackage(UserDict[str, ir.Model]):
         - **Subfolder**: each subdirectory contains ``model.onnx`` → multi-
           component package keyed by subfolder name.
 
-        A nested ``mtp/model.onnx`` is restored as :attr:`mtp_head`, never as a
-        primary model component.
+        An MTP sidecar named by ``.mobius-package.json`` is restored as
+        :attr:`mtp_head`. Unmarked subdirectories, including ``mtp/``, remain
+        ordinary model components.
 
         Args:
             directory: Path to the directory containing models.
@@ -606,13 +835,37 @@ class ModelPackage(UserDict[str, ir.Model]):
         Returns:
             A new ``ModelPackage`` with one entry per model found.
         """
+        return cls._load(directory, frozenset())
+
+    @classmethod
+    def _load(cls, directory: str, ancestors: frozenset[str]) -> ModelPackage:
+        resolved_directory = os.path.realpath(directory)
+        if resolved_directory in ancestors:
+            raise ValueError("ModelPackage MTP sidecar manifests must not contain a cycle.")
+        ancestors = ancestors | {resolved_directory}
+        sidecar_name = _read_mtp_sidecar_name(directory)
+        mtp_dir: str | None = None
+        if sidecar_name is not None:
+            mtp_dir = os.path.join(directory, sidecar_name)
+            if not os.path.isdir(mtp_dir):
+                raise ValueError(
+                    f"ModelPackage manifest references missing MTP sidecar {sidecar_name!r}."
+                )
+            if os.path.islink(mtp_dir):
+                raise ValueError("ModelPackage MTP sidecar directory must not be a symlink.")
+            resolved_sidecar = os.path.realpath(mtp_dir)
+            if os.path.dirname(resolved_sidecar) != resolved_directory:
+                raise ValueError("ModelPackage MTP sidecar must remain inside its package.")
+
         models: dict[str, ir.Model] = {}
-        # Preserve the established multi-component precedence while excluding
-        # the nested MTP auxiliary package from the primary component scan.
         for entry in sorted(os.listdir(directory)):
-            if entry == "mtp":
-                continue
             subdir = os.path.join(directory, entry)
+            if (
+                mtp_dir is not None
+                and os.path.isdir(subdir)
+                and os.path.samefile(subdir, mtp_dir)
+            ):
+                continue
             model_path = os.path.join(subdir, "model.onnx")
             if os.path.isdir(subdir) and os.path.isfile(model_path):
                 models[entry] = ir.load(model_path)
@@ -623,9 +876,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                     models[name] = ir.load(os.path.join(directory, filename))
         package = cls(models)
         package._load_policy_components(directory)
-        mtp_dir = os.path.join(directory, "mtp")
-        if os.path.isfile(os.path.join(mtp_dir, "model.onnx")):
-            package.mtp_head = cls.load(mtp_dir)
+        if mtp_dir is not None:
+            package.mtp_head = cls._load(mtp_dir, ancestors)
         return package
 
     def _load_policy_components(self, directory: str) -> None:

@@ -442,6 +442,10 @@ class GgufShardSet:
     def shard_paths(self) -> list[Path]:
         return [Path(shard._path) for shard in self._shards]
 
+    def source_matches_path(self) -> bool:
+        """Return whether every shard still names the exact file that was opened."""
+        return all(shard.source_matches_path() for shard in self._shards)
+
     def _safe_architecture(self) -> str | None:
         try:
             return self._primary.architecture

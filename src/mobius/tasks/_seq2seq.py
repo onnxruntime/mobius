@@ -110,10 +110,15 @@ class Seq2SeqTask(ModelTask):
         )
         encoder_attention_mask = None
         if self.use_attention_masks:
+            encoder_mask_sequence = (
+                "cross_past_sequence_len + encoder_sequence_len"
+                if self.use_cross_attention_cache
+                else enc_seq_len
+            )
             encoder_attention_mask = builder.input(
                 "encoder_attention_mask",
                 dtype=ir.DataType.INT64,
-                shape=[batch, "cross_past_sequence_len + encoder_sequence_len"],
+                shape=[batch, encoder_mask_sequence],
             )
 
         num_heads = config.num_attention_heads
