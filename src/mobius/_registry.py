@@ -29,6 +29,7 @@ from mobius._configs import (
     Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    KimiK3Config,
     KimiLinearConfig,
     Lfm2Config,
     Lfm2MoeConfig,
@@ -83,6 +84,7 @@ from mobius.models import (
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
+    KimiK3CausalLMModel,
     KimiLinearCausalLMModel,
     LayerNormCausalLMModel,
     Lfm2CausalLMModel,
@@ -610,6 +612,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         task="kimi-linear-text-generation",
         config_class=KimiLinearConfig,
     ),
+    "kimi_k3": ModelRegistration(
+        KimiK3CausalLMModel,
+        task="kimi-k3-text-generation",
+        config_class=KimiK3Config,
+    ),
     "minimax": ModelRegistration(MiniMaxCausalLMModel, config_class=MiniMaxConfig),
     "MiniMaxText01": ModelRegistration(MiniMaxCausalLMModel, config_class=MiniMaxConfig),
     "minimax_text_01": ModelRegistration(MiniMaxCausalLMModel, config_class=MiniMaxConfig),
@@ -1017,6 +1024,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- CausalLM (architecture-specific) ---
     "falcon": "tiiuae/falcon-7b",
+    "falcon_h1": "tiiuae/Falcon-H1-Tiny-90M-Base",
     "bloom": "bigscience/bloom-560m",
     "gemma": "google/gemma-2b",
     "gemma2": "google/gemma-2-2b",
@@ -1084,6 +1092,10 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "glm4_moe": "zai-org/GLM-4.5-Air",
     "granitemoehybrid": "ibm-granite/granite-4.0-tiny-preview",
     "granitemoeshared": "ibm-research/moe-7b-1b-active-shared-experts",
+    "kimi_k3": "yujiepan/kimi-k3-tiny-random",
+    "lfm2_moe": "LiquidAI/LFM2-8B-A1B",
+    "MiniMaxText01": "MiniMaxAI/MiniMax-Text-01",
+    "minimax_text_01": "MiniMaxAI/MiniMax-Text-01",
     "qwen3_omni_moe": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
     "qwen3_vl_moe": "Qwen/Qwen3-VL-30B-A3B-Instruct",
 

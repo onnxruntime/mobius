@@ -373,6 +373,59 @@ def _process_kimi_linear(
     return state_dict
 
 
+def _process_kimi_k3(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert Kimi-K3 recurrent and compressed-MLA converter transforms."""
+    del config
+    for name in tuple(state_dict):
+        tensor = state_dict[name]
+        if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")):
+            if tensor.dim() == 4 and tensor.shape[0] == 1 and tensor.shape[2] == 1:
+                state_dict[name] = tensor.reshape(tensor.shape[1], tensor.shape[3])
+            elif tensor.dim() == 3 and tensor.shape[0] == 1:
+                state_dict[name] = tensor.reshape(tensor.shape[1], tensor.shape[2])
+            else:
+                raise ValueError(
+                    f"Kimi-K3 convolution tensor {name!r} must use the pinned "
+                    f"[1, channels, 1, kernel] or [1, channels, kernel] layout, "
+                    f"got {tuple(tensor.shape)}"
+                )
+        elif name.endswith(".A_log"):
+            if not torch.all(torch.isfinite(tensor)) or not torch.all(tensor < 0):
+                raise ValueError(
+                    f"Kimi-K3 decay tensor {name!r} must contain finite negative values"
+                )
+            state_dict[name] = torch.log(-tensor)
+        elif name.endswith(".k_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi-K3 K-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.transpose(1, 2).reshape(
+                tensor.shape[0] * tensor.shape[2], tensor.shape[1]
+            )
+        elif name.endswith(".v_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi-K3 V-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.reshape(
+                tensor.shape[0] * tensor.shape[1], tensor.shape[2]
+            )
+        elif name.endswith(
+            (".attn_res_score.weight", ".ffn_res_score.weight", ".output_res_score.weight")
+        ):
+            if tensor.dim() != 1:
+                raise ValueError(
+                    f"Kimi-K3 residual score tensor {name!r} must be rank 1, "
+                    f"got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.unsqueeze(0)
+    return state_dict
+
+
 def _process_granitehybrid(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -426,6 +479,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
     "kimi_linear": _process_kimi_linear,
+    "kimi_k3": _process_kimi_k3,
 }
 
 #: mobius ``model_type`` values that no GGUF architecture maps to, but that a

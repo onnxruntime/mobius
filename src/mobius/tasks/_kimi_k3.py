@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Graph task for Kimi Linear's heterogeneous six-kind state ABI."""
+"""Stateful graph task for the Kimi-K3 text decoder."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from mobius.functions import causal_conv_nd_with_state, linear_attention
 from mobius.tasks._base import ModelTask, _make_graph, _make_model
 
 
-class KimiLinearCausalLMTask(ModelTask):
-    """Dynamic-cache task with three KDA convolution states plus matrix state."""
+class KimiK3CausalLMTask(ModelTask):
+    """Build Kimi-K3 with heterogeneous KDA and expanded MLA cache states."""
 
     def __init__(self, *, static_cache: bool = False, **_: object):
         if static_cache:
             raise ValueError(
-                "Kimi Linear does not support static cache: its KDA layers require "
-                "three convolution histories and one FP32 recurrent matrix state"
+                "Kimi-K3 does not support static cache: KDA layers carry convolution "
+                "and recurrent matrix states"
             )
 
     def build(self, module: nn.Module, config: ArchitectureConfig) -> ModelPackage:
@@ -44,22 +44,15 @@ class KimiLinearCausalLMTask(ModelTask):
         past_states = []
         for layer_idx, layer_type in enumerate(config.layer_types):
             prefix = f"past_key_values.{layer_idx}"
-            if layer_type == "kimi_linear_attention":
-                q = builder.input(
-                    f"{prefix}.q_conv_state",
-                    dtype=config.dtype,
-                    shape=[batch, projection, history],
-                )
-                k = builder.input(
-                    f"{prefix}.k_conv_state",
-                    dtype=config.dtype,
-                    shape=[batch, projection, history],
-                )
-                v = builder.input(
-                    f"{prefix}.v_conv_state",
-                    dtype=config.dtype,
-                    shape=[batch, projection, history],
-                )
+            if layer_type == "kimi_k3_attention":
+                convolution_states = [
+                    builder.input(
+                        f"{prefix}.{name}",
+                        dtype=config.dtype,
+                        shape=[batch, projection, history],
+                    )
+                    for name in ("q_conv_state", "k_conv_state", "v_conv_state")
+                ]
                 recurrent = builder.input(
                     f"{prefix}.recurrent_state",
                     dtype=ir.DataType.FLOAT,
@@ -70,8 +63,10 @@ class KimiLinearCausalLMTask(ModelTask):
                         config.linear_value_head_dim,
                     ],
                 )
-                past_states.append((q, k, v, recurrent))
+                past_states.append((*convolution_states, recurrent))
             else:
+                # Expanded K/V is semantically exact. A latent MLA cache would require
+                # an attention kernel that consumes the compressed rank directly.
                 key = builder.input(
                     f"{prefix}.key",
                     dtype=config.dtype,
@@ -105,13 +100,13 @@ class KimiLinearCausalLMTask(ModelTask):
         for layer_idx, (layer_type, states) in enumerate(
             zip(config.layer_types, present_states)
         ):
-            prefix = f"present.{layer_idx}"
-            if layer_type == "kimi_linear_attention":
-                names = ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
-            else:
-                names = ("key", "value")
+            names = (
+                ("q_conv_state", "k_conv_state", "v_conv_state", "recurrent_state")
+                if layer_type == "kimi_k3_attention"
+                else ("key", "value")
+            )
             for state, name in zip(states, names):
-                builder.add_output(state, f"{prefix}.{name}")
+                builder.add_output(state, f"present.{layer_idx}.{name}")
 
         model = _make_model(graph)
         conv = causal_conv_nd_with_state(
@@ -130,11 +125,12 @@ class KimiLinearCausalLMTask(ModelTask):
         model.functions[recurrence.identifier()] = recurrence
         model.metadata_props["mobius.cache_abi"] = (
             "KDA:q_conv_state,k_conv_state,v_conv_state,recurrent_state;"
-            "MLA:key,value;batch-axis=0;rollback=whole-state;replay=exact-prior-state"
+            "MLA:key,value(expanded-semantic-cache);batch-axis=0;"
+            "rollback=whole-state;replay=exact-prior-state"
         )
         model.metadata_props["mobius.runtime_support"] = (
             "Deferred: released generic OGA decoder cache schemas do not represent "
-            "Kimi Linear's heterogeneous state ABI; tracked by "
+            "Kimi-K3's heterogeneous state ABI; tracked by "
             "https://github.com/onnxruntime/mobius/issues/605"
         )
         return ModelPackage({"model": model}, config=config)

@@ -39,6 +39,7 @@ from mobius._configs import (
     Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
+    KimiK3Config,
     KimiLinearConfig,
     Lfm2MoeConfig,
     Mamba2Config,
@@ -228,6 +229,17 @@ _KIMI_LINEAR_KEY_MAP = {
     "expert_weights_scale": "routed_scaling_factor",
 }
 
+_KIMI_K3_KEY_MAP = {
+    **_KIMI_LINEAR_KEY_MAP,
+    "attention.q_lora_rank": "q_lora_rank",
+    "kda.gate_lower_bound": "linear_gate_lower_bound",
+    "expert_latent_length": "routed_expert_hidden_size",
+    "expert_weights_norm": "norm_topk_prob",
+    "attn_res.block_size": "attn_res_block_size",
+    "activation.situ_beta": "activation_situ_beta",
+    "activation.situ_linear_beta": "activation_situ_linear_beta",
+}
+
 _T5_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.relative_buckets_count": "relative_attention_num_buckets",
@@ -252,6 +264,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "granitehybrid": _GRANITEHYBRID_KEY_MAP,
         "minimax": _MINIMAX_KEY_MAP,
         "kimi_linear": _KIMI_LINEAR_KEY_MAP,
+        "kimi_k3": _KIMI_K3_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
 )
@@ -399,6 +412,7 @@ def _derive_hybrid_layout(
         "granitehybrid",
         "plamo2",
         "kimi-linear",
+        "kimi-k3",
     }:
         raw_kv_heads = metadata.get(f"{gguf_arch}.attention.head_count_kv")
         if not isinstance(raw_kv_heads, (list, tuple, np.ndarray)):
@@ -423,6 +437,7 @@ def _derive_hybrid_layout(
             "granitehybrid": "mamba2",
             "plamo2": "mamba",
             "kimi-linear": "kimi_linear_attention",
+            "kimi-k3": "kimi_k3_attention",
         }[gguf_arch]
         return (
             trunk_layers,
@@ -2731,6 +2746,77 @@ def _kimi_linear_postprocess(
     return KimiLinearConfig(**fields)
 
 
+def _kimi_k3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> KimiK3Config:
+    """Restore the exact pinned llama.cpp Kimi-K3 text configuration."""
+    arch = model.architecture
+    _, layer_types, mtp_count = _derive_hybrid_layout(arch, metadata, model.tensor_names)
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("Kimi-K3 GGUF does not support appended NextN blocks")
+    gating = int(metadata[f"{arch}.expert_gating_func"])
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kda_dim = int(metadata[f"{arch}.kda.head_dim"])
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    extra_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    if qk_dim <= extra_dim:
+        raise ValueError("Kimi-K3 MLA key length must exceed the nominal extra-key width")
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="kimi_k3",
+        num_key_value_heads=1,
+        head_dim=qk_dim,
+        q_lora_rank=int(metadata[f"{arch}.attention.q_lora_rank"]),
+        qk_nope_head_dim=qk_dim - extra_dim,
+        qk_rope_head_dim=extra_dim,
+        v_head_dim=int(metadata[f"{arch}.attention.value_length_mla"]),
+        kv_lora_rank=int(metadata[f"{arch}.attention.kv_lora_rank"]),
+        intermediate_size=int(metadata[f"{arch}.feed_forward_length"]),
+        moe_intermediate_size=int(metadata[f"{arch}.expert_feed_forward_length"]),
+        n_shared_experts=int(metadata.get(f"{arch}.expert_shared_count", 0)),
+        first_k_dense_replace=int(metadata.get(f"{arch}.leading_dense_block_count", 0)),
+        routed_scaling_factor=float(metadata.get(f"{arch}.expert_weights_scale", 0.0)),
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm")),
+        layer_types=layer_types,
+        linear_num_key_heads=heads,
+        linear_num_value_heads=heads,
+        linear_key_head_dim=kda_dim,
+        linear_value_head_dim=kda_dim,
+        linear_conv_kernel_dim=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        linear_gate_lower_bound=-float(
+            metadata.get(f"{arch}.kda.gate_lower_bound", -math.inf)
+        ),
+        linear_use_full_rank_gate=True,
+        routed_expert_hidden_size=int(
+            metadata.get(f"{arch}.expert_latent_length", config.hidden_size)
+        ),
+        attn_res_block_size=int(metadata.get(f"{arch}.attn_res.block_size", 0)),
+        latent_moe_use_norm=True,
+        mla_use_output_gate=True,
+        activation_situ_beta=float(metadata.get(f"{arch}.activation.situ_beta", 1.0)),
+        activation_situ_linear_beta=float(
+            metadata.get(f"{arch}.activation.situ_linear_beta", 0.0)
+        ),
+        hidden_act="situ",
+        n_group=1,
+        topk_group=1,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        disable_qmoe=True,
+        tie_word_embeddings=False,
+        rope_type=None,
+        rope_theta=None,
+        rope_scaling=None,
+        partial_rotary_factor=None,
+    )
+    return KimiK3Config(**fields)
+
+
 def _bert_encoder_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2872,6 +2958,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
     "kimi_linear": _kimi_linear_postprocess,
+    "kimi_k3": _kimi_k3_postprocess,
 }
 
 

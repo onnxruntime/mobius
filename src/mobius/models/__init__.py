@@ -81,6 +81,7 @@ __all__ = [
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
+    "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
     "Llama4CausalLMModel",
     "DreamModel",
@@ -260,6 +261,7 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
+from mobius.models.kimi_k3 import KimiK3CausalLMModel
 from mobius.models.kimi_linear import KimiLinearCausalLMModel
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
