@@ -43,11 +43,13 @@ def _gguf_architecture_from_header(
     little_version = struct.unpack_from("<I", data, 4)[0]
     if little_version in {2, 3}:
         byte_order = "<"
-        version = little_version
     else:
-        version = struct.unpack_from(">I", data, 4)[0]
-        if version not in {2, 3}:
-            raise ValueError(f"{source!r} uses unsupported GGUF version {little_version}.")
+        big_version = struct.unpack_from(">I", data, 4)[0]
+        if big_version not in {2, 3}:
+            raise ValueError(
+                f"{source!r} uses an unsupported GGUF version "
+                f"(little-endian={little_version}, big-endian={big_version})."
+            )
         byte_order = ">"
 
     def read_uint32(offset: int) -> tuple[int, int]:

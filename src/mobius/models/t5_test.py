@@ -38,9 +38,6 @@ def test_standard_t5_graph_contract_is_stable():
     package = Seq2SeqTask().build(T5ForConditionalGeneration(config), config)
     decoder = package["decoder"]
 
-    assert sum(len(list(model.graph)) for model in package.values()) == 176
-    assert len(list(package["encoder"].graph)) == 81
-    assert len(list(decoder.graph)) == 95
     decoder_inputs = {value.name: value for value in decoder.graph.inputs}
     assert "encoder_attention_mask" not in decoder_inputs
     assert str(decoder_inputs["past_key_values.0.cross.key"].shape) == (

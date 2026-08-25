@@ -444,8 +444,9 @@ Runtime packaging requires a validated embedded `tokenizer.huggingface.json`;
 opaque tokenizer pre-types are never reconstructed. Deferred/rejected
 architecture, tokenizer, draft-pairing, or mmproj checks run before durable
 output. Multimodal packages use `decoder`, `vision_encoder`, optional
-`audio_encoder`, and `embedding`; an admitted trailing MTP head is persisted
-under `mtp/`.
+`audio_encoder`, and `embedding`. Graph-only exports persist an admitted
+trailing MTP head under `mtp/`; runtime packaging currently rejects packages
+with an attached MTP sidecar.
 
 ---
 

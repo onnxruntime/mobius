@@ -263,12 +263,12 @@ class Qwen3TTSCodecEncoderModel(nn.Module):
         """Encode waveform to audio codes.
 
         Args:
-            waveform: (B, 1, audio_samples) float32.
+            waveform: (B, audio_channels, audio_samples) float32.
 
         Returns:
             codes: (B, 16, T) int64 audio codes.
         """
-        # 1. Conv encoder: (B, 1, samples) -> (B, hidden_size, T')
+        # 1. Conv encoder: (B, audio_channels, samples) -> (B, hidden_size, T')
         hidden = self.encoder(op, waveform)
 
         # 2. Transformer: channels-last

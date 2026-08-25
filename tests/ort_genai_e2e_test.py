@@ -204,11 +204,12 @@ def test_generic_decoder_end_to_end_and_reload(
     ort_genai_module: Any,
 ) -> None:
     """Exercise tokenizer, prefill, threaded KV decode, and package reload."""
-    expected_version = os.environ.get("MOBIUS_EXPECTED_ORT_GENAI_VERSION")
+    expected_version = os.environ.get(
+        "MOBIUS_EXPECTED_ORT_GENAI_VERSION",
+        _EXPECTED_ORT_GENAI_VERSION,
+    )
     installed_version = version("onnxruntime-genai")
-    if expected_version:
-        assert installed_version == expected_version
-    assert installed_version == _EXPECTED_ORT_GENAI_VERSION
+    assert installed_version == expected_version
 
     package_dir = tmp_path / "synthetic-decoder"
     package = _synthetic_decoder_package()

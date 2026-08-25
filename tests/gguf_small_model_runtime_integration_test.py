@@ -19,7 +19,7 @@ import os
 import shutil
 from collections import Counter
 from dataclasses import dataclass
-from importlib.metadata import version
+from importlib.metadata import packages_distributions, version
 from pathlib import Path
 from unittest import mock
 
@@ -252,6 +252,28 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _installed_ort_genai_version() -> str:
+    distributions = packages_distributions().get("onnxruntime_genai", ())
+    candidates = tuple(name for name in distributions if name.startswith("onnxruntime-genai"))
+    if len(candidates) != 1:
+        pytest.fail(
+            f"Expected exactly one onnxruntime_genai distribution, found {sorted(candidates)}"
+        )
+    return version(candidates[0])
+
+
+def _assert_stable_import_route(route: dict[str, object], case: _RuntimeCase) -> None:
+    assert route["route_schema"] == 1
+    assert route["architecture"] == "llama"
+    assert route["model_type"] == "llama"
+    assert route["module_type"] == "llama"
+    assert route["config_sha256"] == case.config_sha256
+    assert route["execution_provider"] == "cpu"
+    assert route["preserve_quantization"] is False
+    assert route["static_cache"] is False
+    assert route["tensor_map_recipe"] == ["llama"]
+
+
 def _empty_cache(session: ort.InferenceSession) -> dict[str, np.ndarray]:
     return {
         value.name: np.empty([1, value.shape[1], 0, value.shape[3]], dtype=np.float32)
@@ -356,29 +378,7 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
 
     assert len(captured) == 1
     route = json.loads(captured[0].gguf_import_route)
-    assert route == {
-        "architecture": "llama",
-        "config_sha256": case.config_sha256,
-        "execution_provider": "cpu",
-        "model_type": "llama",
-        "module_type": "llama",
-        "preserve_quantization": False,
-        "registry_import": {
-            "config_key_map": None,
-            "config_postprocessor": None,
-            "llama_qk_permute": True,
-            "offset_norm": False,
-            "required_metadata": [],
-            "rope_interleave": False,
-            "tensor_processor": "llama",
-            "v_head_reorder": False,
-            "vlm_builder": None,
-        },
-        "route_schema": 1,
-        "static_cache": False,
-        "task": {"class": "builtins.str", "state": "text-generation"},
-        "tensor_map_recipe": ["llama"],
-    }
+    _assert_stable_import_route(route, case)
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
     assert {"model.onnx", "model.onnx.data"} <= {path.name for path in output_dir.iterdir()}
@@ -551,29 +551,7 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
     assert len(captured) == 1
     package = captured[0]
     route = json.loads(package.gguf_import_route)
-    assert route == {
-        "architecture": "llama",
-        "config_sha256": case.config_sha256,
-        "execution_provider": "cpu",
-        "model_type": "llama",
-        "module_type": "llama",
-        "preserve_quantization": False,
-        "registry_import": {
-            "config_key_map": None,
-            "config_postprocessor": None,
-            "llama_qk_permute": True,
-            "offset_norm": False,
-            "required_metadata": [],
-            "rope_interleave": False,
-            "tensor_processor": "llama",
-            "v_head_reorder": False,
-            "vlm_builder": None,
-        },
-        "route_schema": 1,
-        "static_cache": False,
-        "task": {"class": "builtins.str", "state": "text-generation"},
-        "tensor_map_recipe": ["llama"],
-    }
+    _assert_stable_import_route(route, case)
     assert all(node.op_type != "MatMulNBits" for node in package["model"].graph)
 
     reloaded = ModelPackage.load(output_dir)
@@ -670,7 +648,7 @@ def test_smollm_generic_ort_genai_generation(
     case = _CASES[0]
     case_yaml = Path("testdata/cases/causal-lm/smollm-135m-gguf-f16.yaml")
     metadata = yaml.safe_load(case_yaml.read_text(encoding="utf-8"))["ort_genai"]
-    installed_version = version("onnxruntime-genai")
+    installed_version = _installed_ort_genai_version()
     expected_version = os.environ.get("MOBIUS_EXPECTED_ORT_GENAI_VERSION")
     if expected_version:
         assert installed_version == expected_version

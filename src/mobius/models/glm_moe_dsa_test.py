@@ -256,9 +256,15 @@ class TestGlmMoeDsaGraphBuild:
 
     def test_dsa_path_uses_packed_single_head_cache_io(self):
         config, onnx_model = self._build()
-        cache_inputs = {value.name: list(value.shape) for value in onnx_model.graph.inputs[3:]}
+        cache_inputs = {
+            value.name: list(value.shape)
+            for value in onnx_model.graph.inputs
+            if value.name.startswith("past_key_values.")
+        }
         cache_outputs = {
-            value.name: list(value.shape) for value in onnx_model.graph.outputs[1:]
+            value.name: list(value.shape)
+            for value in onnx_model.graph.outputs
+            if value.name.startswith("present.")
         }
         for i, indexer_type in enumerate(config.indexer_types):
             key_width = config.num_attention_heads * (
