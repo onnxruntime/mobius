@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 67
+_EXPECTED_SUPPORTED_COUNT = 71
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
 )
@@ -241,8 +241,9 @@ class TestCapabilityClosure:
         """A ``graph=SUPPORTED`` claim has to be backed by a real model class."""
         if spec.graph is not Support.SUPPORTED:
             return
-        assert spec.model_type in _REGISTRATIONS, (
-            f"{spec.gguf_arch}: model_type {spec.model_type!r} is not registered in "
+        module_type = spec.module_type or spec.model_type
+        assert module_type in _REGISTRATIONS, (
+            f"{spec.gguf_arch}: module type {module_type!r} is not registered in "
             "mobius._registry, so the graph cannot actually be built"
         )
 
@@ -278,13 +279,17 @@ class TestCapabilityClosure:
         assert set(actual) == set(supported_architectures())
         rejected = {
             "chatglm",
+            "eurobert",
             "granitehybrid",
             "internlm2",
+            "jina-bert-v2",
             "lfm2moe",
             "mamba",
             "mamba2",
             "nemotron_h",
             "nemotron_h_moe",
+            "neo-bert",
+            "nomic-bert",
             "phi2",
             "bloom",
             "codeshell",
@@ -1678,7 +1683,7 @@ class TestOffsetNormCompensation:
     )
     def test_offset_norm_models_have_compensation(self, spec) -> None:
         assert spec.model_type is not None
-        if not self._model_uses_offset_norm(spec.model_type):
+        if not self._model_uses_offset_norm(spec.module_type or spec.model_type):
             return
         compensated = spec.tensor_processor == "unoffset_norm" or spec.offset_norm
         assert compensated, (

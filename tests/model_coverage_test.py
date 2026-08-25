@@ -171,6 +171,18 @@ _COVERAGE_SKIP: dict[str, str] = {
     "helium": "Alias for mistral — covered by mistral",
     "open-llama": "Alias for llama — covered by llama",
     "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
+    "eurobert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "jina_bert_v2_gguf": "GGUF-only specialized encoder — no native HF model_type route "
+    "for generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT "
+    "parity are covered by _specialized_encoders_test.py.",
+    "neo_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "nomic_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
     "seed_oss": "Internal model — no public HF checkpoint",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",

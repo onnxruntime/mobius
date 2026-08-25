@@ -156,6 +156,12 @@ from mobius.models.falcon import (
 from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.gguf_encoders import (
+    EuroBertGGUFModel,
+    JinaBertV2GGUFModel,
+    NeoBertGGUFModel,
+    NomicBertGGUFModel,
+)
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel, ScaledEmbeddingGPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -812,6 +818,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "megatron-bert": ModelRegistration(BertModel, task="feature-extraction"),
     "mobilebert": ModelRegistration(BertModel, task="feature-extraction"),
     "modernbert": ModelRegistration(ModernBertModel, task="feature-extraction"),
+    "eurobert_gguf": ModelRegistration(EuroBertGGUFModel, task="feature-extraction"),
+    "jina_bert_v2_gguf": ModelRegistration(JinaBertV2GGUFModel, task="feature-extraction"),
+    "neo_bert_gguf": ModelRegistration(NeoBertGGUFModel, task="feature-extraction"),
+    "nomic_bert_gguf": ModelRegistration(NomicBertGGUFModel, task="feature-extraction"),
     "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
     "mra": ModelRegistration(BertModel, task="feature-extraction"),
     "nezha": ModelRegistration(BertModel, task="feature-extraction"),

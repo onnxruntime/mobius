@@ -461,6 +461,16 @@ class ArchitectureConfig(BaseModelConfig):
 
     # Encoder-specific config
     type_vocab_size: int = 0
+    encoder_use_token_type_embeddings: bool = False
+    encoder_q_bias: bool = False
+    encoder_k_bias: bool = False
+    encoder_v_bias: bool = False
+    encoder_ffn_up_bias: bool = False
+    encoder_ffn_down_bias: bool = False
+    encoder_qk_norm: bool = False
+    encoder_extra_attention_norm: bool = False
+    encoder_fused_geglu: bool = False
+    pooling_type: int = 0
 
     # Encoder-decoder config
     num_decoder_layers: int | None = None
