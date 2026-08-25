@@ -14,7 +14,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     build_ctc_asr_workflow_metadata,
 )
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
-from mobius.tasks._ctc_asr import BATCH_PADDING_SENSITIVE_KEY, CTCAsrTask
+from mobius.tasks._ctc_asr import CTCAsrTask
 
 
 def _tiny_config(**overrides) -> MMSConfig:
@@ -69,21 +69,7 @@ class TestFeatureExtractOutputLength:
             _tiny_config(feat_extract_norm="batch")
 
 
-class TestBatchPaddingSensitivity:
-    """Padding sensitivity is a property of the feature normalization."""
-
-    def test_group_normalization_is_padding_sensitive(self):
-        module = Wav2Vec2ForCTCModel(_tiny_config(feat_extract_norm="group"))
-        assert module.batch_padding_sensitive is True
-
-    def test_layer_normalization_is_row_independent(self):
-        module = Wav2Vec2ForCTCModel(_tiny_config(feat_extract_norm="layer"))
-        assert module.batch_padding_sensitive is False
-
-    def test_task_records_sensitivity_on_the_built_graph(self):
-        pkg = _build(_tiny_config(feat_extract_norm="group"))
-        assert pkg["model"].metadata_props[BATCH_PADDING_SENSITIVE_KEY] == "true"
-
+class TestArchitectureRouting:
     def test_config_class_survives_architecture_rerouting(self):
         # Config resolution reaches this module by re-routing model_type
         # "wav2vec2" to the "mms" registration, so the module must name its own
@@ -120,16 +106,21 @@ class TestCtcAsrMetadata:
         assert decoding["collapse_repeats"] is True
         assert (decoding["time_axis"], decoding["class_axis"]) == (1, 2)
 
-    def test_padding_sensitive_profile_binds_per_row_lengths(self, metadata):
+    def test_frame_lengths_bind_the_ctc_decode(self, metadata):
         profile = metadata["profiles"]["transcription"]
-        assert profile["batch_invariance"] == "padding_sensitive"
         assert profile["decoding"]["lengths"] == "frame_lengths"
         assert profile["outputs"]["frame_lengths"] == "frame_lengths"
 
-    def test_row_independent_when_feature_norm_is_layer(self):
-        config = _tiny_config(feat_extract_norm="layer")
+    @pytest.mark.parametrize("normalization", ["group", "layer"])
+    def test_batch_permission_is_never_inferred_from_shape_or_normalization(
+        self, normalization
+    ):
+        config = _tiny_config(feat_extract_norm=normalization)
         metadata = build_ctc_asr_workflow_metadata(_build(config), config)
-        assert metadata["profiles"]["transcription"]["batch_invariance"] == ("row_independent")
+        profile = metadata["profiles"]["transcription"]
+        component = metadata["pipeline"]["workflow"]["components"]["encoder"]
+        assert "batch_invariance" not in profile
+        assert "batch_capacity" not in component
 
     def test_workflow_is_a_plain_sequence_with_no_generation_loop(self, metadata):
         steps = metadata["pipeline"]["workflow"]["steps"]

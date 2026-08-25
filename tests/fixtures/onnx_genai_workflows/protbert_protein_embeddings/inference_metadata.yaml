@@ -10,7 +10,6 @@ profiles:
       kind: mean
       axis: 1
       normalize: false
-    batch_invariance: row_independent
 pipeline:
   workflow:
     manifest:

@@ -107,9 +107,11 @@ def test_wav2vec2_ctc_padded_batch_is_segmented_by_declared_frame_lengths():
         result = ctc_runtime.transcribe(str(directory), rows, sample_rate)
 
     _, profile = ctc_runtime.select_profile(metadata, "transcription")
-    # Group-normalizing over the padded time axis makes rows interdependent,
-    # which the package must declare rather than leave for a caller to discover.
-    assert profile["batch_invariance"] == "padding_sensitive"
+    # Group normalization makes this graph unsafe to coalesce across requests.
+    # Omitted component capacity is the fail-closed declaration; the request
+    # axis and frame lengths only describe tensors and output segmentation.
+    assert "batch_invariance" not in profile
+    assert "batch_capacity" not in metadata["pipeline"]["workflow"]["components"]["encoder"]
     assert profile["decoding"]["lengths"] == "frame_lengths"
 
     config = MMSConfig.from_transformers(
