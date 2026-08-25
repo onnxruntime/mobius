@@ -15,16 +15,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from collections import Counter
 from dataclasses import dataclass
+from importlib.metadata import version
 from pathlib import Path
 from unittest import mock
 
+import huggingface_hub.constants
 import numpy as np
 import onnxruntime as ort
 import pytest
 import torch
-from huggingface_hub import hf_hub_download
+import yaml
+from huggingface_hub import get_hf_file_metadata, hf_hub_download, hf_hub_url
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from mobius import ModelPackage, build_from_gguf
@@ -216,6 +221,27 @@ _Q4_K_M_CASE = _RuntimeCase(
     ),
     tokenizer_identity_exact=False,
 )
+
+
+@pytest.fixture
+def isolated_hf_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Keep each real-artifact test's Hub/Xet state isolated and disposable."""
+    cache_root = tmp_path / "huggingface-cache"
+    hub_cache = cache_root / "hub"
+    xet_cache = cache_root / "xet"
+    cache_root.mkdir()
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub_cache))
+    monkeypatch.setenv("HF_XET_CACHE", str(xet_cache))
+    monkeypatch.setenv("TRANSFORMERS_CACHE", str(cache_root / "transformers"))
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HOME", str(cache_root))
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(hub_cache))
+    monkeypatch.setattr(huggingface_hub.constants, "HUGGINGFACE_HUB_CACHE", str(hub_cache))
+    monkeypatch.setattr(huggingface_hub.constants, "HF_XET_CACHE", str(xet_cache))
+    try:
+        yield cache_root
+    finally:
+        shutil.rmtree(cache_root, ignore_errors=True)
 
 
 def _sha256(path: Path) -> str:
@@ -633,14 +659,49 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
 
 @pytest.mark.integration
 @pytest.mark.integration_slow
-def test_smollm_generic_ort_genai_generation(tmp_path: Path) -> None:
+@pytest.mark.ort_genai_real
+def test_smollm_generic_ort_genai_generation(
+    tmp_path: Path,
+    isolated_hf_cache: Path,
+) -> None:
     """The one evidenced GGUF route loads through ORT GenAI's generic decoder."""
-    from importlib.metadata import version
-
-    ort_genai = pytest.importorskip("onnxruntime_genai")
-    from mobius.integrations.ort_genai import write_ort_genai_config
+    import onnxruntime_genai as ort_genai
 
     case = _CASES[0]
+    case_yaml = Path("testdata/cases/causal-lm/smollm-135m-gguf-f16.yaml")
+    metadata = yaml.safe_load(case_yaml.read_text(encoding="utf-8"))["ort_genai"]
+    installed_version = version("onnxruntime-genai")
+    expected_version = os.environ.get("MOBIUS_EXPECTED_ORT_GENAI_VERSION")
+    if expected_version:
+        assert installed_version == expected_version
+    assert installed_version in metadata["runtime_versions"]
+    assert metadata["released_capabilities"][installed_version] == {
+        "generic_decoder": True,
+        "state_groups": False,
+    }
+    download_specs = [
+        (
+            case.gguf_repository,
+            case.gguf_revision,
+            case.gguf_filename,
+            case.gguf_size,
+        ),
+        *(
+            (case.tokenizer_repository, case.tokenizer_revision, filename, size)
+            for filename, size, _ in case.tokenizer_assets
+        ),
+    ]
+    remote_download_bytes = 0
+    for repository, revision, filename, expected_size in download_specs:
+        remote = get_hf_file_metadata(
+            hf_hub_url(repository, filename, revision=revision),
+            timeout=30,
+        )
+        assert remote.commit_hash == revision
+        assert remote.size == expected_size
+        remote_download_bytes += remote.size
+    assert remote_download_bytes <= metadata["max_download_bytes"]
+    assert isolated_hf_cache.exists()
     gguf_path = Path(
         hf_hub_download(
             repo_id=case.gguf_repository,
@@ -648,38 +709,43 @@ def test_smollm_generic_ort_genai_generation(tmp_path: Path) -> None:
             filename=case.gguf_filename,
         )
     )
-    output_dir = tmp_path / "smollm-ort-genai"
-    captured: list[ModelPackage] = []
-    original_save = ModelPackage.save
-
-    def capture_save(package: ModelPackage, *args: object, **kwargs: object) -> None:
-        captured.append(package)
-        original_save(package, *args, **kwargs)
-
-    with mock.patch.object(ModelPackage, "save", capture_save):
-        main(
-            [
-                "build-gguf",
-                str(gguf_path),
-                "--output",
-                str(output_dir),
-                "--dtype",
-                "f32",
-                "--execution-provider",
-                "cpu",
-            ]
+    assert gguf_path.stat().st_size == case.gguf_size
+    assert _sha256(gguf_path) == case.gguf_sha256
+    for filename, size, sha256 in case.tokenizer_assets:
+        asset_path = Path(
+            hf_hub_download(
+                repo_id=case.tokenizer_repository,
+                revision=case.tokenizer_revision,
+                filename=filename,
+            )
         )
-
-    assert len(captured) == 1
-    write_ort_genai_config(
-        captured[0],
-        str(output_dir),
-        hf_model_id=case.tokenizer_repository,
-        revision=case.tokenizer_revision,
-        runtime_version=version("onnxruntime-genai"),
+        assert asset_path.stat().st_size == size
+        assert _sha256(asset_path) == sha256
+    output_dir = tmp_path / "smollm-ort-genai"
+    main(
+        [
+            "build-gguf",
+            str(gguf_path),
+            "--output",
+            str(output_dir),
+            "--dtype",
+            "f32",
+            "--execution-provider",
+            "cpu",
+            "--runtime",
+            "ort-genai",
+            "--runtime-version",
+            installed_version,
+            "--tokenizer-repository",
+            case.tokenizer_repository,
+            "--tokenizer-revision",
+            case.tokenizer_revision,
+            "--local-files-only",
+        ]
     )
     config = json.loads((output_dir / "genai_config.json").read_text())
-    assert config["model"]["type"] == "decoder"
+    assert config["model"]["type"] == metadata["model_type"]
+    assert "state_groups" not in config["model"]["decoder"]
 
     model = ort_genai.Model(str(output_dir))
     tokenizer = ort_genai.Tokenizer(model)
@@ -697,4 +763,5 @@ def test_smollm_generic_ort_genai_generation(tmp_path: Path) -> None:
         generator.generate_next_token()
         generated.append(generator.get_next_tokens()[0])
 
+    assert len(generated) == len(case.generated_tokens)
     assert generated == list(case.generated_tokens)

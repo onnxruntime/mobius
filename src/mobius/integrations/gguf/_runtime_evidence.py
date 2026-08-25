@@ -249,8 +249,31 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
     runtime_version="1.29.0",
 )
 
+_SMOLLM_F16_ORT_GENAI = dataclasses.replace(
+    _SMOLLM_F16_ONNX_RUNTIME,
+    evidence_id="smollm-135m-f16-ort-genai-0.15.2",
+    runtime_package_files=(
+        "genai_config.json",
+        "gguf_tokenizer_manifest.json",
+        "model.onnx",
+        "model.onnx.data",
+        "runtime_compatibility.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
+    runtime_package_sha256="09738315d14392316106cca776c52165994ea55ef1407dbd9961c1f92e54c92c",
+    deterministic_test="test_smollm_generic_ort_genai_generation",
+    stateful_semantics="ORT GenAI prefill plus 20 cache-threaded decode steps",
+    runtime="ort-genai",
+    runtime_version="0.15.2",
+)
+
 _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType(
-    {_SMOLLM_F16_ONNX_RUNTIME.evidence_id: _SMOLLM_F16_ONNX_RUNTIME}
+    {
+        record.evidence_id: record
+        for record in (_SMOLLM_F16_ONNX_RUNTIME, _SMOLLM_F16_ORT_GENAI)
+    }
 )
 
 

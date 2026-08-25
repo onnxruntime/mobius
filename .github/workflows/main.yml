@@ -218,6 +218,17 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  ort-genai-e2e:
+    name: ORT GenAI E2E
+    needs: [detect-affected]
+    if: >-
+      always() && !cancelled() &&
+      (needs.detect-affected.result == 'failure' ||
+       needs.detect-affected.outputs.has_affected == 'true')
+    uses: ./.github/workflows/ort_genai_e2e.yml
+    with:
+      run_real: false
+
   test:
     name: test
     strategy:

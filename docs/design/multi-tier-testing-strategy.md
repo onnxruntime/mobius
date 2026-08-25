@@ -862,12 +862,34 @@ The test must verify:
 3. Image preprocessing config (resize, normalize, crop) matches HF
 4. Tokenizer and processor files are present and well-formed
 
-### Proposed test tiers for ORT GenAI
+### ORT GenAI runtime tiers
 
-| Level | What it tests                        | Cost     | CI cadence    |
-|-------|--------------------------------------|----------|---------------|
-| L1+   | Config generation (no weights)       | Seconds  | Every PR      |
-| E2E   | Full pipeline: export + load + gen   | Minutes  | Weekly / GPU   |
+| Lane | What it tests | Runtime | CI cadence |
+|------|---------------|---------|------------|
+| Fast | Generated generic `decoder` package, tokenizer load, model creation, prefill, four cache-threaded decode steps, deterministic tokens, save/reload, and malformed config rejection | CPU; `onnxruntime-genai==0.14.1` and `==0.15.2` | Relevant PRs, main, scheduled/manual |
+| Real | YAML-enrolled immutable artifacts with exact tokenizer provenance, byte budget, deterministic full-length generation, and disposable per-test Hub/Xet caches | CPU; currently `onnxruntime-genai==0.15.2` | Weekly and manual |
+
+Run the lanes locally:
+
+```bash
+python -m pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v
+python -m pytest tests/gguf_small_model_runtime_integration_test.py \
+  -m ort_genai_real -v
+```
+
+The `ort_genai` object in each golden-case YAML is the enrollment record.
+Schema and coverage tests fail when a runtime-supported GGUF route lacks a
+matching evidence ID. Released lanes use the architecture-neutral
+`model.type=decoder`; main-only `state_groups` metadata is explicitly excluded.
+Changes to graph construction, task wiring, ORT GenAI config generation,
+tokenizer packaging, and GGUF qtype/runtime helpers conservatively select the
+fast E2E matrix through `detect_affected_models.py`.
+
+CUDA is not a required PR claim. The existing self-hosted GPU lane uses a
+CUDA-12-specific pre-release ORT feed, so adding it to this released-wheel
+matrix would conflate runtime and EP coverage. CUDA runtime E2E remains suitable
+for scheduled/manual validation once that runner can install an equivalently
+pinned released stack.
 
 ---
 

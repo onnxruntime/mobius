@@ -1,0 +1,97 @@
+name: ORT GenAI End-to-End
+
+on:
+  schedule:
+    - cron: "0 7 * * 2"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      run_real:
+        description: Run the pinned real-artifact lane.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ort-genai-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: Fast CPU / OGA ${{ matrix.ort_genai }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        ort_genai: ["0.14.1", "0.15.2"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install pinned runtime and test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "onnxruntime-genai==${{ matrix.ort_genai }}" \
+            "pytest==8.4.2" \
+            "pytest-timeout==2.4.0"
+          python -m pip install --disable-pip-version-check -e .
+      - name: Run network-free ORT GenAI E2E
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+          MOBIUS_EXPECTED_ORT_GENAI_VERSION: ${{ matrix.ort_genai }}
+        run: |
+          python -m pytest tests/ort_genai_e2e_test.py \
+            -m ort_genai_fast -v --timeout=120 --junitxml=junit-ort-genai-fast.xml
+      - name: Upload fast-lane logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ort-genai-fast-${{ matrix.ort_genai }}
+          path: junit-ort-genai-fast.xml
+          retention-days: 14
+
+  real-smollm:
+    name: Pinned SmolLM F16 CPU / OGA 0.15.2
+    if: github.event_name != 'workflow_call' || inputs.run_real
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install pinned runtime and test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "onnxruntime-genai==0.15.2" \
+            "pytest==8.4.2" \
+            "pytest-timeout==2.4.0" \
+            "gguf==0.17.1"
+          python -m pip install --disable-pip-version-check -e ".[transformers]"
+      - name: Run pinned real-artifact generation
+        env:
+          MOBIUS_EXPECTED_ORT_GENAI_VERSION: "0.15.2"
+        run: |
+          python -m pytest tests/gguf_small_model_runtime_integration_test.py \
+            -m ort_genai_real -v --timeout=1500 --junitxml=junit-ort-genai-real.xml
+      - name: Upload real-lane logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ort-genai-real-smollm-0.15.2
+          path: junit-ort-genai-real.xml
+          retention-days: 30

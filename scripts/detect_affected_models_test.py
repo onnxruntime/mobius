@@ -49,7 +49,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/components/_attention.py") == "traceable"
 
     def test_task_file(self):
-        assert classify_file("src/mobius/tasks/_causal_lm.py") == "traceable"
+        assert classify_file("src/mobius/tasks/_causal_lm.py") == "shared_infra"
 
     def test_configs_file(self):
         assert classify_file("src/mobius/_configs.py") == "other"
@@ -58,7 +58,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/_registry.py") == "other"
 
     def test_builder_file(self):
-        assert classify_file("src/mobius/_builder.py") == "other"
+        assert classify_file("src/mobius/_builder.py") == "shared_infra"
 
     def test_exporter_file(self):
         assert classify_file("src/mobius/_exporter.py") == "other"
@@ -85,7 +85,15 @@ class TestClassifyFile:
         assert classify_file("README.md") == "other"
 
     def test_pyproject(self):
-        assert classify_file("pyproject.toml") == "other"
+        assert classify_file("pyproject.toml") == "shared_infra"
+
+    def test_ort_genai_integration_file(self):
+        assert (
+            classify_file("src/mobius/integrations/ort_genai/ep_config.py") == "shared_infra"
+        )
+
+    def test_ort_genai_workflow(self):
+        assert classify_file(".github/workflows/ort_genai_e2e.yml") == "shared_infra"
 
     def test_windows_paths(self):
         assert classify_file("src\\mobius\\models\\falcon.py") == "model"
@@ -224,16 +232,19 @@ class TestDetectAffectedModels:
         # _attention.py is imported by many models — should find affected types
         assert len(result["affected"]) > 0
 
-    def test_task_change_does_not_trigger_run_all(self):
-        """Task files are traceable but produce an empty affected set.
-
-        No model imports ``mobius.tasks`` directly (tasks are looked up at
-        runtime by string keys), so tracing through the import graph finds
-        no dependents. Documented limitation — see PR description.
-        """
+    def test_task_change_triggers_runtime_matrix(self):
         result = detect_affected_models(["src/mobius/tasks/_causal_lm.py"])
-        assert result["run_all"] is False
-        assert result["affected"] == []
+        assert result == {"affected": [], "run_all": True}
+
+    def test_ort_genai_change_triggers_runtime_matrix(self):
+        result = detect_affected_models(
+            ["src/mobius/integrations/ort_genai/_execution_providers.py"]
+        )
+        assert result == {"affected": [], "run_all": True}
+
+    def test_dependency_change_triggers_runtime_matrix(self):
+        result = detect_affected_models(["pyproject.toml"])
+        assert result == {"affected": [], "run_all": True}
 
     def test_configs_change_no_run_all(self):
         """_configs.py no longer triggers run_all (shared_infra disabled)."""
@@ -253,7 +264,7 @@ class TestDetectAffectedModels:
             ]
         )
         assert result["run_all"] is False
-        assert result["affected"] == ["lfm2"]
+        assert result["affected"] == ["lfm2", "lfm2_vl"]
 
     def test_test_configs_with_unmapped_task_still_runs_all(self):
         result = detect_affected_models(
@@ -348,18 +359,23 @@ class TestDetectAffectedModels:
         # _common.py defines Linear, Embedding, LayerNorm — used everywhere
         assert len(result["affected"]) > 10
 
-    def test_former_shared_infra_no_run_all(self):
-        """Former shared_infra files no longer trigger run_all."""
+    def test_runtime_shared_infra_runs_all(self):
         for path in [
-            "src/mobius/_configs.py",
-            "src/mobius/_registry.py",
-            "src/mobius/_builder.py",
-            "src/mobius/_weight_loading.py",
             "src/mobius/_model_package.py",
-            "src/mobius/models/__init__.py",
+            "src/mobius/integrations/ort_genai/auto_export.py",
+            "src/mobius/integrations/ort_genai/genai_config.py",
+            "src/mobius/integrations/gguf/_runtime_package.py",
+            "src/mobius/integrations/gguf/_tokenizer.py",
+            "src/mobius/integrations/gguf/_builder.py",
+            "src/mobius/integrations/gguf/_quant_registry.py",
+            "src/mobius/integrations/gguf/_repacker.py",
+            "src/mobius/_builder.py",
+            "src/mobius/_optimizations.py",
+            "src/mobius/_weight_loading.py",
+            "testdata/cases/schema.json",
         ]:
             result = detect_affected_models([path])
-            assert result["run_all"] is False, f"{path} should NOT trigger run_all"
+            assert result["run_all"] is True, f"{path} should trigger run_all"
 
     def test_traceable_and_model_combined(self):
         """A component + model file change returns union of affected types."""

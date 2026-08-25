@@ -201,7 +201,11 @@ the PR description).  The full checklist with explanations lives in the
 
 **Runtime and deployment**
 - [ ] CLI build: `mobius build --model <hf-model-id> /tmp/out` succeeds
-- [ ] ORT GenAI: model loads and generates coherent output; test in `tests/ort_genai_test.py`
+- [ ] ORT GenAI fast lane passes on both pinned released runtimes:
+  `pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v`
+- [ ] Runtime-supported real routes declare `ort_genai` evidence in their
+  `testdata/cases/` YAML and pass:
+  `pytest tests/gguf_small_model_runtime_integration_test.py -m ort_genai_real -v`
 - [ ] Foundry Local: exported package loads and responds to a short prompt
 - [ ] Olive quantization: INT4/INT8 quantization runs to completion; quantized model produces coherent output
 

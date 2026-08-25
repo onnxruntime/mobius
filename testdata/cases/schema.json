@@ -262,6 +262,74 @@
       },
       "description": "Pinned GGUF import source. The top-level model_id remains the independent HuggingFace reference."
     },
+    "ort_genai": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "runtime_versions",
+        "model_type",
+        "runtime_evidence_id",
+        "execution_provider",
+        "max_download_bytes",
+        "released_capabilities"
+      ],
+      "properties": {
+        "tier": {
+          "const": "real",
+          "description": "Enroll this case in the pinned real-artifact ORT GenAI lane."
+        },
+        "runtime_versions": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "0.14.1",
+              "0.15.2"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Released onnxruntime-genai versions validated for this route."
+        },
+        "model_type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Expected model.type in the generated genai_config.json."
+        },
+        "runtime_evidence_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Structured runtime evidence record proving this exact artifact route."
+        },
+        "execution_provider": {
+          "const": "cpu",
+          "description": "Required CI currently makes only a CPU execution-provider claim."
+        },
+        "max_download_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912,
+          "description": "Hard per-case aggregate artifact download budget."
+        },
+        "released_capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "0.14.1",
+            "0.15.2"
+          ],
+          "properties": {
+            "0.14.1": {
+              "$ref": "#/$defs/ortGenaiCapabilities"
+            },
+            "0.15.2": {
+              "$ref": "#/$defs/ortGenaiCapabilities"
+            }
+          },
+          "description": "Explicit released-runtime capability expectations."
+        }
+      }
+    },
     "level": {
       "type": "string",
       "enum": [
@@ -446,9 +514,27 @@
       },
       "additionalProperties": false
     },
-    "architecture": {
-      "type": "string",
-      "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
+  "architecture": {
+    "type": "string",
+    "description": "Optional registry architecture key (e.g. Qwen35MtpModel) forcing a specific module class + task at build time. Needed for auxiliary heads (DFlash, MTP) that share a base checkpoint whose architectures field would otherwise auto-route to the base model."
+  }
+},
+"$defs": {
+  "ortGenaiCapabilities": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "generic_decoder",
+      "state_groups"
+    ],
+    "properties": {
+      "generic_decoder": {
+        "const": true
+      },
+      "state_groups": {
+        "const": false
+      }
     }
+}
   }
 }

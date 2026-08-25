@@ -34,6 +34,21 @@ gguf:
         size: 3685
         sha256: "238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8"
 
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "smollm-135m-f16-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 300000000
+  released_capabilities:
+    "0.14.1":
+      generic_decoder: true
+      state_groups: false
+    "0.15.2":
+      generic_decoder: true
+      state_groups: false
+
 inputs:
   prompts:
     - "Once upon a time,"

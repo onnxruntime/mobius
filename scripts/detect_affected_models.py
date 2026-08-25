@@ -35,15 +35,33 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _SRC_ROOT = _PROJECT_ROOT / "src" / "mobius"
 
 # ----------------------------------------------------------------
-# Shared infrastructure paths — any change triggers run_all.
-# Currently empty: core infra files (e.g. _configs.py, _registry.py)
-# are NOT under _TRACEABLE_PREFIXES and therefore classify as "other",
-# triggering no model tests. Add entries here to re-enable run_all for
-# specific paths when broader regression coverage is needed.
+# Shared graph/runtime infrastructure paths — any change triggers run_all.
+# This is intentionally limited to surfaces that can alter exported model
+# graphs, runtime metadata, tokenizer assets, or GGUF qtype handling.
 # ----------------------------------------------------------------
-_SHARED_INFRA_PATTERNS: tuple[str, ...] = ()
+_SHARED_INFRA_PATTERNS: tuple[str, ...] = (
+    "src/mobius/integrations/gguf/_runtime_evidence.py",
+    "src/mobius/integrations/gguf/_runtime_package.py",
+    "src/mobius/integrations/gguf/_tokenizer.py",
+    "src/mobius/integrations/gguf/_builder.py",
+    "src/mobius/integrations/gguf/_quant_registry.py",
+    "src/mobius/integrations/gguf/_repacker.py",
+    "src/mobius/integrations/gguf/_reader.py",
+    "src/mobius/_builder.py",
+    "src/mobius/_model_package.py",
+    "src/mobius/_optimizations.py",
+    "src/mobius/_weight_loading.py",
+    "tests/ort_genai_e2e_test.py",
+    "tests/gguf_small_model_runtime_integration_test.py",
+    "testdata/cases/schema.json",
+    ".github/workflows/ort_genai_e2e.yml",
+    "pyproject.toml",
+)
 
-_SHARED_INFRA_PREFIXES: tuple[str, ...] = ()
+_SHARED_INFRA_PREFIXES: tuple[str, ...] = (
+    "src/mobius/integrations/ort_genai/",
+    "src/mobius/tasks/",
+)
 
 # Traceable infrastructure: component files that are analyzed via the
 # import graph to find which models they actually affect, rather than
@@ -61,6 +79,11 @@ def classify_file(path: str) -> str:
     'test_config', 'golden_case', 'golden_data', 'test', 'other'.
     """
     normalized = path.replace("\\", "/")
+
+    if normalized in _SHARED_INFRA_PATTERNS:
+        return "shared_infra"
+    if any(normalized.startswith(prefix) for prefix in _SHARED_INFRA_PREFIXES):
+        return "shared_infra"
 
     if not normalized.startswith("src/mobius/"):
         # Test infrastructure files that affect all models
