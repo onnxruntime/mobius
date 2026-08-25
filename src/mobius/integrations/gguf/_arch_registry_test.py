@@ -67,7 +67,6 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "bert",
         "cohere2",
         "deci",
-        "deepseek4",
         "dflash",
         "dream",
         "eagle3",
@@ -154,7 +153,7 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 7
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 6
 
     def test_falcon_h1_is_not_a_generic_falcon_alias(self) -> None:
         """Falcon-H1 must fail before constructing the incompatible Falcon graph."""
@@ -626,6 +625,85 @@ class TestPinnedAudioCohort:
         assert all(verdict is Support.DEFERRED for verdict in spec.verdicts.values())
         with pytest.raises(UnsupportedGGUFArchitectureError):
             get_arch_spec(architecture)
+
+
+class TestPinnedRemainingHybridCohort:
+    """Pin C06 loader closure while refusing incompatible state/task ABIs."""
+
+    _ARCHITECTURES = (
+        "bailingmoe3",
+        "deepseek4",
+        "kimi-k3",
+        "kimi-linear",
+        "lfm2moe",
+    )
+    _EXPECTED_TENSOR_COUNTS: ClassVar[dict[str, int]] = {
+        "bailingmoe3": 41,
+        "deepseek4": 44,
+        "kimi-k3": 46,
+        "kimi-linear": 40,
+        "lfm2moe": 24,
+    }
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_loader_inventory_is_suffix_exact(self, architecture: str) -> None:
+        upstream = upstream_architectures()[architecture]
+        names = set(upstream.tensor_names)
+        assert len(names) == self._EXPECTED_TENSOR_COUNTS[architecture]
+        assert upstream.expert_tensor_suffixes == ("weight",)
+        assert all(name.endswith((".weight", ".bias", ".ssm_a")) for name in names)
+        assert not any(name.endswith((".scale", ".input_scale")) for name in names)
+
+    def test_conditional_tensor_representations_are_not_conflated(self) -> None:
+        bailing = set(upstream_architectures()["bailingmoe3"].tensor_names)
+        deepseek = set(upstream_architectures()["deepseek4"].tensor_names)
+        kimi_k3 = set(upstream_architectures()["kimi-k3"].tensor_names)
+        kimi_linear = set(upstream_architectures()["kimi-linear"].tensor_names)
+        lfm2moe = set(upstream_architectures()["lfm2moe"].tensor_names)
+
+        assert "blk.{bid}.nextn.eh_proj.weight" in bailing
+        assert "blk.{bid}.ffn_gate_tid2eid.weight" in deepseek
+        assert "blk.{bid}.indexer_compressor_kv.weight" in deepseek
+        assert "blk.{bid}.ffn_routed_down.weight" in kimi_k3
+        assert "blk.{bid}.attn_res_score.weight" in kimi_k3
+        assert "blk.{bid}.ssm_g_b.weight" in kimi_linear
+        assert "blk.{bid}.ssm_g_b.weight" not in kimi_k3
+        assert "blk.{bid}.shortconv.conv.weight" in lfm2moe
+        assert "blk.{bid}.ffn_gate_shexp.weight" not in lfm2moe
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_no_unpinned_alias_or_config_mutation_is_reachable(
+        self, architecture: str
+    ) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None
+        assert not spec.aliases
+        assert spec.model_type is None
+        assert spec.config_key_map is None
+        assert all(verdict is Support.DEFERRED for verdict in spec.verdicts.values())
+        assert architecture not in GGUF_ARCH_TO_MODEL_TYPE
+
+    @pytest.mark.parametrize(
+        ("architecture", "state_terms"),
+        [
+            ("bailingmoe3", ("convolution histories", "matrix state", "NextN")),
+            ("deepseek4", ("compressed-cache", "rollback", "ordinary KV")),
+            ("kimi-k3", ("matrix state", "latent MoE", "residual banks")),
+            ("kimi-linear", ("convolution histories", "matrix state", "correction-bias")),
+            ("lfm2moe", ("rolling convolution", "reorder", "rollback")),
+        ],
+    )
+    def test_state_and_schedule_mismatch_is_explicit(
+        self, architecture: str, state_terms: tuple[str, ...]
+    ) -> None:
+        reason = try_get_arch_spec(architecture).reason
+        assert reason is not None
+        for term in state_terms:
+            assert term in reason
+
+    def test_hugging_face_deepseek_v4_registration_remains_valid(self) -> None:
+        assert "deepseek_v4" in _REGISTRATIONS
+        assert try_get_arch_spec("deepseek4").model_type is None
 
 
 class TestRejectionsAreActionable:

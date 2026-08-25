@@ -154,12 +154,13 @@ reason.
 |---|---|---|---|---|
 | `arcee` | — | `arcee` | runtime deferred | supported |
 | `arwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `bailingmoe3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `bert` | — | `bert` | runtime deferred | supported |
 | `bloom` | — | `bloom` | tensor_map deferred | unreachable |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
 | `deci` | — | `llama` | supported | supported |
-| `deepseek4` | — | `deepseek_v4` | supported | supported |
+| `deepseek4` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `dflash` | — | `DFlashDraftModel` | runtime deferred | supported |
 | `dream` | — | `dream` | runtime deferred | supported |
 | `eagle3` | — | `Eagle3DraftModel` | runtime deferred | supported |
@@ -180,7 +181,10 @@ reason.
 | `jamba` | — | `jamba` | runtime deferred | rejected |
 | `jina-bert-v2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `jina-bert-v3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `kimi-k3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `kimi-linear` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `lfm2` | — | `lfm2` | runtime deferred | supported |
+| `lfm2moe` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `llada` | — | `llada` | runtime deferred | supported |
 | `llada-moe` | — | `llada` | runtime deferred | supported |
 | `llama` | `mistral` | `llama` | supported | supported |

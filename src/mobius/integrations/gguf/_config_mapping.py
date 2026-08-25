@@ -117,31 +117,6 @@ _MUSE_GLIMMER_KEY_MAP = {
     "attention.sliding_window": "sliding_window",
 }
 
-_DEEPSEEK4_KEY_MAP = {
-    "attention.key_length": "head_dim",
-    "rope.dimension_count": "qk_rope_head_dim",
-    "attention.q_lora_rank": "q_lora_rank",
-    "attention.sliding_window": "sliding_window",
-    "expert_count": "num_local_experts",
-    "expert_used_count": "num_experts_per_tok",
-    "expert_feed_forward_length": "moe_intermediate_size",
-    "expert_shared_count": "n_shared_experts",
-    "expert_weights_scale": "routed_scaling_factor",
-    "expert_weights_norm": "norm_topk_prob",
-    "swiglu_clamp_exp": "swiglu_limit",
-    "attention.indexer.head_count": "index_n_heads",
-    "attention.indexer.key_length": "index_head_dim",
-    "attention.indexer.top_k": "index_topk",
-    "attention.output_group_count": "o_groups",
-    "attention.output_lora_rank": "o_lora_rank",
-    "attention.compress_ratios": "compress_ratios",
-    "attention.compress_rope_freq_base": "compress_rope_theta",
-    "hyper_connection.count": "hc_mult",
-    "hyper_connection.sinkhorn_iterations": "hc_sinkhorn_iters",
-    "hyper_connection.epsilon": "hc_eps",
-    "hash_layer_count": "num_hash_layers",
-}
-
 # GLM-5.2 ('glm-dsa') shares DeepSeek's MLA + MoE + DSA-indexer metadata layout
 # but omits the DeepSeek-V4-only hyper-connection / hash-routing / output-group
 # extensions. Keep the map to the discriminating MLA/MoE/DSA keys only, so the
@@ -219,7 +194,6 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "draft": _DRAFT_KEY_MAP,
         "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
-        "deepseek4": _DEEPSEEK4_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
         "mamba": _MAMBA_KEY_MAP,
         "jamba": _JAMBA_KEY_MAP,

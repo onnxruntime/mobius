@@ -117,6 +117,46 @@ _NO_RWKV_GRAPH = (
     "the wrong recurrence. Build from a supported source/runtime instead."
 )
 
+_BAILINGMOE3_GRAPH_REASON = (
+    "BailingMoE3 alternates head-wise KDA recurrent layers with gated MLA layers, "
+    "so each sequence carries three causal-convolution histories plus a matrix state "
+    "alongside attention cache. Its routed sigmoid/correction-bias experts, always-on "
+    "shared experts, and optional single NextN block also require tensor and task "
+    "contracts Mobius does not implement. Ordinary KV or Mamba state would be wrong."
+)
+
+_DEEPSEEK4_GGUF_GRAPH_REASON = (
+    "The pinned DeepSeek-V4 GGUF runtime uses a dedicated raw sliding-window, CSA, "
+    "HCA, and indexer compressed-cache ABI with persistent compressor state, rollback "
+    "snapshots, four-stream hyper-connections, hash/sqrt-softplus routing, and optional "
+    "MTP storage. Mobius's Hugging Face DeepSeek-V4 graph intentionally exports a dense "
+    "attention fallback with ordinary KV state, so it is not an exact GGUF runtime graph."
+)
+
+_KIMI_K3_GRAPH_REASON = (
+    "Kimi-K3 alternates KDA recurrent and NoPE MLA layers and requires convolution plus "
+    "matrix state, sigmoid routed latent MoE with SiTU experts, optional shared experts, "
+    "and cross-layer residual banks. Kimi-Linear is not an alias: its gates, expert "
+    "activation, latent projections, and residual contract differ. Mobius has no exact "
+    "graph or mixed-state task for either ABI."
+)
+
+_KIMI_LINEAR_GRAPH_REASON = (
+    "Kimi-Linear alternates KDA recurrent and NoPE MLA layers, carrying three rolling "
+    "convolution histories and a per-head matrix state in addition to attention cache. "
+    "Its two-stage decay/output gates and sigmoid correction-bias MoE routing are not "
+    "represented by any Mobius graph or state task; aliasing it to Kimi-K3, Mamba, or "
+    "ordinary attention would change the model."
+)
+
+_LFM2MOE_GRAPH_REASON = (
+    "LFM2MoE has an arbitrary per-layer attention/short-convolution schedule plus a "
+    "dense-to-sigmoid-routed-MoE transition. Recurrent layers use F32 rolling convolution "
+    "state with copy-on-write sequence reorder and bounded rollback snapshots, while "
+    "attention layers use KV cache. The dense LFM2 graph and ordinary KV/static-cache "
+    "tasks do not own that mixed state or the expert correction-bias semantics."
+)
+
 _ENCODER_RUNTIME_VALIDATION_PENDING = (
     "Config extraction, exact pinned tensor closure, encoder-only task dispatch, and "
     "synthetic ORT execution are covered, but no pinned real GGUF artifact has passed "
@@ -573,6 +613,38 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
+        gguf_arch="bailingmoe3",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_BAILINGMOE3_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="kimi-k3",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_KIMI_K3_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="kimi-linear",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_KIMI_LINEAR_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="lfm2moe",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_LFM2MOE_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="minimax-01",
         config=Support.DEFERRED,
         tensor_map=Support.DEFERRED,
@@ -785,10 +857,11 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="deepseek4",
-        model_type="deepseek_v4",
-        tensor_map_recipe=("deepseek4",),
-        config_key_map="deepseek4",
-        rope_interleave=True,
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_DEEPSEEK4_GGUF_GRAPH_REASON,
     ),
     # GLM-5.2 GGUFs (e.g. unsloth/GLM-5.2-GGUF) tag the architecture 'glm-dsa'
     # (MLA + DeepSeek Sparse Attention + MoE) and mobius's registry key is

@@ -590,59 +590,6 @@ _LFM2_MAPPING: dict[str, str] = {
     "blk.{bid}.shortconv.out_proj": "model.layers.{bid}.conv.out_proj",
 }
 
-_DEEPSEEK4_MAPPING: dict[str, str] = {
-    "token_embd": "model.embed_tokens",
-    "output": "lm_head",
-    "output_norm": "model.norm",
-    "output_hc_fn": "model.hc_head_fn",
-    "output_hc_base": "model.hc_head_base@",
-    "output_hc_scale": "model.hc_head_scale@",
-    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
-    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
-    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
-    "blk.{bid}.attn_kv": "model.layers.{bid}.self_attn.kv_proj",
-    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_layernorm",
-    "blk.{bid}.attn_output_a": "model.layers.{bid}.self_attn.o_a_proj",
-    "blk.{bid}.attn_output_b": "model.layers.{bid}.self_attn.o_b_proj",
-    "blk.{bid}.attn_sinks": "model.layers.{bid}.self_attn.attn_sink@",
-    "blk.{bid}.attn_compressor_kv": "model.layers.{bid}.self_attn.compressor.wkv",
-    "blk.{bid}.attn_compressor_gate": "model.layers.{bid}.self_attn.compressor.wgate",
-    "blk.{bid}.attn_compressor_ape": "model.layers.{bid}.self_attn.compressor.ape@",
-    "blk.{bid}.attn_compressor_norm": "model.layers.{bid}.self_attn.compressor.norm",
-    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
-    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
-    "blk.{bid}.indexer_compressor_kv": ("model.layers.{bid}.self_attn.indexer.compressor.wkv"),
-    "blk.{bid}.indexer_compressor_gate": (
-        "model.layers.{bid}.self_attn.indexer.compressor.wgate"
-    ),
-    "blk.{bid}.indexer_compressor_ape": (
-        "model.layers.{bid}.self_attn.indexer.compressor.ape@"
-    ),
-    "blk.{bid}.indexer_compressor_norm": (
-        "model.layers.{bid}.self_attn.indexer.compressor.norm"
-    ),
-    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
-    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
-    # DeepSeekV4MoE now composes the shared MoELayer (mobius.components._moe),
-    # so the gate lives one level deeper at mlp.moe.gate.* than the bare
-    # mlp.gate.* used before the QMoE export change.
-    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.moe.gate",
-    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.moe.gate",
-    "blk.{bid}.ffn_gate_tid2eid": "model.layers.{bid}.mlp.moe.gate.tid2eid@",
-    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
-    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
-    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
-    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
-    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
-    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
-    "blk.{bid}.hc_attn_fn": "model.layers.{bid}.hc_attn_fn",
-    "blk.{bid}.hc_attn_base": "model.layers.{bid}.hc_attn_base@",
-    "blk.{bid}.hc_attn_scale": "model.layers.{bid}.hc_attn_scale@",
-    "blk.{bid}.hc_ffn_fn": "model.layers.{bid}.hc_ffn_fn",
-    "blk.{bid}.hc_ffn_base": "model.layers.{bid}.hc_ffn_base@",
-    "blk.{bid}.hc_ffn_scale": "model.layers.{bid}.hc_ffn_scale@",
-}
-
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -709,7 +656,6 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "bert": _BERT_MAPPING,
         "modern_bert": _MODERN_BERT_MAPPING,
         "t5": _T5_MAPPING,
-        "deepseek4": _DEEPSEEK4_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,
         "gemma4_extras": _GEMMA4_EXTRAS,
