@@ -48,9 +48,10 @@ def test_generated_census_counts_and_pin_are_closed() -> None:
 
 
 def test_runtime_support_requires_structured_evidence() -> None:
-    # Architecture evidence is not yet represented as structured records, so no
-    # architecture may claim runtime support by inheriting a permissive default.
-    assert all(spec.runtime is not Support.SUPPORTED for spec in iter_arch_specs())
+    supported = [spec for spec in iter_arch_specs() if spec.runtime is Support.SUPPORTED]
+    assert [(spec.gguf_arch, spec.runtime_evidence_ids) for spec in supported] == [
+        ("llama", ("smollm-135m-f16-onnxruntime-1.29.0",))
+    ]
 
     pins = {pin.artifact_id for pin in MMPROJ_ARTIFACT_PINS}
     for spec in iter_projector_specs():

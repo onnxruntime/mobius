@@ -5,12 +5,22 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
-from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+from mobius.integrations.gguf import _tokenizer
+from mobius.integrations.gguf._tokenizer import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
+    inspect_gguf_tokenizer,
+    materialize_gguf_tokenizer,
+)
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 
 _PINNED_PRE_IDENTIFIERS = (
@@ -324,3 +334,296 @@ def test_write_exact_tokenizer_assets_removes_stale_default_template(tmp_path: P
     write_gguf_tokenizer_json(source, output)
 
     assert not stale.exists()
+
+
+def _pinned_payloads(metadata: dict) -> dict[str, bytes]:
+    tokenizer = json.loads(_tokenizer_json(metadata["tokenizer.ggml.tokens"]))
+    tokenizer["model"]["merges"] = metadata["tokenizer.ggml.merges"]
+    tokenizer["normalizer"] = None
+    tokenizer["pre_tokenizer"] = {
+        "type": "Sequence",
+        "pretokenizers": [
+            {"type": "Digits", "individual_digits": True},
+            {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": True,
+                "use_regex": True,
+            },
+        ],
+    }
+    tokenizer["post_processor"] = None
+    tokenizer["decoder"] = {
+        "type": "ByteLevel",
+        "add_prefix_space": True,
+        "trim_offsets": True,
+        "use_regex": True,
+    }
+    tokenizer["added_tokens"] = [
+        {
+            "id": index,
+            "content": token,
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+        for index, (token, token_type) in enumerate(
+            zip(
+                metadata["tokenizer.ggml.tokens"],
+                metadata["tokenizer.ggml.token_type"],
+                strict=True,
+            )
+        )
+        if token_type in {2, 3}
+    ]
+    config = {
+        "bos_token": metadata["tokenizer.ggml.tokens"][
+            metadata["tokenizer.ggml.bos_token_id"]
+        ],
+        "eos_token": metadata["tokenizer.ggml.tokens"][
+            metadata["tokenizer.ggml.eos_token_id"]
+        ],
+        "unk_token": metadata["tokenizer.ggml.tokens"][
+            metadata["tokenizer.ggml.unknown_token_id"]
+        ],
+        "pad_token": metadata["tokenizer.ggml.tokens"][
+            metadata["tokenizer.ggml.padding_token_id"]
+        ],
+        "add_bos_token": metadata["tokenizer.ggml.add_bos_token"],
+        "add_eos_token": metadata["tokenizer.ggml.add_eos_token"],
+    }
+    return {
+        "special_tokens_map.json": json.dumps(
+            {name: value for name, value in config.items() if name.endswith("_token")}
+        ).encode(),
+        "tokenizer.json": json.dumps(tokenizer).encode(),
+        "tokenizer_config.json": json.dumps(config).encode(),
+    }
+
+
+def _pinned_source(metadata: dict, payloads: dict[str, bytes]) -> GGUFTokenizerSource:
+    verdict = inspect_gguf_tokenizer(metadata, require_complete=True)
+    return GGUFTokenizerSource(
+        repository="owner/tokenizer",
+        revision="a" * 40,
+        metadata_sha256=str(verdict.metadata_sha256),
+        assets=tuple(
+            GGUFTokenizerAsset(name, len(payload), hashlib.sha256(payload).hexdigest())
+            for name, payload in sorted(payloads.items())
+        ),
+    )
+
+
+def test_pinned_source_rejects_mutable_revision_and_duplicate_assets() -> None:
+    asset = GGUFTokenizerAsset("tokenizer.json", 2, hashlib.sha256(b"{}").hexdigest())
+    with pytest.raises(ValueError, match="immutable 40-hex"):
+        GGUFTokenizerSource("owner/tokenizer", "main", (asset,), "a" * 64)
+    for repository in ("owner/", "/tokenizer"):
+        with pytest.raises(ValueError, match="owner/repository"):
+            GGUFTokenizerSource(repository, "a" * 40, (asset,), "a" * 64)
+    with pytest.raises(ValueError, match="duplicate asset"):
+        GGUFTokenizerSource("owner/tokenizer", "a" * 40, (asset, asset), "a" * 64)
+
+
+def test_pinned_source_missing_tokenizer_json_rejects() -> None:
+    payload = b"{}"
+    asset = GGUFTokenizerAsset(
+        "tokenizer_config.json", len(payload), hashlib.sha256(payload).hexdigest()
+    )
+    with pytest.raises(ValueError, match=r"must include tokenizer\.json"):
+        GGUFTokenizerSource("owner/tokenizer", "a" * 40, (asset,), "a" * 64)
+
+
+def test_missing_pinned_hub_asset_leaves_no_output(tmp_path: Path, monkeypatch) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    source = _pinned_source(metadata, payloads)
+    monkeypatch.setattr(
+        "huggingface_hub.hf_hub_download",
+        mock.Mock(side_effect=FileNotFoundError("missing tokenizer asset")),
+    )
+    output = tmp_path / "output"
+
+    with pytest.raises(FileNotFoundError, match="missing tokenizer asset"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+            local_files_only=True,
+        )
+
+    assert not output.exists()
+
+
+def test_tokenizer_evidence_metadata_mismatch_rejects_before_download(
+    tmp_path: Path, monkeypatch
+) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    source = _pinned_source(metadata, payloads)
+    source = GGUFTokenizerSource(
+        source.repository,
+        source.revision,
+        source.assets,
+        "b" * 64,
+    )
+    download = mock.Mock()
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", download)
+
+    with pytest.raises(ValueError, match="does not match GGUF tokenizer metadata"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            tmp_path / "output",
+            source=source,
+            metadata=metadata,
+        )
+
+    download.assert_not_called()
+
+
+def test_semantic_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    config = json.loads(payloads["tokenizer_config.json"])
+    config["bos_token"] = "<eos>"
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+    source = _pinned_source(metadata, payloads)
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="bos_token id differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+        )
+
+    assert not output.exists()
+
+
+def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"]["pretokenizers"].reverse()
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    source = _pinned_source(metadata, payloads)
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+        )
+
+    assert not output.exists()
+
+
+def test_post_processor_cannot_hide_matching_special_token_flags(
+    tmp_path: Path, monkeypatch
+) -> None:
+    metadata = _metadata(pre="smollm")
+    payloads = _pinned_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["post_processor"] = {
+        "type": "TemplateProcessing",
+        "single": [{"SpecialToken": {"id": "<bos>", "type_id": 0}}],
+        "pair": [{"Sequence": {"id": "A", "type_id": 0}}],
+        "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}},
+    }
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    source = _pinned_source(metadata, payloads)
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            tmp_path / "output",
+            source=source,
+            metadata=metadata,
+        )
+
+
+def test_cross_host_asset_request_strips_auth_and_rejects_redirect(monkeypatch) -> None:
+    payload = b"{}"
+    source = GGUFTokenizerSource(
+        "owner/tokenizer",
+        "a" * 40,
+        (
+            GGUFTokenizerAsset(
+                "tokenizer.json", len(payload), hashlib.sha256(payload).hexdigest()
+            ),
+        ),
+        "b" * 64,
+    )
+    response = SimpleNamespace(status_code=302)
+    response.raise_for_status = lambda: None
+    seen_headers: dict[str, str] = {}
+
+    class _Stream:
+        def __enter__(self):
+            return response
+
+        def __exit__(self, *_args):
+            return None
+
+    class _Session:
+        def stream(self, _method, _url, *, headers, follow_redirects):
+            assert follow_redirects is False
+            seen_headers.update(headers)
+            return _Stream()
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_url", lambda *_a, **_k: "https://hub/a")
+    monkeypatch.setattr(
+        "huggingface_hub.get_hf_file_metadata",
+        lambda _url: SimpleNamespace(
+            commit_hash="a" * 40,
+            location="https://cdn/tokenizer.json",
+        ),
+    )
+    monkeypatch.setattr("huggingface_hub.get_session", lambda: _Session())
+    monkeypatch.setattr(
+        "huggingface_hub.utils.build_hf_headers",
+        lambda: {"Authorization": "Bearer secret", "user-agent": "test"},
+    )
+
+    with pytest.raises(ValueError, match="redirected after authorization policy"):
+        _tokenizer._download_tokenizer_assets(source, local_files_only=False)
+
+    assert not {name for name in seen_headers if name.lower() == "authorization"}
+
+
+def test_local_asset_replacement_during_read_rejects(tmp_path: Path) -> None:
+    path = tmp_path / "tokenizer.json"
+    payload = b"{}"
+    path.write_bytes(payload)
+    expected = GGUFTokenizerAsset(
+        "tokenizer.json", len(payload), hashlib.sha256(payload).hexdigest()
+    )
+    first = path.stat()
+    changed = os.stat_result(
+        (
+            first.st_mode,
+            first.st_ino + 1,
+            first.st_dev,
+            first.st_nlink,
+            first.st_uid,
+            first.st_gid,
+            first.st_size,
+            first.st_atime,
+            first.st_mtime,
+            first.st_ctime,
+        )
+    )
+    with (
+        mock.patch.object(_tokenizer.os, "fstat", side_effect=[first, changed]),
+        pytest.raises(ValueError, match="changed while it was being read"),
+    ):
+        _tokenizer._read_regular_file(path, expected=expected)

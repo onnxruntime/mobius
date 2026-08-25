@@ -1040,14 +1040,14 @@ class TestCLIBuildRuntime:
 class TestCLIBuildGGUF:
     """The CLI must preserve the public GGUF architecture gate for every mode."""
 
-    def test_runtime_deferred_graph_architecture_fails_before_output_creation(
+    def test_runtime_requires_explicit_pinned_tokenizer_before_output_creation(
         self, tmp_path: Path
     ) -> None:
         gguf_path = tmp_path / "llama.gguf"
         output_dir = tmp_path / "must-not-exist"
         _write_gated_gguf(gguf_path, architecture="llama", quantized=False)
 
-        with pytest.raises(SystemExit, match=r"runtime packaging for 'llama' is deferred"):
+        with pytest.raises(SystemExit, match="requires --tokenizer-repository"):
             main(
                 [
                     "build-gguf",
@@ -1056,6 +1056,34 @@ class TestCLIBuildGGUF:
                     str(output_dir),
                     "--runtime",
                     "onnx-genai",
+                    "--dequantize",
+                ]
+            )
+
+        assert not output_dir.exists()
+
+    def test_runtime_rejects_mutable_tokenizer_revision_before_build(
+        self, tmp_path: Path
+    ) -> None:
+        gguf_path = tmp_path / "llama.gguf"
+        output_dir = tmp_path / "must-not-exist"
+        _write_gated_gguf(gguf_path, architecture="llama", quantized=False)
+
+        with pytest.raises(SystemExit, match="immutable 40-hex"):
+            main(
+                [
+                    "build-gguf",
+                    str(gguf_path),
+                    "--output",
+                    str(output_dir),
+                    "--runtime",
+                    "onnx-genai",
+                    "--runtime-version",
+                    "1.29.0",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "main",
                     "--dequantize",
                 ]
             )

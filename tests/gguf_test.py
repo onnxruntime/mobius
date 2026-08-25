@@ -608,10 +608,6 @@ class TestCLIBuildGGUF:
                 ),
             ),
             mock.patch(
-                "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
-                return_value=mock.Mock(materialized=True),
-            ),
-            mock.patch(
                 "mobius.integrations.gguf.build_from_gguf",
                 return_value=package,
             ),
@@ -628,6 +624,10 @@ class TestCLIBuildGGUF:
                     str(output_dir),
                     "--runtime",
                     "ort-genai",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "a" * 40,
                 ]
             )
 
@@ -637,12 +637,15 @@ class TestCLIBuildGGUF:
             str(output_dir),
             runtime="ort-genai",
             runtime_version=None,
+            tokenizer_repository="owner/tokenizer",
+            tokenizer_revision="a" * 40,
+            local_files_only=False,
             external_data="onnx",
             max_shard_size_bytes=None,
             max_workers=8,
         )
 
-    def test_deferred_runtime_tokenizer_fails_before_graph_or_output(self, tmp_path):
+    def test_runtime_without_pinned_tokenizer_fails_before_graph_or_output(self, tmp_path):
         from mobius.__main__ import main
         from mobius.integrations.gguf._spec import Support
 
@@ -665,14 +668,8 @@ class TestCLIBuildGGUF:
                     reason=None,
                 ),
             ),
-            mock.patch(
-                "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
-                return_value=mock.Mock(
-                    materialized=False, reason="opaque pre-tokenizer is deferred"
-                ),
-            ),
             mock.patch("mobius.integrations.gguf.build_from_gguf") as build,
-            pytest.raises(SystemExit, match="opaque pre-tokenizer is deferred"),
+            pytest.raises(SystemExit, match="requires --tokenizer-repository"),
         ):
             main(
                 [

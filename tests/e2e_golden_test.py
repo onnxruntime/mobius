@@ -3023,6 +3023,7 @@ class TestL5GenerationE2E:
         expected_token_ids = load_generation_golden(case)
         if expected_token_ids is None:
             pytest.skip(f"Generation golden file missing: {gen_path}")
+        _assert_gguf_golden_provenance(case, gen_path)
 
         tolerances = load_tolerances("L5", case.dtype)
         # Per-case tolerance override (e.g. VL multi-model pipeline has known

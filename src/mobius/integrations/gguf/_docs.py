@@ -100,8 +100,8 @@ def _summary() -> str:
             (
                 f"| Tokenizer pre identifiers | {len(tokenizers)} | "
                 f"{len({policy.canonical for policy in tokenizers.values()})} semantic groups; "
-                "all default to deferred and become exact-copy only with a validated embedded "
-                "`tokenizer.huggingface.json` |"
+                "all default to deferred and become materializable only from a validated embedded "
+                "`tokenizer.huggingface.json` or an exact pinned source in runtime evidence |"
             ),
             "",
             (
@@ -111,8 +111,9 @@ def _summary() -> str:
                 "construction/execution only; runtime support additionally requires a pinned real "
                 "artifact, independent parity, and deterministic generation or stateful semantics. "
                 "Tokenizer `copy` delegates algorithm semantics to an embedded, "
-                "vocabulary-identical tokenizer JSON; it is not a reconstructed or independently "
-                "proven tokenizer."
+                "vocabulary-identical tokenizer JSON. A `pinned-source` route additionally binds "
+                "an immutable Hub revision, exact asset hashes, and all reconstructible GGUF "
+                "tokenizer semantics."
             ),
         )
     )

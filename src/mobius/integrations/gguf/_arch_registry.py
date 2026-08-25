@@ -679,8 +679,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
         llama_qk_permute=True,
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("smollm-135m-f16-onnxruntime-1.29.0",),
+        reason=(
+            "Runtime support is restricted to exact structured evidence matches. Currently "
+            "that is only neopolita/smollm-135m-gguf F16 at the pinned artifact, CPU import "
+            "route, ONNX Runtime 1.29.0, and HuggingFaceTB/SmolLM-135M tokenizer revision."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="deci",

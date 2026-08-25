@@ -15,12 +15,12 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 2, 'supported': 57}; importable: 55; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 145, 'rejected': 2} |
+| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 2, 'supported': 57}; importable: 55; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
-| Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become exact-copy only with a validated embedded `tokenizer.huggingface.json` |
+| Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
 
-`SUPPORTED` means the named capability is implemented and mechanically tested. `DEFERRED` means it is intentionally unavailable pending the stated work. `REJECTED` means the input or route is invalid by policy. Graph support proves construction/execution only; runtime support additionally requires a pinned real artifact, independent parity, and deterministic generation or stateful semantics. Tokenizer `copy` delegates algorithm semantics to an embedded, vocabulary-identical tokenizer JSON; it is not a reconstructed or independently proven tokenizer.
+`SUPPORTED` means the named capability is implemented and mechanically tested. `DEFERRED` means it is intentionally unavailable pending the stated work. `REJECTED` means the input or route is invalid by policy. Graph support proves construction/execution only; runtime support additionally requires a pinned real artifact, independent parity, and deterministic generation or stateful semantics. Tokenizer `copy` delegates algorithm semantics to an embedded, vocabulary-identical tokenizer JSON. A `pinned-source` route additionally binds an immutable Hub revision, exact asset hashes, and all reconstructible GGUF tokenizer semantics.
 
 <!-- END GGUF CLOSURE SUMMARY -->
 
@@ -31,21 +31,20 @@ normally stores only an opaque `tokenizer.ggml.pre` identifier, not the full
 normalizer, pre-tokenizer, added-token, decoder, and post-processor pipeline.
 Mobius never substitutes a generic BPE/SentencePiece tokenizer.
 
-The only materialized route is `copy`: the GGUF must contain
-`tokenizer.huggingface.json`, and its loadable ordered vocabulary must exactly
-match `tokenizer.ggml.tokens`. Mobius copies that tokenizer pipeline verbatim
-rather than claiming to reconstruct its opaque `pre` semantics, then writes
-`tokenizer_config.json`, `special_tokens_map.json`, and a provenance manifest.
-Otherwise the route is `deferred`: graph-only import remains available, while
-runtime packaging rejects incomplete metadata before durable output. Unknown
-identifiers and malformed or contradictory complete tokenizer tables reject
-before graph construction.
+The `copy` route requires `tokenizer.huggingface.json` in the GGUF and an exact
+ordered-vocabulary match. The `pinned-source` route is narrower: a runtime evidence
+record names one immutable Hub revision and every copied asset's size and SHA-256.
+Mobius additionally compares ordered token IDs, merge order, special-token IDs,
+flags, and chat templates against all corresponding GGUF metadata. The remaining
+normalizer, pre-tokenizer, decoder, and post-processor semantics are accepted only
+through those exact asset hashes, never reconstructed from `tokenizer.ggml.pre`.
+Any missing or contradictory field rejects before durable output.
 
 The graph package records a canonical digest of every tokenizer metadata field.
 Runtime packaging rechecks that digest before writing, so replacing a local
 GGUF between graph construction and package emission cannot mix tokenizer
-identity. The manifest reports ORT tokenizer compatibility as delegated to the
-embedded tokenizer JSON rather than claiming independent algorithm parity.
+identity. The manifest records the selected route, immutable source revision,
+asset hashes, and GGUF tokenizer metadata hash.
 
 This generated policy table is pinned to llama.cpp commit
 `8d9af256337d1a501250f9bbf4c0859a654bddd6`. It enumerates all 87 accepted
@@ -305,13 +304,11 @@ validated embedding owner, but Mobius never invents a second head or silently
 drops an explicit conflicting output.
 
 Complete runtime packages are staged in a sibling temporary directory and
-replace the destination with rollback on an ordinary in-process publication
-failure. Replacement uses separate destination-to-backup and stage-to-destination
-renames: readers can briefly observe no destination, and a process or host crash
-between them requires manual recovery from the sibling backup. This is not a
-single-step atomic exchange, crash-durable transaction, or multi-process lock;
-callers must serialize concurrent writers. The source tokenizer digest is
-rechecked before publication. Publication also requires the exact runtime
+published with one atomic rename. An existing destination is rejected rather
+than moved aside, so readers never observe a replacement gap or mixed package.
+This is not a multi-process lock; callers racing to the same absent destination
+must handle one publication failure. The source tokenizer digest is rechecked
+before publication. Publication also requires the exact runtime
 version from the evidence record and rechecks the source filename, size, SHA-256,
 canonical architecture, tensor/qtype census, and complete graph-shaping import
 route captured during construction. The serialized ONNX file list and graph
@@ -421,7 +418,7 @@ before graph construction or durable output.
 | `lfm2moe` | — | model=`lfm2_moe`; tensor=`lfm2`+`lfm2_moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
 | `llada` | — | model=`llada`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, suffix-exact tensor closure, masked-diffusion task dispatch, and synthetic full-sequence execution are covered, but no pinned real GGUF has passed independent Hugging Face/llama.cpp masked-step logit parity and deterministic multi-step generation parity. Runtime packaging remains deferred until both exist. |
 | `llada-moe` | — | model=`llada`; module=`llada_moe`; tensor=`llama`+`diffusion_fused_qkv`+`moe_qk_norm_extras`+`moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, suffix-exact tensor closure, masked-diffusion task dispatch, and synthetic full-sequence execution are covered, but no pinned real GGUF has passed independent Hugging Face/llama.cpp masked-step logit parity and deterministic multi-step generation parity. Runtime packaging remains deferred until both exist. |
-| `llama` | `mistral` | model=`llama`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
+| `llama` | `mistral` | model=`llama`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=supported; quantized_import=supported | Runtime support is restricted to exact structured evidence matches. Currently that is only neopolita/smollm-135m-gguf F16 at the pinned artifact, CPU import route, ONNX Runtime 1.29.0, and HuggingFaceTB/SmolLM-135M tokenizer revision. |
 | `llama-embed` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | llama-embed is a canonical embedding architecture that inherits Llama's conditional tensor loader but exposes the embedding graph rather than causal logits. Mobius has no GGUF embedding task/package contract for this ID, so it must not alias ordinary llama. |
 | `llama4` | — | none (fails before config extraction) | exact-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Llama4 GGUF is the text member of a paired multimodal package and may contain routed experts and architecture-specific cross-modal layer scheduling. The llama4 clip vision tower, token mixing, position IDs, and package ABI remain deferred; text-backbone similarity is not evidence that the complete GGUF tensor closure is owned. |
 | `maincoder` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Maincoder applies Q/K RMSNorm after RoPE and uses an exact tied-output QK-normalized SwiGLU closure. Existing generic QK-normalized graphs use different ordering, so a family alias would change attention. |

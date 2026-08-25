@@ -88,7 +88,8 @@
         "tensor_qtypes",
         "execution_provider",
         "config_sha256",
-        "preserve_quantization"
+        "preserve_quantization",
+        "tokenizer"
       ],
       "properties": {
         "repository": {
@@ -153,6 +154,110 @@
           "type": "boolean",
           "default": true,
           "description": "Whether to preserve supported GGUF quantization."
+        },
+        "tokenizer": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "repository",
+            "revision",
+            "metadata_sha256",
+            "assets",
+            "identity_status"
+          ],
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "identity_status": {
+                    "const": "rejected"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "rejection_reason"
+                ]
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "rejection_reason"
+                  ]
+                }
+              }
+            }
+          ],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "pattern": "^[^/]+/[^/]+$"
+            },
+            "revision": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "metadata_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "assets": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "filename": {
+                    "const": "tokenizer.json"
+                  }
+                },
+                "required": [
+                  "filename"
+                ]
+              },
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "filename",
+                  "size",
+                  "sha256"
+                ],
+                "properties": {
+                  "filename": {
+                    "type": "string",
+                    "enum": [
+                      "added_tokens.json",
+                      "chat_template.jinja",
+                      "special_tokens_map.json",
+                      "tokenizer.json",
+                      "tokenizer_config.json"
+                    ]
+                  },
+                  "size": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                }
+              }
+            },
+            "identity_status": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "rejected"
+              ]
+            },
+            "rejection_reason": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
         }
       },
       "description": "Pinned GGUF import source. The top-level model_id remains the independent HuggingFace reference."

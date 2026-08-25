@@ -29,7 +29,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from mobius import ModelPackage
 from mobius.__main__ import main
+from mobius.integrations.gguf import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
+    materialize_gguf_tokenizer,
+    write_gguf_runtime_package,
+)
 from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
 
 
 @dataclass(frozen=True)
@@ -46,6 +53,11 @@ class _RuntimeCase:
     tensor_qtypes: dict[str, int]
     config_sha256: str
     generated_tokens: tuple[int, ...]
+    tokenizer_repository: str
+    tokenizer_revision: str
+    tokenizer_metadata_sha256: str
+    tokenizer_assets: tuple[tuple[str, int, str], ...]
+    tokenizer_identity_exact: bool
 
 
 _CASES = (
@@ -83,6 +95,29 @@ _CASES = (
             2428,
             30,
         ),
+        tokenizer_repository="HuggingFaceTB/SmolLM-135M",
+        tokenizer_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
+        tokenizer_metadata_sha256=(
+            "46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc"
+        ),
+        tokenizer_assets=(
+            (
+                "special_tokens_map.json",
+                831,
+                "e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3",
+            ),
+            (
+                "tokenizer.json",
+                2_104_556,
+                "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+            ),
+            (
+                "tokenizer_config.json",
+                3_685,
+                "238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8",
+            ),
+        ),
+        tokenizer_identity_exact=True,
     ),
     _RuntimeCase(
         name="smollm2-135m-instruct-f16",
@@ -118,6 +153,29 @@ _CASES = (
             253,
             9154,
         ),
+        tokenizer_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
+        tokenizer_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
+        tokenizer_metadata_sha256=(
+            "cb0b637d59effdc3ab02f063039e597157fa4996663848cc2178510af5880ace"
+        ),
+        tokenizer_assets=(
+            (
+                "special_tokens_map.json",
+                655,
+                "2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52",
+            ),
+            (
+                "tokenizer.json",
+                2_104_556,
+                "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+            ),
+            (
+                "tokenizer_config.json",
+                3_764,
+                "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df",
+            ),
+        ),
+        tokenizer_identity_exact=False,
     ),
 )
 
@@ -186,6 +244,16 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
     gguf_model = GGUFModel(gguf_path)
     qtypes = Counter(qtype.name for _, _, qtype, _ in gguf_model.tensor_items_raw())
     assert dict(sorted(qtypes.items())) == case.tensor_qtypes
+    for filename, size, sha256 in case.tokenizer_assets:
+        asset_path = Path(
+            hf_hub_download(
+                repo_id=case.tokenizer_repository,
+                revision=case.tokenizer_revision,
+                filename=filename,
+            )
+        )
+        assert asset_path.stat().st_size == size
+        assert _sha256(asset_path) == sha256
 
     output_dir = tmp_path / case.name
     captured: list[ModelPackage] = []
@@ -196,18 +264,31 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
         original_save(package, *args, **kwargs)
 
     with mock.patch.object(ModelPackage, "save", capture_save):
-        main(
-            [
-                "build-gguf",
-                str(gguf_path),
-                "--output",
-                str(output_dir),
-                "--dtype",
-                "f32",
-                "--execution-provider",
-                "cpu",
-            ]
-        )
+        options = [
+            "build-gguf",
+            str(gguf_path),
+            "--output",
+            str(output_dir),
+            "--dtype",
+            "f32",
+            "--execution-provider",
+            "cpu",
+        ]
+        if case.tokenizer_identity_exact:
+            options.extend(
+                [
+                    "--runtime",
+                    "onnx-genai",
+                    "--runtime-version",
+                    "1.29.0",
+                    "--tokenizer-repository",
+                    case.tokenizer_repository,
+                    "--tokenizer-revision",
+                    case.tokenizer_revision,
+                    "--local-files-only",
+                ]
+            )
+        main(options)
 
     assert len(captured) == 1
     route = json.loads(captured[0].gguf_import_route)
@@ -236,10 +317,7 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
     }
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
-    assert sorted(path.name for path in output_dir.iterdir()) == [
-        "model.onnx",
-        "model.onnx.data",
-    ]
+    assert {"model.onnx", "model.onnx.data"} <= {path.name for path in output_dir.iterdir()}
     session = ort.InferenceSession(
         str(output_dir / "model.onnx"), providers=["CPUExecutionProvider"]
     )
@@ -252,6 +330,43 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
     tokenizer = AutoTokenizer.from_pretrained(
         case.reference_repository, revision=case.reference_revision
     )
+    if case.tokenizer_identity_exact:
+        packaged_tokenizer = AutoTokenizer.from_pretrained(output_dir, local_files_only=True)
+        assert packaged_tokenizer(case.prompt).input_ids == tokenizer(case.prompt).input_ids
+    else:
+        rejected_package = tmp_path / f"{case.name}-runtime"
+        with pytest.raises(ValueError, match="No unique GGUF runtime evidence"):
+            write_gguf_runtime_package(
+                captured[0],
+                gguf_path,
+                rejected_package,
+                runtime="onnx-genai",
+                runtime_version="1.29.0",
+                tokenizer_repository=case.tokenizer_repository,
+                tokenizer_revision=case.tokenizer_revision,
+                local_files_only=True,
+            )
+        assert not rejected_package.exists()
+        source = GGUFTokenizerSource(
+            repository=case.tokenizer_repository,
+            revision=case.tokenizer_revision,
+            metadata_sha256=case.tokenizer_metadata_sha256,
+            assets=tuple(GGUFTokenizerAsset(*asset) for asset in case.tokenizer_assets),
+        )
+        rejected_output = tmp_path / f"{case.name}-tokenizer"
+        assert (
+            inspect_gguf_tokenizer(gguf_model.metadata, require_complete=True).metadata_sha256
+            == case.tokenizer_metadata_sha256
+        )
+        with pytest.raises(ValueError, match="pad_token id differs from GGUF"):
+            materialize_gguf_tokenizer(
+                gguf_path,
+                rejected_output,
+                source=source,
+                metadata=gguf_model.metadata,
+                local_files_only=True,
+            )
+        assert not rejected_output.exists()
     reference = AutoModelForCausalLM.from_pretrained(
         case.reference_repository,
         revision=case.reference_revision,
