@@ -245,6 +245,39 @@ _MAMBA2_MAPPING: dict[str, str] = {
     "blk.{bid}.ssm_norm": "backbone.layers.{bid}.mixer.norm",
 }
 
+_BERT_MAPPING: dict[str, str] = {
+    "token_embd": "bert.embeddings.word_embeddings",
+    "position_embd": "bert.embeddings.position_embeddings",
+    "token_types": "bert.embeddings.token_type_embeddings",
+    "token_embd_norm": "bert.embeddings.LayerNorm",
+    "cls": "bert.pooler.dense",
+    "cls_out": "classifier",
+    "blk.{bid}.attn_qkv": "bert.encoder.layer.{bid}.attention.self.qkv",
+    "blk.{bid}.attn_q": "bert.encoder.layer.{bid}.attention.self.query",
+    "blk.{bid}.attn_k": "bert.encoder.layer.{bid}.attention.self.key",
+    "blk.{bid}.attn_v": "bert.encoder.layer.{bid}.attention.self.value",
+    "blk.{bid}.attn_output": "bert.encoder.layer.{bid}.attention.output.dense",
+    "blk.{bid}.attn_output_norm": "bert.encoder.layer.{bid}.attention.output.LayerNorm",
+    "blk.{bid}.ffn_up": "bert.encoder.layer.{bid}.intermediate.dense",
+    "blk.{bid}.ffn_down": "bert.encoder.layer.{bid}.output.dense",
+    "blk.{bid}.layer_output_norm": "bert.encoder.layer.{bid}.output.LayerNorm",
+}
+
+_MODERN_BERT_MAPPING: dict[str, str] = {
+    "token_embd": "model.embeddings.tok_embeddings",
+    "token_embd_norm": "model.embeddings.norm",
+    "output_norm": "model.final_norm",
+    "cls": "head.dense",
+    "cls_norm": "head.norm",
+    "cls_out": "classifier",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.attn_norm",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.attn.Wqkv",
+    "blk.{bid}.attn_output": "model.layers.{bid}.attn.Wo",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.Wi",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.Wo",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.mlp_norm",
+}
+
 _RECURRENT_SUFFIXES: dict[str, dict[str, frozenset[str]]] = {
     "mamba": {
         "token_embd": frozenset({".weight", ".scale", ".input_scale"}),
@@ -425,6 +458,8 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "gpt2": _GPT2_MAPPING,
         "mamba": _MAMBA_MAPPING,
         "mamba2": _MAMBA2_MAPPING,
+        "bert": _BERT_MAPPING,
+        "modern_bert": _MODERN_BERT_MAPPING,
         "deepseek4": _DEEPSEEK4_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,

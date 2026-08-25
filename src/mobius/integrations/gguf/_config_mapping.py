@@ -77,6 +77,7 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "rope.dimension_count": "head_dim",
     "attention.sliding_window": "sliding_window",
     "logit_scale": "logit_scale",
+    "hidden_activation": "hidden_act",
     # MoE fields
     "expert_count": "num_local_experts",
     "expert_used_count": "num_experts_per_tok",
@@ -1342,6 +1343,78 @@ def _mamba2_postprocess(
     return result
 
 
+def _validate_encoder_metadata(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    arch: str,
+) -> None:
+    """Validate metadata that changes an encoder's externally visible contract."""
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(
+            f"{arch} GGUF grouped-query attention is not supported: "
+            f"attention.head_count={config.num_attention_heads}, "
+            f"attention.head_count_kv={config.num_key_value_heads}"
+        )
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false for encoder import")
+    # llama_hparams defaults omitted pooling metadata to NONE.
+    pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
+    if pooling_type != 0:
+        raise ValueError(
+            f"{arch}.pooling_type={pooling_type} requests pooled/reranker output, but "
+            "Mobius currently exports token embeddings only (pooling_type=NONE/0)"
+        )
+    labels = metadata.get(f"{arch}.classifier.output_labels")
+    if labels:
+        raise ValueError(
+            f"{arch}.classifier.output_labels declares a classifier head, but the "
+            "feature-extraction graph exports token embeddings only"
+        )
+
+
+def _bert_encoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Apply pinned BERT defaults and tokenizer-owned token-type metadata."""
+    _validate_encoder_metadata(config, metadata, "bert")
+    token_types = metadata.get("tokenizer.ggml.token_type_count")
+    if token_types is None or int(token_types) <= 0:
+        raise ValueError(
+            "BERT GGUF requires tokenizer.ggml.token_type_count > 0 for token-type embeddings"
+        )
+    config.type_vocab_size = int(token_types)
+    config.hidden_act = "gelu"
+    config.rope_type = None
+    config.attn_qkv_bias = _infer_attn_qkv_bias(model)
+    config.attn_o_bias = _infer_attn_o_bias(model)
+    config.mlp_bias = _infer_mlp_bias(model)
+    return config
+
+
+def _modern_bert_encoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Apply pinned ModernBERT bias-free GeGLU/RoPE semantics."""
+    _validate_encoder_metadata(config, metadata, "modern-bert")
+    del model
+    sliding_window = int(metadata.get("modern-bert.attention.sliding_window", 0))
+    if sliding_window:
+        raise ValueError(
+            "modern-bert GGUF requests symmetric sliding-window attention "
+            f"(window={sliding_window}), which the current encoder graph does not implement"
+        )
+    config.type_vocab_size = 0
+    config.hidden_act = config.hidden_act or "gelu"
+    config.attn_qkv_bias = False
+    config.attn_o_bias = False
+    config.mlp_bias = False
+    return config
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -1361,6 +1434,8 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "muse_glimmer": _muse_glimmer_postprocess,
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
+    "bert_encoder": _bert_encoder_postprocess,
+    "modern_bert_encoder": _modern_bert_encoder_postprocess,
 }
 
 
@@ -1375,7 +1450,7 @@ def _default_activation(model_type: str) -> str:
     # Most modern models use SiLU/Swish
     if model_type == "arcee":
         return "relu2"
-    gelu_models = {"gpt2", "bloom", "starcoder2", "t5"}
+    gelu_models = {"bert", "gpt2", "bloom", "modernbert", "starcoder2", "t5"}
     if model_type in gelu_models:
         return "gelu"
     return "silu"

@@ -117,6 +117,42 @@ _NO_RWKV_GRAPH = (
     "the wrong recurrence. Build from a supported source/runtime instead."
 )
 
+_ENCODER_RUNTIME_VALIDATION_PENDING = (
+    "Config extraction, exact pinned tensor closure, encoder-only task dispatch, and "
+    "synthetic ORT execution are covered, but no pinned real GGUF artifact has passed "
+    "independent embedding parity. Runtime packaging remains deferred until that evidence "
+    "exists."
+)
+
+_ENCODER_GRAPH_MISMATCH = {
+    "eurobert": (
+        "EuroBERT uses pre-norm RMSNorm, RoPE, bias-free split Q/K/V attention, and a "
+        "parallel SwiGLU FFN. Neither the post-norm BertModel nor ModernBertModel graph "
+        "matches that architecture."
+    ),
+    "jina-bert-v2": (
+        "JinaBERT v2 uses ALiBi, optional full-width Q/K norms, an extra attention norm, "
+        "and either separate or fused GeGLU inputs. Mobius has no graph with that exact "
+        "combination."
+    ),
+    "jina-bert-v3": (
+        "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
+        "BertModel has absolute positions and no MoE path."
+    ),
+    "neo-bert": (
+        "NeoBERT uses pre-norm RMSNorm, RoPE, fused QKV, and fused SwiGLU. The existing "
+        "encoder graphs differ in normalization and projection layout."
+    ),
+    "nomic-bert": (
+        "NomicBERT uses RoPE and a parallel gated FFN with BERT-style post norms. "
+        "BertModel uses absolute positions and a non-gated sequential GELU FFN."
+    ),
+    "nomic-bert-moe": (
+        "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
+        "moe_every_n_layers. Mobius has no encoder MoE graph with that schedule."
+    ),
+}
+
 
 _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     # ---------------------------------------------------------------- Llama
@@ -281,6 +317,43 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         quantized_import=Support.REJECTED,
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    # --------------------------------------------------------- Encoder-only
+    GGUFArchitectureSpec(
+        gguf_arch="bert",
+        model_type="bert",
+        tensor_map_recipe=("bert",),
+        config_postprocessor="bert_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="modern-bert",
+        model_type="modernbert",
+        tensor_map_recipe=("modern_bert",),
+        config_postprocessor="modern_bert_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+            "rope.freq_base",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING,
+    ),
+    *(
+        GGUFArchitectureSpec(
+            gguf_arch=architecture,
+            config=Support.DEFERRED,
+            tensor_map=Support.DEFERRED,
+            graph=Support.DEFERRED,
+            runtime=Support.DEFERRED,
+            reason=reason,
+        )
+        for architecture, reason in _ENCODER_GRAPH_MISMATCH.items()
     ),
     GGUFArchitectureSpec(
         gguf_arch="starcoder2",
