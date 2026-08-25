@@ -316,6 +316,28 @@ _MAMBA2_MAPPING: dict[str, str] = {
     "blk.{bid}.ssm_norm": "backbone.layers.{bid}.mixer.norm",
 }
 
+_FALCON_H1_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.final_layernorm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.pre_ff_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ssm_in": "model.layers.{bid}.mamba.in_proj",
+    "blk.{bid}.ssm_out": "model.layers.{bid}.mamba.out_proj",
+    "blk.{bid}.ssm_conv1d": "model.layers.{bid}.mamba.conv1d",
+    "blk.{bid}.ssm_dt": "model.layers.{bid}.mamba.dt_bias@",
+    "blk.{bid}.ssm_a": "model.layers.{bid}.mamba.A_log",
+    "blk.{bid}.ssm_d": "model.layers.{bid}.mamba.D",
+    "blk.{bid}.ssm_norm": "model.layers.{bid}.mamba.norm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.feed_forward.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.feed_forward.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.feed_forward.down_proj",
+}
+
 _JAMBA_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
     "output": "lm_head",
@@ -698,6 +720,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "gpt2": _GPT2_MAPPING,
         "mamba": _MAMBA_MAPPING,
         "mamba2": _MAMBA2_MAPPING,
+        "falcon_h1": _FALCON_H1_MAPPING,
         "jamba": _JAMBA_MAPPING,
         "nemotron_h": _NEMOTRON_H_MAPPING,
         "granitehybrid": _GRANITEHYBRID_MAPPING,

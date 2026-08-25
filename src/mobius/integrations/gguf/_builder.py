@@ -612,6 +612,7 @@ def _validate_gguf_model(
 
     validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
+    _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
     _raise_for_invalid_hybrid_tensor_contract(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
@@ -896,6 +897,176 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
             f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
             f"unexpected={unexpected}, malformed={malformed}"
         )
+
+
+def _raise_for_invalid_falcon_h1_tensor_contract(gguf_model) -> None:
+    """Validate Falcon-H1's complete parallel attention/Mamba2 tensor closure."""
+    if gguf_model.architecture != "falcon-h1":
+        return
+
+    import numpy as np
+
+    metadata = gguf_model.metadata
+    arch = "falcon-h1"
+    positive_fields = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.key_length",
+        "attention.value_length",
+        "ssm.conv_kernel",
+        "ssm.inner_size",
+        "ssm.state_size",
+        "ssm.time_step_rank",
+        "ssm.group_count",
+    )
+    required_fields = (*positive_fields, "attention.layer_norm_rms_epsilon", "rope.freq_base")
+    missing_metadata = sorted(
+        suffix for suffix in required_fields if f"{arch}.{suffix}" not in metadata
+    )
+    if missing_metadata:
+        raise ValueError(
+            f"falcon-h1 GGUF is missing required metadata field(s): {missing_metadata}"
+        )
+    values = {suffix: int(metadata[f"{arch}.{suffix}"]) for suffix in positive_fields}
+    invalid = sorted(suffix for suffix, value in values.items() if value <= 0)
+    if invalid:
+        raise ValueError(f"falcon-h1 GGUF has non-positive metadata field(s): {invalid}")
+    rms_epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    if not np.isfinite(rms_epsilon) or rms_epsilon <= 0:
+        raise ValueError("falcon-h1 attention.layer_norm_rms_epsilon must be positive")
+    if not np.isfinite(rope_base) or rope_base <= 0:
+        raise ValueError("falcon-h1 rope.freq_base must be positive")
+
+    hidden = values["embedding_length"]
+    intermediate = values["feed_forward_length"]
+    layers = values["block_count"]
+    attn_heads = values["attention.head_count"]
+    kv_heads = values["attention.head_count_kv"]
+    key_dim = values["attention.key_length"]
+    value_dim = values["attention.value_length"]
+    conv_kernel = values["ssm.conv_kernel"]
+    ssm_inner = values["ssm.inner_size"]
+    state_size = values["ssm.state_size"]
+    ssm_heads = values["ssm.time_step_rank"]
+    groups = values["ssm.group_count"]
+    if (
+        key_dim != value_dim
+        or hidden != attn_heads * key_dim
+        or attn_heads % kv_heads
+        or ssm_inner % ssm_heads
+        or ssm_heads % groups
+        or ssm_inner % groups
+    ):
+        raise ValueError("falcon-h1 GGUF has inconsistent attention or SSM geometry")
+
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if vocab <= 0:
+        raise ValueError("falcon-h1 GGUF has no positive vocabulary size")
+
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (vocab, hidden),
+    }
+    q_dim = attn_heads * key_dim
+    kv_dim = kv_heads * key_dim
+    conv_dim = ssm_inner + 2 * groups * state_size
+    projection_size = 2 * ssm_inner + 2 * groups * state_size + ssm_heads
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_q.weight": (q_dim, hidden),
+                prefix + "attn_k.weight": (kv_dim, hidden),
+                prefix + "attn_v.weight": (kv_dim, hidden),
+                prefix + "attn_output.weight": (hidden, q_dim),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+                prefix + "ssm_in.weight": (projection_size, hidden),
+                prefix + "ssm_conv1d.weight": (conv_dim, conv_kernel),
+                prefix + "ssm_dt.bias": (ssm_heads,),
+                prefix + "ssm_a": (ssm_heads, 1),
+                prefix + "ssm_d": (ssm_heads, 1),
+                prefix + "ssm_out.weight": (hidden, ssm_inner),
+            }
+        )
+        optional.update(
+            {
+                prefix + "attn_q.bias": (q_dim,),
+                prefix + "attn_k.bias": (kv_dim,),
+                prefix + "attn_v.bias": (kv_dim,),
+                prefix + "attn_output.bias": (hidden,),
+                prefix + "ffn_gate.bias": (intermediate,),
+                prefix + "ffn_up.bias": (intermediate,),
+                prefix + "ffn_down.bias": (hidden,),
+                prefix + "ssm_conv1d.bias": (conv_dim,),
+                prefix + "ssm_norm.weight": (groups, ssm_inner // groups),
+                prefix + "rope_freqs.weight": (key_dim // 2,),
+            }
+        )
+
+    families = {
+        "attention projection biases": {
+            f"blk.{layer}.attn_{projection}.bias"
+            for layer in range(layers)
+            for projection in ("q", "k", "v", "output")
+        },
+        "feed-forward biases": {
+            f"blk.{layer}.ffn_{projection}.bias"
+            for layer in range(layers)
+            for projection in ("gate", "up", "down")
+        },
+        "Mamba convolution biases": {
+            f"blk.{layer}.ssm_conv1d.bias" for layer in range(layers)
+        },
+        "Mamba RMSNorm weights": {f"blk.{layer}.ssm_norm.weight" for layer in range(layers)},
+    }
+    actual_names = set(actual)
+    for family_name, family in families.items():
+        present = family & actual_names
+        if present and present != family:
+            raise ValueError(
+                f"falcon-h1 {family_name} must be present in every layer or absent entirely"
+            )
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - actual_names)
+    unexpected = sorted(actual_names - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & actual_names
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid falcon-h1 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+    for layer in range(layers):
+        decay_name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(decay_name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Falcon-H1 GGUF Mamba decay tensor {decay_name!r}: "
+                "ssm_a must contain only finite negative -exp(A_log) values"
+            )
 
 
 def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
@@ -2086,6 +2257,29 @@ def build_from_gguf(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
             "they carry per-layer conv_state and ssm_state rather than a KV cache."
         )
+    if gguf_arch == "falcon-h1":
+        from mobius.tasks import FalconH1CausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for falcon-h1 GGUF models; "
+                "every layer requires a dynamic four-state K, V, convolution, and SSM ABI"
+            )
+        if preserve_quantization:
+            raise ValueError(
+                "keep_quantized=True is not supported for falcon-h1: recurrent and "
+                "state-sensitive tensors must be dequantized while only exact "
+                "attention/FFN MatMul roles may remain quantized"
+            )
+        if (
+            task is not None
+            and task != "falcon-h1-text-generation"
+            and not isinstance(task, FalconH1CausalLMTask)
+        ):
+            raise ValueError(
+                "falcon-h1 GGUF only supports the dedicated "
+                "'falcon-h1-text-generation' four-state task"
+            )
     if gguf_arch in {
         "lfm2",
         "lfm2moe",

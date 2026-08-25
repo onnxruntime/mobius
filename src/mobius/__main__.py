@@ -174,6 +174,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
             from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
             model_type = _TEXT_ONLY_MODEL_TYPE.get(model_type, model_type)
+        if model_type == "falcon_h1":
+            raise ValueError(
+                "--static-cache cannot represent Falcon-H1's per-layer K, V, "
+                "convolution, and SSM states"
+            )
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 

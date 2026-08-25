@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 52
+_EXPECTED_SUPPORTED_COUNT = 53
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -239,12 +239,13 @@ class TestCapabilityClosure:
         assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT
 
     def test_falcon_h1_is_not_a_generic_falcon_alias(self) -> None:
-        """Falcon-H1 must fail before constructing the incompatible Falcon graph."""
+        """Falcon-H1 resolves only to its dedicated parallel hybrid graph."""
         spec = try_get_arch_spec("falcon-h1")
         assert spec is not None
-        assert spec.model_type is None
-        assert spec.graph is Support.DEFERRED
-        assert "falcon_h1" not in _REGISTRATIONS
+        assert spec.model_type == "falcon_h1"
+        assert spec.graph is Support.SUPPORTED
+        assert spec.runtime is Support.DEFERRED
+        assert _REGISTRATIONS["falcon_h1"].module_class.__name__ == "FalconH1ForCausalLM"
 
     def test_quantized_import_set_is_pinned(self) -> None:
         """Builder acceptance and rejection must come from an explicit policy set."""
