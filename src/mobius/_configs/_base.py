@@ -2002,6 +2002,7 @@ class Lfm2MoeConfig(CausalLMConfig):
     """Configuration for LFM2MoE's dense-prefix and routed-expert feed-forwards."""
 
     num_dense_layers: int = 2
+    use_expert_bias: bool | None = True
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Lfm2MoeConfig:
