@@ -565,7 +565,8 @@ def _verification_lock(root: Path) -> Iterator[None]:
 
 
 def _fsync_file(path: Path) -> None:
-    with path.open("rb") as stream:
+    mode = "r+b" if os.name == "nt" else "rb"
+    with path.open(mode) as stream:
         os.fsync(stream.fileno())
 
 
