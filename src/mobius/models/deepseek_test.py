@@ -276,31 +276,26 @@ def test_qmoe_routing_uses_raw_logits_and_casts_scores_to_hidden_dtype():
     assert any(node.op_type == "Softmax" for node in graph)
 
 
-@pytest.mark.parametrize(
-    ("scoring_func", "use_expert_bias", "n_group"),
-    [("sigmoid", False, 1), ("softmax", True, 1), ("softmax", False, 2)],
-)
-def test_qmoe_routing_fails_closed_outside_cuda_exact_contract(
-    scoring_func: str,
-    use_expert_bias: bool,
-    n_group: int,
-):
+def test_qmoe_routing_preserves_existing_cpu_grouped_encoding():
     config = make_config(
         hidden_size=4,
         num_local_experts=4,
         num_experts_per_tok=2,
-        n_group=n_group,
+        n_group=2,
         topk_group=1,
-        scoring_func=scoring_func,
-        topk_method="greedy",
-        use_expert_bias=use_expert_bias,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        use_expert_bias=True,
     )
     gate = DeepSeekMoEGate(config)
-    builder, op, _graph = create_test_builder()
+    builder, op, graph = create_test_builder()
     hidden = create_test_input(builder, "hidden", [1, 2, 4], ir.DataType.FLOAT)
 
-    with pytest.raises(ValueError, match="QMoE requires ungrouped softmax routing"):
-        gate.qmoe_routing(op, hidden)
+    router_probs, router_weights, _normalize, _scale = gate.qmoe_routing(op, hidden)
+
+    assert router_probs is not None
+    assert router_weights is not None
+    assert any(node.op_type == "Sigmoid" for node in graph)
 
 
 def test_grouped_routing_rejects_non_divisible_expert_count():

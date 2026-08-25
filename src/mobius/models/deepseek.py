@@ -119,27 +119,27 @@ class DeepSeekMoEGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return the exact unbiased softmax route supported by CUDA QMoE.
+        """Return the best QMoE encoding available for this routing contract.
 
         QMoE must receive raw logits as ``router_probs`` because its CUDA
         kernel ignores ``router_weights`` and applies softmax internally.
-        This is exact only for ungrouped softmax routing without a selection
-        correction bias. Configurations outside that contract must use the
-        dense/block fallback via ``disable_qmoe``.
+        This is exact for ungrouped softmax routing without a selection
+        correction bias. Existing grouped or bias-corrected users retain the
+        CPU-correct activated-score encoding; their configs must set
+        ``disable_qmoe`` when targeting CUDA.
         """
-        if self.scoring_func != "softmax" or self.use_expert_bias or self.n_group != 1:
-            raise ValueError(
-                "QMoE requires ungrouped softmax routing without correction bias; "
-                "set disable_qmoe=True for this DeepSeek routing configuration"
-            )
-        router_logits, scores, _ = self._routing_scores(op, hidden_states)
+        router_logits, scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        exact_cuda_route = (
+            self.scoring_func == "softmax" and not self.use_expert_bias and self.n_group == 1
+        )
+        router_probs = router_logits if exact_cuda_route else scores_for_choice
         # QMoE's router_probs/router_weights inputs share type constraint "T"
         # with hidden_states (see contrib_defs.cc). _routing_scores computes
         # in float32 for numerical stability (matching HF's fp32 routing), so
         # cast back to hidden_states' dtype before returning -- otherwise
         # QMoE rejects a fp16/bf16 model with a mismatched-T type error.
         return (
-            op.CastLike(router_logits, hidden_states),
+            op.CastLike(router_probs, hidden_states),
             op.CastLike(scores, hidden_states),
             self.norm_topk_prob,
             float(self.routed_scaling_factor),
