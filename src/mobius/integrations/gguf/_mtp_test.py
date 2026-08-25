@@ -60,7 +60,10 @@ def _write_qwen35_mtp_gguf(
     # UINT32 == GGUFValueType 4.
     writer.add_key_value(f"{architecture}.nextn_predict_layers", mtp_count, 4)
     writer.add_key_value(f"{architecture}.attention.key_length", _HD, 4)
-    writer.add_array(f"{architecture}.attention.recurrent_layers", [False, False])
+    writer.add_array(
+        f"{architecture}.attention.recurrent_layers",
+        [False] * (1 + mtp_count),
+    )
     writer.add_array(f"{architecture}.rope.dimension_sections", [4, 4, 0, 0])
     writer.add_ssm_conv_kernel(3)
     writer.add_ssm_inner_size(32)
@@ -294,7 +297,7 @@ class TestBuildMtpHead:
         monkeypatch.setattr(core_builder, "build_from_module", _unexpected_build)
         with pytest.raises(
             ValueError,
-            match=r"nextn_predict_layers=2.*exactly one MTP sidecar head",
+            match=r"has 2 MTP blocks.*exactly one appended MTP block",
         ):
             build_from_gguf(str(path))
         assert built is False
@@ -325,14 +328,21 @@ class TestBuildMtpHead:
             dedicated_head=dedicated_head,
             tied_output=tied_output,
         )
-        package = build_from_gguf(path, keep_quantized=quantized)
+        preserve_quantization = quantized and not (dedicated_embedding or dedicated_head)
+        if quantized and not preserve_quantization:
+            with pytest.raises(
+                ValueError,
+                match=r"Cannot keep Q4_0 (?:embedding|output) .* quantized",
+            ):
+                build_from_gguf(path, keep_quantized=True)
+        package = build_from_gguf(path, keep_quantized=preserve_quantization)
         head = package.mtp_head
         assert head is not None
         target_initializers = package["model"].graph.initializers
         assert "model.embed_tokens.weight" in target_initializers
         if tied_output:
             assert not any(name.startswith("lm_head.") for name in target_initializers)
-        elif quantized:
+        elif preserve_quantization:
             assert {
                 "lm_head.weight",
                 "lm_head.scales",

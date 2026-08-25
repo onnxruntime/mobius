@@ -3638,21 +3638,26 @@ class TestHybridGGUFBuild:
         assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
         assert all(np.isfinite(output["logits"]).all() for output in outputs)
 
-    def test_lfm2_quantized_source_dequantizes_without_state_or_logit_loss(
+    def test_lfm2_quantized_preservation_fails_closed_and_float_import_executes(
         self, tmp_path: Path
     ) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
         path = tmp_path / "lfm2-q4.gguf"
         _write_lfm2_gguf(path, quantized=True)
-        preserved = build_from_gguf(path, keep_quantized=True)["model"]
+        with pytest.raises(
+            ValueError,
+            match=r"Cannot keep Q4_0 projection .*MatMulNBits",
+        ):
+            build_from_gguf(path, keep_quantized=True)
+
         explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
 
-        assert "MatMulNBits" not in {node.op_type for node in preserved.graph}
-        for actual, expected in zip(self._run_lfm2(preserved), self._run_lfm2(explicit_float)):
-            assert set(actual) == set(expected)
-            for name in actual:
-                np.testing.assert_allclose(actual[name], expected[name], rtol=0, atol=0)
+        assert "MatMulNBits" not in {node.op_type for node in explicit_float.graph}
+        outputs = self._run_lfm2(explicit_float)
+        assert outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
+        assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
+        assert all(np.isfinite(output["logits"]).all() for output in outputs)
 
     def test_qwen35_float_and_quantized_prefill_decode_thread_mixed_state(
         self, tmp_path: Path
