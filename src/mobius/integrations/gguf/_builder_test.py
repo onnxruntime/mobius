@@ -3410,7 +3410,12 @@ class TestBuildQuantizedGguf:
         projection_quantization: str,
         tmp_path: Path,
     ) -> None:
+        import torch
+
         from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._repacker import repack_gguf_tensor
+        from mobius.integrations.gguf._tensor_processors import _reverse_permute
 
         path = tmp_path / f"{architecture}-{projection_quantization}-fused-qkv.gguf"
         _write_moe_gguf(
@@ -3422,10 +3427,55 @@ class TestBuildQuantizedGguf:
         package = build_from_gguf(path)
         model = package["model"]
         names = set(model.graph.initializers)
-        for projection in ("q", "k", "v"):
+        source = GGUFModel(path)
+        raw, qtype, shape = next(
+            (raw, qtype, shape)
+            for name, raw, qtype, shape in source.tensor_items_raw()
+            if name == "blk.0.attn_qkv.weight"
+        )
+        if projection_quantization == "f32":
+            fused_weight = torch.from_numpy(
+                np.array(source.get_tensor("blk.0.attn_qkv.weight"))
+            )
+            fused_scales = fused_zero_points = None
+        else:
+            repacked = repack_gguf_tensor(raw, qtype.value, shape)
+            fused_weight = torch.from_numpy(repacked.weight)
+            fused_scales = torch.from_numpy(repacked.scales)
+            fused_zero_points = torch.from_numpy(repacked.zero_points)
+
+        offset = 0
+        for projection, rows, heads in (("q", 64, 4), ("k", 32, 2), ("v", 32, None)):
             stem = f"model.layers.0.self_attn.{projection}_proj"
             assert f"{stem}.weight" in names or f"{stem}.weight_t" in names
             assert f"{stem}.bias" in names
+            end = offset + rows
+            expected_weight = fused_weight[offset:end]
+            if heads is not None:
+                expected_weight = _reverse_permute(expected_weight, heads)
+            if projection_quantization == "f32":
+                actual_weight = (
+                    model.graph.initializers[f"{stem}.weight_t"].const_value.numpy().T
+                )
+            else:
+                actual_weight = model.graph.initializers[f"{stem}.weight"].const_value.numpy()
+            np.testing.assert_array_equal(actual_weight, expected_weight.numpy())
+
+            if fused_scales is not None and fused_zero_points is not None:
+                expected_scales = fused_scales[offset:end]
+                expected_zero_points = fused_zero_points[offset:end]
+                if heads is not None:
+                    expected_scales = _reverse_permute(expected_scales, heads)
+                    expected_zero_points = _reverse_permute(expected_zero_points, heads)
+                np.testing.assert_array_equal(
+                    model.graph.initializers[f"{stem}.scales"].const_value.numpy(),
+                    expected_scales.numpy(),
+                )
+                np.testing.assert_array_equal(
+                    model.graph.initializers[f"{stem}.zero_points"].const_value.numpy(),
+                    expected_zero_points.numpy(),
+                )
+            offset = end
 
     @pytest.mark.parametrize(
         ("quantize_embedding", "quantize_output"),

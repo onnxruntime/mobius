@@ -98,7 +98,7 @@ class DeepSeekMoEGate(nn.Module):
             self.e_score_correction_bias = nn.Parameter([self.num_experts])
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        _, scores, scores_for_choice = self._routing_scores(op, hidden_states)
 
         # Select top-k experts
         k_val = op.Constant(value_ints=[self.top_k])
@@ -119,29 +119,27 @@ class DeepSeekMoEGate(nn.Module):
         return routing_weights, selected_experts
 
     def qmoe_routing(self, op: OpBuilder, hidden_states: ir.Value):
-        """Return distinct expert-selection and aggregation scores for QMoE.
+        """Return the exact unbiased softmax route supported by CUDA QMoE.
 
-        CPU-only correctness: selection uses ``scores_for_choice`` (bias
-        for V3, unbiased for V2) but aggregation weights come from the
-        separate, unbiased ``scores`` tensor via QMoE's ``router_weights``
-        input -- honored by CPU QMoE but ignored by CUDA QMoE, which always
-        derives weights by softmax-top-k over ``router_probs``
-        (``scores_for_choice``) itself. There is no ``router_probs``
-        encoding that reproduces the correct (unbiased) weights through
-        CUDA's forced internal recompute. Tracked upstream at
-        https://github.com/microsoft/onnxruntime/pull/31570 (adds CUDA
-        ``router_weights`` support); until that lands, this path is
-        CPU-EP-correct only. See ``_scatter_selected_to_full`` in
-        ``mobius.components._moe`` for the same limitation on DeepSeek-V4.
+        QMoE must receive raw logits as ``router_probs`` because its CUDA
+        kernel ignores ``router_weights`` and applies softmax internally.
+        This is exact only for ungrouped softmax routing without a selection
+        correction bias. Configurations outside that contract must use the
+        dense/block fallback via ``disable_qmoe``.
         """
-        scores, scores_for_choice = self._routing_scores(op, hidden_states)
+        if self.scoring_func != "softmax" or self.use_expert_bias or self.n_group != 1:
+            raise ValueError(
+                "QMoE requires ungrouped softmax routing without correction bias; "
+                "set disable_qmoe=True for this DeepSeek routing configuration"
+            )
+        router_logits, scores, _ = self._routing_scores(op, hidden_states)
         # QMoE's router_probs/router_weights inputs share type constraint "T"
         # with hidden_states (see contrib_defs.cc). _routing_scores computes
         # in float32 for numerical stability (matching HF's fp32 routing), so
         # cast back to hidden_states' dtype before returning -- otherwise
         # QMoE rejects a fp16/bf16 model with a mismatched-T type error.
         return (
-            op.CastLike(scores_for_choice, hidden_states),
+            op.CastLike(router_logits, hidden_states),
             op.CastLike(scores, hidden_states),
             self.norm_topk_prob,
             float(self.routed_scaling_factor),
@@ -169,7 +167,7 @@ class DeepSeekMoEGate(nn.Module):
         # Expert selection: group-based or simple TopK
         if self.n_group > 1 and self.topk_method != "greedy":
             scores_for_choice = self._group_topk_selection(op, scores_for_choice)
-        return scores, scores_for_choice
+        return router_logits, scores, scores_for_choice
 
     def _group_topk_selection(self, op, scores_for_choice):
         """Group-based expert selection: pick topk_group groups first."""

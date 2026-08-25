@@ -241,7 +241,7 @@ def test_noaux_tc_supports_single_expert_groups():
     assert any(node.op_type == "TopK" for node in graph)
 
 
-def test_qmoe_routing_casts_scores_back_to_hidden_states_dtype():
+def test_qmoe_routing_uses_raw_logits_and_casts_scores_to_hidden_dtype():
     """qmoe_routing()'s router_probs/router_weights must match hidden_states' dtype.
 
     QMoE's contrib-op schema binds router_probs/router_weights to the same
@@ -262,7 +262,7 @@ def test_qmoe_routing_casts_scores_back_to_hidden_states_dtype():
         routed_scaling_factor=1.0,
     )
     gate = DeepSeekMoEGate(config)
-    builder, op, _graph = create_test_builder()
+    builder, op, graph = create_test_builder()
     hidden = create_test_input(
         builder, "hidden", [1, 2, config.hidden_size], ir.DataType.FLOAT16
     )
@@ -271,6 +271,36 @@ def test_qmoe_routing_casts_scores_back_to_hidden_states_dtype():
 
     assert router_probs.dtype == ir.DataType.FLOAT16
     assert router_weights.dtype == ir.DataType.FLOAT16
+    assert router_probs.producer().op_type == "CastLike"
+    assert router_probs.producer().inputs[0].producer().op_type == "MatMul"
+    assert any(node.op_type == "Softmax" for node in graph)
+
+
+@pytest.mark.parametrize(
+    ("scoring_func", "use_expert_bias", "n_group"),
+    [("sigmoid", False, 1), ("softmax", True, 1), ("softmax", False, 2)],
+)
+def test_qmoe_routing_fails_closed_outside_cuda_exact_contract(
+    scoring_func: str,
+    use_expert_bias: bool,
+    n_group: int,
+):
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        n_group=n_group,
+        topk_group=1,
+        scoring_func=scoring_func,
+        topk_method="greedy",
+        use_expert_bias=use_expert_bias,
+    )
+    gate = DeepSeekMoEGate(config)
+    builder, op, _graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 2, 4], ir.DataType.FLOAT)
+
+    with pytest.raises(ValueError, match="QMoE requires ungrouped softmax routing"):
+        gate.qmoe_routing(op, hidden)
 
 
 def test_grouped_routing_rejects_non_divisible_expert_count():

@@ -5956,16 +5956,30 @@ def _load_quantized_state_dict(
             for target_stem in fused_projection_targets:
                 n_out = quantized_output_sizes[target_stem]
                 end = offset + n_out
-                state_dict[f"{target_stem}.weight"] = torch.from_numpy(
-                    np.array(repacked.weight[offset:end], copy=True)
+                target_name = f"{target_stem}.weight"
+                weight = torch.from_numpy(np.array(repacked.weight[offset:end], copy=True))
+                scales = torch.from_numpy(np.array(repacked.scales[offset:end], copy=True))
+                zero_points = (
+                    torch.from_numpy(np.array(repacked.zero_points[offset:end], copy=True))
+                    if repacked.zero_points is not None
+                    else None
                 )
-                state_dict[f"{target_stem}.scales"] = torch.from_numpy(
-                    np.array(repacked.scales[offset:end], copy=True)
-                )
-                if repacked.zero_points is not None:
-                    state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
-                        np.array(repacked.zero_points[offset:end], copy=True)
-                    )
+                if _needs_qk_permute(
+                    target_name,
+                    num_heads,
+                    num_kv_heads,
+                    model_type,
+                    gguf_arch,
+                ):
+                    n_head = num_heads if ".q_proj." in target_name else num_kv_heads
+                    weight = _reverse_permute(weight, n_head)
+                    scales = _reverse_permute(scales, n_head)
+                    if zero_points is not None:
+                        zero_points = _reverse_permute(zero_points, n_head)
+                state_dict[target_name] = weight
+                state_dict[f"{target_stem}.scales"] = scales
+                if zero_points is not None:
+                    state_dict[f"{target_stem}.zero_points"] = zero_points
                 offset = end
             if offset != int(np_shape[0]):
                 raise ValueError(
