@@ -150,6 +150,16 @@ _COVERAGE_SKIP: dict[str, str] = {
     "llada": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py "
     "(graph build + diffusers-parity + bidirectionality); no small public "
     "checkpoint and non-standard I/O (no attention_mask/KV cache/golden data)",
+    "dream": "Masked-diffusion LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "Dream": "Alias for dream — covered by src/mobius/models/llada_test.py",
+    "llada_moe": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
+    "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
+    "non-standard bidirectional I/O has no generic golden-data path",
+    "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
+    "and GGUF integration tests; generic encoder tests require token_type_ids",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",

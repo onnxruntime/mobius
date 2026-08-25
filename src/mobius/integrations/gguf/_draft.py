@@ -10,6 +10,7 @@ import json
 import os
 import stat
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -129,23 +130,114 @@ def _canonical_json_bytes(value: Any, *, label: str, limit: int) -> bytes:
     return payload
 
 
+def _is_link_or_reparse_point(file_stat: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(file_stat.st_mode) or bool(
+        getattr(file_stat, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _supports_secure_dir_fd() -> bool:
+    return os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
+
+
+def _validate_root_identity(root: Path, expected: os.stat_result) -> None:
+    current = root.lstat()
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _is_link_or_reparse_point(current)
+        or not os.path.samestat(expected, current)
+    ):
+        raise OSError("target root changed while its resources were being read")
+
+
+def _require_stable_root(
+    root: Path,
+    root_identity: os.stat_result | None,
+    *,
+    phase: str,
+) -> None:
+    if root_identity is None:
+        return
+    try:
+        _validate_root_identity(root, root_identity)
+    except OSError as error:
+        raise ValueError(f"target root changed {phase}: {error}") from error
+
+
+def _validate_path_open(
+    root: Path,
+    resource_path: Path,
+    root_identity: os.stat_result,
+    resource_before: os.stat_result,
+    descriptor: int,
+) -> None:
+    opened = os.fstat(descriptor)
+    resource_after = resource_path.lstat()
+    _validate_root_identity(root, root_identity)
+    if (
+        _is_link_or_reparse_point(resource_after)
+        or not os.path.samestat(resource_before, resource_after)
+        or not os.path.samestat(resource_before, opened)
+    ):
+        raise OSError("target root or resource changed while it was being opened")
+
+
+def _open_resource_at_impl(
+    root: Path,
+    root_descriptor: int | None,
+    root_identity: os.stat_result | None,
+    resource: str,
+) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if root_descriptor is not None:
+        return os.open(resource, flags, dir_fd=root_descriptor)
+    if root_identity is None:
+        raise OSError("target root identity was not pinned for path-based reads")
+
+    # Windows cannot open a directory descriptor or use dir_fd. Reject
+    # reparse points and verify the root identity around every resource open.
+    # The caller pins the same identity across the config/tokenizer transaction.
+    _validate_root_identity(root, root_identity)
+    resource_path = root / resource
+    resource_before = resource_path.lstat()
+    if _is_link_or_reparse_point(resource_before):
+        raise OSError("target resource must not be a link or reparse point")
+    descriptor = os.open(resource_path, flags)
+    with ExitStack() as cleanup:
+        cleanup.callback(os.close, descriptor)
+        _validate_path_open(root, resource_path, root_identity, resource_before, descriptor)
+        cleanup.pop_all()
+        return descriptor
+
+
+def _open_resource_at(
+    root: Path,
+    root_descriptor: int | None,
+    root_identity: os.stat_result | None,
+    resource: str,
+) -> int:
+    try:
+        return _open_resource_at_impl(root, root_descriptor, root_identity, resource)
+    except OSError as error:
+        raise ValueError(
+            f"target resource could not be opened safely inside the target root: {error}"
+        ) from error
+
+
 def _read_bounded_json_at(
-    root_descriptor: int,
+    root: Path,
+    root_descriptor: int | None,
+    root_identity: os.stat_result | None,
     resource: str,
     *,
     label: str,
     limit: int,
 ) -> dict[str, Any]:
     try:
-        descriptor = os.open(
-            resource,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=root_descriptor,
-        )
-    except OSError as error:
-        raise ValueError(
-            f"{label} could not be opened safely inside the target root: {error}"
-        ) from error
+        descriptor = _open_resource_at(root, root_descriptor, root_identity, resource)
+    except ValueError as error:
+        raise ValueError(f"{label} could not be opened safely: {error}") from error
     with os.fdopen(descriptor, "rb") as stream:
         file_stat = os.fstat(stream.fileno())
         if not stat.S_ISREG(file_stat.st_mode):
@@ -153,6 +245,7 @@ def _read_bounded_json_at(
         if file_stat.st_size > limit:
             raise ValueError(f"{label} exceeds the {limit}-byte file-size limit")
         payload = stream.read(limit + 1)
+    _require_stable_root(root, root_identity, phase=f"while reading {label}")
     if len(payload) > limit:
         raise ValueError(f"{label} exceeds the {limit}-byte read limit")
     try:
@@ -164,9 +257,20 @@ def _read_bounded_json_at(
     return value
 
 
-def _resource_exists_at(root_descriptor: int, resource: str) -> bool:
+def _resource_exists_at(
+    root: Path,
+    root_descriptor: int | None,
+    root_identity: os.stat_result | None,
+    resource: str,
+) -> bool:
     try:
-        os.stat(resource, dir_fd=root_descriptor, follow_symlinks=False)
+        if root_descriptor is not None:
+            os.stat(resource, dir_fd=root_descriptor, follow_symlinks=False)
+        else:
+            if root_identity is None:
+                raise OSError("target root identity was not pinned for path-based reads")
+            _require_stable_root(root, root_identity, phase="while locating resources")
+            (root / resource).lstat()
     except FileNotFoundError:
         return False
     return True
@@ -177,8 +281,8 @@ def _load_target_resource_files(path: Path) -> tuple[dict[str, Any], dict[str, A
         path_stat = path.lstat()
     except FileNotFoundError as error:
         raise ValueError(f"target config does not exist: {path}") from error
-    if stat.S_ISLNK(path_stat.st_mode):
-        raise ValueError("target config path must not be a symlink")
+    if _is_link_or_reparse_point(path_stat):
+        raise ValueError("target config path must not be a symlink or reparse point")
     if stat.S_ISDIR(path_stat.st_mode):
         root = path
     else:
@@ -186,15 +290,25 @@ def _load_target_resource_files(path: Path) -> tuple[dict[str, Any], dict[str, A
             raise ValueError("target config file must be named config.json")
         root = path.parent
 
-    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_descriptor: int | None = None
+    root_identity: os.stat_result | None = None
+    if _supports_secure_dir_fd():
+        root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            root_descriptor = os.open(root, root_flags)
+        except OSError as error:
+            raise ValueError(f"target root could not be opened safely: {error}") from error
+    else:
+        try:
+            root_identity = root.lstat()
+        except OSError as error:
+            raise ValueError(f"target root could not be opened safely: {error}") from error
+        if not stat.S_ISDIR(root_identity.st_mode) or _is_link_or_reparse_point(root_identity):
+            raise ValueError("target root must be a directory, not a link or reparse point")
     try:
-        root_descriptor = os.open(root, root_flags)
-    except OSError as error:
-        raise ValueError(f"target root could not be opened safely: {error}") from error
-    try:
-        if not _resource_exists_at(root_descriptor, "config.json"):
+        if not _resource_exists_at(root, root_descriptor, root_identity, "config.json"):
             raise ValueError("target config.json does not exist inside the target root")
-        if not _resource_exists_at(root_descriptor, "tokenizer.json"):
+        if not _resource_exists_at(root, root_descriptor, root_identity, "tokenizer.json"):
             alternatives = [
                 name
                 for name in (
@@ -203,7 +317,7 @@ def _load_target_resource_files(path: Path) -> tuple[dict[str, Any], dict[str, A
                     "merges.txt",
                     "tokenizer_config.json",
                 )
-                if _resource_exists_at(root_descriptor, name)
+                if _resource_exists_at(root, root_descriptor, root_identity, name)
             ]
             suffix = (
                 f"; found {alternatives}, but split tokenizer files cannot preserve the full "
@@ -216,19 +330,25 @@ def _load_target_resource_files(path: Path) -> tuple[dict[str, Any], dict[str, A
                 f"target root{suffix}"
             )
         data = _read_bounded_json_at(
+            root,
             root_descriptor,
+            root_identity,
             "config.json",
             label="target config.json",
             limit=_MAX_CONFIG_JSON_BYTES,
         )
         tokenizer = _read_bounded_json_at(
+            root,
             root_descriptor,
+            root_identity,
             "tokenizer.json",
             label="target tokenizer.json",
             limit=_MAX_TOKENIZER_JSON_BYTES,
         )
+        _require_stable_root(root, root_identity, phase="after resource reads")
     finally:
-        os.close(root_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
     return data, tokenizer
 
 

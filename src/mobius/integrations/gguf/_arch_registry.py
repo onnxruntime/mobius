@@ -139,6 +139,46 @@ _DRAFT_RUNTIME_VALIDATION_PENDING = (
     "deferred until that evidence and an acceptance-loop integration exist."
 )
 
+_POCKETTTS_BUNDLE_REASON = (
+    "The primary GGUF is only PocketTTS's transformed causal CALM backbone: its "
+    "embedding table contains folded learned conditioning rows and its duplicated "
+    "embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow "
+    "generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required "
+    "pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering "
+    "the backbone as text generation or TTS would expose the wrong I/O contract, so "
+    "standalone conversion is refused before graph construction."
+)
+
+_QWEN3TTS_BUNDLE_REASON = (
+    "The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing "
+    "Mobius Qwen3TTS conditional-generation or codec model. The converter folds the text "
+    "projection into an extended text+codec embedding table and emits a 3072-row codec "
+    "head whose logits are shifted into that combined vocabulary. The required speaker "
+    "encoder, 15-codebook predictor, and stateful 24-kHz code-to-wave decoder live in a "
+    "qwen3tts_spkenc/qwen3tts_gen mmproj bundle that Mobius cannot import. Standalone "
+    "conversion is therefore refused before graph construction."
+)
+
+_TALKIE_GRAPH_REASON = (
+    "Talkie is a text causal LM despite its upstream survey cohort. Its graph uses "
+    "weight-free RMSNorm, post-RoPE Q/K normalization, learned attention and MLP gain "
+    "sidecars, a per-head query gain, and an embedding skip in every block. No Mobius "
+    "graph or tensor-value transform implements that combination, and no pinned real "
+    "GGUF has passed independent full-logit, KV-state, and generation parity. Aliasing "
+    "it to Llama or an audio task would build the wrong model."
+)
+
+_WAVTOKENIZER_DEC_REASON = (
+    "wavtokenizer-dec is a stateless non-causal code-token to ISTFT-parameter network, "
+    "not a waveform codec decoder. Its metadata overloads features_length as the "
+    "512-wide codebook feature input and embedding_length as the 1282-wide output, while "
+    "768-wide PosNet and ConvNeXt stacks provide the hidden width. The GGUF graph stops "
+    "before the required magnitude/phase reconstruction and ISTFT processor, so mapping "
+    "it to CodecTask would falsely promise waveform output. Dedicated graph, processor, "
+    "quantization guards, and independent F16/Q5_1 parity remain deferred; standalone "
+    "runtime packaging is refused before graph construction."
+)
+
 _ENCODER_GRAPH_MISMATCH = {
     "eurobert": (
         "EuroBERT uses pre-norm RMSNorm, RoPE, bias-free split Q/K/V attention, and a "
@@ -673,6 +713,39 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "Encoder hidden-state import is covered, but the pinned real artifact lacks "
             "independent provenance and full hidden-state parity evidence."
         ),
+    ),
+    # ------------------------------------------------------ Audio / TTS / codec
+    GGUFArchitectureSpec(
+        gguf_arch="pockettts",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_POCKETTTS_BUNDLE_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen3tts",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_QWEN3TTS_BUNDLE_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="talkie",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_TALKIE_GRAPH_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="wavtokenizer-dec",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_WAVTOKENIZER_DEC_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="arwkv7",

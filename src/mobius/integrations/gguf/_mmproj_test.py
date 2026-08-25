@@ -11,6 +11,7 @@ encoder build+run path end-to-end on CPU.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -310,6 +311,23 @@ class TestMultimodalPreflightGuards:
         from mobius.integrations.gguf._reader import GGUFModel
 
         return GGUFModel(str(text_path)), GGUFModel(str(mmproj_path))
+
+    def test_clip_is_allowed_only_in_mmproj_companion_context(
+        self, clip_mmproj_gguf: Path
+    ) -> None:
+        from mobius.integrations.gguf._builder import _validate_gguf_model
+        from mobius.integrations.gguf._errors import DisabledGGUFArchitectureError
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        mmproj = GGUFModel(str(clip_mmproj_gguf))
+        with pytest.raises(DisabledGGUFArchitectureError, match="intentionally disabled"):
+            _validate_gguf_model(mmproj, source=str(clip_mmproj_gguf))
+
+        _validate_gguf_model(
+            mmproj,
+            source=str(clip_mmproj_gguf),
+            allow_mmproj_companion=True,
+        )
 
     def test_rejects_unsupported_text_architecture_before_config(
         self,
@@ -1402,6 +1420,135 @@ class TestVlmRouting:
             execution_provider="default",
             keep_quantized=False,
         )
+
+    @pytest.mark.parametrize(
+        ("architecture", "expected"),
+        [
+            ("gemma4", "build_gemma4_vlm_from_gguf"),
+            ("muse-glimmer", "build_muse_glimmer_vlm_from_gguf"),
+        ],
+    )
+    def test_remote_clip_companion_preflight_reaches_vlm_builder(
+        self, tmp_path: Path, architecture: str, expected: str
+    ) -> None:
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
+
+        text_path = tmp_path / "text.gguf"
+        _write_minimal_gguf(text_path, architecture)
+        mmproj_path = tmp_path / "downloaded-mmproj.gguf"
+        if expected == "build_gemma4_vlm_from_gguf":
+            _write_clip_mmproj_gguf(mmproj_path)
+        else:
+            _write_muse_glimmer_mmproj_gguf(mmproj_path)
+        remote_ref = f"example/{architecture}:mmproj.gguf"
+        package = mock.sentinel.package
+        resolved_revision = "a" * 40
+
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_mmproj_companion_file",
+                return_value=resolved_revision,
+            ) as selected_file_preflight,
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value=str(mmproj_path),
+            ) as download,
+            mock.patch(
+                f"mobius.integrations.gguf._mmproj.{expected}",
+                return_value=package,
+            ) as builder,
+        ):
+            api_type.return_value.model_info.return_value = SimpleNamespace(
+                gguf={"architecture": architecture}
+            )
+            actual = build_vlm_from_gguf(text_path, remote_ref, keep_quantized=False)
+
+        assert actual is package
+        api_type.return_value.model_info.assert_not_called()
+        selected_file_preflight.assert_called_once_with(
+            f"example/{architecture}",
+            "mmproj.gguf",
+            revision="main",
+        )
+        download.assert_called_once_with(
+            repo_id=f"example/{architecture}",
+            filename="mmproj.gguf",
+            revision=resolved_revision,
+        )
+        builder.assert_called_once_with(
+            text_path,
+            remote_ref,
+            dtype=None,
+            execution_provider="default",
+            keep_quantized=False,
+        )
+
+    def test_remote_non_clip_companion_rejects_before_download_or_builder(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
+
+        text_path = tmp_path / "text.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        remote_ref = "example/wrong-companion:model.gguf"
+
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_mmproj_companion_file",
+                side_effect=ValueError(
+                    "Expected a 'clip' mmproj GGUF, got architecture 'llama'."
+                ),
+            ) as selected_file_preflight,
+            mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
+            mock.patch(
+                "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf"
+            ) as builder,
+            pytest.raises(ValueError, match=r"Expected a 'clip' mmproj.*architecture 'llama'"),
+        ):
+            api_type.return_value.model_info.return_value = SimpleNamespace(
+                gguf={"architecture": "clip"}
+            )
+            build_vlm_from_gguf(text_path, remote_ref)
+
+        api_type.return_value.model_info.assert_not_called()
+        selected_file_preflight.assert_called_once_with(
+            "example/wrong-companion",
+            "model.gguf",
+            revision="main",
+        )
+        download.assert_not_called()
+        builder.assert_not_called()
+
+    def test_downloaded_mmproj_header_is_revalidated_before_builder(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
+
+        text_path = tmp_path / "text.gguf"
+        downloaded_path = tmp_path / "selected-file.gguf"
+        _write_minimal_gguf(text_path, "gemma4")
+        _write_minimal_gguf(downloaded_path, "llama")
+        remote_ref = "example/toctou:mmproj.gguf"
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_mmproj_companion_file",
+                return_value="b" * 40,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value=str(downloaded_path),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._mmproj.build_gemma4_vlm_from_gguf"
+            ) as builder,
+            pytest.raises(ValueError, match=r"Expected a 'clip' mmproj.*architecture 'llama'"),
+        ):
+            build_vlm_from_gguf(text_path, remote_ref)
+
+        builder.assert_not_called()
 
 
 class TestMuseGlimmerTemporalPatchSize:

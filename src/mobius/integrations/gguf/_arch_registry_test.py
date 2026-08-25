@@ -518,6 +518,99 @@ class TestPinnedTensorClosure:
             _build_mapping.cache_clear()
 
 
+class TestPinnedAudioCohort:
+    """Pin the audited C09 inventories without implying graph support."""
+
+    _LAYER_COUNTS: ClassVar[dict[str, int]] = {
+        "pockettts": 24,
+        "qwen3tts": 28,
+        "talkie": 40,
+        # wavtokenizer's only {bid} family is the ConvNeXt stack. PosNet's
+        # heterogeneous six-layer schedule is enumerated literally in the pin.
+        "wavtokenizer-dec": 12,
+    }
+    _EXPECTED_COUNTS: ClassVar[dict[str, int]] = {
+        "pockettts": 3 + 10 * 24,
+        "qwen3tts": 3 + 11 * 28,
+        "talkie": 2 + 9 * 40,
+        "wavtokenizer-dec": 161,
+    }
+
+    @classmethod
+    def _expanded_patterns(cls, architecture: str, field: str) -> set[str]:
+        names: set[str] = set()
+        for pattern in getattr(upstream_architectures()[architecture], field):
+            if "{bid}" in pattern:
+                names.update(
+                    pattern.replace("{bid}", str(index))
+                    for index in range(cls._LAYER_COUNTS[architecture])
+                )
+            else:
+                names.add(pattern)
+        return names
+
+    @classmethod
+    def _expanded_names(cls, architecture: str) -> set[str]:
+        return cls._expanded_patterns(architecture, "tensor_names")
+
+    @pytest.mark.parametrize("architecture", sorted(_LAYER_COUNTS))
+    def test_loader_inventory_is_suffix_exact_and_complete(self, architecture: str) -> None:
+        names = self._expanded_names(architecture)
+        assert len(names) == self._EXPECTED_COUNTS[architecture]
+        assert all(name.endswith((".weight", ".bias")) for name in names)
+
+    def test_pockettts_inventory_has_no_semantic_output_head(self) -> None:
+        names = self._expanded_names("pockettts")
+        assert "token_embd.weight" in names
+        assert "output.weight" not in names
+        assert "blk.0.attn_q.bias" not in names
+
+    def test_qwen3tts_inventory_is_the_transformed_talker_only(self) -> None:
+        names = self._expanded_names("qwen3tts")
+        assert "output.weight" in names
+        assert "blk.0.attn_q_norm.weight" in names
+        assert not any(name.startswith("a.gen.") for name in names)
+
+    def test_talkie_loader_and_converter_closures_are_distinct(self) -> None:
+        loader_names = self._expanded_names("talkie")
+        converter_extras = self._expanded_patterns("talkie", "converter_extra_tensor_names")
+
+        assert len(loader_names) == 362
+        assert len(converter_extras) == 80
+        assert len(loader_names | converter_extras) == 442
+        assert not loader_names & converter_extras
+        assert "blk.0.attn_output.scale" in converter_extras
+        assert "blk.0.ffn_down.scale" in converter_extras
+        assert "blk.0.layer_output_scale.weight" in loader_names
+        assert "blk.0.attn_output.input_scale" not in converter_extras
+
+    def test_wavtokenizer_heterogeneous_stacks_are_literal(self) -> None:
+        names = self._expanded_names("wavtokenizer-dec")
+        assert "posnet.2.attn_q.weight" in names
+        assert "posnet.5.attn_norm.weight" in names
+        assert "posnet.5.norm1.weight" not in names
+        assert "convnext.11.gamma.weight" in names
+        assert "convnext.12.gamma.weight" not in names
+
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "pockettts",
+            "qwen3tts",
+            "talkie",
+            "wavtokenizer-dec",
+        ],
+    )
+    def test_task_misdispatch_is_refused(self, architecture: str) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None
+        assert spec.model_type is None
+        assert spec.graph is not Support.SUPPORTED
+        assert all(verdict is Support.DEFERRED for verdict in spec.verdicts.values())
+        with pytest.raises(UnsupportedGGUFArchitectureError):
+            get_arch_spec(architecture)
+
+
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
 

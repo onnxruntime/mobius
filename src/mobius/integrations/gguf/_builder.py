@@ -20,13 +20,22 @@ __all__ = ["build_from_gguf"]
 
 import logging
 import re
+import struct
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import tqdm
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import (
+    HfApi,
+    get_hf_file_metadata,
+    get_session,
+    hf_hub_download,
+    hf_hub_url,
+)
+from huggingface_hub.utils import build_hf_headers
 
 from mobius._model_package import ModelPackage
 from mobius.integrations.gguf._arch_registry import (
@@ -37,16 +46,17 @@ from mobius.integrations.gguf._arch_registry import (
 from mobius.integrations.gguf._errors import (
     DisabledGGUFArchitectureError,
     ShardedGGUFNotSupportedError,
+    UnsupportedGGUFArchitectureError,
 )
 from mobius.integrations.gguf._spec import Support
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
 try:
-    from httpx import TransportError as _HttpxTransportError
+    from httpx import HTTPError as _HttpxHTTPError
 except ImportError:
     pass
 else:
-    _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxTransportError,)
+    _HUB_PREFLIGHT_TRANSPORT_ERRORS += (_HttpxHTTPError,)
 
 if TYPE_CHECKING:
     from mobius.tasks import ModelTask
@@ -58,6 +68,21 @@ _GGUF_SHARD_FILENAME_RE = re.compile(
     re.IGNORECASE,
 )
 _NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
+_GGUF_HEADER_RANGE_BYTES = 16 * 1024 * 1024
+_GGUF_ARCHITECTURE_KEY = b"general.architecture"
+_GGUF_SCALAR_WIDTHS = {
+    0: 1,  # UINT8
+    1: 1,  # INT8
+    2: 2,  # UINT16
+    3: 2,  # INT16
+    4: 4,  # UINT32
+    5: 4,  # INT32
+    6: 4,  # FLOAT32
+    7: 1,  # BOOL
+    10: 8,  # UINT64
+    11: 8,  # INT64
+    12: 8,  # FLOAT64
+}
 
 
 def _summarize_nemotron_h_moe_layout(
@@ -98,25 +123,31 @@ def _raise_for_unsupported_gguf_architecture(
     *,
     source: str,
     tensor_names: Iterable[str] | None = None,
+    allow_mmproj_companion: bool = False,
 ) -> None:
-    """Reject GGUF architectures that do not have semantic conversion evidence.
+    """Reject known architectures whose config, tensor map, or graph is unavailable.
 
-    Only architectures the registry marks ``REJECTED`` are refused here. An
-    architecture that is merely unregistered still reaches the tensor-mapping
-    gate, which produces the actionable "not imported yet" message; failing
-    early would change which error a caller sees.
+    This gate runs immediately after the GGUF header is available so dtype,
+    quantization, config extraction, registry lookup, and graph construction
+    cannot obscure the architecture verdict. Runtime packaging is deliberately
+    excluded: an importable graph may still have a deferred runtime contract.
     """
     spec = try_get_arch_spec(architecture)
     if spec is None:
         return
-    if spec.gguf_arch == MMPROJ_ARCHITECTURE:
+    if spec.gguf_arch == MMPROJ_ARCHITECTURE and allow_mmproj_companion:
         # mmproj sidecars are opened deliberately by the multimodal path, which
-        # pairs them with a text backbone. They are rejected only when someone
-        # passes one as the model itself, and the tensor-mapping gate already
-        # produces that message.
+        # pairs them with a text backbone and applies role-specific validation.
         return
-    rejected = [name for name, verdict in spec.verdicts.items() if verdict is Support.REJECTED]
-    if not rejected:
+    import_verdicts = {
+        name: verdict
+        for name, verdict in spec.verdicts.items()
+        if name in {"config", "tensor_map", "graph"}
+    }
+    unavailable = [
+        name for name, verdict in import_verdicts.items() if verdict is not Support.SUPPORTED
+    ]
+    if not unavailable:
         return
 
     layout = ""
@@ -130,9 +161,16 @@ def _raise_for_unsupported_gguf_architecture(
             f"{list(mtp_blocks)} with mixer types {mtp_kind_names}."
         )
 
-    raise DisabledGGUFArchitectureError(
-        f"Direct GGUF conversion for architecture {spec.gguf_arch!r} is intentionally "
-        f"disabled for {source!r}.{layout} {spec.reason} No ONNX artifacts were emitted."
+    if any(verdict is Support.REJECTED for verdict in import_verdicts.values()):
+        raise DisabledGGUFArchitectureError(
+            f"Direct GGUF conversion for architecture {spec.gguf_arch!r} is intentionally "
+            f"disabled for {source!r}.{layout} {spec.reason} No ONNX artifacts were emitted."
+        )
+    capabilities = ", ".join(unavailable)
+    raise UnsupportedGGUFArchitectureError(
+        f"GGUF architecture {spec.gguf_arch!r} is deferred for {source!r} before config "
+        f"extraction because these import capabilities are unavailable: {capabilities}. "
+        f"{spec.reason} No ONNX artifacts were emitted."
     )
 
 
@@ -356,7 +394,167 @@ def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
         )
 
 
-def _validate_gguf_model(gguf_model, *, source: str) -> None:
+def _gguf_architecture_from_header_prefix(data: bytes, *, source: str) -> str:
+    """Read ``general.architecture`` from a bounded GGUF header prefix."""
+    if len(data) < 24 or data[:4] != b"GGUF":
+        raise ValueError(f"{source!r} does not begin with a valid GGUF header.")
+    version = struct.unpack_from("<I", data, 4)[0]
+    if version not in {2, 3}:
+        raise ValueError(f"{source!r} uses unsupported GGUF version {version}.")
+
+    def read_uint32(offset: int) -> tuple[int, int]:
+        end = offset + 4
+        if end > len(data):
+            raise ValueError(f"{source!r} has a truncated GGUF metadata header.")
+        return struct.unpack_from("<I", data, offset)[0], end
+
+    def read_uint64(offset: int) -> tuple[int, int]:
+        end = offset + 8
+        if end > len(data):
+            raise ValueError(f"{source!r} has a truncated GGUF metadata header.")
+        return struct.unpack_from("<Q", data, offset)[0], end
+
+    def read_string(offset: int) -> tuple[bytes, int]:
+        length, offset = read_uint64(offset)
+        end = offset + length
+        if end > len(data):
+            raise ValueError(f"{source!r} has a truncated GGUF metadata string.")
+        return data[offset:end], end
+
+    def skip_value(value_type: int, offset: int, *, depth: int = 0) -> int:
+        width = _GGUF_SCALAR_WIDTHS.get(value_type)
+        if width is not None:
+            end = offset + width
+            if end > len(data):
+                raise ValueError(f"{source!r} has a truncated GGUF metadata value.")
+            return end
+        if value_type == 8:
+            _, offset = read_string(offset)
+            return offset
+        if value_type != 9:
+            raise ValueError(f"{source!r} uses unknown GGUF metadata type {value_type}.")
+        if depth >= 8:
+            raise ValueError(f"{source!r} has excessively nested GGUF metadata arrays.")
+        element_type, offset = read_uint32(offset)
+        count, offset = read_uint64(offset)
+        if count > len(data):
+            raise ValueError(f"{source!r} declares an impossible GGUF metadata array size.")
+        for _ in range(count):
+            offset = skip_value(element_type, offset, depth=depth + 1)
+        return offset
+
+    kv_count = struct.unpack_from("<Q", data, 16)[0]
+    if kv_count > len(data):
+        raise ValueError(f"{source!r} declares an impossible GGUF metadata entry count.")
+    offset = 24
+    architecture_values: list[bytes] = []
+    for _ in range(kv_count):
+        key, offset = read_string(offset)
+        value_type, offset = read_uint32(offset)
+        if key == _GGUF_ARCHITECTURE_KEY:
+            if value_type != 8:
+                raise ValueError(
+                    f"{source!r} encodes general.architecture with GGUF type "
+                    f"{value_type}, expected string type 8."
+                )
+            value, offset = read_string(offset)
+            architecture_values.append(value)
+        else:
+            offset = skip_value(value_type, offset)
+
+    if len(architecture_values) != 1:
+        raise ValueError(
+            f"{source!r} must contain exactly one general.architecture metadata entry, "
+            f"found {len(architecture_values)}."
+        )
+    value = architecture_values[0]
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{source!r} has a non-UTF-8 general.architecture value.") from error
+
+
+def _preflight_hf_mmproj_companion_file(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str = "main",
+) -> str | None:
+    """Validate the exact selected Hub file header and return its immutable revision."""
+    source = f"{repo_id}@{revision}:{filename}"
+    _raise_for_sharded_gguf(source=source, filename=filename)
+    url = hf_hub_url(repo_id, filename, revision=revision)
+    try:
+        metadata = get_hf_file_metadata(url)
+    except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
+        logger.warning(
+            "Exact-file mmproj header preflight failed for %s (%s); continuing to "
+            "hf_hub_download so a cached file can still be used. The downloaded "
+            "local header will be validated before builder dispatch.",
+            source,
+            error,
+        )
+        return None
+    commit_hash = metadata.commit_hash
+    if not commit_hash:
+        raise ValueError(f"Hub did not resolve an immutable revision for {source!r}.")
+
+    headers = build_hf_headers()
+    if urlparse(url).netloc != urlparse(metadata.location).netloc:
+        headers.pop("authorization", None)
+    headers["Range"] = f"bytes=0-{_GGUF_HEADER_RANGE_BYTES - 1}"
+
+    def read_response(response) -> list[bytes]:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        size = 0
+        chunk_iterator = (
+            response.iter_bytes()
+            if hasattr(response, "iter_bytes")
+            else response.iter_content(chunk_size=64 * 1024)
+        )
+        for chunk in chunk_iterator:
+            remaining = _GGUF_HEADER_RANGE_BYTES - size
+            if remaining <= 0:
+                break
+            chunks.append(chunk[:remaining])
+            size += min(len(chunk), remaining)
+            if size == _GGUF_HEADER_RANGE_BYTES:
+                break
+        return chunks
+
+    try:
+        session = get_session()
+        stream = getattr(session, "stream", None)
+        if callable(stream):
+            with stream("GET", metadata.location, headers=headers) as response:
+                chunks = read_response(response)
+        else:
+            with session.get(metadata.location, headers=headers, stream=True) as response:
+                chunks = read_response(response)
+    except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
+        logger.warning(
+            "Bounded mmproj header range read failed for %s (%s); downloading the "
+            "same immutable revision and validating its local header before dispatch.",
+            source,
+            error,
+        )
+        return commit_hash
+    architecture = _gguf_architecture_from_header_prefix(
+        b"".join(chunks),
+        source=source,
+    )
+    if architecture != MMPROJ_ARCHITECTURE:
+        raise ValueError(
+            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF for {source!r}, "
+            f"got architecture {architecture!r}. No payload was downloaded."
+        )
+    return commit_hash
+
+
+def _validate_gguf_model(
+    gguf_model, *, source: str, allow_mmproj_companion: bool = False
+) -> None:
     """Validate a parsed GGUF before config extraction or graph construction."""
     from mobius.integrations.gguf._shard_set import GgufShardSet
 
@@ -370,6 +568,7 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         gguf_model.architecture,
         source=source,
         tensor_names=gguf_model.tensor_names,
+        allow_mmproj_companion=allow_mmproj_companion,
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
@@ -758,8 +957,8 @@ def _looks_like_hf_repo_id(value: str) -> bool:
     return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
 
 
-def _resolve_gguf_path(gguf_path: str | Path) -> str:
-    """Resolve a GGUF reference to a local file path.
+def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bool) -> str:
+    """Resolve a GGUF reference with an internal primary/companion context.
 
     Accepts:
     - An existing local filesystem path (returned unchanged).
@@ -792,9 +991,33 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
             )
         filename = files[0]
 
-    _preflight_hf_gguf(api, repo_id, filename)
+    resolved_revision: str | None = None
+    if allow_mmproj_companion:
+        resolved_revision = _preflight_hf_mmproj_companion_file(
+            repo_id,
+            filename,
+            revision="main",
+        )
+    else:
+        _preflight_hf_gguf(api, repo_id, filename)
     logger.info("Downloading %s from %s", filename, repo_id)
+    if resolved_revision is not None:
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=resolved_revision,
+        )
     return hf_hub_download(repo_id=repo_id, filename=filename)
+
+
+def _resolve_gguf_path(gguf_path: str | Path) -> str:
+    """Resolve a primary GGUF reference without allowing mmproj sidecars."""
+    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=False)
+
+
+def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
+    """Resolve an internal mmproj companion, allowing only ``clip`` Hub metadata."""
+    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
 
 
 def build_from_gguf(
