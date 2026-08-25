@@ -67,7 +67,6 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "bert",
         "cohere2",
         "deci",
-        "deepseek4",
         "dflash",
         "dream",
         "eagle3",
