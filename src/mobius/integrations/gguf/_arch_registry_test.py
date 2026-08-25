@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 55
+_EXPECTED_SUPPORTED_COUNT = 56
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -167,6 +167,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "llada",
         "llada-moe",
         "llama",
+        "minimax-01",
         "modern-bert",
         "muse-glimmer",
         "nemotron",

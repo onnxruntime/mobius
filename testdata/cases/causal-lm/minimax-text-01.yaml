@@ -1,6 +1,6 @@
 model_id: "MiniMaxAI/MiniMax-Text-01"
 model_type: "minimax"
-revision: "main"
+revision: "a7351bf2bee0e1253919d349f1ad304e6dac13e9"
 task_type: "text-generation"
 dtype: "float32"
 
@@ -15,4 +15,4 @@ generation:
   do_sample: false
 
 skip_reason: "MiniMax-Text-01 is 456B total — too large for CI golden data generation."
-notes: "MiniMax Text-01. Hybrid LightningAttention (linear, gated) + full GQA + MoE. FP accumulation differences (atol=0.05)."
+notes: "Pinned MiniMax Text-01 reference. Exact GGUF graph import covers interval-8 LightningAttention/full-GQA scheduling, normalized residual scaling, partial RoPE, routed MoE, and heterogeneous explicit state. Released ORT GenAI packaging is deferred to #605 because rollback snapshots are not representable."

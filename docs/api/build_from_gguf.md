@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 2, 'supported': 57}; importable: 55; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
+| Architectures | 147 | graph verdicts: {'deferred': 87, 'rejected': 2, 'supported': 58}; importable: 56; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
@@ -428,7 +428,7 @@ before graph construction or durable output.
 | `mimo2` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | MiMo2 requires fused-QKV dense MTP blocks, attention sinks, interleaved sliding KV cache, and three chained heads selected by offsets. Mobius permits one head and cannot preserve that state or FP8 converter transform. |
 | `minicpm` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | MiniCPM requires architecture-specific embedding, residual, and logit scales, Q/K permutation, optional long/short RoPE tensors, and a conditional dense-or-MoE loader. The existing MiniCPM graph does not prove this complete GGUF contract. |
 | `minicpm3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned MiniCPM3 graph uses MLA Q/KV LoRA projections, separate NoPE/RoPE query and key channels, and embedding, residual, and LM-head scales. The current Mobius MiniCPM graph does not represent that exact topology or its scales. |
-| `minimax-01` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned loader schedule is not periodic and its Lightning Attention decay, scaling, residual multipliers, and recurrent rollback semantics are not represented by the current MiniMax graph. |
+| `minimax-01` | — | model=`minimax`; tensor=`minimax` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Graph import is exact, but released ORT GenAI packaging cannot represent the heterogeneous KV/recurrent state slots or bounded rollback snapshots; runtime packaging remains tracked by #605. |
 | `minimax-m2` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | MiniMax-M2 uses full-vector Q/K norms, partial RoPE, and all-layer correction-biased routed experts under metadata-selected gating. Mobius has no exact graph or suffix-safe expert import for that topology. |
 | `minimax-m3` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | MiniMax-M3 adds F32 sparse-indexer tensors and a second index-key cache with position/cell maps, block masks, rollback, and reorder semantics alongside main K/V state. Mobius has no MSA cache task or sparse-index operators; dense fallback would change the model. |
 | `mistral3` | — | none (fails before config extraction) | exact-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned Mistral3 loader selects dense or routed-expert text blocks from metadata and applies architecture-specific output temperature scaling. A VLM package additionally requires the deferred Pixtral clip sidecar and exact patch/merge/token contract. The existing Hugging Face Mistral3 graph does not cover that conditional GGUF closure. |
@@ -593,8 +593,11 @@ real-artifact full-logit and stateful-generation parity.
 - `static_cache=True` and non-hybrid task dispatch are rejected for these mixed
   state ABIs.
 
-`minimax-01` remains deferred before config extraction because its pinned
-Lightning schedule and decay/scaling semantics do not match the current graph.
+`minimax-01` graph import supports its exact pinned Lightning schedule,
+decay/scaling semantics, recurrent state, and mixed full-attention cache.
+Runtime packaging remains deferred because the released schema cannot represent
+that heterogeneous state ABI or bounded rollback snapshots; this is tracked by
+[`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605).
 PLaMo2 has a dedicated alternating Mamba1/attention graph and strict GGUF
 tensor closure. Its mixed per-layer recurrent/KV runtime package remains
 deferred to [`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605).

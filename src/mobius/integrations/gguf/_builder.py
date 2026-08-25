@@ -616,6 +616,7 @@ def _validate_gguf_model(
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
     _raise_for_invalid_plamo2_tensor_contract(gguf_model)
+    _raise_for_invalid_minimax_tensor_contract(gguf_model)
     _raise_for_invalid_hybrid_tensor_contract(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
@@ -632,6 +633,128 @@ def _validate_gguf_model(
         # known-but-deferred tokenizer is allowed for graph-only imports; an
         # unknown or contradictory tokenizer is not.
         inspect_gguf_tokenizer(gguf_model.metadata, source=source)
+
+
+def _raise_for_invalid_minimax_tensor_contract(gguf_model) -> None:
+    """Validate MiniMax-01 metadata, per-layer families, and exact tensor shapes."""
+    if gguf_model.architecture != "minimax-01":
+        return
+
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+    metadata = gguf_model.metadata
+    layers, layer_types, mtp_count = _derive_hybrid_layout(
+        "minimax-01", metadata, gguf_model.tensor_names
+    )
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("MiniMax-01 GGUF does not support appended MTP blocks")
+
+    hidden = int(metadata["minimax-01.embedding_length"])
+    intermediate = int(metadata["minimax-01.feed_forward_length"])
+    heads = int(metadata["minimax-01.attention.head_count"])
+    kv_heads = int(metadata["minimax-01.attention.head_count_kv"])
+    head_dim = int(metadata["minimax-01.attention.key_length"])
+    value_dim = int(metadata["minimax-01.attention.value_length"])
+    rope_dim = int(metadata["minimax-01.rope.dimension_count"])
+    experts = int(metadata["minimax-01.expert_count"])
+    top_k = int(metadata["minimax-01.expert_used_count"])
+    residual_scale = float(metadata["minimax-01.residual_scale"])
+    norm_eps = float(metadata["minimax-01.attention.layer_norm_rms_epsilon"])
+    rope_freq_base = float(metadata["minimax-01.rope.freq_base"])
+    vocab = int(metadata.get("minimax-01.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if (
+        min(hidden, intermediate, heads, kv_heads, head_dim, experts, top_k, vocab) <= 0
+        or heads % kv_heads
+        or value_dim != head_dim
+        or rope_dim <= 0
+        or rope_dim > head_dim
+        or rope_dim % 2
+        or experts <= 1
+        or top_k > experts
+        or not math.isfinite(residual_scale)
+        or residual_scale <= 0
+        or not math.isfinite(norm_eps)
+        or norm_eps <= 0
+        or not math.isfinite(rope_freq_base)
+        or rope_freq_base <= 0
+    ):
+        raise ValueError("MiniMax-01 GGUF has inconsistent architecture metadata")
+    if any(
+        key in metadata
+        for key in (
+            "minimax-01.expert_shared_count",
+            "minimax-01.expert_shared_feed_forward_length",
+        )
+    ):
+        raise ValueError("MiniMax-01 pinned GGUF does not support shared experts")
+
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {"output.weight": (vocab, hidden)}
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate_inp.weight": (experts, hidden),
+                prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
+                prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+            }
+        )
+        if layer_type == "lightning_attention":
+            required.update(
+                {
+                    prefix + "attn_qkv.weight": (3 * q_width, hidden),
+                    prefix + "attn_gate.weight": (q_width, hidden),
+                    prefix + "attn_norm_2.weight": (q_width,),
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "attn_q.weight": (q_width, hidden),
+                    prefix + "attn_k.weight": (kv_width, hidden),
+                    prefix + "attn_v.weight": (kv_width, hidden),
+                }
+            )
+
+    actual = set(gguf_model.tensor_names)
+    allowed = set(required) | set(optional)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - allowed)
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            "Invalid MiniMax-01 GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, out_of_range={out_of_range}"
+        )
+    if not hasattr(gguf_model, "tensor_items_raw"):
+        return
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    malformed = {
+        name: (shape, shapes.get(name))
+        for name, shape in {**required, **optional}.items()
+        if name in shapes and shapes[name] != shape
+    }
+    if malformed:
+        raise ValueError(f"MiniMax-01 GGUF has invalid tensor shape(s): {malformed}")
 
 
 def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:

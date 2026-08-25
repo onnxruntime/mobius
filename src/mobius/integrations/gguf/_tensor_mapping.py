@@ -726,6 +726,25 @@ _LFM2_MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.exp_probs_b": "model.layers.{bid}.feed_forward.expert_bias@",
 }
 
+_MINIMAX_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_norm_2": "model.layers.{bid}.self_attn.norm",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_gate": "model.layers.{bid}.self_attn.output_gate",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+}
+
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -809,6 +828,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "qwen3next_hybrid_extras": _QWEN3NEXT_HYBRID_EXTRAS,
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
+        "minimax": _MINIMAX_MAPPING,
     }
 )
 
