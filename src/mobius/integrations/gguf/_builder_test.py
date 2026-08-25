@@ -6209,21 +6209,21 @@ class TestKimiLinearGGUFBuild:
             for name in quantized_inputs
         )
 
-    def test_native_quantized_mla_projections_requantize_after_reshape(
+    def test_native_quantized_mla_reshape_requires_explicit_dequantization(
         self, tmp_path: Path
     ) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
         path = tmp_path / "kimi-linear-iq4-nl.gguf"
         _write_kimi_linear_gguf(path, quantized=True, native_quantized=True)
-        model = build_from_gguf(path, keep_quantized=True)["model"]
-        quantized_inputs = {
-            node.inputs[1].name
-            for node in model.graph
-            if node.op_type == "MatMulNBits" and len(node.inputs) > 1
-        }
-        assert any(name.endswith("k_b_proj.weight") for name in quantized_inputs)
-        assert any(name.endswith("v_b_proj.weight") for name in quantized_inputs)
+        with pytest.raises(
+            ValueError,
+            match=r"change the dequantized values.*attn_k_b\.weight \(IQ4_NL\)",
+        ):
+            build_from_gguf(path, keep_quantized=True)
+
+        model = build_from_gguf(path, keep_quantized=False)["model"]
+        assert all(node.op_type != "MatMulNBits" for node in model.graph)
 
     def test_left_padding_does_not_change_valid_logits_or_states(self, tmp_path: Path) -> None:
         from mobius._testing.ort_inference import OnnxModelSession
