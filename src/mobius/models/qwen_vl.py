@@ -30,24 +30,29 @@ if TYPE_CHECKING:
     import onnx_ir as ir
 
 
-def split_deepstack_embeds(
+def split_per_layer_inputs(
     op: OpBuilder,
-    deepstack_embeds: ir.Value | None,
+    per_layer_inputs: ir.Value | None,
     config: ArchitectureConfig,
 ) -> list[ir.Value] | None:
-    """Split stacked DeepStack embeddings into a per-layer list.
+    """Split flattened per-layer inputs into one DeepStack tensor per layer.
 
-    The embedding model exposes DeepStack maps as a single stacked
-    ``[D, batch, seq, hidden]`` tensor.  The decoder injects one map into
-    each of its first ``D`` layers, so split the stack into ``D`` tensors
-    of shape ``[batch, seq, hidden]``.  Returns ``None`` when DeepStack is
-    inactive so non-DeepStack decoders remain unaffected.
+    ORT GenAI forwards one rank-3 ``[batch, seq, D * hidden]`` tensor from
+    embedding to decoder. Restore ``[D, batch, seq, hidden]`` and return the
+    per-layer list consumed by the Qwen text model.
     """
-    if deepstack_embeds is None:
+    if per_layer_inputs is None:
         return None
     num_deepstack = len(config.deepstack_visual_indexes or [])
     if num_deepstack == 0:
         return None
+    deepstack_embeds = op.Transpose(
+        op.Reshape(
+            per_layer_inputs,
+            op.Constant(value_ints=[0, 0, num_deepstack, config.hidden_size]),
+        ),
+        perm=[2, 0, 1, 3],
+    )
     return [
         op.Gather(deepstack_embeds, op.Constant(value_int=i), axis=0)
         for i in range(num_deepstack)
@@ -799,12 +804,11 @@ class Qwen3VL3ModelCausalLMModel(nn.Module):
 
     .. note::
        When ``deepstack_visual_indexes`` is set, DeepStack intermediate
-       features are carried through the split via an extra
-       ``deepstack_features`` / ``deepstack_embeds`` channel: the vision
-       encoder emits a stacked ``[D, ...]`` tensor, the embedding model
-       scatters each map to full sequence length, and the decoder adds them
-       into its first ``D`` layers (matching HuggingFace per-layer
-       injection).  Models without DeepStack indices are unaffected.
+       features are packed into ``image_features`` by the vision encoder.
+       The embedding model scatters and flattens them into the generic
+       rank-3 ``per_layer_inputs`` contract consumed by ORT GenAI, and the
+       decoder restores and injects one map into each of its first ``D``
+       layers. Models without DeepStack indices are unaffected.
     """
 
     default_task: str = "qwen-vl"
@@ -905,7 +909,7 @@ class Qwen3VLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
-        deepstack_embeds: ir.Value | None = None,
+        per_layer_inputs: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -914,7 +918,7 @@ class Qwen3VLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
+            deepstack_embeds=split_per_layer_inputs(op, per_layer_inputs, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -950,16 +954,17 @@ class Qwen3VLVisionEncoderModel(nn.Module):
     """Qwen3-VL vision encoder for the 3-model split.
 
     Processes packed image patches through the Qwen3-VL ViT and outputs
-    merged features.  When ``deepstack_visual_indexes`` is set, it also
-    emits the stacked DeepStack intermediate features as a second output.
+    merged features. When ``deepstack_visual_indexes`` is set, intermediate
+    features are packed with the final features into one runtime-compatible
+    output.
 
     Inputs:
         - pixel_values: (total_patches, C*T_p*P*P)
         - image_grid_thw: (num_images, 3) INT64
     Outputs:
-        - image_features: (num_merged_patches, out_hidden_size)
-        - deepstack_features: (D, num_merged_patches, out_hidden_size)
-          (only when ``deepstack_visual_indexes`` is non-empty)
+        - image_features: (num_merged_patches, (D + 1) * out_hidden_size)
+          when DeepStack is active, otherwise
+          (num_merged_patches, out_hidden_size)
     """
 
     def __init__(self, config: ArchitectureConfig):
@@ -1036,19 +1041,17 @@ class Qwen3VLEmbeddingModel(Qwen25VLEmbeddingModel):
 
     Scatters merged image features at image-token positions (like
     Qwen2.5-VL) and, when the vision encoder produces DeepStack features,
-    also scatters each intermediate DeepStack map into a full-length
-    ``[batch, seq, hidden]`` tensor (zero at non-image positions).  The
-    stacked ``deepstack_embeds`` output is consumed by the decoder, which
-    adds them to the hidden states of its first ``D`` layers.
+    also scatters each intermediate DeepStack map into a full-length tensor
+    (zero at non-image positions). The maps are flattened into the generic
+    rank-3 ``per_layer_inputs`` output consumed by ORT GenAI.
 
     Inputs:
         - input_ids: (batch, seq_len) INT64
-        - image_features: (num_image_tokens, hidden_size) FLOAT
-        - deepstack_features: (D, num_image_tokens, hidden_size) FLOAT
-          (only when ``deepstack_visual_indexes`` is non-empty)
+        - image_features: (num_image_tokens, (D + 1) * hidden_size) FLOAT
+          when DeepStack is active
     Outputs:
         - inputs_embeds: (batch, seq_len, hidden_size) FLOAT
-        - deepstack_embeds: (D, batch, seq_len, hidden_size) FLOAT
+        - per_layer_inputs: (batch, seq_len, D * hidden_size) FLOAT
           (only when DeepStack is active)
     """
 

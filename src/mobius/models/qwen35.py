@@ -34,7 +34,7 @@ from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
     _QwenVLTextMixin,
-    split_deepstack_embeds,
+    split_per_layer_inputs,
 )
 
 # ---------------------------------------------------------------------------
@@ -704,7 +704,7 @@ class Qwen35VLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
-        deepstack_embeds: ir.Value | None = None,
+        per_layer_inputs: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -713,7 +713,7 @@ class Qwen35VLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
+            deepstack_embeds=split_per_layer_inputs(op, per_layer_inputs, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
@@ -768,7 +768,7 @@ class Qwen35MoEVLDecoderModel(nn.Module):
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_key_values: list | None = None,
-        deepstack_embeds: ir.Value | None = None,
+        per_layer_inputs: ir.Value | None = None,
     ):
         hidden_states, present_key_values = self.model(
             op,
@@ -777,7 +777,7 @@ class Qwen35MoEVLDecoderModel(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            deepstack_embeds=split_deepstack_embeds(op, deepstack_embeds, self.config),
+            deepstack_embeds=split_per_layer_inputs(op, per_layer_inputs, self.config),
         )
         logits = self.lm_head(op, hidden_states)
         return logits, present_key_values
