@@ -2137,6 +2137,10 @@ def _load_quantized_state_dict(
         native_spec = _native_block_spec(qtype)
         quant_spec = get_quant_spec(qtype)
         is_embedding_tensor = module_stem is not None and module_stem in embedding_stems
+        is_encoder_embedding = is_embedding_tensor and gguf_arch in {
+            "bert",
+            "modern-bert",
+        }
         tensor_role = (
             TensorRole.EMBEDDING
             if is_embedding_tensor
@@ -2176,6 +2180,7 @@ def _load_quantized_state_dict(
                 tensor_role is TensorRole.EMBEDDING
                 and route is not QuantImportRoute.DEQUANTIZE_FLOAT
                 and not is_quantized_embedding
+                and not is_encoder_embedding
             ):
                 raise ValueError(
                     f"Cannot keep {quant_spec.name} embedding {hf_name} quantized: "

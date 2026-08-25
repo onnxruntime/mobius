@@ -64,6 +64,7 @@ _EXPECTED_SUPPORTED_COUNT = 35
 _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
     {
         "arcee",
+        "bert",
         "cohere2",
         "deci",
         "deepseek4",
@@ -77,6 +78,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "granitemoe",
         "hunyuan-dense",
         "llama",
+        "modern-bert",
         "muse-glimmer",
         "nemotron",
         "olmo",

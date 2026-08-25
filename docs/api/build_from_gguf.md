@@ -147,11 +147,13 @@ reason.
 |---|---|---|---|---|
 | `arcee` | — | `arcee` | runtime deferred | supported |
 | `arwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `bert` | — | `bert` | runtime deferred | supported |
 | `bloom` | — | `bloom` | tensor_map deferred | unreachable |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
 | `deci` | — | `llama` | supported | supported |
 | `deepseek4` | — | `deepseek_v4` | supported | supported |
+| `eurobert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `exaone` | — | `exaone` | runtime deferred | supported |
 | `falcon` | — | `falcon` | supported | supported |
 | `gemma` | — | `gemma` | supported | supported |
@@ -163,12 +165,18 @@ reason.
 | `granitemoe` | — | `granitemoe` | runtime deferred | supported |
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
+| `jina-bert-v2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `jina-bert-v3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `llama` | `mistral` | `llama` | supported | supported |
 | `mamba` | — | `mamba` | runtime deferred | rejected |
 | `mamba2` | — | `mamba2` | runtime deferred | rejected |
+| `modern-bert` | — | `modernbert` | runtime deferred | supported |
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
 | `nemotron` | — | `nemotron` | supported | supported |
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
+| `neo-bert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `nomic-bert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `nomic-bert-moe` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `olmo` | — | `olmo` | supported | supported |
 | `olmo2` | — | `olmo2` | supported | supported |
 | `olmoe` | — | `olmoe` | runtime deferred | supported |
