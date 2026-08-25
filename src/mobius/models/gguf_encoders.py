@@ -140,16 +140,11 @@ class _PackedAttention(nn.Module):
         self.output = Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(self, op, hidden_states, attention_mask, position_embeddings):
-        # NeoBERT packs Q/K/V inside each head: (B, S, N, 3*H), not as
-        # three contiguous model-width regions.
-        packed = op.Reshape(
-            self.qkv(op, hidden_states),
-            [0, 0, self.num_heads, 3 * self.head_dim],
+        # llama.cpp's fused build_qkv views contiguous full-width Q, K, and V
+        # regions before each region is reshaped into heads.
+        query, key, value = op.Split(
+            self.qkv(op, hidden_states), axis=-1, num_outputs=3, _outputs=3
         )
-        query, key, value = op.Split(packed, axis=-1, num_outputs=3, _outputs=3)
-        query = op.Reshape(query, [0, 0, self.num_heads * self.head_dim])
-        key = op.Reshape(key, [0, 0, self.num_heads * self.head_dim])
-        value = op.Reshape(value, [0, 0, self.num_heads * self.head_dim])
         query = apply_rotary_pos_emb(
             op,
             query,
@@ -400,7 +395,13 @@ def _pool_encoder_output(op, hidden_states, attention_mask, *, pooling_type: int
     if pooling_type == 0:
         return hidden_states
     if pooling_type == 2:
-        return op.Gather(hidden_states, op.Constant(value_int=0), axis=1)
+        # llama.cpp's CLS pooling selects the lowest-position real token, not
+        # necessarily physical row zero when a request is left padded.
+        first_valid = op.ArgMax(attention_mask, axis=1, keepdims=0, select_last_index=0)
+        seq_len = op.Squeeze(op.Shape(hidden_states, start=1, end=2))
+        one_hot = op.OneHot(first_valid, seq_len, [0, 1], axis=-1)
+        selector = op.Unsqueeze(op.CastLike(one_hot, hidden_states), [2])
+        return op.ReduceSum(op.Mul(hidden_states, selector), axes=[1], keepdims=0)
     mask = op.Unsqueeze(op.CastLike(attention_mask, hidden_states), [2])
     summed = op.ReduceSum(op.Mul(hidden_states, mask), axes=[1], keepdims=0)
     count = op.ReduceSum(mask, axes=[1], keepdims=0)

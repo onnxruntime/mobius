@@ -253,7 +253,7 @@ def test_synthetic_fused_split_values_preserve_gate_up_order() -> None:
     np.testing.assert_allclose(actual, expected)
 
 
-def test_neobert_graph_preserves_per_head_qkv_and_interleaved_rope() -> None:
+def test_neobert_graph_preserves_contiguous_qkv_and_interleaved_rope() -> None:
     arch = "neo-bert"
     config = gguf_to_config(_FakeGGUF(arch, _metadata(arch), _tensors(arch)))
     module = registry.get(get_arch_spec(arch).module_type)(config)
@@ -265,17 +265,17 @@ def test_neobert_graph_preserves_per_head_qkv_and_interleaved_rope() -> None:
         if node.op_type == "Split" and "/attention/" in (node.name or "")
     ]
     assert len(attention_splits) == config.num_hidden_layers
-    assert all(node.inputs[0].producer().op_type == "Reshape" for node in attention_splits)
+    assert all(node.inputs[0].producer().op_type == "MatMul" for node in attention_splits)
     rotary_nodes = [node for node in graph if node.op_type == "RotaryEmbedding"]
     assert len(rotary_nodes) == 2 * config.num_hidden_layers
     assert all(node.attributes["interleaved"].value == 1 for node in rotary_nodes)
 
-    # A head-interleaved projection must split each head's 3*head_dim chunk.
-    projected = np.arange(24, dtype=np.float32).reshape(1, 1, 2, 12)
+    # The pinned fused build_qkv takes three contiguous model-width views.
+    projected = np.arange(24, dtype=np.float32).reshape(1, 1, 24)
     query, key, value = np.split(projected, 3, axis=-1)
-    np.testing.assert_array_equal(query.reshape(1, 1, 8), [[[*range(4), *range(12, 16)]]])
-    np.testing.assert_array_equal(key.reshape(1, 1, 8), [[[*range(4, 8), *range(16, 20)]]])
-    np.testing.assert_array_equal(value.reshape(1, 1, 8), [[[*range(8, 12), *range(20, 24)]]])
+    np.testing.assert_array_equal(query, [[[*range(8)]]])
+    np.testing.assert_array_equal(key, [[[*range(8, 16)]]])
+    np.testing.assert_array_equal(value, [[[*range(16, 24)]]])
 
 
 def test_jina_uses_tanh_approximate_gelu() -> None:
@@ -330,6 +330,45 @@ def test_unknown_specialized_encoder_pooling_fails_closed() -> None:
     metadata[f"{arch}.pooling_type"] = 3
     with pytest.raises(ValueError, match="not a known encoder pooling"):
         gguf_to_config(_FakeGGUF(arch, metadata, _tensors(arch)))
+
+
+def test_cls_pooling_selects_first_valid_left_padded_token() -> None:
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    arch = "neo-bert"
+    metadata = _metadata(arch)
+    metadata[f"{arch}.pooling_type"] = 2
+    tensors = _tensors(arch)
+    config = gguf_to_config(_FakeGGUF(arch, metadata, tensors))
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    package = GGUFEncoderFeatureExtractionTask().build(module, config)
+
+    weights = {
+        map_gguf_to_hf_names(name, arch): torch.zeros(shape) for name, shape in tensors.items()
+    }
+    embeddings = torch.zeros((32, 8))
+    embeddings[0] = 100.0  # Left-padding row must never be selected.
+    embeddings[1] = torch.arange(1, 9, dtype=torch.float32)
+    weights["token_embeddings.weight"] = embeddings
+    for name in tuple(weights):
+        if name.endswith("_norm.weight") or name == "output_norm.weight":
+            weights[name] = torch.ones_like(weights[name])
+    package.apply_weights(weights)
+
+    session = OnnxModelSession(package["model"])
+    try:
+        output = session.run(
+            {
+                "input_ids": np.array([[0, 1, 2]], dtype=np.int64),
+                "attention_mask": np.array([[0, 1, 1]], dtype=np.int64),
+                "token_type_ids": np.zeros((1, 3), dtype=np.int64),
+            }
+        )["sentence_embedding"]
+    finally:
+        session.close()
+    token = np.arange(1, 9, dtype=np.float32)
+    expected = token / np.sqrt(np.mean(token * token) + config.rms_norm_eps)
+    np.testing.assert_allclose(output, expected[None, :], rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
