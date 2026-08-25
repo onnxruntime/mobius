@@ -400,6 +400,8 @@ class BaseModelConfig:
     model_type: str | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
+    mask_token_id: int | None = None
+    diffusion_shift_logits: bool = False
 
 
 @dataclasses.dataclass
@@ -785,6 +787,8 @@ class ArchitectureConfig(BaseModelConfig):
             model_type=model_type,
             bos_token_id=getattr(config, "bos_token_id", None),
             eos_token_id=getattr(config, "eos_token_id", None),
+            mask_token_id=getattr(config, "mask_token_id", None),
+            diffusion_shift_logits=getattr(config, "diffusion_shift_logits", False),
             video_token_id=getattr(
                 parent_config or config,
                 "video_token_id",
@@ -1676,8 +1680,10 @@ class DFlashConfig(CausalLMConfig):
                 "target_layer_ids": getattr(dflash_cfg, "target_layer_ids", None),
                 "mask_token_id": getattr(dflash_cfg, "mask_token_id", None),
             }
+        base_fields = _shallow_fields(base)
+        base_fields.pop("mask_token_id", None)
         return cls(
-            **_shallow_fields(base),
+            **base_fields,
             target_layer_ids=dflash_cfg.get("target_layer_ids"),
             block_size=getattr(config, "block_size", None),
             mask_token_id=dflash_cfg.get("mask_token_id"),

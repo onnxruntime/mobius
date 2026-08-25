@@ -556,6 +556,48 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "dream",
+        {
+            "attn_qkv_bias": True,
+        },
+        True,
+    ),
+    ("Dream", {"attn_qkv_bias": True}, False),
+    (
+        "llada_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "attn_qk_norm": True,
+            "norm_topk_prob": False,
+        },
+        True,
+    ),
+    (
+        "LLaDAMoEModel",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "attn_qk_norm": True,
+            "norm_topk_prob": False,
+        },
+        False,
+    ),
+    (
+        "rnd1",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "attn_qk_norm": True,
+            "norm_topk_prob": True,
+            "tie_word_embeddings": True,
+        },
+        True,
+    ),
+    (
         "qwen3_5_moe",
         {
             "hidden_act": "silu",

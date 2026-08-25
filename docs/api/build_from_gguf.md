@@ -153,6 +153,7 @@ reason.
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
 | `deci` | — | `llama` | supported | supported |
 | `deepseek4` | — | `deepseek_v4` | supported | supported |
+| `dream` | — | `dream` | runtime deferred | supported |
 | `eurobert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `exaone` | — | `exaone` | runtime deferred | supported |
 | `falcon` | — | `falcon` | supported | supported |
@@ -167,6 +168,8 @@ reason.
 | `internlm2` | — | `internlm2` | supported | rejected |
 | `jina-bert-v2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `jina-bert-v3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `llada` | — | `llada` | runtime deferred | supported |
+| `llada-moe` | — | `llada` | runtime deferred | supported |
 | `llama` | `mistral` | `llama` | supported | supported |
 | `mamba` | — | `mamba` | runtime deferred | rejected |
 | `mamba2` | — | `mamba2` | runtime deferred | rejected |
@@ -188,6 +191,7 @@ reason.
 | `qwen35` | — | `qwen3_5_text` | supported | supported |
 | `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
 | `qwen3moe` | `qwen3_moe` | `qwen3_moe` | runtime deferred | supported |
+| `rnd1` | — | `llada` | runtime deferred | supported |
 | `rwkv6` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rwkv6qwen2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -203,6 +207,57 @@ Canonical names are the strings llama.cpp writes into `general.architecture`,
 validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
+
+### Masked language-diffusion GGUF contract
+
+`dream`, `llada`, `llada-moe`, and `rnd1` are full-sequence, bidirectional
+masked-token predictors. Their neural graph has one `input_ids [batch, sequence]`
+input and returns `logits [batch, sequence, vocabulary]` plus
+`proposed_tokens [batch, sequence]`. It has no causal mask, timestep/noise input,
+or KV cache. The caller owns the initial mask, mask-token insertion, seed,
+iteration count, confidence policy, and progressive remasking/commit schedule;
+Mobius does not infer a diffusion schedule from the GGUF.
+
+`tokenizer.ggml.mask_token_id` is therefore required and range-checked. The
+llama.cpp `diffusion.shift_logits` default is preserved (`true` for Dream/RND1,
+explicitly `false` for the pinned LLaDA files). A causal task override or static
+cache is rejected before graph construction. Dense LLaDA alone reverses the
+llama.cpp interleaved-RoPE Q/K row permutation; Dream, LLaDA-MoE, and RND1 keep
+their Q/K rows in converter order. LLaDA-MoE retains raw selected softmax router
+weights, while RND1 renormalizes the selected weights. Fused QKV, when admitted
+by the pinned loader, is split as `[Q heads, KV heads, KV heads]` on the
+float-only path.
+
+Compatible 2-D projections and routed experts retain supported native/affine
+quantization. Embeddings, norms, routers, and auxiliary tensors follow their
+actual consumer ABI; unrecognized sidecars, neural timestep tensors, and noise
+schedule tensors fail suffix-exact closure instead of being dropped.
+A fused QKV tensor is rejected whenever any mapped tensor activates
+quantization preservation, including a float fused tensor in an otherwise
+quantized file. The packed diffusion graph owns separate Q/K/V targets, so
+post-load splitting would leave those targets uninitialized. Use
+`keep_quantized=False` or `--dequantize` for such files; split-QKV quantized
+files remain supported. The pinned diffusion MoE family uses separate stacked
+gate, up, and down expert tensors rather than a fused gate-up tensor, and those
+tensors map directly to the graph's expert targets.
+
+Runtime remains **deferred**. These immutable artifacts were pinned before
+payload download; only the 88.8 MB LLaDA file was downloaded. Its SHA-256,
+57-tensor census, mask token `126336`, `diffusion.shift_logits=false`, and
+quantized CPU masked-forward smoke test were verified. A successful import is
+not parity evidence.
+
+| Architecture | GGUF revision / file | Size / LFS SHA-256 | Source config/tokenizer |
+|---|---|---|---|
+| `dream` | `mradermacher/Dream-v0-Base-7B-GGUF@8145ed37262d0d5769efefd33e156cd2ef98f4b2` / `Dream-v0-Base-7B.Q2_K.gguf` | 3,015,940,512 bytes / `c28476c7e7b0ea4e00e93f3b456f5e2e9b589f4200f29a975f845b8b9e5b0012` | `Dream-org/Dream-v0-Base-7B@6572adb5535263e4d1a337b56942ba48b6dee2a9` |
+| `llada` | `mradermacher/LLaDA-1.5-Tiny-GGUF@752094b7115a2aa5097b6be66187b19a46ff97dc` / `LLaDA-1.5-Tiny.Q2_K.gguf` | 88,765,952 bytes / `31c5fd2c1fc6bcd4e1d8b605774759252c130977562973d721a98c1d810b50a2` | Bundled tokenizer/config metadata verified; `JakeOh/LLaDA-1.5-Tiny` source revision is access-restricted. |
+| `llada-moe` | `mradermacher/LLaDA-MoE-7B-A1B-Instruct-GGUF@1080e16761f6f82a92e8bfb54a4c8998dfee0219` / `LLaDA-MoE-7B-A1B-Instruct.Q8_0.gguf` | 7,829,549,248 bytes / `7e50c4764866b64aba502d2b1e98fe20649c76f70df4b10fb9d2ece7c04fd2fd` | `inclusionAI/LLaDA-MoE-7B-A1B-Instruct@783d3467f108d28ac0a78d3e41af16ab05cabd8d` |
+| `rnd1` | `vikramkr/RND1-Base-0910-Q8_0-GGUF@93d8d35e3aac7b39311e48fc778777ac21529057` / `rnd1-base-0910-q8_0.gguf` | 32,483,927,584 bytes / `689949d9661c88930045c3511f893cacb41068c5133c43dcd388570abd1af28b` | `radicalnumerics/RND1-Base-0910@f1b49afd26579c1cd4ef7e00ae88376de63f2878` |
+
+The support matrix will remain deferred until at least one artifact for each
+architecture passes independent Hugging Face or llama.cpp masked-step logits
+and deterministic multi-step generation parity with identical mask, seed, and
+remasking policy. The three multi-gigabyte artifacts above were not downloaded.
 
 ### Encoder-only GGUF contract
 

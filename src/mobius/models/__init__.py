@@ -81,7 +81,9 @@ __all__ = [
     "JambaCausalLMModel",
     "JetMoeCausalLMModel",
     "Llama4CausalLMModel",
+    "DreamModel",
     "LLaDAModel",
+    "LLaDAMoEModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "Lfm2CausalLMModel",
@@ -149,6 +151,7 @@ __all__ = [
     "Qwen3TTSCodecEncoderModel",
     "Qwen3TTSEmbeddingModel",
     "Qwen3TTSForConditionalGeneration",
+    "RND1Model",
     "Qwen3TTSSpeakerEncoderModel",
     "Qwen3TTSTalkerDecoderModel",
     "Qwen3TTSTokenizerV2Model",
@@ -254,7 +257,7 @@ from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.lfm2 import Lfm2CausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
-from mobius.models.llada import LLaDAModel
+from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model
 from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel

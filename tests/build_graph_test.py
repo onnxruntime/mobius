@@ -251,12 +251,17 @@ class TestBuildGraph:
         # Check expected inputs exist
         input_names = {inp.name for inp in model.graph.inputs}
         assert "input_ids" in input_names
-        assert "attention_mask" in input_names
-        assert "position_ids" in input_names
 
         # Check outputs include logits and KV cache
         output_names = {out.name for out in model.graph.outputs}
         assert "logits" in output_names
+        if task_name == "masked-diffusion":
+            assert input_names == {"input_ids"}
+            assert output_names == {"logits", "proposed_tokens"}
+            return
+
+        assert "attention_mask" in input_names
+        assert "position_ids" in input_names
 
         # Check KV cache / hybrid cache outputs.  Models whose trailing layers
         # borrow K,V from an earlier layer (Gemma 3n's num_kv_shared_layers)

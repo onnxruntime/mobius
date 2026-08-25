@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest import mock
 
 import httpx
@@ -97,6 +98,8 @@ def _write_quantized_gguf(
     output_quantization: str | None = None,
     tie_embeddings: bool = False,
     float_type: str = "f32",
+    fused_qkv: bool = False,
+    fused_qkv_float: bool = False,
 ) -> None:
     """Write a GGUF file with quantized projection weights.
 
@@ -125,6 +128,8 @@ def _write_quantized_gguf(
     elif architecture == "granitemoe":
         writer.add_logit_scale(16.0)
     writer.add_vocab_size(vocab_size)
+    if architecture in {"dream", "llada", "llada-moe", "rnd1"}:
+        writer.add_uint32("tokenizer.ggml.mask_token_id", vocab_size - 1)
 
     head_dim = hidden_size // num_heads
 
@@ -271,21 +276,28 @@ def _write_quantized_gguf(
     )
 
     for i in range(num_layers):
-        add_projection(
-            f"blk.{i}.attn_q.weight",
-            num_heads * head_dim,
-            hidden_size,
-        )
-        add_projection(
-            f"blk.{i}.attn_k.weight",
-            num_kv_heads * head_dim,
-            hidden_size,
-        )
-        add_value_projection(
-            f"blk.{i}.attn_v.weight",
-            num_kv_heads * head_dim,
-            hidden_size,
-        )
+        if fused_qkv:
+            fused_rows = (num_heads + 2 * num_kv_heads) * head_dim
+            if fused_qkv_float:
+                add_float(f"blk.{i}.attn_qkv.weight", (fused_rows, hidden_size))
+            else:
+                add_projection(f"blk.{i}.attn_qkv.weight", fused_rows, hidden_size)
+        else:
+            add_projection(
+                f"blk.{i}.attn_q.weight",
+                num_heads * head_dim,
+                hidden_size,
+            )
+            add_projection(
+                f"blk.{i}.attn_k.weight",
+                num_kv_heads * head_dim,
+                hidden_size,
+            )
+            add_value_projection(
+                f"blk.{i}.attn_v.weight",
+                num_kv_heads * head_dim,
+                hidden_size,
+            )
         add_projection(
             f"blk.{i}.attn_output.weight",
             hidden_size,
@@ -680,6 +692,8 @@ def _write_moe_gguf(
     projection_quantization: str,
     *,
     phi_fused_qkv: bool = False,
+    diffusion_fused_qkv: bool = False,
+    fused_qkv_float: bool = False,
     quantize_tied_embedding: bool = False,
     expert_scale_suffix: str | None = None,
     malformed_expert_scale: bool = False,
@@ -689,7 +703,7 @@ def _write_moe_gguf(
 
     hidden_size = 64
     intermediate_size = 128
-    expert_size = 64 if architecture in {"qwen2moe", "qwen3moe"} else 128
+    expert_size = 64 if architecture in {"qwen2moe", "qwen3moe", "llada-moe", "rnd1"} else 128
     shared_size = 128 if architecture == "qwen2moe" else 32
     num_experts = 4
     num_heads = 4
@@ -710,6 +724,10 @@ def _write_moe_gguf(
     writer.add_vocab_size(vocab_size)
     writer.add_expert_count(num_experts)
     writer.add_expert_used_count(2)
+    if architecture in {"llada-moe", "rnd1"}:
+        writer.add_uint32("tokenizer.ggml.mask_token_id", vocab_size - 1)
+    if architecture == "llada-moe":
+        writer.add_bool("diffusion.shift_logits", False)
     if architecture in {"qwen2moe", "qwen3moe"}:
         writer.add_expert_feed_forward_length(expert_size)
     if architecture == "qwen2moe":
@@ -747,7 +765,20 @@ def _write_moe_gguf(
             raw_dtype=GGMLQuantizationType.Q4_0,
         )
 
-    add_projection = add_q4 if projection_quantization == "q4_0" else add_float
+    def add_mxfp4(name: str, shape: tuple[int, ...]) -> None:
+        assert shape[-1] % 32 == 0
+        byte_shape = (*shape[:-1], (shape[-1] // 32) * 17)
+        writer.add_tensor(
+            name,
+            np.zeros(byte_shape, dtype=np.uint8),
+            raw_dtype=GGMLQuantizationType.MXFP4,
+        )
+
+    add_projection = {
+        "f32": add_float,
+        "mxfp4": add_mxfp4,
+        "q4_0": add_q4,
+    }[projection_quantization]
 
     if quantize_tied_embedding:
         assert architecture in {"qwen3moe", "granitemoe"}
@@ -756,6 +787,12 @@ def _write_moe_gguf(
         add_float("token_embd.weight", (vocab_size, hidden_size))
     if architecture == "phimoe" and phi_fused_qkv:
         add_projection(
+            "blk.0.attn_qkv.weight",
+            ((num_heads + 2 * num_kv_heads) * head_dim, hidden_size),
+        )
+    elif architecture in {"llada-moe", "rnd1"} and diffusion_fused_qkv:
+        add = add_float if fused_qkv_float else add_projection
+        add(
             "blk.0.attn_qkv.weight",
             ((num_heads + 2 * num_kv_heads) * head_dim, hidden_size),
         )
@@ -787,7 +824,7 @@ def _write_moe_gguf(
     if architecture == "olmoe":
         add_float("blk.0.attn_q_norm.weight", (num_heads * head_dim,))
         add_float("blk.0.attn_k_norm.weight", (num_kv_heads * head_dim,))
-    elif architecture == "qwen3moe":
+    elif architecture in {"qwen3moe", "llada-moe", "rnd1"}:
         add_float("blk.0.attn_q_norm.weight", (head_dim,))
         add_float("blk.0.attn_k_norm.weight", (head_dim,))
     elif architecture == "qwen2moe":
@@ -1702,6 +1739,165 @@ class TestBuildQuantizedGguf:
         assert np.isfinite(first).all()
         np.testing.assert_array_equal(first, second)
 
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_dream_masked_diffusion_float_and_quantized_forward(
+        self, projection_quantization: str, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"dream-{projection_quantization}.gguf"
+        quantized = projection_quantization == "q4_0"
+        _write_quantized_gguf(
+            path,
+            architecture="dream",
+            projection_quantization=projection_quantization,
+            quantize_embedding=quantized,
+            output_quantization=projection_quantization,
+        )
+
+        preserved = build_from_gguf(path)
+        model = preserved["model"]
+        op_types = {node.op_type for node in model.graph}
+        assert ("MatMulNBits" in op_types) is quantized
+        assert [value.name for value in model.graph.inputs] == ["input_ids"]
+        assert not any(
+            token in value.name
+            for value in (*model.graph.inputs, *model.graph.outputs)
+            for token in ("past", "present", "cache")
+        )
+
+        output_dir = tmp_path / f"dream-{projection_quantization}-onnx"
+        preserved.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        logits, proposed = session.run(
+            None, {"input_ids": np.array([[1, 2, 255]], dtype=np.int64)}
+        )
+        assert logits.shape == (1, 3, 256)
+        assert proposed.shape == (1, 3)
+        assert np.isfinite(logits).all()
+        np.testing.assert_array_equal(proposed, np.argmax(logits, axis=-1))
+
+        if quantized:
+            dequantized_dir = tmp_path / "dream-dequantized-onnx"
+            build_from_gguf(path, keep_quantized=False).save(
+                dequantized_dir, progress_bar=False
+            )
+            float_session = ort.InferenceSession(
+                str(dequantized_dir / "model.onnx"),
+                providers=["CPUExecutionProvider"],
+            )
+            float_logits = float_session.run(
+                ["logits"], {"input_ids": np.array([[1, 2, 255]], dtype=np.int64)}
+            )[0]
+            np.testing.assert_allclose(logits, float_logits, rtol=0, atol=2e-2)
+
+    @pytest.mark.parametrize("architecture", ["dream", "llada-moe", "rnd1"])
+    @pytest.mark.parametrize(
+        ("source_kind", "writer_kwargs"),
+        [
+            ("affine", {"projection_quantization": "q4_0"}),
+            (
+                "native",
+                {"projection_quantization": "mxfp4"},
+            ),
+            (
+                "mixed_float_fused",
+                {
+                    "projection_quantization": "q4_0",
+                    "fused_qkv_float": True,
+                },
+            ),
+        ],
+    )
+    def test_quantized_diffusion_fused_qkv_rejects_before_graph_build(
+        self,
+        architecture: str,
+        source_kind: str,
+        writer_kwargs: dict,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        import mobius._builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-fused-{source_kind}.gguf"
+        if architecture == "dream":
+            _write_quantized_gguf(
+                path,
+                architecture=architecture,
+                fused_qkv=True,
+                **writer_kwargs,
+            )
+        else:
+            _write_moe_gguf(
+                path,
+                architecture,
+                writer_kwargs["projection_quantization"],
+                diffusion_fused_qkv=True,
+                fused_qkv_float=writer_kwargs.get("fused_qkv_float", False),
+            )
+        monkeypatch.setattr(
+            mobius._builder,
+            "build_from_module",
+            lambda *_args, **_kwargs: pytest.fail("graph construction must not run"),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=rf"Quantization-preserving import of fused QKV.*{architecture}",
+        ) as error:
+            build_from_gguf(path)
+        assert "keep_quantized=False" in str(error.value)
+
+    @pytest.mark.parametrize("architecture", ["dream", "llada-moe", "rnd1"])
+    @pytest.mark.parametrize(
+        ("projection_quantization", "keep_quantized"),
+        [("f32", True), ("q4_0", False)],
+    )
+    def test_float_diffusion_fused_qkv_still_builds_and_runs(
+        self,
+        architecture: str,
+        projection_quantization: str,
+        keep_quantized: bool,
+        tmp_path: Path,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-fused-{projection_quantization}.gguf"
+        if architecture == "dream":
+            _write_quantized_gguf(
+                path,
+                architecture=architecture,
+                projection_quantization=projection_quantization,
+                fused_qkv=True,
+            )
+        else:
+            _write_moe_gguf(
+                path,
+                architecture,
+                projection_quantization,
+                diffusion_fused_qkv=True,
+                fused_qkv_float=projection_quantization == "f32",
+            )
+
+        package = build_from_gguf(path, keep_quantized=keep_quantized)
+        model = package["model"]
+        assert "MatMulNBits" not in {node.op_type for node in model.graph}
+        output_dir = tmp_path / f"{architecture}-fused-{projection_quantization}-onnx"
+        package.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        logits, proposed = session.run(
+            None, {"input_ids": np.array([[1, 2, 255]], dtype=np.int64)}
+        )
+        assert logits.shape == (1, 3, 256)
+        np.testing.assert_array_equal(proposed, np.argmax(logits, axis=-1))
+
     @pytest.mark.parametrize(
         "architecture", ["olmoe", "phimoe", "qwen2moe", "qwen3moe", "granitemoe"]
     )
@@ -1761,6 +1957,44 @@ class TestBuildQuantizedGguf:
         assert first.shape == (1, 2, 256)
         assert np.isfinite(first).all()
         np.testing.assert_array_equal(first, second)
+
+    @pytest.mark.parametrize("architecture", ["llada-moe", "rnd1"])
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_diffusion_moe_cohort_builds_and_runs_masked_forward(
+        self,
+        architecture: str,
+        projection_quantization: str,
+        tmp_path: Path,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-{projection_quantization}.gguf"
+        _write_moe_gguf(path, architecture, projection_quantization)
+        package = build_from_gguf(path)
+        model = package["model"]
+        op_types = {node.op_type for node in model.graph}
+        assert ("MatMulNBits" in op_types) is (projection_quantization == "q4_0")
+        assert [value.name for value in model.graph.inputs] == ["input_ids"]
+        assert not any(
+            token in value.name
+            for value in (*model.graph.inputs, *model.graph.outputs)
+            for token in ("past", "present", "cache")
+        )
+
+        output_dir = tmp_path / f"{architecture}-{projection_quantization}-onnx"
+        package.save(output_dir, progress_bar=False)
+        session = ort.InferenceSession(
+            str(output_dir / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        feeds = {"input_ids": np.array([[1, 2, 255]], dtype=np.int64)}
+        first_logits, first_proposal = session.run(None, feeds)
+        second_logits, second_proposal = session.run(None, feeds)
+        assert first_logits.shape == (1, 3, 256)
+        assert first_proposal.shape == (1, 3)
+        assert np.isfinite(first_logits).all()
+        np.testing.assert_array_equal(first_logits, second_logits)
+        np.testing.assert_array_equal(first_proposal, second_proposal)
 
     @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
     def test_granitemoe_qk_rows_are_reverse_permuted_by_value(
@@ -2393,6 +2627,118 @@ class TestBuildQuantizedGguf:
                 {router_key: torch.empty(2, 4)},
                 config=config,
             )
+
+    @pytest.mark.parametrize("architecture", ["dream", "llada-moe", "rnd1"])
+    def test_float_diffusion_fused_qkv_splits_by_gqa_width(self, architecture: str):
+        import torch
+
+        from mobius._configs import ArchitectureConfig
+        from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+        config = ArchitectureConfig(
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+        stem = "model.layers.0.self_attn"
+        fused_weight = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8)
+        fused_bias = torch.arange(16, dtype=torch.float32)
+        normalized = _normalize_gguf_weights(
+            {
+                f"{stem}.qkv_proj.weight": fused_weight,
+                f"{stem}.qkv_proj.bias": fused_bias,
+            },
+            gguf_arch=architecture,
+            config=config,
+        )
+
+        expected_widths = {"q_proj": (0, 8), "k_proj": (8, 12), "v_proj": (12, 16)}
+        for projection, (start, end) in expected_widths.items():
+            assert torch.equal(
+                normalized[f"{stem}.{projection}.weight"],
+                fused_weight[start:end],
+            )
+            assert torch.equal(
+                normalized[f"{stem}.{projection}.bias"],
+                fused_bias[start:end],
+            )
+
+        with pytest.raises(ValueError, match=r"Invalid fused .* QKV weight width"):
+            _normalize_gguf_weights(
+                {f"{stem}.qkv_proj.weight": fused_weight[:-1]},
+                gguf_arch=architecture,
+                config=config,
+            )
+
+
+class TestLanguageDiffusionDispatch:
+    @staticmethod
+    def _patch_dream_reader(monkeypatch) -> None:
+        class _DreamGGUF:
+            architecture = "dream"
+            metadata: ClassVar[dict] = {
+                "dream.embedding_length": 8,
+                "dream.feed_forward_length": 16,
+                "dream.block_count": 1,
+                "dream.attention.head_count": 2,
+                "dream.attention.head_count_kv": 1,
+                "dream.context_length": 32,
+                "dream.rope.dimension_count": 4,
+                "dream.vocab_size": 16,
+                "dream.attention.layer_norm_rms_epsilon": 1e-5,
+                "tokenizer.ggml.mask_token_id": 15,
+            }
+            tensor_names: ClassVar[list[str]] = [
+                "token_embd.weight",
+                "output_norm.weight",
+                "output.weight",
+                "blk.0.attn_norm.weight",
+                "blk.0.attn_q.weight",
+                "blk.0.attn_k.weight",
+                "blk.0.attn_v.weight",
+                "blk.0.attn_output.weight",
+                "blk.0.ffn_norm.weight",
+                "blk.0.ffn_gate.weight",
+                "blk.0.ffn_down.weight",
+                "blk.0.ffn_up.weight",
+            ]
+
+            def __init__(self, _path):
+                pass
+
+            def get_metadata(self, key, default=None):
+                return self.metadata.get(key, default)
+
+        import mobius._builder
+        import mobius.integrations.gguf._builder as builder
+        import mobius.integrations.gguf._shard_set as shard_set
+
+        monkeypatch.setattr(builder, "_resolve_gguf_path", lambda path: path)
+        monkeypatch.setattr(builder, "_validate_gguf_model", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(builder, "_has_quantized_weights", lambda *_args: False)
+        monkeypatch.setattr(shard_set, "open_gguf_model", _DreamGGUF)
+        monkeypatch.setattr(
+            mobius._builder,
+            "build_from_module",
+            lambda *_args, **_kwargs: pytest.fail("graph construction must not run"),
+        )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"task": "text-generation"}, "only supports task='masked-diffusion'"),
+            ({"static_cache": True}, "has no KV cache"),
+        ],
+    )
+    def test_invalid_generation_contract_is_rejected_before_graph_build(
+        self, monkeypatch, kwargs, message
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        self._patch_dream_reader(monkeypatch)
+        with pytest.raises(ValueError, match=message):
+            build_from_gguf("unused.gguf", **kwargs)
 
 
 class TestEncoderGGUFBuild:
