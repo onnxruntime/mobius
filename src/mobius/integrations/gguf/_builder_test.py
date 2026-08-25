@@ -1275,6 +1275,7 @@ def _write_minimax_gguf(
     path: Path,
     *,
     quantized: bool,
+    quantized_embedding: bool = False,
     omit: str | None = None,
     extra: str | None = None,
     malformed_shape: str | None = None,
@@ -1352,7 +1353,7 @@ def _write_minimax_gguf(
                 )
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
 
-    add_float("token_embd.weight", (vocab, hidden))
+    (add_q4 if quantized_embedding else add_float)("token_embd.weight", (vocab, hidden))
     add_float("output_norm.weight", (hidden,))
     add_float("output.weight", (vocab, hidden))
     projection = add_q4 if quantized else add_float
@@ -5525,9 +5526,27 @@ class TestMiniMaxGGUFBuild:
         from mobius.integrations.gguf import build_from_gguf
 
         path = tmp_path / "minimax-q4.gguf"
-        _write_minimax_gguf(path, quantized=True)
+        _write_minimax_gguf(path, quantized=True, quantized_embedding=True)
         model = build_from_gguf(path, keep_quantized=True)["model"]
-        assert sum(node.op_type == "MatMulNBits" for node in model.graph) >= 19
+        assert sum(node.op_type == "GatherBlockQuantized" for node in model.graph) == 1
+        expected_projection_weights = {
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "model.layers.0.self_attn.output_gate.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.1.self_attn.k_proj.weight",
+            "model.layers.1.self_attn.v_proj.weight",
+            "model.layers.1.self_attn.o_proj.weight",
+            *{
+                f"model.layers.{layer}.mlp.experts.{expert}.{projection}_proj.weight"
+                for layer in range(2)
+                for expert in range(2)
+                for projection in ("gate", "up", "down")
+            },
+        }
+        assert {
+            node.inputs[1].name for node in model.graph if node.op_type == "MatMulNBits"
+        } == expected_projection_weights
         assert all(
             "norm" not in node.inputs[1].name
             for node in model.graph
@@ -5548,6 +5567,38 @@ class TestMiniMaxGGUFBuild:
         model = build_from_gguf(path)["model"]
         assert "lm_head.weight" not in model.graph.initializers
         assert "model.embed_tokens.weight" in model.graph.initializers
+
+    def test_quantized_tied_output_uses_embedding_storage(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "minimax-q4-tied.gguf"
+        _write_minimax_gguf(
+            path,
+            quantized=True,
+            quantized_embedding=True,
+            omit="output.weight",
+        )
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        op_types = [node.op_type for node in model.graph]
+        assert op_types.count("GatherBlockQuantized") == 1
+        assert op_types.count("MatMulNBits") == 20
+        assert (
+            sum(name.endswith("embed_tokens.qweight") for name in model.graph.initializers)
+            == 1
+        )
+        assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
+        tied_head = next(
+            node for node in reversed(model.graph) if node.op_type == "MatMulNBits"
+        )
+        assert tied_head.inputs[2].name == "model.embed_tokens.scales"
+        assert tied_head.inputs[3].name == "model.embed_tokens.zero_points"
+        session = OnnxModelSession(model)
+        try:
+            outputs = session.run(self._inputs(np.asarray([[1, 2]], np.int64)))
+        finally:
+            session.close()
+        assert np.isfinite(outputs["logits"]).all()
 
     def test_cli_build(self, tmp_path: Path) -> None:
         from mobius.__main__ import main

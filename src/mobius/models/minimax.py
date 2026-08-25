@@ -27,14 +27,13 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig, MiniMaxConfig
 from mobius.components import (
     Attention,
-    Embedding,
     MoELayer,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
 )
 from mobius.components._lightning_attention import LightningAttention
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, embedding_for_config
 from mobius.models.moe import _quantized_linear_class, _rename_moe_expert_weights
 
 
@@ -161,9 +160,7 @@ class MiniMaxTextModel(nn.Module):
         if config.head_dim <= 0:
             raise ValueError("MiniMax head_dim must be explicit and positive")
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [MiniMaxDecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)]
         )

@@ -593,8 +593,11 @@ real-artifact full-logit and stateful-generation parity.
 - `static_cache=True` and non-hybrid task dispatch are rejected for these mixed
   state ABIs.
 
-`minimax-01` remains deferred before config extraction because its pinned
-Lightning schedule and decay/scaling semantics do not match the current graph.
+`minimax-01` graph import supports its exact pinned Lightning schedule,
+decay/scaling semantics, recurrent state, and mixed full-attention cache.
+Runtime packaging remains deferred because the released schema cannot represent
+that heterogeneous state ABI or bounded rollback snapshots; this is tracked by
+[`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605).
 PLaMo2 has a dedicated alternating Mamba1/attention graph and strict GGUF
 tensor closure. Its mixed per-layer recurrent/KV runtime package remains
 deferred to [`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605).
