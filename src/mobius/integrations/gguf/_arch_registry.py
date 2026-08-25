@@ -531,7 +531,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.time_step_rank",
         ),
         runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="nemotron_h",
@@ -549,7 +550,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.time_step_rank",
         ),
         runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="granitehybrid",
@@ -567,7 +569,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.time_step_rank",
         ),
         runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="minimax-01",

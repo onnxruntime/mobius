@@ -181,7 +181,14 @@ class TestCapabilityClosure:
             if spec.is_importable
         }
         assert set(actual) == set(supported_architectures())
-        rejected = {"internlm2", "mamba", "mamba2"}
+        rejected = {
+            "granitehybrid",
+            "internlm2",
+            "jamba",
+            "mamba",
+            "mamba2",
+            "nemotron_h",
+        }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
             verdict is Support.SUPPORTED

@@ -166,15 +166,18 @@ reason.
 | `eurobert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `exaone` | — | `exaone` | runtime deferred | supported |
 | `falcon` | — | `falcon` | supported | supported |
+| `falcon-h1` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `gemma` | — | `gemma` | supported | supported |
 | `gemma2` | — | `gemma2` | supported | supported |
 | `gemma3` | — | `gemma3_text` | supported | supported |
 | `gemma4` | — | `gemma4_text` | supported | supported |
 | `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred | unreachable |
 | `gpt2` | — | `gpt2` | supported | supported |
+| `granitehybrid` | — | `granitemoehybrid` | runtime deferred | rejected |
 | `granitemoe` | — | `granitemoe` | runtime deferred | supported |
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
+| `jamba` | — | `jamba` | runtime deferred | rejected |
 | `jina-bert-v2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `jina-bert-v3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `lfm2` | — | `lfm2` | runtime deferred | supported |
@@ -183,9 +186,11 @@ reason.
 | `llama` | `mistral` | `llama` | supported | supported |
 | `mamba` | — | `mamba` | runtime deferred | rejected |
 | `mamba2` | — | `mamba2` | runtime deferred | rejected |
+| `minimax-01` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `modern-bert` | — | `modernbert` | runtime deferred | supported |
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
 | `nemotron` | — | `nemotron` | supported | supported |
+| `nemotron_h` | — | `nemotron_h` | runtime deferred | rejected |
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `neo-bert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `nomic-bert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -195,6 +200,7 @@ reason.
 | `olmoe` | — | `olmoe` | runtime deferred | supported |
 | `phi3` | — | `phi3` | supported | supported |
 | `phimoe` | — | `phimoe` | runtime deferred | supported |
+| `plamo2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `pockettts` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `qwen2` | — | `qwen2` | supported | supported |
 | `qwen2moe` | `qwen2_moe` | `qwen2_moe` | runtime deferred | supported |

@@ -1643,12 +1643,6 @@ def build_from_gguf(
         )
     if keep_quantized and not preserve_quantization:
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
-    if preserve_quantization and gguf_arch == "granitehybrid":
-        raise ValueError(
-            "GraniteHybrid quantization preservation is not supported because its "
-            "separate GGUF dense gate/up tensors must be dequantized and fused. "
-            "Pass keep_quantized=False; no quantized tensor will be silently dropped."
-        )
     _reject_quantized_diffusion_fused_qkv(
         gguf_model,
         gguf_arch,
