@@ -1553,6 +1553,14 @@ def _nemotron_h_postprocess(
             raise ValueError(
                 f"{arch}.expert_shared_count must be exactly 1, got {shared_count}"
             )
+        n_group = int(metadata.get(f"{arch}.expert_group_count", 1))
+        topk_group = int(metadata.get(f"{arch}.expert_group_used_count", 1))
+        if (n_group, topk_group) != (1, 1):
+            raise ValueError(
+                f"{arch} grouped expert routing is unsupported; "
+                f"expert_group_count and expert_group_used_count must both be 1, "
+                f"got {n_group} and {topk_group}"
+            )
         latent_size = metadata.get(f"{arch}.moe_latent_size")
         if latent_size is not None and int(latent_size) <= 0:
             raise ValueError(f"{arch}.moe_latent_size must be greater than zero when present")
@@ -1570,6 +1578,8 @@ def _nemotron_h_postprocess(
         num_experts_per_tok=top_k or None,
         norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm", True)),
         routed_scaling_factor=float(metadata.get(f"{arch}.expert_weights_scale", 1.0)),
+        n_group=1,
+        topk_group=1,
     )
     return NemotronHConfig(
         **fields,

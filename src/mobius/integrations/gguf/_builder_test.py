@@ -1112,6 +1112,7 @@ def _write_nemotron_h_moe_gguf(
     extra: str | None = None,
     malformed_shape: str | None = None,
     mtp: bool = False,
+    quantized_only: str | None = None,
 ) -> None:
     """Write a tiny exact Nemotron-H backbone covering all four layer kinds."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -1202,7 +1203,12 @@ def _write_nemotron_h_moe_gguf(
                 )
         writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
 
-    projection = add_q4 if quantized else add_float
+    def projection(name: str, shape: tuple[int, ...]) -> None:
+        if quantized and (quantized_only is None or name == quantized_only):
+            add_q4(name, shape)
+        else:
+            add_float(name, shape)
+
     add_float("token_embd.weight", (vocab, hidden))
     add_float("output_norm.weight", (hidden,))
     projection("output.weight", (vocab, hidden))
@@ -5248,6 +5254,20 @@ class TestNemotronHMoEGGUFBuild:
             ].const_value.dtype
             == ir.DataType.FLOAT
         )
+
+    def test_quantized_expert_only_requires_explicit_dequantization(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-expert-q4.gguf"
+        _write_nemotron_h_moe_gguf(
+            path,
+            quantized=True,
+            quantized_only="blk.1.ffn_up_exps.weight",
+        )
+        with pytest.raises(ValueError, match=r"keep_quantized=False"):
+            build_from_gguf(path, keep_quantized=True)
 
     @pytest.mark.parametrize(
         ("kwargs", "match"),

@@ -192,6 +192,30 @@ class TestSecondHybridCohortConfig:
         assert config.norm_topk_prob is True
         assert config.routed_scaling_factor == pytest.approx(2.5)
 
+    def test_nemotron_h_moe_rejects_grouped_expert_routing(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("nemotron_h_moe")
+        metadata.update(
+            {
+                "nemotron_h_moe.expert_count": 4,
+                "nemotron_h_moe.expert_used_count": 2,
+                "nemotron_h_moe.expert_feed_forward_length": 96,
+                "nemotron_h_moe.expert_shared_count": 1,
+                "nemotron_h_moe.expert_shared_feed_forward_length": 192,
+                "nemotron_h_moe.expert_group_count": 2,
+                "nemotron_h_moe.expert_group_used_count": 1,
+            }
+        )
+        with pytest.raises(ValueError, match="grouped expert routing is unsupported"):
+            gguf_to_config(
+                _FakeDenseGGUF(
+                    "nemotron_h_moe",
+                    metadata,
+                    ["token_embd.weight", "blk.1.ffn_gate_inp.weight"],
+                )
+            )
+
     def test_dense_nemotron_h_rejects_moe_metadata(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 

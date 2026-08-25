@@ -3803,11 +3803,7 @@ def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
         hf_name = map_gguf_to_hf_names(name, gguf_arch)
         type_id = getattr(qtype, "value", qtype)
-        if (
-            hf_name is not None
-            and hf_name.endswith(".weight")
-            and type_id not in float_type_ids
-        ):
+        if hf_name is not None and name.endswith(".weight") and type_id not in float_type_ids:
             return True
     return False
 
