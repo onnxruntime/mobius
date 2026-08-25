@@ -4643,6 +4643,43 @@ class TestEncoderGGUFBuild:
             build_from_gguf(path)
 
     @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    def test_encoder_missing_geometry_is_actionable(self, architecture: str) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_encoder_tensor_contract,
+        )
+
+        model = SimpleNamespace(
+            architecture=architecture,
+            metadata={
+                f"{architecture}.context_length": 32,
+                f"{architecture}.feed_forward_length": 64,
+                f"{architecture}.block_count": 1,
+                f"{architecture}.attention.head_count": 4,
+            },
+        )
+        with pytest.raises(ValueError, match=r"missing required encoder metadata.*embedding"):
+            _raise_for_invalid_encoder_tensor_contract(model)
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
+    def test_encoder_hidden_size_must_divide_attention_heads(self, architecture: str) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_encoder_tensor_contract,
+        )
+
+        model = SimpleNamespace(
+            architecture=architecture,
+            metadata={
+                f"{architecture}.context_length": 32,
+                f"{architecture}.embedding_length": 65,
+                f"{architecture}.feed_forward_length": 64,
+                f"{architecture}.block_count": 1,
+                f"{architecture}.attention.head_count": 4,
+            },
+        )
+        with pytest.raises(ValueError, match=r"embedding_length must be divisible"):
+            _raise_for_invalid_encoder_tensor_contract(model)
+
+    @pytest.mark.parametrize("architecture", ["bert", "modern-bert"])
     def test_pooling_classifier_and_task_overrides_are_rejected(
         self, tmp_path: Path, architecture: str
     ) -> None:

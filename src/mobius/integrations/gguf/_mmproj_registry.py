@@ -953,10 +953,10 @@ def supported_projector_types() -> tuple[str, ...]:
 
 
 def projector_type_for_modality(metadata: Mapping[str, Any], modality: MMProjModality) -> str:
-    """Resolve the pinned global-key then modality-key projector fallback."""
-    projector_type = metadata.get("clip.projector_type")
+    """Resolve a modality override before the global projector fallback."""
+    projector_type = metadata.get(f"clip.{modality.value}.projector_type")
     if not projector_type:
-        projector_type = metadata.get(f"clip.{modality.value}.projector_type")
+        projector_type = metadata.get("clip.projector_type")
     if not isinstance(projector_type, str) or not projector_type:
         raise ValueError(
             f"clip mmproj has an active {modality.value} encoder but neither "

@@ -144,7 +144,11 @@ class _CohereTextModel(LayerNormTextModel):
             layer_type = (
                 self.layer_types[layer_index] if self.layer_types else "full_attention"
             )
-            use_rope = self.no_rope_layers is None or self.no_rope_layers[layer_index] == 1
+            use_rope = (
+                self.no_rope_layers is None
+                or layer_index >= len(self.no_rope_layers)
+                or self.no_rope_layers[layer_index] == 1
+            )
             hidden_states, present_kv = layer(
                 op,
                 hidden_states=hidden_states,
