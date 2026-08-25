@@ -624,6 +624,16 @@ _LFM2_MAPPING: dict[str, str] = {
     "blk.{bid}.shortconv.out_proj": "model.layers.{bid}.conv.out_proj",
 }
 
+_LFM2_MOE_EXTRAS: dict[str, str] = {
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.feed_forward.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.feed_forward.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.feed_forward.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.feed_forward.experts.down_proj",
+    # GGUF names this parameter as a bias sidecar, while the reference model
+    # stores it as a bare fp32 tensor on the routed feed-forward block.
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.feed_forward.expert_bias@",
+}
+
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -674,6 +684,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
         "lfm2": _LFM2_MAPPING,
+        "lfm2_moe_extras": _LFM2_MOE_EXTRAS,
         "dflash": _DFLASH_MAPPING,
         "eagle3": _EAGLE3_MAPPING,
         "olmo": _OLMO_MAPPING,

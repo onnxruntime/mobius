@@ -1180,6 +1180,95 @@ class TestHybridScheduleExtraction:
             _derive_hybrid_layout("lfm2", md)
 
 
+class TestLfm2MoePostprocess:
+    """Pinned LFM2MoE routing defaults remain overrideable and fail closed."""
+
+    @staticmethod
+    def _base_config():
+        from mobius._configs import ArchitectureConfig
+
+        return ArchitectureConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=256,
+            intermediate_size=128,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+        )
+
+    @staticmethod
+    def _metadata() -> dict[str, int]:
+        return {
+            "lfm2moe.expert_gating_func": 2,
+            "lfm2moe.leading_dense_block_count": 1,
+        }
+
+    def test_pinned_invariant_routing_defaults(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        result = _lfm2moe_postprocess(self._base_config(), self._metadata())
+
+        assert result.num_dense_layers == 1
+        assert result.norm_topk_prob is True
+        assert result.routed_scaling_factor == pytest.approx(1.0)
+        assert result.use_expert_bias is True
+
+    def test_explicit_pinned_routing_values_are_accepted(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        metadata: dict[str, object] = {
+            **self._metadata(),
+            "lfm2moe.expert_weights_norm": True,
+            "lfm2moe.expert_weights_scale": 1.0,
+        }
+        result = _lfm2moe_postprocess(self._base_config(), metadata)
+
+        assert result.norm_topk_prob is True
+        assert result.routed_scaling_factor == pytest.approx(1.0)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("lfm2moe.expert_weights_norm", False),
+            ("lfm2moe.expert_weights_scale", 0.75),
+        ],
+    )
+    def test_non_pinned_routing_overrides_are_rejected(self, key: str, value: object) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        metadata: dict[str, object] = {**self._metadata(), key: value}
+        with pytest.raises(ValueError, match=key.split(".")[-1]):
+            _lfm2moe_postprocess(self._base_config(), metadata)
+
+    def test_missing_dense_prefix_uses_pinned_loader_default(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        metadata = self._metadata()
+        del metadata["lfm2moe.leading_dense_block_count"]
+
+        assert _lfm2moe_postprocess(self._base_config(), metadata).num_dense_layers == 0
+
+    def test_missing_gating_function_remains_fail_closed(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        metadata = self._metadata()
+        del metadata["lfm2moe.expert_gating_func"]
+
+        with pytest.raises(KeyError, match="expert_gating_func"):
+            _lfm2moe_postprocess(self._base_config(), metadata)
+
+    def test_all_dense_prefix_is_valid(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        metadata = self._metadata()
+        metadata["lfm2moe.leading_dense_block_count"] = 2
+
+        assert _lfm2moe_postprocess(self._base_config(), metadata).num_dense_layers == 2
+
+
 class TestMuseGlimmerPostprocess:
     """Muse Glimmer config postprocessing.
 

@@ -87,6 +87,7 @@ __all__ = [
     "LLaVAModel",
     "LayerNormCausalLMModel",
     "Lfm2CausalLMModel",
+    "Lfm2MoECausalLMModel",
     "Lfm2VlForConditionalGeneration",
     "LongcatFlashCausalLMModel",
     "MPTCausalLMModel",
@@ -255,7 +256,7 @@ from mobius.models.internlm import InternLM2CausalLMModel
 from mobius.models.internvl import InternVL2Model
 from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
-from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model
 from mobius.models.llama4 import Llama4CausalLMModel

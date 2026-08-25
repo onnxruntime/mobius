@@ -788,6 +788,105 @@ def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
     writer.close()
 
 
+def _write_lfm2moe_gguf(path: Path, *, quantized: bool) -> None:
+    """Write a tiny LFM2MoE GGUF with dense-conv and routed-attention layers."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    expert_intermediate = 32
+    experts = 4
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    head_dim = hidden // heads
+    kernel = 3
+    rng = np.random.default_rng(31)
+
+    writer = GGUFWriter(str(path), "lfm2moe")
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(2)
+    writer.add_head_count(heads)
+    writer.add_head_count_kv([0, kv_heads])
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_rope_dimension_count(head_dim)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab)
+    writer.add_expert_count(experts)
+    writer.add_expert_used_count(2)
+    writer.add_expert_feed_forward_length(expert_intermediate)
+    writer.add_uint32("lfm2moe.shortconv.l_cache", kernel)
+    writer.add_uint32("lfm2moe.leading_dense_block_count", 1)
+    writer.add_uint32("lfm2moe.expert_gating_func", 2)
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, rng.normal(0, 0.03, shape).astype(np.float32))
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        rows = int(np.prod(shape[:-1]))
+        columns = shape[-1]
+        assert columns % 32 == 0
+        byte_shape = (*shape[:-1], columns // 32 * 18)
+        raw = np.zeros((rows, byte_shape[-1]), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(columns // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(
+            name,
+            raw.reshape(byte_shape),
+            raw_dtype=GGMLQuantizationType.Q4_0,
+        )
+
+    add_projection = add_q4 if quantized else add_float
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("token_embd_norm.weight", (hidden,))
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+
+    add_projection("blk.0.ffn_gate.weight", (intermediate, hidden))
+    add_projection("blk.0.ffn_up.weight", (intermediate, hidden))
+    add_projection("blk.0.ffn_down.weight", (hidden, intermediate))
+    add_float("blk.0.shortconv.conv.weight", (hidden, kernel))
+    add_projection("blk.0.shortconv.in_proj.weight", (3 * hidden, hidden))
+    add_projection("blk.0.shortconv.out_proj.weight", (hidden, hidden))
+
+    add_float("blk.1.ffn_gate_inp.weight", (experts, hidden))
+    add_projection(
+        "blk.1.ffn_gate_exps.weight",
+        (experts, expert_intermediate, hidden),
+    )
+    add_projection(
+        "blk.1.ffn_up_exps.weight",
+        (experts, expert_intermediate, hidden),
+    )
+    add_projection(
+        "blk.1.ffn_down_exps.weight",
+        (experts, hidden, expert_intermediate),
+    )
+    add_float("blk.1.exp_probs_b.bias", (experts,))
+    add_projection("blk.1.attn_q.weight", (heads * head_dim, hidden))
+    add_projection("blk.1.attn_k.weight", (kv_heads * head_dim, hidden))
+    add_projection("blk.1.attn_v.weight", (kv_heads * head_dim, hidden))
+    add_projection("blk.1.attn_output.weight", (hidden, heads * head_dim))
+    add_float("blk.1.attn_q_norm.weight", (head_dim,))
+    add_float("blk.1.attn_k_norm.weight", (head_dim,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_qwen35_gguf(
     path: Path,
     *,
@@ -3662,6 +3761,95 @@ class TestHybridGGUFBuild:
         assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
         assert all(np.isfinite(output["logits"]).all() for output in outputs)
 
+    def test_lfm2moe_float_prefill_decode_threads_mixed_state(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2moe-f32.gguf"
+        _write_lfm2moe_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+
+        assert [value.name for value in model.graph.inputs if "past_" in value.name] == [
+            "past_key_values.0.conv_state",
+            "past_key_values.1.key",
+            "past_key_values.1.value",
+        ]
+        outputs = self._run_lfm2(model)
+        assert outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
+        assert outputs[0]["present.1.key"].shape == (1, 2, 3, 8)
+        assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
+        assert all(np.isfinite(output["logits"]).all() for output in outputs)
+
+        saved = tmp_path / "saved-lfm2moe"
+        package.save(str(saved), progress_bar=False, check_weights=True)
+        reloaded = ModelPackage.load(str(saved))["model"]
+        reloaded_outputs = self._run_lfm2(reloaded)
+        for actual, expected in zip(reloaded_outputs, outputs):
+            for name in actual:
+                np.testing.assert_allclose(actual[name], expected[name], rtol=0, atol=0)
+
+    def test_lfm2moe_quantized_source_requires_explicit_dequantization(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2moe-q4.gguf"
+        _write_lfm2moe_gguf(path, quantized=True)
+        with pytest.raises(ValueError, match="keep_quantized=False"):
+            build_from_gguf(path)
+
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+        outputs = self._run_lfm2(explicit_float)
+        assert all(np.isfinite(output["logits"]).all() for output in outputs)
+
+    def test_lfm2moe_state_rollback_and_batch_reorder(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2moe-state.gguf"
+        _write_lfm2moe_gguf(path, quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        try:
+            prefill = session.run(
+                {
+                    "input_ids": np.asarray([[1, 2], [3, 4]], dtype=np.int64),
+                    "attention_mask": np.ones((2, 2), dtype=np.int64),
+                    "position_ids": np.asarray([[0, 1], [0, 1]], dtype=np.int64),
+                    "past_key_values.0.conv_state": np.zeros((2, 32, 2), dtype=np.float32),
+                    "past_key_values.1.key": np.zeros((2, 2, 0, 8), dtype=np.float32),
+                    "past_key_values.1.value": np.zeros((2, 2, 0, 8), dtype=np.float32),
+                }
+            )
+            snapshot = {
+                "past_key_values.0.conv_state": prefill["present.0.conv_state"],
+                "past_key_values.1.key": prefill["present.1.key"],
+                "past_key_values.1.value": prefill["present.1.value"],
+            }
+
+            def decode(tokens: list[list[int]], states: dict[str, np.ndarray]):
+                return session.run(
+                    {
+                        "input_ids": np.asarray(tokens, dtype=np.int64),
+                        "attention_mask": np.ones((2, 3), dtype=np.int64),
+                        "position_ids": np.asarray([[2], [2]], dtype=np.int64),
+                        **states,
+                    }
+                )
+
+            first = decode([[5], [6]], snapshot)
+            replayed = decode([[5], [6]], snapshot)
+            reordered = decode(
+                [[6], [5]],
+                {name: value[[1, 0]] for name, value in snapshot.items()},
+            )
+        finally:
+            session.close()
+
+        for name in first:
+            np.testing.assert_allclose(replayed[name], first[name], rtol=0, atol=0)
+            np.testing.assert_allclose(reordered[name], first[name][[1, 0]], rtol=0, atol=0)
+
     def test_qwen35_float_and_quantized_prefill_decode_thread_mixed_state(
         self, tmp_path: Path
     ) -> None:
@@ -3739,6 +3927,23 @@ class TestHybridGGUFBuild:
 
         path = tmp_path / "lfm2-misdispatch.gguf"
         _write_lfm2_gguf(path, quantized=False)
+        with pytest.raises(ValueError, match=re.escape(message)):
+            build_from_gguf(path, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"static_cache": True}, "architecture-specific"),
+            ({"task": "text-generation"}, "hybrid-text-generation"),
+        ],
+    )
+    def test_lfm2moe_cache_task_misdispatch_is_rejected(
+        self, tmp_path: Path, kwargs: dict, message: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "lfm2moe-misdispatch.gguf"
+        _write_lfm2moe_gguf(path, quantized=False)
         with pytest.raises(ValueError, match=re.escape(message)):
             build_from_gguf(path, **kwargs)
 
@@ -4214,7 +4419,6 @@ class TestGGUFPreflightGuards:
             "deepseek4",
             "kimi-k3",
             "kimi-linear",
-            "lfm2moe",
             "arctic",
             "dbrx",
             "gpt-oss",
@@ -4805,6 +5009,27 @@ class TestHybridTensorContract:
             names.extend(f"blk.{layer}.{suffix}" for suffix in [*common, *conditional])
         return names
 
+    @classmethod
+    def _lfm2moe_names(cls) -> list[str]:
+        names = cls._lfm2_names()
+        dense_layer_1 = {
+            "blk.1.ffn_gate.weight",
+            "blk.1.ffn_up.weight",
+            "blk.1.ffn_down.weight",
+        }
+        names = [name for name in names if name not in dense_layer_1]
+        names.extend(
+            f"blk.1.{suffix}"
+            for suffix in (
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "exp_probs_b.bias",
+            )
+        )
+        return names
+
     def test_lfm2_exact_mixer_closure_passes(self) -> None:
         from mobius.integrations.gguf._builder import (
             _raise_for_invalid_hybrid_tensor_contract,
@@ -4819,6 +5044,45 @@ class TestHybridTensorContract:
             self._lfm2_names(),
         )
         _raise_for_invalid_hybrid_tensor_contract(model)
+
+    def test_lfm2moe_exact_dense_and_routed_closure_passes(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        _raise_for_invalid_hybrid_tensor_contract(
+            self._FakeGGUF(
+                "lfm2moe",
+                {
+                    "lfm2moe.block_count": 2,
+                    "lfm2moe.attention.head_count_kv": [0, 2],
+                    "lfm2moe.leading_dense_block_count": 1,
+                },
+                self._lfm2moe_names(),
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "wrong_tensor",
+        ["blk.0.ffn_gate_inp.weight", "blk.1.ffn_gate.weight"],
+    )
+    def test_lfm2moe_wrong_ffn_family_is_rejected(self, wrong_tensor: str) -> None:
+        from mobius.integrations.gguf._builder import (
+            _raise_for_invalid_hybrid_tensor_contract,
+        )
+
+        with pytest.raises(ValueError, match=r"wrong .* FFN family"):
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(
+                    "lfm2moe",
+                    {
+                        "lfm2moe.block_count": 2,
+                        "lfm2moe.attention.head_count_kv": [0, 2],
+                        "lfm2moe.leading_dense_block_count": 1,
+                    },
+                    [*self._lfm2moe_names(), wrong_tensor],
+                )
+            )
 
     def test_wrong_mixer_tensor_is_rejected(self) -> None:
         from mobius.integrations.gguf._builder import (

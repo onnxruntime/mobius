@@ -35,6 +35,7 @@ from mobius._configs import (
     Gemma4Config,
     GraniteMoeHybridConfig,
     JambaConfig,
+    Lfm2MoeConfig,
     Mamba2Config,
     MambaConfig,
     MuseGlimmerConfig,
@@ -338,7 +339,7 @@ def _derive_hybrid_layout(
             f"nextn predict layers ({mtp_count}) for architecture {gguf_arch}."
         )
 
-    if gguf_arch in {"lfm2", "jamba", "granitehybrid"}:
+    if gguf_arch in {"lfm2", "lfm2moe", "jamba", "granitehybrid"}:
         raw_kv_heads = metadata.get(f"{gguf_arch}.attention.head_count_kv")
         if not isinstance(raw_kv_heads, (list, tuple, np.ndarray)):
             raise ValueError(
@@ -357,6 +358,7 @@ def _derive_hybrid_layout(
             )
         recurrent_type = {
             "lfm2": "conv",
+            "lfm2moe": "conv",
             "jamba": "mamba",
             "granitehybrid": "mamba2",
         }[gguf_arch]
@@ -565,7 +567,13 @@ def gguf_to_config(
     num_kv_heads = hf_fields.get("num_key_value_heads", num_attention_heads)
     if isinstance(num_kv_heads, (list, np.ndarray)):
         values = [int(value) for value in num_kv_heads]
-        if canonical_arch in {"lfm2", "jamba", "nemotron_h", "granitehybrid"}:
+        if canonical_arch in {
+            "lfm2",
+            "lfm2moe",
+            "jamba",
+            "nemotron_h",
+            "granitehybrid",
+        }:
             nonzero = {value for value in values if value}
             if len(nonzero) != 1:
                 raise ValueError(
@@ -600,6 +608,7 @@ def gguf_to_config(
         canonical_arch
         in {
             "lfm2",
+            "lfm2moe",
             "jamba",
             "nemotron_h",
             "granitehybrid",
@@ -889,6 +898,69 @@ def gguf_to_config(
     )
 
     return config
+
+
+def _lfm2moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> Lfm2MoeConfig:
+    """Restore LFM2MoE fields serialized by the pinned llama.cpp converter.
+
+    The pinned loader defaults a missing dense-prefix length to zero and
+    requires the SIGMOID gating enum. Its graph always normalizes selected
+    probabilities, and the architecture loader does not read a scaling
+    override, so metadata that conflicts with those invariants is rejected.
+    """
+    del model
+    arch = "lfm2moe"
+    gating = int(metadata[f"{arch}.expert_gating_func"])
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+    num_dense_layers = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if not 0 <= num_dense_layers <= config.num_hidden_layers:
+        raise ValueError(
+            f"{arch}.leading_dense_block_count must be in [0, "
+            f"{config.num_hidden_layers}], got {num_dense_layers}"
+        )
+    if (
+        config.num_local_experts is None
+        or config.num_experts_per_tok is None
+        or config.moe_intermediate_size is None
+    ):
+        raise ValueError("lfm2moe requires expert count, top-k, and expert FFN width")
+    if not 0 < config.num_experts_per_tok <= config.num_local_experts:
+        raise ValueError(
+            "lfm2moe expert_used_count must be positive and no greater than expert_count"
+        )
+
+    if metadata.get(f"{arch}.expert_weights_norm", True) is not True:
+        raise ValueError(
+            "lfm2moe.expert_weights_norm=False is incompatible with the pinned "
+            "llama.cpp graph, which always normalizes selected expert weights"
+        )
+    expert_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+    if expert_scale != 1.0:  # noqa: RUF069
+        raise ValueError(
+            "lfm2moe.expert_weights_scale must be 1.0 because the pinned loader "
+            "does not read an architecture-specific override"
+        )
+
+    fields = _shallow_fields(config)
+    fields.update(
+        hidden_act="silu",
+        attn_qk_norm=True,
+        short_conv_bias=False,
+        scoring_func="sigmoid",
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+    )
+    return Lfm2MoeConfig(
+        **fields,
+        num_dense_layers=num_dense_layers,
+        # The pinned loader requires exp_probs_b for every routed layer.
+        use_expert_bias=True,
+    )
 
 
 def _gemma2_postprocess(
@@ -2230,6 +2302,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
     "jamba": _jamba_postprocess,
+    "lfm2moe": _lfm2moe_postprocess,
     "nemotron_h": _nemotron_h_postprocess,
     "granitehybrid": _granitehybrid_postprocess,
     "bert_encoder": _bert_encoder_postprocess,

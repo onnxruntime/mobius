@@ -322,14 +322,6 @@ _KIMI_LINEAR_GRAPH_REASON = (
     "ordinary attention would change the model."
 )
 
-_LFM2MOE_GRAPH_REASON = (
-    "LFM2MoE has an arbitrary per-layer attention/short-convolution schedule plus a "
-    "dense-to-sigmoid-routed-MoE transition. Recurrent layers use F32 rolling convolution "
-    "state with copy-on-write sequence reorder and bounded rollback snapshots, while "
-    "attention layers use KV cache. The dense LFM2 graph and ordinary KV/static-cache "
-    "tasks do not own that mixed state or the expert correction-bias semantics."
-)
-
 _ENCODER_RUNTIME_VALIDATION_PENDING = (
     "Config extraction, exact pinned tensor closure, encoder-only task dispatch, and "
     "synthetic ORT execution are covered, but no pinned real GGUF artifact has passed "
@@ -1138,11 +1130,21 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="lfm2moe",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="lfm2_moe",
+        tensor_map_recipe=("lfm2", "lfm2_moe_extras"),
+        config_postprocessor="lfm2moe",
+        required_metadata=(
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "shortconv.l_cache",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_gating_func",
+        ),
         runtime=Support.DEFERRED,
-        reason=_LFM2MOE_GRAPH_REASON,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="minimax-01",
