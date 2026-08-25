@@ -6192,33 +6192,27 @@ class TestKimiLinearGGUFBuild:
             == model.metadata_props["mobius.cache_abi"]
         )
 
-    def test_quantized_source_preserves_only_matmul_roles(self, tmp_path: Path) -> None:
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / "kimi-linear-q4.gguf"
-        _write_kimi_linear_gguf(path, quantized=True)
-        model = build_from_gguf(path, keep_quantized=True)["model"]
-        quantized_inputs = [
-            node.inputs[1].name
-            for node in model.graph
-            if node.op_type == "MatMulNBits" and len(node.inputs) > 1
-        ]
-        assert quantized_inputs
-        assert all(
-            not any(term in name for term in ("norm", "conv1d", "A_log", "dt_bias"))
-            for name in quantized_inputs
-        )
-
-    def test_native_quantized_mla_reshape_requires_explicit_dequantization(
-        self, tmp_path: Path
+    @pytest.mark.parametrize(
+        ("native_quantized", "qtype_name"),
+        [(False, "Q4_0"), (True, "IQ4_NL")],
+    )
+    def test_quantized_mla_reshape_requires_explicit_dequantization(
+        self,
+        tmp_path: Path,
+        native_quantized: bool,
+        qtype_name: str,
     ) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
-        path = tmp_path / "kimi-linear-iq4-nl.gguf"
-        _write_kimi_linear_gguf(path, quantized=True, native_quantized=True)
+        path = tmp_path / f"kimi-linear-{qtype_name.lower()}.gguf"
+        _write_kimi_linear_gguf(
+            path,
+            quantized=True,
+            native_quantized=native_quantized,
+        )
         with pytest.raises(
             ValueError,
-            match=r"change the dequantized values.*attn_k_b\.weight \(IQ4_NL\)",
+            match=rf"change the dequantized values.*attn_k_b\.weight \({qtype_name}\)",
         ):
             build_from_gguf(path, keep_quantized=True)
 

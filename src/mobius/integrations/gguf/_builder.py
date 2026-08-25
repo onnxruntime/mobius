@@ -5153,10 +5153,10 @@ def _load_quantized_state_dict(
             )
             if explicitly_dequantized and quant_spec.dequantize is Support.SUPPORTED:
                 route = QuantImportRoute.DEQUANTIZE_FLOAT
-            if is_kimi_reshaped_projection and route is QuantImportRoute.NATIVE_BYTES:
+            if is_kimi_reshaped_projection:
                 if quant_spec.dequantize is not Support.SUPPORTED:
                     raise ValueError(
-                        f"Cannot reshape native {quant_spec.name} tensor {hf_name}: "
+                        f"Cannot reshape quantized {quant_spec.name} tensor {hf_name}: "
                         "the stored format has no supported dequantization route."
                     )
                 route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
