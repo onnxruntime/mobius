@@ -524,13 +524,15 @@ def _parse_vm_stat_available_bytes(output: str) -> int | None:
         "Pages speculative",
     }
     available_pages = 0
+    parsed_fields = 0
     for line in output.splitlines():
         name, separator, raw_value = line.partition(":")
-        if separator and name in available_page_names:
-            value = raw_value.strip().rstrip(".")
+        if separator and name.strip() in available_page_names:
+            value = raw_value.strip().rstrip(".").replace(",", "")
             if value.isdigit():
                 available_pages += int(value)
-    return available_pages * page_size
+                parsed_fields += 1
+    return available_pages * page_size if parsed_fields else None
 
 
 def _sysconf_available_ram_bytes() -> int | None:
@@ -574,7 +576,7 @@ def check_disk(kind: str, path: pathlib.Path, required: int, margin_frac: float)
 
 def check_ram(required: int, margin_frac: float) -> SpaceCheck:
     free, source = _probe_available_ram()
-    # If MemAvailable can't be read we cannot verify the RAM budget; refuse
+    # If available RAM can't be probed we cannot verify the RAM budget; refuse
     # rather than emit a success-shaped pass.
     ok = free is not None and free * (1 - margin_frac) >= required
     return SpaceCheck(
