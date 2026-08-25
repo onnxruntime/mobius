@@ -645,11 +645,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "masked embeddings, scalar layer scales, its own KV cache, and a live target-model "
         "context. It is neither Gemma4 text nor the target-config-only draft/MTP ABI."
     ),
-    "glm-dsa": (
-        "GLM-DSA executes an MLA/MoE MTP head with optional shared indexers, DSA cache "
-        "reuse, and GLM-specific sigmoid routing. Mobius has no sparse-index state task "
-        "or suffix-exact ownership for that head."
-    ),
     "glm4": (
         "GLM4 serializes complete fused-FFN trailing blocks and NextN tensors, but the "
         "pinned loader skips appended blocks; GLM-OCR converter transforms also permute "

@@ -78,7 +78,6 @@ _FINAL_CENSUS_CLOSURE = frozenset(
         "exaone4",
         "gemma-embedding",
         "gemma4-assistant",
-        "glm-dsa",
         "glm4",
         "glm4moe",
         "gptj",
