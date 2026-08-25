@@ -1169,6 +1169,8 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
     """Validate the exact pinned C01 dense profiles before config extraction."""
     import numpy as np
 
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
     architecture = gguf_model.architecture
     if architecture not in {"baichuan", "chatglm", "phi2", "seed_oss"}:
         return
@@ -1267,6 +1269,7 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
     actual = {
         name: tuple(int(dimension) for dimension in shape)
         for name, _raw, _qtype, shape in items
+        if not is_known_skip(name)
     }
     required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
@@ -2112,10 +2115,35 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
         return
 
     metadata = gguf_model.metadata
+    required_geometry = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    missing_geometry = [
+        f"{architecture}.{suffix}"
+        for suffix in required_geometry
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_geometry:
+        raise ValueError(
+            f"{architecture} GGUF is missing required encoder metadata: {missing_geometry}"
+        )
     hidden = int(metadata[f"{architecture}.embedding_length"])
     intermediate = int(metadata[f"{architecture}.feed_forward_length"])
     layers = int(metadata[f"{architecture}.block_count"])
     num_heads = int(metadata[f"{architecture}.attention.head_count"])
+    context = int(metadata[f"{architecture}.context_length"])
+    if min(hidden, intermediate, layers, num_heads, context) <= 0 or hidden % num_heads:
+        raise ValueError(
+            f"{architecture} GGUF has invalid encoder geometry: "
+            f"embedding_length={hidden}, feed_forward_length={intermediate}, "
+            f"block_count={layers}, attention.head_count={num_heads}, "
+            f"context_length={context}; all values must be positive and "
+            "embedding_length must be divisible by attention.head_count"
+        )
     num_kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", num_heads))
     if num_kv_heads != num_heads:
         raise ValueError(
@@ -2125,13 +2153,16 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
     vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
     if not vocab:
         vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
-    context = int(metadata[f"{architecture}.context_length"])
+    if vocab <= 0:
+        raise ValueError(f"{architecture} GGUF has no positive vocabulary size")
 
     required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
     }
     if architecture == "bert":
         token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+        if token_types <= 0:
+            raise ValueError("bert GGUF tokenizer.ggml.token_type_count must be positive")
         required.update(
             {
                 "token_types.weight": (token_types, hidden),

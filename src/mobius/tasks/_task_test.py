@@ -334,6 +334,28 @@ class TestSeq2SeqTask:
         assert "past_key_values.0.cross.key" in input_names
         assert "past_key_values.0.cross.value" in input_names
 
+    @pytest.mark.parametrize(
+        ("use_cross_attention_cache", "expected_shape"),
+        [
+            (False, "[batch,encoder_sequence_len]"),
+            (True, "[batch,cross_past_sequence_len + encoder_sequence_len]"),
+        ],
+    )
+    def test_encoder_attention_mask_matches_cross_cache_contract(
+        self, use_cross_attention_cache, expected_shape
+    ):
+        from mobius.models.t5 import T5ForConditionalGeneration
+
+        config, _ = self._make_seq2seq()
+        module = T5ForConditionalGeneration(config)
+        task = Seq2SeqTask(
+            use_attention_masks=True,
+            use_cross_attention_cache=use_cross_attention_cache,
+        )
+        decoder = task.build(module, config)["decoder"]
+        inputs = {value.name: value for value in decoder.graph.inputs}
+        assert str(inputs["encoder_attention_mask"].shape) == expected_shape
+
     def test_decoder_outputs(self):
         config, module = self._make_seq2seq()
         task = Seq2SeqTask()

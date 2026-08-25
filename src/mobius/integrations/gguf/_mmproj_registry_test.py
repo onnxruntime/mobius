@@ -14,8 +14,10 @@ from mobius.integrations.gguf._mmproj_registry import (
     CLIP_METADATA_SCHEMA,
     LLAMA_CPP_MMPROJ_SHA,
     MMPROJ_ARTIFACT_PINS,
+    MMProjModality,
     get_projector_spec,
     iter_projector_specs,
+    projector_type_for_modality,
     supported_projector_types,
 )
 from mobius.integrations.gguf._spec import Support
@@ -155,6 +157,20 @@ def test_metadata_schema_captures_the_pinned_absence_of_a_text_encoder() -> None
     assert fields["clip.has_audio_encoder"].default is False
     assert fields["clip.has_gen_audio_encoder"].default is False
     assert "Absent from the pinned ABI" in fields["clip.has_text_encoder"].note
+
+
+def test_modality_projector_overrides_global_fallback() -> None:
+    metadata = {
+        "clip.projector_type": "gemma4v",
+        "clip.audio.projector_type": "gemma4a",
+    }
+    assert projector_type_for_modality(metadata, MMProjModality.AUDIO) == "gemma4a"
+    assert projector_type_for_modality(metadata, MMProjModality.VISION) == "gemma4v"
+
+
+def test_missing_modality_and_global_projector_fails_closed() -> None:
+    with pytest.raises(ValueError, match=r"neither 'clip\.projector_type' nor"):
+        projector_type_for_modality({}, MMProjModality.GENERATED_AUDIO)
 
 
 @pytest.mark.parametrize("projector_type", ["mlp", "gemma4a", "qwen2.5o"])

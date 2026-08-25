@@ -421,6 +421,24 @@ def test_dense_cohort_missing_geometry_is_actionable_before_graph() -> None:
         _raise_for_invalid_dense_c01_tensor_contract(_FakeGGUF("phi2", metadata, {}))
 
 
+def test_dense_cohort_known_skip_tensors_do_not_break_exact_closure() -> None:
+    metadata = _metadata("phi2", intermediate=32, layers=1)
+    metadata["phi2.attention.layer_norm_epsilon"] = 1e-5
+    tensors = _phi2_tensors(metadata)
+    tensors["blk.0.rope_freqs.weight"] = (4,)
+    tensors["tokenizer.ggml.extra"] = (1,)
+    _raise_for_invalid_dense_c01_tensor_contract(_FakeGGUF("phi2", metadata, tensors))
+
+
+def test_dense_cohort_still_rejects_unknown_extra_tensors() -> None:
+    metadata = _metadata("phi2", intermediate=32, layers=1)
+    metadata["phi2.attention.layer_norm_epsilon"] = 1e-5
+    tensors = _phi2_tensors(metadata)
+    tensors["blk.0.unowned.weight"] = (8,)
+    with pytest.raises(ValueError, match=r"unexpected=.*unowned"):
+        _raise_for_invalid_dense_c01_tensor_contract(_FakeGGUF("phi2", metadata, tensors))
+
+
 @pytest.mark.parametrize("context", [0, -1])
 def test_dense_cohort_rejects_nonpositive_context_before_graph(context) -> None:
     metadata = _metadata("chatglm", layers=1)

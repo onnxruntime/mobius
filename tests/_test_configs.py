@@ -1495,6 +1495,7 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "mamba_n_groups": 1,
             "mamba_d_conv": 4,
             "mamba_chunk_size": 16,
+            "attention_bias": True,
             "attn_qkv_bias": True,
             "attn_o_bias": True,
             "mlp_bias": True,
