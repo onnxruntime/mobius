@@ -51,7 +51,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from mobius.upstream_patches import apply_asset_patches
@@ -134,6 +136,42 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # HF-preprocessed packed pixels through Generator.set_inputs().
     "minicpmv4_6": "phi3v",
 }
+
+# These text types select runtime implementations with semantics that are not
+# described by the ordinary decoder graph ABI. All other compatible, single-
+# model decoder packages use ORT GenAI's released generic DecoderOnly_Model.
+_ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
+    "gpt2": "gpt2",
+    "lfm2": "lfm2",
+    "lfm2_vl": "lfm2",
+    "phi3": "phi3",
+    "phi3small": "phi3small",
+    "phimoe": "phimoe",
+}
+_GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
+_GENERIC_DECODER_TESTED_VERSIONS = ("0.15.2",)
+_DECODER_SEMANTIC_INPUTS = frozenset(
+    {
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "past_sequence_length",
+        "current_sequence_length",
+    }
+)
+_CACHE_NAME = re.compile(
+    r"^(?P<prefix>.+\.)(?P<index>[0-9]+)\.(?P<kind>"
+    r"key|value|conv_state|recurrent_state|ssm_state)$"
+)
+
+
+@dataclass(frozen=True)
+class _DecoderAbi:
+    inputs: dict[str, str]
+    outputs: dict[str, str]
+    cache_slots: int
+    has_recurrent_state: bool
+
 
 _GEMMA4_MODEL_TYPES = frozenset(
     {"gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text"}
@@ -234,22 +272,213 @@ def _select_ort_model_type(
 ) -> str:
     """Choose the ORT-GenAI model type for an exported package.
 
-    Decoder-only packages prefer the built package's ``config.model_type`` so
-    text-only / overridden builds (e.g. ``gemma4_unified -> gemma4_unified_text``)
-    resolve to the decoder-only ORT type. Multimodal packages keep the HF
-    parent ``model_type``: ``build()`` unwraps composite configs to their text
-    sub-config, so ``config.model_type`` would otherwise be the text type even
-    for a full multimodal export.
+    Released ORT GenAI 0.14+ dispatches ``decoder`` to its generic
+    ``DecoderOnly_Model``. Decoder-only packages therefore use that type unless
+    the runtime has genuinely different behavior: ``gpt2`` selects ``Gpt_Model``,
+    ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, and Phi-3 family names enable
+    LongRoPE cache recomputation after the short-context threshold.
 
-    The ``config.model_type`` preference only applies when it resolves to a
-    *known* ORT-GenAI type (a key in :data:`_ORT_GENAI_MODEL_TYPE`). An
-    unrecognised ``config.model_type`` would otherwise pass straight through as
-    an invalid ORT type and mask a valid HF-derived mapping, so in that case we
-    fall back to ``hf_model_type``.
+    Multimodal and encoder-decoder packages retain their architecture-specific
+    type because those values select distinct runtime pipelines and position-ID
+    semantics.
     """
-    if is_decoder_only and config_model_type in _ORT_GENAI_MODEL_TYPE:
-        return _ORT_GENAI_MODEL_TYPE[config_model_type]
+    if is_decoder_only:
+        for source_type in (config_model_type, hf_model_type):
+            resolved = _resolve_ort_genai_model_type(source_type or "unknown")
+            if resolved in _ARCHITECTURE_SPECIFIC_TEXT_TYPES:
+                return _ARCHITECTURE_SPECIFIC_TEXT_TYPES[resolved]
+        return "decoder"
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
+
+
+def _cache_names(names: list[str]) -> dict[str, dict[int, str]]:
+    result: dict[str, dict[int, str]] = {}
+    for name in names:
+        match = _CACHE_NAME.fullmatch(name)
+        if match is None:
+            continue
+        result.setdefault(match["kind"], {})[int(match["index"])] = name
+    return result
+
+
+def _name_template(names: dict[int, str], *, label: str) -> str:
+    templates: set[str] = set()
+    for name in names.values():
+        match = _CACHE_NAME.fullmatch(name)
+        if match is None:
+            raise ValueError(f"Invalid {label} cache name {name!r}")
+        templates.add(f"{match['prefix']}%d.{match['kind']}")
+    if len(templates) != 1:
+        raise ValueError(f"ORT GenAI requires one consistent {label} name template")
+    return templates.pop()
+
+
+def _is_single_model_decoder_package(pkg: ModelPackage) -> bool:
+    if set(pkg) != {"model"}:
+        return False
+    model = pkg.get("model")
+    if model is None:
+        return False
+    input_names = {value.name for value in model.graph.inputs}
+    output_names = {value.name for value in model.graph.outputs}
+    return "input_ids" in input_names and "logits" in output_names
+
+
+def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
+    """Validate and describe the released ORT GenAI decoder graph contract."""
+    input_names = [value.name for value in model.graph.inputs if value.name is not None]
+    output_names = [value.name for value in model.graph.outputs if value.name is not None]
+    if "input_ids" not in input_names:
+        raise ValueError("Generic ORT GenAI decoder graphs must expose an input_ids input")
+    if "logits" not in output_names:
+        raise ValueError("Generic ORT GenAI decoder graphs must expose a logits output")
+    if model_type == "gpt2":
+        raise ValueError(
+            "ORT GenAI's gpt2 runtime requires one rank-5 combined KV-cache tensor per "
+            "layer, but Mobius GPT-2 graphs expose separate key/value tensors; refusing "
+            "to emit an incompatible specialized-runtime config"
+        )
+
+    input_cache = _cache_names(input_names)
+    output_cache = _cache_names(output_names)
+    cache_input_names = {name for values in input_cache.values() for name in values.values()}
+    unknown_inputs = set(input_names) - cache_input_names - _DECODER_SEMANTIC_INPUTS
+    if unknown_inputs:
+        raise ValueError(
+            "ORT GenAI cannot automatically supply decoder graph inputs "
+            f"{sorted(unknown_inputs)}; use a specialized runtime pipeline"
+        )
+    has_current_length = "current_sequence_length" in input_names
+    has_past_length = "past_sequence_length" in input_names
+    if has_current_length != has_past_length:
+        raise ValueError(
+            "ORT GenAI supplies current_sequence_length and past_sequence_length only "
+            "as a pair"
+        )
+    unsupported_kinds = (set(input_cache) | set(output_cache)) - {
+        "key",
+        "value",
+        "conv_state",
+        "recurrent_state",
+    }
+    if unsupported_kinds:
+        raise ValueError(
+            "ORT GenAI released config cannot represent decoder state kinds "
+            f"{sorted(unsupported_kinds)}; heterogeneous state manifests are deferred to #605"
+        )
+
+    key_indices = set(input_cache.get("key", {}))
+    value_indices = set(input_cache.get("value", {}))
+    present_key_indices = set(output_cache.get("key", {}))
+    present_value_indices = set(output_cache.get("value", {}))
+    if not key_indices or key_indices != value_indices:
+        raise ValueError("ORT GenAI decoder graphs require paired key/value cache inputs")
+    if key_indices != present_key_indices or key_indices != present_value_indices:
+        raise ValueError(
+            "ORT GenAI decoder cache outputs must match the graph's key/value inputs"
+        )
+
+    recurrent_indices = set(input_cache.get("conv_state", {}))
+    has_recurrent_state = bool(input_cache.get("recurrent_state"))
+    if model_type == "lfm2":
+        if has_recurrent_state:
+            raise ValueError(
+                "LFM2's legacy runtime contract does not accept recurrent_state tensors"
+            )
+        if recurrent_indices != set(output_cache.get("conv_state", {})):
+            raise ValueError("LFM2 conv_state outputs must match its conv_state inputs")
+    elif recurrent_indices or has_recurrent_state:
+        expected = set(input_cache.get("recurrent_state", {}))
+        if not recurrent_indices or recurrent_indices != expected:
+            raise ValueError(
+                "Generic recurrent state requires paired conv_state/recurrent_state inputs"
+            )
+        if recurrent_indices != set(
+            output_cache.get("conv_state", {})
+        ) or recurrent_indices != set(output_cache.get("recurrent_state", {})):
+            raise ValueError(
+                "Generic recurrent state outputs must match conv_state/recurrent_state inputs"
+            )
+
+    decoder_inputs = {name: name for name in input_names if name in _DECODER_SEMANTIC_INPUTS}
+    decoder_inputs["past_key_names"] = _name_template(input_cache["key"], label="past-key")
+    decoder_inputs["past_value_names"] = _name_template(
+        input_cache["value"], label="past-value"
+    )
+    decoder_outputs = {
+        "logits": "logits",
+        "present_key_names": _name_template(output_cache["key"], label="present-key"),
+        "present_value_names": _name_template(output_cache["value"], label="present-value"),
+    }
+    if model_type == "lfm2" and recurrent_indices:
+        decoder_inputs["past_conv_names"] = _name_template(
+            input_cache["conv_state"], label="past-convolution"
+        )
+        decoder_outputs["present_conv_names"] = _name_template(
+            output_cache["conv_state"], label="present-convolution"
+        )
+    elif recurrent_indices:
+        expected_input_prefix = decoder_inputs["past_key_names"].rsplit(".", 1)[0]
+        expected_output_prefix = decoder_outputs["present_key_names"].rsplit(".", 1)[0]
+        recurrent_templates = {
+            _name_template(input_cache["conv_state"], label="past-convolution"),
+            _name_template(input_cache["recurrent_state"], label="past-recurrent"),
+        }
+        present_templates = {
+            _name_template(output_cache["conv_state"], label="present-convolution"),
+            _name_template(output_cache["recurrent_state"], label="present-recurrent"),
+        }
+        if {template.rsplit(".", 1)[0] for template in recurrent_templates} != {
+            expected_input_prefix
+        } or {template.rsplit(".", 1)[0] for template in present_templates} != {
+            expected_output_prefix
+        }:
+            raise ValueError(
+                "Released ORT GenAI derives recurrent state names from the key-cache "
+                "templates; graph prefixes must match exactly"
+            )
+    all_indices = key_indices | recurrent_indices
+    return _DecoderAbi(
+        inputs=decoder_inputs,
+        outputs=decoder_outputs,
+        cache_slots=max(all_indices) + 1,
+        has_recurrent_state=has_recurrent_state,
+    )
+
+
+def _runtime_version_tuple(version: str) -> tuple[int, int, int]:
+    match = re.match(r"^([0-9]+)\.([0-9]+)\.([0-9]+)", version)
+    if match is None:
+        raise ValueError(
+            f"Invalid onnxruntime-genai version {version!r}; expected MAJOR.MINOR.PATCH"
+        )
+    return tuple(int(part) for part in match.groups())
+
+
+def _write_runtime_compatibility(
+    output_dir: str, *, model_type: str, runtime_version: str | None
+) -> str:
+    if model_type == "decoder" and runtime_version is not None:
+        if _runtime_version_tuple(runtime_version) < _GENERIC_DECODER_MIN_VERSION:
+            raise ValueError(
+                "Generic ORT GenAI decoder packages require onnxruntime-genai >= 0.14.0; "
+                f"requested {runtime_version}"
+            )
+    metadata = {
+        "runtime": "onnxruntime-genai",
+        "model_type": model_type,
+        "minimum_version": "0.14.0" if model_type == "decoder" else None,
+        "tested_versions": (
+            list(_GENERIC_DECODER_TESTED_VERSIONS) if model_type == "decoder" else []
+        ),
+        "uses_main_only_state_groups": False,
+        "heterogeneous_state_manifest": "deferred: https://github.com/onnxruntime/mobius/issues/605",
+    }
+    path = os.path.join(output_dir, "runtime_compatibility.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+        handle.write("\n")
+    return path
 
 
 def _load_generation_config(model_id: str):
@@ -1197,11 +1426,21 @@ def _write_genai_config(
 
     # --- Discover decoder inputs from the ONNX graph ---
     decoder_key = "decoder" if "decoder" in pkg else "model"
-    decoder_inputs = _introspect_inputs(pkg, decoder_key)
-    if decoder_inputs is not None:
-        # KV cache entries are template-based, not per-input
-        decoder_inputs["past_key_names"] = "past_key_values.%d.key"
-        decoder_inputs["past_value_names"] = "past_key_values.%d.value"
+    decoder_model = pkg.get(decoder_key)
+    decoder_abi: _DecoderAbi | None = None
+    if _is_single_model_decoder_package(pkg):
+        if decoder_model is None:
+            raise ValueError("ORT GenAI text packages require a decoder ONNX graph")
+        decoder_abi = _inspect_decoder_abi(decoder_model, model_type=ort_model_type)
+        decoder_inputs = decoder_abi.inputs
+        decoder_outputs = decoder_abi.outputs
+    else:
+        decoder_inputs = _introspect_inputs(pkg, decoder_key)
+        decoder_outputs = None
+        if decoder_inputs is not None:
+            # Multimodal runtime types retain their architecture-specific cache contract.
+            decoder_inputs["past_key_names"] = "past_key_values.%d.key"
+            decoder_inputs["past_value_names"] = "past_key_values.%d.value"
 
     # Derive decoder filename from the actual package key
     decoder_filename = (
@@ -1236,7 +1475,6 @@ def _write_genai_config(
     # mismatch rather than at load time. Rather than silently emit a broken
     # config, raise a clear error so the caller picks an EP/dtype combination
     # (e.g. fp32 on CPU) that lowers full attention to GQA.
-    decoder_model = pkg.get(decoder_key)
     supports_in_place_kv_cache: bool | None = None
     if decoder_model is not None:
         has_gqa = any(
@@ -1269,6 +1507,27 @@ def _write_genai_config(
             )
         supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
+    sliding_window = None
+    window_size = getattr(config, "sliding_window", None)
+    if isinstance(window_size, int) and window_size > 0:
+        layer_types = getattr(config, "layer_types", None)
+        local_types = {"local", "sliding_attention", "window_attention"}
+        layers = (
+            [
+                index
+                for index, layer_type in enumerate(layer_types)
+                if layer_type in local_types
+            ]
+            if layer_types
+            else list(range(config.num_hidden_layers))
+        )
+        sliding_window = {
+            "window_size": window_size,
+            "slide_key_value_cache": False,
+            "slide_inputs": False,
+            "layers": layers,
+        }
+
     generator = GenaiConfigGenerator.from_config(
         config,
         ort_model_type,
@@ -1278,9 +1537,15 @@ def _write_genai_config(
         eos_token_id=eos_token_id,
         pad_token_id=pad_token_id,
         decoder_inputs=decoder_inputs,
+        decoder_outputs=decoder_outputs,
         decoder_filename=decoder_filename,
         supports_in_place_kv_cache=supports_in_place_kv_cache,
-        num_cache_layer_slots=_count_cache_layer_slots(decoder_model),
+        num_cache_layer_slots=(
+            decoder_abi.cache_slots
+            if decoder_abi is not None
+            else _count_cache_layer_slots(decoder_model)
+        ),
+        sliding_window=sliding_window,
     )
     generator.with_special_tokens(
         **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)
@@ -1499,6 +1764,7 @@ def write_ort_genai_config(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
+    runtime_version: str | None = None,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -1535,8 +1801,8 @@ def write_ort_genai_config(
             directory rather than a HuggingFace model ID.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
-        revision: Optional immutable HuggingFace revision used for every remote
-            configuration, tokenizer, and processor request.
+        runtime_version: Optional onnxruntime-genai version that will consume the
+            package. Generic decoder packages reject versions older than 0.14.0.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -1580,12 +1846,11 @@ def write_ort_genai_config(
     pad_token_id: int | None = None
     ort_model_type: str
 
-    # Detect multimodal capabilities from the package keys. Needed before
-    # resolving the ORT model type so decoder-only (text-only) packages can
-    # prefer their own config.model_type (see below).
+    # Generic decoder dispatch is intentionally limited to one-graph text packages.
+    # Auxiliary encoder, pipeline, and sidecar graphs require their own runtime contract.
     is_vlm = "vision_encoder" in pkg and "embedding" in pkg
     has_speech = "audio_encoder" in pkg
-    is_decoder_only = not is_vlm and not has_speech
+    is_decoder_only = _is_single_model_decoder_package(pkg)
 
     if hf_model_id is not None:
         import transformers
@@ -1635,7 +1900,9 @@ def write_ort_genai_config(
             # does not bind, so borrowing that type would mis-wire the graph.
             ort_model_type = "gemma3n"
         else:
-            ort_model_type = _resolve_ort_genai_model_type(raw_type)
+            ort_model_type = _select_ort_model_type(
+                raw_type, raw_type, is_decoder_only=is_decoder_only
+            )
         if ort_model_type == "unknown":
             logger.warning(
                 "Could not determine ORT-GenAI model type: pkg.config.model_type "
@@ -1672,6 +1939,15 @@ def write_ort_genai_config(
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
+    if (
+        ort_model_type == "decoder"
+        and runtime_version is not None
+        and _runtime_version_tuple(runtime_version) < _GENERIC_DECODER_MIN_VERSION
+    ):
+        raise ValueError(
+            "Generic ORT GenAI decoder packages require onnxruntime-genai >= 0.14.0; "
+            f"requested {runtime_version}"
+        )
 
     result: dict[str, str] = {}
 
@@ -1746,6 +2022,12 @@ def write_ort_genai_config(
         has_speech=has_speech,
     )
     result["genai_config"] = genai_path
+    compatibility_path = _write_runtime_compatibility(
+        directory,
+        model_type=ort_model_type,
+        runtime_version=runtime_version,
+    )
+    result["runtime_compatibility"] = compatibility_path
 
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(
@@ -1791,6 +2073,7 @@ def export_package(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
+    runtime_version: str | None = None,
     external_data: str = "onnx",
     progress_bar: bool = True,
 ) -> dict[str, str]:
@@ -1834,6 +2117,8 @@ def export_package(
             resolving token IDs and model type.
         revision: Optional immutable HuggingFace revision used for remote
             configuration, tokenizer, and processor requests.
+        runtime_version: Optional onnxruntime-genai version that will consume
+            the package.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -1892,6 +2177,7 @@ def export_package(
         context_length=context_length,
         local_config_dir=local_config_dir,
         trust_remote_code=trust_remote_code,
+        runtime_version=runtime_version,
     )
 
     # 3. Add ONNX paths to the manifest

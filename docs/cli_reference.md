@@ -161,6 +161,44 @@ tokenizer files to the output directory:
 - With `--config` (local directory): tokenizer files are copied from that
   directory.
 
+For a single-model decoder-only text graph, Mobius emits the architecture-neutral
+`model.type: "decoder"` contract supported by onnxruntime-genai 0.14.0 and newer.
+The graph determines the exact semantic input names, output names, cache templates,
+and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
+architecture names do not need a runtime registry entry.
+
+Architecture-specific types remain only where the runtime selects different
+behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` selects
+`Gpt_Model`, but Mobius's separate rank-4 key/value cache ABI does not match that
+runtime's rank-5 combined-cache contract, so config generation currently fails
+closed. `phi3`, `phimoe`, and `phi3small` retain their names because the released
+generator uses them to recompute LongRoPE caches when generation crosses the
+short-context threshold. Multimodal, audio, encoder-decoder, special-position-ID,
+and split pipeline packages remain outside the generic path and require their
+dedicated types and schemas. These exceptions follow the
+[v0.15.2 runtime model factory](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/model.cpp#L874-L907),
+which selects `Gpt_Model`, `LFM2_Model`, `WhisperModel`, `MarianModel`,
+`MultiModalLanguageModel`, and `DecoderOnlyPipelineModel` separately from
+`DecoderOnly_Model`; Qwen-VL's special position handling is likewise implemented in
+its [dedicated runtime model](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/qwen_vl_model.cpp).
+The Phi-3 LongRoPE threshold dispatch is in the released
+[`Generator`](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/generators.cpp).
+
+Released generic recurrent state is enabled only when the optimized graph exposes
+matching `conv_state` and `recurrent_state` names derived from the same cache
+template. Mobius rejects static-cache names and heterogeneous state layouts that
+the released config schema cannot represent rather than emitting a misleading
+dense cache. The deferred state-manifest work is tracked by
+[#605](https://github.com/onnxruntime/mobius/issues/605).
+
+Each export also writes `runtime_compatibility.json`. Generic decoder metadata
+records the minimum runtime version and the latest stable release exercised by
+Mobius (0.15.2); it never emits the unreleased `decoder.state_groups` field.
+Generic config availability does not promote a GGUF runtime verdict: the only
+runtime-supported GGUF route remains the exact pinned SmolLM F16/CPU package, while
+SmolLM2 remains rejected because its GGUF padding-token metadata conflicts with the
+official pinned tokenizer.
+
 #### Example
 
 ```bash

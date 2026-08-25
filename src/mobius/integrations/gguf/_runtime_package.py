@@ -280,7 +280,14 @@ def write_gguf_runtime_package(
                     "ORT GenAI runtime packaging requires an explicit evidenced execution "
                     "provider: cpu, cuda, or dml."
                 )
-            artifacts.update(write_ort_genai_config(pkg, str(stage), ep=execution_provider))
+            artifacts.update(
+                write_ort_genai_config(
+                    pkg,
+                    str(stage),
+                    ep=execution_provider,
+                    runtime_version=runtime_version,
+                )
+            )
         else:
             from mobius.integrations.onnx_genai import write_onnx_genai_config
 
