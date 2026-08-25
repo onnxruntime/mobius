@@ -27,6 +27,7 @@ from __future__ import annotations
 
 __all__ = [
     "UPSTREAM_COMMIT",
+    "UPSTREAM_DATE",
     "UpstreamArchitecture",
     "UpstreamQuantType",
     "upstream_architecture",
@@ -47,6 +48,11 @@ UPSTREAM_COMMIT = "8d9af256337d1a501250f9bbf4c0859a654bddd6"
 
 _DATA_PACKAGE = "mobius.integrations.gguf._upstream_data"
 _DATA_FILE = "llamacpp_pin.json"
+UPSTREAM_DATE = str(
+    json.loads(
+        resources.files(_DATA_PACKAGE).joinpath(_DATA_FILE).read_text(encoding="utf-8")
+    )["commit_date"]
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

@@ -690,6 +690,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="deci",
@@ -697,17 +699,23 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     # ----------------------------------------------------------------- Qwen
     GGUFArchitectureSpec(
         gguf_arch="qwen2",
         model_type="qwen2",
         tensor_map_recipe=("llama",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen3",
         model_type="qwen3",
         tensor_map_recipe=("llama",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="dflash",
@@ -903,6 +911,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="gemma",
         tensor_map_recipe=("llama",),
         tensor_processor="unoffset_norm",
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="gemma2",
@@ -910,6 +920,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama", "gemma2_extras"),
         tensor_processor="unoffset_norm",
         config_postprocessor="gemma2",
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="gemma3",
@@ -919,6 +931,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         # `+1` baked into every *norm.weight must be removed on import.
         tensor_processor="unoffset_norm",
         config_postprocessor="gemma3",
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="gemma4",
@@ -930,12 +944,16 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         # corrupt every norm.
         config_postprocessor="gemma4",
         vlm_builder="gemma4",
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     # -------------------------------------------------------------- Various
     GGUFArchitectureSpec(
         gguf_arch="phi3",
         model_type="phi3",
         tensor_map_recipe=("phi3",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="baichuan",
@@ -990,12 +1008,16 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="falcon",
         model_type="falcon",
         tensor_map_recipe=("falcon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="gpt2",
         model_type="gpt2",
         tensor_map_recipe=("gpt2",),
         tensor_processor="gpt2",
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="mamba",
@@ -1198,11 +1220,15 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="starcoder2",
         model_type="starcoder2",
         tensor_map_recipe=("llama",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="stablelm",
         model_type="stablelm",
         tensor_map_recipe=("llama",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="internlm2",
@@ -1210,8 +1236,9 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
         quantized_import=Support.REJECTED,
-        reason=_NO_QUANTIZED_PROJECTION_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="olmo",
@@ -1221,6 +1248,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         required_metadata=("attention.layer_norm_epsilon",),
         tensor_processor="llama",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="olmo2",
@@ -1228,6 +1257,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("llama", "olmo2_extras"),
         config_postprocessor="dense_sliding",
         required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="olmoe",
@@ -1439,6 +1470,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         required_metadata=("attention.layer_norm_rms_epsilon",),
         tensor_processor="llama",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="exaone",
@@ -1453,12 +1486,16 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="nemotron",
         tensor_map_recipe=("llama",),
         tensor_processor="unoffset_norm",
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="hunyuan-dense",
         model_type="hunyuan_v1_dense",
         aliases=frozenset({"hunyuan_v1_dense"}),
         tensor_map_recipe=("llama", "hunyuan_extras"),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="muse-glimmer",
@@ -1470,6 +1507,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         config_postprocessor="muse_glimmer",
         vlm_builder="muse_glimmer",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="deepseek4",
@@ -1535,6 +1574,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="bloom",
         model_type="bloom",
         tensor_map=Support.DEFERRED,
+        runtime=Support.DEFERRED,
         quantized_import=Support.REJECTED,
         reason=_NO_TENSOR_MAP,
     ),

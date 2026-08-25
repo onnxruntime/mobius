@@ -619,6 +619,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         print("Dequantized mode: converting GGUF weights to float...")
 
     gguf_path = args.gguf_path
+    gguf_reference = gguf_path
     output_dir = args.output_dir
     target_config = getattr(args, "target_config", None)
     runtime = getattr(args, "runtime", None)
@@ -638,20 +639,28 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
 
     if runtime is not None:
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
         from mobius.integrations.gguf._builder import (
             _resolve_gguf_path,
             _validate_gguf_model,
         )
         from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._spec import Support
         from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
 
         # Resolve and validate the exact selected source before graph construction
         # so a deferred tokenizer cannot leave a graph-only directory behind.
-        gguf_path = _resolve_gguf_path(gguf_path)
-        gguf_model = GGUFModel(gguf_path)
-        _validate_gguf_model(gguf_model, source=str(gguf_path))
+        resolved_gguf_path = _resolve_gguf_path(gguf_path)
+        gguf_model = GGUFModel(resolved_gguf_path)
+        _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
+        architecture_spec = get_arch_spec(gguf_model.architecture)
+        if architecture_spec.runtime is not Support.SUPPORTED:
+            raise SystemExit(
+                f"Error: GGUF runtime packaging for {architecture_spec.gguf_arch!r} is "
+                f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
+            )
         tokenizer_verdict = inspect_gguf_tokenizer(
-            gguf_model.metadata, source=str(gguf_path), require_complete=True
+            gguf_model.metadata, source=str(resolved_gguf_path), require_complete=True
         )
         if not tokenizer_verdict.materialized:
             raise SystemExit(
@@ -659,7 +668,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             )
 
     pkg = build_from_gguf(
-        gguf_path,
+        gguf_reference,
         mmproj=mmproj_path,
         dtype=args.dtype,
         keep_quantized=keep_quantized,
@@ -715,6 +724,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             gguf_path,
             output_dir,
             runtime=runtime,
+            runtime_version=getattr(args, "runtime_version", None),
             external_data=args.external_data,
             max_shard_size_bytes=(
                 _parse_size(args.max_shard_size) if args.max_shard_size else None
@@ -1249,6 +1259,14 @@ def build_parser() -> argparse.ArgumentParser:
             "the GGUF; opaque tokenizer.ggml.pre metadata is not reconstructed. "
             "'onnx-genai' writes inference_metadata.yaml and 'ort-genai' writes "
             "genai_config.json."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--runtime-version",
+        default=None,
+        help=(
+            "Exact selected runtime version. Required once an architecture has a "
+            "runtime-supported evidence record; it must equal the version validated there."
         ),
     )
     gguf_parser.add_argument(

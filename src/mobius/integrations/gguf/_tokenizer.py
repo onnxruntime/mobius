@@ -409,6 +409,7 @@ def write_gguf_tokenizer_json(
     *,
     metadata: Mapping[str, Any] | None = None,
     expected_metadata_sha256: str | None = None,
+    source_identity: str | None = None,
 ) -> str:
     """Copy an exact embedded tokenizer and reproduce its GGUF-side config."""
     from mobius.integrations.gguf._reader import GGUFModel
@@ -455,7 +456,7 @@ def write_gguf_tokenizer_json(
         chat_template_path.unlink()
     manifest = {
         "format_version": 1,
-        "source": str(gguf_path.resolve()),
+        "source": source_identity or str(gguf_path.resolve()),
         "route": verdict.route,
         "model": verdict.model,
         "pre": verdict.pre,

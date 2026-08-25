@@ -35,6 +35,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _stat_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
 def _parse_field_value(field) -> Any:
     """Extract a Python value from a :class:`gguf.ReaderField`.
 
@@ -153,12 +158,23 @@ class GGUFModel:
         if not self._path.is_file():
             raise FileNotFoundError(f"GGUF file not found: {self._path}")
 
+        source_identity = _stat_identity(self._path)
         self._reader = GGUFReader(str(self._path))
+        if _stat_identity(self._path) != source_identity:
+            raise ValueError("GGUF source changed while the reader was opening it")
+        self._source_identity = source_identity
         self._metadata: dict[str, Any] | None = None
         # Build tensor name → index map for O(1) lookup
         self._tensor_index: dict[str, int] = {
             t.name: i for i, t in enumerate(self._reader.tensors)
         }
+
+    def source_matches_path(self) -> bool:
+        """Return whether the path still names the exact file opened by this reader."""
+        try:
+            return _stat_identity(self._path) == self._source_identity
+        except OSError:
+            return False
 
     @property
     def architecture(self) -> str:

@@ -12,11 +12,18 @@ from unittest import mock
 import pytest
 
 from mobius.integrations.gguf import write_gguf_runtime_package
+from mobius.integrations.gguf._spec import Support
 
 
 class _FakePackage:
     def __init__(self):
         self.config = object()
+        self.gguf_architecture = "llama"
+        self.gguf_execution_provider = "cpu"
+        self.gguf_import_route = '{"route_schema":1}'
+        self.gguf_artifact_identity = SimpleNamespace(
+            architecture="llama", filename="model.gguf", sha256="a" * 64
+        )
         self.gguf_tokenizer_verdict = _materialized()
         self.saved_to: str | None = None
 
@@ -49,14 +56,62 @@ def _write_config(_pkg, output, **_kwargs):
     return {"inference_metadata": str(path)}
 
 
+@pytest.fixture(autouse=True)
+def _runtime_supported():
+    with (
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.get_arch_spec",
+            return_value=SimpleNamespace(
+                runtime=Support.SUPPORTED,
+                reason=None,
+                gguf_arch="llama",
+                runtime_evidence_ids=("test-evidence",),
+            ),
+        ),
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
+            return_value=SimpleNamespace(
+                evidence_id="test-evidence",
+                graph_files=("model.onnx",),
+                graph_sha256=mock.ANY,
+                runtime_package_files=("model.onnx",),
+                runtime_package_sha256=mock.ANY,
+            ),
+        ),
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.gguf_graph_package_identity",
+            return_value=SimpleNamespace(files=("model.onnx",), sha256=mock.ANY),
+        ),
+    ):
+        yield
+
+
 class TestWriteGgufRuntimePackage:
+    def test_deferred_architecture_rejects_before_source_read_or_output(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.get_arch_spec",
+                return_value=SimpleNamespace(
+                    runtime=Support.DEFERRED,
+                    reason="independent parity is missing",
+                ),
+            ),
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match=r"runtime packaging.*deferred"),
+        ):
+            write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out)
+        read_source.assert_not_called()
+        assert not out.exists()
+
     def test_atomically_emits_graph_tokenizer_and_runtime_config(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"
         with (
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}),
+                return_value=SimpleNamespace(metadata={}, architecture="llama"),
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
@@ -85,7 +140,7 @@ class TestWriteGgufRuntimePackage:
         with (
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}),
+                return_value=SimpleNamespace(metadata={}, architecture="llama"),
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
@@ -107,7 +162,7 @@ class TestWriteGgufRuntimePackage:
         with (
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}),
+                return_value=SimpleNamespace(metadata={}, architecture="llama"),
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
@@ -132,7 +187,7 @@ class TestWriteGgufRuntimePackage:
         with (
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}),
+                return_value=SimpleNamespace(metadata={}, architecture="llama"),
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
@@ -184,41 +239,18 @@ class TestWriteGgufRuntimePackage:
             "sentinel.bin": b"unchanged"
         }
 
-    def test_failed_mtp_metadata_write_leaves_existing_output_unchanged(self, tmp_path):
+    @pytest.mark.parametrize("runtime", ["onnx-genai", "ort-genai"])
+    def test_runtime_rejects_unevidenced_mtp_before_source_read(self, tmp_path, runtime):
         pkg = _FakePackage()
         pkg.mtp_head = SimpleNamespace(config=object())
         out = tmp_path / "out"
-        out.mkdir()
-        sentinel = out / "sentinel.bin"
-        sentinel.write_bytes(b"unchanged")
         with (
-            mock.patch(
-                "mobius.integrations.gguf._runtime_package.GGUFModel",
-                return_value=SimpleNamespace(metadata={}),
-            ),
-            mock.patch(
-                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
-                return_value=_materialized(),
-            ),
-            mock.patch(
-                "mobius.integrations.gguf._runtime_package.write_gguf_tokenizer_json",
-                side_effect=_write_tokenizer,
-            ),
-            mock.patch(
-                "mobius.integrations.onnx_genai.write_onnx_genai_config",
-                side_effect=_write_config,
-            ),
-            mock.patch(
-                "mobius.integrations.onnx_genai.inference_metadata."
-                "write_mtp_speculator_metadata",
-                side_effect=RuntimeError("mtp metadata failed"),
-            ),
-            pytest.raises(RuntimeError, match="mtp metadata failed"),
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match="runtime-evidenced GGUF MTP"),
         ):
-            write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out)
-        assert {path.name: path.read_bytes() for path in out.iterdir()} == {
-            "sentinel.bin": b"unchanged"
-        }
+            write_gguf_runtime_package(pkg, tmp_path / "m.gguf", out, runtime=runtime)
+        read_source.assert_not_called()
+        assert not out.exists()
 
     def test_unknown_runtime_rejects_before_source_read(self, tmp_path):
         with pytest.raises(ValueError, match="Unknown runtime"):
@@ -226,37 +258,15 @@ class TestWriteGgufRuntimePackage:
                 _FakePackage(), tmp_path / "m.gguf", tmp_path / "out", runtime="tflite"
             )
 
-    def test_save_model_false_requires_an_existing_graph(self, tmp_path):
-        with pytest.raises(ValueError, match=r"existing package containing model\.onnx"):
+    def test_save_model_false_is_rejected_before_source_read(self, tmp_path):
+        with (
+            mock.patch("mobius.integrations.gguf._runtime_package.GGUFModel") as read_source,
+            pytest.raises(ValueError, match="save_model=False is not supported"),
+        ):
             write_gguf_runtime_package(
-                _FakePackage(),
-                tmp_path / "m.gguf",
-                tmp_path / "missing",
-                save_model=False,
+                _FakePackage(), tmp_path / "m.gguf", tmp_path / "output", save_model=False
             )
-
-    def test_save_model_false_does_not_accept_an_mtp_only_graph(self, tmp_path):
-        output = tmp_path / "output"
-        (output / "mtp").mkdir(parents=True)
-        (output / "mtp" / "model.onnx").write_bytes(b"mtp")
-        with pytest.raises(ValueError, match="primary package graph"):
-            write_gguf_runtime_package(
-                _FakePackage(),
-                tmp_path / "m.gguf",
-                output,
-                save_model=False,
-            )
-
-    def test_ort_genai_rejects_undeclared_mtp_sidecar(self, tmp_path):
-        pkg = _FakePackage()
-        pkg.mtp_head = SimpleNamespace(config=object())
-        with pytest.raises(ValueError, match="does not yet have a declared GGUF MTP"):
-            write_gguf_runtime_package(
-                pkg,
-                tmp_path / "m.gguf",
-                tmp_path / "output",
-                runtime="ort-genai",
-            )
+        read_source.assert_not_called()
 
     def test_target_coupled_draft_rejects_before_source_read(self, tmp_path):
         pkg = _FakePackage()

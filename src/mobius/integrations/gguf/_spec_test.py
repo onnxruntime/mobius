@@ -24,9 +24,13 @@ from mobius.integrations.gguf._spec import (
 
 
 class TestArchitectureSpecValidation:
-    def test_a_minimal_supported_spec_is_accepted(self) -> None:
+    def test_a_minimal_graph_import_spec_is_accepted(self) -> None:
         spec = GGUFArchitectureSpec(
-            gguf_arch="llama", model_type="llama", tensor_map_recipe=("llama",)
+            gguf_arch="llama",
+            model_type="llama",
+            tensor_map_recipe=("llama",),
+            runtime=Support.DEFERRED,
+            reason="runtime evidence is pending",
         )
         assert spec.is_importable
         assert spec.names == frozenset({"llama"})
@@ -39,11 +43,21 @@ class TestArchitectureSpecValidation:
 
     def test_a_buildable_spec_needs_a_model_type(self) -> None:
         with pytest.raises(ValueError, match="requires a model_type"):
-            GGUFArchitectureSpec(gguf_arch="llama", tensor_map_recipe=("llama",))
+            GGUFArchitectureSpec(
+                gguf_arch="llama",
+                tensor_map_recipe=("llama",),
+                runtime=Support.DEFERRED,
+                reason="runtime evidence is pending",
+            )
 
     def test_a_mappable_spec_needs_a_recipe(self) -> None:
         with pytest.raises(ValueError, match="non-empty tensor_map_recipe"):
-            GGUFArchitectureSpec(gguf_arch="llama", model_type="llama")
+            GGUFArchitectureSpec(
+                gguf_arch="llama",
+                model_type="llama",
+                runtime=Support.DEFERRED,
+                reason="runtime evidence is pending",
+            )
 
     def test_a_recipe_may_not_contradict_an_unsupported_verdict(self) -> None:
         """A recipe on a rejected mapping would imply the mapping works."""
@@ -63,6 +77,27 @@ class TestArchitectureSpecValidation:
                 model_type="llama",
                 aliases=frozenset({"llama"}),
                 tensor_map_recipe=("llama",),
+                runtime=Support.DEFERRED,
+                reason="runtime evidence is pending",
+            )
+
+    def test_runtime_support_needs_structured_evidence_ids(self) -> None:
+        with pytest.raises(ValueError, match="structured evidence IDs"):
+            GGUFArchitectureSpec(
+                gguf_arch="llama",
+                model_type="llama",
+                tensor_map_recipe=("llama",),
+                runtime=Support.SUPPORTED,
+            )
+
+    def test_runtime_support_rejects_unknown_evidence_ids(self) -> None:
+        with pytest.raises(ValueError, match="Unknown GGUF runtime evidence IDs"):
+            GGUFArchitectureSpec(
+                gguf_arch="llama",
+                model_type="llama",
+                tensor_map_recipe=("llama",),
+                runtime=Support.SUPPORTED,
+                runtime_evidence_ids=("invented",),
             )
 
     def test_verdicts_are_reported_separately(self) -> None:

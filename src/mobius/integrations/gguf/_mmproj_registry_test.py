@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import dataclasses
-import pathlib
 from types import MappingProxyType
 
 import pytest
@@ -101,13 +100,15 @@ def test_registry_and_verdict_views_are_immutable() -> None:
         spec.verdicts["runtime"] = Support.DEFERRED  # type: ignore[index]
 
 
-def test_support_is_conservative_and_artifact_backed() -> None:
+def test_graph_import_is_conservative_and_artifact_backed() -> None:
     assert supported_projector_types() == ("gemma4v", "muse-glimmer")
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
     assert set(pins) == {"gemma4-e2b-f16", "muse-glimmer-30b-bf16"}
     for projector_type in supported_projector_types():
         spec = get_projector_spec(projector_type)
-        assert spec.is_supported
+        assert spec.is_importable
+        assert spec.runtime is Support.DEFERRED
+        assert not spec.is_supported
         assert spec.real_artifact_ids
         assert all(artifact_id in pins for artifact_id in spec.real_artifact_ids)
         assert all(pins[artifact_id].parity_test for artifact_id in spec.real_artifact_ids)
@@ -173,33 +174,6 @@ def test_generated_audio_decoders_are_explicitly_rejected(projector_type: str) -
 
 
 def test_documented_projector_matrix_is_generated_from_registry() -> None:
-    doc = pathlib.Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
-    begin = "<!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->"
-    end = "<!-- END GGUF MMPROJ SUPPORT MATRIX -->"
-    block = doc.read_text(encoding="utf-8").split(begin, 1)[1].split(end, 1)[0]
-    documented = [line for line in block.splitlines() if line.startswith("| `")]
-    expected = []
-    for spec in iter_projector_specs():
-        modalities = ", ".join(
-            modality.value for modality in sorted(spec.modalities, key=lambda item: item.value)
-        )
-        targets = (
-            ", ".join(f"`{target}`" for target in sorted(spec.target_architectures)) or "—"
-        )
-        status = (
-            "supported"
-            if spec.is_supported
-            else "; ".join(
-                f"{name} {verdict.value}"
-                for name, verdict in spec.verdicts.items()
-                if verdict is not Support.SUPPORTED
-            )
-        )
-        limitation = (
-            spec.reason
-            or "Exact registry-backed graph, tensor closure, target pairing, and component parity."
-        )
-        expected.append(
-            f"| `{spec.projector_type}` | {modalities} | {targets} | {status} | {limitation} |"
-        )
-    assert documented == expected
+    from mobius.integrations.gguf._docs import check_document
+
+    assert check_document()

@@ -22,7 +22,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
+from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._runtime_evidence import (
+    gguf_graph_package_identity,
+    matching_runtime_evidence,
+)
+from mobius.integrations.gguf._spec import Support
 from mobius.integrations.gguf._tokenizer import (
     inspect_gguf_tokenizer,
     write_gguf_tokenizer_json,
@@ -39,12 +45,16 @@ def write_gguf_runtime_package(
     output_dir: str | Path,
     *,
     runtime: Runtime = "onnx-genai",
+    runtime_version: str | None = None,
     save_model: bool = True,
     **save_kwargs: Any,
 ) -> dict[str, str]:
-    """Write a complete, loadable package for a GGUF-built model.
+    """Write a complete, loadable package for a runtime-evidenced GGUF model.
 
-    Emits the ONNX graph, an exact embedded ``tokenizer.huggingface.json`` copy,
+    Emission is gated by the architecture runtime verdict. The current registry
+    intentionally has no runtime-supported architectures; graph-only imports remain
+    available. Once a qualifying structured evidence record is registered, this
+    function emits the graph, an exact embedded ``tokenizer.huggingface.json`` copy,
     and the selected runtime's configuration contract as one staged directory.
 
     Args:
@@ -56,8 +66,9 @@ def write_gguf_runtime_package(
         runtime: Which runtime contract to emit. ``"onnx-genai"`` writes
             ``inference_metadata.yaml``; ``"ort-genai"`` writes
             ``genai_config.json``.
-        save_model: Save the ONNX graph too. Pass ``False`` when the caller has
-            already saved it and only wants the runtime artifacts.
+        runtime_version: Exact runtime version covered by the evidence record.
+        save_model: Must remain ``True``. Existing graph directories cannot be
+            associated with the build-time evidence transaction safely.
         **save_kwargs: Forwarded to :meth:`ModelPackage.save`.
 
     Returns:
@@ -69,6 +80,35 @@ def write_gguf_runtime_package(
     """
     if runtime not in ("onnx-genai", "ort-genai"):
         raise ValueError(f"Unknown runtime {runtime!r}; expected 'onnx-genai' or 'ort-genai'.")
+    if not save_model:
+        raise ValueError(
+            "save_model=False is not supported for runtime-evidenced GGUF packages because "
+            "an existing graph cannot be bound to the build-time evidence transaction."
+        )
+    architecture = getattr(pkg, "gguf_architecture", None)
+    if not architecture:
+        raise ValueError(
+            "GGUF runtime packaging requires the canonical source architecture captured "
+            "during graph construction."
+        )
+    architecture_spec = get_arch_spec(architecture)
+    if architecture_spec.runtime is not Support.SUPPORTED:
+        raise ValueError(
+            f"GGUF runtime packaging for {architecture!r} is "
+            f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
+        )
+    import_route = getattr(pkg, "gguf_import_route", None)
+    if not import_route:
+        raise ValueError(
+            "GGUF runtime packaging requires the exact import route captured during "
+            "graph construction."
+        )
+    built_identity = getattr(pkg, "gguf_artifact_identity", None)
+    if built_identity is None:
+        raise ValueError(
+            "GGUF runtime packaging requires the immutable source identity captured during "
+            "graph construction."
+        )
     if runtime == "ort-genai" and getattr(pkg, "gguf_reuse_plan", None) is not None:
         raise ValueError(
             "ORT GenAI packaging is not supported with reused GGUF weights because "
@@ -84,38 +124,33 @@ def write_gguf_runtime_package(
             "package and draft_manifest.json, then pair it with the exact validated target."
         )
     mtp_head = getattr(pkg, "mtp_head", None)
-    if runtime == "ort-genai" and mtp_head is not None:
+    if mtp_head is not None:
         raise ValueError(
-            "ORT GenAI runtime packaging does not yet have a declared GGUF MTP sidecar "
-            "contract; refusing to emit an unreachable mtp/model.onnx."
+            f"{runtime} runtime packaging does not yet have a runtime-evidenced GGUF MTP "
+            "sidecar contract; refusing to emit an unreachable mtp/model.onnx."
         )
 
     output_dir = Path(output_dir)
-    if not save_model:
-        if not output_dir.is_dir():
-            raise ValueError(
-                "save_model=False requires an existing package containing model.onnx; "
-                "refusing to publish runtime artifacts without a graph."
-            )
-        component_names = list(pkg)
-        expected_models = (
-            [output_dir / "model.onnx"]
-            if len(component_names) == 1
-            else [output_dir / name / "model.onnx" for name in component_names]
-        )
-        missing_models = [path for path in expected_models if not path.is_file()]
-        if not component_names or missing_models:
-            raise ValueError(
-                "save_model=False requires every existing primary package graph; "
-                f"missing {[str(path) for path in missing_models] or ['package components']}."
-            )
-        if mtp_head is not None and not (output_dir / "mtp" / "model.onnx").is_file():
-            raise ValueError(
-                "save_model=False requires the existing package to contain mtp/model.onnx."
-            )
-
     source_path = Path(getattr(pkg, "gguf_source_path", gguf_path))
-    source_metadata = GGUFModel(source_path).metadata
+    source_model = GGUFModel(source_path)
+    source_architecture = get_arch_spec(source_model.architecture).gguf_arch
+    if source_architecture != architecture:
+        raise ValueError(
+            "The GGUF source architecture no longer matches the canonical architecture "
+            f"captured during graph construction: built={architecture!r}, "
+            f"current={source_architecture!r}."
+        )
+    evidence = matching_runtime_evidence(
+        architecture_spec.runtime_evidence_ids,
+        architecture=architecture,
+        runtime=runtime,
+        source_path=source_path,
+        gguf_model=source_model,
+        built_identity=built_identity,
+        import_route=import_route,
+        runtime_version=runtime_version,
+    )
+    source_metadata = source_model.metadata
     verdict = inspect_gguf_tokenizer(
         source_metadata,
         source=str(source_path),
@@ -144,23 +179,37 @@ def write_gguf_runtime_package(
     )
     try:
         artifacts: dict[str, str] = {}
-        if save_model:
-            pkg.save(str(stage), **save_kwargs)
-        elif output_dir.exists():
-            shutil.copytree(output_dir, stage, dirs_exist_ok=True)
+        pkg.save(str(stage), **save_kwargs)
+        graph_identity = gguf_graph_package_identity(stage)
+        if (
+            graph_identity.files != evidence.graph_files
+            or graph_identity.sha256 != evidence.graph_sha256
+        ):
+            raise ValueError(
+                "Serialized GGUF graph package does not match runtime evidence: "
+                f"expected files={evidence.graph_files}, sha256={evidence.graph_sha256}; "
+                f"got files={graph_identity.files}, sha256={graph_identity.sha256}."
+            )
 
         tokenizer_path = write_gguf_tokenizer_json(
             source_path,
             stage,
             metadata=source_metadata,
             expected_metadata_sha256=built_verdict.metadata_sha256,
+            source_identity=(f"sha256:{built_identity.sha256}/{built_identity.filename}"),
         )
         artifacts["tokenizer"] = tokenizer_path
 
         if runtime == "ort-genai":
             from mobius.integrations.ort_genai import write_ort_genai_config
 
-            artifacts.update(write_ort_genai_config(pkg, str(stage)))
+            execution_provider = getattr(pkg, "gguf_execution_provider", None)
+            if execution_provider not in {"cpu", "cuda", "dml"}:
+                raise ValueError(
+                    "ORT GenAI runtime packaging requires an explicit evidenced execution "
+                    "provider: cpu, cuda, or dml."
+                )
+            artifacts.update(write_ort_genai_config(pkg, str(stage), ep=execution_provider))
         else:
             from mobius.integrations.onnx_genai import write_onnx_genai_config
 
@@ -181,6 +230,17 @@ def write_gguf_runtime_package(
             )
             if speculator_path is not None:
                 artifacts["speculator"] = str(speculator_path)
+        runtime_identity = gguf_graph_package_identity(stage)
+        if (
+            runtime_identity.files != evidence.runtime_package_files
+            or runtime_identity.sha256 != evidence.runtime_package_sha256
+        ):
+            raise ValueError(
+                "Completed GGUF runtime package does not match evidence: "
+                f"expected files={evidence.runtime_package_files}, "
+                f"sha256={evidence.runtime_package_sha256}; "
+                f"got files={runtime_identity.files}, sha256={runtime_identity.sha256}."
+            )
         backup: Path | None = None
         if output_dir.exists():
             backup = output_dir.with_name(f".{output_dir.name}.backup")

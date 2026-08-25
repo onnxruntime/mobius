@@ -582,6 +582,7 @@ class TestCLIBuildGGUF:
     def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
         """build-gguf forwards the selected runtime after saving the graph."""
         from mobius.__main__ import main
+        from mobius.integrations.gguf._spec import Support
 
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
@@ -595,9 +596,17 @@ class TestCLIBuildGGUF:
             ),
             mock.patch(
                 "mobius.integrations.gguf._reader.GGUFModel",
-                return_value=mock.Mock(metadata={}),
+                return_value=mock.Mock(metadata={}, architecture="llama"),
             ),
             mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._arch_registry.get_arch_spec",
+                return_value=mock.Mock(
+                    gguf_arch="llama",
+                    runtime=Support.SUPPORTED,
+                    reason=None,
+                ),
+            ),
             mock.patch(
                 "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
                 return_value=mock.Mock(materialized=True),
@@ -627,6 +636,7 @@ class TestCLIBuildGGUF:
             str(tmp_path / "model.gguf"),
             str(output_dir),
             runtime="ort-genai",
+            runtime_version=None,
             external_data="onnx",
             max_shard_size_bytes=None,
             max_workers=8,
@@ -634,6 +644,7 @@ class TestCLIBuildGGUF:
 
     def test_deferred_runtime_tokenizer_fails_before_graph_or_output(self, tmp_path):
         from mobius.__main__ import main
+        from mobius.integrations.gguf._spec import Support
 
         output = tmp_path / "output"
         with (
@@ -643,9 +654,17 @@ class TestCLIBuildGGUF:
             ),
             mock.patch(
                 "mobius.integrations.gguf._reader.GGUFModel",
-                return_value=mock.Mock(metadata={}),
+                return_value=mock.Mock(metadata={}, architecture="llama"),
             ),
             mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._arch_registry.get_arch_spec",
+                return_value=mock.Mock(
+                    gguf_arch="llama",
+                    runtime=Support.SUPPORTED,
+                    reason=None,
+                ),
+            ),
             mock.patch(
                 "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
                 return_value=mock.Mock(

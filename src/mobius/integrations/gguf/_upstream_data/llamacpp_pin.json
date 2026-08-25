@@ -1,6 +1,7 @@
 {
 "source": "https://github.com/ggml-org/llama.cpp",
 "commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+"commit_date": "2026-08-23T16:59:42Z",
 "mtp_nextn": {
   "metadata_key_template": "{arch}.nextn_predict_layers",
   "metadata_type": "uint32",

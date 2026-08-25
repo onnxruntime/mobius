@@ -108,18 +108,18 @@ class ProjectorSpec:
         verdicts = (self.metadata, self.tensor_map, self.graph, self.runtime)
         if any(verdict is not Support.SUPPORTED for verdict in verdicts) and not self.reason:
             raise ValueError(f"{self.projector_type}: unsupported capability needs a reason")
-        if self.is_supported:
+        if self.is_importable:
             if not self.builder or not self.target_architectures:
                 raise ValueError(
-                    f"{self.projector_type}: supported projector needs builder and target"
+                    f"{self.projector_type}: importable projector needs builder and target"
                 )
             if not self.required_metadata or not self.required_top_tensors:
                 raise ValueError(
-                    f"{self.projector_type}: supported projector needs an exact loader closure"
+                    f"{self.projector_type}: importable projector needs an exact loader closure"
                 )
             if not self.real_artifact_ids:
                 raise ValueError(
-                    f"{self.projector_type}: supported projector needs real artifact evidence"
+                    f"{self.projector_type}: importable projector needs real artifact evidence"
                 )
         elif any(
             (
@@ -150,8 +150,17 @@ class ProjectorSpec:
         )
 
     @property
+    def is_importable(self) -> bool:
+        """Whether metadata, tensor mapping, and graph construction are supported."""
+        return all(
+            verdict is Support.SUPPORTED
+            for verdict in (self.metadata, self.tensor_map, self.graph)
+        )
+
+    @property
     def is_supported(self) -> bool:
-        return all(verdict is Support.SUPPORTED for verdict in self.verdicts.values())
+        """Whether the complete graph and runtime package are supported."""
+        return self.is_importable and self.runtime is Support.SUPPORTED
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -515,7 +524,12 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         metadata=Support.SUPPORTED,
         tensor_map=Support.SUPPORTED,
         graph=Support.SUPPORTED,
-        runtime=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata, tensor closure, graph construction, and independent component parity "
+            "are covered, but the paired text target, processor, and deterministic package "
+            "generation have no end-to-end runtime evidence."
+        ),
         builder="gemma4",
         required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.vision.projector_type"),
         required_top_tensors=(
@@ -834,7 +848,12 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         metadata=Support.SUPPORTED,
         tensor_map=Support.SUPPORTED,
         graph=Support.SUPPORTED,
-        runtime=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata, tensor closure, graph construction, and independent component parity "
+            "are covered, but the paired text target, processor, and deterministic package "
+            "generation have no end-to-end runtime evidence."
+        ),
         builder="muse_glimmer",
         required_metadata=(
             *_COMMON_REQUIRED_VISION_METADATA,
@@ -930,7 +949,7 @@ def get_projector_spec(projector_type: str) -> ProjectorSpec:
 
 def supported_projector_types() -> tuple[str, ...]:
     """Return projector strings that may reach graph construction."""
-    return tuple(spec.projector_type for spec in _SPECS if spec.is_supported)
+    return tuple(spec.projector_type for spec in _SPECS if spec.is_importable)
 
 
 def projector_type_for_modality(metadata: Mapping[str, Any], modality: MMProjModality) -> str:

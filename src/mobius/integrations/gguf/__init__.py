@@ -18,10 +18,8 @@ Usage::
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
 
-    # Write a directory the runtime can actually load (graph + tokenizer +
-    # inference metadata). Saving only the graph produces a package that
-    # loads nowhere.
-    write_gguf_runtime_package(pkg, "path/to/model.gguf", "out_dir")
+    # Runtime packaging is fail-closed and currently unavailable because no
+    # architecture has complete real-artifact runtime evidence.
 
 :func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
 to :func:`build_gemma4_vlm_from_gguf` for the multimodal assembly.

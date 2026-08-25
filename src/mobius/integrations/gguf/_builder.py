@@ -1797,6 +1797,22 @@ def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
     return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
 
 
+def _logical_source_filename(reference: str | Path, resolved_path: str | Path) -> str:
+    """Preserve an explicitly selected Hub-relative filename for evidence."""
+    raw = str(reference)
+    repo_revision, _, requested_filename = raw.partition(":")
+    repo_id = repo_revision.partition("@")[0]
+    if requested_filename and _looks_like_hf_repo_id(repo_id):
+        return requested_filename
+    resolved = Path(resolved_path)
+    parts = resolved.parts
+    if _looks_like_hf_repo_id(repo_id) and "snapshots" in parts:
+        snapshot_index = parts.index("snapshots")
+        if len(parts) > snapshot_index + 2:
+            return Path(*parts[snapshot_index + 2 :]).as_posix()
+    return resolved.name
+
+
 def build_from_gguf(
     gguf_path: str | Path,
     *,
@@ -1897,6 +1913,8 @@ def build_from_gguf(
             if a quantized input has no supported preservation target.
     """
     import dataclasses
+    import hashlib
+    import json
 
     # A companion mmproj GGUF turns this into a multimodal build: the text +
     # vision/audio encoders are assembled by the dedicated VLM builder. Keep
@@ -1952,7 +1970,21 @@ def build_from_gguf(
     # 1. Parse GGUF file (auto-download from HF Hub when given "owner/repo[:filename]").
     #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
     #    (never merged into a second on-disk GGUF); a plain file opens as before.
+    source_reference = str(gguf_path)
     gguf_path = _resolve_gguf_path(gguf_path)
+    logical_source_filename = _logical_source_filename(source_reference, gguf_path)
+    source_path = Path(gguf_path)
+    if source_path.is_symlink():
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        try:
+            source_path.absolute().relative_to(Path(HF_HUB_CACHE).absolute())
+        except ValueError:
+            pass
+        else:
+            # Snapshot links point into the immutable content-addressed blob store.
+            source_path = source_path.resolve(strict=True)
+            gguf_path = str(source_path)
     gguf_model = _gguf_model if _gguf_model is not None else open_gguf_model(gguf_path)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
     if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
@@ -2357,6 +2389,70 @@ def build_from_gguf(
     if draft_manifest is not None:
         pkg.draft_manifest = draft_manifest
     pkg.gguf_source_path = str(Path(gguf_path).resolve())
+    pkg.gguf_source_filename = logical_source_filename
+    pkg.gguf_architecture = spec.gguf_arch
+    pkg.gguf_execution_provider = execution_provider
+    if dataclasses.is_dataclass(resolved_task) and not isinstance(resolved_task, type):
+        task_state: object = dataclasses.asdict(resolved_task)
+    elif isinstance(resolved_task, str):
+        task_state = resolved_task
+    else:
+        task_state = dict(sorted(vars(resolved_task).items()))
+    graph_config = json.dumps(
+        dataclasses.asdict(config),
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    pkg.gguf_import_route = json.dumps(
+        {
+            "architecture": spec.gguf_arch,
+            "config_sha256": hashlib.sha256(graph_config.encode()).hexdigest(),
+            "execution_provider": execution_provider,
+            "model_type": spec.model_type,
+            "module_type": module_type,
+            "preserve_quantization": preserve_quantization,
+            "registry_import": {
+                "config_key_map": spec.config_key_map,
+                "config_postprocessor": spec.config_postprocessor,
+                "llama_qk_permute": spec.llama_qk_permute,
+                "offset_norm": spec.offset_norm,
+                "required_metadata": spec.required_metadata,
+                "rope_interleave": spec.rope_interleave,
+                "tensor_processor": spec.tensor_processor,
+                "v_head_reorder": spec.v_head_reorder,
+                "vlm_builder": spec.vlm_builder,
+            },
+            "route_schema": 1,
+            "static_cache": static_cache,
+            "task": {
+                "class": f"{type(resolved_task).__module__}.{type(resolved_task).__qualname__}",
+                "state": task_state,
+            },
+            "tensor_map_recipe": spec.tensor_map_recipe,
+        },
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if spec.runtime is Support.SUPPORTED:
+        if not gguf_model.source_matches_path():
+            raise ValueError(
+                "GGUF source changed after the reader opened it; refusing to bind the graph "
+                "to a different artifact identity."
+            )
+        from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+        pkg.gguf_artifact_identity = gguf_artifact_identity(
+            Path(gguf_path),
+            gguf_model,
+            architecture=spec.gguf_arch,
+            filename=logical_source_filename,
+        )
+        if not gguf_model.source_matches_path():
+            raise ValueError(
+                "GGUF source changed while its graph and artifact identity were being built."
+            )
     pkg.gguf_tokenizer_verdict = tokenizer_verdict
 
     return pkg

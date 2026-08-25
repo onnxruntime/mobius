@@ -4511,6 +4511,24 @@ class TestGGUFPreflightGuards:
             revision=commit_hash,
         )
 
+    def test_nested_hub_filename_is_preserved_for_runtime_identity(self):
+        from mobius.integrations.gguf._builder import _logical_source_filename
+
+        assert (
+            _logical_source_filename(
+                "example/model:nested/model.gguf",
+                "/cache/blobs/abcdef",
+            )
+            == "nested/model.gguf"
+        )
+        assert (
+            _logical_source_filename(
+                "example/model",
+                "/cache/models--example--model/snapshots/abc/nested/model.gguf",
+            )
+            == "nested/model.gguf"
+        )
+
     def test_explicit_hub_revision_is_used_for_filename_discovery(self) -> None:
         from mobius.integrations.gguf._builder import _resolve_gguf_path
 

@@ -1551,15 +1551,11 @@ class TestDocumentedSupportMatrix:
         return rows
 
     def test_the_doc_table_matches_the_registry(self) -> None:
-        text = self._DOC.read_text(encoding="utf-8")
-        assert self._BEGIN in text and self._END in text, (
-            f"{self._DOC} is missing the generated support-matrix markers"
-        )
-        block = text.split(self._BEGIN, 1)[1].split(self._END, 1)[0]
-        documented = [line for line in block.splitlines() if line.startswith("| `")]
-        assert documented == self._expected_rows(), (
-            "docs/api/build_from_gguf.md is out of date with the architecture "
-            "registry. Regenerate the support matrix between its markers."
+        from mobius.integrations.gguf._docs import check_document
+
+        assert check_document(), (
+            "docs/api/build_from_gguf.md is out of date; run "
+            "`python scripts/generate_gguf_support_docs.py`."
         )
 
 
