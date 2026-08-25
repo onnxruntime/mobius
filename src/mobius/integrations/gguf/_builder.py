@@ -4947,9 +4947,10 @@ def _load_quantized_state_dict(
             np_shape,
             quantized_stems,
         )
-        if gguf_arch == "kimi-linear" and module_hf_name.endswith(
+        is_kimi_reshaped_projection = gguf_arch == "kimi-linear" and module_hf_name.endswith(
             (".k_b_proj.weight", ".v_b_proj.weight")
-        ):
+        )
+        if is_kimi_reshaped_projection:
             # These tensors are rank-3 in GGUF. They target one flattened
             # projection rather than an expert-major collection.
             affine_targets = []
@@ -4995,6 +4996,13 @@ def _load_quantized_state_dict(
             )
             if explicitly_dequantized and quant_spec.dequantize is Support.SUPPORTED:
                 route = QuantImportRoute.DEQUANTIZE_FLOAT
+            if is_kimi_reshaped_projection and route is QuantImportRoute.NATIVE_BYTES:
+                if quant_spec.dequantize is not Support.SUPPORTED:
+                    raise ValueError(
+                        f"Cannot reshape native {quant_spec.name} tensor {hf_name}: "
+                        "the stored format has no supported dequantization route."
+                    )
+                route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
             if route is QuantImportRoute.REJECTED:
                 raise ValueError(
                     f"Cannot import GGUF tensor {gguf_name} mapped to {hf_name} "
@@ -5199,9 +5207,7 @@ def _load_quantized_state_dict(
                     data_section_offset,
                     tensors_by_name[gguf_name],
                 )
-            elif gguf_arch == "kimi-linear" and hf_name.endswith(
-                (".k_b_proj.weight", ".v_b_proj.weight")
-            ):
+            elif is_kimi_reshaped_projection:
                 values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
                 if hf_name.endswith(".k_b_proj.weight"):
                     values = values.transpose(0, 2, 1).reshape(

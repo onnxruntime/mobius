@@ -60,6 +60,7 @@ class KimiDeltaAttention(nn.Module):
         self._head_dim = config.linear_key_head_dim
         self._projection_size = self._heads * self._head_dim
         kernel = config.linear_conv_kernel_dim
+        self._conv_history = kernel - 1
 
         self.q_proj = linear_class(config.hidden_size, self._projection_size, bias=False)
         self.k_proj = linear_class(config.hidden_size, self._projection_size, bias=False)
@@ -86,9 +87,53 @@ class KimiDeltaAttention(nn.Module):
         convolution: nn.Module,
         hidden_states: ir.Value,
         state: ir.Value,
+        current_mask: ir.Value,
     ):
         projected = op.Transpose(projection(op, hidden_states), perm=[0, 2, 1])
-        value, present = convolution(op, projected, state)
+        value, _ = convolution(op, projected, state)
+
+        # Retain the last valid projected tokens rather than padding positions.
+        # The prior state contributes enough valid entries to keep TopK fixed-width.
+        conv_input = op.Concat(state, projected, axis=2)
+        batch = op.Shape(current_mask, start=0, end=1)
+        past_valid = op.Expand(
+            op.CastLike(1, current_mask),
+            op.Concat(batch, op.Constant(value_ints=[self._conv_history]), axis=0),
+        )
+        valid = op.Concat(past_valid, current_mask, axis=1)
+        positions = op.Range(
+            op.Constant(value_int=0),
+            op.Gather(op.Shape(valid), op.Constant(value_int=1), axis=0),
+            op.Constant(value_int=1),
+        )
+        positions = op.Expand(op.Unsqueeze(positions, [0]), op.Shape(valid))
+        masked_positions = op.Where(
+            op.Cast(valid, to=ir.DataType.BOOL),
+            positions,
+            op.Expand(op.Constant(value_int=-1), op.Shape(valid)),
+        )
+        selected, _ = op.TopK(
+            masked_positions,
+            op.Constant(value_ints=[self._conv_history]),
+            axis=1,
+            largest=1,
+            sorted=1,
+            _outputs=2,
+        )
+        selected = op.Gather(
+            selected,
+            op.Constant(value_ints=list(range(self._conv_history - 1, -1, -1))),
+            axis=1,
+        )
+        selected = op.Expand(
+            op.Unsqueeze(selected, [1]),
+            op.Concat(
+                op.Shape(projected, start=0, end=2),
+                op.Constant(value_ints=[self._conv_history]),
+                axis=0,
+            ),
+        )
+        present = op.GatherElements(conv_input, selected, axis=2)
         return op.Transpose(value, perm=[0, 2, 1]), present
 
     def forward(
@@ -108,17 +153,32 @@ class KimiDeltaAttention(nn.Module):
             op.Constant(value_ints=[9223372036854775807]),
             op.Constant(value_ints=[1]),
         )
-        current_mask = op.Unsqueeze(op.CastLike(current_mask, hidden_states), [-1])
-        masked_hidden_states = op.Mul(hidden_states, current_mask)
+        current_mask_3d = op.Unsqueeze(op.CastLike(current_mask, hidden_states), [-1])
+        masked_hidden_states = op.Mul(hidden_states, current_mask_3d)
 
         q, present_q = self._project_conv(
-            op, self.q_proj, self.q_conv1d, masked_hidden_states, q_conv_state
+            op,
+            self.q_proj,
+            self.q_conv1d,
+            masked_hidden_states,
+            q_conv_state,
+            current_mask,
         )
         k, present_k = self._project_conv(
-            op, self.k_proj, self.k_conv1d, masked_hidden_states, k_conv_state
+            op,
+            self.k_proj,
+            self.k_conv1d,
+            masked_hidden_states,
+            k_conv_state,
+            current_mask,
         )
         v, present_v = self._project_conv(
-            op, self.v_proj, self.v_conv1d, masked_hidden_states, v_conv_state
+            op,
+            self.v_proj,
+            self.v_conv1d,
+            masked_hidden_states,
+            v_conv_state,
+            current_mask,
         )
 
         shape = [0, 0, self._heads, self._head_dim]
@@ -142,11 +202,9 @@ class KimiDeltaAttention(nn.Module):
         a = op.Neg(op.Exp(op.Cast(self.A_log, to=ir.DataType.FLOAT)))
         decay = op.Reshape(decay, [0, 0, self._heads, self._head_dim])
         decay = op.Reshape(op.Mul(decay, a), [0, 0, self._projection_size])
-        decay = op.Mul(decay, current_mask)
-        beta = op.Sigmoid(
-            op.Cast(self.b_proj(op, masked_hidden_states), to=ir.DataType.FLOAT)
-        )
-        beta = op.Mul(beta, current_mask)
+        decay = op.Mul(decay, current_mask_3d)
+        beta = op.Sigmoid(op.Cast(self.b_proj(op, masked_hidden_states), to=ir.DataType.FLOAT))
+        beta = op.Mul(beta, current_mask_3d)
 
         output, present_recurrent = op.LinearAttention(
             q,
@@ -170,7 +228,7 @@ class KimiDeltaAttention(nn.Module):
             op.Reshape(output, [0, 0, self._projection_size]),
             hidden_states,
         )
-        output = op.Mul(output, current_mask)
+        output = op.Mul(output, current_mask_3d)
         output = self.o_proj(op, output)
         return output, (present_q, present_k, present_v, present_recurrent)
 
@@ -187,21 +245,15 @@ class KimiMLAAttention(nn.Module):
         self._qk_dim = self._nope + self._extra
         self._value_dim = config.v_head_dim
         self._kv_rank = config.kv_lora_rank
-        self.q_proj = linear_class(
-            config.hidden_size, self._heads * self._qk_dim, bias=False
-        )
+        self.q_proj = linear_class(config.hidden_size, self._heads * self._qk_dim, bias=False)
         self.kv_a_proj_with_mqa = linear_class(
             config.hidden_size, self._kv_rank + self._extra, bias=False
         )
         self.kv_a_layernorm = RMSNorm(self._kv_rank, eps=config.rms_norm_eps)
         # llama.cpp serializes these as separate MatMul roles. Keeping them
         # separate preserves quantized GGUF weights without a lossy fuse/split.
-        self.k_b_proj = linear_class(
-            self._kv_rank, self._heads * self._nope, bias=False
-        )
-        self.v_b_proj = linear_class(
-            self._kv_rank, self._heads * self._value_dim, bias=False
-        )
+        self.k_b_proj = linear_class(self._kv_rank, self._heads * self._nope, bias=False)
+        self.v_b_proj = linear_class(self._kv_rank, self._heads * self._value_dim, bias=False)
         self.o_proj = linear_class(
             self._heads * self._value_dim, config.hidden_size, bias=False
         )
@@ -213,9 +265,7 @@ class KimiMLAAttention(nn.Module):
         attention_bias: ir.Value,
         past_key_value: tuple[ir.Value, ir.Value],
     ):
-        query = op.Reshape(
-            self.q_proj(op, hidden_states), [0, 0, self._heads, self._qk_dim]
-        )
+        query = op.Reshape(self.q_proj(op, hidden_states), [0, 0, self._heads, self._qk_dim])
         compressed, key_extra = op.Split(
             self.kv_a_proj_with_mqa(op, hidden_states),
             [self._kv_rank, self._extra],
@@ -223,12 +273,8 @@ class KimiMLAAttention(nn.Module):
             _outputs=2,
         )
         compressed = self.kv_a_layernorm(op, compressed)
-        key_nope = op.Reshape(
-            self.k_b_proj(op, compressed), [0, 0, self._heads, self._nope]
-        )
-        value = op.Reshape(
-            self.v_b_proj(op, compressed), [0, 0, self._heads, self._value_dim]
-        )
+        key_nope = op.Reshape(self.k_b_proj(op, compressed), [0, 0, self._heads, self._nope])
+        value = op.Reshape(self.v_b_proj(op, compressed), [0, 0, self._heads, self._value_dim])
         key_extra = op.Expand(
             op.Reshape(key_extra, [0, 0, 1, self._extra]),
             [1, 1, self._heads, 1],

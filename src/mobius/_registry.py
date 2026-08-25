@@ -1076,6 +1076,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "dbrx": "databricks/dbrx-instruct",
     "arctic": "Snowflake/snowflake-arctic-instruct",
     "jetmoe": "jetmoe/jetmoe-8b",
+    "kimi_linear": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
     "longcat_flash": "yujiepan/longcat-flash-tiny-random",
     "minimax": "MiniMaxAI/MiniMax-Text-01",
     "ernie4_5_moe": "baidu/ERNIE-4.5-21B-A3B-PT",

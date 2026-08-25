@@ -48,9 +48,7 @@ def test_preprocess_splits_fused_mla_kv_b_in_head_major_order() -> None:
     model = KimiLinearCausalLMModel(_config())
     fused = torch.arange(2 * (8 + 6) * 8, dtype=torch.float32).reshape(28, 8)
 
-    result = model.preprocess_weights(
-        {"model.layers.1.self_attn.kv_b_proj.weight": fused}
-    )
+    result = model.preprocess_weights({"model.layers.1.self_attn.kv_b_proj.weight": fused})
 
     expected = fused.reshape(2, 14, 8)
     torch.testing.assert_close(
@@ -71,10 +69,7 @@ def test_preprocess_aligns_routed_expert_names() -> None:
         {"model.layers.1.block_sparse_moe.experts.0.w1.weight": weight}
     )
 
-    assert (
-        "model.layers.1.block_sparse_moe.moe.experts.0.gate_proj.weight"
-        in result
-    )
+    assert "model.layers.1.block_sparse_moe.moe.experts.0.gate_proj.weight" in result
 
 
 def test_top_one_router_keeps_the_unbiased_sigmoid_weight() -> None:

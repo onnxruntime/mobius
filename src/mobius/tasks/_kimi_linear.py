@@ -24,16 +24,12 @@ class KimiLinearCausalLMTask(ModelTask):
                 "three convolution histories and one FP32 recurrent matrix state"
             )
 
-    def build(
-        self, module: nn.Module, config: ArchitectureConfig
-    ) -> ModelPackage:
+    def build(self, module: nn.Module, config: ArchitectureConfig) -> ModelPackage:
         batch = ir.SymbolicDim("batch")
         seq_len = ir.SymbolicDim("sequence_len")
         past_len = ir.SymbolicDim("past_sequence_len")
         graph, builder = _make_graph()
-        input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len]
-        )
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
         attention_mask = builder.input(
             "attention_mask",
             dtype=ir.DataType.INT64,

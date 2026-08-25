@@ -1406,6 +1406,7 @@ def _write_kimi_linear_gguf(
     path: Path,
     *,
     quantized: bool,
+    native_quantized: bool = False,
     omit: str | None = None,
     extra: str | None = None,
     malformed_shape: str | None = None,
@@ -1471,26 +1472,28 @@ def _write_kimi_linear_gguf(
             values.fill(1.0)
         writer.add_tensor(name, values)
 
-    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+    def add_quantized(name: str, shape: tuple[int, ...]) -> None:
         if name == omit:
             return
         shape = shape_for(name, shape)
         assert shape[-1] % 32 == 0
         raw = np.zeros((*shape[:-1], shape[-1] // 32 * 18), dtype=np.uint8)
-        for index in np.ndindex(shape[:-1]):
-            for block in range(shape[-1] // 32):
-                offset = block * 18
-                raw[(*index, slice(offset, offset + 2))] = np.array(
-                    [rng.uniform(0.01, 0.05)], dtype=np.float16
-                ).view(np.uint8)
-                raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
-                    0, 256, 16, dtype=np.uint8
-                )
-        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+        qtype = GGMLQuantizationType.IQ4_NL if native_quantized else GGMLQuantizationType.Q4_0
+        if not native_quantized:
+            for index in np.ndindex(shape[:-1]):
+                for block in range(shape[-1] // 32):
+                    offset = block * 18
+                    raw[(*index, slice(offset, offset + 2))] = np.array(
+                        [rng.uniform(0.01, 0.05)], dtype=np.float16
+                    ).view(np.uint8)
+                    raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
+                        0, 256, 16, dtype=np.uint8
+                    )
+        writer.add_tensor(name, raw, raw_dtype=qtype)
 
     add_float("token_embd.weight", (vocab, hidden))
     add_float("output_norm.weight", (hidden,))
-    projection = add_q4 if quantized else add_float
+    projection = add_quantized if quantized else add_float
     projection("output.weight", (vocab, hidden))
     projection_width = heads * kda_dim
 
@@ -5915,6 +5918,22 @@ class TestKimiLinearGGUFBuild:
             for name in quantized_inputs
         )
 
+    def test_native_quantized_mla_projections_requantize_after_reshape(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-iq4-nl.gguf"
+        _write_kimi_linear_gguf(path, quantized=True, native_quantized=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        quantized_inputs = {
+            node.inputs[1].name
+            for node in model.graph
+            if node.op_type == "MatMulNBits" and len(node.inputs) > 1
+        }
+        assert any(name.endswith("k_b_proj.weight") for name in quantized_inputs)
+        assert any(name.endswith("v_b_proj.weight") for name in quantized_inputs)
+
     def test_left_padding_does_not_change_valid_logits_or_states(self, tmp_path: Path) -> None:
         from mobius._testing.ort_inference import OnnxModelSession
         from mobius.integrations.gguf import build_from_gguf
@@ -5940,6 +5959,59 @@ class TestKimiLinearGGUFBuild:
                 if name.endswith((".key", ".value")):
                     actual = actual[:, :, -expected.shape[2] :]
                 np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        finally:
+            session.close()
+
+    def test_right_padding_preserves_state_for_cached_decode(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-right-padding.gguf"
+        _write_kimi_linear_gguf(path, quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        try:
+            unpadded = session.run(self._inputs(np.asarray([[7, 8]], np.int64)))
+            padded = session.run(
+                self._inputs(
+                    np.asarray([[7, 8, 0, 0]], np.int64),
+                    attention_mask=np.asarray([[1, 1, 0, 0]], np.int64),
+                )
+            )
+            for suffix in (
+                "q_conv_state",
+                "k_conv_state",
+                "v_conv_state",
+                "recurrent_state",
+            ):
+                np.testing.assert_allclose(
+                    padded[f"present.0.{suffix}"],
+                    unpadded[f"present.0.{suffix}"],
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+
+            unpadded_states = {
+                name.replace("present.", "past_key_values."): value
+                for name, value in unpadded.items()
+                if name.startswith("present.")
+            }
+            padded_states = {
+                name.replace("present.", "past_key_values."): value
+                for name, value in padded.items()
+                if name.startswith("present.")
+            }
+            token = np.asarray([[9]], np.int64)
+            expected = session.run(self._inputs(token, unpadded_states))
+            actual = session.run(
+                self._inputs(
+                    token,
+                    padded_states,
+                    attention_mask=np.asarray([[1, 1, 0, 0, 1]], np.int64),
+                )
+            )
+            np.testing.assert_allclose(
+                actual["logits"], expected["logits"], rtol=1e-5, atol=1e-5
+            )
         finally:
             session.close()
 

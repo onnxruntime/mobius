@@ -163,6 +163,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "granitemoe",
         "hunyuan-dense",
         "jamba",
+        "kimi-linear",
         "lfm2",
         "llada",
         "llada-moe",

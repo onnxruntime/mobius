@@ -9,7 +9,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, KimiLinearConfig
 from mobius.components import (
     Embedding,
     KimiDeltaAttention,
@@ -37,12 +37,8 @@ class _KimiExpertMLP(nn.Module):
     def __init__(self, config: ArchitectureConfig, linear_class: type | None = None):
         super().__init__()
         linear_class = linear_class or Linear
-        self.gate_proj = linear_class(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.down_proj = linear_class(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
+        self.gate_proj = linear_class(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = linear_class(config.intermediate_size, config.hidden_size, bias=False)
         self.up_proj = linear_class(config.hidden_size, config.intermediate_size, bias=False)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
@@ -66,14 +62,10 @@ class _KimiSparseMoeBlock(nn.Module):
             expert_factory=lambda cfg, lc: _KimiExpertMLP(cfg, lc),
         )
         shared_size = config.moe_intermediate_size * config.n_shared_experts
-        self.shared_experts = _SharedExpertMLP(
-            config, shared_size, linear_class=linear_class
-        )
+        self.shared_experts = _SharedExpertMLP(config, shared_size, linear_class=linear_class)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        return op.Add(
-            self.moe(op, hidden_states), self.shared_experts(op, hidden_states)
-        )
+        return op.Add(self.moe(op, hidden_states), self.shared_experts(op, hidden_states))
 
 
 class KimiLinearDecoderLayer(nn.Module):
@@ -93,9 +85,7 @@ class KimiLinearDecoderLayer(nn.Module):
             self.block_sparse_moe = None
             self.mlp = _KimiExpertMLP(config, linear_class)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -167,7 +157,7 @@ class KimiLinearCausalLMModel(CausalLMModel):
     """Dedicated Kimi Linear KDA/NoPE-MLA/MoE decoder."""
 
     default_task = "kimi-linear-text-generation"
-    config_class: type
+    config_class = KimiLinearConfig
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
@@ -198,9 +188,7 @@ class KimiLinearCausalLMModel(CausalLMModel):
                 )
                 continue
             new_key = key
-            new_key = new_key.replace(
-                ".block_sparse_moe.gate.", ".block_sparse_moe.moe.gate."
-            )
+            new_key = new_key.replace(".block_sparse_moe.gate.", ".block_sparse_moe.moe.gate.")
             new_key = new_key.replace(
                 ".block_sparse_moe.experts.",
                 ".block_sparse_moe.moe.experts.",
