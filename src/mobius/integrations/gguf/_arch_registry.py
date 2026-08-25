@@ -1164,11 +1164,43 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="kimi-linear",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="kimi_linear",
+        config_key_map="kimi_linear",
+        config_postprocessor="kimi_linear",
+        tensor_map_recipe=("kimi_linear",),
+        tensor_processor="kimi_linear",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "attention.key_length_mla",
+            "attention.value_length_mla",
+            "attention.kv_lora_rank",
+            "rope.dimension_count",
+            "ssm.conv_kernel",
+            "kda.head_dim",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+            "leading_dense_block_count",
+            "expert_weights_scale",
+            "expert_gating_func",
+        ),
         runtime=Support.DEFERRED,
-        reason=_KIMI_LINEAR_GRAPH_REASON,
+        reason=(
+            "The exact KDA/NoPE-MLA schedule, four-state recurrent ABI, dense/MoE "
+            "topology, correction-bias routing, pinned metadata, tensor closure, and "
+            "compatible MatMul/expert quantization are supported. Released generic ORT "
+            "GenAI cache schemas cannot "
+            "represent heterogeneous KV plus three convolution histories and a matrix "
+            "state, and representative real-weight GGUF evidence is pending; package "
+            "runtime remains tracked by onnxruntime/mobius#605."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="lfm2moe",

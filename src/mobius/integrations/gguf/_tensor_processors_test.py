@@ -15,6 +15,52 @@ from mobius.integrations.gguf._tensor_processors import (
 )
 
 
+class TestProcessTensorsKimiLinear:
+    def test_inverts_decay_conv_and_mla_split_layouts(self) -> None:
+        heads, rank, nope, value_dim, channels, kernel = 2, 3, 4, 5, 6, 3
+        decay_log = torch.arange(heads, dtype=torch.float32).reshape(1, 1, heads, 1)
+        conv = torch.arange(channels * kernel, dtype=torch.float32).reshape(
+            1, channels, 1, kernel
+        )
+        key_hf = torch.arange(heads * nope * rank, dtype=torch.float32).reshape(
+            heads, nope, rank
+        )
+        value_hf = torch.arange(heads * value_dim * rank, dtype=torch.float32).reshape(
+            heads, value_dim, rank
+        )
+        state = {
+            "model.layers.0.self_attn.A_log": -torch.exp(decay_log),
+            "model.layers.0.self_attn.q_conv1d.weight": conv,
+            "model.layers.1.self_attn.k_b_proj.weight": key_hf.transpose(1, 2),
+            "model.layers.1.self_attn.v_b_proj.weight": value_hf,
+        }
+        config = SimpleNamespace(model_type="kimi_linear", _gguf_arch="kimi-linear")
+
+        result = process_tensors(state, config)
+
+        torch.testing.assert_close(result["model.layers.0.self_attn.A_log"], decay_log)
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_conv1d.weight"],
+            conv.reshape(channels, kernel),
+        )
+        torch.testing.assert_close(
+            result["model.layers.1.self_attn.k_b_proj.weight"],
+            key_hf.reshape(heads * nope, rank),
+        )
+        torch.testing.assert_close(
+            result["model.layers.1.self_attn.v_b_proj.weight"],
+            value_hf.reshape(heads * value_dim, rank),
+        )
+
+    def test_rejects_non_negative_decay(self) -> None:
+        config = SimpleNamespace(model_type="kimi_linear", _gguf_arch="kimi-linear")
+        with pytest.raises(ValueError, match="finite negative"):
+            process_tensors(
+                {"model.layers.0.self_attn.A_log": torch.tensor([0.0])},
+                config,
+            )
+
+
 class TestProcessTensorsLlama:
     """Tests for Llama/Mistral Q/K reverse permutation."""
 

@@ -13,6 +13,46 @@ from mobius.integrations.gguf._tensor_mapping import (
 )
 
 
+@pytest.mark.parametrize(
+    ("gguf_name", "hf_name"),
+    [
+        (
+            "blk.0.ssm_conv1d_q.weight",
+            "model.layers.0.self_attn.q_conv1d.weight",
+        ),
+        ("blk.0.ssm_a", "model.layers.0.self_attn.A_log"),
+        ("blk.0.ssm_dt.bias", "model.layers.0.self_attn.dt_bias"),
+        (
+            "blk.1.attn_k_b.weight",
+            "model.layers.1.self_attn.k_b_proj.weight",
+        ),
+        (
+            "blk.1.ffn_gate_exps.weight",
+            "model.layers.1.block_sparse_moe.moe.experts.gate_proj.weight",
+        ),
+        (
+            "blk.1.exp_probs_b.bias",
+            "model.layers.1.block_sparse_moe.moe.gate.e_score_correction_bias",
+        ),
+    ],
+)
+def test_kimi_linear_exact_tensor_mapping(gguf_name: str, hf_name: str) -> None:
+    assert map_gguf_to_hf_names(gguf_name, "kimi-linear") == hf_name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "blk.0.ssm_a.weight",
+        "blk.0.ssm_conv1d_q.input_scale",
+        "blk.1.exp_probs_b.weight",
+        "blk.1.attn_kv_b.weight",
+    ],
+)
+def test_kimi_linear_rejects_wrong_or_legacy_suffixes(name: str) -> None:
+    assert map_gguf_to_hf_names(name, "kimi-linear") is None
+
+
 class TestMapGGUFToHFNames:
     """Tests for map_gguf_to_hf_names()."""
 

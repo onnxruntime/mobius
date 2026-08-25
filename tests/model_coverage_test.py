@@ -158,6 +158,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
     "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
+    "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
+    "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
+    "real-weight L4/L5 parity remains pending.",
     "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
     "and GGUF integration tests; generic encoder tests require token_type_ids",
     # --- Internal / duplicate aliases ---
