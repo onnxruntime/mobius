@@ -25,11 +25,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 from mobius.integrations.gguf._arch_registry import get_arch_spec
-from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import (
     gguf_graph_package_identity,
     matching_runtime_evidence,
 )
+from mobius.integrations.gguf._shard_set import open_gguf_model
 from mobius.integrations.gguf._spec import Support
 from mobius.integrations.gguf._tokenizer import (
     GGUFTokenizerAsset,
@@ -197,7 +197,12 @@ def write_gguf_runtime_package(
         )
 
     source_path = Path(getattr(pkg, "gguf_source_path", gguf_path))
-    source_model = GGUFModel(source_path)
+    source_model = open_gguf_model(source_path)
+    if not source_model.source_matches_path():
+        raise ValueError(
+            "The GGUF source changed while the canonical reader was opening it; "
+            "refusing runtime publication."
+        )
     source_architecture = get_arch_spec(source_model.architecture).gguf_arch
     if source_architecture != architecture:
         raise ValueError(
@@ -217,6 +222,11 @@ def write_gguf_runtime_package(
         tokenizer_repository=tokenizer_repository,
         tokenizer_revision=tokenizer_revision,
     )
+    if not source_model.source_matches_path():
+        raise ValueError(
+            "The GGUF source changed while runtime evidence was being matched; "
+            "refusing runtime publication."
+        )
     source_metadata = source_model.metadata
     verdict = inspect_gguf_tokenizer(
         source_metadata,
