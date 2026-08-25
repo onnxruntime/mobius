@@ -203,9 +203,9 @@ class QwenVLTask(VisionLanguageTask):
     ) -> ir.Model:
         """Build Qwen VL vision encoder with packed patches and grid_thw.
 
-        When ``deepstack_visual_indexes`` is set (Qwen3-VL family), the vision
-        encoder emits an extra ``deepstack_features`` output stacking the
-        intermediate DeepStack maps: ``[D, num_merged_patches, out_hidden]``.
+        When ``deepstack_visual_indexes`` is set (Qwen3-VL family), the final
+        and intermediate maps are packed into the single ``image_features``
+        output as ``[num_merged_patches, (D + 1) * out_hidden]``.
         """
         total_patches = ir.SymbolicDim("total_patches")
         num_images = ir.SymbolicDim("num_images")
@@ -236,8 +236,13 @@ class QwenVLTask(VisionLanguageTask):
 
         if isinstance(outputs, tuple):
             image_features, deepstack_features = outputs
-            builder.add_output(image_features, "image_features")
-            builder.add_output(deepstack_features, "deepstack_features")
+            num_deepstack = len(config.deepstack_visual_indexes or [])
+            deepstack_flat = op.Reshape(
+                op.Transpose(deepstack_features, perm=[1, 0, 2]),
+                op.Constant(value_ints=[0, num_deepstack * config.hidden_size]),
+            )
+            packed_features = op.Concat(image_features, deepstack_flat, axis=1)
+            builder.add_output(packed_features, "image_features")
         else:
             builder.add_output(outputs, "image_features")
         return _make_model(graph)

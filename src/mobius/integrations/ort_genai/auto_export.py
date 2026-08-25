@@ -242,11 +242,6 @@ _QWEN35_VL_MODEL_TYPES = frozenset(
         "qwen3_5_moe_vl",
     }
 )
-_QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS = {
-    "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
-    "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
-    "nv_profile_max_shapes": "input_ids:1x1024,image_features:2520x1024",
-}
 _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS = {
     "nv_profile_min_shapes": "pixel_values:600x1536",
     "nv_profile_opt_shapes": "pixel_values:600x1536",
@@ -573,6 +568,31 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     if model is None:
         return None
     return {out.name: out.name for out in model.graph.outputs if out.name is not None}
+
+
+def _qwen35_trt_rtx_embedding_provider_options(pkg: ModelPackage) -> dict[str, str]:
+    embedding = pkg.get("embedding")
+    if embedding is None:
+        raise ValueError("Qwen3.5 TRT-RTX export requires an embedding component.")
+    image_features = next(
+        (value for value in embedding.graph.inputs if value.name == "image_features"),
+        None,
+    )
+    if (
+        image_features is None
+        or image_features.shape is None
+        or not isinstance(image_features.shape[-1], int)
+    ):
+        raise ValueError(
+            "Qwen3.5 TRT-RTX export requires a static image_features width "
+            "to generate optimization profiles."
+        )
+    width = image_features.shape[-1]
+    return {
+        "nv_profile_min_shapes": f"input_ids:1x1,image_features:0x{width}",
+        "nv_profile_opt_shapes": f"input_ids:1x226,image_features:192x{width}",
+        "nv_profile_max_shapes": f"input_ids:1x1024,image_features:2520x{width}",
+    }
 
 
 def _copy_tokenizer_files(
@@ -1647,7 +1667,7 @@ def _write_genai_config(
                     )
                 if ep == "trt-rtx" and model_type in _QWEN35_VL_MODEL_TYPES:
                     vision_kwargs["embedding_provider_options"] = (
-                        _QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS
+                        _qwen35_trt_rtx_embedding_provider_options(pkg)
                     )
                     vision_kwargs["vision_provider_options"] = (
                         _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS
@@ -1655,10 +1675,9 @@ def _write_genai_config(
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
-            # Introspect vision outputs so extra maps (e.g. Qwen3-VL
-            # ``deepstack_features``) are forwarded to the embedding model
-            # via genai_config.json; defaulting to ``image_features`` alone
-            # would silently drop DeepStack at runtime.
+            # Introspect runtime-semantic vision outputs from the ONNX graph.
+            # Model-specific auxiliary features must be packed into a supported
+            # output by the task rather than emitted as arbitrary config keys.
             vision_output_mapping = _introspect_outputs(pkg, "vision_encoder")
             if vision_output_mapping is not None:
                 vision_kwargs["output_names"] = vision_output_mapping

@@ -1333,9 +1333,22 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "decoder": _mock_model(),
-                "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
+                "decoder": _mock_model(
+                    inputs=[
+                        "inputs_embeds",
+                        "attention_mask",
+                        "position_ids",
+                        "per_layer_inputs",
+                    ]
+                ),
+                "vision_encoder": _mock_model(
+                    inputs=["pixel_values", "image_grid_thw"],
+                    outputs=["image_features"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "image_features"],
+                    outputs=["inputs_embeds", "per_layer_inputs"],
+                ),
             },
             config=FakeConfig(),
         )
@@ -1351,6 +1364,10 @@ class TestExportForOrtGenai:
         assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
+        assert model["decoder"]["inputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert model["embedding"]["outputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert model["vision"]["outputs"] == {"image_features": "image_features"}
+        assert "deepstack" not in json.dumps(data)
 
     def test_qwen35_vl_uses_native_qwen35_runtime_type(self, tmp_path):
         import dataclasses
@@ -1381,11 +1398,16 @@ class TestExportForOrtGenai:
             temporal_patch_size: int = 2
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
+        embedding = _mock_model(
+            inputs=["input_ids", "image_features"],
+            outputs=["inputs_embeds", "per_layer_inputs"],
+        )
+        embedding.graph.inputs[1].shape = ir.Shape(["num_tokens", 4096])
         pkg = ModelPackage(
             {
                 "decoder": _mock_model(),
                 "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
+                "embedding": embedding,
             },
             config=FakeConfig(),
         )
@@ -1424,19 +1446,19 @@ class TestExportForOrtGenai:
             model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "nv_profile_min_shapes"
             ]
-            == "input_ids:1x1,image_features:0x1024"
+            == "input_ids:1x1,image_features:0x4096"
         )
         assert (
             model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "nv_profile_opt_shapes"
             ]
-            == "input_ids:1x226,image_features:192x1024"
+            == "input_ids:1x226,image_features:192x4096"
         )
         assert (
             model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "nv_profile_max_shapes"
             ]
-            == "input_ids:1x1024,image_features:2520x1024"
+            == "input_ids:1x1024,image_features:2520x4096"
         )
         assert (
             model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
@@ -3335,25 +3357,19 @@ class TestGraphInputNames:
 
 
 class TestIntrospectVisionOutputs:
-    """_introspect_outputs surfaces extra vision outputs (DeepStack)."""
+    """_introspect_outputs surfaces graph outputs."""
 
-    def test_vision_deepstack_output_is_surfaced(self):
-        """A Qwen3-VL vision encoder's deepstack_features output is mapped."""
+    def test_vision_image_output_is_surfaced(self):
         from mobius._model_package import ModelPackage
 
         pkg = ModelPackage(
             {
-                "vision_encoder": _mock_model_with_outputs(
-                    ["image_features", "deepstack_features"]
-                ),
+                "vision_encoder": _mock_model_with_outputs(["image_features"]),
             },
             config=mock.MagicMock(),
         )
         mapping = _introspect_outputs(pkg, "vision_encoder")
-        assert mapping == {
-            "image_features": "image_features",
-            "deepstack_features": "deepstack_features",
-        }
+        assert mapping == {"image_features": "image_features"}
 
     def test_missing_key_returns_none(self):
         from mobius._model_package import ModelPackage
