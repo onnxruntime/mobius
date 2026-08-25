@@ -84,6 +84,14 @@ def test_kimi_linear_config_uses_top_level_head_count_when_nested_value_is_absen
     assert extracted.linear_num_key_heads == config.num_attention_heads
 
 
+def test_kimi_linear_config_rejects_empty_convolution_history() -> None:
+    config = _kimi_linear_hf_config()
+    config.linear_attn_config["short_conv_kernel_size"] = 1
+
+    with pytest.raises(ValueError, match="at least 2"):
+        KimiLinearConfig.from_transformers(config)
+
+
 @pytest.mark.parametrize(
     ("override", "match"),
     [

@@ -814,6 +814,7 @@ def _raise_for_invalid_kimi_linear_tensor_contract(gguf_model) -> None:
             expert_intermediate,
         )
         <= 0
+        or conv < 2
         or qk_dim <= extra_dim
         or top_k > experts
         or shared != 1
@@ -1047,6 +1048,7 @@ def _raise_for_invalid_kimi_k3_tensor_contract(gguf_model) -> None:
             attn_res_block,
         )
         <= 0
+        or conv < 2
         or qk_dim <= extra_dim
         or top_k > experts
         or dense_layers != 1
@@ -5410,9 +5412,7 @@ def _load_quantized_state_dict(
         is_kimi_reshaped_projection = gguf_arch in {
             "kimi-linear",
             "kimi-k3",
-        } and module_hf_name.endswith(
-            (".k_b_proj.weight", ".v_b_proj.weight")
-        )
+        } and module_hf_name.endswith((".k_b_proj.weight", ".v_b_proj.weight"))
         if is_kimi_reshaped_projection:
             # These tensors are rank-3 in GGUF. They target one flattened
             # projection rather than an expert-major collection.

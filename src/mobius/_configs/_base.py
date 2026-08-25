@@ -1559,8 +1559,11 @@ class KimiLinearConfig(CausalLMConfig):
 
         num_heads = int(vars(linear).get("num_heads", base.num_attention_heads))
         head_dim = int(linear.head_dim)
+        conv_kernel = int(linear.short_conv_kernel_size)
         if num_heads != base.num_attention_heads:
             raise ValueError("Kimi Linear KDA and MLA head counts must match")
+        if conv_kernel < 2:
+            raise ValueError("Kimi Linear short_conv_kernel_size must be at least 2")
         fields = _shallow_fields(base)
         fields.update(
             model_type="kimi_linear",
@@ -1572,7 +1575,7 @@ class KimiLinearConfig(CausalLMConfig):
             linear_num_value_heads=num_heads,
             linear_key_head_dim=head_dim,
             linear_value_head_dim=head_dim,
-            linear_conv_kernel_dim=int(linear.short_conv_kernel_size),
+            linear_conv_kernel_dim=conv_kernel,
             num_local_experts=int(config.num_experts),
             num_experts_per_tok=int(config.num_experts_per_token),
             n_group=n_group,
@@ -1676,8 +1679,11 @@ class KimiK3Config(CausalLMConfig):
             raise ValueError("Kimi-K3 requires a positive attn_res_block_size")
 
         num_heads = int(vars(linear).get("num_heads", base.num_attention_heads))
+        conv_kernel = int(linear.short_conv_kernel_size)
         if num_heads != base.num_attention_heads:
             raise ValueError("Kimi-K3 KDA and MLA head counts must match")
+        if conv_kernel < 2:
+            raise ValueError("Kimi-K3 short_conv_kernel_size must be at least 2")
         fields = _shallow_fields(base)
         fields.update(
             model_type="kimi_k3",
@@ -1689,7 +1695,7 @@ class KimiK3Config(CausalLMConfig):
             linear_num_value_heads=num_heads,
             linear_key_head_dim=int(linear.head_dim),
             linear_value_head_dim=int(linear.head_dim),
-            linear_conv_kernel_dim=int(linear.short_conv_kernel_size),
+            linear_conv_kernel_dim=conv_kernel,
             linear_gate_lower_bound=-raw_lower_bound,
             linear_use_full_rank_gate=True,
             mla_use_output_gate=True,

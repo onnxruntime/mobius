@@ -24,6 +24,7 @@ def _write_kimi_k3_gguf(
     shared: int = 2,
     fused_kv_b: bool = False,
     omit_metadata: str | None = None,
+    conv: int = 4,
 ) -> dict[str, np.ndarray]:
     from gguf import GGMLQuantizationType, GGUFWriter
 
@@ -39,7 +40,6 @@ def _write_kimi_k3_gguf(
     value_dim = 32
     q_rank = 32
     kv_rank = 32
-    conv = 4
     experts = 2
     rng = np.random.default_rng(623)
     tensors: dict[str, np.ndarray] = {}
@@ -240,9 +240,7 @@ def _kimi_k3_reference(
     def rms(x: np.ndarray, name: str, eps: float = 1e-5) -> np.ndarray:
         return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * tensors[name]
 
-    def situ(
-        x: np.ndarray, gate_name: str, up_name: str, down_name: str
-    ) -> np.ndarray:
+    def situ(x: np.ndarray, gate_name: str, up_name: str, down_name: str) -> np.ndarray:
         gate = linear(x, gate_name)
         up = linear(x, up_name)
         activated = 4.0 * np.tanh(gate / 4.0) * sigmoid(gate)
@@ -251,9 +249,7 @@ def _kimi_k3_reference(
 
     def mix(prefix: np.ndarray, bank: list[np.ndarray], name: str) -> np.ndarray:
         values = np.stack([*bank, prefix], axis=2)
-        normalized = values / np.sqrt(
-            np.mean(values * values, axis=-1, keepdims=True) + 1e-5
-        )
+        normalized = values / np.sqrt(np.mean(values * values, axis=-1, keepdims=True) + 1e-5)
         scores = normalized @ tensors[name][:, None]
         scores = scores[..., 0]
         probabilities = np.exp(scores - np.max(scores, axis=-1, keepdims=True))
@@ -282,9 +278,10 @@ def _kimi_k3_reference(
     k = k.reshape(1, 2, 2, 32)
     q /= np.sqrt(np.sum(q * q, axis=-1, keepdims=True) + 1e-6)
     k /= np.sqrt(np.sum(k * k, axis=-1, keepdims=True) + 1e-6)
-    z = linear(
-        linear(normed, "blk.0.ssm_f_a.weight"), "blk.0.ssm_f_b.weight"
-    ) + tensors["blk.0.ssm_dt.bias"]
+    z = (
+        linear(linear(normed, "blk.0.ssm_f_a.weight"), "blk.0.ssm_f_b.weight")
+        + tensors["blk.0.ssm_dt.bias"]
+    )
     decay = -5.0 * sigmoid(
         (-tensors["blk.0.ssm_a"])[None, None, :, None] * z.reshape(1, 2, 2, 32)
     )
@@ -294,9 +291,7 @@ def _kimi_k3_reference(
     for token in range(2):
         state *= np.exp(decay[:, token, :, :, None])
         retrieval = np.einsum("bhd,bhdv->bhv", k[:, token], state)
-        delta = (v.reshape(1, 2, 2, 32)[:, token] - retrieval) * beta[
-            :, token, :, None
-        ]
+        delta = (v.reshape(1, 2, 2, 32)[:, token] - retrieval) * beta[:, token, :, None]
         state += np.einsum("bhd,bhv->bhdv", k[:, token], delta)
         recurrent_output[:, token] = np.einsum(
             "bhd,bhdv->bhv", q[:, token] * (32**-0.5), state
@@ -308,9 +303,7 @@ def _kimi_k3_reference(
         * tensors["blk.0.ssm_norm.weight"]
         * sigmoid(gate)
     )
-    attention = linear(
-        recurrent_output.reshape(1, 2, 64), "blk.0.attn_output.weight"
-    )
+    attention = linear(recurrent_output.reshape(1, 2, 64), "blk.0.attn_output.weight")
     mixed = mix(attention, [initial_embedding], "blk.0.ffn_res_score.weight")
     dense_input = rms(mixed, "blk.0.ffn_norm.weight")
     hidden = attention + situ(
@@ -354,9 +347,7 @@ def _kimi_k3_reference(
     moe_input = rms(mixed, "blk.1.ffn_norm.weight")
     latent = linear(moe_input, "blk.1.ffn_routed_down.weight")
     router_scores = sigmoid(linear(moe_input, "blk.1.ffn_gate_inp.weight"))
-    selected = np.argmax(
-        router_scores + tensors["blk.1.exp_probs_b.bias"], axis=-1
-    )
+    selected = np.argmax(router_scores + tensors["blk.1.exp_probs_b.bias"], axis=-1)
     routed = np.empty_like(latent)
     for expert in range(2):
         expert_output = situ(
@@ -389,29 +380,34 @@ def _kimi_k3_reference(
 
 class TestKimiK3GGUFBuild:
     @staticmethod
-    def _inputs(tokens: np.ndarray, states: dict[str, np.ndarray] | None = None):
+    def _inputs(
+        tokens: np.ndarray,
+        states: dict[str, np.ndarray] | None = None,
+        attention_mask: np.ndarray | None = None,
+    ):
         batch, sequence = tokens.shape
-        values = {
+        if states is None:
+            states = {
+                "past_key_values.0.q_conv_state": np.zeros((batch, 64, 3), np.float32),
+                "past_key_values.0.k_conv_state": np.zeros((batch, 64, 3), np.float32),
+                "past_key_values.0.v_conv_state": np.zeros((batch, 64, 3), np.float32),
+                "past_key_values.0.recurrent_state": np.zeros((batch, 2, 32, 32), np.float32),
+                "past_key_values.1.key": np.zeros((batch, 2, 0, 48), np.float32),
+                "past_key_values.1.value": np.zeros((batch, 2, 0, 32), np.float32),
+            }
+        past = states["past_key_values.1.key"].shape[2]
+        return {
             "input_ids": tokens,
-            "attention_mask": np.ones((batch, sequence), np.int64),
-            "position_ids": np.arange(sequence, dtype=np.int64)[None, :].repeat(batch, 0),
-            "past_key_values.0.q_conv_state": np.zeros((batch, 64, 3), np.float32),
-            "past_key_values.0.k_conv_state": np.zeros((batch, 64, 3), np.float32),
-            "past_key_values.0.v_conv_state": np.zeros((batch, 64, 3), np.float32),
-            "past_key_values.0.recurrent_state": np.zeros(
-                (batch, 2, 32, 32), np.float32
+            "attention_mask": (
+                np.ones((batch, past + sequence), np.int64)
+                if attention_mask is None
+                else attention_mask
             ),
-            "past_key_values.1.key": np.zeros((batch, 2, 0, 48), np.float32),
-            "past_key_values.1.value": np.zeros((batch, 2, 0, 32), np.float32),
+            "position_ids": np.broadcast_to(
+                np.arange(past, past + sequence, dtype=np.int64), (batch, sequence)
+            ).copy(),
+            **states,
         }
-        if states:
-            values.update(states)
-            past = states["past_key_values.1.key"].shape[2]
-            values["attention_mask"] = np.ones((batch, past + sequence), np.int64)
-            values["position_ids"] = (
-                np.arange(past, past + sequence, dtype=np.int64)[None, :].repeat(batch, 0)
-            )
-        return values
 
     def test_reduced_authoritative_equations_match_ort(self, tmp_path: Path) -> None:
         from mobius._testing.ort_inference import OnnxModelSession
@@ -452,9 +448,7 @@ class TestKimiK3GGUFBuild:
         for expert in range(2):
             prefix = f"model.layers.1.block_sparse_moe.moe.experts.{expert}"
             np.testing.assert_array_equal(
-                model.graph.initializers[
-                    f"{prefix}.gate_proj.weight_t"
-                ].const_value.numpy(),
+                model.graph.initializers[f"{prefix}.gate_proj.weight_t"].const_value.numpy(),
                 11.0 + expert,
             )
             np.testing.assert_array_equal(
@@ -462,9 +456,7 @@ class TestKimiK3GGUFBuild:
                 21.0 + expert,
             )
             np.testing.assert_array_equal(
-                model.graph.initializers[
-                    f"{prefix}.down_proj.weight_t"
-                ].const_value.numpy(),
+                model.graph.initializers[f"{prefix}.down_proj.weight_t"].const_value.numpy(),
                 31.0 + expert,
             )
 
@@ -492,9 +484,63 @@ class TestKimiK3GGUFBuild:
         output = tmp_path / "roundtrip"
         package.save(output, progress_bar=False)
         reloaded = ModelPackage.load(output)
-        assert reloaded["model"].metadata_props["mobius.cache_abi"] == model.metadata_props[
-            "mobius.cache_abi"
-        ]
+        assert (
+            reloaded["model"].metadata_props["mobius.cache_abi"]
+            == model.metadata_props["mobius.cache_abi"]
+        )
+
+    def test_right_padding_preserves_kda_state_for_cached_decode(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-k3-right-padding.gguf"
+        _write_kimi_k3_gguf(path)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        try:
+            unpadded = session.run(self._inputs(np.asarray([[7, 8]], np.int64)))
+            padded = session.run(
+                self._inputs(
+                    np.asarray([[7, 8, 0, 0]], np.int64),
+                    attention_mask=np.asarray([[1, 1, 0, 0]], np.int64),
+                )
+            )
+            for suffix in (
+                "q_conv_state",
+                "k_conv_state",
+                "v_conv_state",
+                "recurrent_state",
+            ):
+                np.testing.assert_allclose(
+                    padded[f"present.0.{suffix}"],
+                    unpadded[f"present.0.{suffix}"],
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
+
+            unpadded_states = {
+                name.replace("present.", "past_key_values."): value
+                for name, value in unpadded.items()
+                if name.startswith("present.")
+            }
+            padded_states = {
+                name.replace("present.", "past_key_values."): value
+                for name, value in padded.items()
+                if name.startswith("present.")
+            }
+            token = np.asarray([[9]], np.int64)
+            expected = session.run(self._inputs(token, unpadded_states))
+            actual = session.run(
+                self._inputs(
+                    token,
+                    padded_states,
+                    attention_mask=np.asarray([[1, 1, 0, 0, 1]], np.int64),
+                )
+            )
+            np.testing.assert_allclose(
+                actual["logits"], expected["logits"], rtol=1e-5, atol=1e-5
+            )
+        finally:
+            session.close()
 
     def test_quantized_source_preserves_only_compatible_matmul_roles(
         self, tmp_path: Path
@@ -512,8 +558,7 @@ class TestKimiK3GGUFBuild:
         assert quantized_inputs
         assert all(
             not any(
-                term in name
-                for term in ("norm", "conv1d", "A_log", "dt_bias", "res_score")
+                term in name for term in ("norm", "conv1d", "A_log", "dt_bias", "res_score")
             )
             for name in quantized_inputs
         )
@@ -577,6 +622,7 @@ class TestKimiK3GGUFBuild:
             ({"kv_heads": [0, 0]}, "requires both KDA and MLA"),
             ({"gating": 0}, "inconsistent pinned architecture metadata"),
             ({"shared": 1}, "inconsistent pinned architecture metadata"),
+            ({"conv": 1}, "inconsistent pinned architecture metadata"),
             (
                 {"omit_metadata": "leading_dense_block_count"},
                 "inconsistent pinned architecture metadata",

@@ -71,6 +71,7 @@ class KimiK3DeltaAttention(nn.Module):
         self._head_dim = config.linear_key_head_dim
         assert self._heads is not None and self._head_dim is not None
         self._projection_size = self._heads * self._head_dim
+        self._conv_history = config.linear_conv_kernel_dim - 1
         self._lower_bound = config.linear_gate_lower_bound
         assert self._lower_bound is not None
 
@@ -96,10 +97,53 @@ class KimiK3DeltaAttention(nn.Module):
         convolution: nn.Module,
         hidden_states: ir.Value,
         state: ir.Value,
+        current_mask: ir.Value,
     ):
         # CausalConvWithState consumes (B, channels, sequence).
         projected = op.Transpose(projection(op, hidden_states), perm=[0, 2, 1])
-        value, present = convolution(op, projected, state)
+        value, _ = convolution(op, projected, state)
+
+        # Retain valid projected tokens rather than letting right padding evict history.
+        conv_input = op.Concat(state, projected, axis=2)
+        batch = op.Shape(current_mask, start=0, end=1)
+        past_valid = op.Expand(
+            op.CastLike(1, current_mask),
+            op.Concat(batch, op.Constant(value_ints=[self._conv_history]), axis=0),
+        )
+        valid = op.Concat(past_valid, current_mask, axis=1)
+        positions = op.Range(
+            op.Constant(value_int=0),
+            op.Gather(op.Shape(valid), op.Constant(value_int=1), axis=0),
+            op.Constant(value_int=1),
+        )
+        positions = op.Expand(op.Unsqueeze(positions, [0]), op.Shape(valid))
+        masked_positions = op.Where(
+            op.Cast(valid, to=ir.DataType.BOOL),
+            positions,
+            op.Expand(op.Constant(value_int=-1), op.Shape(valid)),
+        )
+        selected, _ = op.TopK(
+            masked_positions,
+            op.Constant(value_ints=[self._conv_history]),
+            axis=1,
+            largest=1,
+            sorted=1,
+            _outputs=2,
+        )
+        selected = op.Gather(
+            selected,
+            op.Constant(value_ints=list(range(self._conv_history - 1, -1, -1))),
+            axis=1,
+        )
+        selected = op.Expand(
+            op.Unsqueeze(selected, [1]),
+            op.Concat(
+                op.Shape(projected, start=0, end=2),
+                op.Constant(value_ints=[self._conv_history]),
+                axis=0,
+            ),
+        )
+        present = op.GatherElements(conv_input, selected, axis=2)
         return op.Transpose(value, perm=[0, 2, 1]), present
 
     def forward(
@@ -119,27 +163,29 @@ class KimiK3DeltaAttention(nn.Module):
             op.Constant(value_ints=[9223372036854775807]),
             op.Constant(value_ints=[1]),
         )
-        current_mask = op.Unsqueeze(op.CastLike(current_mask, hidden_states), [-1])
-        x = op.Mul(hidden_states, current_mask)
+        current_mask_3d = op.Unsqueeze(op.CastLike(current_mask, hidden_states), [-1])
+        x = op.Mul(hidden_states, current_mask_3d)
 
-        q, present_q = self._project_conv(op, self.q_proj, self.q_conv1d, x, q_conv_state)
-        k, present_k = self._project_conv(op, self.k_proj, self.k_conv1d, x, k_conv_state)
-        v, present_v = self._project_conv(op, self.v_proj, self.v_conv1d, x, v_conv_state)
+        q, present_q = self._project_conv(
+            op, self.q_proj, self.q_conv1d, x, q_conv_state, current_mask
+        )
+        k, present_k = self._project_conv(
+            op, self.k_proj, self.k_conv1d, x, k_conv_state, current_mask
+        )
+        v, present_v = self._project_conv(
+            op, self.v_proj, self.v_conv1d, x, v_conv_state, current_mask
+        )
 
         head_shape = [0, 0, self._heads, self._head_dim]
         q4 = op.Cast(op.Reshape(q, head_shape), to=ir.DataType.FLOAT)
         k4 = op.Cast(op.Reshape(k, head_shape), to=ir.DataType.FLOAT)
         q4 = op.Div(
             q4,
-            op.Sqrt(
-                op.Add(op.ReduceSumSquare(q4, [-1], keepdims=True), self._QK_NORM_EPS)
-            ),
+            op.Sqrt(op.Add(op.ReduceSumSquare(q4, [-1], keepdims=True), self._QK_NORM_EPS)),
         )
         k4 = op.Div(
             k4,
-            op.Sqrt(
-                op.Add(op.ReduceSumSquare(k4, [-1], keepdims=True), self._QK_NORM_EPS)
-            ),
+            op.Sqrt(op.Add(op.ReduceSumSquare(k4, [-1], keepdims=True), self._QK_NORM_EPS)),
         )
         q = op.Reshape(q4, [0, 0, self._projection_size])
         k = op.Reshape(k4, [0, 0, self._projection_size])
@@ -156,9 +202,9 @@ class KimiK3DeltaAttention(nn.Module):
         )
         decay = op.Reshape(z, head_shape)
         decay = op.Neg(op.Mul(float(self._lower_bound), op.Sigmoid(op.Mul(a, decay))))
-        decay = op.Mul(op.Reshape(decay, [0, 0, self._projection_size]), current_mask)
+        decay = op.Mul(op.Reshape(decay, [0, 0, self._projection_size]), current_mask_3d)
         beta = op.Sigmoid(op.Cast(self.b_proj(op, x), to=ir.DataType.FLOAT))
-        beta = op.Mul(beta, current_mask)
+        beta = op.Mul(beta, current_mask_3d)
 
         output, present_recurrent = op.LinearAttention(
             q,
@@ -178,7 +224,7 @@ class KimiK3DeltaAttention(nn.Module):
         gate = op.Reshape(self.g_proj(op, x), head_shape)
         output = self.o_norm(op, output, gate)
         output = op.CastLike(op.Reshape(output, [0, 0, self._projection_size]), hidden_states)
-        return self.o_proj(op, op.Mul(output, current_mask)), (
+        return self.o_proj(op, op.Mul(output, current_mask_3d)), (
             present_q,
             present_k,
             present_v,
@@ -336,6 +382,7 @@ class _KimiK3RoutedMoE(nn.Module):
                 [-1],
                 keepdims=True,
             )
+            weight = op.CastLike(weight, expert_output)
             contribution = op.Mul(expert_output, weight)
             routed = contribution if routed is None else op.Add(routed, contribution)
         assert routed is not None

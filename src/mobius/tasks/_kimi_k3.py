@@ -131,6 +131,6 @@ class KimiK3CausalLMTask(ModelTask):
         model.metadata_props["mobius.runtime_support"] = (
             "Deferred: released generic OGA decoder cache schemas do not represent "
             "Kimi-K3's heterogeneous state ABI; tracked by "
-            "https://github.com/onnxruntime/mobius#605"
+            "https://github.com/onnxruntime/mobius/issues/605"
         )
         return ModelPackage({"model": model}, config=config)

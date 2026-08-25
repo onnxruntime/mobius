@@ -1412,6 +1412,7 @@ def _write_kimi_linear_gguf(
     malformed_shape: str | None = None,
     kv_heads: list[int] | None = None,
     gating: int = 2,
+    conv: int = 4,
 ) -> None:
     """Write a tiny pinned-format Kimi Linear GGUF with one KDA and one MLA layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -1426,7 +1427,6 @@ def _write_kimi_linear_gguf(
     extra_dim = 16
     value_dim = 32
     kv_rank = 32
-    conv = 4
     experts = 2
     rng = np.random.default_rng(617)
 
@@ -6331,6 +6331,7 @@ class TestKimiLinearGGUFBuild:
             ),
             ({"kv_heads": [0, 0]}, "requires both KDA and MLA"),
             ({"gating": 0}, "must be SIGMOID"),
+            ({"conv": 1}, "inconsistent pinned architecture metadata"),
         ],
     )
     def test_invalid_contract_fails_before_graph(

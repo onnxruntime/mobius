@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import types
 
+import onnx_ir as ir
 import pytest
 import torch
 
+from mobius._builder import _cast_module_dtype
 from mobius._configs import KimiK3Config
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius.models.kimi_k3 import KimiK3CausalLMModel
 from mobius.tasks import KimiK3CausalLMTask
 
@@ -109,6 +112,15 @@ def test_config_rejects_selective_compressed_tensors_checkpoint() -> None:
         KimiK3Config.from_transformers(parent)
 
 
+def test_config_rejects_empty_convolution_history() -> None:
+    text = _text_config()
+    text.linear_attn_config["short_conv_kernel_size"] = 1
+    parent = types.SimpleNamespace(model_type="kimi_k3", text_config=text)
+
+    with pytest.raises(ValueError, match="at least 2"):
+        KimiK3Config.from_transformers(parent)
+
+
 def test_model_has_attention_residual_latent_moe_and_untied_head() -> None:
     model = KimiK3CausalLMModel(_config())
 
@@ -119,6 +131,35 @@ def test_model_has_attention_residual_latent_moe_and_untied_head() -> None:
     assert moe.routed_down_proj is not None
     assert model.model.layers[0].attn_res_score is not None
     assert model.lm_head.weight is not model.model.embed_tokens.weight
+
+
+def test_half_precision_routing_weights_match_expert_output_dtype() -> None:
+    config = _config()
+    config.dtype = ir.DataType.FLOAT16
+    module = KimiK3CausalLMModel(config)
+    _cast_module_dtype(module, config.dtype)
+    model = KimiK3CausalLMTask().build(module, config)["model"]
+    SymbolicShapeInferencePass()(model)
+    graph = model.graph
+    routed_muls = [
+        node
+        for node in graph
+        if node.op_type == "Mul"
+        and any(
+            value is not None
+            and value.producer() is not None
+            and value.producer().op_type == "CastLike"
+            and value.producer().inputs[0].producer() is not None
+            and value.producer().inputs[0].producer().op_type == "ReduceSum"
+            for value in node.inputs
+        )
+    ]
+
+    assert routed_muls
+    assert all(
+        {value.dtype for value in node.inputs if value is not None} == {ir.DataType.FLOAT16}
+        for node in routed_muls
+    )
 
 
 def test_preprocess_strips_multimodal_prefix_and_aligns_experts() -> None:
