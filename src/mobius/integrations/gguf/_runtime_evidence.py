@@ -174,7 +174,7 @@ def _is_hex(value: str) -> bool:
 
 _SMOLLM_F16_ROUTE = (
     '{"architecture":"llama","config_sha256":'
-    '"af8b88c1d03c543f01163394589b7392bb52acb3c74240c0d9bda2e5c3097e0a",'
+    '"134f95e6a635d978737d712ed61ac8959acebdf080eafae838cf97f12c416430",'
     '"execution_provider":"cpu","model_type":"llama","module_type":"llama",'
     '"preserve_quantization":false,"registry_import":{"config_key_map":null,'
     '"config_postprocessor":null,"llama_qk_permute":true,"offset_norm":false,'
@@ -238,7 +238,7 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
         "tokenizer.json",
         "tokenizer_config.json",
     ),
-    runtime_package_sha256="31c3f5c2bff6ab861b84b5d3640b5eb265959e0c3f674fe1470223ed19b25165",
+    runtime_package_sha256="5b6fdbdb1db7f7fb9423f2356820812712556abf783acb6bd63c572920031982",
     parity_test="test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
     parity_kind="full-logit",
     deterministic_test=(

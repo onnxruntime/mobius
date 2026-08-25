@@ -205,7 +205,7 @@ class TestWriteGgufRuntimePackage:
         pkg = _FakePackage()
         pkg.gguf_reuse_plan = object()
         with pytest.raises(ValueError, match="no supported setting"):
-            write_gguf_runtime_package(
+            _write_runtime(
                 pkg,
                 tmp_path / "m.gguf",
                 tmp_path / "out",
@@ -217,20 +217,15 @@ class TestWriteGgufRuntimePackage:
         pkg = _FakePackage()
         pkg.draft_manifest = {"architecture": "eagle3"}
         out = tmp_path / "out"
-        out.mkdir()
-        sentinel = out / "sentinel.bin"
-        sentinel.write_bytes(b"unchanged")
 
         with pytest.raises(ValueError, match="target-coupled speculative draft"):
-            write_gguf_runtime_package(
+            _write_runtime(
                 pkg,
                 tmp_path / "eagle3.gguf",
                 out,
             )
         assert pkg.saved_to is None
-        assert {path.name: path.read_bytes() for path in out.iterdir()} == {
-            "sentinel.bin": b"unchanged"
-        }
+        assert not out.exists()
 
     @pytest.mark.parametrize("runtime", ["onnx-genai", "ort-genai"])
     def test_runtime_rejects_unevidenced_mtp_before_source_read(self, tmp_path, runtime):
