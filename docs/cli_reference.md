@@ -192,8 +192,8 @@ dense cache. The deferred state-manifest work is tracked by
 [#605](https://github.com/onnxruntime/mobius/issues/605).
 
 Each export also writes `runtime_compatibility.json`. Generic decoder metadata
-records the minimum runtime version and the released versions exercised by Mobius
-(0.14.1 and 0.15.2); it never emits the unreleased `decoder.state_groups` field.
+records the minimum runtime version and the latest stable release exercised by
+Mobius (0.15.2); it never emits the unreleased `decoder.state_groups` field.
 Generic config availability does not promote a GGUF runtime verdict: the only
 runtime-supported GGUF route remains the exact pinned SmolLM F16/CPU package, while
 SmolLM2 remains rejected because its GGUF padding-token metadata conflicts with the

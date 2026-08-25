@@ -149,7 +149,7 @@ _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
     "phimoe": "phimoe",
 }
 _GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
-_GENERIC_DECODER_TESTED_VERSIONS = ("0.14.1", "0.15.2")
+_GENERIC_DECODER_TESTED_VERSIONS = ("0.15.2",)
 _DECODER_SEMANTIC_INPUTS = frozenset(
     {
         "input_ids",
@@ -1801,8 +1801,6 @@ def write_ort_genai_config(
             directory rather than a HuggingFace model ID.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
-        revision: Optional immutable HuggingFace revision used for every remote
-            configuration, tokenizer, and processor request.
         runtime_version: Optional onnxruntime-genai version that will consume the
             package. Generic decoder packages reject versions older than 0.14.0.
 

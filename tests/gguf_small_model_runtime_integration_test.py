@@ -667,15 +667,6 @@ def test_smollm_generic_ort_genai_generation(tmp_path: Path) -> None:
                 "f32",
                 "--execution-provider",
                 "cpu",
-                "--runtime",
-                "onnx-genai",
-                "--runtime-version",
-                "1.29.0",
-                "--tokenizer-repository",
-                case.tokenizer_repository,
-                "--tokenizer-revision",
-                case.tokenizer_revision,
-                "--local-files-only",
             ]
         )
 
@@ -683,6 +674,8 @@ def test_smollm_generic_ort_genai_generation(tmp_path: Path) -> None:
     write_ort_genai_config(
         captured[0],
         str(output_dir),
+        hf_model_id=case.tokenizer_repository,
+        revision=case.tokenizer_revision,
         runtime_version=version("onnxruntime-genai"),
     )
     config = json.loads((output_dir / "genai_config.json").read_text())

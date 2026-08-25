@@ -2141,16 +2141,8 @@ class TestExportForOrtGenai:
             data = json.load(f)
         assert data["model"]["type"] == "decoder"
 
-    def test_config_mode_qwen3_moe_emits_supported_decoder_type(self, tmp_path):
-        """Qwen3-MoE --config exports must not emit the unsupported HF type.
-
-        Regression: a decoder-only Qwen3-MoE package wrote
-        ``"type": "qwen3_moe"`` into genai_config.json, and loading it raised
-        ``RuntimeError: Unsupported model_type in config.json: qwen3_moe``
-        because ORT GenAI's LLM registry has no such type. The emitted type is
-        literally ``"qwen3"``: ORT GenAI's tokenizer tag fallback keys the
-        Qwen3 reasoning-token IDs off that name.
-        """
+    def test_config_mode_qwen3_moe_emits_generic_decoder_type(self, tmp_path):
+        """Qwen3-MoE uses the graph-driven generic decoder contract."""
         from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
         pkg = _make_fake_llm_pkg("qwen3_moe")
@@ -2158,7 +2150,7 @@ class TestExportForOrtGenai:
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        assert data["model"]["type"] == "qwen3"
+        assert data["model"]["type"] == "decoder"
 
     def test_config_mode_gemma3_text_vlm_uses_multimodal_model_type(self, tmp_path):
         """Gemma3 VLM --config exports use ORT's multimodal gemma3 type."""
@@ -3409,7 +3401,7 @@ def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
         "runtime": "onnxruntime-genai",
         "model_type": "decoder",
         "minimum_version": "0.14.0",
-        "tested_versions": ["0.14.1", "0.15.2"],
+        "tested_versions": ["0.15.2"],
         "uses_main_only_state_groups": False,
         "heterogeneous_state_manifest": (
             "deferred: https://github.com/onnxruntime/mobius/issues/605"
