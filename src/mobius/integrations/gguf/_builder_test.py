@@ -1070,6 +1070,8 @@ class TestReuseGgufWeights:
         assert final_model.read_bytes() == b"new model"
         assert final_manifest.read_bytes() == b"new manifest"
         assert not final_sidecar.exists()
+
+
 @pytest.fixture
 def q5_1_gguf(tmp_path: Path) -> Path:
     """Create a GGUF whose projections require dequantize/requantize."""

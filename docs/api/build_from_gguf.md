@@ -145,13 +145,13 @@ reason.
 
 | GGUF architecture | Accepted aliases | mobius `model_type` | Float import | Quantized import |
 |---|---|---|---|---|
-| `arcee` | — | `arcee` | runtime deferred | unreachable |
+| `arcee` | — | `arcee` | runtime deferred | supported |
 | `bloom` | — | `bloom` | tensor_map deferred | unreachable |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
-| `cohere2` | — | `cohere2` | runtime deferred | unreachable |
+| `cohere2` | — | `cohere2` | runtime deferred | supported |
 | `deci` | — | `llama` | supported | supported |
 | `deepseek4` | — | `deepseek_v4` | supported | supported |
-| `exaone` | — | `exaone` | runtime deferred | unreachable |
+| `exaone` | — | `exaone` | runtime deferred | supported |
 | `falcon` | — | `falcon` | supported | supported |
 | `gemma` | — | `gemma` | supported | supported |
 | `gemma2` | — | `gemma2` | supported | supported |

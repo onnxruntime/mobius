@@ -63,8 +63,11 @@ _EXPECTED_SUPPORTED_COUNT = 29
 # modules before joining this set.
 _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
     {
+        "arcee",
+        "cohere2",
         "deci",
         "deepseek4",
+        "exaone",
         "falcon",
         "gemma",
         "gemma2",
@@ -76,6 +79,8 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "mamba",
         "muse-glimmer",
         "nemotron",
+        "olmo",
+        "olmo2",
         "phi3",
         "qwen2",
         "qwen2moe",
@@ -83,6 +88,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "qwen35",
         "qwen35moe",
         "qwen3moe",
+        "smollm3",
         "stablelm",
         "starcoder2",
     }
