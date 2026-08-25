@@ -113,6 +113,32 @@ def test_support_is_conservative_and_artifact_backed() -> None:
         assert all(pins[artifact_id].parity_test for artifact_id in spec.real_artifact_ids)
 
 
+def test_vlm_text_cohort_records_exact_companion_identity_without_support_claims() -> None:
+    expected_targets = {
+        "qwen2vl_merger": {"qwen2vl"},
+        "qwen2.5vl_merger": {"qwen2vl"},
+        "qwen3vl_merger": {"qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe"},
+        "qwen3a": {"qwen3vl", "qwen3vlmoe"},
+        "gemma3nv": {"gemma3n"},
+        "gemma3na": {"gemma3n"},
+        "pixtral": {"deepseek2", "llama", "mistral3", "mistral4"},
+        "llama4": {"llama4"},
+        "qwen2.5o": {"qwen2vl"},
+        "paddleocr": {"paddleocr"},
+        "cogvlm": {"cogvlm"},
+        "deepseekocr": {"deepseek2-ocr"},
+        "deepseekocr2": {"deepseek2-ocr"},
+        "hunyuanvl": {"hunyuan_vl"},
+    }
+    for projector_type, targets in expected_targets.items():
+        spec = get_projector_spec(projector_type)
+        assert spec.target_architectures == frozenset(targets)
+        assert not spec.is_supported
+        assert set(spec.verdicts.values()) == {Support.DEFERRED}
+        assert spec.builder is None
+        assert spec.required_top_tensors == ()
+
+
 def test_every_non_supported_verdict_has_an_actionable_reason() -> None:
     for spec in iter_projector_specs():
         if spec.is_supported:

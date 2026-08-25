@@ -399,11 +399,14 @@ def _deferred(
     enum_name: str,
     modalities: frozenset[MMProjModality],
     reason: str,
+    *,
+    target_architectures: frozenset[str] = frozenset(),
 ) -> ProjectorSpec:
     return ProjectorSpec(
         projector_type=projector_type,
         enum_name=enum_name,
         modalities=modalities,
+        target_architectures=target_architectures,
         reason=reason,
     )
 
@@ -462,18 +465,21 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_QWEN2VL",
         _VISION_BASE,
         "The existing HF Qwen2-VL graph is not wired to the pinned GGUF merger ABI.",
+        target_architectures=frozenset({"qwen2vl"}),
     ),
     _deferred(
         "qwen2.5vl_merger",
         "PROJECTOR_TYPE_QWEN25VL",
         _VISION_BASE,
         "The Qwen2.5-VL merger/window ordering has no GGUF tensor-closure parity test.",
+        target_architectures=frozenset({"qwen2vl"}),
     ),
     _deferred(
         "qwen3vl_merger",
         "PROJECTOR_TYPE_QWEN3VL",
         _VISION_BASE,
         "The Qwen3-VL merger/window ordering has no GGUF tensor-closure parity test.",
+        target_architectures=frozenset({"qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe"}),
     ),
     _deferred(
         "step3vl",
@@ -492,12 +498,14 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_GEMMA3NV",
         _VISION_BASE,
         "Gemma3n vision sidecar routing is not implemented.",
+        target_architectures=frozenset({"gemma3n"}),
     ),
     _deferred(
         "gemma3na",
         "PROJECTOR_TYPE_GEMMA3NA",
         _AUDIO_BASE,
         "Gemma3n audio sidecar routing is not implemented.",
+        target_architectures=frozenset({"gemma3n"}),
     ),
     ProjectorSpec(
         projector_type="gemma4v",
@@ -568,6 +576,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_PIXTRAL",
         _VISION_BASE,
         "The Pixtral component has no pinned mmproj tensor mapping or positional-interpolation parity.",
+        target_architectures=frozenset({"deepseek2", "llama", "mistral3", "mistral4"}),
     ),
     _deferred(
         "ultravox",
@@ -586,6 +595,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_LLAMA4",
         _VISION_BASE,
         "Llama4 vision encoder and multimodal target package are out of scope.",
+        target_architectures=frozenset({"llama4"}),
     ),
     _deferred(
         "qwen2a",
@@ -598,6 +608,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_QWEN3A",
         _AUDIO_BASE,
         "Qwen3 audio encoder/projector is not implemented.",
+        target_architectures=frozenset({"qwen3vl", "qwen3vlmoe"}),
     ),
     _deferred(
         "glma",
@@ -610,6 +621,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_QWEN25O",
         _VISION_BASE | _AUDIO_BASE,
         "This legacy string changes meaning by modality; accepting it would create a false alias.",
+        target_architectures=frozenset({"qwen2vl"}),
     ),
     _deferred(
         "voxtral",
@@ -646,6 +658,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_PADDLEOCR",
         _VISION_BASE,
         "PaddleOCR vision/projector graph is not implemented.",
+        target_architectures=frozenset({"paddleocr"}),
     ),
     _deferred(
         "lightonocr",
@@ -658,6 +671,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_COGVLM",
         _VISION_BASE,
         "CogVLM feature output differs from LLaVA and is not implemented.",
+        target_architectures=frozenset({"cogvlm"}),
     ),
     _deferred(
         "janus_pro",
@@ -688,12 +702,14 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_DEEPSEEKOCR",
         _VISION_BASE,
         "DeepSeek-OCR SAM/projector graph is not implemented.",
+        target_architectures=frozenset({"deepseek2-ocr"}),
     ),
     _deferred(
         "deepseekocr2",
         "PROJECTOR_TYPE_DEEPSEEKOCR2",
         _VISION_BASE,
         "DeepSeek-OCR2 SAM/projector graph is not implemented.",
+        target_architectures=frozenset({"deepseek2-ocr"}),
     ),
     _deferred(
         "lfm2a",
@@ -742,6 +758,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "PROJECTOR_TYPE_HUNYUANVL",
         _VISION_BASE,
         "HunyuanVL vision/projector graph is not implemented.",
+        target_architectures=frozenset({"hunyuan_vl"}),
     ),
     _deferred(
         "minicpmv4_6",
