@@ -164,17 +164,17 @@ def _write_qwen35_mtp_gguf(
             matrix(f"{prefix}.nextn.embed_tokens.weight", (_VOCAB, _H))
         if dedicated_norm:
             f32(f"{prefix}.nextn.shared_head_norm.weight", (_H,))
+        if unknown_nextn:
+            f32(f"{prefix}.nextn.unknown.weight", (_H,))
+        if extra_mtp_tensor is not None:
+            f32(extra_mtp_tensor, (_H,))
+        _add_decoder_block(index)
         if dedicated_head:
             matrix(
                 f"{prefix}.nextn.shared_head_head.weight",
                 (_VOCAB, _H),
                 asymmetric=asymmetric_dedicated_head,
             )
-        if unknown_nextn:
-            f32(f"{prefix}.nextn.unknown.weight", (_H,))
-        if extra_mtp_tensor is not None:
-            f32(extra_mtp_tensor, (_H,))
-        _add_decoder_block(index)
 
     if quantized_backbone_embedding:
         matrix("token_embd.weight", (_VOCAB, _H))

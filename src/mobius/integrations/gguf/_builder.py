@@ -22,7 +22,7 @@ import logging
 import re
 import struct
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
@@ -3337,6 +3337,7 @@ def _load_quantized_state_dict(
     name_mapper: Callable[[str, str], str | None] | None = None,
     warn_unmapped: bool = True,
     reuse_candidates: dict | None = None,
+    dequantize_float_linear_types: Mapping[str, Collection[str]] | None = None,
 ) -> dict:
     """Load tensors, preserving native blocks or normalizing to MatMulNBits.
 
@@ -3554,6 +3555,11 @@ def _load_quantized_state_dict(
                 }
                 and not should_repack
                 and not fused_projection_targets
+                and (
+                    dequantize_float_linear_types is None
+                    or module_stem not in dequantize_float_linear_types
+                    or quant_spec.name not in dequantize_float_linear_types[module_stem]
+                )
             ):
                 raise ValueError(
                     f"Cannot keep {quant_spec.name} {tensor_role.value} {hf_name} "

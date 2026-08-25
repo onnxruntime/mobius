@@ -350,8 +350,9 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
         )
     if count != 1:
         raise ValueError(
-            f"{architecture} GGUF declares {count} MTP heads; ModelPackage can represent "
-            "exactly one and will not silently truncate the remaining heads"
+            f"{architecture} GGUF declares {count} MTP heads and has {count} MTP blocks, "
+            "but only exactly one appended MTP block can be represented; refusing to "
+            "silently truncate the remaining heads"
         )
     if legacy_tensors:
         raise ValueError(
@@ -620,6 +621,7 @@ def build_mtp_head_from_gguf(
             mtp_config,
             name_mapper=_mapper,
             warn_unmapped=False,
+            dequantize_float_linear_types={"lm_head": {"Q4_1"}},
         )
         # Mirror the backbone (build_from_gguf steps 7/7b): run process_tensors
         # over only the float tensors (native quant blocks were already
