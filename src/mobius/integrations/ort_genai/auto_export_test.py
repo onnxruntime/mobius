@@ -159,6 +159,12 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
         assert _resolve_ort_genai_model_type("gemma4_text") == "gemma4_text"
 
+    def test_qwen35_text_and_multimodal_model_types_remain_distinct(self):
+        assert _resolve_ort_genai_model_type("qwen3_5_text") == "qwen3_5_text"
+        assert _resolve_ort_genai_model_type("qwen3_5_moe_text") == "qwen3_5_moe_text"
+        assert _resolve_ort_genai_model_type("qwen3_5") == "qwen3_5"
+        assert _resolve_ort_genai_model_type("qwen3_5_moe") == "qwen3_5_moe"
+
 
 class TestSelectOrtModelType:
     """Text-only / multimodal ORT model type selection (PR: text_only export)."""
@@ -189,6 +195,32 @@ class TestSelectOrtModelType:
         assert (
             _select_ort_model_type("not_a_real_type", "qwen3", is_decoder_only=True)
             == "decoder"
+        )
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
+    def test_decoder_only_qwen35_preserves_text_runtime_type(self, model_type):
+        assert (
+            _select_ort_model_type(model_type, "qwen3_5_moe", is_decoder_only=True)
+            == model_type
+        )
+
+    @pytest.mark.parametrize(
+        ("config_model_type", "hf_model_type", "expected"),
+        [
+            ("qwen3_5_text", "qwen3_5", "qwen3_5"),
+            ("qwen3_5_moe_text", "qwen3_5_moe", "qwen3_5_moe"),
+        ],
+    )
+    def test_multimodal_qwen35_preserves_parent_vlm_runtime_type(
+        self, config_model_type, hf_model_type, expected
+    ):
+        assert (
+            _select_ort_model_type(
+                config_model_type,
+                hf_model_type,
+                is_decoder_only=False,
+            )
+            == expected
         )
 
     def test_decoder_only_preserves_specialized_hf_fallback(self):
@@ -1060,6 +1092,18 @@ class TestWriteOrtGenaiConfigLocalDir:
     def _make_pkg():
         return _make_fake_llm_pkg("llama")
 
+    def test_qwen35_moe_text_emits_standalone_llm_config(self, tmp_path):
+        pkg = _make_fake_llm_pkg("qwen3_5_moe_text")
+
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+        assert model["type"] == "qwen3_5_moe_text"
+        assert model["decoder"]["filename"] == "model.onnx"
+        assert "vision" not in model
+        assert "embedding" not in model
+
     def test_local_config_dir_copies_tokenizer_files(self, tmp_path):
         """When local_config_dir is set, tokenizer files are copied from it."""
         src = tmp_path / "local_model"
@@ -1535,7 +1579,7 @@ class TestExportForOrtGenai:
         assert resize["min_pixels"] == 12544
         assert resize["max_pixels"] == 9633792
 
-    def test_qwen36_vl_hf_parent_type_maps_to_qwen35_runtime(self, tmp_path):
+    def test_qwen36_vl_hf_parent_type_maps_to_qwen35_moe_runtime(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1551,7 +1595,7 @@ class TestExportForOrtGenai:
         class FakeConfig:
             # build_transformers_model unwraps Qwen3.6 VL to the text sub-config,
             # but write_ort_genai_config must preserve the multimodal HF parent
-            # type and map it to ORT GenAI's native qwen3_5 runtime.
+            # type and map it to ORT GenAI's native qwen3_5_moe VLM runtime.
             model_type: str = "qwen3_5_moe_text"
             vocab_size: int = 248064
             hidden_size: int = 2048
@@ -1601,7 +1645,7 @@ class TestExportForOrtGenai:
 
         with open(result["genai_config"]) as f:
             data = json.load(f)
-        assert data["model"]["type"] == "qwen3_5"
+        assert data["model"]["type"] == "qwen3_5_moe"
         assert data["model"]["vision"]["patch_size"] == 16
 
     def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):

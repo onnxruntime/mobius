@@ -117,16 +117,17 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    # Qwen3.5 / Qwen3.6 use the Qwen-VL auxiliary vision+embedding pipeline
-    # but a hybrid DeltaNet/full-attention decoder, so they must select the
-    # native ORT GenAI qwen3_5 model type rather than the Qwen2.5-VL decoder.
+    # Standalone Qwen3.5 / Qwen3.6 text decoders have dedicated ORT GenAI LLM
+    # types. Multimodal parents and their internal text subconfigs retain the
+    # corresponding Qwen-VL runtime type so full packages construct the
+    # vision+embedding pipeline.
     "qwen3_5": "qwen3_5",
-    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_text": "qwen3_5_text",
     "qwen3_5_vl": "qwen3_5",
     "qwen3_5_vl_text": "qwen3_5",
-    "qwen3_5_moe": "qwen3_5",
-    "qwen3_5_moe_text": "qwen3_5",
-    "qwen3_5_moe_vl": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5_moe",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
+    "qwen3_5_moe_vl": "qwen3_5_moe",
     # GLM-OCR uses the Qwen2.5-VL three-model runtime contract: packed image
     # patches, M-RoPE position IDs, an embedding mixer, and a cached decoder.
     "glm_ocr": "qwen2_5_vl",
@@ -144,6 +145,10 @@ _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
     "gpt2": "gpt2",
     "lfm2": "lfm2",
     "lfm2_vl": "lfm2",
+    # These select the Qwen3.5 hybrid recurrent-attention LLM implementations;
+    # their unsuffixed siblings select multimodal implementations.
+    "qwen3_5_text": "qwen3_5_text",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
 }
 _LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
 _GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
@@ -274,8 +279,10 @@ def _select_ort_model_type(
     Released ORT GenAI dispatches ``decoder`` to its generic
     ``DecoderOnly_Model``. Decoder-only packages therefore use that type unless
     the runtime has genuinely different behavior: ``gpt2`` selects ``Gpt_Model``,
-    ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, and Phi-3 family names are
-    retained only for LongRoPE cache recomputation after the short-context threshold.
+    ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, Qwen3.5 text types select
+    their hybrid recurrent-attention LLM implementations, and Phi-3 family
+    names are retained only for LongRoPE cache recomputation after the
+    short-context threshold.
 
     Multimodal and encoder-decoder packages retain their architecture-specific
     type because those values select distinct runtime pipelines and position-ID
