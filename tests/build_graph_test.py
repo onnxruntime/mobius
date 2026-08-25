@@ -1232,8 +1232,7 @@ class TestBuildGraphVisionLanguage:
         model_cls = registry.get("qwen3_vl")
         module = model_cls(config)
         task_name = _default_task_for_model("qwen3_vl")
-        task = get_task(task_name)
-        pkg = task.build(module, config)
+        pkg = build_from_module(module, config, task=task_name, execution_provider="cpu")
 
         # 3-model split produces decoder, vision, embedding
         assert "decoder" in pkg
@@ -1244,6 +1243,14 @@ class TestBuildGraphVisionLanguage:
         decoder = pkg["decoder"]
         assert "logits" in {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in {inp.name for inp in decoder.graph.inputs}
+
+        vision_encoder = pkg["vision_encoder"]
+        node_order = {id(node): index for index, node in enumerate(vision_encoder.graph)}
+        for index, node in enumerate(vision_encoder.graph):
+            for input_value in node.inputs:
+                producer = input_value.producer() if input_value is not None else None
+                if producer is not None and producer.graph is vision_encoder.graph:
+                    assert node_order[id(producer)] < index
 
     def test_qwen35_vl_graph(self):
         """Build Qwen3.5-VL with its auto-detected 3-model task."""

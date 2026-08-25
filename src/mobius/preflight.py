@@ -38,13 +38,18 @@ __all__ = [
     "run_preflight",
 ]
 
+import ctypes
 import dataclasses
 import enum
 import json
 import logging
 import os
 import pathlib
+import re
 import shutil
+import subprocess
+import sys
+from ctypes import wintypes
 
 from mobius.integrations._weight_loading import (
     _SINGLE_WEIGHT_NAME,
@@ -459,7 +464,32 @@ def _default_download_dir() -> pathlib.Path:
         return pathlib.Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def _available_ram_bytes() -> int | None:
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", wintypes.DWORD),
+        ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _windows_available_ram_bytes() -> int | None:
+    status = _MemoryStatusEx()
+    status.dwLength = ctypes.sizeof(status)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    if kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return int(status.ullAvailPhys)
+    return None
+
+
+def _proc_available_ram_bytes() -> int | None:
     try:
         for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
             if line.startswith("MemAvailable:"):
@@ -467,6 +497,66 @@ def _available_ram_bytes() -> int | None:
     except OSError:
         return None
     return None
+
+
+def _darwin_available_ram_bytes() -> int | None:
+    try:
+        result = subprocess.run(
+            ["vm_stat"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    return _parse_vm_stat_available_bytes(result.stdout)
+
+
+def _parse_vm_stat_available_bytes(output: str) -> int | None:
+    page_size_match = re.search(r"page size of (\d+) bytes", output)
+    if page_size_match is None:
+        return None
+    page_size = int(page_size_match.group(1))
+    available_page_names = {
+        "Pages free",
+        "Pages inactive",
+        "Pages speculative",
+    }
+    available_pages = 0
+    for line in output.splitlines():
+        name, separator, raw_value = line.partition(":")
+        if separator and name in available_page_names:
+            value = raw_value.strip().rstrip(".")
+            if value.isdigit():
+                available_pages += int(value)
+    return available_pages * page_size
+
+
+def _sysconf_available_ram_bytes() -> int | None:
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return None
+    return int(pages * page_size) if pages > 0 and page_size > 0 else None
+
+
+def _probe_available_ram() -> tuple[int | None, str]:
+    if os.name == "nt":
+        return _windows_available_ram_bytes(), "GlobalMemoryStatusEx:ullAvailPhys"
+    if sys.platform == "darwin":
+        if (available := _darwin_available_ram_bytes()) is not None:
+            return available, "vm_stat:available pages"
+    if (available := _proc_available_ram_bytes()) is not None:
+        return available, "/proc/meminfo:MemAvailable"
+    if (available := _sysconf_available_ram_bytes()) is not None:
+        return available, "os.sysconf:SC_AVPHYS_PAGES"
+    return None, "unavailable"
+
+
+def _available_ram_bytes() -> int | None:
+    return _probe_available_ram()[0]
 
 
 def check_disk(kind: str, path: pathlib.Path, required: int, margin_frac: float) -> SpaceCheck:
@@ -483,13 +573,13 @@ def check_disk(kind: str, path: pathlib.Path, required: int, margin_frac: float)
 
 
 def check_ram(required: int, margin_frac: float) -> SpaceCheck:
-    free = _available_ram_bytes()
+    free, source = _probe_available_ram()
     # If MemAvailable can't be read we cannot verify the RAM budget; refuse
     # rather than emit a success-shaped pass.
     ok = free is not None and free * (1 - margin_frac) >= required
     return SpaceCheck(
         kind="ram",
-        path="/proc/meminfo:MemAvailable",
+        path=source,
         required_bytes=required,
         free_bytes=int(free) if free is not None else -1,
         margin_frac=margin_frac,
