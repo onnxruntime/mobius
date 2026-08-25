@@ -112,6 +112,31 @@ class TestMapGGUFToHFNames:
                 "blk.0.ffn_gate.weight",
                 "model.layers.0.shared_mlp.gate_proj.weight",
             ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate_inp.weight",
+                "model.layers.0.block_sparse_moe.gate.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate_exps.weight",
+                "model.layers.0.block_sparse_moe.gate_proj.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_up_exps.weight",
+                "model.layers.0.block_sparse_moe.up_proj.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_down_exps.weight",
+                "model.layers.0.block_sparse_moe.output_linear.weight",
+            ),
+            (
+                "granitehybrid",
+                "blk.0.ffn_gate_shexp.weight",
+                "model.layers.0.shared_mlp.gate_proj.weight",
+            ),
         ],
     )
     def test_second_hybrid_cohort_mapping(

@@ -422,6 +422,29 @@ class TestProcessTensorsMamba:
         assert result["model.layers.0.mamba.D"].shape == (2,)
         assert result["model.layers.0.mamba.norm.weight"].shape == (4,)
 
+    def test_granitehybrid_expert_gate_up_fusion_preserves_expert_order(self) -> None:
+        config = SimpleNamespace(
+            model_type="granitemoehybrid",
+            _gguf_arch="granitehybrid",
+            layer_types=["mamba2"],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=2,
+        )
+        gate = torch.stack((torch.full((2, 4), 11.0), torch.full((2, 4), 12.0)))
+        up = torch.stack((torch.full((2, 4), 21.0), torch.full((2, 4), 22.0)))
+        state_dict = {
+            "model.layers.0.block_sparse_moe.gate_proj.weight": gate,
+            "model.layers.0.block_sparse_moe.up_proj.weight": up,
+        }
+
+        result = process_tensors(state_dict, config)
+
+        fused = result["model.layers.0.block_sparse_moe.input_linear.weight"]
+        assert fused.shape == (2, 4, 4)
+        torch.testing.assert_close(fused[:, :2], gate)
+        torch.testing.assert_close(fused[:, 2:], up)
+
 
 class TestProcessTensorsNoop:
     """Test that unknown architectures pass through."""

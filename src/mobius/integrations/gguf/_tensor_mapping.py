@@ -441,6 +441,13 @@ _GRANITEHYBRID_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_gate": "model.layers.{bid}.shared_mlp.gate_proj",
     "blk.{bid}.ffn_up": "model.layers.{bid}.shared_mlp.up_proj",
     "blk.{bid}.ffn_down": "model.layers.{bid}.shared_mlp.output_linear",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.block_sparse_moe.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.block_sparse_moe.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.block_sparse_moe.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.block_sparse_moe.output_linear",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.shared_mlp.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.shared_mlp.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.shared_mlp.output_linear",
 }
 
 _BERT_MAPPING: dict[str, str] = {

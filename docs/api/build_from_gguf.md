@@ -396,7 +396,7 @@ before graph construction or durable output.
 | `gptneox` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | GPT-NeoX GGUF requires fused biased QKV, bias-bearing LayerNorm/GELU blocks, partial RoPE, and metadata-selected parallel versus sequential residual topology. Mobius implements only the parallel MHA subset and cannot admit the full loader union. |
 | `granite` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The granite architecture is a conditional dense-or-MoE union with residual, embedding, attention, and inverse-logit scales, optional biases/RoPE factors, shared experts, and optional deep-stack inputs. It is not the GraniteMoE or GraniteHybrid GGUF contract. |
 | `granite_swa` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Granite SWA requires attention sinks, a complete interleaved sliding-window schedule, residual/logit scaling, fused routed gate-up experts, and optional fused shared experts/deep-stack injection. Mobius owns neither that cache ABI nor its fused expert sidecars. |
-| `granitehybrid` | — | model=`granitemoehybrid`; tensor=`granitehybrid` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
+| `granitehybrid` | — | model=`granitemoehybrid`; tensor=`granitehybrid` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Exact mixed attention/Mamba2 scheduling, architecture-wide dense or routed MoE feed-forward selection, optional shared experts, Granite scaling, value-preserving float expert fusion, and strict pinned tensor closure are supported. Quantized sources require explicit dequantization because the current graph has no exact packed 3-D expert ABI; use keep_quantized=False. Generic ORT GenAI runtime packaging remains deferred because its released cache schema cannot represent heterogeneous KV, convolution, and recurrent state slots; tracked by onnxruntime/mobius#605. |
 | `granitemoe` | — | model=`granitemoe`; tensor=`llama`+`moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `graniteswitch` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | GraniteSwitch repurposes an appended synthetic layer as a token-history-driven adapter router and carries fourteen switched-LoRA tensors per block in addition to decoder KV state. It is not MTP, and Mobius has no switched-LoRA graph, MUL_MAT_ID quantization contract, or package ABI. |
 | `grok` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned Grok graph applies embedding, attention-output, and logit scales; attention, and optional final-logit softcaps; post-attention and post-FFN norms; and a dense-plus-routed expert residual scaled by sqrt(2)/2. Mobius's generic MoE graph has none of that combined topology, so the Hugging Face-style expert names are not evidence that a GGUF alias is safe. |
@@ -556,8 +556,9 @@ independent full-logit and generation parity.
 ### Second hybrid cohort
 
 `jamba`, `nemotron_h`, and `granitehybrid` have graph-import support for exact
-pinned subsets. Jamba includes routed MoE layers; Nemotron-H and GraniteHybrid
-remain dense-only. Runtime packaging remains deferred pending independent
+pinned subsets. All three include their routed-MoE forms; GraniteHybrid selects
+dense or routed feed-forward globally and may add one always-active shared
+expert on every layer. Runtime packaging remains deferred pending independent
 real-artifact full-logit and stateful-generation parity.
 
 - Schedules come from suffix-exact per-layer metadata. Jamba and GraniteHybrid
@@ -568,14 +569,19 @@ real-artifact full-logit and stateful-generation parity.
   Mamba-1 with biased depthwise convolution and bias-free projections, and
   softmax-first top-k routing without post-top-k renormalization. Routed layers
   are inferred exactly from `ffn_gate_inp`; stacked expert tensors are split in
-  numeric order. There are no shared experts. Nemotron-H rejects MTP and all MoE
-  files. GraniteHybrid rejects routed-MoE files until 3-D expert fusion,
-  ordering, and quantized preservation have independent value tests.
+  numeric order. There are no shared experts. Nemotron-H supports its exact
+  mixed dense/MoE schedule, correction-biased sigmoid routing, shared expert,
+  and optional latent projections while rejecting unsupported MTP blocks.
+  GraniteHybrid uses normalized softmax top-k routing on every layer, fuses
+  separate GGUF expert gate/up tensors in gate-then-up order, and adds the
+  optional shared SwiGLU branch.
 - Every layer must provide exactly its pinned loader tensor family. Missing,
   wrong-mixer, partial, auxiliary, scale/input-scale, and out-of-range tensors
   are rejected before graph construction. Compatible attention, dense-FFN, and
-  expert MatMul weights may remain quantized; Mamba and other state-sensitive
-  tensors are dequantized. GGUF Mamba decay values are inverted
+  expert MatMul weights may remain quantized where the graph owns an exact
+  packed ABI. GraniteHybrid and Nemotron-H quantized sources require explicit
+  dequantization; neither silently drops or rewrites packed expert semantics.
+  GGUF Mamba decay values are inverted
   from `-exp(A_log)`; convolution and grouped Mamba2 tensors are restored to
   graph shapes.
 - State inputs and outputs are caller-owned. Mamba1 uses conv
