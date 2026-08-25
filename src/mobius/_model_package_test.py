@@ -374,7 +374,7 @@ class TestModelPackageSaveLoad:
         assert sorted(loaded) == ["model"]
         assert loaded.mtp_head is not None
         assert sorted(loaded.mtp_head) == ["model"]
-        assert (tmp_path / "mtp" / "model.onnx").exists()
+        assert (tmp_path / ".mobius-mtp" / "model.onnx").exists()
 
     def test_mtp_head_roundtrip_with_multicomponent_target(self, tmp_path):
         pkg = ModelPackage(
@@ -391,6 +391,290 @@ class TestModelPackageSaveLoad:
         assert sorted(loaded) == ["decoder", "embedding"]
         assert loaded.mtp_head is not None
         assert sorted(loaded.mtp_head) == ["model"]
+
+    def test_legitimate_mtp_component_roundtrip(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                "mtp": _make_simple_model("mtp"),
+            }
+        )
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["model", "mtp"]
+        assert loaded.mtp_head is None
+
+    def test_mtp_sidecar_directory_collision_is_encoded(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                ".mobius-mtp": _make_simple_model("legitimate-component"),
+                "mtp": _make_simple_model("mtp-component"),
+            }
+        )
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == [".mobius-mtp", "model", "mtp"]
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["auxiliary", "draft"]
+        assert (tmp_path / ".mobius-mtp-1" / "draft" / "model.onnx").is_file()
+
+    def test_mtp_sidecar_case_insensitive_collision_is_encoded(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                ".MOBIUS-MTP": _make_simple_model("legitimate-component"),
+            }
+        )
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == [".MOBIUS-MTP", "model"]
+        assert loaded.mtp_head is not None
+        assert (tmp_path / ".mobius-mtp-1" / "model.onnx").is_file()
+
+    def test_nested_mtp_sidecars_roundtrip(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "auxiliary": _make_simple_model("auxiliary"),
+            }
+        )
+        pkg.mtp_head.mtp_head = ModelPackage(
+            {
+                "next": _make_simple_model("next"),
+                "next_auxiliary": _make_simple_model("next-auxiliary"),
+            }
+        )
+
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["auxiliary", "draft"]
+        assert loaded.mtp_head.mtp_head is not None
+        assert sorted(loaded.mtp_head.mtp_head) == ["next", "next_auxiliary"]
+
+    def test_self_referential_mtp_head_fails_before_writing(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = pkg
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="must not contain a cycle"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_cyclic_nested_mtp_heads_fail_before_writing(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        sidecar = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.mtp_head = sidecar
+        sidecar.mtp_head = pkg
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="must not contain a cycle"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_reserved_manifest_component_fails_before_writing(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                ".mobius-package.json": _make_simple_model("collision"),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="reserved for package metadata"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    @pytest.mark.parametrize("name", ["", ".", "..", "../outside", "nested/model"])
+    def test_unsafe_component_name_fails_before_writing(self, tmp_path, name):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                name: _make_simple_model("unsafe"),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="must be a non-empty path segment"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_removing_mtp_head_removes_stale_sidecar(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+        pkg.save(str(tmp_path))
+
+        pkg.mtp_head = None
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert sorted(loaded) == ["model"]
+        assert loaded.mtp_head is None
+        assert not (tmp_path / ".mobius-mtp").exists()
+
+    def test_manifest_artifact_collision_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        (output / ".mobius-package.json").write_text(
+            '{"format": "mobius.model-package.v1", "mtp_head": "policies"}\n'
+        )
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.add_policy_component("sample", build_greedy_sampler())
+
+        with pytest.raises(ValueError, match="collides with an active artifact namespace"):
+            pkg.save(str(output))
+
+        assert not (output / "model.onnx").exists()
+
+    def test_resaving_mtp_head_replaces_stale_components(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage(
+            {
+                "draft": _make_simple_model("draft"),
+                "stale": _make_simple_model("stale"),
+            }
+        )
+        pkg.save(str(tmp_path))
+
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("replacement")})
+        pkg.save(str(tmp_path))
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.mtp_head is not None
+        assert sorted(loaded.mtp_head) == ["model"]
+        assert not (tmp_path / ".mobius-mtp" / "stale").exists()
+
+    def test_sidecar_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (output / ".mobius-mtp").symlink_to(external, target_is_directory=True)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+        pkg.mtp_head = ModelPackage({"model": _make_simple_model("draft")})
+
+        with pytest.raises(ValueError, match="must be a real directory"):
+            pkg.save(str(output))
+
+        assert not (output / "model.onnx").exists()
+        assert not list(external.iterdir())
+
+    def test_manifest_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external.json"
+        external.write_text("unchanged")
+        (output / ".mobius-package.json").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+
+        with pytest.raises(ValueError, match="manifest must not be a symlink"):
+            pkg.save(str(output))
+
+        assert not (output / "model.onnx").exists()
+        assert external.read_text() == "unchanged"
+
+    def test_component_directory_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external"
+        external.mkdir()
+        (output / "decoder").symlink_to(external, target_is_directory=True)
+        pkg = ModelPackage(
+            {
+                "decoder": _make_simple_model("decoder"),
+                "embedding": _make_simple_model("embedding"),
+            }
+        )
+
+        with pytest.raises(ValueError, match=r"component 'decoder'.*real directory"):
+            pkg.save(str(output))
+
+        assert not (output / "embedding").exists()
+        assert not list(external.iterdir())
+
+    def test_flat_model_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external.onnx"
+        external.write_text("unchanged")
+        (output / "model.onnx").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+
+        with pytest.raises(ValueError, match="model output must not be a symlink"):
+            pkg.save(str(output))
+
+        assert external.read_text() == "unchanged"
+
+    @pytest.mark.parametrize("name", ["policies", "adapters"])
+    def test_artifact_namespace_component_fails_before_writing(self, tmp_path, name):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("target"),
+                name: _make_simple_model(name),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="reserved for package artifacts"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_case_insensitive_component_collision_fails_before_writing(self, tmp_path):
+        pkg = ModelPackage(
+            {
+                "model": _make_simple_model("lower"),
+                "MODEL": _make_simple_model("upper"),
+            }
+        )
+        output = tmp_path / "output"
+
+        with pytest.raises(ValueError, match="distinct when compared case-insensitively"):
+            pkg.save(str(output))
+
+        assert not output.exists()
+
+    def test_flat_safetensors_symlink_fails_before_writing(self, tmp_path):
+        output = tmp_path / "output"
+        output.mkdir()
+        external = tmp_path / "external.safetensors"
+        external.write_text("unchanged")
+        (output / "model.safetensors").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model("target")})
+
+        with pytest.raises(ValueError, match="model output must not be a symlink"):
+            pkg.save(str(output), external_data="safetensors")
+
+        assert external.read_text() == "unchanged"
+
+    @pytest.mark.parametrize("sidecar_name", [".", ".."])
+    def test_load_rejects_escaping_sidecar_name(self, tmp_path, sidecar_name):
+        (tmp_path / ".mobius-package.json").write_text(
+            f'{{"format": "mobius.model-package.v1", "mtp_head": "{sidecar_name}"}}\n'
+        )
+
+        with pytest.raises(ValueError, match="Invalid ModelPackage manifest"):
+            ModelPackage.load(str(tmp_path))
 
     def test_save_creates_directory(self, tmp_path):
         outdir = tmp_path / "nested" / "dir"
