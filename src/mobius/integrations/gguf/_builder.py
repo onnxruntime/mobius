@@ -1109,14 +1109,47 @@ def _raise_for_invalid_plamo2_tensor_contract(gguf_model) -> None:
 
     head_counts = metadata[f"{arch}.attention.head_count"]
     kv_counts = metadata[f"{arch}.attention.head_count_kv"]
-    if not isinstance(head_counts, (list, tuple, np.ndarray)) or not isinstance(
-        kv_counts, (list, tuple, np.ndarray)
-    ):
-        raise TypeError("PLaMo2 attention head counts must be per-layer arrays")
+    head_counts_are_arrays = isinstance(head_counts, (list, tuple, np.ndarray))
+    kv_counts_are_arrays = isinstance(kv_counts, (list, tuple, np.ndarray))
+    if head_counts_are_arrays and len(head_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+    if kv_counts_are_arrays and len(kv_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+    if kv_counts_are_arrays:
+        attention_layers = [int(value) > 0 for value in kv_counts]
+    elif head_counts_are_arrays:
+        attention_layers = [int(value) > 0 for value in head_counts]
+    else:
+        # Early llama.cpp PLaMo2 converters serialized the attention dimensions
+        # as scalars. The mutually exclusive tensor families still encode the
+        # exact layer schedule, so expand it only when every layer is unambiguous.
+        tensor_names = set(gguf_model.tensor_names)
+        attention_layers = []
+        for layer in range(layers):
+            has_attention = f"blk.{layer}.attn_qkv.weight" in tensor_names
+            has_mamba = f"blk.{layer}.ssm_in.weight" in tensor_names
+            if has_attention == has_mamba:
+                raise ValueError(
+                    "PLaMo2 scalar head metadata requires exactly one attention or "
+                    f"Mamba tensor family in layer {layer}"
+                )
+            attention_layers.append(has_attention)
+    if not head_counts_are_arrays:
+        attention_heads = int(head_counts)
+        if attention_heads <= 0:
+            raise ValueError("PLaMo2 scalar attention head_count must be positive")
+        head_counts = metadata[f"{arch}.attention.head_count"] = [
+            attention_heads if is_attention else 0 for is_attention in attention_layers
+        ]
+    if not kv_counts_are_arrays:
+        attention_kv_heads = int(kv_counts)
+        if attention_kv_heads <= 0:
+            raise ValueError("PLaMo2 scalar attention head_count_kv must be positive")
+        kv_counts = metadata[f"{arch}.attention.head_count_kv"] = [
+            attention_kv_heads if is_attention else 0 for is_attention in attention_layers
+        ]
     head_counts = [int(value) for value in head_counts]
     kv_counts = [int(value) for value in kv_counts]
-    if len(head_counts) != layers or len(kv_counts) != layers:
-        raise ValueError("PLaMo2 attention head arrays must match block_count")
 
     actual_shapes = {
         name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))

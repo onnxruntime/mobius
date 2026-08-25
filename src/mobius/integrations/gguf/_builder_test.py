@@ -837,6 +837,7 @@ def _write_plamo2_gguf(
     predefined_state: bool = False,
     head_counts: list[int] | None = None,
     kv_head_counts: list[int] | None = None,
+    legacy_scalar_heads: bool = False,
     quantized_embedding: bool = False,
     include_output: bool = False,
 ) -> None:
@@ -861,8 +862,10 @@ def _write_plamo2_gguf(
     writer.add_embedding_length(hidden)
     writer.add_feed_forward_length(intermediate)
     writer.add_block_count(2)
-    writer.add_head_count(head_counts or [0, heads])
-    writer.add_head_count_kv(kv_head_counts or [0, kv_heads])
+    writer.add_head_count(heads if legacy_scalar_heads else head_counts or [0, heads])
+    writer.add_head_count_kv(
+        kv_heads if legacy_scalar_heads else kv_head_counts or [0, kv_heads]
+    )
     writer.add_layer_norm_rms_eps(epsilon)
     writer.add_rope_freq_base(10_000.0)
     writer.add_vocab_size(vocab)
@@ -4546,6 +4549,16 @@ class TestPlamo2GGUFBuild:
         outputs = session.run(self._inputs(2))
         assert outputs["logits"].shape == (2, 2, 64)
         assert outputs["present.0.ssm_state"].dtype == np.float32
+
+    def test_legacy_scalar_heads_infer_exact_tensor_schedule(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-legacy-scalar-heads.gguf"
+        _write_plamo2_gguf(path, quantized=False, legacy_scalar_heads=True)
+        package = build_from_gguf(path)
+        assert package.config.layer_types == ["mamba", "full_attention"]
+        assert package.config.attention_head_counts == (0, 4)
+        assert package.config.attention_kv_head_counts == (0, 2)
 
     def test_quantized_source_preserves_exact_projection_roles(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf

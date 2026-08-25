@@ -179,6 +179,15 @@ class TestInspectGgufTokenizer:
         assert verdict.pre == "hunyuan-dense"
         assert "compiled llama.cpp behavior" in verdict.reason
 
+    def test_plamo2_legacy_default_pre_is_validated_but_deferred(self):
+        metadata = _metadata(pre="default")
+        metadata["tokenizer.ggml.model"] = "plamo2"
+        metadata.pop("tokenizer.ggml.merges")
+        verdict = inspect_gguf_tokenizer(metadata)
+        assert verdict.route == "deferred"
+        assert verdict.pre == "default"
+        assert verdict.canonical_pre == "default"
+
     def test_exact_embedded_json_is_copy_route(self):
         verdict = inspect_gguf_tokenizer(_metadata(embedded=True))
         assert verdict.route == "copy"
