@@ -1699,6 +1699,8 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
 
 def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
     """Require the exact dense tensor family for each audited hybrid layer."""
+    import numpy as np
+
     from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
 
     architecture = gguf_model.architecture
@@ -2027,6 +2029,16 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
     )
     if malformed:
         raise ValueError(f"Invalid Jamba GGUF tensor shape(s): {malformed}")
+    for index, layer_type in enumerate(layer_types):
+        if layer_type != "mamba":
+            continue
+        decay_name = f"blk.{index}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(decay_name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Jamba GGUF Mamba decay tensor {decay_name!r}: "
+                "ssm_a must contain only finite negative -exp(A_log) values"
+            )
 
 
 def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:

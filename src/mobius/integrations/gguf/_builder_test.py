@@ -957,6 +957,7 @@ def _write_jamba_gguf(
     expert_count: int = 2,
     expert_used_count: int = 1,
     malformed_shape: str | None = None,
+    invalid_decay: bool = False,
 ) -> None:
     """Write a tiny mixed Jamba GGUF with one dense and one routed layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -1007,6 +1008,8 @@ def _write_jamba_gguf(
         values = rng.normal(0.0, 0.03, size=shape).astype(np.float32)
         if negative:
             values = -np.exp(values)
+            if invalid_decay:
+                values.flat[0] = -np.inf
         if expert_order:
             for expert in range(shape[0]):
                 values[expert].fill(expert + 1)
@@ -4937,6 +4940,7 @@ class TestJambaGGUFBuild:
             ({"expert_count": 0, "expert_used_count": 1}, "expert_count"),
             ({"expert_count": 1, "expert_used_count": 1}, "not a routed-MoE"),
             ({"expert_count": 2, "expert_used_count": 3}, "expert_used_count"),
+            ({"invalid_decay": True}, "finite negative"),
             ({"extra": "blk.0.ssm_in.scale"}, "auxiliary|tensor closure"),
         ],
     )
