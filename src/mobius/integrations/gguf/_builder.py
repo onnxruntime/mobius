@@ -617,6 +617,7 @@ def _validate_gguf_model(
     _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
     _raise_for_invalid_plamo2_tensor_contract(gguf_model)
     _raise_for_invalid_minimax_tensor_contract(gguf_model)
+    _raise_for_invalid_kimi_linear_tensor_contract(gguf_model)
     _raise_for_invalid_hybrid_tensor_contract(gguf_model)
     _raise_for_invalid_t5_tensor_contract(gguf_model)
     _raise_for_malformed_recurrent_tensors(gguf_model)
@@ -755,6 +756,228 @@ def _raise_for_invalid_minimax_tensor_contract(gguf_model) -> None:
     }
     if malformed:
         raise ValueError(f"MiniMax-01 GGUF has invalid tensor shape(s): {malformed}")
+
+
+def _raise_for_invalid_kimi_linear_tensor_contract(gguf_model) -> None:
+    """Validate Kimi Linear's pinned metadata and exact heterogeneous closure."""
+    if gguf_model.architecture != "kimi-linear":
+        return
+
+    import numpy as np
+
+    from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    if int(gguf_model.format_version) != 3:
+        raise ValueError(
+            f"Kimi Linear supports only pinned GGUF v3, got v{gguf_model.format_version}"
+        )
+    metadata = gguf_model.metadata
+    arch = "kimi-linear"
+    layers, layer_types, mtp_count = _derive_hybrid_layout(
+        arch, metadata, gguf_model.tensor_names
+    )
+    assert layer_types is not None
+    if mtp_count:
+        raise ValueError("Kimi Linear GGUF does not support appended NextN blocks")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    dense_intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    value_dim = int(metadata[f"{arch}.attention.value_length_mla"])
+    kv_rank = int(metadata[f"{arch}.attention.kv_lora_rank"])
+    extra_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    kda_dim = int(metadata[f"{arch}.kda.head_dim"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    expert_intermediate = int(metadata[f"{arch}.expert_feed_forward_length"])
+    shared = int(metadata[f"{arch}.expert_shared_count"])
+    dense_layers = int(metadata[f"{arch}.leading_dense_block_count"])
+    routed_scale = float(metadata[f"{arch}.expert_weights_scale"])
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    if (
+        min(
+            layers,
+            hidden,
+            dense_intermediate,
+            heads,
+            qk_dim,
+            value_dim,
+            kv_rank,
+            extra_dim,
+            kda_dim,
+            conv,
+            experts,
+            top_k,
+            expert_intermediate,
+        )
+        <= 0
+        or qk_dim <= extra_dim
+        or top_k > experts
+        or shared != 1
+        or dense_layers != 1
+        or not math.isfinite(routed_scale)
+        or routed_scale <= 0
+        or not math.isfinite(epsilon)
+        or epsilon <= 0
+    ):
+        raise ValueError("Kimi Linear GGUF has inconsistent pinned architecture metadata")
+    for key in ("expert_group_count", "expert_group_used_count"):
+        if f"{arch}.{key}" in metadata and int(metadata[f"{arch}.{key}"]) != 1:
+            raise ValueError(f"Kimi Linear requires {arch}.{key}=1")
+
+    kv_counts = metadata[f"{arch}.attention.head_count_kv"]
+    if not isinstance(kv_counts, (list, tuple, np.ndarray)):
+        raise TypeError("kimi-linear.attention.head_count_kv must be an exact per-layer array")
+    kv_counts = [int(value) for value in kv_counts]
+    if len(kv_counts) != layers or any(value not in {0, 1} for value in kv_counts):
+        raise ValueError(
+            "Kimi Linear per-layer KV-head counts must contain block_count entries of 0 or 1"
+        )
+    if all(value == 0 for value in kv_counts) or all(value == 1 for value in kv_counts):
+        raise ValueError("Kimi Linear requires both KDA and MLA layers")
+
+    actual_shapes = {
+        name: tuple(int(dim) for dim in gguf_model.get_tensor_shape(name))
+        for name in gguf_model.tensor_names
+    }
+    vocab = int(
+        metadata.get(
+            f"{arch}.vocab_size",
+            actual_shapes.get("token_embd.weight", (0,))[0],
+        )
+    )
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+        "output.weight": (vocab, hidden),
+    }
+    projection_width = heads * kda_dim
+    nope_dim = qk_dim - extra_dim
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "ffn_norm.weight": (hidden,),
+            }
+        )
+        if layer_type == "kimi_linear_attention":
+            required.update(
+                {
+                    prefix + "attn_q.weight": (projection_width, hidden),
+                    prefix + "attn_k.weight": (projection_width, hidden),
+                    prefix + "attn_v.weight": (projection_width, hidden),
+                    prefix + "ssm_conv1d_q.weight": (1, projection_width, 1, conv),
+                    prefix + "ssm_conv1d_k.weight": (1, projection_width, 1, conv),
+                    prefix + "ssm_conv1d_v.weight": (1, projection_width, 1, conv),
+                    prefix + "ssm_f_a.weight": (kda_dim, hidden),
+                    prefix + "ssm_f_b.weight": (projection_width, kda_dim),
+                    prefix + "ssm_beta.weight": (heads, hidden),
+                    prefix + "ssm_a": (1, 1, heads, 1),
+                    prefix + "ssm_dt.bias": (projection_width,),
+                    prefix + "ssm_g_a.weight": (kda_dim, hidden),
+                    prefix + "ssm_g_b.weight": (projection_width, kda_dim),
+                    prefix + "ssm_norm.weight": (kda_dim,),
+                    prefix + "attn_output.weight": (hidden, projection_width),
+                }
+            )
+        else:
+            required.update(
+                {
+                    prefix + "attn_q.weight": (heads * qk_dim, hidden),
+                    prefix + "attn_kv_a_mqa.weight": (kv_rank + extra_dim, hidden),
+                    prefix + "attn_kv_a_norm.weight": (kv_rank,),
+                    prefix + "attn_k_b.weight": (heads, kv_rank, nope_dim),
+                    prefix + "attn_v_b.weight": (heads, value_dim, kv_rank),
+                    prefix + "attn_output.weight": (hidden, heads * value_dim),
+                }
+            )
+        if layer < dense_layers:
+            required.update(
+                {
+                    prefix + "ffn_gate.weight": (dense_intermediate, hidden),
+                    prefix + "ffn_up.weight": (dense_intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, dense_intermediate),
+                }
+            )
+        else:
+            shared_width = shared * expert_intermediate
+            required.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "exp_probs_b.bias": (experts,),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        expert_intermediate,
+                    ),
+                    prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                }
+            )
+
+    actual = set(gguf_model.tensor_names)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - actual)
+    unexpected = sorted(actual - set(required))
+    if missing or unexpected or out_of_range:
+        raise ValueError(
+            "Invalid Kimi Linear GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, out_of_range={out_of_range}"
+        )
+    malformed = {
+        name: (shape, actual_shapes.get(name))
+        for name, shape in required.items()
+        if actual_shapes.get(name) != shape
+    }
+    if malformed:
+        raise ValueError(f"Kimi Linear GGUF has invalid tensor shape(s): {malformed}")
+
+    float_types = float_storage_type_ids()
+    non_matmul = {
+        name
+        for name in required
+        if name.endswith(("_norm.weight", "ssm_a", "ssm_dt.bias", "exp_probs_b.bias"))
+        or "conv1d" in name
+    }
+    invalid_storage = []
+    for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
+        qtype_id = getattr(qtype, "value", qtype)
+        if name in non_matmul and qtype_id not in float_types:
+            invalid_storage.append(name)
+    if invalid_storage:
+        raise ValueError(
+            "Kimi Linear recurrent, norm, and routing auxiliary tensors must remain float: "
+            f"{sorted(invalid_storage)}"
+        )
+
+    for layer, layer_type in enumerate(layer_types):
+        if layer_type != "kimi_linear_attention":
+            continue
+        name = f"blk.{layer}.ssm_a"
+        decay = np.asarray(gguf_model.get_tensor(name))
+        if not np.all(np.isfinite(decay)) or not np.all(decay < 0):
+            raise ValueError(
+                f"Malformed Kimi Linear decay tensor {name!r}: expected finite -exp(A_log)"
+            )
 
 
 def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
@@ -3085,6 +3308,11 @@ def build_from_gguf(
             f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
             "they carry per-layer conv_state and ssm_state rather than a KV cache."
         )
+    if static_cache and gguf_arch == "kimi-linear":
+        raise ValueError(
+            "Kimi Linear does not support static cache: KDA layers carry three "
+            "convolution histories and one recurrent matrix state"
+        )
     if gguf_arch == "falcon-h1":
         from mobius.tasks import FalconH1CausalLMTask
 
@@ -3688,6 +3916,10 @@ def _replace_native_block_linears(
         hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
             continue
+        if gguf_arch == "kimi-linear" and hf_name.endswith(
+            (".k_b_proj.weight", ".v_b_proj.weight")
+        ):
+            continue
         for stem in _native_block_target_stems(hf_name, np_shape, quantized_stems):
             replacements[stem] = format_name
 
@@ -3870,7 +4102,11 @@ def _normalize_gguf_weights(
         # Stacked expert weights [num_experts, out, ...] → per-expert.
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            for container in (".mlp.experts", ".feed_forward.experts"):
+            for container in (
+                ".mlp.experts",
+                ".feed_forward.experts",
+                ".block_sparse_moe.moe.experts",
+            ):
                 marker = f"{container}.{proj}."
                 if marker in key and value.dim() >= 3:
                     prefix, suffix = key.rsplit(marker, 1)
@@ -4711,6 +4947,13 @@ def _load_quantized_state_dict(
             np_shape,
             quantized_stems,
         )
+        if gguf_arch == "kimi-linear" and module_hf_name.endswith(
+            (".k_b_proj.weight", ".v_b_proj.weight")
+        ):
+            # These tensors are rank-3 in GGUF. They target one flattened
+            # projection rather than an expert-major collection.
+            affine_targets = []
+            native_targets = []
         fused_projection_targets = _fused_projection_target_stems(
             module_hf_name, quantized_stems
         )
@@ -4956,6 +5199,25 @@ def _load_quantized_state_dict(
                     data_section_offset,
                     tensors_by_name[gguf_name],
                 )
+            elif gguf_arch == "kimi-linear" and hf_name.endswith(
+                (".k_b_proj.weight", ".v_b_proj.weight")
+            ):
+                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                if hf_name.endswith(".k_b_proj.weight"):
+                    values = values.transpose(0, 2, 1).reshape(
+                        int(np_shape[0]) * int(np_shape[2]), int(np_shape[1])
+                    )
+                else:
+                    values = values.reshape(
+                        int(np_shape[0]) * int(np_shape[1]), int(np_shape[2])
+                    )
+                repacked = repack_dequantized_tensor(
+                    values,
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                n_requantized += 1
             elif route is QuantImportRoute.AFFINE_REPACK and can_repack(qtype_val):
                 shape_2d = (int(np_shape[0]), int(np_shape[1]))
                 repacked = repack_gguf_tensor(

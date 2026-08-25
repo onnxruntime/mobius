@@ -1402,6 +1402,153 @@ def _write_minimax_gguf(
     writer.close()
 
 
+def _write_kimi_linear_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    omit: str | None = None,
+    extra: str | None = None,
+    malformed_shape: str | None = None,
+    kv_heads: list[int] | None = None,
+    gating: int = 2,
+) -> None:
+    """Write a tiny pinned-format Kimi Linear GGUF with one KDA and one MLA layer."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 64
+    dense_intermediate = 64
+    expert_intermediate = 32
+    vocab = 64
+    heads = 2
+    kda_dim = 32
+    qk_dim = 48
+    extra_dim = 16
+    value_dim = 32
+    kv_rank = 32
+    conv = 4
+    experts = 2
+    rng = np.random.default_rng(617)
+
+    writer = GGUFWriter(str(path), "kimi-linear")
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(dense_intermediate)
+    writer.add_block_count(2)
+    writer.add_head_count(heads)
+    writer.add_array(
+        "kimi-linear.attention.head_count_kv",
+        kv_heads if kv_heads is not None else [0, 1],
+    )
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_uint32("kimi-linear.attention.key_length_mla", qk_dim)
+    writer.add_uint32("kimi-linear.attention.value_length_mla", value_dim)
+    writer.add_uint32("kimi-linear.attention.kv_lora_rank", kv_rank)
+    writer.add_rope_dimension_count(extra_dim)
+    writer.add_uint32("kimi-linear.ssm.conv_kernel", conv)
+    writer.add_uint32("kimi-linear.kda.head_dim", kda_dim)
+    writer.add_expert_count(experts)
+    writer.add_expert_used_count(1)
+    writer.add_uint32("kimi-linear.expert_feed_forward_length", expert_intermediate)
+    writer.add_uint32("kimi-linear.expert_shared_count", 1)
+    writer.add_uint32("kimi-linear.leading_dense_block_count", 1)
+    writer.add_float32("kimi-linear.expert_weights_scale", 2.446)
+    writer.add_uint32("kimi-linear.expert_gating_func", gating)
+    writer.add_vocab_size(vocab)
+
+    def shape_for(name: str, shape: tuple[int, ...]) -> tuple[int, ...]:
+        if name == malformed_shape:
+            return (*shape[:-1], shape[-1] + 1)
+        return shape
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        shape = shape_for(name, shape)
+        values = rng.normal(0.0, 0.02, shape).astype(np.float32)
+        if name.endswith("ssm_a"):
+            values = -np.exp(values)
+        elif name.endswith(("output_norm.weight", "attn_norm.weight", "ffn_norm.weight")):
+            values.fill(1.0)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        shape = shape_for(name, shape)
+        assert shape[-1] % 32 == 0
+        raw = np.zeros((*shape[:-1], shape[-1] // 32 * 18), dtype=np.uint8)
+        for index in np.ndindex(shape[:-1]):
+            for block in range(shape[-1] // 32):
+                offset = block * 18
+                raw[(*index, slice(offset, offset + 2))] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
+                    0, 256, 16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    projection = add_q4 if quantized else add_float
+    projection("output.weight", (vocab, hidden))
+    projection_width = heads * kda_dim
+
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+        projection(prefix + "attn_output.weight", (hidden, projection_width))
+        if layer == 0:
+            projection(prefix + "attn_q.weight", (projection_width, hidden))
+            projection(prefix + "attn_k.weight", (projection_width, hidden))
+            projection(prefix + "attn_v.weight", (projection_width, hidden))
+            add_float(prefix + "ssm_conv1d_q.weight", (1, projection_width, 1, conv))
+            add_float(prefix + "ssm_conv1d_k.weight", (1, projection_width, 1, conv))
+            add_float(prefix + "ssm_conv1d_v.weight", (1, projection_width, 1, conv))
+            projection(prefix + "ssm_f_a.weight", (kda_dim, hidden))
+            projection(prefix + "ssm_f_b.weight", (projection_width, kda_dim))
+            projection(prefix + "ssm_beta.weight", (heads, hidden))
+            add_float(prefix + "ssm_a", (1, 1, heads, 1))
+            add_float(prefix + "ssm_dt.bias", (projection_width,))
+            projection(prefix + "ssm_g_a.weight", (kda_dim, hidden))
+            projection(prefix + "ssm_g_b.weight", (projection_width, kda_dim))
+            add_float(prefix + "ssm_norm.weight", (kda_dim,))
+            projection(prefix + "ffn_gate.weight", (dense_intermediate, hidden))
+            projection(prefix + "ffn_up.weight", (dense_intermediate, hidden))
+            projection(prefix + "ffn_down.weight", (hidden, dense_intermediate))
+        else:
+            projection(prefix + "attn_q.weight", (heads * qk_dim, hidden))
+            projection(prefix + "attn_kv_a_mqa.weight", (kv_rank + extra_dim, hidden))
+            add_float(prefix + "attn_kv_a_norm.weight", (kv_rank,))
+            projection(prefix + "attn_k_b.weight", (heads, kv_rank, qk_dim - extra_dim))
+            projection(prefix + "attn_v_b.weight", (heads, value_dim, kv_rank))
+            add_float(prefix + "ffn_gate_inp.weight", (experts, hidden))
+            add_float(prefix + "exp_probs_b.bias", (experts,))
+            projection(
+                prefix + "ffn_gate_exps.weight",
+                (experts, expert_intermediate, hidden),
+            )
+            projection(
+                prefix + "ffn_up_exps.weight",
+                (experts, expert_intermediate, hidden),
+            )
+            projection(
+                prefix + "ffn_down_exps.weight",
+                (experts, hidden, expert_intermediate),
+            )
+            projection(prefix + "ffn_gate_shexp.weight", (expert_intermediate, hidden))
+            projection(prefix + "ffn_up_shexp.weight", (expert_intermediate, hidden))
+            projection(prefix + "ffn_down_shexp.weight", (hidden, expert_intermediate))
+    if extra is not None:
+        add_float(extra, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_nemotron_h_moe_gguf(
     path: Path,
     *,
@@ -5662,6 +5809,192 @@ class TestMiniMaxGGUFBuild:
         graph_build.assert_not_called()
 
 
+class TestKimiLinearGGUFBuild:
+    """Kimi Linear GGUF import preserves its heterogeneous state and tensor roles."""
+
+    @staticmethod
+    def _inputs(
+        tokens: np.ndarray,
+        states: dict[str, np.ndarray] | None = None,
+        attention_mask: np.ndarray | None = None,
+    ):
+        batch, sequence = tokens.shape
+        if states is None:
+            states = {
+                "past_key_values.0.q_conv_state": np.zeros((batch, 64, 3), dtype=np.float32),
+                "past_key_values.0.k_conv_state": np.zeros((batch, 64, 3), dtype=np.float32),
+                "past_key_values.0.v_conv_state": np.zeros((batch, 64, 3), dtype=np.float32),
+                "past_key_values.0.recurrent_state": np.zeros(
+                    (batch, 2, 32, 32), dtype=np.float32
+                ),
+                "past_key_values.1.key": np.zeros((batch, 2, 0, 48), dtype=np.float32),
+                "past_key_values.1.value": np.zeros((batch, 2, 0, 32), dtype=np.float32),
+            }
+        past = states["past_key_values.1.key"].shape[2]
+        return {
+            "input_ids": tokens,
+            "attention_mask": (
+                np.ones((batch, past + sequence), dtype=np.int64)
+                if attention_mask is None
+                else attention_mask
+            ),
+            "position_ids": np.broadcast_to(
+                np.arange(past, past + sequence, dtype=np.int64), (batch, sequence)
+            ).copy(),
+            **states,
+        }
+
+    def test_float_import_runtime_state_replay_reorder_and_roundtrip(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-f32.gguf"
+        _write_kimi_linear_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert package.config.layer_types == ["kimi_linear_attention", "full_attention"]
+        assert model.metadata_props["mobius.cache_abi"].startswith(
+            "KDA:q_conv_state,k_conv_state,v_conv_state,recurrent_state"
+        )
+        assert [value.name for value in model.graph.outputs[1:]] == [
+            "present.0.q_conv_state",
+            "present.0.k_conv_state",
+            "present.0.v_conv_state",
+            "present.0.recurrent_state",
+            "present.1.key",
+            "present.1.value",
+        ]
+
+        session = OnnxModelSession(model)
+        try:
+            prefill = session.run(self._inputs(np.asarray([[1, 2], [3, 4]], np.int64)))
+            snapshot = {
+                name.replace("present.", "past_key_values."): value.copy()
+                for name, value in prefill.items()
+                if name.startswith("present.")
+            }
+            tokens = np.asarray([[5], [6]], np.int64)
+            first = session.run(self._inputs(tokens, snapshot))
+            replay = session.run(self._inputs(tokens, snapshot))
+            np.testing.assert_array_equal(first["logits"], replay["logits"])
+
+            reordered = {name: value[::-1].copy() for name, value in snapshot.items()}
+            swapped = session.run(self._inputs(tokens[::-1].copy(), reordered))
+            np.testing.assert_allclose(
+                swapped["logits"], first["logits"][::-1], rtol=1e-5, atol=1e-5
+            )
+        finally:
+            session.close()
+
+        output = tmp_path / "roundtrip"
+        package.save(output, progress_bar=False)
+        reloaded = ModelPackage.load(output)
+        assert set(reloaded) == {"model"}
+        assert (
+            reloaded["model"].metadata_props["mobius.cache_abi"]
+            == model.metadata_props["mobius.cache_abi"]
+        )
+
+    def test_quantized_source_preserves_only_matmul_roles(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-q4.gguf"
+        _write_kimi_linear_gguf(path, quantized=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        quantized_inputs = [
+            node.inputs[1].name
+            for node in model.graph
+            if node.op_type == "MatMulNBits" and len(node.inputs) > 1
+        ]
+        assert quantized_inputs
+        assert all(
+            not any(term in name for term in ("norm", "conv1d", "A_log", "dt_bias"))
+            for name in quantized_inputs
+        )
+
+    def test_left_padding_does_not_change_valid_logits_or_states(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-padding.gguf"
+        _write_kimi_linear_gguf(path, quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        try:
+            unpadded = session.run(self._inputs(np.asarray([[7, 8]], np.int64)))
+            padded = session.run(
+                self._inputs(
+                    np.asarray([[0, 0, 7, 8]], np.int64),
+                    attention_mask=np.asarray([[0, 0, 1, 1]], np.int64),
+                )
+            )
+            np.testing.assert_allclose(
+                padded["logits"][:, -2:], unpadded["logits"], rtol=1e-5, atol=1e-5
+            )
+            for name, expected in unpadded.items():
+                if not name.startswith("present."):
+                    continue
+                actual = padded[name]
+                if name.endswith((".key", ".value")):
+                    actual = actual[:, :, -expected.shape[2] :]
+                np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+        finally:
+            session.close()
+
+    def test_static_cache_is_rejected(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-static.gguf"
+        _write_kimi_linear_gguf(path, quantized=False)
+        with pytest.raises(ValueError, match="does not support static cache"):
+            build_from_gguf(path, static_cache=True)
+
+    def test_cli_build(self, tmp_path: Path) -> None:
+        from mobius.__main__ import main
+        from mobius._model_package import ModelPackage
+
+        path = tmp_path / "kimi-linear-cli.gguf"
+        output = tmp_path / "kimi-linear-cli-output"
+        _write_kimi_linear_gguf(path, quantized=False)
+        main(["build-gguf", str(path), "--output", str(output), "--dequantize"])
+        package = ModelPackage.load(output)
+        assert "model" in package
+        assert "KDA:q_conv_state" in package["model"].metadata_props["mobius.cache_abi"]
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"omit": "blk.0.ssm_a"}, "tensor closure"),
+            ({"extra": "blk.2.attn_q.weight"}, "out_of_range"),
+            (
+                {"malformed_shape": "blk.1.attn_k_b.weight"},
+                "invalid tensor shape",
+            ),
+            ({"kv_heads": [0, 0]}, "requires both KDA and MLA"),
+            ({"gating": 0}, "must be SIGMOID"),
+        ],
+    )
+    def test_invalid_contract_fails_before_graph(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        kwargs: dict[str, object],
+        match: str,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "kimi-linear-invalid.gguf"
+        _write_kimi_linear_gguf(path, quantized=False, **kwargs)
+        graph_build = mock.Mock(side_effect=AssertionError("graph construction reached"))
+        monkeypatch.setattr(core_builder, "build_from_module", graph_build)
+        with pytest.raises((TypeError, ValueError), match=match):
+            build_from_gguf(path)
+        graph_build.assert_not_called()
+
+
 class TestGraniteHybridMoEGGUFBuild:
     """GraniteHybrid GGUF import preserves mixed state and routed expert order."""
 
@@ -6337,7 +6670,6 @@ class TestGGUFPreflightGuards:
             "bailingmoe3",
             "deepseek4",
             "kimi-k3",
-            "kimi-linear",
             "arctic",
             "dbrx",
             "gpt-oss",

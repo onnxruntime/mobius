@@ -596,6 +596,44 @@ _WEIGHT = frozenset({".weight"})
 _PROJECTION = frozenset({".weight", ".scale", ".input_scale"})
 _BIASED_PROJECTION = frozenset({".weight", ".bias", ".scale", ".input_scale"})
 
+_RECURRENT_SUFFIXES["kimi-linear"] = {
+    "token_embd": _WEIGHT,
+    "output": _PROJECTION,
+    "output_norm": _WEIGHT,
+    "blk.{bid}.attn_norm": _WEIGHT,
+    "blk.{bid}.ffn_norm": _WEIGHT,
+    "blk.{bid}.attn_q": _PROJECTION,
+    "blk.{bid}.attn_k": _PROJECTION,
+    "blk.{bid}.attn_v": _PROJECTION,
+    "blk.{bid}.ssm_conv1d_q": _WEIGHT,
+    "blk.{bid}.ssm_conv1d_k": _WEIGHT,
+    "blk.{bid}.ssm_conv1d_v": _WEIGHT,
+    "blk.{bid}.ssm_f_a": _PROJECTION,
+    "blk.{bid}.ssm_f_b": _PROJECTION,
+    "blk.{bid}.ssm_beta": _PROJECTION,
+    "blk.{bid}.ssm_a": frozenset({""}),
+    "blk.{bid}.ssm_dt": frozenset({".bias"}),
+    "blk.{bid}.ssm_g_a": _PROJECTION,
+    "blk.{bid}.ssm_g_b": _PROJECTION,
+    "blk.{bid}.ssm_norm": _WEIGHT,
+    "blk.{bid}.attn_output": _PROJECTION,
+    "blk.{bid}.attn_kv_a_norm": _WEIGHT,
+    "blk.{bid}.attn_kv_a_mqa": _PROJECTION,
+    "blk.{bid}.attn_k_b": _PROJECTION,
+    "blk.{bid}.attn_v_b": _PROJECTION,
+    "blk.{bid}.ffn_gate": _PROJECTION,
+    "blk.{bid}.ffn_up": _PROJECTION,
+    "blk.{bid}.ffn_down": _PROJECTION,
+    "blk.{bid}.ffn_gate_inp": _WEIGHT,
+    "blk.{bid}.exp_probs_b": frozenset({".bias"}),
+    "blk.{bid}.ffn_gate_exps": _PROJECTION,
+    "blk.{bid}.ffn_up_exps": _PROJECTION,
+    "blk.{bid}.ffn_down_exps": _PROJECTION,
+    "blk.{bid}.ffn_gate_shexp": _PROJECTION,
+    "blk.{bid}.ffn_up_shexp": _PROJECTION,
+    "blk.{bid}.ffn_down_shexp": _PROJECTION,
+}
+
 _DENSE_DIFFUSION_SUFFIXES = {
     "token_embd": _WEIGHT,
     "output": _PROJECTION,
@@ -745,6 +783,46 @@ _MINIMAX_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
 }
 
+_KIMI_LINEAR_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.ssm_conv1d_q": "model.layers.{bid}.self_attn.q_conv1d.weight@",
+    "blk.{bid}.ssm_conv1d_k": "model.layers.{bid}.self_attn.k_conv1d.weight@",
+    "blk.{bid}.ssm_conv1d_v": "model.layers.{bid}.self_attn.v_conv1d.weight@",
+    "blk.{bid}.ssm_f_a": "model.layers.{bid}.self_attn.f_a_proj",
+    "blk.{bid}.ssm_f_b": "model.layers.{bid}.self_attn.f_b_proj",
+    "blk.{bid}.ssm_beta": "model.layers.{bid}.self_attn.b_proj",
+    "blk.{bid}.ssm_a": "model.layers.{bid}.self_attn.A_log@",
+    "blk.{bid}.ssm_dt": "model.layers.{bid}.self_attn.dt_bias@",
+    "blk.{bid}.ssm_g_a": "model.layers.{bid}.self_attn.g_a_proj",
+    "blk.{bid}.ssm_g_b": "model.layers.{bid}.self_attn.g_b_proj",
+    "blk.{bid}.ssm_norm": "model.layers.{bid}.self_attn.o_norm",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_k_b": "model.layers.{bid}.self_attn.k_b_proj",
+    "blk.{bid}.attn_v_b": "model.layers.{bid}.self_attn.v_b_proj",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.block_sparse_moe.moe.gate",
+    "blk.{bid}.exp_probs_b": (
+        "model.layers.{bid}.block_sparse_moe.moe.gate.e_score_correction_bias@"
+    ),
+    "blk.{bid}.ffn_gate_exps": ("model.layers.{bid}.block_sparse_moe.moe.experts.gate_proj"),
+    "blk.{bid}.ffn_up_exps": ("model.layers.{bid}.block_sparse_moe.moe.experts.up_proj"),
+    "blk.{bid}.ffn_down_exps": ("model.layers.{bid}.block_sparse_moe.moe.experts.down_proj"),
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.block_sparse_moe.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.block_sparse_moe.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj",
+}
+
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -829,6 +907,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
         "minimax": _MINIMAX_MAPPING,
+        "kimi_linear": _KIMI_LINEAR_MAPPING,
     }
 )
 

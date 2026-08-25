@@ -333,6 +333,46 @@ def _process_plamo2(
     return state_dict
 
 
+def _process_kimi_linear(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert the pinned Kimi Linear converter's recurrent tensor transforms."""
+    del config
+    for name in tuple(state_dict):
+        tensor = state_dict[name]
+        if name.endswith((".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")):
+            if tensor.dim() != 4 or tensor.shape[0] != 1 or tensor.shape[2] != 1:
+                raise ValueError(
+                    f"Kimi Linear convolution tensor {name!r} must have shape "
+                    f"[1, channels, 1, kernel], got {tuple(tensor.shape)}"
+                )
+            state_dict[name] = tensor.reshape(tensor.shape[1], tensor.shape[3])
+        elif name.endswith(".A_log"):
+            if not torch.all(torch.isfinite(tensor)) or not torch.all(tensor < 0):
+                raise ValueError(
+                    f"Kimi Linear decay tensor {name!r} must contain finite negative values"
+                )
+            state_dict[name] = torch.log(-tensor)
+        elif name.endswith(".k_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi Linear K-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.transpose(1, 2).reshape(
+                tensor.shape[0] * tensor.shape[2], tensor.shape[1]
+            )
+        elif name.endswith(".v_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"Kimi Linear V-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.reshape(
+                tensor.shape[0] * tensor.shape[1], tensor.shape[2]
+            )
+    return state_dict
+
+
 def _process_granitehybrid(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -385,6 +425,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "mamba": _process_mamba,
     "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
+    "kimi_linear": _process_kimi_linear,
 }
 
 #: mobius ``model_type`` values that no GGUF architecture maps to, but that a

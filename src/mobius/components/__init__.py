@@ -33,6 +33,8 @@ __all__ = [
     "GatedDeltaNet",
     "GatedMLP",
     "GatedRMSNorm",
+    "KimiDeltaAttention",
+    "KimiMLAAttention",
     "Gemma3nAudioEncoder",
     "Gemma3nMultimodalEmbedder",
     "GlmOcrVisionModel",
@@ -181,6 +183,7 @@ from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
 from mobius.components._gemma4_audio import ClippableLinear
 from mobius.components._gemma4_audio import Gemma4AudioEncoder as Gemma4AudioEncoder
 from mobius.components._glm_ocr_vision import GlmOcrVisionModel
+from mobius.components._kimi_linear import KimiDeltaAttention, KimiMLAAttention
 from mobius.components._lightning_attention import (
     LightningAttention as LightningAttention,
 )

@@ -284,6 +284,16 @@ class TestBuildGraph:
                 assert f"present.{i}.recurrent_state" in output_names, (
                     f"Missing present.{i}.recurrent_state"
                 )
+            elif ltype == "kimi_linear_attention":
+                for state_name in (
+                    "q_conv_state",
+                    "k_conv_state",
+                    "v_conv_state",
+                    "recurrent_state",
+                ):
+                    assert f"present.{i}.{state_name}" in output_names, (
+                        f"Missing present.{i}.{state_name}"
+                    )
             elif ltype in ("mamba", "mamba2"):
                 assert f"present.{i}.conv_state" in output_names, (
                     f"Missing present.{i}.conv_state"

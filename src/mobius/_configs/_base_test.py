@@ -9,7 +9,104 @@ import types
 
 import pytest
 
-from mobius._configs import ArchitectureConfig, MiniMaxConfig, NemotronParseConfig
+from mobius._configs import (
+    ArchitectureConfig,
+    KimiLinearConfig,
+    MiniMaxConfig,
+    NemotronParseConfig,
+)
+
+
+def _kimi_linear_hf_config(**overrides):
+    values = {
+        "model_type": "kimi_linear",
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 48,
+        "vocab_size": 64,
+        "max_position_embeddings": 64,
+        "rms_norm_eps": 1e-6,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "linear_attn_config": {
+            "kda_layers": [1, 2, 3],
+            "full_attn_layers": [4],
+            "num_heads": 2,
+            "head_dim": 32,
+            "short_conv_kernel_size": 4,
+        },
+        "mla_use_nope": True,
+        "q_lora_rank": None,
+        "qk_nope_head_dim": 32,
+        "qk_rope_head_dim": 16,
+        "v_head_dim": 32,
+        "kv_lora_rank": 32,
+        "first_k_dense_replace": 1,
+        "moe_intermediate_size": 32,
+        "moe_layer_freq": 1,
+        "moe_renormalize": True,
+        "moe_router_activation_func": "sigmoid",
+        "num_experts": 2,
+        "num_experts_per_token": 1,
+        "num_expert_group": 1,
+        "topk_group": 1,
+        "num_shared_experts": 1,
+        "num_nextn_predict_layers": 0,
+        "routed_scaling_factor": 2.446,
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+def test_kimi_linear_config_extracts_exact_schedule() -> None:
+    config = KimiLinearConfig.from_transformers(_kimi_linear_hf_config())
+
+    assert config.layer_types == [
+        "kimi_linear_attention",
+        "kimi_linear_attention",
+        "kimi_linear_attention",
+        "full_attention",
+    ]
+    assert config.linear_key_head_dim == 32
+    assert config.qk_nope_head_dim == 32
+    assert config.qk_rope_head_dim == 16
+
+
+def test_kimi_linear_config_uses_top_level_head_count_when_nested_value_is_absent() -> None:
+    config = _kimi_linear_hf_config()
+    del config.linear_attn_config["num_heads"]
+
+    extracted = KimiLinearConfig.from_transformers(config)
+
+    assert extracted.linear_num_key_heads == config.num_attention_heads
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        (
+            {
+                "linear_attn_config": {
+                    "kda_layers": [1, 2],
+                    "full_attn_layers": [4],
+                    "num_heads": 2,
+                    "head_dim": 32,
+                    "short_conv_kernel_size": 4,
+                }
+            },
+            "exactly partition",
+        ),
+        ({"num_expert_group": 2}, "single expert-group"),
+    ],
+)
+def test_kimi_linear_config_rejects_non_authoritative_profiles(
+    override: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        KimiLinearConfig.from_transformers(_kimi_linear_hf_config(**override))
 
 
 def test_minimax_config_extracts_exact_schedule_head_geometry_and_residuals():

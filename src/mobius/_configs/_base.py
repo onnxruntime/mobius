@@ -1504,6 +1504,88 @@ class MiniMaxConfig(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class KimiLinearConfig(CausalLMConfig):
+    """Exact configuration for Moonshot Kimi Linear models."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> KimiLinearConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        linear = _as_attribute_config(getattr(config, "linear_attn_config", None))
+        if linear is None:
+            raise ValueError("Kimi Linear requires linear_attn_config")
+
+        kda_layers = [int(i) for i in getattr(linear, "kda_layers", ())]
+        full_layers = [int(i) for i in getattr(linear, "full_attn_layers", ())]
+        expected = set(range(1, base.num_hidden_layers + 1))
+        if set(kda_layers) & set(full_layers):
+            raise ValueError("Kimi Linear KDA and full-attention schedules must not overlap")
+        if set(kda_layers) | set(full_layers) != expected:
+            raise ValueError(
+                "Kimi Linear schedules must exactly partition one-based layer indices "
+                f"1..{base.num_hidden_layers}"
+            )
+        if len(kda_layers) != len(set(kda_layers)) or len(full_layers) != len(
+            set(full_layers)
+        ):
+            raise ValueError("Kimi Linear schedules must not contain duplicate layers")
+        if not bool(getattr(config, "mla_use_nope", False)):
+            raise ValueError("Kimi Linear requires mla_use_nope=true")
+        if getattr(config, "q_lora_rank", None) not in (None, 0):
+            raise ValueError("Kimi Linear Q-LoRA is not supported by the authoritative graph")
+        if int(getattr(config, "num_nextn_predict_layers", 0)):
+            raise ValueError("Kimi Linear NextN prediction layers are not supported")
+        if int(getattr(config, "moe_layer_freq", 1)) != 1:
+            raise ValueError("Kimi Linear requires moe_layer_freq=1")
+        if str(getattr(config, "moe_router_activation_func", "")) != "sigmoid":
+            raise ValueError("Kimi Linear requires sigmoid expert routing")
+        if not bool(getattr(config, "moe_renormalize", False)):
+            raise ValueError("Kimi Linear requires selected expert weight renormalization")
+        n_group = int(vars(config).get("num_expert_group", 1))
+        topk_group = int(vars(config).get("topk_group", 1))
+        if n_group != 1 or topk_group != 1:
+            raise ValueError(
+                "Kimi Linear supports only the pinned single expert-group profile"
+            )
+
+        num_heads = int(vars(linear).get("num_heads", base.num_attention_heads))
+        head_dim = int(linear.head_dim)
+        if num_heads != base.num_attention_heads:
+            raise ValueError("Kimi Linear KDA and MLA head counts must match")
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="kimi_linear",
+            layer_types=[
+                "kimi_linear_attention" if i + 1 in set(kda_layers) else "full_attention"
+                for i in range(base.num_hidden_layers)
+            ],
+            linear_num_key_heads=num_heads,
+            linear_num_value_heads=num_heads,
+            linear_key_head_dim=head_dim,
+            linear_value_head_dim=head_dim,
+            linear_conv_kernel_dim=int(linear.short_conv_kernel_size),
+            num_local_experts=int(config.num_experts),
+            num_experts_per_tok=int(config.num_experts_per_token),
+            n_group=n_group,
+            topk_group=topk_group,
+            n_shared_experts=int(config.num_shared_experts),
+            norm_topk_prob=True,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            disable_qmoe=True,
+            rope_type=None,
+            rope_theta=None,
+            rope_scaling=None,
+            partial_rotary_factor=None,
+        )
+        result = cls(**fields)
+        if result.qk_nope_head_dim is None or result.qk_rope_head_dim is None:
+            raise ValueError("Kimi Linear requires both MLA key dimension fields")
+        if result.v_head_dim is None or result.kv_lora_rank is None:
+            raise ValueError("Kimi Linear requires MLA value dimension and KV-LoRA rank")
+        return result
+
+
+@dataclasses.dataclass
 class EncoderConfig(ArchitectureConfig):
     """Configuration for encoder-only models (BERT, ViT, etc.)."""
 

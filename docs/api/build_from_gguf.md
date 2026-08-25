@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 87, 'rejected': 2, 'supported': 58}; importable: 56; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
+| Architectures | 147 | graph verdicts: {'deferred': 86, 'rejected': 2, 'supported': 59}; importable: 57; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
@@ -412,7 +412,7 @@ before graph construction or durable output.
 | `jina-bert-v2` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JinaBERT v2 uses ALiBi, optional full-width Q/K norms, an extra attention norm, and either separate or fused GeGLU inputs. Mobius has no graph with that exact combination. |
 | `jina-bert-v3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. BertModel has absolute positions and no MoE path. |
 | `kimi-k3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Kimi-K3 alternates KDA recurrent and NoPE MLA layers and requires convolution plus matrix state, sigmoid routed latent MoE with SiTU experts, optional shared experts, and cross-layer residual banks. Kimi-Linear is not an alias: its gates, expert activation, latent projections, and residual contract differ. Mobius has no exact graph or mixed-state task for either ABI. |
-| `kimi-linear` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Kimi-Linear alternates KDA recurrent and NoPE MLA layers, carrying three rolling convolution histories and a per-head matrix state in addition to attention cache. Its two-stage decay/output gates and sigmoid correction-bias MoE routing are not represented by any Mobius graph or state task; aliasing it to Kimi-K3, Mamba, or ordinary attention would change the model. |
+| `kimi-linear` | — | model=`kimi_linear`; tensor=`kimi_linear` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The exact KDA/NoPE-MLA schedule, four-state recurrent ABI, dense/MoE topology, correction-bias routing, pinned metadata, tensor closure, and compatible MatMul/expert quantization are supported. Released generic ORT GenAI cache schemas cannot represent heterogeneous KV plus three convolution histories and a matrix state, and representative real-weight GGUF evidence is pending; package runtime remains tracked by onnxruntime/mobius#605. |
 | `laguna` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Laguna combines per-head-or-element softplus attention gates, dual-RoPE interleaved sliding-window attention, a dense prefix, and sigmoid correction-biased routed/shared experts. Mobius has no exact graph or iSWA cache contract. |
 | `lfm2` | — | model=`lfm2`; tensor=`lfm2` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. |
 | `lfm2moe` | — | model=`lfm2_moe`; tensor=`lfm2`+`lfm2_moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
@@ -614,6 +614,50 @@ real full-logit plus deterministic stateful-generation evidence.
 attention, dense-MLP, and routed-MoE scheduling. Files with a folded MTP block
 still fail before graph construction because no released package contract
 represents that auxiliary attention+MoE head.
+
+### Remaining hybrid cohort
+
+`bailingmoe3`, `deepseek4`, and `kimi-k3` are explicitly
+deferred before config extraction. Their loader inventories are
+suffix-exact in the pinned census, but none has an exact Mobius graph plus state
+task. No aliases are accepted.
+
+- BailingMoE3 and Kimi-K3 mix KDA recurrence with MLA. A recurrent
+  layer carries three Q/K/V convolution histories and a per-head matrix state;
+  an MLA layer carries attention cache. BailingMoE3 also has gated attention,
+  correction-biased routed/shared SwiGLU experts, and optional single-layer
+  NextN storage. Kimi-K3 adds SiTU, latent expert projections, and cross-layer
+  residual banks.
+- Kimi-Linear now has a dedicated graph and task. The importer reconstructs the
+  exact per-layer KDA/NoPE-MLA schedule from `attention.head_count_kv`, validates
+  dense-versus-MoE closure, restores `A_log`, convolution, and split MLA K/V-B
+  layouts, and exposes three convolution histories plus one FP32 recurrent matrix
+  for each KDA layer. Static cache and generic OGA packaging remain unsupported
+  because released decoder cache schemas cannot represent that heterogeneous ABI.
+- DeepSeek-V4 requires raw sliding-window K, ratio-4 CSA, ratio-128 HCA, and
+  indexer compressed caches plus persistent compressor and rollback state.
+  Compression ratios are per-layer and limited to `0`, `4`, or `128`; ratio 4
+  alone owns indexer-compressor tensors. Hash-routed prefix layers and later
+  sqrt-softplus/correction-bias layers share neither selection inputs nor cache
+  behavior. The Mobius Hugging Face model intentionally exports a dense fallback
+  with ordinary KV state, so it remains valid for `mobius build` but cannot be
+  used for `general.architecture=deepseek4`.
+- LFM2MoE serializes its arbitrary attention/short-convolution schedule as the
+  complete `attention.head_count_kv` array (`0` means convolution). It switches
+  from dense SwiGLU to sigmoid, correction-biased, normalized routed experts at
+  `leading_dense_block_count`. Recurrent state is F32 rolling convolution
+  history with copy-on-write reorder and bounded rollback snapshots; it is not
+  ordinary KV or the dense LFM2 task.
+- The pinned GGUF closures use separate gate/up/down expert tensors. They do not
+  contain emitted `.scale` or `.input_scale` sidecars: DeepSeek-V4 and Kimi-K3
+  converter input scales are consumed while forming MXFP4 expert weights.
+  Recurrent coefficients, convolution kernels, biases, norms, hash tables, and
+  residual/compressor sidecars are not mathematically interchangeable with
+  MatMul weights and must never be silently preserved or dropped.
+- Partial NextN/MTP, fused gate-up experts, mixed tied output storage, unknown
+  mixer tensors, and auxiliary heads remain outside the admitted contract.
+  Runtime status cannot advance without a pinned real artifact, independent
+  full-logit parity, and deterministic stateful generation evidence.
 
 ### Audio/TTS/codec cohort
 
