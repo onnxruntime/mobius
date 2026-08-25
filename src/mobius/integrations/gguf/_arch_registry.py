@@ -74,18 +74,6 @@ _NO_TENSOR_MAP = (
     "checkpoint with `mobius build` instead."
 )
 
-_NEMOTRON_H_MOE_REASON = (
-    "Direct GGUF conversion is intentionally disabled. GGUF block_count includes a "
-    "combined attention+MoE MTP auxiliary block, so aliasing it to the 52-layer "
-    "'nemotron_h' backbone would build the wrong graph. The Nemotron-H Mamba2 path "
-    "also lacks passing full-logit/generation parity, and common GGUF presets "
-    "contain Q5_0/Q5_1 expert tensors that cannot be preserved by MatMulNBits. Use "
-    "llama.cpp/Unsloth to run the GGUF without changing its quantization, or start "
-    "from the official pinned BF16 Hugging Face checkpoint and quantize the "
-    "validated ONNX export with Olive only after L4/L5 semantic generation passes. "
-    "See docs/api/build_from_gguf.md for the pinned recipe and waiver."
-)
-
 _MMPROJ_REASON = (
     "This is a multimodal projector sidecar, not a language model. Upstream it is a "
     "quant-only stub whose runtime lives outside libllama. Pass it to "
@@ -1094,6 +1082,34 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
+        gguf_arch="nemotron_h_moe",
+        model_type="nemotron_h",
+        tensor_map_recipe=("nemotron_h_moe",),
+        config_key_map="nemotron_h",
+        config_postprocessor="nemotron_h_moe",
+        tensor_processor="mamba",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_feed_forward_length",
+        ),
+        runtime=Support.DEFERRED,
+        reason=(
+            "Exact mixed attention/Mamba2/dense/MoE scheduling, sigmoid correction-bias "
+            "routing, shared experts, optional latent projections, and strict GGUF tensor "
+            "closure are supported. Generic ORT GenAI runtime packaging remains deferred "
+            "because its released cache schema cannot represent heterogeneous KV, "
+            "convolution, and recurrent state slots; tracked by onnxruntime/mobius#605."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="granitehybrid",
         model_type="granitemoehybrid",
         tensor_map_recipe=("granitehybrid",),
@@ -1745,15 +1761,6 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
         reason=_RWKV_GRAPH_REASONS["rwkv7"],
-    ),
-    GGUFArchitectureSpec(
-        gguf_arch="nemotron_h_moe",
-        config=Support.REJECTED,
-        tensor_map=Support.REJECTED,
-        graph=Support.REJECTED,
-        runtime=Support.REJECTED,
-        quantized_import=Support.REJECTED,
-        reason=_NEMOTRON_H_MOE_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch=MMPROJ_ARCHITECTURE,

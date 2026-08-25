@@ -1091,6 +1091,11 @@ def build_gemma4_vlm_from_gguf(
     text_gguf = (
         _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
     )
+    if text_gguf.architecture != "gemma4":
+        raise ValueError(
+            "Gemma4 VLM package construction requires a gemma4 text GGUF; "
+            f"got {text_gguf.architecture!r}"
+        )
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
 
     preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, "gemma4")

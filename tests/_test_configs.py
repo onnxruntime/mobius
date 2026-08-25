@@ -1475,6 +1475,31 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    # Nemotron-H latent MoE: gate/shared expert use hidden states while routed
+    # experts operate in the projected latent space.
+    (
+        "nemotron_h",
+        {
+            "hidden_act": "relu2",
+            "layer_types": ["mamba2", "moe", "full_attention", "moe"],
+            "_config_cls": NemotronHConfig,
+            "num_hidden_layers": 4,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "moe_latent_size": TINY_HIDDEN // 2,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE * 2,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 2.5,
+        },
+        True,
+    ),
     # nemotron_h MoE variant: hybrid Mamba2+MoE+Attention (Nemotron-3 30B/120B)
     (
         "nemotron_h",

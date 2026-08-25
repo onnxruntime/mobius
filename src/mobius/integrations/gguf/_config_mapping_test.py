@@ -66,9 +66,9 @@ class TestSecondHybridCohortConfig:
             f"{architecture}.ssm.state_size": 8,
             f"{architecture}.ssm.time_step_rank": 8,
         }
-        if architecture in {"nemotron_h", "granitehybrid"}:
+        if architecture in {"nemotron_h", "nemotron_h_moe", "granitehybrid"}:
             metadata[f"{architecture}.ssm.group_count"] = 2
-        if architecture == "nemotron_h":
+        if architecture in {"nemotron_h", "nemotron_h_moe"}:
             metadata[f"{architecture}.feed_forward_length"] = [0, 128, 0]
         return metadata
 
@@ -145,7 +145,7 @@ class TestSecondHybridCohortConfig:
         with pytest.raises(ValueError, match=r"exactly 3|each contain exactly 3"):
             gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
 
-    @pytest.mark.parametrize("architecture", ["nemotron_h", "granitehybrid"])
+    @pytest.mark.parametrize("architecture", ["granitehybrid"])
     def test_moe_modes_fail_closed(self, architecture: str) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 
@@ -154,6 +154,52 @@ class TestSecondHybridCohortConfig:
         metadata[f"{architecture}.expert_used_count"] = 2
         with pytest.raises(ValueError, match="MoE"):
             gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+
+    def test_nemotron_h_moe_derives_exact_routed_schedule_and_defaults(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("nemotron_h_moe")
+        metadata.update(
+            {
+                "nemotron_h_moe.expert_count": 4,
+                "nemotron_h_moe.expert_used_count": 2,
+                "nemotron_h_moe.expert_feed_forward_length": 96,
+                "nemotron_h_moe.expert_shared_count": 1,
+                "nemotron_h_moe.expert_shared_feed_forward_length": 192,
+                "nemotron_h_moe.expert_weights_norm": True,
+                "nemotron_h_moe.expert_weights_scale": 2.5,
+                "nemotron_h_moe.moe_latent_size": 32,
+            }
+        )
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "nemotron_h_moe",
+                metadata,
+                [
+                    "token_embd.weight",
+                    "blk.1.ffn_gate_inp.weight",
+                    "blk.1.ffn_latent_down.weight",
+                    "blk.1.ffn_latent_up.weight",
+                ],
+            )
+        )
+        assert config.layer_types == ["mamba2", "moe", "mamba2"]
+        assert config.num_local_experts == 4
+        assert config.num_experts_per_tok == 2
+        assert config.moe_intermediate_size == 96
+        assert config.shared_expert_intermediate_size == 192
+        assert config.moe_latent_size == 32
+        assert config.norm_topk_prob is True
+        assert config.routed_scaling_factor == pytest.approx(2.5)
+
+    def test_dense_nemotron_h_rejects_moe_metadata(self) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("nemotron_h")
+        metadata["nemotron_h.expert_count"] = 4
+        metadata["nemotron_h.expert_used_count"] = 2
+        with pytest.raises(ValueError, match="nemotron_h_moe"):
+            gguf_to_config(_FakeDenseGGUF("nemotron_h", metadata, ["token_embd.weight"]))
 
     def test_jamba_derives_exact_routed_layer_schedule(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
