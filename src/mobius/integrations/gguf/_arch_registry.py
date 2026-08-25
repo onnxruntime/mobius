@@ -1135,7 +1135,16 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         runtime=Support.DEFERRED,
         quantized_import=Support.REJECTED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+        reason=(
+            "Exact mixed attention/Mamba2 scheduling, architecture-wide dense or routed "
+            "MoE feed-forward selection, optional shared experts, Granite scaling, "
+            "value-preserving float expert fusion, and strict pinned tensor closure are "
+            "supported. Quantized sources require explicit dequantization because the "
+            "current graph has no exact packed 3-D expert ABI; use keep_quantized=False. "
+            "Generic ORT GenAI runtime packaging remains deferred because its released cache "
+            "schema cannot represent heterogeneous KV, convolution, and recurrent state "
+            "slots; tracked by onnxruntime/mobius#605."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="bailingmoe3",

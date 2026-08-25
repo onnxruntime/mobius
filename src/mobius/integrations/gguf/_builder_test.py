@@ -1103,6 +1103,174 @@ def _write_jamba_gguf(
     writer.close()
 
 
+def _write_granitehybrid_moe_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    omit: str | None = None,
+    extra: str | None = None,
+    expert_count: int = 2,
+    expert_used_count: int = 1,
+    shared_width: int = 16,
+    attention_biases: bool = True,
+    malformed_shape: str | None = None,
+) -> None:
+    """Write a tiny mixed GraniteHybrid GGUF with routed and shared experts."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    expert_width = 32
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    inner = 64
+    ssm_heads = 4
+    groups = 1
+    state = 4
+    kernel = 4
+    rng = np.random.default_rng(614)
+
+    writer = GGUFWriter(str(path), "granitehybrid")
+    writer.add_context_length(32)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(expert_width)
+    writer.add_block_count(2)
+    writer.add_head_count(heads)
+    writer.add_head_count_kv([0, kv_heads])
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab)
+    writer.add_ssm_conv_kernel(kernel)
+    writer.add_ssm_inner_size(inner)
+    writer.add_ssm_state_size(state)
+    writer.add_ssm_time_step_rank(ssm_heads)
+    writer.add_ssm_group_count(groups)
+    writer.add_expert_count(expert_count)
+    writer.add_expert_used_count(expert_used_count)
+    if shared_width:
+        writer.add_expert_shared_feed_forward_length(shared_width)
+    writer.add_embedding_scale(12.0)
+    writer.add_residual_scale(0.5)
+    writer.add_attention_scale(0.125)
+    writer.add_logit_scale(16.0)
+    writer.add_bool("granitehybrid.rope.scaling.finetuned", False)
+    writer.add_string("granitehybrid.feed_forward.activation", "silu")
+
+    def adjusted_shape(name: str, shape: tuple[int, ...]) -> tuple[int, ...]:
+        if name == malformed_shape:
+            return (*shape[:-1], shape[-1] + 1)
+        return shape
+
+    def add_float(
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        fill: float | None = None,
+        expert_base: float | None = None,
+        negative: bool = False,
+    ) -> None:
+        if name == omit:
+            return
+        shape = adjusted_shape(name, shape)
+        values = rng.normal(0.0, 0.03, size=shape).astype(np.float32)
+        if fill is not None:
+            values.fill(fill)
+        if expert_base is not None:
+            for expert in range(shape[0]):
+                values[expert].fill(expert_base + expert)
+        if negative:
+            values = -np.exp(values)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        shape = adjusted_shape(name, shape)
+        assert shape[-1] % 32 == 0
+        byte_shape = (*shape[:-1], shape[-1] // 32 * 18)
+        raw = np.zeros(byte_shape, dtype=np.uint8)
+        for index in np.ndindex(shape[:-1]):
+            for block in range(shape[-1] // 32):
+                offset = block * 18
+                raw[(*index, slice(offset, offset + 2))] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_gate_inp.weight", (expert_count, hidden))
+        expert_projection = add_q4 if quantized else add_float
+        if quantized:
+            expert_projection(
+                prefix + "ffn_gate_exps.weight",
+                (expert_count, expert_width, hidden),
+            )
+            expert_projection(
+                prefix + "ffn_up_exps.weight",
+                (expert_count, expert_width, hidden),
+            )
+            expert_projection(
+                prefix + "ffn_down_exps.weight",
+                (expert_count, hidden, expert_width),
+            )
+        else:
+            add_float(
+                prefix + "ffn_gate_exps.weight",
+                (expert_count, expert_width, hidden),
+                expert_base=11.0,
+            )
+            add_float(
+                prefix + "ffn_up_exps.weight",
+                (expert_count, expert_width, hidden),
+                expert_base=21.0,
+            )
+            add_float(
+                prefix + "ffn_down_exps.weight",
+                (expert_count, hidden, expert_width),
+                expert_base=31.0,
+            )
+        if shared_width:
+            add_float(prefix + "ffn_gate_shexp.weight", (shared_width, hidden))
+            add_float(prefix + "ffn_up_shexp.weight", (shared_width, hidden))
+            add_float(prefix + "ffn_down_shexp.weight", (hidden, shared_width))
+
+    add_float(
+        "blk.0.ssm_in.weight",
+        (2 * inner + 2 * groups * state + ssm_heads, hidden),
+    )
+    add_float("blk.0.ssm_conv1d.weight", (inner + 2 * groups * state, kernel))
+    add_float("blk.0.ssm_conv1d.bias", (inner + 2 * groups * state,))
+    add_float("blk.0.ssm_dt.bias", (ssm_heads,))
+    add_float("blk.0.ssm_a", (ssm_heads, 1), negative=True)
+    add_float("blk.0.ssm_d", (ssm_heads, 1))
+    add_float("blk.0.ssm_norm.weight", (groups, inner // groups))
+    add_float("blk.0.ssm_out.weight", (hidden, inner))
+
+    head_dim = hidden // heads
+    add_float("blk.1.attn_q.weight", (heads * head_dim, hidden))
+    add_float("blk.1.attn_k.weight", (kv_heads * head_dim, hidden))
+    add_float("blk.1.attn_v.weight", (kv_heads * head_dim, hidden))
+    if attention_biases:
+        add_float("blk.1.attn_q.bias", (heads * head_dim,))
+        add_float("blk.1.attn_k.bias", (kv_heads * head_dim,))
+        add_float("blk.1.attn_v.bias", (kv_heads * head_dim,))
+    add_float("blk.1.attn_output.weight", (hidden, heads * head_dim))
+    if extra is not None:
+        add_float(extra, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_nemotron_h_moe_gguf(
     path: Path,
     *,
@@ -5135,6 +5303,182 @@ class TestJambaGGUFBuild:
         assert not graph_build_started
 
 
+class TestGraniteHybridMoEGGUFBuild:
+    """GraniteHybrid GGUF import preserves mixed state and routed expert order."""
+
+    @staticmethod
+    def _inputs(tokens: np.ndarray) -> dict[str, np.ndarray]:
+        batch, sequence = tokens.shape
+        return {
+            "input_ids": tokens,
+            "position_ids": np.broadcast_to(
+                np.arange(sequence, dtype=np.int64),
+                (batch, sequence),
+            ).copy(),
+            "attention_mask": np.ones((batch, sequence), np.int64),
+            "past_key_values.0.conv_state": np.zeros((batch, 72, 3), np.float32),
+            "past_key_values.0.ssm_state": np.zeros((batch, 4, 4, 16), np.float32),
+            "past_key_values.1.key": np.zeros((batch, 2, 0, 8), np.float32),
+            "past_key_values.1.value": np.zeros((batch, 2, 0, 8), np.float32),
+        }
+
+    def test_float_import_preserves_expert_order_and_round_trips(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-moe-f32.gguf"
+        _write_granitehybrid_moe_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert [value.name for value in model.graph.outputs] == [
+            "logits",
+            "present.0.conv_state",
+            "present.0.ssm_state",
+            "present.1.key",
+            "present.1.value",
+        ]
+        for layer in range(2):
+            fused = model.graph.initializers[
+                f"model.layers.{layer}.block_sparse_moe.input_linear.weight"
+            ].const_value.numpy()
+            down = model.graph.initializers[
+                f"model.layers.{layer}.block_sparse_moe.output_linear.weight"
+            ].const_value.numpy()
+            for expert in range(2):
+                np.testing.assert_array_equal(fused[expert, :32], 11.0 + expert)
+                np.testing.assert_array_equal(fused[expert, 32:], 21.0 + expert)
+                np.testing.assert_array_equal(down[expert], 31.0 + expert)
+
+        output_dir = tmp_path / "saved-granitehybrid"
+        package.save(output_dir, progress_bar=False)
+        session = OnnxModelSession(ModelPackage.load(output_dir)["model"])
+        outputs = session.run(self._inputs(np.asarray([[1, 2], [3, 4]], np.int64)))
+        assert outputs["logits"].shape == (2, 2, 64)
+        assert outputs["present.0.conv_state"].shape == (2, 72, 3)
+        assert outputs["present.0.ssm_state"].shape == (2, 4, 4, 16)
+
+    def test_prefill_decode_reorder_rollback_and_replay(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-moe-state.gguf"
+        _write_granitehybrid_moe_gguf(path, quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        histories = np.asarray([[1, 2], [3, 4]], np.int64)
+        prefill = session.run(self._inputs(histories))
+        snapshot = {name: np.array(value, copy=True) for name, value in prefill.items()}
+
+        order = np.asarray([1, 0], np.int64)
+        next_tokens = np.asarray([[5], [6]], np.int64)
+        decode_inputs = {
+            "input_ids": next_tokens,
+            "position_ids": np.full((2, 1), 2, np.int64),
+            "attention_mask": np.ones((2, 3), np.int64),
+            "past_key_values.0.conv_state": snapshot["present.0.conv_state"][order],
+            "past_key_values.0.ssm_state": snapshot["present.0.ssm_state"][order],
+            "past_key_values.1.key": snapshot["present.1.key"][order],
+            "past_key_values.1.value": snapshot["present.1.value"][order],
+        }
+        decoded = session.run(decode_inputs)
+        replayed = session.run(decode_inputs)
+        for name in decoded:
+            np.testing.assert_array_equal(decoded[name], replayed[name])
+
+        full_tokens = np.concatenate([histories[order], next_tokens], axis=1)
+        full = session.run(self._inputs(full_tokens))
+        np.testing.assert_allclose(
+            decoded["logits"][:, -1],
+            full["logits"][:, -1],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+
+    def test_optional_shared_expert_can_be_absent(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-moe-no-shared.gguf"
+        _write_granitehybrid_moe_gguf(path, quantized=False, shared_width=0)
+        model = build_from_gguf(path)["model"]
+        assert not any("shared_mlp" in name for name in model.graph.initializers)
+
+    def test_attention_biases_can_be_absent(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-moe-no-attention-bias.gguf"
+        _write_granitehybrid_moe_gguf(path, quantized=False, attention_biases=False)
+        model = build_from_gguf(path)["model"]
+        assert not any(
+            name.startswith("model.layers.1.self_attn.")
+            and name.endswith((".q_proj.bias", ".k_proj.bias", ".v_proj.bias"))
+            for name in model.graph.initializers
+        )
+
+    def test_quantized_source_requires_explicit_dequantization(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-moe-q4.gguf"
+        _write_granitehybrid_moe_gguf(path, quantized=True)
+        with pytest.raises(ValueError, match=r"keep_quantized=False"):
+            build_from_gguf(path, keep_quantized=True)
+
+        model = build_from_gguf(path, keep_quantized=False)["model"]
+        assert all(node.op_type != "MatMulNBits" for node in model.graph)
+        assert model.graph.initializers[
+            "model.layers.0.block_sparse_moe.input_linear.weight"
+        ].shape == [2, 64, 32]
+
+    def test_cli_builds_dequantized_package(self, tmp_path: Path) -> None:
+        from mobius.__main__ import main
+        from mobius._model_package import ModelPackage
+
+        path = tmp_path / "granitehybrid-moe-cli.gguf"
+        output_dir = tmp_path / "cli-output"
+        _write_granitehybrid_moe_gguf(path, quantized=False)
+
+        main(["build-gguf", str(path), "--output", str(output_dir), "--dequantize"])
+
+        package = ModelPackage.load(output_dir)
+        assert set(package) == {"model"}
+        assert (output_dir / "model.onnx").is_file()
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"omit": "blk.1.ffn_up_exps.weight"}, "tensor closure"),
+            ({"extra": "blk.0.ffn_gate.weight"}, "mixes dense and routed"),
+            (
+                {"malformed_shape": "blk.1.ffn_gate_exps.weight"},
+                "tensor shape",
+            ),
+            ({"expert_count": 0, "expert_used_count": 1}, "both be zero or both positive"),
+            ({"expert_count": 1, "expert_used_count": 1}, "not a routed-MoE"),
+            ({"expert_count": 2, "expert_used_count": 3}, "must be in"),
+            ({"omit": "blk.1.attn_q.bias"}, "partial attention Q/K/V projection"),
+            ({"extra": "blk.0.ffn_gate_up_exps.weight"}, "unexpected|Malformed"),
+            ({"extra": "blk.0.ffn_gate_exps.scale"}, "auxiliary quantization"),
+            ({"extra": "blk.2.ffn_gate_inp.weight"}, "out_of_range"),
+        ],
+    )
+    def test_malformed_sources_fail_before_graph(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        kwargs: dict[str, object],
+        match: str,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-moe-invalid.gguf"
+        _write_granitehybrid_moe_gguf(path, quantized=False, **kwargs)
+        graph_build = mock.Mock(side_effect=AssertionError("graph construction reached"))
+        monkeypatch.setattr(core_builder, "build_from_module", graph_build)
+        with pytest.raises(ValueError, match=match):
+            build_from_gguf(path)
+        graph_build.assert_not_called()
+
+
 class TestNemotronHMoEGGUFBuild:
     """Nemotron-H GGUF import preserves hybrid state and exact expert semantics."""
 
@@ -6352,7 +6696,12 @@ class TestHybridTensorContract:
                     "ssm_d",
                     "ssm_out.weight",
                 ],
-                ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"],
+                [
+                    "attn_q.weight",
+                    "attn_k.weight",
+                    "attn_v.weight",
+                    "attn_output.weight",
+                ],
             ]
         elif architecture == "nemotron_h":
             common = ["attn_norm.weight"]
@@ -6386,7 +6735,15 @@ class TestHybridTensorContract:
                     "ssm_norm.weight",
                     "ssm_out.weight",
                 ],
-                ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"],
+                [
+                    "attn_q.weight",
+                    "attn_q.bias",
+                    "attn_k.weight",
+                    "attn_k.bias",
+                    "attn_v.weight",
+                    "attn_v.bias",
+                    "attn_output.weight",
+                ],
             ]
         for layer, mixer in enumerate(mixers):
             names.extend(f"blk.{layer}.{suffix}" for suffix in [*common, *mixer])
@@ -6439,7 +6796,6 @@ class TestHybridTensorContract:
             )
         partial_bias = {
             "nemotron_h": "blk.1.ffn_up.bias",
-            "granitehybrid": "blk.1.attn_q.bias",
         }.get(architecture)
         if partial_bias is not None:
             with pytest.raises(ValueError, match=r"partial .* bias family"):

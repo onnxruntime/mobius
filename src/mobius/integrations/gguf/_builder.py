@@ -1796,13 +1796,30 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
             },
         }
     else:
-        common = {
-            "attn_norm.weight",
-            "ffn_norm.weight",
-            "ffn_gate.weight",
-            "ffn_up.weight",
-            "ffn_down.weight",
+        common = {"attn_norm.weight", "ffn_norm.weight"}
+        num_experts = int(metadata.get("granitehybrid.expert_count", 0))
+        top_k = int(metadata.get("granitehybrid.expert_used_count", 0))
+        if bool(num_experts) != bool(top_k):
+            raise ValueError(
+                "GraniteHybrid expert_count and expert_used_count must both be zero "
+                "or both positive"
+            )
+        dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+        routed_ffn = {
+            "ffn_gate_inp.weight",
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
         }
+        shared_ffn = {
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+        }
+        shared_width = int(metadata.get("granitehybrid.expert_shared_feed_forward_length", 0))
+        common |= routed_ffn if num_experts else dense_ffn
+        if num_experts and shared_width > 0:
+            common |= shared_ffn
         required_by_type = {
             "mamba2": {
                 "ssm_in.weight",
@@ -1830,6 +1847,18 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 "rope_freqs.weight",
             },
         }
+        forbidden_ffn = dense_ffn if num_experts else routed_ffn | shared_ffn
+        present_forbidden = sorted(
+            f"blk.{index}.{suffix}"
+            for index in range(layer_count)
+            for suffix in forbidden_ffn
+            if f"blk.{index}.{suffix}" in actual
+        )
+        if present_forbidden:
+            raise ValueError(
+                "GraniteHybrid GGUF mixes dense and routed/shared MoE representations: "
+                f"{present_forbidden}"
+            )
 
     expected = set(required_global)
     allowed = required_global | optional_global
@@ -1855,6 +1884,11 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
         "recurrent convolution",
         [f"blk.{index}.ssm_conv1d.bias" for index in recurrent_layers],
     )
+    if architecture in {"nemotron_h", "nemotron_h_moe", "granitehybrid"}:
+        require_all_or_none(
+            "attention output projection",
+            [f"blk.{index}.attn_output.bias" for index in attention_layers],
+        )
     if architecture == "granitehybrid":
         require_all_or_none(
             "attention Q/K/V projection",
@@ -1864,10 +1898,16 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 for projection in ("q", "k", "v")
             ],
         )
-    if architecture in {"nemotron_h", "nemotron_h_moe", "granitehybrid"}:
+    if architecture == "granitehybrid" and not int(
+        metadata.get("granitehybrid.expert_count", 0)
+    ):
         require_all_or_none(
-            "attention output projection",
-            [f"blk.{index}.attn_output.bias" for index in attention_layers],
+            "dense shared-MLP",
+            [
+                f"blk.{index}.ffn_{projection}.bias"
+                for index in range(layer_count)
+                for projection in ("gate", "up", "down")
+            ],
         )
     if architecture in {"nemotron_h", "nemotron_h_moe"}:
         mlp_layers = [
@@ -1949,9 +1989,7 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
             f"unexpected={unexpected}, out_of_range={out_of_range}"
         )
 
-    if architecture not in {"jamba", "nemotron_h", "nemotron_h_moe"} or not hasattr(
-        gguf_model, "tensor_items_raw"
-    ):
+    if not hasattr(gguf_model, "tensor_items_raw"):
         return
 
     shapes = {
@@ -1960,6 +1998,9 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
     }
     if architecture in {"nemotron_h", "nemotron_h_moe"}:
         _validate_nemotron_h_tensor_shapes(gguf_model, layer_types, actual)
+        return
+    if architecture == "granitehybrid":
+        _validate_granitehybrid_tensor_shapes(gguf_model, layer_types, actual)
         return
 
     hidden = int(metadata["jamba.embedding_length"])
@@ -2196,6 +2237,148 @@ def _validate_nemotron_h_tensor_shapes(gguf_model, layer_types, actual: set[str]
     )
     if malformed:
         raise ValueError(f"Invalid Nemotron-H GGUF tensor shape(s): {malformed}")
+
+
+def _validate_granitehybrid_tensor_shapes(gguf_model, layer_types, actual: set[str]) -> None:
+    """Validate logical GraniteHybrid tensor shapes before graph construction."""
+    metadata = gguf_model.metadata
+    arch = gguf_model.architecture
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    heads_raw = metadata[f"{arch}.attention.head_count"]
+    heads_by_layer = (
+        [int(value) for value in heads_raw]
+        if isinstance(heads_raw, (list, tuple, np.ndarray))
+        else [int(heads_raw)] * len(layer_types)
+    )
+    kv_by_layer = [int(value) for value in metadata[f"{arch}.attention.head_count_kv"]]
+    attention_heads = next(
+        (
+            heads_by_layer[index]
+            for index, kind in enumerate(layer_types)
+            if kind == "full_attention"
+        ),
+        0,
+    )
+    head_dim = int(
+        metadata.get(
+            f"{arch}.attention.key_length",
+            hidden // attention_heads if attention_heads else 0,
+        )
+    )
+    state = int(metadata[f"{arch}.ssm.state_size"])
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    groups = int(metadata[f"{arch}.ssm.group_count"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+    expert_count = int(metadata.get(f"{arch}.expert_count", 0))
+    expert_width = int(metadata[f"{arch}.feed_forward_length"])
+    shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+
+    expected: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    if "output.weight" in actual:
+        expected["output.weight"] = (vocab, hidden)
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        expected[prefix + "attn_norm.weight"] = (hidden,)
+        expected[prefix + "ffn_norm.weight"] = (hidden,)
+        if layer_type == "mamba2":
+            conv_width = inner + 2 * groups * state
+            expected.update(
+                {
+                    prefix + "ssm_in.weight": (
+                        2 * inner + 2 * groups * state + ssm_heads,
+                        hidden,
+                    ),
+                    prefix + "ssm_conv1d.weight": (conv_width, conv),
+                    prefix + "ssm_dt.bias": (ssm_heads,),
+                    prefix + "ssm_a": (ssm_heads, 1),
+                    prefix + "ssm_d": (ssm_heads, 1),
+                    prefix + "ssm_norm.weight": (groups, inner // groups),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+            if prefix + "ssm_conv1d.bias" in actual:
+                expected[prefix + "ssm_conv1d.bias"] = (conv_width,)
+        else:
+            heads = heads_by_layer[layer]
+            kv_heads = kv_by_layer[layer]
+            expected.update(
+                {
+                    prefix + "attn_q.weight": (heads * head_dim, hidden),
+                    prefix + "attn_q.bias": (heads * head_dim,),
+                    prefix + "attn_k.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_k.bias": (kv_heads * head_dim,),
+                    prefix + "attn_v.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_v.bias": (kv_heads * head_dim,),
+                    prefix + "attn_output.weight": (hidden, heads * head_dim),
+                }
+            )
+            if prefix + "attn_output.bias" in actual:
+                expected[prefix + "attn_output.bias"] = (hidden,)
+
+        if expert_count:
+            expected.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (expert_count, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        expert_count,
+                        expert_width,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        expert_count,
+                        expert_width,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        expert_count,
+                        hidden,
+                        expert_width,
+                    ),
+                }
+            )
+            if shared_width:
+                expected.update(
+                    {
+                        prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                    }
+                )
+        else:
+            expected.update(
+                {
+                    prefix + "ffn_gate.weight": (expert_width, hidden),
+                    prefix + "ffn_up.weight": (expert_width, hidden),
+                    prefix + "ffn_down.weight": (hidden, expert_width),
+                }
+            )
+            for projection, size in (
+                ("gate", expert_width),
+                ("up", expert_width),
+                ("down", hidden),
+            ):
+                name = prefix + f"ffn_{projection}.bias"
+                if name in actual:
+                    expected[name] = (size,)
+
+    malformed = sorted(
+        f"{name}: expected {expected_shape}, got {shapes[name]}"
+        for name, expected_shape in expected.items()
+        if name in shapes and shapes[name] != expected_shape
+    )
+    if malformed:
+        raise ValueError(f"Invalid GraniteHybrid GGUF tensor shape(s): {malformed}")
 
 
 def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:

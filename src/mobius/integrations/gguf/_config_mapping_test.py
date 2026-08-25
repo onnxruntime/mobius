@@ -145,15 +145,81 @@ class TestSecondHybridCohortConfig:
         with pytest.raises(ValueError, match=r"exactly 3|each contain exactly 3"):
             gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
 
-    @pytest.mark.parametrize("architecture", ["granitehybrid"])
-    def test_moe_modes_fail_closed(self, architecture: str) -> None:
+    def test_granitehybrid_moe_extracts_exact_geometry_and_scaling(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config
 
-        metadata = self._metadata(architecture)
-        metadata[f"{architecture}.expert_count"] = 4
-        metadata[f"{architecture}.expert_used_count"] = 2
-        with pytest.raises(ValueError, match="MoE"):
-            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["token_embd.weight"]))
+        metadata = self._metadata("granitehybrid")
+        metadata.update(
+            {
+                "granitehybrid.expert_count": 4,
+                "granitehybrid.expert_used_count": 2,
+                "granitehybrid.expert_shared_feed_forward_length": 96,
+                "granitehybrid.embedding_scale": 12.0,
+                "granitehybrid.residual_scale": 0.5,
+                "granitehybrid.attention.scale": 0.125,
+                "granitehybrid.logit_scale": 16.0,
+                "granitehybrid.rope.scaling.finetuned": False,
+            }
+        )
+        config = gguf_to_config(
+            _FakeDenseGGUF(
+                "granitehybrid",
+                metadata,
+                [
+                    "token_embd.weight",
+                    "blk.1.attn_q.bias",
+                    "blk.1.attn_output.bias",
+                ],
+            )
+        )
+        assert config.layer_types == ["mamba2", "full_attention", "mamba2"]
+        assert config.num_local_experts == 4
+        assert config.num_experts_per_tok == 2
+        assert config.intermediate_size == 128
+        assert config.shared_intermediate_size == 96
+        assert config.norm_topk_prob is True
+        assert config.routed_scaling_factor == pytest.approx(1.0)
+        assert config.embedding_multiplier == pytest.approx(12.0)
+        assert config.residual_multiplier == pytest.approx(0.5)
+        assert config.attention_multiplier == pytest.approx(0.125)
+        assert config.logits_scaling == pytest.approx(16.0)
+        assert config.rope_type is None
+        assert config.attn_qkv_bias is True
+        assert config.attn_o_bias is True
+
+    @pytest.mark.parametrize(
+        ("updates", "match"),
+        [
+            ({"expert_count": 4}, "both be zero or both positive"),
+            ({"expert_count": 1, "expert_used_count": 1}, "not a routed-MoE"),
+            ({"expert_count": 4, "expert_used_count": 5}, "must be in"),
+            (
+                {
+                    "expert_count": 4,
+                    "expert_used_count": 2,
+                    "expert_weights_norm": False,
+                },
+                "normalized top-k",
+            ),
+            (
+                {
+                    "expert_count": 4,
+                    "expert_used_count": 2,
+                    "expert_weights_scale": 2.0,
+                },
+                "does not define",
+            ),
+            ({"logit_scale": 0.0}, "must be nonzero"),
+            ({"feed_forward_length": 0}, "must be greater than zero"),
+        ],
+    )
+    def test_granitehybrid_invalid_moe_config_rejects(self, updates, match) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("granitehybrid")
+        metadata.update({f"granitehybrid.{key}": value for key, value in updates.items()})
+        with pytest.raises(ValueError, match=match):
+            gguf_to_config(_FakeDenseGGUF("granitehybrid", metadata, ["token_embd.weight"]))
 
     def test_nemotron_h_moe_derives_exact_routed_schedule_and_defaults(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config

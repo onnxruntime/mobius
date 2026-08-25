@@ -590,15 +590,12 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in hf_kwargs["layer_types"]
         ]
 
-    # GraniteMoeHybrid uses layers_block_type (HF field) with layer-type values.
-    # Convert our internal "mamba2"/"full_attention" names to the current HF values
-    # ("linear_attention"/"full_attention"); the legacy "mamba"/"attention" names
-    # are no longer accepted by HF's layer-type validator.
+    # GraniteMoeHybrid's current constructor consumes layer_types and selects
+    # the recurrent path only for the literal "mamba" layer type.
     if hf_model_type in ("granitemoehybrid",) and "layer_types" in hf_kwargs:
-        layer_types = hf_kwargs.pop("layer_types")
-        hf_kwargs["layers_block_type"] = [
-            "full_attention" if lt in ("full_attention", "attention") else "linear_attention"
-            for lt in layer_types
+        hf_kwargs["layer_types"] = [
+            "attention" if lt in ("full_attention", "attention") else "mamba"
+            for lt in hf_kwargs["layer_types"]
         ]
 
     # NemotronH uses its public layer-type vocabulary rather than Mobius names.

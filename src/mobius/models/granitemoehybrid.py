@@ -100,7 +100,10 @@ class _FusedMoEBlock(nn.Module):
 
         # Routing gate: HF name is router.layer, renamed to gate in preprocess_weights
         self.gate = TopKGate(
-            config.hidden_size, config.num_local_experts, config.num_experts_per_tok
+            config.hidden_size,
+            config.num_local_experts,
+            config.num_experts_per_tok,
+            routed_scaling_factor=config.routed_scaling_factor,
         )
 
         # Fused 3D expert weights — names match HF directly
@@ -192,7 +195,7 @@ def _feedforward(
     op: OpBuilder,
     hidden_states: ir.Value,
     block_sparse_moe: nn.Module | None,
-    shared_mlp: nn.Module,
+    shared_mlp: nn.Module | None,
 ) -> ir.Value:
     """Combined routed-MoE + shared-MLP feedforward.
 
@@ -200,10 +203,12 @@ def _feedforward(
     variants with ``num_local_experts == 0`` (e.g. granite-4.0-1b) only the
     dense shared MLP runs. Mirrors HF ``GraniteMoeHybridDecoderLayer``.
     """
-    shared_out = shared_mlp(op, hidden_states)
+    shared_out = shared_mlp(op, hidden_states) if shared_mlp is not None else None
     if block_sparse_moe is None:
+        assert shared_out is not None
         return shared_out
-    return op.Add(block_sparse_moe(op, hidden_states), shared_out)
+    routed_out = block_sparse_moe(op, hidden_states)
+    return op.Add(routed_out, shared_out) if shared_out is not None else routed_out
 
 
 class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
@@ -243,7 +248,9 @@ class _GraniteMoeHybridMambaDecoderLayer(nn.Module):
         self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
         # Dense shared MLP with fused gate+up weight
-        self.shared_mlp = _FusedSharedMLP(config)
+        self.shared_mlp = (
+            _FusedSharedMLP(config) if config.shared_intermediate_size > 0 else None
+        )
 
         self._residual_multiplier = config.residual_multiplier
 
@@ -309,7 +316,9 @@ class _GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         self.block_sparse_moe = _FusedMoEBlock(config) if self._has_experts else None
 
         # Dense shared MLP with fused gate+up weight
-        self.shared_mlp = _FusedSharedMLP(config)
+        self.shared_mlp = (
+            _FusedSharedMLP(config) if config.shared_intermediate_size > 0 else None
+        )
 
         self._residual_multiplier = config.residual_multiplier
 

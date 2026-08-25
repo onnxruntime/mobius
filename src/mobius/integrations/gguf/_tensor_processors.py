@@ -337,19 +337,32 @@ def _process_granitehybrid(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Invert Granite attention/Mamba transforms and fuse its dense gate/up input."""
+    """Invert Granite transforms and reconstruct fused shared/expert gate-up weights."""
     state_dict = _process_llama(state_dict, config)
     state_dict = _process_mamba(state_dict, config)
     for name in list(state_dict):
-        if not name.endswith(".shared_mlp.gate_proj.weight"):
-            continue
-        prefix = name.removesuffix("gate_proj.weight")
-        up_name = f"{prefix}up_proj.weight"
-        if up_name not in state_dict:
-            raise ValueError(f"GraniteHybrid dense FFN is missing paired tensor {up_name!r}")
-        state_dict[f"{prefix}input_linear.weight"] = torch.cat(
-            (state_dict.pop(name), state_dict.pop(up_name)), dim=0
-        )
+        if name.endswith(".shared_mlp.gate_proj.weight"):
+            prefix = name.removesuffix("gate_proj.weight")
+            up_name = f"{prefix}up_proj.weight"
+            if up_name not in state_dict:
+                raise ValueError(
+                    f"GraniteHybrid shared FFN is missing paired tensor {up_name!r}"
+                )
+            state_dict[f"{prefix}input_linear.weight"] = torch.cat(
+                (state_dict.pop(name), state_dict.pop(up_name)), dim=0
+            )
+        elif name.endswith(".block_sparse_moe.gate_proj.weight"):
+            prefix = name.removesuffix("gate_proj.weight")
+            up_name = f"{prefix}up_proj.weight"
+            if up_name not in state_dict:
+                raise ValueError(
+                    f"GraniteHybrid routed experts are missing paired tensor {up_name!r}"
+                )
+            # GGUF stores [E, F, H] gate and up tensors separately while the
+            # Transformers/Mobius module stores [E, 2F, H] in gate-then-up order.
+            state_dict[f"{prefix}input_linear.weight"] = torch.cat(
+                (state_dict.pop(name), state_dict.pop(up_name)), dim=1
+            )
     return state_dict
 
 

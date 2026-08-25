@@ -24,6 +24,7 @@ __all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvabl
 
 import dataclasses
 import logging
+import math
 import re
 from collections.abc import Iterable
 from types import MappingProxyType
@@ -1604,12 +1605,8 @@ def _granitehybrid_postprocess(
     metadata: dict[str, Any],
     model: Any,
 ) -> GraniteMoeHybridConfig:
-    """Build the dense GraniteHybrid subset with exact scaling metadata."""
-    if int(metadata.get("granitehybrid.expert_count", 0)):
-        raise ValueError(
-            "GraniteHybrid MoE GGUF import is deferred until 3-D expert fusion and "
-            "quantized expert ordering have independent value tests"
-        )
+    """Build GraniteHybrid with its exact shared-MLP and routed-expert geometry."""
+    arch = "granitehybrid"
     inner_size = int(metadata["granitehybrid.ssm.inner_size"])
     num_heads = int(metadata["granitehybrid.ssm.time_step_rank"])
     groups = int(metadata["granitehybrid.ssm.group_count"])
@@ -1618,21 +1615,84 @@ def _granitehybrid_postprocess(
     if min(num_heads, groups) <= 0 or inner_size % num_heads or num_heads % groups:
         raise ValueError("GraniteHybrid Mamba2 head and group dimensions are inconsistent")
 
+    num_experts = int(metadata.get(f"{arch}.expert_count", 0))
+    top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
+    if bool(num_experts) != bool(top_k):
+        raise ValueError(
+            "GraniteHybrid expert_count and expert_used_count must both be zero "
+            "or both positive"
+        )
+    expert_width = config.intermediate_size
+    if expert_width <= 0:
+        raise ValueError("granitehybrid.feed_forward_length must be greater than zero")
+    if num_experts:
+        if num_experts <= 1:
+            raise ValueError(
+                "GraniteHybrid expert_count=1 is not a routed-MoE layout; "
+                "use the dense shared-MLP tensors"
+            )
+        if not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"GraniteHybrid expert_used_count must be in [1, {num_experts}], got {top_k}"
+            )
+        shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+        if shared_width < 0:
+            raise ValueError(
+                "granitehybrid.expert_shared_feed_forward_length must be non-negative"
+            )
+        if not bool(metadata.get(f"{arch}.expert_weights_norm", True)):
+            raise ValueError("GraniteHybrid requires normalized top-k routing weights")
+        routed_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+        if not math.isclose(routed_scale, 1.0, rel_tol=0.0, abs_tol=0.0):
+            raise ValueError(
+                "GraniteHybrid does not define an additional routed-expert output scale; "
+                f"got expert_weights_scale={routed_scale}"
+            )
+    else:
+        shared_width = config.intermediate_size
+        if f"{arch}.expert_shared_feed_forward_length" in metadata:
+            raise ValueError(
+                "granitehybrid.expert_shared_feed_forward_length requires routed experts"
+            )
+
+    if config.hidden_act not in (None, "silu"):
+        raise ValueError(
+            f"granitehybrid.hidden_activation must be silu, got {config.hidden_act!r}"
+        )
+    logit_scale = float(metadata.get(f"{arch}.logit_scale", 1.0))
+    if math.isclose(logit_scale, 0.0, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("granitehybrid.logit_scale must be nonzero")
+    tensor_names = set(model.tensor_names)
+    has_attention_bias = any(".attn_q.bias" in name for name in tensor_names)
+    has_attention_output_bias = any(".attn_output.bias" in name for name in tensor_names)
+    has_mlp_bias = any(
+        name.endswith((".ffn_gate.bias", ".ffn_up.bias", ".ffn_down.bias"))
+        for name in tensor_names
+    )
     fields = _shallow_fields(config)
     fields.update(
-        num_local_experts=None,
-        num_experts_per_tok=None,
+        hidden_act="silu",
+        intermediate_size=int(expert_width),
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        attn_qkv_bias=has_attention_bias,
+        attn_o_bias=has_attention_output_bias,
+        mlp_bias=has_mlp_bias,
         rope_type=(
             fields["rope_type"]
             if bool(metadata.get("granitehybrid.rope.scaling.finetuned", True))
             else None
         ),
-        embedding_multiplier=float(metadata.get("granitehybrid.embedding_scale", 0.0)) or 1.0,
-        residual_multiplier=float(metadata.get("granitehybrid.residual_scale", 0.0)) or 1.0,
+        embedding_multiplier=float(metadata.get("granitehybrid.embedding_scale", 1.0)),
+        residual_multiplier=float(metadata.get("granitehybrid.residual_scale", 1.0)),
         attention_multiplier=(
-            float(metadata.get("granitehybrid.attention.scale", 0.0)) or None
+            float(metadata["granitehybrid.attention.scale"]) or None
+            if "granitehybrid.attention.scale" in metadata
+            else None
         ),
-        logits_scaling=float(metadata.get("granitehybrid.logit_scale", 0.0)) or 1.0,
+        logits_scaling=logit_scale,
     )
     return GraniteMoeHybridConfig(
         **fields,
@@ -1644,7 +1704,7 @@ def _granitehybrid_postprocess(
         mamba_expand=2,
         mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
         mamba_proj_bias=False,
-        shared_intermediate_size=config.intermediate_size,
+        shared_intermediate_size=int(shared_width),
     )
 
 
