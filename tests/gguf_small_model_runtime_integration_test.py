@@ -192,6 +192,29 @@ _Q4_K_M_CASE = _RuntimeCase(
     tensor_qtypes={"F32": 61, "Q4_K": 16, "Q5_0": 166, "Q6_K": 14, "Q8_0": 15},
     config_sha256="303a313b8a2544e6338e30d388406d245ff208ba2e1fa21ea3e4a6304a032459",
     generated_tokens=(198, 198, 18, 504, 2388, 13685, 284, 5208, 28, 198),
+    tokenizer_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
+    tokenizer_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
+    tokenizer_metadata_sha256=(
+        "cb0b637d59effdc3ab02f063039e597157fa4996663848cc2178510af5880ace"
+    ),
+    tokenizer_assets=(
+        (
+            "special_tokens_map.json",
+            655,
+            "2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52",
+        ),
+        (
+            "tokenizer.json",
+            2_104_556,
+            "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+        ),
+        (
+            "tokenizer_config.json",
+            3_764,
+            "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df",
+        ),
+    ),
+    tokenizer_identity_exact=False,
 )
 
 
