@@ -303,14 +303,6 @@ _DEEPSEEK4_GGUF_GRAPH_REASON = (
     "attention fallback with ordinary KV state, so it is not an exact GGUF runtime graph."
 )
 
-_KIMI_K3_GRAPH_REASON = (
-    "Kimi-K3 alternates KDA recurrent and NoPE MLA layers and requires convolution plus "
-    "matrix state, sigmoid routed latent MoE with SiTU experts, optional shared experts, "
-    "and cross-layer residual banks. Kimi-Linear is not an alias: its gates, expert "
-    "activation, latent projections, and residual contract differ. Mobius has no exact "
-    "graph or mixed-state task for either ABI."
-)
-
 _KIMI_LINEAR_GRAPH_REASON = (
     "Kimi-Linear alternates KDA recurrent and NoPE MLA layers, carrying three rolling "
     "convolution histories and a per-head matrix state in addition to attention cache. "
@@ -1160,11 +1152,44 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="kimi-k3",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="kimi_k3",
+        config_key_map="kimi_k3",
+        config_postprocessor="kimi_k3",
+        tensor_map_recipe=("kimi_k3",),
+        tensor_processor="kimi_k3",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "attention.q_lora_rank",
+            "attention.key_length_mla",
+            "attention.value_length_mla",
+            "attention.kv_lora_rank",
+            "rope.dimension_count",
+            "ssm.conv_kernel",
+            "kda.head_dim",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+            "expert_gating_func",
+            "attn_res.block_size",
+            "activation.situ_beta",
+            "activation.situ_linear_beta",
+        ),
         runtime=Support.DEFERRED,
-        reason=_KIMI_K3_GRAPH_REASON,
+        reason=(
+            "The exact KDA/NoPE gated-MLA schedule, four-state recurrent ABI, "
+            "attention-residual banks, Stable LatentMoE routing, SiTU activation, "
+            "strict metadata/tensor closure, and compatible projection quantization are "
+            "supported. Released generic ORT GenAI cache schemas cannot represent the "
+            "heterogeneous KV plus convolution/matrix state ABI; tracked by "
+            "onnxruntime/mobius#605."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="kimi-linear",

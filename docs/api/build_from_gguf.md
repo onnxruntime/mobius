@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 86, 'rejected': 2, 'supported': 59}; importable: 57; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
+| Architectures | 147 | graph verdicts: {'deferred': 85, 'rejected': 2, 'supported': 60}; importable: 58; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
@@ -414,7 +414,7 @@ before graph construction or durable output.
 | `jamba` | — | model=`jamba`; tensor=`jamba` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Exact mixed attention/Mamba and dense/routed-MoE schedules, strict tensor closure and shapes, GGUF value transforms, compatible projection quantization, value-checked expert ordering, reduced Transformers parity, and multi-token ORT state threading, reorder, and replay are covered. Generic ORT GenAI runtime packaging remains deferred because its released cache schema cannot represent heterogeneous KV, convolution, and recurrent state slots; tracked by #605. |
 | `jina-bert-v2` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JinaBERT v2 uses ALiBi, optional full-width Q/K norms, an extra attention norm, and either separate or fused GeGLU inputs. Mobius has no graph with that exact combination. |
 | `jina-bert-v3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. BertModel has absolute positions and no MoE path. |
-| `kimi-k3` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Kimi-K3 alternates KDA recurrent and NoPE MLA layers and requires convolution plus matrix state, sigmoid routed latent MoE with SiTU experts, optional shared experts, and cross-layer residual banks. Kimi-Linear is not an alias: its gates, expert activation, latent projections, and residual contract differ. Mobius has no exact graph or mixed-state task for either ABI. |
+| `kimi-k3` | — | model=`kimi_k3`; tensor=`kimi_k3` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The exact KDA/NoPE gated-MLA schedule, four-state recurrent ABI, attention-residual banks, Stable LatentMoE routing, SiTU activation, strict metadata/tensor closure, and compatible projection quantization are supported. Released generic ORT GenAI cache schemas cannot represent the heterogeneous KV plus convolution/matrix state ABI; tracked by onnxruntime/mobius#605. |
 | `kimi-linear` | — | model=`kimi_linear`; tensor=`kimi_linear` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The exact KDA/NoPE-MLA schedule, four-state recurrent ABI, dense/MoE topology, correction-bias routing, pinned metadata, tensor closure, and compatible MatMul/expert quantization are supported. Released generic ORT GenAI cache schemas cannot represent heterogeneous KV plus three convolution histories and a matrix state, and representative real-weight GGUF evidence is pending; package runtime remains tracked by onnxruntime/mobius#605. |
 | `laguna` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Laguna combines per-head-or-element softplus attention gates, dual-RoPE interleaved sliding-window attention, a dense prefix, and sigmoid correction-biased routed/shared experts. Mobius has no exact graph or iSWA cache contract. |
 | `lfm2` | — | model=`lfm2`; tensor=`lfm2` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. |
@@ -620,17 +620,19 @@ represents that auxiliary attention+MoE head.
 
 ### Remaining hybrid cohort
 
-`bailingmoe3`, `deepseek4`, and `kimi-k3` are explicitly
+`bailingmoe3` and `deepseek4` are explicitly
 deferred before config extraction. Their loader inventories are
 suffix-exact in the pinned census, but none has an exact Mobius graph plus state
 task. No aliases are accepted.
 
-- BailingMoE3 and Kimi-K3 mix KDA recurrence with MLA. A recurrent
-  layer carries three Q/K/V convolution histories and a per-head matrix state;
-  an MLA layer carries attention cache. BailingMoE3 also has gated attention,
+- BailingMoE3 mixes KDA recurrence with MLA, gated attention,
   correction-biased routed/shared SwiGLU experts, and optional single-layer
-  NextN storage. Kimi-K3 adds SiTU, latent expert projections, and cross-layer
-  residual banks.
+  NextN storage. Its exact graph and state task remain deferred.
+- Kimi-K3 now has a dedicated text graph and task. It preserves Q-LoRA gated
+  NoPE MLA, lower-bounded KDA decay with full-rank output gates, cross-layer
+  attention residuals, and Stable LatentMoE with SiTU. Each recurrent layer
+  carries three Q/K/V convolution histories and one FP32 matrix state; static
+  cache and generic OGA packaging remain deferred under #605.
 - Kimi-Linear now has a dedicated graph and task. The importer reconstructs the
   exact per-layer KDA/NoPE-MLA schedule from `attention.head_count_kv`, validates
   dense-versus-MoE closure, restores `A_log`, convolution, and split MLA K/V-B

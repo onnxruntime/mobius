@@ -53,6 +53,42 @@ def test_kimi_linear_rejects_wrong_or_legacy_suffixes(name: str) -> None:
     assert map_gguf_to_hf_names(name, "kimi-linear") is None
 
 
+@pytest.mark.parametrize(
+    ("gguf_name", "hf_name"),
+    [
+        ("output_res_score.weight", "model.output_res_score.weight"),
+        ("blk.0.ssm_g.weight", "model.layers.0.self_attn.g_proj.weight"),
+        ("blk.1.attn_q_a.weight", "model.layers.1.self_attn.q_a_proj.weight"),
+        ("blk.1.attn_gate.weight", "model.layers.1.self_attn.g_proj.weight"),
+        (
+            "blk.1.ffn_routed_down.weight",
+            "model.layers.1.block_sparse_moe.routed_down_proj.weight",
+        ),
+        (
+            "blk.1.ffn_routed_norm.weight",
+            "model.layers.1.block_sparse_moe.routed_norm.weight",
+        ),
+        ("blk.1.ffn_res_score.weight", "model.layers.1.ffn_res_score.weight"),
+    ],
+)
+def test_kimi_k3_exact_tensor_mapping(gguf_name: str, hf_name: str) -> None:
+    assert map_gguf_to_hf_names(gguf_name, "kimi-k3") == hf_name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "blk.0.ssm_g_a.weight",
+        "blk.0.ssm_g_b.weight",
+        "blk.1.attn_gate.bias",
+        "blk.1.ffn_routed_norm.scale",
+        "blk.1.attn_res_score.input_scale",
+    ],
+)
+def test_kimi_k3_rejects_wrong_or_legacy_suffixes(name: str) -> None:
+    assert map_gguf_to_hf_names(name, "kimi-k3") is None
+
+
 class TestMapGGUFToHFNames:
     """Tests for map_gguf_to_hf_names()."""
 

@@ -61,6 +61,27 @@ class TestProcessTensorsKimiLinear:
             )
 
 
+class TestProcessTensorsKimiK3:
+    def test_restores_collapsed_conv_and_decay(self) -> None:
+        config = SimpleNamespace(model_type="kimi_k3", _gguf_arch="kimi-k3")
+        state = {
+            "model.layers.0.self_attn.q_conv1d.weight": torch.arange(
+                24, dtype=torch.float32
+            ).reshape(1, 6, 4),
+            "model.layers.0.self_attn.A_log": -torch.exp(
+                torch.tensor([0.25, -0.5], dtype=torch.float32)
+            ),
+        }
+
+        result = process_tensors(state, config)
+
+        assert result["model.layers.0.self_attn.q_conv1d.weight"].shape == (6, 4)
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.A_log"],
+            torch.tensor([0.25, -0.5], dtype=torch.float32),
+        )
+
+
 class TestProcessTensorsLlama:
     """Tests for Llama/Mistral Q/K reverse permutation."""
 

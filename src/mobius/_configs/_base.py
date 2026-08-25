@@ -422,6 +422,8 @@ class ArchitectureConfig(BaseModelConfig):
     linear_value_head_dim: int | None = None
     linear_num_key_heads: int | None = None
     linear_num_value_heads: int | None = None
+    linear_gate_lower_bound: float | None = None
+    linear_use_full_rank_gate: bool = False
 
     # Double-gated short-convolution config (LFM2-style hybrid layers).
     short_conv_kernel: int = 3
@@ -504,6 +506,14 @@ class ArchitectureConfig(BaseModelConfig):
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
     rope_interleave: bool = False
+    mla_use_output_gate: bool = False
+
+    # Kimi-K3 attention-residual and latent-expert configuration.
+    attn_res_block_size: int | None = None
+    routed_expert_hidden_size: int | None = None
+    latent_moe_use_norm: bool = False
+    activation_situ_beta: float = 1.0
+    activation_situ_linear_beta: float | None = None
 
     # DeepSeek-V4 compressed sparse attention / Hyper-Connections.
     o_groups: int = 1
@@ -1582,6 +1592,137 @@ class KimiLinearConfig(CausalLMConfig):
             raise ValueError("Kimi Linear requires both MLA key dimension fields")
         if result.v_head_dim is None or result.kv_lora_rank is None:
             raise ValueError("Kimi Linear requires MLA value dimension and KV-LoRA rank")
+        return result
+
+
+@dataclasses.dataclass
+class KimiK3Config(CausalLMConfig):
+    """Text-decoder configuration extracted from the composite Kimi-K3 config."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> KimiK3Config:
+        parent = parent_config or config
+        text = _as_attribute_config(getattr(config, "text_config", None)) or config
+        base = ArchitectureConfig.from_transformers(text, parent)
+        if (
+            base.quantization is not None
+            and base.quantization.quant_method == "compressed-tensors"
+        ):
+            raise NotImplementedError(
+                "Kimi-K3 compressed-tensors checkpoints use selective MXFP4 routed "
+                "experts, which are not representable by the generic quantized-linear "
+                "loader. Use a GGUF checkpoint or an unquantized state dict."
+            )
+        linear = _as_attribute_config(getattr(text, "linear_attn_config", None))
+        if linear is None:
+            raise ValueError("Kimi-K3 requires text_config.linear_attn_config")
+
+        kda_layers = [int(i) for i in getattr(linear, "kda_layers", ())]
+        full_layers = [int(i) for i in getattr(linear, "full_attn_layers", ())]
+        expected = set(range(1, base.num_hidden_layers + 1))
+        if (
+            set(kda_layers) & set(full_layers)
+            or set(kda_layers) | set(full_layers) != expected
+            or len(kda_layers) != len(set(kda_layers))
+            or len(full_layers) != len(set(full_layers))
+        ):
+            raise ValueError(
+                "Kimi-K3 KDA and MLA schedules must uniquely partition one-based "
+                f"layer indices 1..{base.num_hidden_layers}"
+            )
+        if not bool(getattr(text, "mla_use_nope", False)):
+            raise ValueError("Kimi-K3 requires mla_use_nope=true")
+        if not bool(getattr(text, "mla_use_output_gate", False)):
+            raise ValueError("Kimi-K3 requires mla_use_output_gate=true")
+        if not bool(getattr(linear, "use_full_rank_gate", False)):
+            raise ValueError("Kimi-K3 requires a full-rank KDA output gate")
+        raw_lower_bound = float(getattr(linear, "gate_lower_bound", 0.0))
+        if raw_lower_bound >= 0.0:
+            raise ValueError("Kimi-K3 gate_lower_bound must be negative")
+        if int(getattr(text, "first_k_dense_replace", 0)) != 1:
+            raise ValueError("Kimi-K3 requires exactly one leading dense layer")
+        if int(getattr(text, "num_shared_experts", 0)) != 2:
+            raise ValueError("Kimi-K3 requires exactly two shared experts")
+        if str(getattr(text, "hidden_act", "")) != "situ":
+            raise ValueError("Kimi-K3 requires SiTU expert activation")
+        if not math.isclose(float(getattr(text, "activation_situ_beta", 0.0)), 4.0):
+            raise ValueError("Kimi-K3 requires activation_situ_beta=4")
+        if not math.isclose(float(getattr(text, "activation_situ_linear_beta", 0.0)), 25.0):
+            raise ValueError("Kimi-K3 requires activation_situ_linear_beta=25")
+        if not bool(getattr(text, "latent_moe_use_norm", False)):
+            raise ValueError("Kimi-K3 requires latent MoE RMS normalization")
+        if getattr(text, "routed_expert_hidden_size", None) is None:
+            raise ValueError("Kimi-K3 requires routed_expert_hidden_size")
+        if getattr(text, "q_lora_rank", None) in (None, 0):
+            raise ValueError("Kimi-K3 requires Q-LoRA")
+        if bool(getattr(text, "tie_word_embeddings", False)):
+            raise ValueError("Kimi-K3 requires an untied LM head")
+        if str(getattr(text, "moe_router_activation_func", "")) != "sigmoid":
+            raise ValueError("Kimi-K3 requires sigmoid expert routing")
+        if not bool(getattr(text, "moe_renormalize", False)):
+            raise ValueError("Kimi-K3 requires selected expert weight renormalization")
+        if int(getattr(text, "moe_layer_freq", 1)) != 1:
+            raise ValueError("Kimi-K3 requires MoE in every layer after layer zero")
+        if str(getattr(text, "topk_method", "")) != "noaux_tc":
+            raise ValueError("Kimi-K3 requires correction-bias noaux_tc routing")
+        if (
+            int(getattr(text, "num_expert_group", 1)) != 1
+            or int(getattr(text, "topk_group", 1)) != 1
+        ):
+            raise ValueError("Kimi-K3 requires the released single expert-group profile")
+        if int(getattr(text, "num_nextn_predict_layers", 0)):
+            raise ValueError("Kimi-K3 NextN prediction layers are not supported")
+        if int(getattr(text, "attn_res_block_size", 0)) <= 0:
+            raise ValueError("Kimi-K3 requires a positive attn_res_block_size")
+
+        num_heads = int(vars(linear).get("num_heads", base.num_attention_heads))
+        if num_heads != base.num_attention_heads:
+            raise ValueError("Kimi-K3 KDA and MLA head counts must match")
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="kimi_k3",
+            layer_types=[
+                "kimi_k3_attention" if i + 1 in set(kda_layers) else "full_attention"
+                for i in range(base.num_hidden_layers)
+            ],
+            linear_num_key_heads=num_heads,
+            linear_num_value_heads=num_heads,
+            linear_key_head_dim=int(linear.head_dim),
+            linear_value_head_dim=int(linear.head_dim),
+            linear_conv_kernel_dim=int(linear.short_conv_kernel_size),
+            linear_gate_lower_bound=-raw_lower_bound,
+            linear_use_full_rank_gate=True,
+            mla_use_output_gate=True,
+            attn_res_block_size=int(text.attn_res_block_size),
+            routed_expert_hidden_size=int(text.routed_expert_hidden_size),
+            latent_moe_use_norm=True,
+            activation_situ_beta=float(text.activation_situ_beta),
+            activation_situ_linear_beta=float(text.activation_situ_linear_beta),
+            num_local_experts=int(text.num_experts),
+            num_experts_per_tok=int(text.num_experts_per_token),
+            n_group=int(getattr(text, "num_expert_group", 1)),
+            topk_group=int(getattr(text, "topk_group", 1)),
+            n_shared_experts=2,
+            norm_topk_prob=True,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            disable_qmoe=True,
+            rope_type=None,
+            rope_theta=None,
+            rope_scaling=None,
+            partial_rotary_factor=None,
+            tie_word_embeddings=False,
+        )
+        result = cls(**fields)
+        required = (
+            result.q_lora_rank,
+            result.kv_lora_rank,
+            result.qk_nope_head_dim,
+            result.qk_rope_head_dim,
+            result.v_head_dim,
+        )
+        if any(value is None for value in required):
+            raise ValueError("Kimi-K3 requires complete Q-LoRA and MLA dimensions")
         return result
 
 

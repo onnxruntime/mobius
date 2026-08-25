@@ -7026,7 +7026,6 @@ class TestGGUFPreflightGuards:
         [
             "bailingmoe3",
             "deepseek4",
-            "kimi-k3",
             "arctic",
             "dbrx",
             "gpt-oss",

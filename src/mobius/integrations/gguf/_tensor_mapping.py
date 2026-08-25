@@ -634,6 +634,24 @@ _RECURRENT_SUFFIXES["kimi-linear"] = {
     "blk.{bid}.ffn_down_shexp": _PROJECTION,
 }
 
+_RECURRENT_SUFFIXES["kimi-k3"] = {
+    **_RECURRENT_SUFFIXES["kimi-linear"],
+    "output_res_score": _WEIGHT,
+    "blk.{bid}.attn_res_score": _WEIGHT,
+    "blk.{bid}.ffn_res_score": _WEIGHT,
+    "blk.{bid}.ssm_g": _PROJECTION,
+    "blk.{bid}.attn_q_a": _PROJECTION,
+    "blk.{bid}.attn_q_a_norm": _WEIGHT,
+    "blk.{bid}.attn_q_b": _PROJECTION,
+    "blk.{bid}.attn_kv_b": _PROJECTION,
+    "blk.{bid}.attn_gate": _PROJECTION,
+    "blk.{bid}.ffn_routed_down": _PROJECTION,
+    "blk.{bid}.ffn_routed_up": _PROJECTION,
+    "blk.{bid}.ffn_routed_norm": _WEIGHT,
+}
+del _RECURRENT_SUFFIXES["kimi-k3"]["blk.{bid}.ssm_g_a"]
+del _RECURRENT_SUFFIXES["kimi-k3"]["blk.{bid}.ssm_g_b"]
+
 _DENSE_DIFFUSION_SUFFIXES = {
     "token_embd": _WEIGHT,
     "output": _PROJECTION,
@@ -823,6 +841,24 @@ _KIMI_LINEAR_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj",
 }
 
+_KIMI_K3_MAPPING: dict[str, str] = {
+    **_KIMI_LINEAR_MAPPING,
+    "output_res_score": "model.output_res_score",
+    "blk.{bid}.attn_res_score": "model.layers.{bid}.attn_res_score",
+    "blk.{bid}.ffn_res_score": "model.layers.{bid}.ffn_res_score",
+    "blk.{bid}.ssm_g": "model.layers.{bid}.self_attn.g_proj",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_b": "model.layers.{bid}.self_attn.kv_b_proj",
+    "blk.{bid}.attn_gate": "model.layers.{bid}.self_attn.g_proj",
+    "blk.{bid}.ffn_routed_down": "model.layers.{bid}.block_sparse_moe.routed_down_proj",
+    "blk.{bid}.ffn_routed_up": "model.layers.{bid}.block_sparse_moe.routed_up_proj",
+    "blk.{bid}.ffn_routed_norm": "model.layers.{bid}.block_sparse_moe.routed_norm",
+}
+del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_a"]
+del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_b"]
+
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -908,6 +944,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
         "minimax": _MINIMAX_MAPPING,
         "kimi_linear": _KIMI_LINEAR_MAPPING,
+        "kimi_k3": _KIMI_K3_MAPPING,
     }
 )
 

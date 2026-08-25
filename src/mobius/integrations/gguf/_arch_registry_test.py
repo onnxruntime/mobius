@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 57
+_EXPECTED_SUPPORTED_COUNT = 58
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -904,12 +904,10 @@ class TestPinnedRemainingHybridCohort:
     _ARCHITECTURES = (
         "bailingmoe3",
         "deepseek4",
-        "kimi-k3",
     )
     _EXPECTED_TENSOR_COUNTS: ClassVar[dict[str, int]] = {
         "bailingmoe3": 41,
         "deepseek4": 44,
-        "kimi-k3": 46,
     }
 
     @pytest.mark.parametrize("architecture", _ARCHITECTURES)
@@ -955,7 +953,6 @@ class TestPinnedRemainingHybridCohort:
         [
             ("bailingmoe3", ("convolution histories", "matrix state", "NextN")),
             ("deepseek4", ("compressed-cache", "rollback", "ordinary KV")),
-            ("kimi-k3", ("matrix state", "latent MoE", "residual banks")),
         ],
     )
     def test_state_and_schedule_mismatch_is_explicit(
@@ -989,6 +986,19 @@ class TestPinnedRemainingHybridCohort:
         assert spec.runtime is Support.DEFERRED
         assert spec.config_key_map == "kimi_linear"
         assert spec.tensor_processor == "kimi_linear"
+
+    def test_kimi_k3_graph_and_import_advance_but_runtime_stays_deferred(self) -> None:
+        spec = try_get_arch_spec("kimi-k3")
+        assert spec is not None
+        assert spec.model_type == "kimi_k3"
+        assert spec.config is Support.SUPPORTED
+        assert spec.tensor_map is Support.SUPPORTED
+        assert spec.graph is Support.SUPPORTED
+        assert spec.runtime is Support.DEFERRED
+        assert spec.config_key_map == "kimi_k3"
+        assert spec.tensor_processor == "kimi_k3"
+        assert spec.reason is not None
+        assert "heterogeneous KV plus convolution/matrix state ABI" in spec.reason
 
     def test_hugging_face_deepseek_v4_registration_remains_valid(self) -> None:
         assert "deepseek_v4" in _REGISTRATIONS
