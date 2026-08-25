@@ -1465,12 +1465,12 @@ class TestBuildQuantizedGguf:
             tie_embeddings=True,
             quantize_embedding=True,
         )
-        model = build_from_gguf(path)["model"]
+        model = build_from_gguf(path, keep_quantized=False)["model"]
         names = set(model.graph.initializers)
         assert any(".mlp.gate_proj.weight" in name for name in names)
         assert not any(".mlp.experts." in name for name in names)
         assert not any(".mlp.gate.weight" in name for name in names)
-        assert "model.embed_tokens.qweight" in names
+        assert "model.embed_tokens.weight" in names
         assert not any(name.startswith("lm_head.") for name in names)
 
     @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])

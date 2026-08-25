@@ -159,6 +159,7 @@ reason.
 | `gemma4` | — | `gemma4_text` | supported | supported |
 | `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred | unreachable |
 | `gpt2` | — | `gpt2` | supported | supported |
+| `granitemoe` | — | `granitemoe` | runtime deferred | supported |
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
 | `llama` | `mistral` | `llama` | supported | supported |
@@ -168,13 +169,15 @@ reason.
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `olmo` | — | `olmo` | supported | supported |
 | `olmo2` | — | `olmo2` | supported | supported |
+| `olmoe` | — | `olmoe` | runtime deferred | supported |
 | `phi3` | — | `phi3` | supported | supported |
+| `phimoe` | — | `phimoe` | runtime deferred | supported |
 | `qwen2` | — | `qwen2` | supported | supported |
-| `qwen2moe` | `qwen2_moe` | `qwen2_moe` | supported | supported |
+| `qwen2moe` | `qwen2_moe` | `qwen2_moe` | runtime deferred | supported |
 | `qwen3` | — | `qwen3` | supported | supported |
 | `qwen35` | — | `qwen3_5_text` | supported | supported |
 | `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
-| `qwen3moe` | `qwen3_moe` | `qwen3_moe` | supported | supported |
+| `qwen3moe` | `qwen3_moe` | `qwen3_moe` | runtime deferred | supported |
 | `smollm3` | — | `smollm3` | supported | supported |
 | `stablelm` | — | `stablelm` | supported | supported |
 | `starcoder2` | — | `starcoder2` | supported | supported |
@@ -261,16 +264,16 @@ construction.
 
 | Stored qtype | ID | Projection/output route | Direct exactness | Embedding route | Expert-major route | Non-MatMul route | Runtime |
 |---|---:|---|---|---|---|---|---|
-| `Q4_0` | 2 | affine repack | exact | affine repack | rejected | dequantize to float | deferred |
-| `Q4_1` | 3 | affine repack | lossy | affine repack | rejected | dequantize to float | deferred |
-| `Q5_0` | 6 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `Q5_1` | 7 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `Q8_0` | 8 | affine repack | exact | affine repack | rejected | dequantize to float | deferred |
-| `Q2_K` | 10 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `Q3_K` | 11 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `Q4_K` | 12 | affine repack | lossy | affine repack | rejected | dequantize to float | deferred |
-| `Q5_K` | 13 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `Q6_K` | 14 | affine repack | lossy | affine repack | rejected | dequantize to float | deferred |
+| `Q4_0` | 2 | affine repack | exact | affine repack | affine repack | dequantize to float | deferred |
+| `Q4_1` | 3 | affine repack | lossy | affine repack | affine repack | dequantize to float | deferred |
+| `Q5_0` | 6 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `Q5_1` | 7 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `Q8_0` | 8 | affine repack | exact | affine repack | affine repack | dequantize to float | deferred |
+| `Q2_K` | 10 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `Q3_K` | 11 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `Q4_K` | 12 | affine repack | lossy | affine repack | affine repack | dequantize to float | deferred |
+| `Q5_K` | 13 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `Q6_K` | 14 | affine repack | lossy | affine repack | affine repack | dequantize to float | deferred |
 | `IQ2_XXS` | 16 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
 | `IQ2_XS` | 17 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
 | `IQ3_XXS` | 18 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
@@ -280,11 +283,11 @@ construction.
 | `IQ2_S` | 22 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
 | `IQ4_XS` | 23 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
 | `IQ1_M` | 29 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
-| `TQ1_0` | 34 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `TQ2_0` | 35 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
+| `TQ1_0` | 34 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `TQ2_0` | 35 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
 | `MXFP4` | 39 | native byte-preserved | — | dequantize/requantize | native byte-preserved | dequantize to float | deferred |
-| `NVFP4` | 40 | dequantize/requantize | — | dequantize/requantize | rejected | dequantize to float | deferred |
-| `Q1_0` | 41 | affine repack | exact | affine repack | rejected | rejected | deferred |
+| `NVFP4` | 40 | dequantize/requantize | — | dequantize/requantize | dequantize/requantize | dequantize to float | deferred |
+| `Q1_0` | 41 | affine repack | exact | affine repack | affine repack | rejected | deferred |
 | `Q2_0` | 42 | rejected | — | rejected | rejected | rejected | deferred |
 
 <!-- END GGUF QUANTIZATION MATRIX -->

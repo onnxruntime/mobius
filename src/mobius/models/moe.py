@@ -329,7 +329,8 @@ class PhiMoEGGUFCausalLMModel(Phi3MoECausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = MoETextModel(config, norm_class=RMSNormBias)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=True)
+        linear_class = _quantized_linear_class(config) or Linear
+        self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=True)
 
 
 class MoECausalLMModel(CausalLMModel):
@@ -343,11 +344,7 @@ class MoECausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         quantization = getattr(config, "quantization", None)
-        if (
-            config.tie_word_embeddings
-            and quantization is not None
-            and quantization.quant_method == "gguf"
-        ):
+        if quantization is not None and quantization.quant_method == "gguf":
             super().__init__(config)
             self._replace_text_model(MoETextModel(config))
         else:
@@ -456,10 +453,15 @@ class Qwen2MoECausalLMModel(CausalLMModel):
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = MoETextModel(config, layer_class=Qwen2MoEDecoderLayer)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        quantization = getattr(config, "quantization", None)
+        if quantization is not None and quantization.quant_method == "gguf":
+            super().__init__(config)
+            self._replace_text_model(MoETextModel(config, layer_class=Qwen2MoEDecoderLayer))
+        else:
+            nn.Module.__init__(self)
+            self.config = config
+            self.model = MoETextModel(config, layer_class=Qwen2MoEDecoderLayer)
+            self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

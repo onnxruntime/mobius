@@ -390,14 +390,11 @@ def quant_import_decision(
                     "to complete per-expert projection rows."
                 ),
             )
-        return (
-            QuantImportRoute.REJECTED,
-            None,
-            (
-                "Only contiguous native expert-major blocks have a complete packed-tensor "
-                "route. Rebuild with keep_quantized=False for float expert normalization."
-            ),
-        )
+        # Conventional MoE graphs expose one affine MatMulNBits module per
+        # expert. The importer repacks the contiguous [E, N, K] source once,
+        # then splits the packed rows across those complete expert targets.
+        # Non-native qtypes therefore use the same declared affine/decode
+        # policy as ordinary projections below.
     target = (
         None
         if target_bits is None or target_block_size is None
