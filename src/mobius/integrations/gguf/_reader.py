@@ -359,6 +359,13 @@ class GGUFModel:
             str(getattr(tensor.tensor_type, "name", tensor.tensor_type)),
         )
 
+    def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+        """Get a tensor's logical numpy shape without reading its payload."""
+        if name not in self._tensor_index:
+            raise KeyError(f"Tensor '{name}' not found in GGUF file.")
+        tensor = self._reader.get_tensor(self._tensor_index[name])
+        return tuple(int(dim) for dim in reversed(tensor.shape))
+
     def __repr__(self) -> str:
         arch = self.architecture if self._reader else "?"
         n_tensors = len(self._tensor_index)

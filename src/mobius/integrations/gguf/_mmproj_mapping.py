@@ -21,8 +21,8 @@ so the mmproj weights flow through the *same* tested preprocessing path as a
 real HF Gemma4 checkpoint before being applied to the ONNX graph.
 
 Companion activation-range tensors (``.input_max`` / ``.input_min`` /
-``.output_max`` / ``.output_min``) that llama.cpp stores next to each weight are
-**not** model weights and are skipped — see :func:`is_mmproj_stat_tensor`.
+``.output_max`` / ``.output_min``) are learned clipping bounds. Gemma4's
+``ClippableLinear`` graph consumes them; dropping them changes model semantics.
 
 The name derivation was verified against ``unsloth/gemma-4-E2B-it-GGUF``'s
 ``mmproj-F16.gguf`` (``clip.vision.projector_type = gemma4v``,
@@ -63,6 +63,18 @@ _VISION_BLOCK_STEMS: dict[str, str] = {
     "ffn_up.weight": "mlp.up_proj.weight",
     "ffn_down.weight": "mlp.down_proj.weight",
 }
+
+for _gguf_stem, _hf_stem in {
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_out": "self_attn.o_proj",
+    "ffn_gate": "mlp.gate_proj",
+    "ffn_up": "mlp.up_proj",
+    "ffn_down": "mlp.down_proj",
+}.items():
+    for _bound in ("input_min", "input_max", "output_min", "output_max"):
+        _VISION_BLOCK_STEMS[f"{_gguf_stem}.{_bound}"] = f"{_hf_stem}.{_bound}"
 
 # ---------------------------------------------------------------------------
 # Audio tower (a.* / mm.a.input_projection)
@@ -105,12 +117,11 @@ _STAT_SUFFIXES = (".input_max", ".input_min", ".output_max", ".output_min")
 
 
 def is_mmproj_stat_tensor(name: str) -> bool:
-    """Return ``True`` for llama.cpp activation-range stats (not weights).
+    """Return ``True`` for llama.cpp activation clipping bounds.
 
-    Each quantizable linear in the mmproj carries companion
-    ``.input_max``/``.input_min``/``.output_max``/``.output_min`` scalar
-    tensors describing the observed activation range. These are calibration
-    statistics, not learnable parameters, and must be skipped.
+    These tensors are model parameters for Gemma4 ``ClippableLinear`` layers.
+    The predicate remains public for callers that need to classify their role;
+    mapping functions decide whether a specific projector consumes them.
     """
     return name.endswith(_STAT_SUFFIXES)
 
@@ -120,14 +131,11 @@ def map_mmproj_vision_to_hf(name: str) -> str | None:
 
     Returns the HuggingFace name consumed by
     :meth:`Gemma4Model.preprocess_weights` (``vision_tower.*`` /
-    ``embed_vision.*``), or ``None`` if the tensor is skipped (activation-range
-    stats or the audio tower).
+    ``embed_vision.*``), or ``None`` if the tensor is outside the Gemma4 vision
+    closure (for example, the audio tower).
 
     The mapping mirrors :mod:`_tensor_mapping` for the text backbone.
     """
-    if is_mmproj_stat_tensor(name):
-        return None
-
     blk = _VISION_BLK.match(name)
     if blk is not None:
         idx, stem = blk.group(1), blk.group(2)

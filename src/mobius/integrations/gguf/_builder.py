@@ -700,6 +700,11 @@ def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
     architecture = gguf_model.architecture
+    if architecture == MMPROJ_ARCHITECTURE:
+        # The mmproj registry validates role-specific tensor closure. Running
+        # text tensor mapping here would misclassify clip sidecars as standalone
+        # language models before the more actionable projector error can fire.
+        return
     expert_count = gguf_model.get_metadata(f"{architecture}.expert_count")
     block_count = int(gguf_model.get_metadata(f"{architecture}.block_count", 0))
     mtp_count = int(gguf_model.get_metadata(f"{architecture}.nextn_predict_layers", 0))
