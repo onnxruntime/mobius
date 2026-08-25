@@ -74,7 +74,12 @@ class DeepSeekMoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.scoring_func = config.scoring_func
         self.topk_method = config.topk_method
-        self.use_expert_bias = getattr(config, "use_expert_bias", True)
+        explicit_expert_bias = getattr(config, "use_expert_bias", None)
+        self.use_expert_bias = (
+            self.scoring_func == "sigmoid"
+            if explicit_expert_bias is None
+            else explicit_expert_bias
+        )
         if self.n_group <= 0 or self.num_experts % self.n_group:
             raise ValueError(
                 "DeepSeek grouped routing requires num_local_experts to be evenly "
@@ -511,16 +516,8 @@ class DeepSeekV3CausalLMModel(CausalLMModel):
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = DeepSeekV3TextModel(config)
-        quantization = config.quantization
-        linear_class = (
-            _linear_factory(config)
-            if quantization is not None and quantization.quantize_lm_head
-            else Linear
-        )
-        self.lm_head = linear_class(config.hidden_size, config.vocab_size, bias=False)
+        super().__init__(config)
+        self._replace_text_model(DeepSeekV3TextModel(config))
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

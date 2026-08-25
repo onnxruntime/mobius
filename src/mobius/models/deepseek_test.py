@@ -112,6 +112,24 @@ def test_sigmoid_gate_without_optional_correction_bias_has_no_bias_parameter():
     assert [name for name, _ in gate.named_parameters()] == ["weight"]
 
 
+@pytest.mark.parametrize(
+    ("scoring_func", "expects_bias"),
+    [("softmax", False), ("sigmoid", True)],
+)
+def test_unspecified_correction_bias_preserves_hf_routing_defaults(
+    scoring_func: str, expects_bias: bool
+):
+    config = make_config(
+        hidden_size=4,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        scoring_func=scoring_func,
+        use_expert_bias=None,
+    )
+    names = {name for name, _ in DeepSeekMoEGate(config).named_parameters()}
+    assert ("e_score_correction_bias" in names) is expects_bias
+
+
 def test_gguf_expanded_expert_values_are_renamed_without_repacking():
     config = make_config(
         hidden_size=4,

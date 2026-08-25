@@ -498,7 +498,7 @@ class ArchitectureConfig(BaseModelConfig):
     topk_method: str = "greedy"
     first_k_dense_replace: int = 0
     n_shared_experts: int | None = None
-    use_expert_bias: bool = True
+    use_expert_bias: bool | None = None
     disable_qmoe: bool = False
 
     # MiniMax-01 hybrid attention and normalized-residual scaling.

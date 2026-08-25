@@ -2033,6 +2033,7 @@ def _write_moe_gguf(
     fused_qkv_float: bool = False,
     quantize_tied_embedding: bool = False,
     output_quantization: str | None = None,
+    include_output: bool = True,
     expert_scale_suffix: str | None = None,
     malformed_expert_scale: bool = False,
 ) -> None:
@@ -2215,7 +2216,7 @@ def _write_moe_gguf(
     add_float("output_norm.weight", (hidden_size,))
     if architecture == "phimoe":
         add_float("output_norm.bias", (hidden_size,))
-    if architecture not in {"qwen3moe", "granitemoe"}:
+    if architecture not in {"qwen3moe", "granitemoe"} and include_output:
         add_output("output.weight", (vocab_size, hidden_size))
         if architecture == "phimoe":
             add_float("output.bias", (vocab_size,))
@@ -3402,13 +3403,22 @@ class TestBuildQuantizedGguf:
         assert np.isfinite(logits).all()
 
     @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
     def test_promoted_moe_fused_biased_qkv_builds_and_runs(
-        self, architecture: str, tmp_path: Path
+        self,
+        architecture: str,
+        projection_quantization: str,
+        tmp_path: Path,
     ) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
-        path = tmp_path / f"{architecture}-fused-qkv.gguf"
-        _write_moe_gguf(path, architecture, "f32", phi_fused_qkv=True)
+        path = tmp_path / f"{architecture}-{projection_quantization}-fused-qkv.gguf"
+        _write_moe_gguf(
+            path,
+            architecture,
+            projection_quantization,
+            phi_fused_qkv=True,
+        )
         package = build_from_gguf(path)
         model = package["model"]
         names = set(model.graph.initializers)
@@ -3441,6 +3451,25 @@ class TestBuildQuantizedGguf:
         names = set(package["model"].graph.initializers)
         assert ("model.embed_tokens.scales" in names) is quantize_embedding
         assert ("lm_head.scales" in names) is quantize_output
+
+    def test_deepseek_tied_quantized_head_reuses_embedding_storage(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "deepseek-tied-q4.gguf"
+        _write_moe_gguf(
+            path,
+            "deepseek",
+            "q4_0",
+            quantize_tied_embedding=True,
+            include_output=False,
+        )
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert model.graph.initializers["model.embed_tokens.qweight"].const_value is not None
+        assert not any(name.startswith("lm_head.") for name in model.graph.initializers)
+        package.save(tmp_path / "onnx", progress_bar=False)
 
     @pytest.mark.parametrize("architecture", ["llada-moe", "rnd1"])
     @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])

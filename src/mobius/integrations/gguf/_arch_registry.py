@@ -710,7 +710,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         # architecture map by mistake. Keep accepting it, but canonically this
         # architecture is spelled the way llama.cpp writes it.
         aliases=frozenset({"qwen2_moe"}),
-        tensor_map_recipe=("llama", "diffusion_fused_qkv", "moe_extras"),
+        tensor_map_recipe=("llama", "moe_extras"),
         config_postprocessor="moe",
         required_metadata=(
             "attention.layer_norm_rms_epsilon",
@@ -1506,7 +1506,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     GGUFArchitectureSpec(
         gguf_arch="bailingmoe",
         model_type="bailing_moe",
-        tensor_map_recipe=("llama", "moe_extras"),
+        tensor_map_recipe=("llama", "diffusion_fused_qkv", "moe_extras"),
         config_key_map="conventional_shared_moe",
         config_postprocessor="conventional_shared_moe",
         required_metadata=(

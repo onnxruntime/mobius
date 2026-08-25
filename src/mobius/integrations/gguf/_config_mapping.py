@@ -1370,10 +1370,22 @@ def _conventional_shared_moe_postprocess(
     if arch in {"bailingmoe", "deepseek"} and gating != 1:
         raise ValueError(f"{arch}.expert_gating_func must be SOFTMAX (1), got {gating}")
 
+    all_bias_layers = {
+        layer
+        for layer in range(config.num_hidden_layers)
+        if f"blk.{layer}.exp_probs_b.bias" in names
+    }
+    if arch != "dots1" and all_bias_layers:
+        raise ValueError(f"{arch} does not consume exp_probs_b correction-bias tensors")
+    dense_bias_layers = all_bias_layers & set(range(dense_prefix))
+    if dense_bias_layers:
+        raise ValueError(
+            f"{arch} correction bias is invalid on dense layers {sorted(dense_bias_layers)}"
+        )
     bias_layers = {
         layer
         for layer in range(dense_prefix, config.num_hidden_layers)
-        if f"blk.{layer}.exp_probs_b.bias" in names
+        if layer in all_bias_layers
     }
     routed_layers = set(range(dense_prefix, config.num_hidden_layers))
     if bias_layers and bias_layers != routed_layers:
