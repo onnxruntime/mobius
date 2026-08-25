@@ -9,6 +9,7 @@ to avoid requiring model downloads.
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,33 @@ from mobius.integrations.gguf._config_mapping import (
     gguf_to_config,
 )
 from mobius.integrations.gguf._reader import GGUFModel
+
+
+def _raw_gguf_string(value: bytes) -> bytes:
+    return struct.pack("<Q", len(value)) + value
+
+
+def _raw_gguf_header(*entries: bytes) -> bytes:
+    return b"GGUF" + struct.pack("<IQQ", 3, 0, len(entries)) + b"".join(entries)
+
+
+def _raw_gguf_architecture_entry() -> bytes:
+    return (
+        _raw_gguf_string(b"general.architecture")
+        + struct.pack("<I", 8)
+        + _raw_gguf_string(b"llama")
+    )
+
+
+def _raw_gguf_array_entry(
+    *,
+    count: int,
+    element_type: int,
+    payload: bytes = b"",
+) -> bytes:
+    return (
+        _raw_gguf_string(b"test.array") + struct.pack("<IIQ", 9, element_type, count) + payload
+    )
 
 
 def _write_test_gguf(
@@ -371,6 +399,29 @@ class TestGGUFModelReader:
     def test_file_not_found(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError, match="not found"):
             GGUFModel(tmp_path / "nonexistent.gguf")
+
+    def test_rejects_huge_metadata_array_before_constructing_upstream_reader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import gguf
+
+        path = tmp_path / "huge-array.gguf"
+        path.write_bytes(
+            _raw_gguf_header(
+                _raw_gguf_array_entry(count=2**63, element_type=0),
+                _raw_gguf_architecture_entry(),
+            )
+        )
+
+        def fail_if_constructed(path: str):
+            pytest.fail(f"GGUFReader unexpectedly opened {path}")
+
+        monkeypatch.setattr(gguf, "GGUFReader", fail_if_constructed)
+        with pytest.raises(
+            ValueError,
+            match=r"truncated GGUF metadata array.*9223372036854775808 elements",
+        ):
+            GGUFModel(path)
 
     def test_repr(self, llama_gguf: Path):
         model = GGUFModel(llama_gguf)

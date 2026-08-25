@@ -7418,6 +7418,87 @@ class TestGGUFPreflightGuards:
                 source="duplicate.gguf",
             )
 
+    def test_structural_header_parser_rejects_array_above_safety_limit(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _gguf_architecture_from_header_prefix,
+        )
+
+        count = 1_000_001
+        padding_entry = (
+            struct.pack("<Q", len(b"padding"))
+            + b"padding"
+            + struct.pack("<IIQ", 9, 0, count)
+            + bytes(count)
+        )
+        data = (
+            b"GGUF"
+            + struct.pack("<IQQ", 3, 0, 2)
+            + padding_entry
+            + _gguf_header_prefix("llama")[24:]
+        )
+        with pytest.raises(ValueError, match=r"1000001.*safety limit of 1000000"):
+            _gguf_architecture_from_header_prefix(data, source="oversized-array.gguf")
+
+    def test_structural_header_parser_rejects_truncated_fixed_width_array(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _gguf_architecture_from_header_prefix,
+        )
+
+        array_entry = (
+            struct.pack("<Q", len(b"padding"))
+            + b"padding"
+            + struct.pack("<IIQ", 9, 4, 2)
+            + b"\x00" * 7
+        )
+        data = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + array_entry
+        with pytest.raises(
+            ValueError,
+            match=r"truncated GGUF metadata array.*requiring at least 8 bytes.*7 remaining",
+        ):
+            _gguf_architecture_from_header_prefix(data, source="truncated-array.gguf")
+
+    def test_structural_header_parser_rejects_truncated_nested_array(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _gguf_architecture_from_header_prefix,
+        )
+
+        nested_array = struct.pack("<IQ", 0, 2**63)
+        array_entry = (
+            struct.pack("<Q", len(b"padding"))
+            + b"padding"
+            + struct.pack("<IIQ", 9, 9, 1)
+            + nested_array
+        )
+        data = b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + array_entry
+        with pytest.raises(
+            ValueError,
+            match=r"truncated GGUF metadata array.*9223372036854775808 elements",
+        ):
+            _gguf_architecture_from_header_prefix(data, source="nested-array.gguf")
+
+    def test_structural_header_parser_accepts_array_at_safety_limit(self) -> None:
+        from mobius.integrations.gguf._builder import (
+            _gguf_architecture_from_header_prefix,
+        )
+
+        count = 1_000_000
+        padding_entry = (
+            struct.pack("<Q", len(b"padding"))
+            + b"padding"
+            + struct.pack("<IIQ", 9, 0, count)
+            + bytes(count)
+        )
+        data = (
+            b"GGUF"
+            + struct.pack("<IQQ", 3, 0, 2)
+            + padding_entry
+            + _gguf_header_prefix("llama")[24:]
+        )
+        assert (
+            _gguf_architecture_from_header_prefix(data, source="boundary-array.gguf")
+            == "llama"
+        )
+
     def test_exact_companion_preflight_rejects_unresolved_mutable_revision(self) -> None:
         from mobius.integrations.gguf._builder import (
             _preflight_hf_mmproj_companion_file,
