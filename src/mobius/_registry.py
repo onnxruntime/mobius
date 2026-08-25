@@ -475,7 +475,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "gemma": ModelRegistration(GemmaCausalLMModel),
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
-    "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),
+    "gemma3": ModelRegistration(Gemma3MultiModalModel, task="gemma3-vision-language"),
     "gemma3_text": ModelRegistration(Gemma3CausalLMModel),
     "gemma3n_text": ModelRegistration(Gemma3nCausalLMModel),
     "gemma4_text": ModelRegistration(Gemma4CausalLMModel, config_class=Gemma4Config),

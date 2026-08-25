@@ -91,6 +91,10 @@ class _Gemma3VisionEncoderModel(nn.Module):
         )
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
+        pixel_values = op.CastLike(
+            pixel_values,
+            self.vision_tower.vision_model.embeddings.patch_embedding,
+        )
         vision_features = self.vision_tower(op, pixel_values)
         image_features = self.multi_modal_projector(op, vision_features)
         # Projector returns (batch, tokens, hidden); squeeze the leading
@@ -130,18 +134,29 @@ class _Gemma3EmbeddingModel(nn.Module):
         self.image_token_id = config.image_token_id or 0
 
     def forward(self, op: OpBuilder, input_ids: ir.Value, image_features: ir.Value):
-        text_embeds = self.embed_tokens(op, input_ids)
-
         image_mask = op.Equal(
             input_ids,
             op.Constant(value_int=self.image_token_id),
         )
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
 
+        # Gemma 3's <image_soft_token> is one past the text embedding table.
+        # Substitute a valid row before Gather; image positions are replaced below.
+        safe_input_ids = op.Where(
+            image_mask,
+            op.Constant(value_int=self.config.pad_token_id or 0),
+            input_ids,
+        )
+        text_embeds = self.embed_tokens(op, safe_input_ids)
+
+        # Number image placeholders over the flattened batch so row 2 starts
+        # after row 1's features rather than reusing feature row zero.
         mask_int = op.Cast(image_mask, to=7)
-        cumsum = op.CumSum(mask_int, 1)
+        flat_mask = op.Reshape(mask_int, op.Constant(value_ints=[-1]))
+        cumsum = op.CumSum(flat_mask, 0)
         indices = op.Sub(cumsum, op.Constant(value_int=1))
         indices = op.Clip(indices, op.Constant(value_int=0))
+        indices = op.Reshape(indices, op.Shape(input_ids))
 
         # Decode steps may pass empty image features ([0, hidden]); append one
         # zero row so the Gather below has a valid row that Where will not use.
@@ -168,7 +183,7 @@ class Gemma3MultiModalModel(nn.Module):
     - embedding: token embedding + image feature fusion
     """
 
-    default_task: str = "vision-language"
+    default_task: str = "gemma3-vision-language"
     category: str = "Multimodal"
 
     # Runtime HF ``named_modules()`` sub-trees per ONNX component.

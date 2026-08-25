@@ -25,6 +25,15 @@ def test_document_is_exact_generator_output() -> None:
     assert check_document()
 
 
+def test_manual_real_artifact_table_covers_every_registry_pin() -> None:
+    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    for pin in MMPROJ_ARTIFACT_PINS:
+        assert f"`{pin.repository}@{pin.revision}`" in document
+        assert f"`{pin.filename}`" in document
+        assert f"`{pin.lfs_sha256}`" in document
+        assert f"{pin.size:,}" in document
+
+
 def test_stale_at_style_pin_is_rejected(tmp_path: Path) -> None:
     document = tmp_path / "build_from_gguf.md"
     document.write_text(
