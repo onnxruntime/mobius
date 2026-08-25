@@ -19,8 +19,6 @@ _SPECIALIZED_DECODER_MODEL_TYPES = {
     "gpt2": "gpt2",
     "lfm2": "lfm2",
     "lfm2_vl": "lfm2",
-    "qwen3_5_text": "qwen3_5_text",
-    "qwen3_5_moe_text": "qwen3_5_moe_text",
 }
 _LONGROPE_DECODER_MODEL_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
 

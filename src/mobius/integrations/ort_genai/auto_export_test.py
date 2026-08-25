@@ -159,11 +159,20 @@ class TestResolveOrtGenaiModelType:
         assert _resolve_ort_genai_model_type("gemma4") == "gemma4"
         assert _resolve_ort_genai_model_type("gemma4_text") == "gemma4_text"
 
-    def test_qwen35_text_and_multimodal_model_types_remain_distinct(self):
-        assert _resolve_ort_genai_model_type("qwen3_5_text") == "qwen3_5_text"
-        assert _resolve_ort_genai_model_type("qwen3_5_moe_text") == "qwen3_5_moe_text"
-        assert _resolve_ort_genai_model_type("qwen3_5") == "qwen3_5"
-        assert _resolve_ort_genai_model_type("qwen3_5_moe") == "qwen3_5_moe"
+    @pytest.mark.parametrize(
+        ("source_type", "expected"),
+        [
+            ("qwen3_5_text", "qwen3_5_text"),
+            ("qwen3_5_moe_text", "qwen3_5_moe_text"),
+            ("qwen3_5", "qwen3_5"),
+            ("qwen3_5_vl", "qwen3_5"),
+            ("qwen3_5_vl_text", "qwen3_5"),
+            ("qwen3_5_moe", "qwen3_5_moe"),
+            ("qwen3_5_moe_vl", "qwen3_5_moe"),
+        ],
+    )
+    def test_qwen35_source_and_multimodal_model_type_mapping(self, source_type, expected):
+        assert _resolve_ort_genai_model_type(source_type) == expected
 
 
 class TestSelectOrtModelType:
@@ -198,10 +207,10 @@ class TestSelectOrtModelType:
         )
 
     @pytest.mark.parametrize("model_type", ["qwen3_5_text", "qwen3_5_moe_text"])
-    def test_decoder_only_qwen35_preserves_text_runtime_type(self, model_type):
+    def test_decoder_only_qwen35_uses_released_generic_decoder(self, model_type):
         assert (
             _select_ort_model_type(model_type, "qwen3_5_moe", is_decoder_only=True)
-            == model_type
+            == "decoder"
         )
 
     @pytest.mark.parametrize(
@@ -1099,7 +1108,7 @@ class TestWriteOrtGenaiConfigLocalDir:
 
         with open(result["genai_config"]) as f:
             model = json.load(f)["model"]
-        assert model["type"] == "qwen3_5_moe_text"
+        assert model["type"] == "decoder"
         assert model["decoder"]["filename"] == "model.onnx"
         assert "vision" not in model
         assert "embedding" not in model
@@ -2299,6 +2308,67 @@ class TestExportForOrtGenai:
         with open(result["genai_config"]) as f:
             data = json.load(f)
         assert data["model"]["type"] == "gemma3n"
+
+    @pytest.mark.parametrize(
+        ("text_model_type", "expected_runtime_type"),
+        [
+            ("qwen3_5_text", "qwen3_5"),
+            ("qwen3_5_vl_text", "qwen3_5"),
+            ("qwen3_5_moe_text", "qwen3_5_moe"),
+        ],
+    )
+    def test_config_mode_qwen35_text_vlm_recovers_multimodal_type(
+        self,
+        tmp_path,
+        text_model_type,
+        expected_runtime_type,
+    ):
+        """Unwrapped Qwen3.5/3.6 VLM configs retain their VLM runtime pipeline."""
+        import dataclasses
+
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+        @dataclasses.dataclass
+        class FakeVision:
+            image_size: int = 448
+            patch_size: int = 16
+            spatial_merge_size: int = 2
+            window_size: int = 112
+
+        @dataclasses.dataclass
+        class FakeConfig:
+            model_type: str
+            vocab_size: int = 248064
+            hidden_size: int = 2048
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 16
+            num_key_value_heads: int = 8
+            head_dim: int = 128
+            max_position_embeddings: int = 128
+            image_token_id: int = 248056
+            vision_start_token_id: int = 248053
+            video_token_id: int = 248057
+            tokens_per_second: float = 2.0
+            temporal_patch_size: int = 2
+            vision: FakeVision = dataclasses.field(default_factory=FakeVision)
+
+        pkg = ModelPackage(
+            {
+                "decoder": _mock_model_with_inputs(["inputs_embeds", "attention_mask"]),
+                "vision_encoder": _mock_model_with_inputs(["pixel_values"]),
+                "embedding": _mock_model_with_inputs(["input_ids", "image_features"]),
+            },
+            config=FakeConfig(model_type=text_model_type),
+        )
+
+        result = write_ort_genai_config(pkg, str(tmp_path), hf_model_id=None)
+
+        with open(result["genai_config"]) as f:
+            model = json.load(f)["model"]
+        assert model["type"] == expected_runtime_type
+        assert model["vision"]["filename"] == "vision_encoder/model.onnx"
+        assert model["embedding"]["filename"] == "embedding/model.onnx"
 
     def test_gemma3n_references_only_processor_files_that_exist(self, tmp_path):
         """Every processor file genai_config.json names must be on disk.
