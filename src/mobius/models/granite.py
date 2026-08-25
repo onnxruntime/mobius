@@ -9,13 +9,12 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius.components import (
-    Embedding,
     RMSNorm,
     create_attention_bias,
     create_decoder_layer,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel, Linear
+from mobius.models.base import CausalLMModel, embedding_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -28,9 +27,7 @@ class GraniteTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
         self.layers = nn.ModuleList(
             [create_decoder_layer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -91,7 +88,7 @@ class GraniteCausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = GraniteTextModel(config)
+        self._replace_text_model(GraniteTextModel(config))
         self.logits_scaling = config.logits_scaling
 
     def forward(
@@ -120,22 +117,26 @@ class GraniteMoETextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         from mobius.components import TopKGate
-        from mobius.models.moe import MoEDecoderLayer
+        from mobius.models.moe import MoEDecoderLayer, UngatedSharedMoEDecoderLayer
 
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
         self.embedding_multiplier = config.embedding_multiplier
 
+        layer_class = (
+            UngatedSharedMoEDecoderLayer
+            if config.shared_expert_intermediate_size is not None
+            else MoEDecoderLayer
+        )
         self.layers = nn.ModuleList(
             [
-                MoEDecoderLayer(
+                layer_class(
                     config,
                     gate=TopKGate(
                         config.hidden_size,
                         config.num_local_experts,
                         config.num_experts_per_tok,
+                        routed_scaling_factor=config.routed_scaling_factor,
                     ),
                 )
                 for _ in range(config.num_hidden_layers)
@@ -200,10 +201,8 @@ class GraniteMoECausalLMModel(CausalLMModel):
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = GraniteMoETextModel(config)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        super().__init__(config)
+        self._replace_text_model(GraniteMoETextModel(config))
         self.logits_scaling = config.logits_scaling
 
     def forward(
@@ -224,7 +223,10 @@ class GraniteMoECausalLMModel(CausalLMModel):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        from mobius.models.moe import _rename_moe_expert_weights
+        from mobius.models.moe import (
+            _preprocess_moe_weights,
+            _rename_moe_expert_weights,
+        )
 
         state_dict = _rename_moe_expert_weights(state_dict)
-        return super().preprocess_weights(state_dict)
+        return _preprocess_moe_weights(self, state_dict)

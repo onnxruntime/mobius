@@ -333,10 +333,20 @@ class TestStorageInvariants:
         assert route is QuantImportRoute.REJECTED
         assert "decoder" in reason
 
-    def test_non_native_expert_major_route_is_rejected(self) -> None:
-        route, _, reason = quant_import_decision(3, TensorRole.EXPERT)
+    def test_affine_expert_major_route_uses_complete_per_expert_targets(self) -> None:
+        route, exactness, _ = quant_import_decision(2, TensorRole.EXPERT)
+        assert route is QuantImportRoute.AFFINE_REPACK
+        assert exactness is RepackExactness.EXACT
+
+    def test_expert_major_route_without_a_decoder_is_rejected(self) -> None:
+        route, _, reason = quant_import_decision(
+            41,
+            TensorRole.EXPERT,
+            target_bits=4,
+            target_block_size=32,
+        )
         assert route is QuantImportRoute.REJECTED
-        assert "keep_quantized=False" in reason
+        assert "no trusted decoder" in reason
 
     def test_exact_q8_route_becomes_lossy_for_four_bit_target(self) -> None:
         route, exactness, reason = quant_import_decision(

@@ -22,6 +22,20 @@ class RMSNorm(nn.Module):
         return apply_rms_norm(op, hidden_states, self.weight, self.variance_epsilon)
 
 
+class RMSNormBias(nn.Module):
+    """RMS normalization with learned scale and bias."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter([hidden_size])
+        self.bias = nn.Parameter([hidden_size])
+        self.variance_epsilon = eps
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        normalized = apply_rms_norm(op, hidden_states, self.weight, self.variance_epsilon)
+        return op.Add(normalized, self.bias)
+
+
 class OffsetRMSNorm(nn.Module):
     """RMSNorm with +1 offset on weight: output = norm(x) * (1.0 + weight).
 

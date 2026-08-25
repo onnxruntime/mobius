@@ -56,7 +56,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 29
+_EXPECTED_SUPPORTED_COUNT = 32
 
 # Quantized reachability is separately pinned from float importability. A new
 # architecture must explicitly prove that its graph exposes packed projection
@@ -74,6 +74,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "gemma3",
         "gemma4",
         "gpt2",
+        "granitemoe",
         "hunyuan-dense",
         "llama",
         "mamba",
@@ -81,7 +82,9 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "nemotron",
         "olmo",
         "olmo2",
+        "olmoe",
         "phi3",
+        "phimoe",
         "qwen2",
         "qwen2moe",
         "qwen3",
@@ -267,7 +270,19 @@ class TestDerivedViewsAgree:
 class TestPinnedTensorClosure:
     """Every pinned source tensor must map or be an intentional computed skip."""
 
-    _NEW_ARCHITECTURES = ("olmo", "olmo2", "cohere2", "arcee", "smollm3", "exaone")
+    _NEW_ARCHITECTURES = (
+        "olmo",
+        "olmo2",
+        "cohere2",
+        "arcee",
+        "smollm3",
+        "exaone",
+        "olmoe",
+        "phimoe",
+        "qwen2moe",
+        "qwen3moe",
+        "granitemoe",
+    )
 
     @staticmethod
     def _unmapped(architecture: str) -> list[str]:
@@ -283,6 +298,21 @@ class TestPinnedTensorClosure:
     def test_every_pinned_tensor_family_closes(self, architecture: str) -> None:
         assert not self._unmapped(architecture)
 
+    @pytest.mark.parametrize(
+        "architecture", ["olmoe", "phimoe", "qwen2moe", "qwen3moe", "granitemoe"]
+    )
+    def test_pinned_expert_suffixes_close_without_drops(self, architecture: str) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert upstream.expert_tensor_suffixes == ("weight", "scale", "input_scale")
+        expert_families = [
+            family for family in upstream.tensor_families if family.endswith("_exps")
+        ]
+        assert expert_families
+        for family in expert_families:
+            for suffix in upstream.expert_tensor_suffixes:
+                name = family.replace("{bid}", "0") + f".{suffix}"
+                assert map_gguf_to_hf_names(name, architecture) is not None, name
+
     def test_deleting_one_mapping_breaks_closure(self) -> None:
         """Falsify the support claim rather than only testing the happy path."""
         olmo_mapping = _MAPPING_TABLES["olmo"]
@@ -292,6 +322,16 @@ class TestPinnedTensorClosure:
             assert self._unmapped("olmo") == ["blk.{bid}.attn_q"]
         finally:
             olmo_mapping["blk.{bid}.attn_q"] = removed
+            _build_mapping.cache_clear()
+
+    def test_deleting_expert_mapping_breaks_moe_closure(self) -> None:
+        moe_mapping = _MAPPING_TABLES["moe_extras"]
+        removed = moe_mapping.pop("blk.{bid}.ffn_gate_exps")
+        _build_mapping.cache_clear()
+        try:
+            assert "blk.{bid}.ffn_gate_exps" in self._unmapped("qwen3moe")
+        finally:
+            moe_mapping["blk.{bid}.ffn_gate_exps"] = removed
             _build_mapping.cache_clear()
 
 

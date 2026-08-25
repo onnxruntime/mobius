@@ -157,6 +157,7 @@ _COVERAGE_SKIP: dict[str, str] = {
     "gpt_oss": "Internal model — no public HF checkpoint",
     "helium": "Alias for mistral — covered by mistral",
     "open-llama": "Alias for llama — covered by llama",
+    "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
     "seed_oss": "Internal model — no public HF checkpoint",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",

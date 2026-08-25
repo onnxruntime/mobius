@@ -500,6 +500,21 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "phimoe_gguf",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "partial_rotary_factor": 0.5,
+            "rope_type": "longrope",
+            "rope_scaling": {
+                "short_factor": LONGROPE_FACTORS,
+                "long_factor": LONGROPE_FACTORS,
+            },
+            "original_max_position_embeddings": 128,
+        },
+        True,
+    ),
+    (
         "granitemoe",
         {"num_local_experts": 4, "num_experts_per_tok": 2},
         True,

@@ -98,6 +98,7 @@ from mobius.models import (
     Phi4MMMultiModalModel,
     Phi4SigLIPModel,
     PhiCausalLMModel,
+    PhiMoEGGUFCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
     Qwen3CausalLMModel,
@@ -577,6 +578,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "mixtral": ModelRegistration(MoECausalLMModel),
     "olmoe": ModelRegistration(MoECausalLMModel),
     "phimoe": ModelRegistration(Phi3MoECausalLMModel),
+    "phimoe_gguf": ModelRegistration(PhiMoEGGUFCausalLMModel),
     "qwen2_moe": ModelRegistration(Qwen2MoECausalLMModel),
     "qwen3_5_moe": ModelRegistration(Qwen35MoECausalLMModel),
     "qwen3_moe": ModelRegistration(MoECausalLMModel),
@@ -1024,6 +1026,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Mixture of Experts ---
     "mixtral": "mistralai/Mixtral-8x7B-v0.1",
     "phimoe": "microsoft/Phi-tiny-MoE-instruct",
+    "phimoe_gguf": "microsoft/Phi-tiny-MoE-instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_5_moe": "Qwen/Qwen3.5-MoE-A3B-128K",

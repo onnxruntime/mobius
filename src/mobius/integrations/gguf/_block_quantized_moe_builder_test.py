@@ -249,8 +249,10 @@ def test_gate_opt_in_allows_leftover_storm() -> None:
 # force a v2 node (covered by the mixed-format reject + env-cannot-force cases
 # below).
 
-_E2E_HID = 64
-_E2E_MOE_INTER = 32
+# Native IQ blocks encode 256 logical elements per block. Keep both matrix
+# dimensions block-aligned so GGUFWriter records the intended logical shapes.
+_E2E_HID = 256
+_E2E_MOE_INTER = 256
 _E2E_N_EXP = 4
 _E2E_TOPK = 2
 _E2E_HEADS = 4

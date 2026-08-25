@@ -66,6 +66,7 @@ __all__ = [
     "QuantizedLinear",
     "RadioVisionModel",
     "RMSNorm",
+    "RMSNormBias",
     "RmsNorm2d",
     "ScaleFreeRMSNorm",
     "SelectiveScan",
@@ -302,6 +303,7 @@ from mobius.components._rms_norm import (
     OffsetRMSNorm,
     PostGatedRMSNorm,
     RMSNorm,
+    RMSNormBias,
     ScaleFreeRMSNorm,
     apply_rms_norm,
 )

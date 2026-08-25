@@ -30,11 +30,18 @@ _VOCAB = 100
 _BLOCK_COUNT = 2  # 1 decoder layer + 1 nextn head block
 
 
-def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False, mtp_count: int = 1) -> None:
-    """Write a tiny ``qwen35`` GGUF with a trailing ``blk.1.nextn.*`` MTP head."""
-    from gguf import GGUFWriter
+def _write_qwen35_mtp_gguf(
+    path: Path,
+    *,
+    architecture: str = "qwen35",
+    quantized: bool = False,
+    mtp_count: int = 1,
+    mtp_aux_suffix: str | None = None,
+) -> None:
+    """Write a tiny Qwen3.5 GGUF with a trailing ``blk.1.nextn.*`` MTP head."""
+    from gguf import GGMLQuantizationType, GGUFWriter
 
-    writer = GGUFWriter(str(path), "qwen35")
+    writer = GGUFWriter(str(path), architecture)
     writer.add_context_length(512)
     writer.add_embedding_length(_H)
     writer.add_feed_forward_length(_FFN)
@@ -45,38 +52,42 @@ def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False, mtp_count: in
     writer.add_layer_norm_rms_eps(1e-5)
     writer.add_vocab_size(_VOCAB)
     # UINT32 == GGUFValueType 4.
-    writer.add_key_value("qwen35.nextn_predict_layers", mtp_count, 4)
-    writer.add_key_value("qwen35.attention.key_length", _HD, 4)
+    writer.add_key_value(f"{architecture}.nextn_predict_layers", mtp_count, 4)
+    writer.add_key_value(f"{architecture}.attention.key_length", _HD, 4)
 
     def f32(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
 
-    def weight(name: str, shape: tuple[int, int]) -> None:
+    def matrix(name: str, shape: tuple[int, ...]) -> None:
         if not quantized:
             f32(name, shape)
             return
-        from gguf import GGMLQuantizationType
-
-        n_out, k_in = shape
-        raw = np.zeros((n_out, k_in // 32 * 18), dtype=np.uint8)
-        raw[:, ::18] = np.array([0.5], dtype=np.float16).view(np.uint8)[0]
-        raw[:, 1::18] = np.array([0.5], dtype=np.float16).view(np.uint8)[1]
-        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+        rows = int(np.prod(shape[:-1]))
+        k_in = shape[-1]
+        assert k_in % 32 == 0
+        raw = np.zeros((rows, (k_in // 32) * 18), dtype=np.uint8)
+        raw[:, 0::18] = 0x00
+        raw[:, 1::18] = 0x3C
+        writer.add_tensor(
+            name,
+            raw.reshape(*shape[:-1], -1),
+            raw_dtype=GGMLQuantizationType.Q4_0,
+        )
 
     def _add_decoder_block(idx: int) -> None:
         # Qwen3.5 uses doubled-Q output gating: q_proj emits 2 * num_heads *
         # head_dim rows (gate + query).
-        weight(f"blk.{idx}.attn_q.weight", (2 * _NH * _HD, _H))
-        weight(f"blk.{idx}.attn_k.weight", (_NKV * _HD, _H))
-        weight(f"blk.{idx}.attn_v.weight", (_NKV * _HD, _H))
-        weight(f"blk.{idx}.attn_output.weight", (_H, _NH * _HD))
+        matrix(f"blk.{idx}.attn_q.weight", (2 * _NH * _HD, _H))
+        matrix(f"blk.{idx}.attn_k.weight", (_NKV * _HD, _H))
+        matrix(f"blk.{idx}.attn_v.weight", (_NKV * _HD, _H))
+        matrix(f"blk.{idx}.attn_output.weight", (_H, _NH * _HD))
         f32(f"blk.{idx}.attn_q_norm.weight", (_HD,))
         f32(f"blk.{idx}.attn_k_norm.weight", (_HD,))
         f32(f"blk.{idx}.attn_norm.weight", (_H,))
         f32(f"blk.{idx}.post_attention_norm.weight", (_H,))
-        weight(f"blk.{idx}.ffn_gate.weight", (_FFN, _H))
-        weight(f"blk.{idx}.ffn_up.weight", (_FFN, _H))
-        weight(f"blk.{idx}.ffn_down.weight", (_H, _FFN))
+        matrix(f"blk.{idx}.ffn_gate.weight", (_FFN, _H))
+        matrix(f"blk.{idx}.ffn_up.weight", (_FFN, _H))
+        matrix(f"blk.{idx}.ffn_down.weight", (_H, _FFN))
 
     # Decoder layer 0.
     _add_decoder_block(0)
@@ -84,7 +95,10 @@ def _write_qwen35_mtp_gguf(path: Path, *, quantized: bool = False, mtp_count: in
     # MTP head blocks: each has cross-conditioning tensors plus a full
     # attention/FFN sublayer.
     for index in range(1, 1 + mtp_count):
-        weight(f"blk.{index}.nextn.eh_proj.weight", (_H, 2 * _H))
+        matrix(f"blk.{index}.nextn.eh_proj.weight", (_H, 2 * _H))
+        if mtp_aux_suffix is not None:
+            assert mtp_aux_suffix in {"scale", "input_scale"}
+            f32(f"blk.{index}.nextn.eh_proj.{mtp_aux_suffix}", (1,))
         f32(f"blk.{index}.nextn.enorm.weight", (_H,))
         f32(f"blk.{index}.nextn.hnorm.weight", (_H,))
         f32(f"blk.{index}.nextn.shared_head_norm.weight", (_H,))
@@ -119,6 +133,11 @@ class TestMtpNameMapping:
         )
         assert (
             map_gguf_mtp_to_hf_names("blk.1.nextn.shared_head_norm.weight", 1) == "norm.weight"
+        )
+        assert map_gguf_mtp_to_hf_names("blk.1.nextn.eh_proj.bias", 1) == "fc.bias"
+        assert map_gguf_mtp_to_hf_names("blk.1.nextn.eh_proj.scale", 1) == "fc.scale"
+        assert (
+            map_gguf_mtp_to_hf_names("blk.1.nextn.eh_proj.input_scale", 1) == "fc.input_scale"
         )
 
     def test_maps_attention_and_ffn_onto_layer_zero(self):
@@ -265,6 +284,48 @@ class TestBuildMtpHead:
 
 class TestMtpAutoDetect:
     """MTP is emitted iff the source GGUF ships the nextn head (no user flag)."""
+
+    @pytest.mark.parametrize("architecture", ["qwen35", "qwen35moe"])
+    @pytest.mark.parametrize("quantized", [False, True], ids=["float", "quantized"])
+    @pytest.mark.parametrize("suffix", ["scale", "input_scale"])
+    def test_mtp_auxiliary_scales_are_rejected_before_any_graph_build(
+        self,
+        architecture: str,
+        quantized: bool,
+        suffix: str,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / f"{architecture}-{suffix}-{'q4' if quantized else 'f32'}.gguf"
+        _write_qwen35_mtp_gguf(
+            path,
+            architecture=architecture,
+            quantized=quantized,
+            mtp_aux_suffix=suffix,
+        )
+        if quantized:
+            assert any(
+                qtype.name == "Q4_0" for _, _, qtype, _ in GGUFModel(path).tensor_items_raw()
+            )
+
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("neither backbone nor MTP graph construction may start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(
+            ValueError,
+            match=rf"nextn\.eh_proj\.{suffix}.*cannot represent GGUF scale/input_scale",
+        ):
+            build_from_gguf(path)
+        assert not graph_build_started
 
     def test_mtp_gguf_auto_emits_head_sidecar(self, qwen35_mtp_gguf: Path):
         from mobius.integrations.gguf import build_from_gguf

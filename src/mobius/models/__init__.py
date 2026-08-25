@@ -115,6 +115,7 @@ __all__ = [
     "PersimmonCausalLMModel",
     "Phi3CausalLMModel",
     "Phi3MoECausalLMModel",
+    "PhiMoEGGUFCausalLMModel",
     "Phi3SmallCausalLMModel",
     "Phi3VModel",
     "Phi4MMCausalLMModel",
@@ -275,6 +276,7 @@ from mobius.models.moe import (
     HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,
+    PhiMoEGGUFCausalLMModel,
     Qwen2MoECausalLMModel,
 )
 from mobius.models.moonshine import MoonshineForConditionalGeneration

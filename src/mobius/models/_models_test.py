@@ -22,7 +22,9 @@ from mobius._registry import (
     registry,
 )
 from mobius._testing import make_config
+from mobius.components import LayerNorm, RMSNormBias
 from mobius.models.base import CausalLMModel, TextModel
+from mobius.models.moe import Phi3MoECausalLMModel, PhiMoEGGUFCausalLMModel
 from mobius.tasks import CausalLMTask
 
 
@@ -64,6 +66,17 @@ class TestCausalLMModel:
         sd = {"lm_head.weight": torch.zeros(100, 64)}
         sd = model.preprocess_weights(sd)
         assert "model.embed_tokens.weight" not in sd
+
+    def test_phimoe_norm_matches_checkpoint_format(self):
+        config = make_config(
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            partial_rotary_factor=0.5,
+        )
+        native = Phi3MoECausalLMModel(config)
+        gguf = PhiMoEGGUFCausalLMModel(config)
+        assert isinstance(native.model.layers[0].input_layernorm, LayerNorm)
+        assert isinstance(gguf.model.layers[0].input_layernorm, RMSNormBias)
 
 
 class TestBuildFromModule:

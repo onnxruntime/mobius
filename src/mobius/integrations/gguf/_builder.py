@@ -371,6 +371,58 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         source=source,
         tensor_names=gguf_model.tensor_names,
     )
+    _raise_for_unsupported_auxiliary_quantization(gguf_model)
+
+
+def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
+    """Reject scale sidecars whose semantics the target quantization ABI cannot express."""
+    from mobius.integrations.gguf._mtp import map_gguf_mtp_to_hf_names
+    from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
+
+    architecture = gguf_model.architecture
+    expert_count = gguf_model.get_metadata(f"{architecture}.expert_count")
+    block_count = int(gguf_model.get_metadata(f"{architecture}.block_count", 0))
+    mtp_count = int(gguf_model.get_metadata(f"{architecture}.nextn_predict_layers", 0))
+    mtp_block_indices = range(max(0, block_count - mtp_count), block_count)
+    for gguf_name, _raw, _qtype, shape in gguf_model.tensor_items_raw():
+        suffix = next(
+            (
+                candidate
+                for candidate in (".input_scale", ".scale")
+                if gguf_name.endswith(candidate)
+            ),
+            None,
+        )
+        if suffix is None:
+            continue
+        hf_name = map_gguf_to_hf_names(gguf_name, architecture)
+        if hf_name is None:
+            hf_name = next(
+                (
+                    mapped
+                    for block_index in mtp_block_indices
+                    if (mapped := map_gguf_mtp_to_hf_names(gguf_name, block_index)) is not None
+                ),
+                None,
+            )
+        if hf_name is None:
+            continue
+
+        is_expert_scale = ".mlp.experts." in hf_name
+        expected = (int(expert_count),) if is_expert_scale and expert_count else (1,)
+        actual = tuple(int(dim) for dim in shape)
+        if actual != expected:
+            raise ValueError(
+                f"Invalid GGUF auxiliary quantization tensor {gguf_name!r}: "
+                f"expected shape {expected}, got {actual}"
+            )
+        raise ValueError(
+            f"GGUF auxiliary quantization tensor {gguf_name!r} maps to {hf_name!r}, "
+            "but Mobius cannot represent GGUF scale/input_scale sidecars "
+            "(including NVFP4 scale2) in its expert/projection quantization ABI. "
+            "This file is rejected before graph construction to avoid silently "
+            "dropping required quantization data."
+        )
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
@@ -540,6 +592,7 @@ def build_from_gguf(
         resolve_dtype,
     )
     from mobius._registry import registry
+    from mobius.integrations.gguf._arch_registry import get_arch_spec
     from mobius.integrations.gguf._config_mapping import (
         GGUF_ARCH_TO_MODEL_TYPE,
         gguf_to_config,
@@ -598,6 +651,7 @@ def build_from_gguf(
 
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
+    spec = get_arch_spec(gguf_arch)
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
@@ -670,7 +724,8 @@ def build_from_gguf(
         )
 
     # 4. Look up module class and resolve task
-    module_class = registry.get(model_type)
+    module_type = spec.module_type or model_type
+    module_class = registry.get(module_type)
     resolved_task: str | ModelTask
     if static_cache:
         from mobius.tasks import CausalLMTask
@@ -964,6 +1019,15 @@ def _native_block_target_stems(
     return []
 
 
+def _fused_qkv_target_stems(hf_name: str, available_stems: set[str]) -> list[str]:
+    """Return separate Q/K/V targets for a fused GGUF attention projection."""
+    if not hf_name.endswith(".qkv_proj.weight"):
+        return []
+    stem = hf_name[: -len(".qkv_proj.weight")]
+    candidates = [f"{stem}.{projection}_proj" for projection in ("q", "k", "v")]
+    return candidates if all(candidate in available_stems for candidate in candidates) else []
+
+
 def _replace_child_module(root, path: str, replacement) -> None:
     """Replace a named ONNXScript child module while retaining its graph name."""
     parts = path.split(".")
@@ -1099,6 +1163,8 @@ def _normalize_gguf_weights(
 
     result: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
+        if config is not None:
+            _validate_moe_weight_shape(key, tuple(value.shape), config)
         # Stacked expert weights [num_experts, out, in] → per-expert
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -1769,6 +1835,7 @@ def _load_quantized_state_dict(
     # Collect module paths that use QuantizedLinear so we know
     # which .weight parameters should receive repacked data.
     quantized_stems = set()
+    quantized_output_sizes: dict[str, int] = {}
     native_block_stems: dict[str, str] = {}
     quantized_embedding_stems = set()
     float_linear_stems = set()
@@ -1776,6 +1843,7 @@ def _load_quantized_state_dict(
     for mod_name, mod in module.named_modules():
         if isinstance(mod, QuantizedLinear) or getattr(mod, "_gguf_quantized_linear", False):
             quantized_stems.add(mod_name)
+            quantized_output_sizes[mod_name] = mod._n
         elif isinstance(mod, BlockQuantizedLinear):
             native_block_stems[mod_name] = mod._format
         elif isinstance(mod, QuantizedEmbedding):
@@ -1820,6 +1888,7 @@ def _load_quantized_state_dict(
             if warn_unmapped:
                 logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
             continue
+        _validate_moe_weight_shape(hf_name, tuple(int(dim) for dim in np_shape), config)
 
         # Determine the int value of the quant type for can_repack
         qtype_val = qtype.value if hasattr(qtype, "value") else qtype
@@ -1839,6 +1908,12 @@ def _load_quantized_state_dict(
             np_shape,
             set(native_block_stems),
         )
+        affine_targets = _native_block_target_stems(
+            hf_name,
+            np_shape,
+            quantized_stems,
+        )
+        fused_qkv_targets = _fused_qkv_target_stems(hf_name, quantized_stems)
         native_spec = _native_block_spec(qtype)
         quant_spec = get_quant_spec(qtype)
         is_embedding_tensor = stem is not None and stem in embedding_stems
@@ -1895,13 +1970,40 @@ def _load_quantized_state_dict(
                     QuantImportRoute.DEQUANTIZE_REQUANTIZE,
                 }
                 and not should_repack
+                and not fused_qkv_targets
             ):
                 raise ValueError(
                     f"Cannot keep {quant_spec.name} {tensor_role.value} {hf_name} "
                     "quantized: the model graph does not expose MatMulNBits. Use "
                     "keep_quantized=False for explicit float import."
                 )
-        if native_targets and native_spec is not None:
+        if fused_qkv_targets:
+            values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+            offset = 0
+            for target_stem in fused_qkv_targets:
+                n_out = quantized_output_sizes[target_stem]
+                target_values = values[offset : offset + n_out]
+                offset += n_out
+                repacked = repack_dequantized_tensor(
+                    target_values,
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                state_dict[f"{target_stem}.weight"] = torch.from_numpy(repacked.weight)
+                state_dict[f"{target_stem}.scales"] = torch.from_numpy(repacked.scales)
+                if repacked.zero_points is not None:
+                    state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
+                        repacked.zero_points
+                    )
+            if offset != int(np_shape[0]):
+                raise ValueError(
+                    f"Fused QKV tensor {hf_name!r} has {np_shape[0]} rows, "
+                    f"but Q/K/V targets require {offset}"
+                )
+            n_repacked += len(fused_qkv_targets)
+            n_requantized += 1
+        elif native_targets and native_spec is not None:
             n_out = int(np_shape[-2])
             k_in = int(np_shape[-1])
             packed = preserve_native_blocks(
@@ -1948,6 +2050,86 @@ def _load_quantized_state_dict(
                         tuple(int(dim) for dim in w.shape),
                     )
             n_repacked += len(native_targets)
+        elif affine_targets:
+            # GGUF stores routed experts as one expert-major 3-D tensor
+            # [E, N, K]. MatMulNBits parameters remain per expert, so repack
+            # the contiguous [E*N, K] matrix once and split only after packing.
+            num_experts = len(affine_targets)
+            n_out = int(np_shape[-2])
+            k_in = int(np_shape[-1])
+            aggregate_shape = (num_experts * n_out, k_in)
+            if can_repack(qtype_val):
+                repacked = repack_gguf_tensor(
+                    raw.ravel().view(np.uint8),
+                    qtype_val,
+                    aggregate_shape,
+                )
+                if repacked.bits != target_bits or repacked.block_size != target_block_size:
+                    _require_supported_requantization(
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        tensor_name=hf_name,
+                    )
+                    values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                    repacked = repack_dequantized_tensor(
+                        values.reshape(aggregate_shape),
+                        bits=target_bits,
+                        block_size=target_block_size,
+                        symmetric=target_symmetric,
+                    )
+                    n_requantized += 1
+            else:
+                _require_supported_requantization(
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    tensor_name=hf_name,
+                )
+                values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
+                repacked = repack_dequantized_tensor(
+                    values.reshape(aggregate_shape),
+                    bits=target_bits,
+                    block_size=target_block_size,
+                    symmetric=target_symmetric,
+                )
+                n_requantized += 1
+
+            packed = repacked.weight.reshape(num_experts, n_out, *repacked.weight.shape[1:])
+            scales = repacked.scales.reshape(num_experts, n_out, *repacked.scales.shape[1:])
+            zero_points = (
+                repacked.zero_points.reshape(
+                    num_experts,
+                    n_out,
+                    *repacked.zero_points.shape[1:],
+                )
+                if repacked.zero_points is not None
+                else None
+            )
+            for index, target_stem in enumerate(affine_targets):
+                target_name = f"{target_stem}.weight"
+                weight = torch.from_numpy(np.array(packed[index], copy=True))
+                scale = torch.from_numpy(np.array(scales[index], copy=True))
+                zero_point = (
+                    torch.from_numpy(np.array(zero_points[index], copy=True))
+                    if zero_points is not None
+                    else None
+                )
+                if _needs_qk_permute(
+                    target_name,
+                    num_heads,
+                    num_kv_heads,
+                    model_type,
+                ):
+                    n_head = num_heads if ".q_proj." in target_name else num_kv_heads
+                    weight = _reverse_permute(weight, n_head)
+                    scale = _reverse_permute(scale, n_head)
+                    if zero_point is not None:
+                        zero_point = _reverse_permute(zero_point, n_head)
+                state_dict[target_name] = weight
+                state_dict[f"{target_stem}.scales"] = scale
+                if zero_points is not None:
+                    assert zero_point is not None
+                    state_dict[f"{target_stem}.zero_points"] = zero_point
+            n_repacked += num_experts
         elif should_repack:
             if is_tencent_q1_0_tensor:
                 repacked = parse_tencent_q1_0_tensor(
@@ -2054,6 +2236,37 @@ def _load_quantized_state_dict(
         n_requantized,
     )
     return state_dict
+
+
+def _validate_moe_weight_shape(
+    name: str,
+    shape: tuple[int, ...],
+    config,
+) -> None:
+    """Reject router/expert tensors that could otherwise be partially routed."""
+    num_experts = config.num_local_experts
+    if num_experts is None:
+        return
+    expert_size = config.moe_intermediate_size or config.intermediate_size
+    if ".mlp.experts." in name:
+        projection = name.rsplit(".mlp.experts.", 1)[1].split(".", 1)[0]
+        if projection not in {"gate_proj", "up_proj", "down_proj"}:
+            return
+        expected = (
+            (num_experts, config.hidden_size, expert_size)
+            if projection == "down_proj"
+            else (num_experts, expert_size, config.hidden_size)
+        )
+        if shape != expected:
+            raise ValueError(
+                f"Invalid stacked expert shape for {name}: expected {expected}, got {shape}"
+            )
+    elif name.endswith(".mlp.gate.weight"):
+        expected = (num_experts, config.hidden_size)
+        if shape != expected:
+            raise ValueError(
+                f"Invalid router shape for {name}: expected {expected}, got {shape}"
+            )
 
 
 def _needs_qk_permute(

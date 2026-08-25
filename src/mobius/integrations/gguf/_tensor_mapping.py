@@ -242,6 +242,14 @@ _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_down_shexp": ("model.layers.{bid}.mlp.shared_expert.down_proj"),
 }
 
+# Per-head/full-projection Q/K norms used by Qwen3-MoE and OLMoE. The
+# ArchitectureConfig selects the logical width; the GGUF tensor family is the
+# same for both representations.
+_MOE_QK_NORM_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 # Qwen3.5 hybrid extensions: DeltaNet (SSM) + full-attention.
 # DeltaNet layers use linear_attn.* naming; full-attention layers add
 # q_norm/k_norm under self_attn; both use post_attention_layernorm.
@@ -377,6 +385,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "gemma3_extras": _GEMMA3_EXTRAS,
         "gemma4_extras": _GEMMA4_EXTRAS,
         "moe_extras": _MOE_EXTRAS,
+        "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
         "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
@@ -392,7 +401,11 @@ def is_known_skip(gguf_name: str) -> bool:
     """
     if gguf_name.startswith("tokenizer."):
         return True
-    if "rope_freqs" in gguf_name or "attn_rot_embd" in gguf_name:
+    if (
+        "rope_freqs" in gguf_name
+        or "attn_rot_embd" in gguf_name
+        or gguf_name.startswith(("rope_factors_long", "rope_factors_short"))
+    ):
         return True
     return False
 
@@ -452,7 +465,10 @@ def _split_suffix(name: str) -> tuple[str, str]:
 
     Returns ``("blk.0.attn_q", "")`` if no suffix is found.
     """
-    for suffix in (".weight", ".bias"):
+    # llama.cpp's generic model loader accepts sidecar quantization scales for
+    # every projection family. Keep these names visible to pre-build validation
+    # rather than silently treating them as unknown tensors.
+    for suffix in (".input_scale", ".weight", ".scale", ".bias"):
         if name.endswith(suffix):
             return name[: -len(suffix)], suffix
     return name, ""
