@@ -167,6 +167,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "llada",
         "llada-moe",
         "llama",
+        "minimax-01",
         "modern-bert",
         "muse-glimmer",
         "nemotron",
