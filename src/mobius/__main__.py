@@ -10,6 +10,7 @@ import glob
 import json
 import logging
 import os
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -642,6 +643,16 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             "Error: dflash/eagle3 target-coupled drafts do not support standalone "
             "runtime packaging; omit --runtime to save the auxiliary graph and manifest."
         )
+    tokenizer_repository = getattr(args, "tokenizer_repository", None)
+    tokenizer_revision = getattr(args, "tokenizer_revision", None)
+    if (tokenizer_repository is None) != (tokenizer_revision is None):
+        raise SystemExit(
+            "Error: --tokenizer-repository and --tokenizer-revision must be provided together."
+        )
+    if runtime is None and tokenizer_repository is not None:
+        raise SystemExit(
+            "Error: pinned tokenizer materialization is only available with --runtime."
+        )
 
     if runtime is not None:
         from mobius.integrations.gguf._arch_registry import get_arch_spec
@@ -651,7 +662,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
         from mobius.integrations.gguf._reader import GGUFModel
         from mobius.integrations.gguf._spec import Support
-        from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
 
         # Resolve and validate the exact selected source before graph construction
         # so a deferred tokenizer cannot leave a graph-only directory behind.
@@ -664,12 +674,18 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
                 f"Error: GGUF runtime packaging for {architecture_spec.gguf_arch!r} is "
                 f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
             )
-        tokenizer_verdict = inspect_gguf_tokenizer(
-            gguf_model.metadata, source=str(resolved_gguf_path), require_complete=True
-        )
-        if not tokenizer_verdict.materialized:
+        if tokenizer_repository is None or tokenizer_revision is None:
             raise SystemExit(
-                f"Error: cannot emit a complete {runtime} package: {tokenizer_verdict.reason}"
+                "Error: GGUF runtime packaging requires --tokenizer-repository and an "
+                "immutable --tokenizer-revision."
+            )
+        if tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/")):
+            raise SystemExit(
+                "Error: --tokenizer-repository must be an owner/repository Hub ID."
+            )
+        if re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None:
+            raise SystemExit(
+                "Error: --tokenizer-revision must be an immutable 40-hex commit SHA."
             )
 
     pkg = build_from_gguf(
@@ -730,6 +746,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             output_dir,
             runtime=runtime,
             runtime_version=getattr(args, "runtime_version", None),
+            tokenizer_repository=tokenizer_repository,
+            tokenizer_revision=tokenizer_revision,
+            local_files_only=getattr(args, "local_files_only", False),
             external_data=args.external_data,
             max_shard_size_bytes=(
                 _parse_size(args.max_shard_size) if args.max_shard_size else None
@@ -1273,6 +1292,26 @@ def build_parser() -> argparse.ArgumentParser:
             "Exact selected runtime version. Required once an architecture has a "
             "runtime-supported evidence record; it must equal the version validated there."
         ),
+    )
+    gguf_parser.add_argument(
+        "--tokenizer-repository",
+        default=None,
+        metavar="OWNER/REPO",
+        help=(
+            "Exact Hugging Face repository containing tokenizer assets for runtime "
+            "packaging. Requires --tokenizer-revision and must match runtime evidence."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--tokenizer-revision",
+        default=None,
+        metavar="COMMIT_SHA",
+        help="Immutable 40-hex revision for --tokenizer-repository.",
+    )
+    gguf_parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Use only already-cached pinned tokenizer assets; perform no Hub requests.",
     )
     gguf_parser.add_argument(
         "--static-cache",

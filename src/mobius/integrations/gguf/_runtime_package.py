@@ -30,8 +30,10 @@ from mobius.integrations.gguf._runtime_evidence import (
 )
 from mobius.integrations.gguf._spec import Support
 from mobius.integrations.gguf._tokenizer import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
     inspect_gguf_tokenizer,
-    write_gguf_tokenizer_json,
+    materialize_gguf_tokenizer,
 )
 
 __all__ = ["write_gguf_runtime_package"]
@@ -46,34 +48,38 @@ def write_gguf_runtime_package(
     *,
     runtime: Runtime = "onnx-genai",
     runtime_version: str | None = None,
+    tokenizer_repository: str | None = None,
+    tokenizer_revision: str | None = None,
+    local_files_only: bool = False,
     save_model: bool = True,
     **save_kwargs: Any,
 ) -> dict[str, str]:
     """Write a complete, loadable package for a runtime-evidenced GGUF model.
 
-    Emission is gated by the architecture runtime verdict. The current registry
-    intentionally has no runtime-supported architectures; graph-only imports remain
-    available. Once a qualifying structured evidence record is registered, this
-    function emits the graph, an exact embedded ``tokenizer.huggingface.json`` copy,
-    and the selected runtime's configuration contract as one staged directory.
+    Emission is gated by the architecture runtime verdict and an exact structured
+    evidence match. The function emits the graph, hash-verified tokenizer assets
+    from an immutable Hub revision, and the selected runtime's configuration
+    contract as one staged directory.
 
     Args:
         pkg: The :class:`~mobius.ModelPackage` returned by
             :func:`~mobius.integrations.gguf.build_from_gguf`.
         gguf_path: The source ``.gguf`` file. Runtime packaging is rejected when
-            it does not embed a complete, vocabulary-identical tokenizer JSON.
+            its tokenizer metadata does not match the selected evidence record.
         output_dir: Destination directory.
         runtime: Which runtime contract to emit. ``"onnx-genai"`` writes
             ``inference_metadata.yaml``; ``"ort-genai"`` writes
             ``genai_config.json``.
         runtime_version: Exact runtime version covered by the evidence record.
+        tokenizer_repository: Exact Hub repository holding tokenizer assets.
+        tokenizer_revision: Immutable 40-hex tokenizer repository revision.
+        local_files_only: Resolve tokenizer assets only from the local Hub cache.
         save_model: Must remain ``True``. Existing graph directories cannot be
             associated with the build-time evidence transaction safely.
         **save_kwargs: Forwarded to :meth:`ModelPackage.save`.
 
     Returns:
-        Mapping of artifact name to written path. The ``tokenizer`` key is
-        absent when the GGUF carries no tokenizer metadata to rebuild from.
+        Mapping of artifact name to written path.
 
     Raises:
         ValueError: If ``runtime`` is not a supported runtime name.
@@ -84,6 +90,17 @@ def write_gguf_runtime_package(
         raise ValueError(
             "save_model=False is not supported for runtime-evidenced GGUF packages because "
             "an existing graph cannot be bound to the build-time evidence transaction."
+        )
+    if tokenizer_repository is None or tokenizer_revision is None:
+        raise ValueError(
+            "GGUF runtime packaging requires an explicit tokenizer_repository and immutable "
+            "tokenizer_revision."
+        )
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        raise FileExistsError(
+            f"GGUF runtime package destination already exists: {output_dir}. "
+            "Refusing a non-atomic directory replacement."
         )
     architecture = getattr(pkg, "gguf_architecture", None)
     if not architecture:
@@ -130,7 +147,6 @@ def write_gguf_runtime_package(
             "sidecar contract; refusing to emit an unreachable mtp/model.onnx."
         )
 
-    output_dir = Path(output_dir)
     source_path = Path(getattr(pkg, "gguf_source_path", gguf_path))
     source_model = GGUFModel(source_path)
     source_architecture = get_arch_spec(source_model.architecture).gguf_arch
@@ -149,6 +165,8 @@ def write_gguf_runtime_package(
         built_identity=built_identity,
         import_route=import_route,
         runtime_version=runtime_version,
+        tokenizer_repository=tokenizer_repository,
+        tokenizer_revision=tokenizer_revision,
     )
     source_metadata = source_model.metadata
     verdict = inspect_gguf_tokenizer(
@@ -156,12 +174,6 @@ def write_gguf_runtime_package(
         source=str(source_path),
         require_complete=True,
     )
-    if not verdict.materialized:
-        raise ValueError(
-            f"Cannot emit a complete {runtime} package: {verdict.reason}. "
-            "The GGUF graph remains buildable, but Mobius will not claim a runnable "
-            "package without an exact tokenizer artifact."
-        )
     built_verdict = getattr(pkg, "gguf_tokenizer_verdict", None)
     if (
         built_verdict is None
@@ -191,12 +203,22 @@ def write_gguf_runtime_package(
                 f"got files={graph_identity.files}, sha256={graph_identity.sha256}."
             )
 
-        tokenizer_path = write_gguf_tokenizer_json(
+        tokenizer_source = GGUFTokenizerSource(
+            repository=evidence.tokenizer_repository,
+            revision=evidence.tokenizer_revision,
+            metadata_sha256=evidence.tokenizer_metadata_sha256,
+            assets=tuple(
+                GGUFTokenizerAsset(filename, size, sha256)
+                for filename, size, sha256 in evidence.tokenizer_assets
+            ),
+        )
+        tokenizer_path = materialize_gguf_tokenizer(
             source_path,
             stage,
+            source=tokenizer_source,
             metadata=source_metadata,
-            expected_metadata_sha256=built_verdict.metadata_sha256,
             source_identity=(f"sha256:{built_identity.sha256}/{built_identity.filename}"),
+            local_files_only=local_files_only,
         )
         artifacts["tokenizer"] = tokenizer_path
 
@@ -241,20 +263,7 @@ def write_gguf_runtime_package(
                 f"sha256={evidence.runtime_package_sha256}; "
                 f"got files={runtime_identity.files}, sha256={runtime_identity.sha256}."
             )
-        backup: Path | None = None
-        if output_dir.exists():
-            backup = output_dir.with_name(f".{output_dir.name}.backup")
-            if backup.exists():
-                raise FileExistsError(f"Atomic package backup path already exists: {backup}")
-            os.replace(output_dir, backup)
-        try:
-            os.replace(stage, output_dir)
-        except Exception:
-            if backup is not None:
-                os.replace(backup, output_dir)
-            raise
-        if backup is not None:
-            shutil.rmtree(backup)
+        os.replace(stage, output_dir)
         return {
             name: str(output_dir / Path(path).relative_to(stage))
             for name, path in artifacts.items()

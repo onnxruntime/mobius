@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -33,6 +34,8 @@ def _record(payload: bytes) -> GGUFRuntimeEvidence:
         config_revision="b" * 40,
         tokenizer_repository="owner/tokenizer",
         tokenizer_revision="c" * 40,
+        tokenizer_metadata_sha256="f" * 64,
+        tokenizer_assets=(("tokenizer.json", 2, hashlib.sha256(b"{}").hexdigest()),),
         tensor_count=2,
         tensor_qtypes=(("F32", 1), ("Q4_K", 1)),
         import_route='{"route_schema":1}',
@@ -60,6 +63,11 @@ def _model():
     )
 
 
+def test_runtime_evidence_rejects_non_hex_tokenizer_metadata_digest() -> None:
+    with pytest.raises(ValueError, match="immutable 40-hex revisions and LFS SHA-256"):
+        replace(_record(b"pinned-gguf"), tokenizer_metadata_sha256="g" * 64)
+
+
 def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
     tmp_path, monkeypatch
 ) -> None:
@@ -83,6 +91,8 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
             import_route=record.import_route,
             runtime_version="1.0.0",
+            tokenizer_repository=record.tokenizer_repository,
+            tokenizer_revision=record.tokenizer_revision,
         )
         is record
     )
@@ -97,6 +107,21 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
             import_route=record.import_route,
             runtime_version="1.0.0",
+            tokenizer_repository=record.tokenizer_repository,
+            tokenizer_revision=record.tokenizer_revision,
+        )
+    with pytest.raises(ValueError, match="No unique GGUF runtime evidence"):
+        matching_runtime_evidence(
+            (record.evidence_id,),
+            architecture="llama",
+            runtime="onnx-genai",
+            source_path=source,
+            gguf_model=_model(),
+            built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
+            import_route=record.import_route,
+            runtime_version="1.0.0",
+            tokenizer_repository="attacker/replacement",
+            tokenizer_revision=record.tokenizer_revision,
         )
 
 
@@ -123,6 +148,8 @@ def test_matching_evidence_rejects_source_replaced_after_build(tmp_path, monkeyp
             built_identity=built_identity,
             import_route=record.import_route,
             runtime_version="1.0.0",
+            tokenizer_repository=record.tokenizer_repository,
+            tokenizer_revision=record.tokenizer_revision,
         )
 
 

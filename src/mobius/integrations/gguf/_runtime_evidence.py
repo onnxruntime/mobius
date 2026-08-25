@@ -61,6 +61,8 @@ class GGUFRuntimeEvidence:
     config_revision: str
     tokenizer_repository: str
     tokenizer_revision: str
+    tokenizer_metadata_sha256: str
+    tokenizer_assets: tuple[tuple[str, int, str], ...]
     tensor_count: int
     tensor_qtypes: tuple[tuple[str, int], ...]
     import_route: str
@@ -87,6 +89,7 @@ class GGUFRuntimeEvidence:
             self.config_revision,
             self.tokenizer_repository,
             self.tokenizer_revision,
+            self.tokenizer_metadata_sha256,
             self.import_route,
             self.graph_sha256,
             self.runtime_package_sha256,
@@ -108,6 +111,7 @@ class GGUFRuntimeEvidence:
                 len(value) != 64
                 for value in (
                     self.lfs_sha256,
+                    self.tokenizer_metadata_sha256,
                     self.graph_sha256,
                     self.runtime_package_sha256,
                 )
@@ -117,6 +121,7 @@ class GGUFRuntimeEvidence:
                 for value in (
                     *revisions,
                     self.lfs_sha256,
+                    self.tokenizer_metadata_sha256,
                     self.graph_sha256,
                     self.runtime_package_sha256,
                 )
@@ -128,6 +133,24 @@ class GGUFRuntimeEvidence:
         if self.parity_kind not in {"full-logit", "component"}:
             raise ValueError(
                 "GGUF runtime evidence parity_kind must be full-logit or component"
+            )
+        asset_names = tuple(asset[0] for asset in self.tokenizer_assets)
+        if (
+            not self.tokenizer_assets
+            or "tokenizer.json" not in asset_names
+            or asset_names != tuple(sorted(asset_names))
+            or len(set(asset_names)) != len(asset_names)
+            or any(
+                filename != Path(filename).name
+                or size <= 0
+                or len(sha256) != 64
+                or not _is_hex(sha256)
+                for filename, size, sha256 in self.tokenizer_assets
+            )
+        ):
+            raise ValueError(
+                "GGUF runtime evidence tokenizer_assets must be sorted, unique, "
+                "basename-only exact file identities including tokenizer.json"
             )
         if (
             not self.graph_files
@@ -145,12 +168,90 @@ class GGUFRuntimeEvidence:
             )
 
 
-# Empty by design: graph/import execution evidence does not satisfy this schema.
-_RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType({})
-
-
 def _is_hex(value: str) -> bool:
     return all(character in "0123456789abcdefABCDEF" for character in value)
+
+
+_SMOLLM_F16_ROUTE = (
+    '{"architecture":"llama","config_sha256":'
+    '"af8b88c1d03c543f01163394589b7392bb52acb3c74240c0d9bda2e5c3097e0a",'
+    '"execution_provider":"cpu","model_type":"llama","module_type":"llama",'
+    '"preserve_quantization":false,"registry_import":{"config_key_map":null,'
+    '"config_postprocessor":null,"llama_qk_permute":true,"offset_norm":false,'
+    '"required_metadata":[],"rope_interleave":false,"tensor_processor":"llama",'
+    '"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,'
+    '"task":{"class":"builtins.str","state":"text-generation"},'
+    '"tensor_map_recipe":["llama"]}'
+)
+
+_SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
+    evidence_id="smollm-135m-f16-onnxruntime-1.29.0",
+    architecture="llama",
+    repository="neopolita/smollm-135m-gguf",
+    revision="22cca988936eafe92908e7558907c3964e10bba7",
+    filename="ggml-model-f16.gguf",
+    size=270_885_504,
+    lfs_sha256="ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2",
+    config_repository="HuggingFaceTB/SmolLM-135M",
+    config_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
+    tokenizer_repository="HuggingFaceTB/SmolLM-135M",
+    tokenizer_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
+    tokenizer_metadata_sha256="46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc",
+    tokenizer_assets=(
+        (
+            "special_tokens_map.json",
+            831,
+            "e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3",
+        ),
+        (
+            "tokenizer.json",
+            2_104_556,
+            "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+        ),
+        (
+            "tokenizer_config.json",
+            3_685,
+            "238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8",
+        ),
+    ),
+    tensor_count=272,
+    tensor_qtypes=(("F16", 211), ("F32", 61)),
+    import_route=_SMOLLM_F16_ROUTE,
+    graph_files=("model.onnx", "model.onnx.data"),
+    graph_sha256="3d242b09fcb5041d71e5914084cf00780867b3b0e32f669f8733369b19b6ea9b",
+    runtime_package_files=(
+        "gguf_tokenizer_manifest.json",
+        "inference_metadata.yaml",
+        "model.onnx",
+        "model.onnx.data",
+        "policies/cache_length_update.onnx",
+        "policies/decoder_state_initializer.onnx",
+        "policies/decoder_step_update.onnx",
+        "policies/generated_length_update.onnx",
+        "policies/last_token_logits.onnx",
+        "policies/termination.onnx",
+        "policies/termination_batch_initializer.onnx",
+        "policies/token_sampler.onnx",
+        "policies/token_state_update.onnx",
+        "policies/token_to_slot.onnx",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
+    runtime_package_sha256="31c3f5c2bff6ab861b84b5d3640b5eb265959e0c3f674fe1470223ed19b25165",
+    parity_test="test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
+    parity_kind="full-logit",
+    deterministic_test=(
+        "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]"
+    ),
+    stateful_semantics="dynamic KV cache prefill plus 20 cache-threaded decode steps",
+    runtime="onnx-genai",
+    runtime_version="1.29.0",
+)
+
+_RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType(
+    {_SMOLLM_F16_ONNX_RUNTIME.evidence_id: _SMOLLM_F16_ONNX_RUNTIME}
+)
 
 
 def runtime_evidence(evidence_id: str) -> GGUFRuntimeEvidence | None:
@@ -190,6 +291,8 @@ def matching_runtime_evidence(
     built_identity: GGUFArtifactIdentity,
     import_route: str,
     runtime_version: str | None,
+    tokenizer_repository: str,
+    tokenizer_revision: str,
 ) -> GGUFRuntimeEvidence:
     """Return exact evidence for the package source, route, and requested runtime."""
     validate_runtime_evidence_ids(architecture, evidence_ids)
@@ -220,6 +323,8 @@ def matching_runtime_evidence(
         and _RUNTIME_EVIDENCE[evidence_id].tensor_count == identity.tensor_count
         and _RUNTIME_EVIDENCE[evidence_id].tensor_qtypes == identity.tensor_qtypes
         and _RUNTIME_EVIDENCE[evidence_id].import_route == import_route
+        and _RUNTIME_EVIDENCE[evidence_id].tokenizer_repository == tokenizer_repository
+        and _RUNTIME_EVIDENCE[evidence_id].tokenizer_revision == tokenizer_revision
     ]
     if len(candidates) != 1:
         raise ValueError(

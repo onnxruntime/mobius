@@ -18,6 +18,22 @@ gguf:
   config_sha256: "c62123baf4e95656cdc9f5b798c14319bbaafec594526c462b10555f561969f9"
   preserve_quantization: false
   keep_quantized: true
+  tokenizer:
+    repository: "HuggingFaceTB/SmolLM2-135M-Instruct"
+    revision: "12fd25f77366fa6b3b4b768ec3050bf629380bac"
+    metadata_sha256: "cb0b637d59effdc3ab02f063039e597157fa4996663848cc2178510af5880ace"
+    identity_status: "rejected"
+    rejection_reason: "GGUF padding_token_id=0 conflicts with the pinned tokenizer pad_token_id=2."
+    assets:
+      - filename: "special_tokens_map.json"
+        size: 655
+        sha256: "2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52"
+      - filename: "tokenizer.json"
+        size: 2104556
+        sha256: "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+      - filename: "tokenizer_config.json"
+        size: 3764
+        sha256: "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df"
 
 inputs:
   prompts:

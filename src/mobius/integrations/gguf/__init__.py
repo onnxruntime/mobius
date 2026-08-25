@@ -18,8 +18,8 @@ Usage::
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
 
-    # Runtime packaging is fail-closed and currently unavailable because no
-    # architecture has complete real-artifact runtime evidence.
+    # Runtime packaging is fail-closed and available only for an exact artifact,
+    # import route, runtime version, and pinned tokenizer evidence record.
 
 :func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
 to :func:`build_gemma4_vlm_from_gguf` for the multimodal assembly.
@@ -52,11 +52,19 @@ from mobius.integrations.gguf._shard_set import (
     discover_gguf_shards,
     open_gguf_model,
 )
-from mobius.integrations.gguf._tokenizer import write_gguf_tokenizer_json
+from mobius.integrations.gguf._tokenizer import (
+    GGUFTokenizerAsset,
+    GGUFTokenizerSource,
+    materialize_gguf_tokenizer,
+    write_gguf_tokenizer_json,
+)
 
 __all__ = [
     "build_from_gguf",
     "build_gemma4_vlm_from_gguf",
+    "GGUFTokenizerAsset",
+    "GGUFTokenizerSource",
+    "materialize_gguf_tokenizer",
     "write_gguf_runtime_package",
     "write_gguf_tokenizer_json",
     "verify_gguf_reuse_manifest",
