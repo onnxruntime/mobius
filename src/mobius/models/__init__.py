@@ -185,6 +185,7 @@ __all__ = [
     "mimi_default_config",
     "moshi_depformer_config",
     "moshi_temporal_config",
+    "Plamo2ForCausalLM",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -314,6 +315,7 @@ from mobius.models.phi import (
 from mobius.models.phi3 import Phi3CausalLMModel
 from mobius.models.phi3_v import Phi3VModel
 from mobius.models.phi4_siglip import Phi4SigLIPModel
+from mobius.models.plamo2 import Plamo2ForCausalLM
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,

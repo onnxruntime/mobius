@@ -41,6 +41,7 @@ from mobius._configs import (
     MambaConfig,
     MuseGlimmerConfig,
     NemotronHConfig,
+    Plamo2Config,
     _shallow_fields,
 )
 from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
@@ -162,6 +163,14 @@ _FALCON_H1_KEY_MAP = {
     "ssm.time_step_rank": "mamba_n_heads",
 }
 
+_PLAMO2_KEY_MAP = {
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "mamba_d_conv",
+    "ssm.group_count": "mamba_group_count",
+    "ssm.state_size": "mamba_d_state",
+    "ssm.time_step_rank": "mamba_num_heads",
+}
+
 _JAMBA_KEY_MAP = {
     "attention.head_count": "num_attention_heads",
     "attention.head_count_kv": "num_key_value_heads",
@@ -211,6 +220,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "glm_dsa": _GLM_DSA_KEY_MAP,
         "mamba": _MAMBA_KEY_MAP,
         "falcon_h1": _FALCON_H1_KEY_MAP,
+        "plamo2": _PLAMO2_KEY_MAP,
         "jamba": _JAMBA_KEY_MAP,
         "nemotron_h": _NEMOTRON_H_KEY_MAP,
         "granitehybrid": _GRANITEHYBRID_KEY_MAP,
@@ -353,7 +363,7 @@ def _derive_hybrid_layout(
             f"nextn predict layers ({mtp_count}) for architecture {gguf_arch}."
         )
 
-    if gguf_arch in {"lfm2", "lfm2moe", "jamba", "granitehybrid"}:
+    if gguf_arch in {"lfm2", "lfm2moe", "jamba", "granitehybrid", "plamo2"}:
         raw_kv_heads = metadata.get(f"{gguf_arch}.attention.head_count_kv")
         if not isinstance(raw_kv_heads, (list, tuple, np.ndarray)):
             raise ValueError(
@@ -375,6 +385,7 @@ def _derive_hybrid_layout(
             "lfm2moe": "conv",
             "jamba": "mamba",
             "granitehybrid": "mamba2",
+            "plamo2": "mamba",
         }[gguf_arch]
         return (
             trunk_layers,
@@ -560,6 +571,20 @@ def gguf_to_config(
     head_dim = hf_fields.get("head_dim")
     hidden_size = hf_fields["hidden_size"]
     num_attention_heads = hf_fields["num_attention_heads"]
+    if isinstance(num_attention_heads, (list, np.ndarray)):
+        values = [int(value) for value in num_attention_heads]
+        if canonical_arch != "plamo2":
+            raise ValueError(
+                f"{canonical_arch} has unsupported per-layer attention head counts"
+            )
+        nonzero = {value for value in values if value}
+        if len(nonzero) != 1:
+            raise ValueError(
+                "plamo2 attention layers must use one consistent non-zero head count"
+            )
+        if not nonzero:
+            raise ValueError("plamo2 GGUF has no attention layer")
+        num_attention_heads = nonzero.pop()
     if canonical_arch in {"mamba", "mamba2"}:
         # Pure recurrent GGUFs deliberately write attention.head_count=0.
         # The temporary ArchitectureConfig still needs a nonzero placeholder;
@@ -587,6 +612,7 @@ def gguf_to_config(
             "jamba",
             "nemotron_h",
             "granitehybrid",
+            "plamo2",
         }:
             nonzero = {value for value in values if value}
             if len(nonzero) != 1:
@@ -626,6 +652,7 @@ def gguf_to_config(
             "jamba",
             "nemotron_h",
             "granitehybrid",
+            "plamo2",
         }
         or canonical_arch in _DELTA_NET_ARCHITECTURES
     ):
@@ -2148,6 +2175,93 @@ def _falcon_h1_postprocess(
     return result
 
 
+def _plamo2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> Plamo2Config:
+    """Build PLaMo2 from its exact serialized schedule and tensor geometry."""
+    arch = "plamo2"
+    layers = config.num_hidden_layers
+    head_counts = tuple(int(value) for value in metadata[f"{arch}.attention.head_count"])
+    kv_head_counts = tuple(int(value) for value in metadata[f"{arch}.attention.head_count_kv"])
+    if len(head_counts) != layers or len(kv_head_counts) != layers:
+        raise ValueError("PLaMo2 attention head arrays must match block_count")
+
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    if ssm_heads <= 0 or inner % ssm_heads:
+        raise ValueError("PLaMo2 SSM head count must divide ssm.inner_size")
+    if int(metadata[f"{arch}.ssm.group_count"]) != 0:
+        raise ValueError("PLaMo2 supports only ssm.group_count=0")
+
+    key_length = metadata.get(f"{arch}.attention.key_length")
+    value_length = metadata.get(f"{arch}.attention.value_length")
+    inferred: set[tuple[int, int]] = set()
+    if model is not None:
+        for layer, kv_heads in enumerate(kv_head_counts):
+            if kv_heads == 0:
+                continue
+            q_heads = head_counts[layer]
+            qkv_shape = model.get_tensor_shape(f"blk.{layer}.attn_qkv.weight")
+            output_shape = model.get_tensor_shape(f"blk.{layer}.attn_output.weight")
+            value_width, value_remainder = divmod(int(output_shape[1]), q_heads)
+            key_width, key_remainder = divmod(
+                int(qkv_shape[0]) - kv_heads * value_width,
+                q_heads + kv_heads,
+            )
+            if value_remainder or key_remainder or min(key_width, value_width) <= 0:
+                raise ValueError("PLaMo2 key/value widths cannot be inferred exactly")
+            inferred.add((key_width, value_width))
+    if inferred and len(inferred) != 1:
+        raise ValueError("PLaMo2 attention tensor shapes contradict across layers")
+    if inferred:
+        inferred_key, inferred_value = inferred.pop()
+        if key_length is not None and int(key_length) != inferred_key:
+            raise ValueError("PLaMo2 attention.key_length contradicts tensor shapes")
+        if value_length is not None and int(value_length) != inferred_value:
+            raise ValueError("PLaMo2 attention.value_length contradicts tensor shapes")
+        key_length = inferred_key
+        value_length = inferred_value
+    if key_length is None or value_length is None:
+        raise ValueError("PLaMo2 key/value widths require exact tensor-shape evidence")
+    key_length = int(key_length)
+    value_length = int(value_length)
+    if (
+        key_length != value_length
+        or key_length * config.num_attention_heads != config.hidden_size
+    ):
+        raise ValueError(
+            "PLaMo2 requires equal key/value widths and head_count * width == embedding_length"
+        )
+    if inner != ssm_heads * key_length:
+        raise ValueError(
+            "PLaMo2 ssm.inner_size must equal ssm.time_step_rank * attention key width"
+        )
+
+    fields = _base_model_fields(config, Plamo2Config)
+    fields.pop("layer_types", None)
+    fields.update(
+        hidden_act="silu",
+        head_dim=key_length,
+        attention_head_counts=head_counts,
+        attention_kv_head_counts=kv_head_counts,
+        mamba_num_heads=ssm_heads,
+        mamba_d_state=int(metadata[f"{arch}.ssm.state_size"]),
+        mamba_d_conv=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        mamba_dt_rank=max(64, config.hidden_size // 16),
+        mamba_group_count=0,
+        attention_window_size=min(config.max_position_embeddings, 2048),
+        use_predefined_initial_state=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+    )
+    result = Plamo2Config(**fields)
+    result.model_type = "plamo2"
+    return result
+
+
 def _validate_encoder_metadata(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2383,6 +2497,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
     "falcon_h1": _falcon_h1_postprocess,
+    "plamo2": _plamo2_postprocess,
     "jamba": _jamba_postprocess,
     "lfm2moe": _lfm2moe_postprocess,
     "nemotron_h": _nemotron_h_postprocess,

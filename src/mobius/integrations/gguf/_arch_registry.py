@@ -1161,13 +1161,32 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="plamo2",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="plamo2",
+        config_key_map="plamo2",
+        config_postprocessor="plamo2",
+        tensor_map_recipe=("plamo2",),
+        tensor_processor="plamo2",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "ssm.conv_kernel",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+            "ssm.group_count",
+        ),
         runtime=Support.DEFERRED,
         reason=(
-            "The pinned PLaMo2 loader requires a dedicated fused-QKV Mamba1/attention "
-            "graph with sandwich norms and offset transforms that Mobius does not have."
+            "The dedicated graph and GGUF importer preserve PLaMo2's alternating "
+            "Mamba1/attention layers and mixed state ABI, but released ORT GenAI "
+            "cannot represent heterogeneous per-layer state. Runtime packaging "
+            "remains deferred to onnxruntime/mobius#605."
         ),
     ),
     GGUFArchitectureSpec(

@@ -318,7 +318,11 @@ class TestBuildGraph:
             for n in init_names
         )
         has_attn = any(
-            "self_attn" in n or "self_attention" in n or "attention" in n or ".attn." in n
+            "self_attn" in n
+            or "self_attention" in n
+            or "attention" in n
+            or ".attn." in n
+            or "qkv_proj" in n
             for n in init_names
         )
         has_mlp = any("mlp" in n or "expert" in n or "feed_forward" in n for n in init_names)

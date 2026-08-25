@@ -824,6 +824,126 @@ def _write_falcon_h1_gguf(
     writer.close()
 
 
+def _write_plamo2_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    omit: str | None = None,
+    extra: str | None = None,
+    invalid_decay: bool = False,
+    group_count: int = 0,
+    epsilon: float = 1e-6,
+    activation: str | None = None,
+    predefined_state: bool = False,
+    head_counts: list[int] | None = None,
+    kv_head_counts: list[int] | None = None,
+    quantized_embedding: bool = False,
+    include_output: bool = False,
+) -> None:
+    """Write a complete tiny alternating PLaMo2 GGUF."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    head_dim = 8
+    inner = 32
+    ssm_heads = 4
+    state = 4
+    kernel = 4
+    dt_rank = 64
+    rng = np.random.default_rng(607)
+
+    writer = GGUFWriter(str(path), "plamo2")
+    writer.add_context_length(32)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(2)
+    writer.add_head_count(head_counts or [0, heads])
+    writer.add_head_count_kv(kv_head_counts or [0, kv_heads])
+    writer.add_layer_norm_rms_eps(epsilon)
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_vocab_size(vocab)
+    writer.add_ssm_conv_kernel(kernel)
+    writer.add_ssm_inner_size(inner)
+    writer.add_ssm_state_size(state)
+    writer.add_ssm_time_step_rank(ssm_heads)
+    writer.add_ssm_group_count(group_count)
+    if activation is not None:
+        writer.add_string("plamo2.feed_forward.activation", activation)
+    if predefined_state:
+        writer.add_bool("plamo2.ssm.use_predefined_initial_state", True)
+
+    def add_float(name: str, shape: tuple[int, ...], *, negative: bool = False) -> None:
+        if name == omit:
+            return
+        values = rng.normal(0.0, 0.03, size=shape).astype(np.float32)
+        if negative:
+            values = -np.exp(values)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, int]) -> None:
+        if name == omit:
+            return
+        rows, columns = shape
+        assert columns % 32 == 0
+        raw = np.zeros((rows, columns // 32 * 18), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(columns // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    projection = add_q4 if quantized else add_float
+    (add_q4 if quantized_embedding else add_float)("token_embd.weight", (vocab, hidden))
+    if include_output:
+        projection("output.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "post_attention_norm", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+        add_float(prefix + "post_ffw_norm", (hidden,))
+        projection(prefix + "ffn_up.weight", (2 * intermediate, hidden))
+        projection(prefix + "ffn_down.weight", (hidden, intermediate))
+    projection(
+        "blk.0.ssm_in.weight",
+        (2 * inner, hidden),
+    )
+    add_float("blk.0.ssm_conv1d.weight", (inner, kernel))
+    projection("blk.0.ssm_x.weight", (2 * state + dt_rank, inner))
+    add_float("blk.0.ssm_dt.weight", (ssm_heads, dt_rank))
+    add_float("blk.0.ssm_dt.bias", (ssm_heads,))
+    add_float("blk.0.ssm_a", (ssm_heads,), negative=not invalid_decay)
+    add_float("blk.0.ssm_d", (ssm_heads,))
+    add_float("blk.0.ssm_dt_norm", (dt_rank,))
+    add_float("blk.0.ssm_b_norm", (state,))
+    add_float("blk.0.ssm_c_norm", (state,))
+    projection("blk.0.ssm_out.weight", (hidden, inner))
+    projection(
+        "blk.1.attn_qkv.weight",
+        (heads * head_dim + 2 * kv_heads * head_dim, hidden),
+    )
+    add_float("blk.1.attn_q_norm.weight", (heads, head_dim))
+    add_float("blk.1.attn_k_norm.weight", (kv_heads, head_dim))
+    projection("blk.1.attn_output.weight", (hidden, heads * head_dim))
+    if extra is not None:
+        add_float(extra, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
     """Write a tiny two-layer LFM2 GGUF with one conv and one attention layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -4371,6 +4491,162 @@ class TestFalconH1GGUFBuild:
         assert not graph_build_started
 
 
+class TestPlamo2GGUFBuild:
+    """PLaMo2 GGUF import preserves exact fused tensors and mixed state."""
+
+    @staticmethod
+    def _inputs(batch: int) -> dict[str, np.ndarray]:
+        return {
+            "input_ids": np.asarray([[1, 2], [3, 4]][:batch], np.int64),
+            "position_ids": np.asarray([[0, 1], [0, 1]][:batch], np.int64),
+            "attention_mask": np.ones((batch, 2), np.int64),
+            "past_key_values.0.conv_state": np.zeros((batch, 32, 3), np.float32),
+            "past_key_values.0.ssm_state": np.zeros((batch, 4, 8, 4), np.float32),
+            "past_key_values.1.key": np.zeros((batch, 2, 0, 8), np.float32),
+            "past_key_values.1.value": np.zeros((batch, 2, 0, 8), np.float32),
+        }
+
+    def test_float_import_executes_and_round_trips(self, tmp_path: Path) -> None:
+        from gguf import GGUFReader
+
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-f32.gguf"
+        _write_plamo2_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+        source_tensors = {tensor.name: tensor.data for tensor in GGUFReader(path).tensors}
+        norm_pairs = {
+            "output_norm.weight": "model.norm.weight",
+            "blk.0.attn_norm.weight": "model.layers.0.pre_mixer_norm.weight",
+            "blk.0.post_attention_norm": "model.layers.0.post_mixer_norm.weight",
+            "blk.0.ffn_norm.weight": "model.layers.0.pre_mlp_norm.weight",
+            "blk.0.post_ffw_norm": "model.layers.0.post_mlp_norm.weight",
+        }
+        for source_name, initializer_name in norm_pairs.items():
+            np.testing.assert_array_equal(
+                model.graph.initializers[initializer_name].const_value.numpy(),
+                source_tensors[source_name],
+            )
+        assert model.metadata_props["mobius.runtime_support"].endswith(
+            "onnxruntime/mobius#605"
+        )
+        assert [value.name for value in model.graph.outputs] == [
+            "logits",
+            "present.0.conv_state",
+            "present.0.ssm_state",
+            "present.1.key",
+            "present.1.value",
+        ]
+        output_dir = tmp_path / "saved"
+        package.save(output_dir, progress_bar=False)
+        session = OnnxModelSession(ModelPackage.load(output_dir)["model"])
+        outputs = session.run(self._inputs(2))
+        assert outputs["logits"].shape == (2, 2, 64)
+        assert outputs["present.0.ssm_state"].dtype == np.float32
+
+    def test_quantized_source_preserves_exact_projection_roles(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-q4.gguf"
+        _write_plamo2_gguf(path, quantized=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        assert sum(node.op_type == "MatMulNBits" for node in model.graph) == 9
+        assert (
+            model.graph.initializers["model.layers.0.mixer.A"].const_value.dtype
+            == ir.DataType.FLOAT
+        )
+        assert (
+            model.graph.initializers["model.layers.0.mixer.dt_proj.weight_t"].const_value.dtype
+            == ir.DataType.FLOAT
+        )
+        assert (
+            model.graph.initializers["model.layers.0.mixer.B_norm_weight"].const_value.dtype
+            == ir.DataType.FLOAT
+        )
+
+    def test_quantized_tied_embedding_is_preserved_once(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-q4-embedding.gguf"
+        _write_plamo2_gguf(path, quantized=True, quantized_embedding=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        op_types = [node.op_type for node in model.graph]
+        assert op_types.count("GatherBlockQuantized") == 1
+        assert op_types.count("MatMulNBits") == 10
+        assert (
+            sum(name.endswith("embed_tokens.qweight") for name in model.graph.initializers)
+            == 1
+        )
+
+    def test_quantized_untied_output_head_is_preserved(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-q4-output.gguf"
+        _write_plamo2_gguf(path, quantized=True, include_output=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        assert sum(node.op_type == "MatMulNBits" for node in model.graph) == 10
+        assert "lm_head.weight" in model.graph.initializers
+        assert "lm_head.scales" in model.graph.initializers
+
+    def test_cli_builds_dequantized_package(self, tmp_path: Path) -> None:
+        from mobius.__main__ import main
+
+        source = tmp_path / "plamo2-cli.gguf"
+        output = tmp_path / "plamo2-cli"
+        _write_plamo2_gguf(source, quantized=True)
+        main(["build-gguf", str(source), "--output", str(output), "--dequantize"])
+        assert (output / "model.onnx").is_file()
+
+    def test_static_cache_is_rejected(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-static.gguf"
+        _write_plamo2_gguf(path, quantized=False)
+        with pytest.raises(ValueError, match="heterogeneous"):
+            build_from_gguf(path, static_cache=True)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"omit": "blk.0.ssm_out.weight"}, "tensor closure"),
+            ({"extra": "blk.0.unknown.weight"}, "tensor"),
+            ({"invalid_decay": True}, "finite negative"),
+            ({"group_count": 1}, "group_count=0"),
+            ({"epsilon": 1e-5}, "rms_epsilon=1e-6"),
+            ({"activation": "gelu"}, "fused SwiGLU"),
+            ({"predefined_state": True}, "predefined initial state"),
+            ({"head_counts": [4, 4]}, "head_count=4"),
+            ({"kv_head_counts": [0]}, "match block_count"),
+        ],
+    )
+    def test_malformed_sources_fail_before_graph(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        kwargs: dict[str, object],
+        match: str,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-invalid.gguf"
+        _write_plamo2_gguf(path, quantized=False, **kwargs)
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match=match):
+            build_from_gguf(path)
+        assert not graph_build_started
+
+
 class TestBuildGgufStaticCache:
     """Tests for build_from_gguf(static_cache=True).
 
@@ -4682,7 +4958,6 @@ class TestGGUFPreflightGuards:
         "architecture",
         [
             "minimax-01",
-            "plamo2",
             "bailingmoe3",
             "deepseek4",
             "kimi-k3",
