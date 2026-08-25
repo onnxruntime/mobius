@@ -22,6 +22,10 @@ import jsonschema
 import pytest
 import yaml
 
+from mobius.integrations.gguf._arch_registry import iter_arch_specs
+from mobius.integrations.gguf._runtime_evidence import runtime_evidence
+from mobius.integrations.gguf._spec import Support
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CASES_DIR = _REPO_ROOT / "testdata" / "cases"
 _SCHEMA_PATH = _CASES_DIR / "schema.json"
@@ -108,3 +112,51 @@ def test_all_yaml_task_types_are_in_schema() -> None:
             "Add them to the task_type enum in testdata/cases/schema.json:\n"
             + "\n".join(missing)
         )
+
+
+def test_every_runtime_supported_route_has_ort_genai_e2e_enrollment() -> None:
+    """Runtime support cannot outgrow pinned downstream generation coverage."""
+    enrolled: dict[str, dict[str, Any]] = {}
+    for yaml_path in _YAML_FILES:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        marker = data.get("ort_genai")
+        if marker:
+            evidence_id = marker["runtime_evidence_id"]
+            assert evidence_id not in enrolled, (
+                f"Duplicate ORT GenAI evidence ID: {evidence_id}"
+            )
+            enrolled[evidence_id] = marker
+
+    required_routes = {
+        (
+            evidence.architecture,
+            evidence.repository,
+            evidence.revision,
+            evidence.filename,
+            evidence.import_route,
+        )
+        for spec in iter_arch_specs()
+        if spec.runtime is Support.SUPPORTED
+        for evidence_id in spec.runtime_evidence_ids
+        if (evidence := runtime_evidence(evidence_id)) is not None
+    }
+    enrolled_routes = set()
+    for evidence_id, marker in enrolled.items():
+        evidence = runtime_evidence(evidence_id)
+        assert evidence is not None
+        assert evidence.runtime == "ort-genai"
+        assert evidence.runtime_version in marker["runtime_versions"]
+        enrolled_routes.add(
+            (
+                evidence.architecture,
+                evidence.repository,
+                evidence.revision,
+                evidence.filename,
+                evidence.import_route,
+            )
+        )
+        assert marker["execution_provider"] == "cpu"
+        assert marker["model_type"] == "decoder"
+        assert marker["runtime_versions"] == ["0.15.2"]
+        assert marker["max_download_bytes"] >= evidence.size
+    assert enrolled_routes == required_routes

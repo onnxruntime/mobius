@@ -139,6 +139,9 @@ class GoldenTestCase:
     tokenizer/reference checkpoint used to create the golden data.
     """
 
+    ort_genai: dict[str, object] | None
+    """Pinned ORT GenAI E2E enrollment and released-runtime capability record."""
+
     yaml_path: Path
     """Absolute path to the source YAML file."""
 
@@ -267,6 +270,7 @@ def load_test_case(yaml_path: Path) -> GoldenTestCase:
         min_token_match_ratio=data.get("min_token_match_ratio"),
         architecture=data.get("architecture"),
         gguf_source=data.get("gguf"),
+        ort_genai=data.get("ort_genai"),
         yaml_path=yaml_path,
     )
 

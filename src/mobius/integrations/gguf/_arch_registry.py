@@ -680,11 +680,15 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_processor="llama",
         llama_qk_permute=True,
         runtime=Support.SUPPORTED,
-        runtime_evidence_ids=("smollm-135m-f16-onnxruntime-1.29.0",),
+        runtime_evidence_ids=(
+            "smollm-135m-f16-onnxruntime-1.29.0",
+            "smollm-135m-f16-ort-genai-0.15.2",
+        ),
         reason=(
             "Runtime support is restricted to exact structured evidence matches. Currently "
             "that is only neopolita/smollm-135m-gguf F16 at the pinned artifact, CPU import "
-            "route, ONNX Runtime 1.29.0, and HuggingFaceTB/SmolLM-135M tokenizer revision."
+            "route, evidenced ONNX Runtime/ORT GenAI versions, and the pinned "
+            "HuggingFaceTB/SmolLM-135M tokenizer revision."
         ),
     ),
     GGUFArchitectureSpec(

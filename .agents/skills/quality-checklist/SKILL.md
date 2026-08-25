@@ -165,9 +165,13 @@ python examples/<model>_text_generation.py --compare-hf --dtype bf16
 
 Downstream evidence:
 
-- [ ] If ORT GenAI load/generation is run, record the exact runtime version and
-      result. Failures document limitations but never gate Mobius export based
-      on the runtime registry, topology support, or cache executor capability.
+- [ ] The network-free generic decoder test passes with the pinned latest stable
+      `onnxruntime-genai==0.15.2`.
+- [ ] Every runtime-supported real route has an `ort_genai` YAML marker with an
+      immutable evidence ID, exact tokenizer provenance, bounded download size,
+      CPU provider claim, and explicit released-version capabilities.
+- [ ] Real generation asserts the full generated length before token equality
+      and runs with an isolated Hub/Xet cache that is deleted after the test.
 - [ ] If ORT GenAI validation is run for a model with dual head dimensions,
       determine whether that runtime requires
       `search.past_present_share_buffer=false` for its uniform KV-cache
@@ -183,7 +187,9 @@ Waiver needed if any of the steps are not possible.
 Run the ORT GenAI integration test:
 
 ```bash
-python -m pytest tests/ort_genai_test.py -m integration_slow -k "<model>" -sv
+python -m pytest tests/ort_genai_e2e_test.py -m ort_genai_fast -v
+python -m pytest tests/gguf_small_model_runtime_integration_test.py \
+  -m ort_genai_real -v
 ```
 
 ### 10. Foundry Local package check

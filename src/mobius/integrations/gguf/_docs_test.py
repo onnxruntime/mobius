@@ -50,7 +50,13 @@ def test_generated_census_counts_and_pin_are_closed() -> None:
 def test_runtime_support_requires_structured_evidence() -> None:
     supported = [spec for spec in iter_arch_specs() if spec.runtime is Support.SUPPORTED]
     assert [(spec.gguf_arch, spec.runtime_evidence_ids) for spec in supported] == [
-        ("llama", ("smollm-135m-f16-onnxruntime-1.29.0",))
+        (
+            "llama",
+            (
+                "smollm-135m-f16-onnxruntime-1.29.0",
+                "smollm-135m-f16-ort-genai-0.15.2",
+            ),
+        )
     ]
 
     pins = {pin.artifact_id for pin in MMPROJ_ARTIFACT_PINS}

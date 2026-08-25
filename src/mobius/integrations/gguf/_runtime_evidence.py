@@ -174,7 +174,7 @@ def _is_hex(value: str) -> bool:
 
 _SMOLLM_F16_ROUTE = (
     '{"architecture":"llama","config_sha256":'
-    '"134f95e6a635d978737d712ed61ac8959acebdf080eafae838cf97f12c416430",'
+    '"b999a219ddf6046f1b6e5c082dab2d00b7ba1682169914430b1a3672fc735498",'
     '"execution_provider":"cpu","model_type":"llama","module_type":"llama",'
     '"preserve_quantization":false,"registry_import":{"config_key_map":null,'
     '"config_postprocessor":null,"llama_qk_permute":true,"offset_norm":false,'
@@ -249,8 +249,31 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
     runtime_version="1.29.0",
 )
 
+_SMOLLM_F16_ORT_GENAI = dataclasses.replace(
+    _SMOLLM_F16_ONNX_RUNTIME,
+    evidence_id="smollm-135m-f16-ort-genai-0.15.2",
+    runtime_package_files=(
+        "genai_config.json",
+        "gguf_tokenizer_manifest.json",
+        "model.onnx",
+        "model.onnx.data",
+        "runtime_compatibility.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
+    runtime_package_sha256="43568320f669d259d5a570ee04bd6378316ab31ce2fcb6383e75b479b4f2b349",
+    deterministic_test="test_smollm_generic_ort_genai_generation",
+    stateful_semantics="ORT GenAI prefill plus 20 cache-threaded decode steps",
+    runtime="ort-genai",
+    runtime_version="0.15.2",
+)
+
 _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType(
-    {_SMOLLM_F16_ONNX_RUNTIME.evidence_id: _SMOLLM_F16_ONNX_RUNTIME}
+    {
+        record.evidence_id: record
+        for record in (_SMOLLM_F16_ONNX_RUNTIME, _SMOLLM_F16_ORT_GENAI)
+    }
 )
 
 
