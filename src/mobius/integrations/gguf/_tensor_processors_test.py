@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mobius.integrations.gguf._tensor_processors import (
@@ -315,6 +316,50 @@ class TestProcessTensorsMamba:
         }
         result = process_tensors(state_dict, config)
         assert result["backbone.layers.0.mixer.conv1d.weight"].shape == (16, 1, 4)
+
+    def test_decay_transform_recovers_original_a_log_values(self) -> None:
+        config = SimpleNamespace(model_type="mamba")
+        a_log = torch.tensor([-2.0, 0.0, 1.5], dtype=torch.float32)
+        gguf_a = -torch.exp(a_log)
+        state_dict = {"model.layers.0.mixer.A_log": gguf_a}
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["model.layers.0.mixer.A_log"], a_log)
+        torch.testing.assert_close(
+            -torch.exp(result["model.layers.0.mixer.A_log"]),
+            gguf_a,
+        )
+
+    def test_decay_transform_rejects_wrong_direction_input(self) -> None:
+        config = SimpleNamespace(model_type="mamba2")
+        state_dict = {"backbone.layers.0.mixer.A_log": torch.tensor([-1.0, 0.25])}
+
+        with pytest.raises(ValueError, match="only negative"):
+            process_tensors(state_dict, config)
+
+    def test_mamba2_squeezes_cpp_head_parameter_layout(self) -> None:
+        config = SimpleNamespace(model_type="mamba2")
+        state_dict = {
+            "backbone.layers.0.mixer.A_log": -torch.exp(torch.tensor([[0.0], [1.0]])),
+            "backbone.layers.0.mixer.D": torch.tensor([[1.0], [2.0]]),
+            "backbone.layers.0.mixer.norm.weight": torch.tensor([[3.0, 4.0]]),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.A_log"],
+            torch.tensor([0.0, 1.0]),
+        )
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.D"],
+            torch.tensor([1.0, 2.0]),
+        )
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.norm.weight"],
+            torch.tensor([3.0, 4.0]),
+        )
 
 
 class TestProcessTensorsNoop:

@@ -215,19 +215,63 @@ _GPT2_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": "transformer.h.{bid}.ln_2",
 }
 
-# Mamba uses backbone.* naming.
+# Mamba uses model.* in Mobius; preprocess_weights nests the selective-scan
+# parameters under mixer.ssm after this GGUF-to-HF stage.
 _MAMBA_MAPPING: dict[str, str] = {
+    "token_embd": "model.embeddings",
+    "output": "lm_head",
+    "output_norm": "model.norm_f",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.norm",
+    "blk.{bid}.ssm_in": "model.layers.{bid}.mixer.in_proj",
+    "blk.{bid}.ssm_out": "model.layers.{bid}.mixer.out_proj",
+    "blk.{bid}.ssm_conv1d": "model.layers.{bid}.mixer.conv1d",
+    "blk.{bid}.ssm_dt": "model.layers.{bid}.mixer.dt_proj",
+    "blk.{bid}.ssm_a": "model.layers.{bid}.mixer.A_log",
+    "blk.{bid}.ssm_d": "model.layers.{bid}.mixer.D",
+    "blk.{bid}.ssm_x": "model.layers.{bid}.mixer.x_proj",
+}
+
+_MAMBA2_MAPPING: dict[str, str] = {
     "token_embd": "backbone.embeddings",
     "output": "lm_head",
     "output_norm": "backbone.norm_f",
     "blk.{bid}.attn_norm": "backbone.layers.{bid}.norm",
-    "blk.{bid}.ssm_in": ("backbone.layers.{bid}.mixer.in_proj"),
-    "blk.{bid}.ssm_out": ("backbone.layers.{bid}.mixer.out_proj"),
-    "blk.{bid}.ssm_conv1d": ("backbone.layers.{bid}.mixer.conv1d"),
-    "blk.{bid}.ssm_dt": ("backbone.layers.{bid}.mixer.dt_proj"),
+    "blk.{bid}.ssm_in": "backbone.layers.{bid}.mixer.in_proj",
+    "blk.{bid}.ssm_out": "backbone.layers.{bid}.mixer.out_proj",
+    "blk.{bid}.ssm_conv1d": "backbone.layers.{bid}.mixer.conv1d",
+    "blk.{bid}.ssm_dt": "backbone.layers.{bid}.mixer.dt_bias@",
     "blk.{bid}.ssm_a": "backbone.layers.{bid}.mixer.A_log",
     "blk.{bid}.ssm_d": "backbone.layers.{bid}.mixer.D",
-    "blk.{bid}.ssm_x": ("backbone.layers.{bid}.mixer.x_proj"),
+    "blk.{bid}.ssm_norm": "backbone.layers.{bid}.mixer.norm",
+}
+
+_RECURRENT_SUFFIXES: dict[str, dict[str, frozenset[str]]] = {
+    "mamba": {
+        "token_embd": frozenset({".weight", ".scale", ".input_scale"}),
+        "output": frozenset({".weight", ".scale", ".input_scale"}),
+        "output_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.attn_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_in": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_conv1d": frozenset({".weight", ".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_x": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_dt": frozenset({".weight", ".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_a": frozenset({""}),
+        "blk.{bid}.ssm_d": frozenset({""}),
+        "blk.{bid}.ssm_out": frozenset({".weight", ".scale", ".input_scale"}),
+    },
+    "mamba2": {
+        "token_embd": frozenset({".weight", ".scale", ".input_scale"}),
+        "output": frozenset({".weight", ".scale", ".input_scale"}),
+        "output_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.attn_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_in": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_conv1d": frozenset({".weight", ".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_dt": frozenset({".bias", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_a": frozenset({""}),
+        "blk.{bid}.ssm_d": frozenset({""}),
+        "blk.{bid}.ssm_norm": frozenset({".weight", ".scale", ".input_scale"}),
+        "blk.{bid}.ssm_out": frozenset({".weight", ".scale", ".input_scale"}),
+    },
 }
 
 # MoE extensions for Qwen2MoE/Qwen3MoE/DeepSeek.
@@ -380,6 +424,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "falcon": _FALCON_MAPPING,
         "gpt2": _GPT2_MAPPING,
         "mamba": _MAMBA_MAPPING,
+        "mamba2": _MAMBA2_MAPPING,
         "deepseek4": _DEEPSEEK4_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,
@@ -503,6 +548,9 @@ def map_gguf_to_hf_names(
     if blk_match:
         bid = blk_match.group(1)
         lookup = _BLK_PATTERN.sub(_BLK_TEMPLATE, stem)
+        allowed_suffixes = _RECURRENT_SUFFIXES.get(architecture, {}).get(lookup)
+        if allowed_suffixes is not None and suffix not in allowed_suffixes:
+            return None
         hf_pattern = mapping.get(lookup)
         if hf_pattern is not None:
             hf_pattern = hf_pattern.replace("{bid}", bid)
@@ -510,6 +558,9 @@ def map_gguf_to_hf_names(
                 return hf_pattern[:-1]
             return hf_pattern + suffix
     else:
+        allowed_suffixes = _RECURRENT_SUFFIXES.get(architecture, {}).get(stem)
+        if allowed_suffixes is not None and suffix not in allowed_suffixes:
+            return None
         hf_stem = mapping.get(stem)
         if hf_stem is not None:
             if hf_stem.endswith("@"):

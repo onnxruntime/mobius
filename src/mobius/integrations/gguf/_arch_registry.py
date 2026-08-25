@@ -104,6 +104,19 @@ _NO_QUANTIZED_PROJECTION_REASON = (
     "weights. Use keep_quantized=False for explicit float import."
 )
 
+_RECURRENT_RUNTIME_VALIDATION_PENDING = (
+    "Config extraction, exact pinned tensor-name closure, GGUF value transforms, and "
+    "synthetic recurrent-state execution are covered, but no representative real-weight "
+    "GGUF has yet passed independent full-logit parity and deterministic multi-token "
+    "stateful ORT generation. Runtime packaging remains deferred until that evidence exists."
+)
+
+_NO_RWKV_GRAPH = (
+    "llama.cpp implements this as a distinct RWKV recurrent architecture. Mobius has no "
+    "matching RWKV model graph or state-cache contract, so mapping it to Mamba would build "
+    "the wrong recurrence. Build from a supported source/runtime instead."
+)
+
 
 _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     # ---------------------------------------------------------------- Llama
@@ -236,7 +249,38 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="mamba",
         model_type="mamba",
         tensor_map_recipe=("mamba",),
+        config_key_map="mamba",
+        config_postprocessor="mamba",
         tensor_processor="mamba",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="mamba2",
+        model_type="mamba2",
+        tensor_map_recipe=("mamba2",),
+        config_key_map="mamba",
+        config_postprocessor="mamba2",
+        tensor_processor="mamba",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="starcoder2",
@@ -421,6 +465,38 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "relative attention bias, and cross-attention, none of which the "
             "decoder-only GGUF tensor mapping models. " + _NO_TENSOR_MAP
         ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="arwkv7",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_NO_RWKV_GRAPH,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="rwkv6",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_NO_RWKV_GRAPH,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="rwkv6qwen2",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_NO_RWKV_GRAPH,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="rwkv7",
+        config=Support.DEFERRED,
+        tensor_map=Support.DEFERRED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=_NO_RWKV_GRAPH,
     ),
     GGUFArchitectureSpec(
         gguf_arch="nemotron_h_moe",

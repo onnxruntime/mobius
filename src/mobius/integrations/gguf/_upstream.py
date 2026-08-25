@@ -67,6 +67,8 @@ class UpstreamArchitecture:
         tensor_families: Exact entries from the pinned
             ``gguf-py/gguf/constants.py::MODEL_TENSORS`` table. Vendored only
             for architectures whose tensor-map support mobius claims.
+        tensor_names: Exact full tensor names, including suffixes, created by
+            architecture-specific pinned C++ tensor creation sites.
         expert_tensor_suffixes: Exact suffixes created for routed expert tensors
             by the pinned C++ generic loader pass.
     """
@@ -76,6 +78,7 @@ class UpstreamArchitecture:
     cpp_loader: bool
     dual_moe: bool
     tensor_families: tuple[str, ...] = ()
+    tensor_names: tuple[str, ...] = ()
     expert_tensor_suffixes: tuple[str, ...] = ()
 
 
@@ -134,6 +137,7 @@ def upstream_architectures() -> dict[str, UpstreamArchitecture]:
             cpp_loader=fields["cpp_loader"],
             dual_moe=fields["dual_moe"],
             tensor_families=tuple(fields.get("tensor_families", ())),
+            tensor_names=tuple(fields.get("tensor_names", ())),
             expert_tensor_suffixes=tuple(fields.get("expert_tensor_suffixes", ())),
         )
         for name, fields in _payload()["architectures"].items()

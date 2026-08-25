@@ -40,7 +40,6 @@ __all__ = [
 import logging
 from typing import Any
 
-import numpy as np
 import torch
 
 from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
@@ -292,6 +291,7 @@ def _process_mamba(
 
     - ``conv1d.weight``: unsqueeze dim 1 (GGUF is 2D, HF is 3D)
     - ``A_log``: GGUF stores ``-exp(A_log)``; restore with ``log(-x)``
+    - Mamba2 ``A_log``/``D``: squeeze llama.cpp's trailing singleton axis
 
     Reference: ``MambaTensorProcessor`` in HF's
     ``modeling_gguf_pytorch_utils.py``.
@@ -300,8 +300,29 @@ def _process_mamba(
         if "conv1d" in name and name.endswith(".weight"):
             if tensor.dim() == 2:
                 state_dict[name] = tensor.unsqueeze(1)
-        elif "A_log" in name:
-            state_dict[name] = torch.from_numpy(np.log(-tensor.numpy()))
+        elif name.endswith(".A_log"):
+            if not torch.all(tensor < 0):
+                raise ValueError(
+                    f"Malformed GGUF Mamba decay tensor {name!r}: "
+                    "ssm_a must contain only negative -exp(A_log) values"
+                )
+            tensor = torch.log(-tensor)
+            if config.model_type == "mamba2" and tensor.dim() == 2 and tensor.shape[-1] == 1:
+                tensor = tensor.squeeze(-1)
+            state_dict[name] = tensor
+        elif (
+            config.model_type == "mamba2"
+            and name.endswith(".D")
+            and tensor.dim() == 2
+            and tensor.shape[-1] == 1
+        ):
+            state_dict[name] = tensor.squeeze(-1)
+        elif (
+            config.model_type == "mamba2"
+            and name.endswith(".norm.weight")
+            and tensor.dim() == 2
+        ):
+            state_dict[name] = tensor.flatten()
     return state_dict
 
 

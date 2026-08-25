@@ -33,6 +33,8 @@ from mobius._configs import (
     ArchitectureConfig,
     Gemma2Config,
     Gemma4Config,
+    Mamba2Config,
+    MambaConfig,
     MuseGlimmerConfig,
     _shallow_fields,
 )
@@ -144,6 +146,15 @@ _GLM_DSA_KEY_MAP = {
     "attention.indexer.top_k": "index_topk",
 }
 
+_MAMBA_KEY_MAP = {
+    "attention.layer_norm_rms_epsilon": "layer_norm_epsilon",
+    "ssm.conv_kernel": "conv_kernel",
+    "ssm.group_count": "n_groups",
+    "ssm.inner_size": "intermediate_size",
+    "ssm.state_size": "state_size",
+    "ssm.time_step_rank": "time_step_rank",
+}
+
 #: Named architecture-specific key maps that :attr:`GGUFArchitectureSpec.
 #: config_key_map` selects. Every name here must be referenced by a spec and
 #: every name a spec references must exist here; ``_arch_registry_test`` checks
@@ -153,6 +164,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
         "deepseek4": _DEEPSEEK4_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
+        "mamba": _MAMBA_KEY_MAP,
     }
 )
 
@@ -356,6 +368,11 @@ def gguf_to_config(
     head_dim = hf_fields.get("head_dim")
     hidden_size = hf_fields["hidden_size"]
     num_attention_heads = hf_fields["num_attention_heads"]
+    if canonical_arch in {"mamba", "mamba2"}:
+        # Pure recurrent GGUFs deliberately write attention.head_count=0.
+        # The temporary ArchitectureConfig still needs a nonzero placeholder;
+        # the postprocessor replaces it with the real SSM head geometry.
+        num_attention_heads = int(num_attention_heads) or 1
     key_length = metadata.get(f"{gguf_arch}.attention.key_length")
     if key_length is not None:
         head_dim = int(key_length)
@@ -1249,6 +1266,82 @@ def _muse_glimmer_qk_scale_factor(model: Any, default: float) -> float:
     return float(values[0])
 
 
+def _base_model_fields(config: ArchitectureConfig, cls: type) -> dict[str, Any]:
+    """Copy only fields accepted by a recurrent BaseModelConfig subclass."""
+    return {
+        field.name: getattr(config, field.name)
+        for field in dataclasses.fields(cls)
+        if hasattr(config, field.name)
+    }
+
+
+def _mamba_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> MambaConfig:
+    """Build the Mamba config from llama.cpp's SSM metadata."""
+    del model
+    arch = "mamba"
+    if bool(metadata.get(f"{arch}.ssm.dt_b_c_rms")):
+        raise ValueError(
+            "mamba.ssm.dt_b_c_rms=true requires FalconMamba's extra B/C/dt norms, "
+            "which the pure Mamba graph does not implement"
+        )
+    fields = _base_model_fields(config, MambaConfig)
+    fields.update(
+        intermediate_size=int(metadata[f"{arch}.ssm.inner_size"]),
+        state_size=int(metadata[f"{arch}.ssm.state_size"]),
+        conv_kernel=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        time_step_rank=int(metadata[f"{arch}.ssm.time_step_rank"]),
+        layer_norm_epsilon=float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"]),
+        use_conv_bias=True,
+        expand=int(metadata[f"{arch}.ssm.inner_size"]) // config.hidden_size,
+    )
+    result = MambaConfig(**fields)
+    result.model_type = "mamba"
+    return result
+
+
+def _mamba2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> Mamba2Config:
+    """Build Mamba2 head/group geometry from pinned GGUF SSM metadata."""
+    del model
+    arch = "mamba2"
+    d_inner = int(metadata[f"{arch}.ssm.inner_size"])
+    num_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    n_groups = int(metadata[f"{arch}.ssm.group_count"])
+    if num_heads <= 0 or d_inner % num_heads:
+        raise ValueError(
+            f"{arch}.ssm.inner_size ({d_inner}) must be divisible by "
+            f"ssm.time_step_rank/head_count ({num_heads})"
+        )
+    if n_groups <= 0 or num_heads % n_groups or d_inner % n_groups:
+        raise ValueError(
+            f"{arch}.ssm.group_count ({n_groups}) must divide both head_count "
+            f"({num_heads}) and inner_size ({d_inner})"
+        )
+    fields = _base_model_fields(config, Mamba2Config)
+    fields.update(
+        intermediate_size=d_inner,
+        num_heads=num_heads,
+        head_dim=d_inner // num_heads,
+        state_size=int(metadata[f"{arch}.ssm.state_size"]),
+        n_groups=n_groups,
+        conv_kernel=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        expand=d_inner // config.hidden_size,
+        layer_norm_epsilon=float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"]),
+        use_conv_bias=True,
+        chunk_size=256,
+    )
+    result = Mamba2Config(**fields)
+    result.model_type = "mamba2"
+    return result
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -1266,6 +1359,8 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "gemma3": _gemma3_postprocess,
     "gemma4": _gemma4_postprocess,
     "muse_glimmer": _muse_glimmer_postprocess,
+    "mamba": _mamba_postprocess,
+    "mamba2": _mamba2_postprocess,
 }
 
 

@@ -146,6 +146,7 @@ reason.
 | GGUF architecture | Accepted aliases | mobius `model_type` | Float import | Quantized import |
 |---|---|---|---|---|
 | `arcee` | — | `arcee` | runtime deferred | supported |
+| `arwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `bloom` | — | `bloom` | tensor_map deferred | unreachable |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
@@ -163,7 +164,8 @@ reason.
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
 | `llama` | `mistral` | `llama` | supported | supported |
-| `mamba` | — | `mamba` | supported | supported |
+| `mamba` | — | `mamba` | runtime deferred | rejected |
+| `mamba2` | — | `mamba2` | runtime deferred | rejected |
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
 | `nemotron` | — | `nemotron` | supported | supported |
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
@@ -178,6 +180,9 @@ reason.
 | `qwen35` | — | `qwen3_5_text` | supported | supported |
 | `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
 | `qwen3moe` | `qwen3_moe` | `qwen3_moe` | runtime deferred | supported |
+| `rwkv6` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `rwkv6qwen2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `rwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `smollm3` | — | `smollm3` | supported | supported |
 | `stablelm` | — | `stablelm` | supported | supported |
 | `starcoder2` | — | `starcoder2` | supported | supported |
@@ -189,6 +194,40 @@ Canonical names are the strings llama.cpp writes into `general.architecture`,
 validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
+
+### Pure recurrent Mamba evidence
+
+`mamba` and `mamba2` have config, suffix-exact C++ tensor-name closure,
+graph-build, save/load,
+quantized-source dequantization, and recurrent prompt/decode state-threading
+coverage. Mamba1 ingests prompts as single-token recurrent steps; Mamba2 also
+supports multi-token prefill. Their runtime verdict remains **deferred**: no pinned real GGUF has
+yet passed an independent full-logit comparison plus deterministic multi-token
+generation against its source implementation.
+
+The optional Mamba `ssm.dt_b_c_rms` metadata defaults to `false`, matching the
+pinned loader. Files that explicitly set it to `true` are rejected because they
+require FalconMamba's additional B/C/dt norms, which the pure Mamba graph does
+not implement.
+
+The real-file audit was completed from HTTP range metadata before any payload
+download:
+
+| Architecture | GGUF revision and file | Size | LFS SHA-256 | Header evidence |
+|---|---|---:|---|---|
+| Mamba | `QuantFactory/mamba-130m-hf-GGUF@f781792fcca13eb3457a00dc41674715608b02da`<br>`mamba-130m-hf-Q2_K.gguf` | 69,302,464 | `922a9c947f979024fe3675b11a9257637d2226f8953f1831a351890953a5209a` | 242 tensors: Q2_K projections, Q6_K tied embedding, F16 dt projection, F32 conv/state/norm |
+| Mamba2 | `rpatel622/mamba2-130m-hf-Q8_0-GGUF@0daf70963405439f2102f6fefe92d7584e2c76eb`<br>`mamba2-130m-hf-q8_0.gguf` | 180,669,152 | `c5d91a0653794a159f19d60159c362b179b506a206be120f8b63f43013155839` | 219 tensors: Q8_0 embedding/output/projections and F32 conv/state/norm; A/D use llama.cpp's `(heads, 1)` layout |
+
+The corresponding source configuration/tokenizer revisions are
+`state-spaces/mamba-130m-hf@1e76775f628fbf1350fbe4dbb3d971ba64af25a1`
+and `AntonV/mamba2-130m-hf@05e8773fc4ac1cd067e8a18a5c45372ce5178405`.
+The header census covers every layer and confirms the pinned llama.cpp tensor
+families and qtypes without treating graph construction as runtime parity.
+
+`arwkv7`, `rwkv6`, `rwkv6qwen2`, and `rwkv7` are explicitly deferred because
+their time-mixing/channel-mixing recurrence is a distinct architecture and
+Mobius has no corresponding graph. They must not be routed through either
+Mamba implementation.
 
 GraniteMoE has real-weight import and deterministic ORT execution coverage from
 `bartowski/granite-3.0-1b-a400m-instruct-GGUF` revision

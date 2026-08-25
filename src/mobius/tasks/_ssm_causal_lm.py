@@ -34,6 +34,7 @@ def _build_ssm_task(
     config: BaseModelConfig,
     conv_state_shape: list,
     ssm_state_shape: list,
+    sequence_length: int | ir.SymbolicDim,
 ) -> ModelPackage:
     """Shared implementation for SSM causal LM tasks.
 
@@ -47,11 +48,13 @@ def _build_ssm_task(
         A :class:`ModelPackage` containing the built model.
     """
     batch = ir.SymbolicDim("batch")
-    seq_len = ir.SymbolicDim("sequence_len")
-
     graph, builder = _make_graph()
 
-    input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+    input_ids = builder.input(
+        "input_ids",
+        dtype=ir.DataType.INT64,
+        shape=[batch, sequence_length],
+    )
 
     past_states: list[tuple[ir.Value, ir.Value]] = []
     for i in range(config.num_hidden_layers):
@@ -115,6 +118,9 @@ class SSMCausalLMTask(ModelTask):
             config,
             conv_state_shape=[d_inner, config.conv_kernel - 1],
             ssm_state_shape=[d_inner, config.state_size],
+            # Mamba1's selective-scan graph is a single recurrent step.
+            # Prompt ingestion is token-by-token with state threading.
+            sequence_length=1,
         )
 
 
@@ -155,6 +161,7 @@ class SSM2CausalLMTask(ModelTask):
             conv_state_shape=[conv_dim, config.conv_kernel - 1],
             # LinearAttention convention: (H, d_k, d_v) = (H, d_state, d_head)
             ssm_state_shape=[config.num_heads, state_size, config.head_dim],
+            sequence_length=ir.SymbolicDim("sequence_len"),
         )
         # Register CausalConvWithState and LinearAttention function ops.
         from mobius.tasks._cache_utils import (

@@ -372,6 +372,28 @@ def _validate_gguf_model(gguf_model, *, source: str) -> None:
         tensor_names=gguf_model.tensor_names,
     )
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
+    _raise_for_malformed_recurrent_tensors(gguf_model)
+
+
+def _raise_for_malformed_recurrent_tensors(gguf_model) -> None:
+    """Reject recurrent tensor suffixes not created by the pinned C++ loaders."""
+    from mobius.integrations.gguf._upstream import upstream_architecture
+
+    upstream = upstream_architecture(gguf_model.architecture)
+    if upstream is None or not upstream.tensor_names:
+        return
+
+    expected = set(upstream.tensor_names)
+    malformed = []
+    for name in gguf_model.tensor_names:
+        template = re.sub(r"^blk\.\d+\.", "blk.{bid}.", name)
+        if template not in expected:
+            malformed.append(name)
+    if malformed:
+        raise ValueError(
+            f"Malformed {gguf_model.architecture} GGUF tensor name(s): {malformed}. "
+            "The suffixes do not match the pinned llama.cpp tensor creation sites."
+        )
 
 
 def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
@@ -655,6 +677,11 @@ def build_from_gguf(
     model_type = getattr(config, "_gguf_model_type", None)
     if model_type is None:
         model_type = GGUF_ARCH_TO_MODEL_TYPE.get(gguf_arch, gguf_arch)
+    if static_cache and model_type in {"mamba", "mamba2"}:
+        raise ValueError(
+            f"static_cache=True is not supported for recurrent {model_type} GGUF models; "
+            "they carry per-layer conv_state and ssm_state rather than a KV cache."
+        )
 
     # 2b. Architecture-resolution safety rail. When the GGUF architecture string
     # bridges to a specialised registry key, verify the metadata-derived config
@@ -2244,10 +2271,10 @@ def _validate_moe_weight_shape(
     config,
 ) -> None:
     """Reject router/expert tensors that could otherwise be partially routed."""
-    num_experts = config.num_local_experts
+    num_experts = getattr(config, "num_local_experts", None)
     if num_experts is None:
         return
-    expert_size = config.moe_intermediate_size or config.intermediate_size
+    expert_size = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
     if ".mlp.experts." in name:
         projection = name.rsplit(".mlp.experts.", 1)[1].split(".", 1)[0]
         if projection not in {"gate_proj", "up_proj", "down_proj"}:

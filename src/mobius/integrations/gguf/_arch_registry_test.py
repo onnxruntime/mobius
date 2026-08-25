@@ -56,7 +56,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 32
+_EXPECTED_SUPPORTED_COUNT = 33
 
 # Quantized reachability is separately pinned from float importability. A new
 # architecture must explicitly prove that its graph exposes packed projection
@@ -77,7 +77,6 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "granitemoe",
         "hunyuan-dense",
         "llama",
-        "mamba",
         "muse-glimmer",
         "nemotron",
         "olmo",
@@ -162,11 +161,12 @@ class TestCapabilityClosure:
             if spec.is_importable
         }
         assert set(actual) == set(supported_architectures())
-        assert actual["internlm2"] is Support.REJECTED
+        rejected = {"internlm2", "mamba", "mamba2"}
+        assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
             verdict is Support.SUPPORTED
             for arch, verdict in actual.items()
-            if arch != "internlm2"
+            if arch not in rejected
         )
 
 
@@ -282,16 +282,23 @@ class TestPinnedTensorClosure:
         "qwen2moe",
         "qwen3moe",
         "granitemoe",
+        "mamba",
+        "mamba2",
     )
 
     @staticmethod
     def _unmapped(architecture: str) -> list[str]:
         upstream = upstream_architectures()[architecture]
         unmapped = []
-        for family in upstream.tensor_families:
-            name = family.replace("{bid}", "0") + ".weight"
+        names = (
+            tuple((name, name) for name in upstream.tensor_names)
+            if upstream.tensor_names
+            else tuple((family + ".weight", family) for family in upstream.tensor_families)
+        )
+        for pinned_name, label in names:
+            name = pinned_name.replace("{bid}", "0")
             if map_gguf_to_hf_names(name, architecture) is None and not is_known_skip(name):
-                unmapped.append(family)
+                unmapped.append(label)
         return unmapped
 
     @pytest.mark.parametrize("architecture", _NEW_ARCHITECTURES)
@@ -334,6 +341,83 @@ class TestPinnedTensorClosure:
             moe_mapping["blk.{bid}.ffn_gate_exps"] = removed
             _build_mapping.cache_clear()
 
+    _RECURRENT_TENSOR_NAMES: ClassVar[dict[str, set[str]]] = {
+        "mamba": {
+            "token_embd.weight",
+            "output_norm.weight",
+            "output.weight",
+            "blk.{bid}.attn_norm.weight",
+            "blk.{bid}.ssm_in.weight",
+            "blk.{bid}.ssm_conv1d.weight",
+            "blk.{bid}.ssm_conv1d.bias",
+            "blk.{bid}.ssm_x.weight",
+            "blk.{bid}.ssm_dt.weight",
+            "blk.{bid}.ssm_dt.bias",
+            "blk.{bid}.ssm_a",
+            "blk.{bid}.ssm_d",
+            "blk.{bid}.ssm_out.weight",
+        },
+        "mamba2": {
+            "token_embd.weight",
+            "output_norm.weight",
+            "output.weight",
+            "blk.{bid}.attn_norm.weight",
+            "blk.{bid}.ssm_in.weight",
+            "blk.{bid}.ssm_conv1d.weight",
+            "blk.{bid}.ssm_conv1d.bias",
+            "blk.{bid}.ssm_dt.bias",
+            "blk.{bid}.ssm_a",
+            "blk.{bid}.ssm_d",
+            "blk.{bid}.ssm_norm.weight",
+            "blk.{bid}.ssm_out.weight",
+        },
+    }
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_pure_recurrent_pinned_tensor_names_are_suffix_exact(
+        self, architecture: str
+    ) -> None:
+        upstream = upstream_architectures()[architecture]
+        assert set(upstream.tensor_names) == self._RECURRENT_TENSOR_NAMES[architecture]
+        for pinned_name in upstream.tensor_names:
+            name = pinned_name.replace("{bid}", "7")
+            assert map_gguf_to_hf_names(name, architecture) is not None, name
+
+    @pytest.mark.parametrize(
+        ("architecture", "malformed"),
+        [
+            ("mamba", "blk.0.ssm_a.weight"),
+            ("mamba", "blk.0.ssm_d.bias"),
+            ("mamba", "blk.0.ssm_in.bias"),
+            ("mamba2", "blk.0.ssm_dt.weight"),
+            ("mamba2", "blk.0.ssm_a.bias"),
+            ("mamba2", "blk.0.ssm_norm.bias"),
+        ],
+    )
+    def test_pure_recurrent_malformed_suffixes_do_not_map(
+        self, architecture: str, malformed: str
+    ) -> None:
+        assert map_gguf_to_hf_names(malformed, architecture) is None
+
+    @pytest.mark.parametrize(
+        ("architecture", "mapping_key"),
+        [
+            ("mamba", "blk.{bid}.ssm_x"),
+            ("mamba2", "blk.{bid}.ssm_norm"),
+        ],
+    )
+    def test_deleting_recurrent_mapping_breaks_closure(
+        self, architecture: str, mapping_key: str
+    ) -> None:
+        mapping = _MAPPING_TABLES[architecture]
+        removed = mapping.pop(mapping_key)
+        _build_mapping.cache_clear()
+        try:
+            assert any(name.startswith(mapping_key) for name in self._unmapped(architecture))
+        finally:
+            mapping[mapping_key] = removed
+            _build_mapping.cache_clear()
+
 
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
@@ -360,8 +444,8 @@ class TestRejectionsAreActionable:
             get_arch_spec("gptj")
 
     def test_an_unimported_upstream_architecture_names_its_cohort(self) -> None:
-        with pytest.raises(UnsupportedGGUFArchitectureError, match="C05-pure-recurrent"):
-            get_arch_spec("mamba2")
+        with pytest.raises(UnsupportedGGUFArchitectureError, match="distinct RWKV"):
+            get_arch_spec("rwkv6")
 
     def test_an_unknown_architecture_is_distinguished_from_an_upstream_one(self) -> None:
         with pytest.raises(UnsupportedGGUFArchitectureError, match="not among the 147"):

@@ -323,6 +323,108 @@ def _write_quantized_gguf(
     writer.close()
 
 
+def _write_recurrent_gguf(
+    path: Path,
+    architecture: str,
+    *,
+    quantized: bool,
+    malformed_conv: bool = False,
+    auxiliary_scale: bool = False,
+    malformed_suffix: bool = False,
+) -> None:
+    """Write an exact one-layer Mamba/Mamba2 GGUF tensor set."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden_size = 32
+    inner_size = 64
+    state_size = 8
+    conv_kernel = 4
+    dt_rank_or_heads = 4
+    vocab_size = 64
+    groups = 1
+    rng = np.random.default_rng(7)
+
+    writer = GGUFWriter(str(path), architecture)
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden_size)
+    writer.add_feed_forward_length(0)
+    writer.add_block_count(1)
+    writer.add_head_count(0)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab_size)
+    writer.add_ssm_conv_kernel(conv_kernel)
+    writer.add_ssm_inner_size(inner_size)
+    writer.add_ssm_state_size(state_size)
+    writer.add_ssm_time_step_rank(dt_rank_or_heads)
+    if architecture == "mamba":
+        writer.add_ssm_dt_b_c_rms(False)
+    else:
+        writer.add_ssm_group_count(groups)
+
+    def add_float(name: str, shape: tuple[int, ...], *, negative: bool = False) -> None:
+        values = rng.normal(0.0, 0.05, size=shape).astype(np.float32)
+        if negative:
+            values = -np.exp(values)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, int]) -> None:
+        rows, columns = shape
+        assert columns % 32 == 0
+        raw = np.zeros((rows, columns // 32 * 18), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(columns // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    add_projection = add_q4 if quantized else add_float
+    add_float("token_embd.weight", (vocab_size, hidden_size))
+    add_float("output_norm.weight", (hidden_size,))
+    add_float("output.weight", (vocab_size, hidden_size))
+    add_float("blk.0.attn_norm.weight", (hidden_size,))
+    if architecture == "mamba":
+        add_projection("blk.0.ssm_in.weight", (2 * inner_size, hidden_size))
+        conv_width = conv_kernel + 1 if malformed_conv else conv_kernel
+        add_float("blk.0.ssm_conv1d.weight", (inner_size, conv_width))
+        add_float("blk.0.ssm_conv1d.bias", (inner_size,))
+        add_projection(
+            "blk.0.ssm_x.weight",
+            (dt_rank_or_heads + 2 * state_size, inner_size),
+        )
+        # The small dt projection is deliberately float: its input dimension
+        # cannot satisfy Q4_0's 32-value block ABI.
+        add_float("blk.0.ssm_dt.weight", (inner_size, dt_rank_or_heads))
+        add_float("blk.0.ssm_dt.bias", (inner_size,))
+        add_float("blk.0.ssm_a", (inner_size, state_size), negative=True)
+        add_float("blk.0.ssm_d", (inner_size,))
+    else:
+        conv_dim = inner_size + 2 * groups * state_size
+        projection_size = 2 * inner_size + 2 * groups * state_size + dt_rank_or_heads
+        add_projection("blk.0.ssm_in.weight", (projection_size, hidden_size))
+        conv_width = conv_kernel + 1 if malformed_conv else conv_kernel
+        add_float("blk.0.ssm_conv1d.weight", (conv_dim, conv_width))
+        add_float("blk.0.ssm_conv1d.bias", (conv_dim,))
+        add_float("blk.0.ssm_dt.bias", (dt_rank_or_heads,))
+        add_float("blk.0.ssm_a", (dt_rank_or_heads, 1), negative=True)
+        add_float("blk.0.ssm_d", (dt_rank_or_heads, 1))
+        add_float("blk.0.ssm_norm.weight", (inner_size,))
+    add_projection("blk.0.ssm_out.weight", (hidden_size, inner_size))
+    if auxiliary_scale:
+        add_float("blk.0.ssm_in.scale", (1,))
+    if malformed_suffix:
+        add_float("blk.0.ssm_a.weight", (dt_rank_or_heads,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_moe_gguf(
     path: Path,
     architecture: str,
@@ -2042,6 +2144,173 @@ class TestBuildQuantizedGguf:
                 {router_key: torch.empty(2, 4)},
                 config=config,
             )
+
+
+class TestRecurrentGGUFBuild:
+    """Mamba GGUF imports preserve recurrent state and tensor-role semantics."""
+
+    @staticmethod
+    def _run_steps(model, architecture: str) -> list[dict[str, np.ndarray]]:
+        from mobius._testing.ort_inference import OnnxModelSession
+
+        conv_channels = 64 if architecture == "mamba" else 80
+        ssm_shape = (1, 64, 8) if architecture == "mamba" else (1, 4, 8, 16)
+        states = {
+            "past_states.0.conv_state": np.zeros((1, conv_channels, 3), dtype=np.float32),
+            "past_states.0.ssm_state": np.zeros(ssm_shape, dtype=np.float32),
+        }
+        token_groups = [[1], [2], [3], [4]]
+        if architecture == "mamba2":
+            token_groups = [[1, 2, 3], [4]]
+
+        session = OnnxModelSession(model)
+        outputs = []
+        try:
+            for tokens in token_groups:
+                out = session.run(
+                    {
+                        "input_ids": np.asarray([tokens], dtype=np.int64),
+                        **states,
+                    }
+                )
+                outputs.append(out)
+                states = {
+                    "past_states.0.conv_state": out["present.0.conv_state"],
+                    "past_states.0.ssm_state": out["present.0.ssm_state"],
+                }
+        finally:
+            session.close()
+        return outputs
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_float_prefill_decode_state_threading_and_save_load(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-f32.gguf"
+        _write_recurrent_gguf(path, architecture, quantized=False)
+        package = build_from_gguf(path)
+
+        output_dir = tmp_path / f"{architecture}-saved"
+        package.save(output_dir, progress_bar=False)
+        reloaded = ModelPackage.load(output_dir)
+        outputs = self._run_steps(reloaded["model"], architecture)
+
+        assert all(np.isfinite(out["logits"]).all() for out in outputs)
+        assert np.count_nonzero(outputs[-1]["present.0.conv_state"]) > 0
+        assert np.count_nonzero(outputs[-1]["present.0.ssm_state"]) > 0
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_quantized_projection_preservation_is_rejected_and_float_import_executes(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-q4.gguf"
+        _write_recurrent_gguf(path, architecture, quantized=True)
+        with pytest.raises(ValueError, match="does not support keep_quantized=True"):
+            build_from_gguf(path, keep_quantized=True)
+
+        # Current Mamba projection consumers are ordinary Linear modules.
+        # Explicit float import dequantizes the GGUF source before stateful execution.
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+        assert "MatMulNBits" not in {node.op_type for node in explicit_float.graph}
+        float_steps = self._run_steps(explicit_float, architecture)
+        assert all(np.isfinite(out["logits"]).all() for out in float_steps)
+        assert np.count_nonzero(float_steps[-1]["present.0.conv_state"]) > 0
+        assert np.count_nonzero(float_steps[-1]["present.0.ssm_state"]) > 0
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_static_kv_cache_is_rejected(self, tmp_path: Path, architecture: str) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-static.gguf"
+        _write_recurrent_gguf(path, architecture, quantized=False)
+        with pytest.raises(ValueError, match="conv_state and ssm_state"):
+            build_from_gguf(path, static_cache=True)
+
+    def test_mamba1_graph_rejects_multi_token_input(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "mamba-multitoken.gguf"
+        _write_recurrent_gguf(path, "mamba", quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        try:
+            with pytest.raises(
+                ort.capi.onnxruntime_pybind11_state.InvalidArgument,
+                match=r"dimension|Expected",
+            ):
+                session.run(
+                    {
+                        "input_ids": np.asarray([[1, 2]], dtype=np.int64),
+                        "past_states.0.conv_state": np.zeros((1, 64, 3), np.float32),
+                        "past_states.0.ssm_state": np.zeros((1, 64, 8), np.float32),
+                    }
+                )
+        finally:
+            session.close()
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_malformed_conv_shape_is_not_silently_loaded(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-bad-conv.gguf"
+        _write_recurrent_gguf(path, architecture, quantized=False, malformed_conv=True)
+        with pytest.raises(ValueError, match="shape"):
+            build_from_gguf(path)
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_malformed_recurrent_suffix_is_rejected_before_graph_build(
+        self, tmp_path: Path, architecture: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-bad-suffix.gguf"
+        _write_recurrent_gguf(
+            path,
+            architecture,
+            quantized=False,
+            malformed_suffix=True,
+        )
+
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match="suffixes do not match"):
+            build_from_gguf(path)
+        assert not graph_build_started
+
+    @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
+    def test_auxiliary_quantization_sidecar_is_rejected_before_graph_build(
+        self, tmp_path: Path, architecture: str, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / f"{architecture}-sidecar.gguf"
+        _write_recurrent_gguf(path, architecture, quantized=False, auxiliary_scale=True)
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match="scale/input_scale"):
+            build_from_gguf(path)
+        assert not graph_build_started
 
 
 class TestBuildGgufStaticCache:
