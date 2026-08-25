@@ -2343,6 +2343,28 @@ def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
 class TestReuseGgufWeights:
     """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
 
+    def test_fsync_file_uses_writable_descriptor_on_windows(
+        self, tmp_path: Path, monkeypatch
+    ):
+        from mobius.integrations.gguf import _reuse
+
+        path = tmp_path / "artifact.bin"
+        path.write_bytes(b"artifact")
+        opened_modes = []
+        real_open = Path.open
+
+        def tracking_open(self, *args, **kwargs):
+            if self == path:
+                opened_modes.append(args[0] if args else kwargs.get("mode", "r"))
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(_reuse.os, "name", "nt")
+        monkeypatch.setattr(Path, "open", tracking_open)
+
+        _reuse._fsync_file(path)
+
+        assert opened_modes == ["r+b"]
+
     def test_mixed_save_preserves_ranges_and_runs(self, tmp_path: Path):
         from mobius._model_package import ModelPackage
         from mobius.integrations.gguf import (
