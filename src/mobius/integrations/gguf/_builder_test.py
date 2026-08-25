@@ -1314,3 +1314,51 @@ class TestReorderDeltaNetVHeads:
         ref = sd[f"{p}in_proj_z.weight"].clone()
         out = _reorder_deltanet_v_heads({k: v.clone() for k, v in sd.items()}, cfg)
         assert torch.equal(out[f"{p}in_proj_z.weight"], ref)
+
+
+class TestGgufArchSurvivesToWeightProcessing:
+    """``_gguf_arch`` must reach ``process_tensors`` on every build path.
+
+    It is a plain instance attribute, not a dataclass field, so every
+    ``dataclasses.replace`` in the builder drops it. It is also the key the
+    weight-processor dispatch is built on, so losing it silently demotes
+    dispatch to the ``model_type`` fallback — which is exactly the indirection
+    the architecture registry exists to remove. A regression here would be
+    invisible until a spec's processor stopped agreeing with its model_type,
+    and would then affect only non-float32 and quantized imports.
+    """
+
+    @staticmethod
+    def _recorded_arches(monkeypatch, gguf_path: Path, **build_kwargs) -> list[object]:
+        from mobius.integrations.gguf import _builder as builder_module
+        from mobius.integrations.gguf import _tensor_processors
+
+        seen: list[object] = []
+        real = _tensor_processors.process_tensors
+
+        def spy(state_dict, config):
+            seen.append(getattr(config, "_gguf_arch", None))
+            return real(state_dict, config)
+
+        monkeypatch.setattr(_tensor_processors, "process_tensors", spy)
+        builder_module.build_from_gguf(gguf_path, **build_kwargs)
+        return seen
+
+    def test_float_path_keeps_the_architecture(self, monkeypatch, q4_0_gguf: Path):
+        seen = self._recorded_arches(monkeypatch, q4_0_gguf, keep_quantized=False)
+        assert seen, "process_tensors was never called"
+        assert all(arch == "llama" for arch in seen), seen
+
+    def test_dtype_override_keeps_the_architecture(self, monkeypatch, q4_0_gguf: Path):
+        """``dtype`` triggers a ``dataclasses.replace`` that drops the attribute."""
+        seen = self._recorded_arches(
+            monkeypatch, q4_0_gguf, keep_quantized=False, dtype="float16"
+        )
+        assert seen, "process_tensors was never called"
+        assert all(arch == "llama" for arch in seen), seen
+
+    def test_quantized_path_keeps_the_architecture(self, monkeypatch, q4_0_gguf: Path):
+        """The preserve-quantization path replaces the config as well."""
+        seen = self._recorded_arches(monkeypatch, q4_0_gguf, keep_quantized=True)
+        assert seen, "process_tensors was never called"
+        assert all(arch == "llama" for arch in seen), seen

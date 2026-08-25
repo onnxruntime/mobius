@@ -37,6 +37,12 @@ import functools
 import re
 from types import MappingProxyType
 
+from mobius.integrations.gguf._arch_registry import get_arch_spec, try_get_arch_spec
+from mobius.integrations.gguf._errors import (
+    DisabledGGUFArchitectureError,
+    UnsupportedGGUFArchitectureError,
+)
+
 # ---------------------------------------------------------------------------
 # Architecture-specific GGUF → HF stem mappings
 # ---------------------------------------------------------------------------
@@ -271,23 +277,10 @@ _DEEPSEEK4_MAPPING: dict[str, str] = {
     "blk.{bid}.hc_ffn_scale": "model.layers.{bid}.hc_ffn_scale@",
 }
 
-# Architectures sharing the llama HF naming convention.
-_LLAMA_FAMILY = frozenset(
-    {
-        "llama",
-        "mistral",
-        "qwen2",
-        "qwen3",
-        "qwen35",
-        "starcoder2",
-        "internlm2",
-        "nemotron",
-        "stablelm",
-        "deci",
-    }
-)
-
-_GEMMA_FAMILY = frozenset({"gemma", "gemma2", "gemma3"})
+# Architectures sharing the llama HF naming convention are declared in
+# ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
+# frozenset here, so the "which architectures does this cover?" question has one
+# answer instead of one per module.
 
 # HunYuan-v1 dense uses the Llama base but adds per-head Q/K layer-norms
 # (HF: ``query_layernorm`` / ``key_layernorm``), which mobius renames to
@@ -296,8 +289,6 @@ _HUNYUAN_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
 }
-
-_HUNYUAN_FAMILY = frozenset({"hunyuan-dense", "hunyuan_v1_dense"})
 
 # Muse Glimmer keeps the Llama projection names but rearranges the norms and
 # adds a sigmoid gate on the attention output.
@@ -323,15 +314,30 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_gate": "model.layers.{bid}.self_attn.gate_proj",
 }
 
-_MUSE_GLIMMER_FAMILY = frozenset({"muse-glimmer", "muse_glimmer"})
 
-_MOE_FAMILY = frozenset(
+#: Named mapping tables that :data:`GGUFArchitectureSpec.tensor_map_recipe`
+#: composes, in order. Later tables in a recipe override earlier ones, which is
+#: how the Gemma variants replace the Llama ``ffn_norm`` mapping.
+#:
+#: Every name here must be referenced by at least one spec, and every name a
+#: spec references must exist here. Both directions are asserted by
+#: ``_arch_registry_test``, so an orphaned table or a typo in a recipe fails the
+#: suite instead of silently producing an unmapped tensor.
+_MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
-        "qwen2moe",
-        "qwen2_moe",
-        "qwen3moe",
-        "qwen3_moe",
-        "qwen35moe",
+        "llama": _LLAMA_MAPPING,
+        "phi3": _PHI3_MAPPING,
+        "falcon": _FALCON_MAPPING,
+        "gpt2": _GPT2_MAPPING,
+        "mamba": _MAMBA_MAPPING,
+        "deepseek4": _DEEPSEEK4_MAPPING,
+        "gemma2_extras": _GEMMA2_EXTRAS,
+        "gemma3_extras": _GEMMA3_EXTRAS,
+        "gemma4_extras": _GEMMA4_EXTRAS,
+        "moe_extras": _MOE_EXTRAS,
+        "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
+        "hunyuan_extras": _HUNYUAN_EXTRAS,
+        "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
     }
 )
 
@@ -355,74 +361,42 @@ def _build_mapping(
 ) -> MappingProxyType[str, str]:
     """Return the GGUF→HF stem mapping for *architecture*.
 
-    Cached per architecture to avoid rebuilding on every tensor.
-    Returns an immutable proxy to prevent mutation of the cache.
-    """
-    arch = architecture.lower()
+    The recipe comes from the architecture registry rather than an ``if/elif``
+    chain here, so adding an architecture never means editing this function and
+    the set of mappable architectures cannot drift from the set of configurable
+    ones. Tables are layered in recipe order, so a later table overrides an
+    earlier one — which is how the Gemma variants replace the Llama
+    ``ffn_norm`` mapping with their pre-feedforward norm.
 
-    if arch in _LLAMA_FAMILY:
-        result = dict(_LLAMA_MAPPING)
-        if arch == "qwen35":
-            result.update(_QWEN35_HYBRID_EXTRAS)
-    elif arch == "gemma3":
-        # Gemma3 uses the llama.cpp Gemma tensor names (ffn_norm as the
-        # pre-feedforward norm, plus post_attention/post_ffw norms and Q/K
-        # norms), distinct from the older _GEMMA2_EXTRAS names — keep it out of
-        # the shared _GEMMA_FAMILY path.
-        result = dict(_LLAMA_MAPPING)
-        result.update(_GEMMA3_EXTRAS)
-    elif arch == "gemma2":
-        # Gemma2 uses the llama.cpp Gemma tensor names (ffn_norm as the
-        # pre-feedforward norm, plus post_attention/post_ffw sandwich norms),
-        # distinct from the plain-Llama norm layout of Gemma v1. It has no
-        # per-head Q/K norms (those are Gemma3+).
-        result = dict(_LLAMA_MAPPING)
-        result.update(_GEMMA2_EXTRAS)
-    elif arch in _GEMMA_FAMILY:
-        # Gemma v1: standard two-norm (input + post-attention) Llama layout with
-        # no sandwich feedforward norms, so the plain Llama base is correct.
-        result = dict(_LLAMA_MAPPING)
-    elif arch == "gemma4":
-        # Gemma 4 starts from the Llama base but needs several overrides and
-        # many new tensor types for Q/K norms, per-layer scalars, MoE norms,
-        # and per-layer input embeddings. Use a dedicated extras dict rather
-        # than extending _GEMMA_FAMILY to avoid contaminating Gemma 2/3.
-        result = dict(_LLAMA_MAPPING)
-        result.update(_GEMMA4_EXTRAS)
-    elif arch == "phi3":
-        result = dict(_PHI3_MAPPING)
-    elif arch == "falcon":
-        result = dict(_FALCON_MAPPING)
-    elif arch == "gpt2":
-        result = dict(_GPT2_MAPPING)
-    elif arch == "mamba":
-        result = dict(_MAMBA_MAPPING)
-    elif arch in _HUNYUAN_FAMILY:
-        result = dict(_LLAMA_MAPPING)
-        result.update(_HUNYUAN_EXTRAS)
-    elif arch in _MUSE_GLIMMER_FAMILY:
-        result = dict(_LLAMA_MAPPING)
-        result.update(_MUSE_GLIMMER_EXTRAS)
-    elif arch in _MOE_FAMILY:
-        result = dict(_LLAMA_MAPPING)
-        result.update(_MOE_EXTRAS)
-        if arch == "qwen35moe":
-            result.update(_QWEN35_HYBRID_EXTRAS)
-    elif arch == "deepseek4":
-        result = dict(_DEEPSEEK4_MAPPING)
-    else:
-        supported = sorted(
-            _LLAMA_FAMILY
-            | _GEMMA_FAMILY
-            | _MOE_FAMILY
-            | _HUNYUAN_FAMILY
-            | _MUSE_GLIMMER_FAMILY
-            | {"deepseek4", "gemma4", "phi3", "falcon", "gpt2", "mamba"}
-        )
-        raise ValueError(
-            f"Unsupported GGUF architecture: {architecture!r}. "
-            f"Supported: {', '.join(supported)}"
-        )
+    Cached per architecture to avoid rebuilding on every tensor. Returns an
+    immutable proxy to prevent mutation of the cache.
+
+    Raises:
+        UnsupportedGGUFArchitectureError: The architecture has no tensor
+            mapping, whether because it is unregistered, deliberately disabled,
+            or registered without one. This gate has always reported every such
+            case as a ``ValueError``, so it reports disabled architectures that
+            way too rather than leaking the ``NotImplementedError`` base that
+            :func:`get_arch_spec` uses.
+    """
+    spec = try_get_arch_spec(architecture.lower())
+    if spec is None or not spec.is_importable:
+        try:
+            get_arch_spec(architecture.lower())
+        except DisabledGGUFArchitectureError as error:
+            raise UnsupportedGGUFArchitectureError(str(error)) from None
+        except UnsupportedGGUFArchitectureError:
+            raise
+        raise AssertionError("unreachable: spec is importable after all")
+    result: dict[str, str] = {}
+    for table_name in spec.tensor_map_recipe:
+        table = _MAPPING_TABLES.get(table_name)
+        if table is None:
+            raise ValueError(
+                f"Architecture {spec.gguf_arch!r} references unknown tensor mapping "
+                f"table {table_name!r}. Known tables: {sorted(_MAPPING_TABLES)}"
+            )
+        result.update(table)
     return MappingProxyType(result)
 
 

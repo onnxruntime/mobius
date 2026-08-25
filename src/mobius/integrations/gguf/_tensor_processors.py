@@ -43,7 +43,17 @@ from typing import Any
 import numpy as np
 import torch
 
+from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
+
 logger = logging.getLogger(__name__)
+
+#: mobius ``model_type`` values that no GGUF architecture maps to, but which
+#: still store Q/K with the llama.cpp interleaved-rope permutation, so a caller
+#: passing one directly must get the right answer.
+#:
+#: ``mistral`` is Llama-architecture; llama.cpp writes Mistral checkpoints with
+#: ``general.architecture = "llama"``, so no spec produces this model_type.
+_EXTRA_QK_PERMUTE_MODEL_TYPES = frozenset({"mistral"})
 
 # Model types whose GGUF Q/K weights are stored with llama.cpp's
 # interleaved-rope permutation and therefore require reverse-permutation
@@ -54,12 +64,49 @@ logger = logging.getLogger(__name__)
 # rope and store Q/K in plain HF row order — applying the permute to them
 # scrambles the attention heads and produces garbage output. They must
 # NOT be reverse-permuted.
-LLAMA_QK_PERMUTE_MODEL_TYPES = frozenset({"llama", "mistral", "muse_glimmer_text"})
+#
+# Derived from the architecture registry so that declaring a new architecture
+# cannot leave this set behind.
+LLAMA_QK_PERMUTE_MODEL_TYPES = (
+    frozenset(
+        spec.model_type
+        for spec in iter_arch_specs()
+        if spec.llama_qk_permute and spec.model_type is not None
+    )
+    | _EXTRA_QK_PERMUTE_MODEL_TYPES
+)
 
 
 def needs_llama_qk_permute(model_type: str | None) -> bool:
     """Return True if this model type needs llama.cpp Q/K reverse-permute."""
     return model_type in LLAMA_QK_PERMUTE_MODEL_TYPES
+
+
+def _resolve_processor(config: Any) -> Any:
+    """Return the weight processor for *config*, or ``None``.
+
+    Dispatch prefers the GGUF architecture recorded on the config, because that
+    is the identity the registry is keyed on. Falling back to ``model_type`` is
+    what silently broke Gemma 3: its processor was registered under ``gemma3``
+    while GGUF ``gemma3`` resolves to model_type ``gemma3_text``, so the Gemma
+    norm un-offset never ran and every norm was left with llama.cpp's baked-in
+    ``+1`` on top of the ``OffsetRMSNorm`` the graph applies at runtime.
+
+    The ``model_type`` path is retained for callers that build a config without
+    going through :func:`gguf_to_config`.
+    """
+    gguf_arch = getattr(config, "_gguf_arch", None)
+    if gguf_arch is not None:
+        spec = try_get_arch_spec(gguf_arch)
+        if spec is not None:
+            name = spec.tensor_processor
+            return None if name is None else _PROCESSOR_IMPLS[name]
+
+    model_type = getattr(config, "model_type", None)
+    if model_type is None:
+        return None
+    name = _LEGACY_MODEL_TYPE_PROCESSORS.get(model_type)
+    return None if name is None else _PROCESSOR_IMPLS[name]
 
 
 def process_tensors(
@@ -68,9 +115,9 @@ def process_tensors(
 ) -> dict[str, torch.Tensor]:
     """Apply architecture-specific tensor transformations.
 
-    Dispatches to an architecture-specific processor based on
-    ``config.model_type``. If no processor is registered for the
-    model type, the state dict is returned unchanged.
+    Dispatches on the GGUF architecture recorded on *config*, falling back to
+    ``config.model_type``. If no processor applies, the state dict is returned
+    unchanged.
 
     Args:
         state_dict: HuggingFace-named state dict from GGUF import.
@@ -81,11 +128,7 @@ def process_tensors(
     Returns:
         The transformed state dict (modified in-place).
     """
-    model_type = getattr(config, "model_type", None)
-    if model_type is None:
-        return state_dict
-
-    processor = _PROCESSORS.get(model_type)
+    processor = _resolve_processor(config)
     if processor is None:
         return state_dict
 
@@ -157,38 +200,34 @@ def _reverse_permute(
     return w.swapaxes(1, 2).reshape(weights.shape)
 
 
-def _process_gemma(
+def _process_unoffset_norm(
     state_dict: dict[str, torch.Tensor],
     config: Any,
 ) -> dict[str, torch.Tensor]:
-    """Restore Gemma norm weights to the HF convention.
+    """Undo the ``+1`` llama.cpp bakes into centered norm weights.
 
-    llama.cpp bakes the Gemma ``(1 + w)`` RMSNorm offset into the stored
-    weights: ``w_gguf = w_hf + 1``. The mobius Gemma graph normalizes with
-    :class:`OffsetRMSNorm`, which re-applies ``(1 + weight)`` at runtime, so the
-    initializer it consumes must be the raw ``w_hf``. Subtract 1 to undo the
-    llama.cpp offset (matching HF's ``Gemma2TensorProcessor`` in
-    ``modeling_gguf_pytorch_utils.py``); otherwise the offset is applied twice
-    and every norm — hence the whole model — is corrupted.
+    Several architectures scale by ``(1 + w)`` rather than by ``w``: Gemma's
+    ``Gemma*RMSNorm`` and Nemotron's ``NemotronLayerNorm1P`` both store ``w_hf``
+    in the HuggingFace checkpoint and add one at runtime. llama.cpp has no
+    offset norm, so its converters fold the constant in and write
+    ``w_gguf = w_hf + 1`` — see ``conversion/nemotron.py`` at the pinned commit
+    ("Adding +1 to LayerNorm's weights here to implement layernorm1p w/o
+    changing anything on the GGML engine side") and the Gemma equivalents.
+
+    The mobius graphs normalize with :class:`OffsetRMSNorm` /
+    :class:`OffsetLayerNorm`, which re-apply the ``1 +`` themselves, so the
+    initializer they consume must be the raw ``w_hf``. Subtract one to undo the
+    fold; otherwise the offset lands twice and every norm — hence the whole
+    model — is corrupted.
+
+    This matches HF's ``Gemma2TensorProcessor`` **and** ``NemotronTensorProcessor``
+    in ``modeling_gguf_pytorch_utils.py``, both of which subtract one. mobius
+    previously had a separate Nemotron processor that added one instead, leaving
+    Nemotron GGUF imports scaling by ``w_hf + 3`` instead of ``w_hf + 1``.
     """
     for name in list(state_dict):
         if "norm" in name and name.endswith(".weight"):
             state_dict[name] = state_dict[name] - 1
-    return state_dict
-
-
-def _process_nemotron(
-    state_dict: dict[str, torch.Tensor],
-    config: Any,
-) -> dict[str, torch.Tensor]:
-    """Restore Nemotron norm weights (same offset as Gemma).
-
-    Reference: ``NemotronTensorProcessor`` in HF's
-    ``modeling_gguf_pytorch_utils.py``.
-    """
-    for name in list(state_dict):
-        if "norm" in name and name.endswith(".weight"):
-            state_dict[name] = state_dict[name] + 1
     return state_dict
 
 
@@ -266,21 +305,45 @@ def _process_mamba(
     return state_dict
 
 
-# Map model_type → processor function.
-# Architectures not listed here need no tensor transforms.
+# Named weight processors. The architecture registry refers to these by name,
+# which is why the table is keyed on the processor's own identity rather than on
+# a model_type. Every name here must be referenced by at least one architecture
+# spec, and every name a spec references must exist here; ``_arch_registry_test``
+# checks both directions, so an orphaned processor or a typo in a spec fails the
+# suite instead of silently doing nothing.
 #
-# NOTE: Qwen2/Qwen3 are intentionally NOT mapped to ``_process_llama``.
-# Unlike Llama/Mistral, llama.cpp does not permute Qwen Q/K weights
-# (Qwen uses NEOX-style rope), so reverse-permuting them corrupts the
-# attention heads. See ``LLAMA_QK_PERMUTE_MODEL_TYPES``.
-_PROCESSORS: dict[str, Any] = {
+# NOTE: Qwen2/Qwen3 deliberately have no processor. Unlike Llama/Mistral,
+# llama.cpp does not permute Qwen Q/K weights (Qwen uses NEOX-style rope), so
+# reverse-permuting them corrupts the attention heads. See
+# ``LLAMA_QK_PERMUTE_MODEL_TYPES``.
+_PROCESSOR_IMPLS: dict[str, Any] = {
     "llama": _process_llama,
-    "mistral": _process_llama,
-    "gemma": _process_gemma,
-    "gemma2": _process_gemma,
-    "gemma3": _process_gemma,
-    "nemotron": _process_nemotron,
-    "muse_glimmer_text": _process_muse_glimmer,
+    "unoffset_norm": _process_unoffset_norm,
+    "muse_glimmer": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
+}
+
+#: mobius ``model_type`` values that no GGUF architecture maps to, but that a
+#: caller may pass directly in a hand-built config.
+#:
+#: ``mistral`` is Llama-architecture (llama.cpp writes it as ``llama``).
+#: ``gemma3`` is the *multimodal* Gemma 3 model type; ``models/gemma3.py``
+#: normalizes with ``OffsetRMSNorm``, so it needs the Gemma un-offset. GGUF
+#: ``gemma3`` resolves to ``gemma3_text`` and is handled through its spec.
+_EXTRA_MODEL_TYPE_PROCESSORS: dict[str, str] = {
+    "mistral": "llama",
+    "gemma3": "unoffset_norm",
+}
+
+#: Fallback ``model_type`` → processor-name map for configs that did not come
+#: from :func:`~mobius.integrations.gguf._config_mapping.gguf_to_config` and so
+#: carry no ``_gguf_arch``. Derived from the registry, then extended.
+_LEGACY_MODEL_TYPE_PROCESSORS: dict[str, str] = {
+    **{
+        spec.model_type: spec.tensor_processor
+        for spec in iter_arch_specs()
+        if spec.model_type is not None and spec.tensor_processor is not None
+    },
+    **_EXTRA_MODEL_TYPE_PROCESSORS,
 }

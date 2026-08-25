@@ -31,82 +31,83 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from mobius.integrations.gguf._quant_registry import iter_quant_specs, quant_spec_by_name
+from mobius.integrations.gguf._spec import NativeBlockSpec
+
+__all__ = [
+    "NATIVE_BLOCK_BYTE_SIZES",
+    "NativeBlockSpec",
+    "RepackedTensor",
+    "can_repack",
+    "native_block_spec",
+    "preserve_native_blocks",
+    "repack_dequantized_tensor",
+    "repack_gguf_tensor",
+    "repack_quant_params",
+]
+
 _BLOCK_SIZE = 32
 
-# GGUF quantization type IDs (from gguf.GGMLQuantizationType enum)
-_GGUF_Q4_0 = 2
-_GGUF_Q4_1 = 3
-_GGUF_Q8_0 = 8
-_GGUF_Q4_K = 12
-_GGUF_Q6_K = 14
-_GGUF_IQ2_XXS = 16
-_GGUF_IQ2_XS = 17
-_GGUF_IQ3_XXS = 18
-_GGUF_IQ1_S = 19
-_GGUF_IQ4_NL = 20
-_GGUF_IQ3_S = 21
-_GGUF_IQ2_S = 22
-_GGUF_IQ4_XS = 23
-_GGUF_IQ1_M = 29
-_GGUF_MXFP4 = 39
-_GGUF_Q1_0 = 41
 
-# Block byte sizes per GGUF type
-_BLOCK_BYTES = {
-    _GGUF_Q4_0: 18,  # 2B scale + 16B quants
-    _GGUF_Q4_1: 20,  # 2B scale + 2B min + 16B quants
-    _GGUF_Q8_0: 34,  # 2B scale + 32B int8 values
-    _GGUF_Q4_K: 144,  # 2B d + 2B dmin + 12B scales + 128B quants
-    _GGUF_Q6_K: 210,  # 128B low nibbles + 64B high bits + 16B scales + 2B d
-    _GGUF_Q1_0: 18,  # 2B scale + 16B packed bits (128 elements)
+def _type_id(name: str) -> int:
+    """Return the pinned ``ggml_type`` id for an upper-case type name."""
+    spec = quant_spec_by_name(name)
+    if spec is None:
+        raise ValueError(f"GGML type {name!r} is not in the pinned llama.cpp census")
+    return spec.ggml_type_id
+
+
+# GGUF quantization type IDs, resolved from the pinned llama.cpp census rather
+# than hand-typed, so they cannot drift from ``gguf.GGMLQuantizationType``.
+_GGUF_Q4_0 = _type_id("Q4_0")
+_GGUF_Q4_1 = _type_id("Q4_1")
+_GGUF_Q8_0 = _type_id("Q8_0")
+_GGUF_Q4_K = _type_id("Q4_K")
+_GGUF_Q6_K = _type_id("Q6_K")
+_GGUF_Q1_0 = _type_id("Q1_0")
+
+# Block geometry, repack targets, and native layouts are all derived from
+# ``_quant_registry``. They used to be four literal dicts here plus three more
+# in ``_builder``, kept in sync by hand; a type present in one and missing from
+# another raised ``KeyError`` partway through a build.
+#
+# Block byte sizes:
+#   Q4_0  18 = 2B scale + 16B quants
+#   Q4_1  20 = 2B scale + 2B min + 16B quants
+#   Q8_0  34 = 2B scale + 32B int8 values
+#   Q4_K 144 = 2B d + 2B dmin + 12B sub-scales + 128B quants
+#   Q6_K 210 = 128B low nibbles + 64B high bits + 16B scales + 2B d
+#   Q1_0  18 = 2B scale + 16B packed bits (128 elements)
+_BLOCK_BYTES: dict[int, int] = {
+    spec.ggml_type_id: spec.block_bytes
+    for spec in iter_quant_specs()
+    if spec.affine_repack is not None
 }
 
-# Elements per GGUF block. Q4_K uses 256-element "super-blocks"
-# that decompose into 8 sub-blocks of 32 for MatMulNBits. Q1_0 uses
-# 128-element blocks (QK1_0 from llama.cpp).
-_GGUF_BLOCK_ELEMENTS = {
-    _GGUF_Q4_0: 32,
-    _GGUF_Q4_1: 32,
-    _GGUF_Q8_0: 32,
-    _GGUF_Q4_K: 256,
-    _GGUF_Q6_K: 256,
-    _GGUF_Q1_0: 128,
+# Elements per GGUF block. Q4_K/Q6_K use 256-element "super-blocks" that
+# decompose into 8 sub-blocks of 32 for MatMulNBits; Q1_0 uses 128-element
+# blocks (QK1_0 from llama.cpp).
+_GGUF_BLOCK_ELEMENTS: dict[int, int] = {
+    spec.ggml_type_id: spec.block_elements
+    for spec in iter_quant_specs()
+    if spec.affine_repack is not None
 }
 
-_SUPPORTED_TYPES = frozenset(_BLOCK_BYTES.keys())
+_SUPPORTED_TYPES = frozenset(_BLOCK_BYTES)
 
 # MatMulNBits representation produced for each supported GGUF type.
-_REPACK_PARAMS = {
-    _GGUF_Q4_0: (4, 32),
-    _GGUF_Q4_1: (4, 32),
-    _GGUF_Q8_0: (8, 32),
-    _GGUF_Q4_K: (4, 32),
-    _GGUF_Q6_K: (4, 32),
-    _GGUF_Q1_0: (2, 128),
+_REPACK_PARAMS: dict[int, tuple[int, int]] = {
+    spec.ggml_type_id: spec.affine_repack.as_params()
+    for spec in iter_quant_specs()
+    if spec.affine_repack is not None
 }
 
-
-@dataclass(frozen=True)
-class NativeBlockSpec:
-    """Serialized GGUF block layout accepted directly by the runtime."""
-
-    format: str
-    elements: int
-    bytes: int
-
-
-_NATIVE_BLOCK_SPECS = {
-    _GGUF_MXFP4: NativeBlockSpec("mxfp4", 32, 17),
-    _GGUF_IQ4_NL: NativeBlockSpec("iq4_nl", 32, 18),
-    _GGUF_IQ4_XS: NativeBlockSpec("iq4_xs", 256, 136),
-    _GGUF_IQ3_S: NativeBlockSpec("iq3_s", 256, 110),
-    _GGUF_IQ3_XXS: NativeBlockSpec("iq3_xxs", 256, 98),
-    _GGUF_IQ2_XXS: NativeBlockSpec("iq2_xxs", 256, 66),
-    _GGUF_IQ2_XS: NativeBlockSpec("iq2_xs", 256, 74),
-    _GGUF_IQ2_S: NativeBlockSpec("iq2_s", 256, 82),
-    _GGUF_IQ1_S: NativeBlockSpec("iq1_s", 256, 50),
-    _GGUF_IQ1_M: NativeBlockSpec("iq1_m", 256, 56),
+_NATIVE_BLOCK_SPECS: dict[int, NativeBlockSpec] = {
+    spec.ggml_type_id: spec.native_preserve
+    for spec in iter_quant_specs()
+    if spec.native_preserve is not None
 }
+
 NATIVE_BLOCK_BYTE_SIZES = frozenset(spec.bytes for spec in _NATIVE_BLOCK_SPECS.values())
 
 

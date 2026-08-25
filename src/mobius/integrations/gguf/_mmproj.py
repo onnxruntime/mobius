@@ -43,12 +43,14 @@ __all__ = [
 import dataclasses
 import logging
 import math
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from mobius._model_package import ModelPackage
+from mobius.integrations.gguf._arch_registry import MMPROJ_ARCHITECTURE
 
 logger = logging.getLogger(__name__)
 
@@ -522,9 +524,9 @@ def build_gemma4_vlm_from_gguf(
 
     mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
     _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
-    if mmproj_gguf.architecture != "clip":
+    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
         raise ValueError(
-            f"Expected a 'clip' mmproj GGUF, got architecture "
+            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
             f"{mmproj_gguf.architecture!r} for {mmproj_gguf_path!r}."
         )
     logger.info("Building Gemma4 VLM from text=%s mmproj=%s", text_gguf_path, mmproj_gguf_path)
@@ -713,9 +715,9 @@ def build_muse_glimmer_vlm_from_gguf(
 
     mmproj_gguf = GGUFModel(_resolve_local_path(mmproj_gguf_path))
     _validate_gguf_model(mmproj_gguf, source=str(mmproj_gguf_path))
-    if mmproj_gguf.architecture != "clip":
+    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
         raise ValueError(
-            f"Expected a 'clip' mmproj GGUF, got architecture "
+            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
             f"{mmproj_gguf.architecture!r} for {mmproj_gguf_path!r}."
         )
     logger.info(
@@ -797,6 +799,9 @@ def build_muse_glimmer_vlm_from_gguf(
         and value.dtype != torch.uint8
     }
     rest = {key: value for key, value in text_state.items() if key not in float_state}
+    # ``dataclasses.replace`` above drops the plain instance attribute that
+    # ``process_tensors`` dispatches on, so restore it before processing.
+    config._gguf_arch = text_gguf.architecture
     float_state = _normalize_gguf_weights(process_tensors(float_state, config))
     text_state = {**float_state, **rest}
 
@@ -826,15 +831,10 @@ def build_vlm_from_gguf(
     The mmproj itself is always ``general.architecture = clip``, so the text
     backbone is what decides how the pair is assembled.
     """
-    from mobius.integrations.gguf._config_mapping import GGUF_ARCH_TO_MODEL_TYPE
     from mobius.integrations.gguf._reader import GGUFModel
 
     text_arch = GGUFModel(_resolve_local_path(text_gguf_path)).architecture
-    builder = (
-        build_muse_glimmer_vlm_from_gguf
-        if GGUF_ARCH_TO_MODEL_TYPE.get(text_arch) == "muse_glimmer_text"
-        else build_gemma4_vlm_from_gguf
-    )
+    builder = _resolve_vlm_builder(text_arch)
     return builder(
         text_gguf_path,
         mmproj_gguf_path,
@@ -842,6 +842,34 @@ def build_vlm_from_gguf(
         execution_provider=execution_provider,
         keep_quantized=keep_quantized,
     )
+
+
+#: Named multimodal assembly entry points that
+#: :attr:`GGUFArchitectureSpec.vlm_builder` selects, held as module attribute
+#: names so dispatch resolves at call time rather than capturing the function
+#: objects at import.
+#:
+#: Every name here must be referenced by a spec and every name a spec references
+#: must exist here; ``_arch_registry_test`` checks both directions.
+_VLM_BUILDERS: dict[str, str] = {
+    "gemma4": "build_gemma4_vlm_from_gguf",
+    "muse_glimmer": "build_muse_glimmer_vlm_from_gguf",
+}
+
+
+def _resolve_vlm_builder(text_arch: str) -> Callable[..., ModelPackage]:
+    """Return the multimodal assembly entry point for a text architecture.
+
+    Architectures with no declared ``vlm_builder`` fall back to the Gemma 4
+    assembly, which is the historical default for an unrecognized pairing.
+    """
+    from mobius.integrations.gguf._arch_registry import try_get_arch_spec
+
+    spec = try_get_arch_spec(text_arch)
+    name = None if spec is None else spec.vlm_builder
+    attribute = _VLM_BUILDERS.get(name or "", "build_gemma4_vlm_from_gguf")
+    builder: Callable[..., ModelPackage] = globals()[attribute]
+    return builder
 
 
 def _muse_glimmer_multimodal_name(hf_name: str) -> str:
