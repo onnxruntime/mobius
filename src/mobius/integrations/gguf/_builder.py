@@ -537,6 +537,7 @@ def _validate_gguf_model(
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
+    _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
@@ -1427,6 +1428,172 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
     malformed = {
         name: (required.get(name, optional.get(name)), actual[name])
         for name in shape_checked & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
+    """Validate the complete pinned tensor census for conventional legacy decoders."""
+    architecture = gguf_model.architecture
+    supported = {
+        "bloom",
+        "codeshell",
+        "command-r",
+        "jais2",
+        "orion",
+        "qwen",
+        "starcoder",
+        "xverse",
+    }
+    if architecture not in supported:
+        return
+    metadata = gguf_model.metadata
+    suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    if architecture == "command-r":
+        suffixes += ("logit_scale",)
+    missing_metadata = [
+        f"{architecture}.{suffix}"
+        for suffix in suffixes
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{architecture} GGUF is missing required decoder metadata: {missing_metadata}"
+        )
+    if architecture == "command-r":
+        logit_scale = float(metadata["command-r.logit_scale"])
+        if not math.isfinite(logit_scale) or logit_scale <= 0:
+            raise ValueError(
+                f"command-r.logit_scale must be a finite positive value, got {logit_scale!r}"
+            )
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    serialized_ffn = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+    context = int(metadata[f"{architecture}.context_length"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    if min(hidden, serialized_ffn, layers, heads, kv_heads, context, vocab) <= 0:
+        raise ValueError(f"{architecture} GGUF has invalid decoder geometry")
+    if hidden % heads or heads % kv_heads:
+        raise ValueError(f"{architecture} GGUF has invalid grouped-query geometry")
+    head_dim = hidden // heads
+    kv_dim = kv_heads * head_dim
+    intermediate = serialized_ffn // 2 if architecture == "qwen" else serialized_ffn
+    if architecture == "qwen" and serialized_ffn % 2:
+        raise ValueError("qwen feed_forward_length must be even (two fused SwiGLU halves)")
+    if architecture == "command-r" and layers >= 64:
+        raise ValueError(
+            "command-r GGUF with block_count >= 64 requires distinct per-head Q/K "
+            "LayerNorm weights, which the current Attention graph cannot represent"
+        )
+
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    if architecture in {"command-r", "orion", "xverse"}:
+        fused = sorted(name for name in actual if name.endswith(".attn_qkv.weight"))
+        if fused:
+            raise ValueError(
+                f"{architecture} GGUF fused QKV tensors are not supported; "
+                f"split attn_q/attn_k/attn_v tensors are required: {fused}"
+            )
+    required: dict[str, tuple[int, ...]] = {}
+    optional: dict[str, tuple[int, ...]] = {}
+    if architecture == "codeshell":
+        optional["token_embd.weight"] = (vocab, hidden)
+    else:
+        required["token_embd.weight"] = (vocab, hidden)
+    if architecture == "bloom":
+        required.update(
+            {
+                "token_embd_norm.weight": (hidden,),
+                "token_embd_norm.bias": (hidden,),
+            }
+        )
+    if architecture == "starcoder":
+        required["position_embd.weight"] = (context, hidden)
+    required["output_norm.weight"] = (hidden,)
+    if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
+        required["output_norm.bias"] = (hidden,)
+    output_shape = (vocab, hidden)
+    if architecture == "codeshell":
+        optional["output.weight"] = output_shape
+    elif architecture in {"orion", "qwen", "xverse"}:
+        required["output.weight"] = output_shape
+    elif architecture in {"bloom", "jais2", "starcoder"}:
+        optional["output.weight"] = output_shape
+
+    gated = architecture in {"command-r", "orion", "qwen", "xverse"}
+    fused_only = architecture in {"bloom", "qwen", "starcoder"}
+    separate_only = architecture == "jais2"
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required[prefix + "attn_norm.weight"] = (hidden,)
+        if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
+            required[prefix + "attn_norm.bias"] = (hidden,)
+        required[prefix + "attn_output.weight"] = (hidden, hidden)
+        if architecture in {"bloom", "codeshell", "jais2", "starcoder"}:
+            required[prefix + "attn_output.bias"] = (hidden,)
+
+        fused = prefix + "attn_qkv.weight"
+        split = {
+            prefix + "attn_q.weight": (hidden, hidden),
+            prefix + "attn_k.weight": (kv_dim, hidden),
+            prefix + "attn_v.weight": (kv_dim, hidden),
+        }
+        use_fused = fused_only or (not separate_only and fused in actual)
+        if use_fused:
+            required[fused] = (hidden + 2 * kv_dim, hidden)
+            if architecture in {"bloom", "codeshell", "qwen", "starcoder"}:
+                required[prefix + "attn_qkv.bias"] = (hidden + 2 * kv_dim,)
+        else:
+            required.update(split)
+            if architecture in {"codeshell", "jais2"}:
+                required.update(
+                    {
+                        prefix + "attn_q.bias": (hidden,),
+                        prefix + "attn_k.bias": (kv_dim,),
+                        prefix + "attn_v.bias": (kv_dim,),
+                    }
+                )
+        if architecture != "command-r":
+            required[prefix + "ffn_norm.weight"] = (hidden,)
+        if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
+            required[prefix + "ffn_norm.bias"] = (hidden,)
+        if gated:
+            required[prefix + "ffn_gate.weight"] = (intermediate, hidden)
+        required[prefix + "ffn_up.weight"] = (intermediate, hidden)
+        required[prefix + "ffn_down.weight"] = (hidden, intermediate)
+        if architecture in {"bloom", "codeshell", "jais2", "starcoder"}:
+            required[prefix + "ffn_up.bias"] = (intermediate,)
+            required[prefix + "ffn_down.bias"] = (hidden,)
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - set(actual))
+    if architecture == "codeshell" and not {
+        "token_embd.weight",
+        "output.weight",
+    } & set(actual):
+        missing.append("token_embd.weight or output.weight")
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & set(actual)
         if actual[name] != required.get(name, optional.get(name))
     }
     if missing or unexpected or malformed:

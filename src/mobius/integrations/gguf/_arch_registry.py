@@ -1747,10 +1747,114 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     GGUFArchitectureSpec(
         gguf_arch="bloom",
         model_type="bloom",
-        tensor_map=Support.DEFERRED,
+        tensor_map_recipe=("bloom",),
+        tensor_processor="bloom",
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
         runtime=Support.DEFERRED,
         quantized_import=Support.REJECTED,
-        reason=_NO_TENSOR_MAP,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because canonical Bloom GGUF stores "
+            "one fused QKV projection that must be reordered and split into three graph targets."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="codeshell",
+        model_type="kclgpt",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because the pinned loader accepts a "
+            "fused QKV tensor that must be split into separate graph projections."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="command-r",
+        model_type="command_r",
+        tensor_map_recipe=("llama", "command_r_extras"),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon", "logit_scale"),
+        runtime=Support.DEFERRED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Import requires canonical logit_scale metadata and is restricted to split "
+            "Q/K/V tensors in the 40-layer Command-R profile; quantization preservation is "
+            "supported only for that split route. Pinned variants with "
+            "64 or more layers require distinct per-head Q/K LayerNorm parameters that the "
+            "current Attention graph cannot represent."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jais2",
+        model_type="jais2",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="orion",
+        model_type="orion",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Fused QKV input is rejected because its import transform is not implemented. "
+            "Quantization preservation is also rejected for this architecture."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen",
+        model_type="qwen",
+        tensor_map_recipe=("llama", "qwen1_extras"),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because Qwen v1 stores fused QKV "
+            "weights that must be split into separate graph projections."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="starcoder",
+        model_type="gpt_bigcode",
+        tensor_map_recipe=("starcoder",),
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because StarCoder stores one fused "
+            "biased MQA projection that must be split for the graph."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="xverse",
+        model_type="xverse",
+        tensor_map_recipe=("llama",),
+        tensor_processor="xverse",
+        config_postprocessor="conventional_legacy",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Fused QKV input is rejected because it cannot be combined truthfully with the "
+            "required architecture-specific Q/K row permutations. Quantization preservation "
+            "is also rejected for this architecture."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="t5",
@@ -1837,6 +1941,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             reason=reason,
         )
         for architecture, reason in _FINAL_CENSUS_DEFERRED_REASONS.items()
+        if architecture
+        not in {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
     ),
     GGUFArchitectureSpec(
         gguf_arch="arwkv7",

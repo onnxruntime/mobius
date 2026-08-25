@@ -2942,6 +2942,40 @@ def _eagle3_postprocess(
     return Eagle3Config(**fields)
 
 
+def _conventional_legacy_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    """Apply only pinned, architecture-owned defaults for legacy decoders."""
+    del metadata
+    has_command_qk_norm = model.architecture == "command-r" and any(
+        name.endswith(("attn_q_norm.weight", "attn_k_norm.weight"))
+        for name in model.tensor_names
+    )
+    if has_command_qk_norm:
+        raise ValueError(
+            "command-r GGUF with per-head Q/K LayerNorm tensors is not supported: "
+            "the current Attention graph shares one norm vector across heads"
+        )
+    return dataclasses.replace(
+        config,
+        hidden_act={
+            "codeshell": "gelu_pytorch_tanh",
+            "jais2": "relu2",
+            "starcoder": "gelu_pytorch_tanh",
+        }.get(model.architecture, config.hidden_act),
+        intermediate_size=(
+            config.intermediate_size // 2
+            if model.architecture == "qwen"
+            else config.intermediate_size
+        ),
+        tie_word_embeddings=(
+            not {"token_embd.weight", "output.weight"}.issubset(model.tensor_names)
+            if model.architecture == "codeshell"
+            else config.tie_word_embeddings
+        ),
+    )
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -2950,6 +2984,7 @@ def _eagle3_postprocess(
 # model_type keying is what let the Gemma weight processor drift out of reach
 # when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "conventional_legacy": _conventional_legacy_postprocess,
     "dflash": _dflash_postprocess,
     "eagle3": _eagle3_postprocess,
     "dream": _dream_postprocess,
@@ -2998,7 +3033,17 @@ def _default_activation(model_type: str) -> str:
     # Most modern models use SiLU/Swish
     if model_type == "arcee":
         return "relu2"
-    gelu_models = {"bert", "gpt2", "bloom", "modernbert", "starcoder2", "t5"}
+    gelu_models = {
+        "bert",
+        "bloom",
+        "gpt2",
+        "gpt_bigcode",
+        "jais2",
+        "kclgpt",
+        "modernbert",
+        "starcoder2",
+        "t5",
+    }
     if model_type in gelu_models:
         return "gelu"
     return "silu"

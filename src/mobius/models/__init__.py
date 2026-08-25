@@ -20,6 +20,7 @@ __all__ = [
     "FusedGateUpCausalLMModel",
     "ChatGLMCausalLMModel",
     "CodeGenCausalLMModel",
+    "CodeShellCausalLMModel",
     "AutoencoderKLCogVideoXModel",
     "CogVideoXTransformer3DModel",
     "CogVideoXVAEConfig",
@@ -89,6 +90,7 @@ __all__ = [
     "LLaDAMoEModel",
     "LLaVAModel",
     "LayerNormCausalLMModel",
+    "LegacyLayerNormCausalLMModel",
     "Lfm2CausalLMModel",
     "Lfm2MoECausalLMModel",
     "Lfm2VlForConditionalGeneration",
@@ -263,6 +265,10 @@ from mobius.models.jamba import JambaCausalLMModel
 from mobius.models.jetmoe import JetMoeCausalLMModel
 from mobius.models.kimi_k3 import KimiK3CausalLMModel
 from mobius.models.kimi_linear import KimiLinearCausalLMModel
+from mobius.models.legacy_decoder import (
+    CodeShellCausalLMModel,
+    LegacyLayerNormCausalLMModel,
+)
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration
 from mobius.models.llada import DreamModel, LLaDAModel, LLaDAMoEModel, RND1Model

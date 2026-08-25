@@ -236,8 +236,19 @@ _COVERAGE_SKIP: dict[str, str] = {
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
     "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
     "glm_moe_dsa": "Very large MoE (~1.5T, zai-org/GLM-5.2) — no small public checkpoint",
+    "jais2": "Jais2's smallest public checkpoint is 8B; L1-L3 graph, config, "
+    "weight-alignment, and synthetic parity are covered, but real-weight L4/L5 "
+    "goldens exceed the CPU CI budget.",
+    "kclgpt": "CodeShell's public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and synthetic weight-path coverage are present, but no "
+    "small public artifact exists for bounded L4/L5 golden generation.",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
+    "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
+    "covered, but no small public artifact exists for bounded L4/L5 validation.",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
+    "xverse": "Xverse's smallest public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and value-based GGUF permutation coverage are present, "
+    "but real-weight L4/L5 goldens exceed the CPU CI budget.",
     # --- Models without test_model_id ---
     "aya_vision": "VL model — no test_model_id yet",
     "chameleon": "VL model — no test_model_id yet",
