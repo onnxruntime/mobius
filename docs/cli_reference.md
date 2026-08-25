@@ -161,8 +161,10 @@ tokenizer files to the output directory:
 - With `--config` (local directory): tokenizer files are copied from that
   directory.
 
-For a single-model decoder-only text graph, Mobius emits the architecture-neutral
-`model.type: "decoder"` contract supported by onnxruntime-genai 0.14.0 and newer.
+For a graph-representable, single-model decoder-only text graph, Mobius emits the
+architecture-neutral `model.type: "decoder"` contract supported by
+onnxruntime-genai 0.14.0 and newer. Validation targets only the latest stable
+release, currently 0.15.2.
 The graph determines the exact semantic input names, output names, cache templates,
 and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
 architecture names do not need a runtime registry entry.
@@ -171,9 +173,10 @@ Architecture-specific types remain only where the runtime selects different
 behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` selects
 `Gpt_Model`, but Mobius's separate rank-4 key/value cache ABI does not match that
 runtime's rank-5 combined-cache contract, so config generation currently fails
-closed. `phi3`, `phimoe`, and `phi3small` retain their names because the released
-generator uses them to recompute LongRoPE caches when generation crosses the
-short-context threshold. Multimodal, audio, encoder-decoder, special-position-ID,
+closed. `phi3`, `phimoe`, and `phi3small` retain their names only when their config selects
+LongRoPE, because the released generator uses those names to recompute caches when
+generation crosses the short-context threshold. Ordinary Phi-3-family graphs use
+`decoder`. Multimodal, audio, encoder-decoder, special-position-ID,
 and split pipeline packages remain outside the generic path and require their
 dedicated types and schemas. These exceptions follow the
 [v0.15.2 runtime model factory](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/model.cpp#L874-L907),

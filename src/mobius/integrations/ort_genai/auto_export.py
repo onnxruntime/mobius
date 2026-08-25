@@ -144,10 +144,8 @@ _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
     "gpt2": "gpt2",
     "lfm2": "lfm2",
     "lfm2_vl": "lfm2",
-    "phi3": "phi3",
-    "phi3small": "phi3small",
-    "phimoe": "phimoe",
 }
+_LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
 _GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
 _GENERIC_DECODER_TESTED_VERSIONS = ("0.15.2",)
 _DECODER_SEMANTIC_INPUTS = frozenset(
@@ -269,14 +267,15 @@ def _select_ort_model_type(
     hf_model_type: str | None,
     *,
     is_decoder_only: bool,
+    rope_type: str | None = None,
 ) -> str:
     """Choose the ORT-GenAI model type for an exported package.
 
-    Released ORT GenAI 0.14+ dispatches ``decoder`` to its generic
+    Released ORT GenAI dispatches ``decoder`` to its generic
     ``DecoderOnly_Model``. Decoder-only packages therefore use that type unless
     the runtime has genuinely different behavior: ``gpt2`` selects ``Gpt_Model``,
-    ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, and Phi-3 family names enable
-    LongRoPE cache recomputation after the short-context threshold.
+    ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, and Phi-3 family names are
+    retained only for LongRoPE cache recomputation after the short-context threshold.
 
     Multimodal and encoder-decoder packages retain their architecture-specific
     type because those values select distinct runtime pipelines and position-ID
@@ -287,6 +286,8 @@ def _select_ort_model_type(
             resolved = _resolve_ort_genai_model_type(source_type or "unknown")
             if resolved in _ARCHITECTURE_SPECIFIC_TEXT_TYPES:
                 return _ARCHITECTURE_SPECIFIC_TEXT_TYPES[resolved]
+            if resolved in _LONGROPE_TEXT_TYPES and rope_type == "longrope":
+                return resolved
         return "decoder"
     return _resolve_ort_genai_model_type(hf_model_type or "unknown")
 
@@ -1546,6 +1547,7 @@ def _write_genai_config(
             else _count_cache_layer_slots(decoder_model)
         ),
         sliding_window=sliding_window,
+        has_specialized_topology=not _is_single_model_decoder_package(pkg),
     )
     generator.with_special_tokens(
         **_special_token_ids_from_tokenizer_config(output_dir, config.vocab_size)
@@ -1865,7 +1867,10 @@ def write_ort_genai_config(
         # See _select_ort_model_type: decoder-only packages prefer the package's
         # own config.model_type; multimodal packages keep the HF parent type.
         ort_model_type = _select_ort_model_type(
-            cfg_model_type, model_type, is_decoder_only=is_decoder_only
+            cfg_model_type,
+            model_type,
+            is_decoder_only=is_decoder_only,
+            rope_type=getattr(config, "rope_type", None),
         )
         # Token IDs may live on the parent config or the text sub-config
         # (e.g. Gemma4Config has text_config with bos_token_id=2).
@@ -1901,7 +1906,10 @@ def write_ort_genai_config(
             ort_model_type = "gemma3n"
         else:
             ort_model_type = _select_ort_model_type(
-                raw_type, raw_type, is_decoder_only=is_decoder_only
+                raw_type,
+                raw_type,
+                is_decoder_only=is_decoder_only,
+                rope_type=getattr(config, "rope_type", None),
             )
         if ort_model_type == "unknown":
             logger.warning(
@@ -1948,7 +1956,6 @@ def write_ort_genai_config(
             "Generic ORT GenAI decoder packages require onnxruntime-genai >= 0.14.0; "
             f"requested {runtime_version}"
         )
-
     result: dict[str, str] = {}
 
     if "mtp" in pkg:
@@ -2022,9 +2029,11 @@ def write_ort_genai_config(
         has_speech=has_speech,
     )
     result["genai_config"] = genai_path
+    with open(genai_path, encoding="utf-8") as handle:
+        emitted_model_type = json.load(handle)["model"]["type"]
     compatibility_path = _write_runtime_compatibility(
         directory,
-        model_type=ort_model_type,
+        model_type=emitted_model_type,
         runtime_version=runtime_version,
     )
     result["runtime_compatibility"] = compatibility_path

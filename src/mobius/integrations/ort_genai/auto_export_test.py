@@ -202,13 +202,28 @@ class TestSelectOrtModelType:
             ("gpt2", "gpt2"),
             ("lfm2", "lfm2"),
             ("lfm2_vl", "lfm2"),
-            ("phi3", "phi3"),
-            ("phi3small", "phi3small"),
-            ("phimoe", "phimoe"),
         ],
     )
     def test_specialized_decoder_type_is_preserved(self, model_type, expected):
         assert _select_ort_model_type(model_type, model_type, is_decoder_only=True) == expected
+
+    @pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+    def test_phi3_family_uses_generic_decoder_without_longrope(self, model_type):
+        assert (
+            _select_ort_model_type(model_type, model_type, is_decoder_only=True) == "decoder"
+        )
+
+    @pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+    def test_phi3_family_preserves_specialized_type_for_longrope(self, model_type):
+        assert (
+            _select_ort_model_type(
+                model_type,
+                model_type,
+                is_decoder_only=True,
+                rope_type="longrope",
+            )
+            == model_type
+        )
 
 
 class TestWriteProcessorConfig:
@@ -3409,6 +3424,20 @@ def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
     }
 
 
+def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_path):
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg["mtp"] = _mock_model(inputs=["hidden_states"], outputs=["draft_logits"])
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
+        compatibility = json.load(handle)
+
+    assert config["model"]["type"] == "qwen2"
+    assert compatibility["model_type"] == config["model"]["type"]
+
+
 @pytest.mark.parametrize(
     ("model_type", "config_overrides"),
     [
@@ -3470,10 +3499,20 @@ def test_gpt2_specialized_runtime_rejects_separate_cache_graph(tmp_path):
 
 @pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
 def test_phi3_longrope_runtime_type_is_preserved(tmp_path, model_type):
-    result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
+    pkg = _make_fake_llm_pkg(model_type)
+    pkg.config.rope_type = "longrope"
+    result = write_ort_genai_config(pkg, str(tmp_path))
     with open(result["genai_config"], encoding="utf-8") as handle:
         config = json.load(handle)
     assert config["model"]["type"] == model_type
+
+
+@pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])
+def test_phi3_without_longrope_emits_generic_decoder(tmp_path, model_type):
+    result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+    assert config["model"]["type"] == "decoder"
 
 
 class TestGemma4RealModel:
@@ -3819,7 +3858,7 @@ class TestGemma4RealModel:
         genai_config = gen.generate()
 
         assert "model" in genai_config
-        assert genai_config["model"]["type"] == "qwen2"
+        assert genai_config["model"]["type"] == "decoder"
         assert genai_config["model"]["vocab_size"] == 256
         assert genai_config["model"]["decoder"]["num_hidden_layers"] == 2
 
@@ -3834,7 +3873,7 @@ class TestGemma4RealModel:
 
         with open(os.path.join(output_dir, "genai_config.json")) as f:
             saved = json.load(f)
-        assert saved["model"]["type"] == "qwen2"
+        assert saved["model"]["type"] == "decoder"
 
     def test_phi4mm_detection_and_config(self, tmp_path):
         """Simulate phi4mm auto-export: verify detection and config."""
