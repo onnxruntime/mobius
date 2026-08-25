@@ -840,6 +840,7 @@ def _write_plamo2_gguf(
     legacy_scalar_heads: bool = False,
     quantized_embedding: bool = False,
     include_output: bool = False,
+    rope_theta: float = 10_000.0,
 ) -> None:
     """Write a complete tiny alternating PLaMo2 GGUF."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -867,7 +868,7 @@ def _write_plamo2_gguf(
         kv_heads if legacy_scalar_heads else kv_head_counts or [0, kv_heads]
     )
     writer.add_layer_norm_rms_eps(epsilon)
-    writer.add_rope_freq_base(10_000.0)
+    writer.add_rope_freq_base(rope_theta)
     writer.add_vocab_size(vocab)
     writer.add_ssm_conv_kernel(kernel)
     writer.add_ssm_inner_size(inner)
@@ -4504,7 +4505,7 @@ class TestPlamo2GGUFBuild:
             "position_ids": np.asarray([[0, 1], [0, 1]][:batch], np.int64),
             "attention_mask": np.ones((batch, 2), np.int64),
             "past_key_values.0.conv_state": np.zeros((batch, 32, 3), np.float32),
-            "past_key_values.0.ssm_state": np.zeros((batch, 4, 8, 4), np.float32),
+            "past_key_values.0.recurrent_state": np.zeros((batch, 4, 8, 4), np.float32),
             "past_key_values.1.key": np.zeros((batch, 2, 0, 8), np.float32),
             "past_key_values.1.value": np.zeros((batch, 2, 0, 8), np.float32),
         }
@@ -4533,13 +4534,13 @@ class TestPlamo2GGUFBuild:
                 model.graph.initializers[initializer_name].const_value.numpy(),
                 source_tensors[source_name],
             )
-        assert model.metadata_props["mobius.runtime_support"].endswith(
-            "onnxruntime/mobius#605"
+        assert model.metadata_props["mobius.runtime_support"] == (
+            "ORT GenAI 0.15.2 state ABI; package requires GQA-specialized attention"
         )
         assert [value.name for value in model.graph.outputs] == [
             "logits",
             "present.0.conv_state",
-            "present.0.ssm_state",
+            "present.0.recurrent_state",
             "present.1.key",
             "present.1.value",
         ]
@@ -4548,7 +4549,7 @@ class TestPlamo2GGUFBuild:
         session = OnnxModelSession(ModelPackage.load(output_dir)["model"])
         outputs = session.run(self._inputs(2))
         assert outputs["logits"].shape == (2, 2, 64)
-        assert outputs["present.0.ssm_state"].dtype == np.float32
+        assert outputs["present.0.recurrent_state"].dtype == np.float32
 
     def test_legacy_scalar_heads_infer_exact_tensor_schedule(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
@@ -4560,6 +4561,14 @@ class TestPlamo2GGUFBuild:
         assert package.config.attention_head_counts == (0, 4)
         assert package.config.attention_kv_head_counts == (0, 2)
 
+    def test_legacy_million_base_restores_reference_local_rope(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "plamo2-legacy-rope.gguf"
+        _write_plamo2_gguf(path, quantized=False, rope_theta=1_000_000.0)
+        package = build_from_gguf(path)
+        assert package.config.rope_theta == pytest.approx(10_000.0)
+
     def test_quantized_source_preserves_exact_projection_roles(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
@@ -4568,7 +4577,7 @@ class TestPlamo2GGUFBuild:
         model = build_from_gguf(path, keep_quantized=True)["model"]
         assert sum(node.op_type == "MatMulNBits" for node in model.graph) == 9
         assert (
-            model.graph.initializers["model.layers.0.mixer.A"].const_value.dtype
+            model.graph.initializers["model.layers.0.mixer.A_log"].const_value.dtype
             == ir.DataType.FLOAT
         )
         assert (

@@ -108,6 +108,9 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     # ORT GenAI (see onnxruntime-genai/src/models/model_type.h LLM list).
     "hunyuan_v1_dense": "decoder",
     "deepseek_v4": "decoder",
+    # PLaMo2 is a decoder-only hybrid. Released ORT GenAI does not have a
+    # model-specific registry entry, so emit its generic decoder type.
+    "plamo2": "decoder",
     # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
@@ -202,6 +205,7 @@ _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS = {
 
 _TOKENIZER_FILES = [
     "tokenizer.json",
+    "tokenizer.jsonl",  # PLaMo2 scored vocabulary
     "tokenizer_config.json",
     "special_tokens_map.json",
     "tokenizer.model",  # SentencePiece
@@ -209,6 +213,7 @@ _TOKENIZER_FILES = [
     "merges.txt",  # BPE
     "vocab.json",  # BPE
     "chat_template.jinja",  # Chat template for ORT GenAI
+    "tokenization_plamo.py",  # PLaMo2's exact custom tokenizer implementation
     # Preserve HuggingFace processor metadata for VLMs whose preprocessing
     # cannot be represented by an ort-extensions image_processor.json.
     "preprocessor_config.json",
@@ -477,6 +482,7 @@ def _fix_chat_template(
     hf_model_id: str | None,
     *,
     revision: str | None = None,
+    trust_remote_code: bool = False,
 ) -> bool:
     """Ensure chat_template is present in tokenizer_config.json.
 
@@ -508,6 +514,7 @@ def _fix_chat_template(
 
         tokenizer = AutoTokenizer.from_pretrained(
             hf_model_id,
+            trust_remote_code=trust_remote_code,
             **_revision_kwargs(revision),
         )
         template = getattr(tokenizer, "chat_template", None)
@@ -1760,7 +1767,12 @@ def write_ort_genai_config(
     _fix_tokenizer_config(directory)
 
     # Ensure chat_template is in tokenizer_config.json
-    _fix_chat_template(directory, hf_model_id, revision=revision)
+    _fix_chat_template(
+        directory,
+        hf_model_id,
+        revision=revision,
+        trust_remote_code=trust_remote_code,
+    )
 
     # Correct assets that ship broken from upstream
     apply_asset_patches(directory)

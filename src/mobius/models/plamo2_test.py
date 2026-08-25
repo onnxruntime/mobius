@@ -10,7 +10,7 @@ import onnx_ir as ir
 import torch
 
 from mobius import build_from_module
-from mobius._configs import Plamo2Config
+from mobius._configs import Plamo2Config, QuantizationConfig
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.plamo2 import Plamo2ForCausalLM
 from mobius.tasks import Plamo2CausalLMTask
@@ -50,9 +50,7 @@ def _fill_weights(model: ir.Model) -> None:
             continue
         shape = [dim if isinstance(dim, int) else 1 for dim in initializer.shape]
         values = (rng.standard_normal(shape) * 0.03).astype(initializer.dtype.numpy())
-        if initializer.name.endswith(".A"):
-            values = -np.exp(values)
-        elif "norm" in initializer.name:
+        if "norm" in initializer.name:
             values += 1.0
         initializer.const_value = ir.Tensor(values)
 
@@ -62,7 +60,7 @@ def _empty_states(config: Plamo2Config, batch: int) -> dict[str, np.ndarray]:
         "past_key_values.0.conv_state": np.zeros(
             (batch, config.mamba_inner_size, config.mamba_d_conv - 1), np.float32
         ),
-        "past_key_values.0.ssm_state": np.zeros(
+        "past_key_values.0.recurrent_state": np.zeros(
             (
                 batch,
                 config.mamba_num_heads,
@@ -124,10 +122,8 @@ def test_plamo2_mamba_matches_independent_reduced_reference() -> None:
         initializer.const_value = ir.Tensor(value)
         values[initializer.name] = value
 
-    def assign(name: str, scale: float = 0.05, *, negative: bool = False) -> np.ndarray:
+    def assign(name: str, scale: float = 0.05) -> np.ndarray:
         value = (rng.standard_normal(values[name].shape) * scale).astype(np.float32)
-        if negative:
-            value = -np.exp(value)
         model.graph.initializers[name].const_value = ir.Tensor(value)
         values[name] = value
         return value
@@ -138,7 +134,7 @@ def test_plamo2_mamba_matches_independent_reduced_reference() -> None:
     assign("model.layers.0.mixer.bcdt_proj.weight")
     assign("model.layers.0.mixer.dt_proj.weight")
     assign("model.layers.0.mixer.dt_bias")
-    assign("model.layers.0.mixer.A", negative=True)
+    assign("model.layers.0.mixer.A_log")
     assign("model.layers.0.mixer.D")
     assign("model.layers.0.mixer.out_proj.weight")
 
@@ -204,7 +200,8 @@ def test_plamo2_mamba_matches_independent_reduced_reference() -> None:
     scan_outputs = []
     for index in range(input_ids.shape[1]):
         decay = np.exp(
-            dt[:, index, :, None, None] * values["model.layers.0.mixer.A"][None, :, None, None]
+            dt[:, index, :, None, None]
+            * -np.exp(values["model.layers.0.mixer.A_log"])[None, :, None, None]
         )
         update = (
             dt[:, index, :, None, None]
@@ -229,7 +226,9 @@ def test_plamo2_mamba_matches_independent_reduced_reference() -> None:
         rtol=1e-6,
         atol=1e-7,
     )
-    np.testing.assert_allclose(outputs["present.0.ssm_state"], state, rtol=2e-5, atol=2e-6)
+    np.testing.assert_allclose(
+        outputs["present.0.recurrent_state"], state, rtol=2e-5, atol=2e-6
+    )
 
 
 def test_plamo2_attention_and_mlp_match_independent_reduced_reference() -> None:
@@ -407,7 +406,9 @@ def test_plamo2_left_padding_does_not_change_recurrent_state_or_valid_logits() -
         padded["present.0.conv_state"], unpadded["present.0.conv_state"], atol=1e-7
     )
     np.testing.assert_allclose(
-        padded["present.0.ssm_state"], unpadded["present.0.ssm_state"], atol=1e-7
+        padded["present.0.recurrent_state"],
+        unpadded["present.0.recurrent_state"],
+        atol=1e-7,
     )
 
 
@@ -451,6 +452,7 @@ def test_plamo2_preprocesses_offsets_and_decay_values() -> None:
         "model.layers.layers.0.pre_mlp_norm.weight": torch.tensor([5.0]),
         "model.layers.layers.0.post_mlp_norm.weight": torch.tensor([6.0]),
         "model.layers.layers.0.mixer.A_log": torch.tensor([0.0, 1.0]),
+        "model.embed_tokens.weight": torch.tensor([8.0]),
         "lm_head.weight": torch.tensor([9.0]),
     }
     actual = model.preprocess_weights(weights)
@@ -468,10 +470,31 @@ def test_plamo2_preprocesses_offsets_and_decay_values() -> None:
         actual["model.layers.0.post_mlp_norm.weight"],
         torch.tensor([6.0 + 1.0 / (5.0**1.5)]),
     )
-    torch.testing.assert_close(
-        actual["model.layers.0.mixer.A"], -torch.exp(torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(actual["model.layers.0.mixer.A_log"], torch.tensor([0.0, 1.0]))
+    gguf_actual = model.preprocess_weights(
+        {"model.layers.0.mixer.A": -torch.exp(torch.tensor([0.0, 1.0]))}
     )
-    assert "lm_head.weight" not in actual
+    torch.testing.assert_close(
+        gguf_actual["model.layers.0.mixer.A_log"], torch.tensor([0.0, 1.0])
+    )
+    torch.testing.assert_close(actual["lm_head.weight"], torch.tensor([8.0]))
+
+
+def test_plamo2_preprocesses_effectively_tied_quantized_embeddings() -> None:
+    config = _config()
+    config.tie_word_embeddings = False
+    config.quantization = QuantizationConfig(tie_word_embeddings=True)
+    model = Plamo2ForCausalLM(config)
+
+    actual = model.preprocess_weights(
+        {
+            "model.embed_tokens.weight": torch.tensor([8.0]),
+            "lm_head.weight": torch.tensor([9.0]),
+        }
+    )
+
+    torch.testing.assert_close(actual["model.embed_tokens.weight"], torch.tensor([8.0]))
+    torch.testing.assert_close(actual["lm_head.weight"], torch.tensor([8.0]))
 
 
 def test_plamo2_transformers_config_uses_explicit_schedule_and_pinned_defaults() -> None:

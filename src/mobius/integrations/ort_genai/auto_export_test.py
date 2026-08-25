@@ -110,6 +110,9 @@ class TestResolveOrtGenaiModelType:
         # decoder-only causal LM not in its built-in registry.
         assert _resolve_ort_genai_model_type("hunyuan_v1_dense") == "decoder"
 
+    def test_plamo2_maps_to_generic_decoder(self):
+        assert _resolve_ort_genai_model_type("plamo2") == "decoder"
+
     def test_unknown_model_type_passthrough(self):
         assert _resolve_ort_genai_model_type("my_custom") == "my_custom"
 
@@ -807,10 +810,20 @@ class TestFixChatTemplate:
         with mock.patch(
             "transformers.AutoTokenizer.from_pretrained",
             return_value=fake_tokenizer,
-        ):
-            result = _fix_chat_template(str(tmp_path), "fake/model")
+        ) as from_pretrained:
+            result = _fix_chat_template(
+                str(tmp_path),
+                "fake/model",
+                revision="immutable-revision",
+                trust_remote_code=True,
+            )
 
         assert result is True
+        from_pretrained.assert_called_once_with(
+            "fake/model",
+            revision="immutable-revision",
+            trust_remote_code=True,
+        )
         fixed = json.loads((tmp_path / "tokenizer_config.json").read_text())
         assert fixed["chat_template"] == "{{ bos_token }}"
 
@@ -946,7 +959,9 @@ class TestCopyTokenizerFilesFromLocal:
         src = tmp_path / "model"
         src.mkdir()
         (src / "tokenizer.json").write_text('{"test": true}')
+        (src / "tokenizer.jsonl").write_text('["token", 0.0, "NORMAL"]\n')
         (src / "tokenizer_config.json").write_text('{"model_type": "llama"}')
+        (src / "tokenization_plamo.py").write_text("class Plamo2Tokenizer: pass\n")
         (src / "chat_template.jinja").write_text("{{ messages }}")
 
         dst = tmp_path / "output"
@@ -955,7 +970,9 @@ class TestCopyTokenizerFilesFromLocal:
 
         assert set(copied) == {
             "tokenizer.json",
+            "tokenizer.jsonl",
             "tokenizer_config.json",
+            "tokenization_plamo.py",
             "chat_template.jinja",
         }
         assert (dst / "tokenizer.json").read_text() == '{"test": true}'

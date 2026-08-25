@@ -288,8 +288,9 @@ class TestBuildGraph:
                 assert f"present.{i}.conv_state" in output_names, (
                     f"Missing present.{i}.conv_state"
                 )
-                assert f"present.{i}.ssm_state" in output_names, (
-                    f"Missing present.{i}.ssm_state"
+                state_name = "recurrent_state" if model_type == "plamo2" else "ssm_state"
+                assert f"present.{i}.{state_name}" in output_names, (
+                    f"Missing present.{i}.{state_name}"
                 )
             elif ltype == "conv":
                 assert f"present.{i}.conv_state" in output_names, (

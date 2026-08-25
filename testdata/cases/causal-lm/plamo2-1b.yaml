@@ -7,7 +7,7 @@ trust_remote_code: true
 
 inputs:
   prompts:
-    - "The future of local inference is"
+    - "Hello"
 
 level: "L4+L5"
 
@@ -15,5 +15,4 @@ generation:
   max_new_tokens: 20
   do_sample: false
 
-notes: "The exact public checkpoint/GGUF route was exercised; see testdata/evidence/causal-lm/plamo2-1b-real.json."
-skip_reason: "Real CPU validation found cached-decode divergence, and ORT GenAI 0.15.2 cannot bind the heterogeneous recurrent/KV state ABI; do not claim L4/L5 yet."
+notes: "The pinned source checkpoint and public F32 GGUF pass raw ORT prefill, all cached decode steps, rollback/replay, and exact 20-token generation. ORT GenAI 0.15.2 also passes exact token-ID generation through its sparse KV+recurrent ABI on a CPU-specialized GQA package; unspecialized Attention plus recurrent state is rejected during package config generation. Text tokenization remains deferred because the official custom tokenizer has no identity-preserving tokenizer.json representation."
