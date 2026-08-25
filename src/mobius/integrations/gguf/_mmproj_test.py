@@ -329,7 +329,7 @@ class TestMultimodalPreflightGuards:
             allow_mmproj_companion=True,
         )
 
-    def test_rejects_unsupported_text_architecture_before_config(
+    def test_rejects_non_gemma4_text_architecture_before_config(
         self,
         tmp_path: Path,
     ):
@@ -343,7 +343,7 @@ class TestMultimodalPreflightGuards:
                 "mobius.integrations.gguf._mmproj._resolve_local_path",
                 side_effect=[str(text_path)],
             ) as resolve,
-            pytest.raises(NotImplementedError, match="nemotron_h_moe"),
+            pytest.raises(ValueError, match="requires a gemma4 text GGUF"),
         ):
             build_gemma4_vlm_from_gguf(text_path, "owner/repo:mmproj.gguf")
 

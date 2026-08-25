@@ -232,7 +232,6 @@ _XFAIL_REASONS: dict[str, str] = {
     # NemotronH Mamba2 layers diverge (cos=0.65): LinearAttention gated-SSM
     # recurrence on CPU produces different results than HF's naive Mamba2.
     # Attention-only layers match perfectly (cos=0.9999).
-    "nemotron_h": "Mamba2 SSM recurrence diverges on CPU (LinearAttention vs HF naive)",
 }
 
 # Fields that are properties in HF configs and cannot be set directly,
@@ -602,12 +601,16 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             for lt in layer_types
         ]
 
-    # NemotronH uses layers_block_type with HF values {"mamba", "attention", "moe"}.
-    # Convert our internal layer_types names (mamba2, full_attention, mlp) to HF names.
+    # NemotronH uses its public layer-type vocabulary rather than Mobius names.
     # Also translate mobius Mamba field names to HF NemotronHConfig field names.
     if hf_model_type in ("nemotron_h",) and "layer_types" in hf_kwargs:
         layer_types = hf_kwargs.pop("layer_types")
-        _nemotron_type_map = {"mamba2": "mamba", "full_attention": "attention", "mlp": "moe"}
+        _nemotron_type_map = {
+            "mamba2": "mamba",
+            "full_attention": "attention",
+            "mlp": "mlp",
+            "moe": "moe",
+        }
         hf_kwargs["layers_block_type"] = [_nemotron_type_map.get(lt, lt) for lt in layer_types]
         # Mobius NemotronHConfig → HF NemotronHConfig field name mapping
         _nemotron_field_map = {
@@ -617,10 +620,17 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "mamba_n_groups": "n_groups",
             "mamba_d_conv": "conv_kernel",
             "mamba_expand": "expand",
+            "rms_norm_eps": "layer_norm_epsilon",
         }
         for old_name, new_name in _nemotron_field_map.items():
             if old_name in hf_kwargs:
                 hf_kwargs[new_name] = hf_kwargs.pop(old_name)
+        if "hidden_act" in hf_kwargs:
+            hf_kwargs["mlp_hidden_act"] = hf_kwargs.pop("hidden_act")
+        if "shared_expert_intermediate_size" in hf_kwargs:
+            hf_kwargs["moe_shared_expert_intermediate_size"] = hf_kwargs.pop(
+                "shared_expert_intermediate_size"
+            )
         # HF NemotronH has an explicit head_dim (default 128) that is not
         # derived from hidden_size / num_attention_heads. Set it to match.
         if "head_dim" not in hf_kwargs:
@@ -686,6 +696,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "num_experts_per_tok": "moe_topk",
             "moe_intermediate_size": "expert_ffn_hidden_size",
         },
+        "nemotron_h": {"num_local_experts": "n_routed_experts"},
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():
@@ -1171,6 +1182,23 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
     # 3. Create HF model
     hf_config = _create_hf_config(model_type, config_overrides)
     hf_model = _create_hf_model(model_type, hf_config, seed)
+    if model_type == "nemotron_h":
+        # Force correction bias to determine the selected experts. This catches
+        # implementations that incorrectly use biased scores as final weights.
+        for layer in hf_model.model.layers:
+            if getattr(layer, "block_type", None) != "moe":
+                continue
+            bias = layer.mixer.gate.e_score_correction_bias
+            with torch.no_grad():
+                bias.copy_(
+                    torch.linspace(
+                        4.0,
+                        1.0,
+                        bias.numel(),
+                        dtype=bias.dtype,
+                        device=bias.device,
+                    )
+                )
 
     # 4. Transfer HF weights to ONNX
     try:

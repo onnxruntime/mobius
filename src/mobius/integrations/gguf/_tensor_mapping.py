@@ -411,6 +411,14 @@ _NEMOTRON_H_MAPPING: dict[str, str] = {
     "blk.{bid}.ssm_norm": "backbone.layers.{bid}.mixer.norm",
     "blk.{bid}.ffn_up": "backbone.layers.{bid}.mixer.up_proj",
     "blk.{bid}.ffn_down": "backbone.layers.{bid}.mixer.down_proj",
+    "blk.{bid}.ffn_gate_inp": "backbone.layers.{bid}.mixer.gate",
+    "blk.{bid}.exp_probs_b": "backbone.layers.{bid}.mixer.gate.e_score_correction_bias@",
+    "blk.{bid}.ffn_up_exps": "backbone.layers.{bid}.mixer.experts.up_proj@",
+    "blk.{bid}.ffn_down_exps": "backbone.layers.{bid}.mixer.experts.down_proj@",
+    "blk.{bid}.ffn_up_shexp": "backbone.layers.{bid}.mixer.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "backbone.layers.{bid}.mixer.shared_experts.down_proj",
+    "blk.{bid}.ffn_latent_down": "backbone.layers.{bid}.mixer.fc1_latent_proj",
+    "blk.{bid}.ffn_latent_up": "backbone.layers.{bid}.mixer.fc2_latent_proj",
 }
 
 _GRANITEHYBRID_MAPPING: dict[str, str] = {
@@ -779,6 +787,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "plamo2": _PLAMO2_MAPPING,
         "jamba": _JAMBA_MAPPING,
         "nemotron_h": _NEMOTRON_H_MAPPING,
+        "nemotron_h_moe": _NEMOTRON_H_MAPPING,
         "granitehybrid": _GRANITEHYBRID_MAPPING,
         "bert": _BERT_MAPPING,
         "modern_bert": _MODERN_BERT_MAPPING,

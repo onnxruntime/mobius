@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 3, 'supported': 56}; importable: 54; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 3} |
+| Architectures | 147 | graph verdicts: {'deferred': 88, 'rejected': 2, 'supported': 57}; importable: 55; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 145, 'rejected': 2} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become exact-copy only with a validated embedded `tokenizer.huggingface.json` |
@@ -442,7 +442,7 @@ before graph construction or durable output.
 | `nanbeige` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Nanbeige reuses physical layer weights across a configurable logical loop count, optionally normalizes between loops, and allocates a distinct KV slot for every logical occurrence. A Llama alias would build the wrong layer count and cache ABI. |
 | `nemotron` | — | model=`nemotron`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `nemotron_h` | — | model=`nemotron_h`; tensor=`nemotron_h` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
-| `nemotron_h_moe` | — | none (fails before config extraction) | not claimed | config=rejected; tensor_map=rejected; graph=rejected; runtime=rejected; quantized_import=rejected | Direct GGUF conversion is intentionally disabled. GGUF block_count includes a combined attention+MoE MTP auxiliary block, so aliasing it to the 52-layer 'nemotron_h' backbone would build the wrong graph. The Nemotron-H Mamba2 path also lacks passing full-logit/generation parity, and common GGUF presets contain Q5_0/Q5_1 expert tensors that cannot be preserved by MatMulNBits. Use llama.cpp/Unsloth to run the GGUF without changing its quantization, or start from the official pinned BF16 Hugging Face checkpoint and quantize the validated ONNX export with Olive only after L4/L5 semantic generation passes. See docs/api/build_from_gguf.md for the pinned recipe and waiver. |
+| `nemotron_h_moe` | — | model=`nemotron_h`; tensor=`nemotron_h_moe` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Exact mixed attention/Mamba2/dense/MoE scheduling, sigmoid correction-bias routing, shared experts, optional latent projections, and strict GGUF tensor closure are supported. Generic ORT GenAI runtime packaging remains deferred because its released cache schema cannot represent heterogeneous KV, convolution, and recurrent state slots; tracked by onnxruntime/mobius#605. Quantization preservation is unsupported because mixed Mamba2 recurrent parameters must remain dequantized and correction-biased sigmoid experts cannot use the fused MoE ABI. Use keep_quantized=False for explicit float import. |
 | `neo-bert` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | NeoBERT uses pre-norm RMSNorm, RoPE, fused QKV, and fused SwiGLU. The existing encoder graphs differ in normalization and projection layout. |
 | `nomic-bert` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | NomicBERT uses RoPE and a parallel gated FFN with BERT-style post norms. BertModel uses absolute positions and a non-gated sequential GELU FFN. |
 | `nomic-bert-moe` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | NomicBERT-MoE alternates dense and routed-expert FFNs according to moe_every_n_layers. Mobius has no encoder MoE graph with that schedule. |
@@ -604,8 +604,10 @@ deferred pending the heterogeneous-state schema tracked by
 [`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605) and
 real full-logit plus deterministic stateful-generation evidence.
 
-`nemotron_h_moe` remains rejected because its folded MTP attention+MoE head has
-no equivalent package contract.
+`nemotron_h_moe` backbone import is supported with exact mixed Mamba2,
+attention, dense-MLP, and routed-MoE scheduling. Files with a folded MTP block
+still fail before graph construction because no released package contract
+represents that auxiliary attention+MoE head.
 
 ### Audio/TTS/codec cohort
 
@@ -1393,163 +1395,42 @@ reported only as graph/import evidence.
   as documented above. It does not establish runtime support for an architecture.
 
 
-## NVIDIA Nemotron 3.5 Lightning waiver
+## NVIDIA Nemotron-H MoE support boundary
 
-Direct conversion of GGUF architecture `nemotron_h_moe` is intentionally
-disabled. The following evidence is pinned:
+`nemotron_h_moe` backbone conversion is supported against pinned llama.cpp
+`8d9af256337d1a501250f9bbf4c0859a654bddd6`. Import reconstructs the exact
+per-layer Mamba2/attention/dense/MoE schedule and validates every required
+tensor before graph construction. Routed experts use sigmoid probabilities,
+correction bias only for top-k selection, optional probability normalization,
+and the serialized routed scaling factor. Experts are non-gated ReLU-squared
+MLPs; one shared expert and optional latent down/up projections are represented
+explicitly.
 
-- GGUF repository:
-  `unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` at
-  `f2d3fe3694501008786e81e5f20360cbf715496a`.
-- Official BF16 comparison:
-  `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` at
-  `d468880b6ad3c6e0d21377ce7242adaea4cc884d`.
-- The official backbone has exactly 52 layers: 23 Mamba, 23 MoE, and
-  6 attention layers. GGUF block 52 is a separate combined attention+MoE MTP
-  auxiliary block, so `block_count=53` cannot be aliased to the backbone.
+The importer accepts only the canonical stacked expert tensors and canonical
+`blk.N.exp_probs_b.bias`. Missing expert tensors, separate or fused variants,
+partial latent projections, unsupported scale/input-scale sidecars, and
+inconsistent metadata or logical shapes fail before graph construction.
+Quantized-source import is available only with `keep_quantized=False`
+(`mobius build-gguf --dequantize`): mixed recurrent roles and the custom
+sigmoid/ReLU-squared expert graph do not have an exact current quantized ABI.
 
-### Quantization findings
+Synthetic evidence covers:
 
-| GGUF file | Relevant tensor inventory | Direct preservation |
-|---|---|---|
-| `...-Q8_0.gguf` | 32.904B parameters in `Q8_0` | Qtype-compatible, but blocked by architecture and semantic validation |
-| `...-MXFP4_MOE.gguf` | 14.687B `MXFP4`, 12.772B `Q5_1`, 5.445B `Q8_0` | No; the 5-bit expert weights require a quantization-changing float round-trip |
-| `...-UD-Q4_K_M.gguf` | 15.326B `Q5_0`, 12.772B `Q5_1`, 4.806B `Q8_0` | No; the preset name does not describe its actual per-tensor types |
-| `BF16/...-0000*-of-00002.gguf` | 329 tensors in shard 1 and 88 in shard 2 | No; Mobius does not assemble GGUF shards |
+- full-logit parity with Transformers for dense, routed/shared, and latent-MoE
+  schedules, including correction-bias-driven expert selection;
+- float and dequantized Q4 GGUF import, expert-order value checks, ORT execution
+  with convolution/recurrent/KV state threading, and package round-trip;
+- strict malformed-family, sidecar, shape, and MTP rejection.
 
-The GGUF embeds GPT-2/Pixtral BPE metadata with BOS 1 and EOS 11, but declares
-padding ID 999 (`<SPECIAL_999>`). The pinned official tokenizer declares
-`<|im_end|>` (ID 11) as padding. The GGUF also names the BF16 base repository
-without recording its immutable source commit. Both discrepancies must be
-resolved before a self-contained runtime package can be accepted.
+The smallest public full-MoE source is still the 30B-A3B model, so no practical
+small real-weight checkpoint exists for CI parity. The pinned public pair is
+`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` and
+`unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF`.
 
-The guard also reflects missing semantic evidence: Nemotron-H Mamba2 synthetic
-full-logit parity is not passing, and no real-weight ORT or ORT GenAI generation
-has passed. Graph creation, config emission, or session creation is not a
-substitute for generation.
-
-### Reproduce the guard with a pinned download
-
-The `Q8_0` file is the only practical candidate whose large quantized tensors
-all use a currently repackable type. Download it explicitly so the source does
-not move:
-
-```powershell
-$repo = "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF"
-$revision = "f2d3fe3694501008786e81e5f20360cbf715496a"
-$file = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
-
-python -m pip install `
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple `
-  huggingface_hub
-hf download $repo $file --revision $revision --local-dir .\nemotron-gguf
-
-# Expected: fail-fast NotImplementedError; no ONNX package is emitted.
-python -m mobius build-gguf ".\nemotron-gguf\$file" `
-  --ep cpu `
-  --external-data safetensors --output .\nemotron-gguf-onnx
-```
-
-`mobius build-gguf --runtime ort-genai` is rejected separately. The GGUF CLI
-does not emit `genai_config.json` until a selected architecture's cache and
-tokenizer contracts have passed real ORT GenAI generation.
-
-To execute the pinned GGUF without changing its quantization, use current
-llama.cpp instead:
-
-```powershell
-.\llama-cli.exe `
-  --model ".\nemotron-gguf\$file" `
-  --temp 0.6 --top-p 0.95 --min-p 0.01
-```
-
-### Option A: official BF16, then Olive
-
-Option A is the ONNX route because it preserves authoritative config,
-tokenizer, and weight provenance. It is still a candidate until Nemotron-H
-semantic tests pass, and currently targets direct ONNX Runtime rather than
-ORT GenAI:
-
-```powershell
-$repo = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
-$revision = "d468880b6ad3c6e0d21377ce7242adaea4cc884d"
-
-hf download $repo --revision $revision --local-dir .\nemotron-bf16
-python -m mobius build `
-  --config .\nemotron-bf16 `
-  --dtype bf16 --ep cuda `
-  --external-data safetensors --max-shard-size 5GB `
-  --output .\nemotron-bf16-onnx
-```
-
-After the BF16 package passes full-logit and generation parity, quantize its
-decoder with an initialized Olive environment:
-
-```json
-{
-  "input_model": {
-    "type": "OnnxModel",
-    "model_path": "nemotron-bf16-onnx/model.onnx"
-  },
-  "passes": {
-    "int4": {
-      "type": "OnnxKQuantQuantization",
-      "bits": 4,
-      "block_size": 32
-    }
-  },
-  "output_dir": "nemotron-int4-onnx"
-}
-```
-
-```powershell
-python -m pip install `
-  --index-url https://packagefeedproxy.microsoft.io/pypi/simple `
-  olive-ai onnxruntime
-olive run --config .\olive-int4.json
-Copy-Item .\nemotron-bf16\tokenizer* .\nemotron-int4-onnx\
-Copy-Item .\nemotron-bf16\special_tokens_map.json .\nemotron-int4-onnx\
-Copy-Item .\nemotron-bf16\chat_template.jinja .\nemotron-int4-onnx\
-```
-
-The candidate can be checked for direct ORT session loading:
-
-```python
-import onnxruntime as ort
-
-session = ort.InferenceSession(
-    r".\nemotron-int4-onnx\model.onnx",
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-)
-print(session.get_providers())
-print([(value.name, value.shape, value.type) for value in session.get_inputs()])
-```
-
-Session loading is not generation evidence. There is intentionally no ORT
-GenAI generation command for this model at the pinned revisions:
-
-- ORT GenAI 0.15.2 does not register model type `nemotron_h`.
-- The generated generic decoder config does not bind the graph's Mamba
-  `conv_state` and `recurrent_state` cache inputs.
-- The official `generation_config.json` uses EOS IDs `[2, 11]`, while the
-  architecture config alone supplies EOS 2.
-
-Do not publish the package unless BF16 full logits match the pinned reference,
-direct-ORT greedy generation is coherent and deterministic through an
-independently validated hybrid-cache loop, the quantized package remains
-non-degenerate, and ORT GenAI model/cache/token support is implemented before
-claiming ORT GenAI compatibility.
-
-### Prerequisites for revisiting direct GGUF conversion
-
-1. Map the 52-layer schedule exactly and model block 52 as MTP, or explicitly
-   exclude it with generation evidence.
-2. Fix Nemotron-H Mamba2 full-logit parity before testing quantized output.
-3. Preserve every large source qtype. For Q5 variants this requires a validated
-   5-bit runtime kernel and repacker; dequantize/requantize is not direct
-   preservation.
-4. Resolve the GGUF padding-token mismatch and record an immutable upstream
-   BF16 source revision.
-5. Pass real-weight prefill, cached decode, deterministic multi-token
-   generation, ORT load/inference, and ORT GenAI package generation on each
-   claimed EP.
+Those released GGUFs append a combined attention+MoE MTP block to the
+52-layer backbone (23 Mamba2, 23 MoE, 6 attention). Mobius rejects that MTP
+sidecar before graph construction rather than aliasing `block_count=53` to a
+52-layer decoder. ORT GenAI packaging also remains deferred because released
+runtime schemas do not represent the heterogeneous KV, convolution, and
+recurrent state slots; see
+[`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605).

@@ -389,10 +389,12 @@ embeddings dequantize because these graphs do not yet implement
 quantized fused QKV is also rejected, while float fused QKV is split losslessly.
 
 Sharded GGUF inputs are rejected because a single shard has an incomplete
-tensor table. `nemotron_h_moe` is also rejected until its MTP block, Mamba2
-parity, mixed expert quantization, tokenizer provenance, and real ORT/ORT GenAI
-generation are validated. See
-[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-35-lightning-waiver).
+tensor table. MTP-free `nemotron_h_moe` backbones are supported with exact
+hybrid scheduling and routed/shared/latent expert semantics; quantized sources
+require `--dequantize`. Files with the released combined attention+MoE MTP
+sidecar fail before graph construction, and ORT GenAI packaging remains
+deferred. See
+[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-h-moe-support-boundary).
 
 Runtime packaging requires a validated embedded `tokenizer.huggingface.json`;
 opaque tokenizer pre-types are never reconstructed. Deferred/rejected

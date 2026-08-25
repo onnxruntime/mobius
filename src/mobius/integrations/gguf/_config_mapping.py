@@ -25,6 +25,7 @@ __all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvabl
 import dataclasses
 import logging
 import re
+from collections.abc import Iterable
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -93,10 +94,12 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "expert_used_count": "num_experts_per_tok",
     "expert_feed_forward_length": "moe_intermediate_size",
     "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
+    "expert_shared_count": "n_shared_experts",
     "expert_weights_scale": "routed_scaling_factor",
     "expert_weights_norm": "norm_topk_prob",
     "expert_group_count": "n_group",
     "expert_group_used_count": "topk_group",
+    "moe_latent_size": "moe_latent_size",
     # Hybrid (DeltaNet / Mamba + Attention) fields
     "full_attention_interval": "full_attention_interval",
     # SSM/DeltaNet fields (used for linear attention in hybrid models)
@@ -353,6 +356,7 @@ def _nextn_predict_layers(gguf_arch: str, metadata: dict[str, Any]) -> int:
 def _derive_hybrid_layout(
     gguf_arch: str,
     metadata: dict[str, Any],
+    tensor_names: Iterable[str] | None = None,
 ) -> tuple[int, list[str] | None, int]:
     """Derive the trunk layer count and exact mixer schedule from GGUF metadata."""
     total_layers = int(metadata[f"{gguf_arch}.block_count"])
@@ -397,31 +401,35 @@ def _derive_hybrid_layout(
             mtp_count,
         )
 
-    if gguf_arch == "nemotron_h":
-        if mtp_count:
-            raise ValueError("nemotron_h GGUF import does not support folded MTP blocks")
+    if gguf_arch in {"nemotron_h", "nemotron_h_moe"}:
         kv_raw = metadata.get(f"{gguf_arch}.attention.head_count_kv")
         ffn_raw = metadata.get(f"{gguf_arch}.feed_forward_length")
         if not isinstance(kv_raw, (list, tuple, np.ndarray)) or not isinstance(
             ffn_raw, (list, tuple, np.ndarray)
         ):
             raise ValueError(
-                "nemotron_h requires per-layer attention.head_count_kv and "
+                f"{gguf_arch} requires per-layer attention.head_count_kv and "
                 "feed_forward_length arrays"
             )
         kv_heads = [int(value) for value in kv_raw]
         ffn_lengths = [int(value) for value in ffn_raw]
         if len(kv_heads) != total_layers or len(ffn_lengths) != total_layers:
             raise ValueError(
-                f"nemotron_h schedule arrays must each contain exactly {total_layers} entries"
+                f"{gguf_arch} schedule arrays must each contain exactly {total_layers} entries"
             )
         if any(value < 0 for value in (*kv_heads, *ffn_lengths)):
-            raise ValueError("nemotron_h schedule entries must be non-negative")
+            raise ValueError(f"{gguf_arch} schedule entries must be non-negative")
         uses_moe = int(metadata.get(f"{gguf_arch}.expert_count", 0)) > 0
+        names = set(tensor_names) if tensor_names is not None else None
         layer_types = []
-        for kv_heads_i, ffn_length_i in zip(kv_heads, ffn_lengths):
+        for layer, (kv_heads_i, ffn_length_i) in enumerate(
+            zip(kv_heads[:trunk_layers], ffn_lengths[:trunk_layers])
+        ):
             if ffn_length_i:
-                layer_types.append("moe" if uses_moe else "mlp")
+                has_router = names is not None and f"blk.{layer}.ffn_gate_inp.weight" in names
+                layer_types.append(
+                    "moe" if has_router or (names is None and uses_moe) else "mlp"
+                )
             elif kv_heads_i == 0:
                 layer_types.append("mamba2")
             else:
@@ -574,17 +582,18 @@ def gguf_to_config(
     num_attention_heads = hf_fields["num_attention_heads"]
     if isinstance(num_attention_heads, (list, np.ndarray)):
         values = [int(value) for value in num_attention_heads]
-        if canonical_arch != "plamo2":
+        if canonical_arch not in {"plamo2", "nemotron_h", "nemotron_h_moe"}:
             raise ValueError(
                 f"{canonical_arch} has unsupported per-layer attention head counts"
             )
         nonzero = {value for value in values if value}
         if len(nonzero) != 1:
             raise ValueError(
-                "plamo2 attention layers must use one consistent non-zero head count"
+                f"{canonical_arch} attention layers must use one consistent non-zero "
+                "head count"
             )
         if not nonzero:
-            raise ValueError("plamo2 GGUF has no attention layer")
+            raise ValueError(f"{canonical_arch} GGUF has no attention layer")
         num_attention_heads = nonzero.pop()
     if canonical_arch in {"mamba", "mamba2"}:
         # Pure recurrent GGUFs deliberately write attention.head_count=0.
@@ -612,6 +621,7 @@ def gguf_to_config(
             "lfm2moe",
             "jamba",
             "nemotron_h",
+            "nemotron_h_moe",
             "granitehybrid",
             "plamo2",
         }:
@@ -652,13 +662,14 @@ def gguf_to_config(
             "lfm2moe",
             "jamba",
             "nemotron_h",
+            "nemotron_h_moe",
             "granitehybrid",
             "plamo2",
         }
         or canonical_arch in _DELTA_NET_ARCHITECTURES
     ):
         derived_layers, layer_types, derived_mtp_count = _derive_hybrid_layout(
-            canonical_arch, metadata
+            canonical_arch, metadata, model.tensor_names
         )
         if derived_layers != int(num_hidden_layers) or derived_mtp_count != mtp_predict_layers:
             raise ValueError("Hybrid schedule and decoder layer metadata disagree")
@@ -667,12 +678,12 @@ def gguf_to_config(
                 metadata.get(f"{canonical_arch}.full_attention_interval", 4)
             )
 
-    if canonical_arch == "nemotron_h":
+    if canonical_arch in {"nemotron_h", "nemotron_h_moe"}:
         ffn_lengths = metadata[f"{gguf_arch}.feed_forward_length"]
         nonzero_ffn_lengths = {int(value) for value in ffn_lengths if int(value)}
         if len(nonzero_ffn_lengths) > 1:
             raise ValueError(
-                "nemotron_h dense FFN layers must use one consistent feed-forward length"
+                f"{gguf_arch} FFN layers must use one consistent feed-forward length"
             )
         hf_fields["intermediate_size"] = (
             nonzero_ffn_lengths.pop() if nonzero_ffn_lengths else 4 * hidden_size
@@ -1502,30 +1513,89 @@ def _nemotron_h_postprocess(
     metadata: dict[str, Any],
     model: Any,
 ) -> NemotronHConfig:
-    """Build the dense, no-MTP Nemotron-H subset."""
-    if int(metadata.get("nemotron_h.expert_count", 0)):
-        raise ValueError(
-            "Nemotron-H MoE GGUF import is deferred; fused softmax MoE is incompatible "
-            "with its sigmoid correction-bias routing"
-        )
-    inner_size = int(metadata["nemotron_h.ssm.inner_size"])
-    num_heads = int(metadata["nemotron_h.ssm.time_step_rank"])
+    """Build the exact dense or routed-MoE Nemotron-H backbone."""
+    arch = model.architecture
+    if arch not in {"nemotron_h", "nemotron_h_moe"}:
+        raise ValueError(f"Unexpected GGUF architecture for Nemotron-H: {arch!r}")
+    inner_size = int(metadata[f"{arch}.ssm.inner_size"])
+    num_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    groups = int(metadata[f"{arch}.ssm.group_count"])
     if min(inner_size, num_heads) <= 0 or inner_size % num_heads:
         raise ValueError(
-            "nemotron_h.ssm.inner_size must be positive and divisible by ssm.time_step_rank"
+            f"{arch}.ssm.inner_size must be positive and divisible by ssm.time_step_rank"
         )
+    if groups <= 0 or num_heads % groups:
+        raise ValueError(f"{arch}.ssm.time_step_rank must be divisible by ssm.group_count")
+
+    num_experts = int(metadata.get(f"{arch}.expert_count", 0))
+    top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
+    layer_types = list(config.layer_types or ())
+    routed_layers = [i for i, layer_type in enumerate(layer_types) if layer_type == "moe"]
+    if arch == "nemotron_h_moe":
+        if num_experts <= 1 or not 1 <= top_k <= num_experts:
+            raise ValueError(
+                f"{arch} requires expert_count > 1 and expert_used_count in "
+                f"[1, expert_count], got {num_experts} and {top_k}"
+            )
+        if not routed_layers:
+            raise ValueError(f"{arch} metadata declares experts but has no routed MoE layer")
+        if config.moe_intermediate_size is None or config.moe_intermediate_size <= 0:
+            raise ValueError(f"{arch}.expert_feed_forward_length must be greater than zero")
+        if (
+            config.shared_expert_intermediate_size is None
+            or config.shared_expert_intermediate_size <= 0
+        ):
+            raise ValueError(
+                f"{arch}.expert_shared_feed_forward_length must be greater than zero"
+            )
+        shared_count = int(metadata.get(f"{arch}.expert_shared_count", 1))
+        if shared_count != 1:
+            raise ValueError(
+                f"{arch}.expert_shared_count must be exactly 1, got {shared_count}"
+            )
+        n_group = int(metadata.get(f"{arch}.expert_group_count", 1))
+        topk_group = int(metadata.get(f"{arch}.expert_group_used_count", 1))
+        if (n_group, topk_group) != (1, 1):
+            raise ValueError(
+                f"{arch} grouped expert routing is unsupported; "
+                f"expert_group_count and expert_group_used_count must both be 1, "
+                f"got {n_group} and {topk_group}"
+            )
+        latent_size = metadata.get(f"{arch}.moe_latent_size")
+        if latent_size is not None and int(latent_size) <= 0:
+            raise ValueError(f"{arch}.moe_latent_size must be greater than zero when present")
+    elif num_experts or top_k or routed_layers:
+        raise ValueError(
+            "nemotron_h uses the dense architecture contract; routed experts require "
+            "general.architecture='nemotron_h_moe'"
+        )
+
     fields = _shallow_fields(config)
-    fields["hidden_act"] = "relu2"
+    fields.update(
+        hidden_act="relu2",
+        layer_types=layer_types,
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm", True)),
+        routed_scaling_factor=float(metadata.get(f"{arch}.expert_weights_scale", 1.0)),
+        n_group=1,
+        topk_group=1,
+    )
     return NemotronHConfig(
         **fields,
         mamba_n_heads=num_heads,
         mamba_d_head=inner_size // num_heads,
-        mamba_d_state=int(metadata["nemotron_h.ssm.state_size"]),
-        mamba_n_groups=int(metadata["nemotron_h.ssm.group_count"]),
-        mamba_d_conv=int(metadata["nemotron_h.ssm.conv_kernel"]),
+        mamba_d_state=int(metadata[f"{arch}.ssm.state_size"]),
+        mamba_n_groups=groups,
+        mamba_d_conv=int(metadata[f"{arch}.ssm.conv_kernel"]),
         mamba_expand=inner_size // config.hidden_size,
         mamba_conv_bias=any(".ssm_conv1d.bias" in name for name in model.tensor_names),
         mamba_proj_bias=False,
+        moe_latent_size=(
+            int(metadata[f"{arch}.moe_latent_size"])
+            if f"{arch}.moe_latent_size" in metadata
+            else None
+        ),
     )
 
 
@@ -2542,6 +2612,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "jamba": _jamba_postprocess,
     "lfm2moe": _lfm2moe_postprocess,
     "nemotron_h": _nemotron_h_postprocess,
+    "nemotron_h_moe": _nemotron_h_postprocess,
     "granitehybrid": _granitehybrid_postprocess,
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,

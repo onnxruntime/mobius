@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 54
+_EXPECTED_SUPPORTED_COUNT = 55
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -275,6 +275,7 @@ class TestCapabilityClosure:
             "mamba",
             "mamba2",
             "nemotron_h",
+            "nemotron_h_moe",
             "phi2",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
@@ -1496,7 +1497,7 @@ class TestRejectionsAreActionable:
         with pytest.raises(UnsupportedGGUFArchitectureError, match="Unsupported GGUF"):
             get_arch_spec(architecture)
 
-    @pytest.mark.parametrize("architecture", ["nemotron_h_moe", MMPROJ_ARCHITECTURE])
+    @pytest.mark.parametrize("architecture", [MMPROJ_ARCHITECTURE])
     def test_deliberately_disabled_architectures_raise_the_disabled_error(
         self, architecture: str
     ) -> None:
@@ -1523,7 +1524,18 @@ class TestRejectionsAreActionable:
         with pytest.raises(ValueError):
             get_arch_spec("definitely-not-real")
         with pytest.raises(NotImplementedError):
-            get_arch_spec("nemotron_h_moe")
+            get_arch_spec(MMPROJ_ARCHITECTURE)
+
+    def test_nemotron_h_moe_graph_is_supported_but_runtime_is_deferred(self) -> None:
+        spec = get_arch_spec("nemotron_h_moe")
+        assert spec.model_type == "nemotron_h"
+        assert spec.config is Support.SUPPORTED
+        assert spec.tensor_map is Support.SUPPORTED
+        assert spec.graph is Support.SUPPORTED
+        assert spec.runtime is Support.DEFERRED
+        assert spec.quantized_import is Support.REJECTED
+        assert spec.reason is not None
+        assert "onnxruntime/mobius#605" in spec.reason
 
 
 class TestDocumentedSupportMatrix:

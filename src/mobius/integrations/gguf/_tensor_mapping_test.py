@@ -93,6 +93,21 @@ class TestMapGGUFToHFNames:
                 "backbone.layers.1.mixer.dt_bias",
             ),
             (
+                "nemotron_h_moe",
+                "blk.1.exp_probs_b.bias",
+                "backbone.layers.1.mixer.gate.e_score_correction_bias",
+            ),
+            (
+                "nemotron_h_moe",
+                "blk.1.ffn_up_exps.weight",
+                "backbone.layers.1.mixer.experts.up_proj",
+            ),
+            (
+                "nemotron_h_moe",
+                "blk.1.ffn_up_shexp.weight",
+                "backbone.layers.1.mixer.shared_experts.up_proj.weight",
+            ),
+            (
                 "granitehybrid",
                 "blk.0.ffn_gate.weight",
                 "model.layers.0.shared_mlp.gate_proj.weight",

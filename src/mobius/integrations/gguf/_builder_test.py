@@ -1103,6 +1103,172 @@ def _write_jamba_gguf(
     writer.close()
 
 
+def _write_nemotron_h_moe_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    latent: bool = False,
+    omit: str | None = None,
+    extra: str | None = None,
+    malformed_shape: str | None = None,
+    mtp: bool = False,
+    quantized_only: str | None = None,
+) -> None:
+    """Write a tiny exact Nemotron-H backbone covering all four layer kinds."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    dense_width = 64
+    expert_width = 64
+    shared_width = 64
+    latent_width = 32
+    vocab = 64
+    heads = 2
+    kv_heads = 1
+    ssm_heads = 4
+    head_dim = hidden // heads
+    inner = 64
+    groups = 1
+    state = 4
+    kernel = 4
+    experts = 2
+    rng = np.random.default_rng(613)
+
+    writer = GGUFWriter(str(path), "nemotron_h_moe")
+    writer.add_context_length(32)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(
+        [0, dense_width, 0, dense_width] + ([dense_width] if mtp else [])
+    )
+    writer.add_block_count(5 if mtp else 4)
+    writer.add_head_count([0, 0, heads, 0] + ([heads] if mtp else []))
+    writer.add_head_count_kv([0, 0, kv_heads, 0] + ([kv_heads] if mtp else []))
+    writer.add_layer_norm_rms_eps(1e-6)
+    writer.add_vocab_size(vocab)
+    writer.add_ssm_conv_kernel(kernel)
+    writer.add_ssm_inner_size(inner)
+    writer.add_ssm_state_size(state)
+    writer.add_ssm_time_step_rank(ssm_heads)
+    writer.add_ssm_group_count(groups)
+    writer.add_expert_count(experts)
+    writer.add_expert_used_count(1)
+    writer.add_expert_feed_forward_length(expert_width)
+    writer.add_expert_shared_count(1)
+    writer.add_expert_shared_feed_forward_length(shared_width)
+    writer.add_expert_weights_norm(True)
+    writer.add_expert_weights_scale(2.5)
+    if latent:
+        writer.add_uint32("nemotron_h_moe.moe_latent_size", latent_width)
+    if mtp:
+        writer.add_uint32("nemotron_h_moe.nextn_predict_layers", 1)
+
+    def adjusted_shape(name: str, shape: tuple[int, ...]) -> tuple[int, ...]:
+        if name == malformed_shape:
+            return (*shape[:-1], shape[-1] + 1)
+        return shape
+
+    def add_float(
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        expert_order: bool = False,
+        negative: bool = False,
+    ) -> None:
+        if name == omit:
+            return
+        shape = adjusted_shape(name, shape)
+        values = rng.normal(0.0, 0.03, size=shape).astype(np.float32)
+        if negative:
+            values = -np.exp(values)
+        if expert_order:
+            for expert in range(shape[0]):
+                values[expert].fill(expert + 1)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        shape = adjusted_shape(name, shape)
+        assert shape[-1] % 32 == 0
+        byte_shape = (*shape[:-1], shape[-1] // 32 * 18)
+        raw = np.zeros(byte_shape, dtype=np.uint8)
+        for index in np.ndindex(shape[:-1]):
+            for block in range(shape[-1] // 32):
+                offset = block * 18
+                raw[(*index, slice(offset, offset + 2))] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    def projection(name: str, shape: tuple[int, ...]) -> None:
+        if quantized and (quantized_only is None or name == quantized_only):
+            add_q4(name, shape)
+        else:
+            add_float(name, shape)
+
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    projection("output.weight", (vocab, hidden))
+    for layer in range(4):
+        add_float(f"blk.{layer}.attn_norm.weight", (hidden,))
+
+    conv_width = inner + 2 * groups * state
+    projection(
+        "blk.0.ssm_in.weight",
+        (2 * inner + 2 * groups * state + ssm_heads, hidden),
+    )
+    add_float("blk.0.ssm_conv1d.weight", (conv_width, kernel))
+    add_float("blk.0.ssm_conv1d.bias", (conv_width,))
+    add_float("blk.0.ssm_dt.bias", (ssm_heads,))
+    add_float("blk.0.ssm_a", (ssm_heads, 1), negative=True)
+    add_float("blk.0.ssm_d", (ssm_heads, 1))
+    add_float("blk.0.ssm_norm.weight", (groups, inner // groups))
+    projection("blk.0.ssm_out.weight", (hidden, inner))
+
+    expert_input = latent_width if latent else hidden
+    add_float("blk.1.ffn_gate_inp.weight", (experts, hidden))
+    add_float("blk.1.exp_probs_b.bias", (experts,))
+    if quantized:
+        projection("blk.1.ffn_up_exps.weight", (experts, expert_width, expert_input))
+        projection("blk.1.ffn_down_exps.weight", (experts, expert_input, expert_width))
+    else:
+        add_float(
+            "blk.1.ffn_up_exps.weight",
+            (experts, expert_width, expert_input),
+            expert_order=True,
+        )
+        add_float(
+            "blk.1.ffn_down_exps.weight",
+            (experts, expert_input, expert_width),
+            expert_order=True,
+        )
+    projection("blk.1.ffn_up_shexp.weight", (shared_width, hidden))
+    projection("blk.1.ffn_down_shexp.weight", (hidden, shared_width))
+    if latent:
+        projection("blk.1.ffn_latent_down.weight", (latent_width, hidden))
+        projection("blk.1.ffn_latent_up.weight", (hidden, latent_width))
+
+    projection("blk.2.attn_q.weight", (heads * head_dim, hidden))
+    projection("blk.2.attn_k.weight", (kv_heads * head_dim, hidden))
+    projection("blk.2.attn_v.weight", (kv_heads * head_dim, hidden))
+    projection("blk.2.attn_output.weight", (hidden, heads * head_dim))
+
+    projection("blk.3.ffn_up.weight", (dense_width, hidden))
+    projection("blk.3.ffn_down.weight", (hidden, dense_width))
+    if mtp:
+        projection("blk.4.nextn.eh_proj.weight", (hidden, 2 * hidden))
+    if extra is not None:
+        add_float(extra, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
     """Write a tiny two-layer LFM2 GGUF with one conv and one attention layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -4969,6 +5135,208 @@ class TestJambaGGUFBuild:
         assert not graph_build_started
 
 
+class TestNemotronHMoEGGUFBuild:
+    """Nemotron-H GGUF import preserves hybrid state and exact expert semantics."""
+
+    @staticmethod
+    def _inputs(tokens: np.ndarray) -> dict[str, np.ndarray]:
+        batch, sequence = tokens.shape
+        return {
+            "input_ids": tokens,
+            "position_ids": np.broadcast_to(
+                np.arange(sequence, dtype=np.int64),
+                (batch, sequence),
+            ).copy(),
+            "attention_mask": np.ones((batch, sequence), np.int64),
+            "past_key_values.0.conv_state": np.zeros((batch, 72, 3), np.float32),
+            "past_key_values.0.ssm_state": np.zeros((batch, 4, 4, 16), np.float32),
+            "past_key_values.2.key": np.zeros((batch, 1, 0, 16), np.float32),
+            "past_key_values.2.value": np.zeros((batch, 1, 0, 16), np.float32),
+        }
+
+    def test_float_import_preserves_expert_order_state_and_roundtrip(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-f32.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert [value.name for value in model.graph.outputs] == [
+            "logits",
+            "present.0.conv_state",
+            "present.0.ssm_state",
+            "present.2.key",
+            "present.2.value",
+        ]
+        for expert in range(2):
+            for projection in ("up_proj", "down_proj"):
+                value = model.graph.initializers[
+                    f"model.layers.1.moe.experts.{expert}.{projection}.weight_t"
+                ].const_value.numpy()
+                np.testing.assert_array_equal(value, expert + 1)
+
+        output_dir = tmp_path / "saved-nemotron-h-moe"
+        package.save(output_dir, progress_bar=False)
+        session = OnnxModelSession(ModelPackage.load(output_dir)["model"])
+        outputs = session.run(self._inputs(np.asarray([[1, 2], [3, 4]], np.int64)))
+        assert outputs["logits"].shape == (2, 2, 64)
+        assert outputs["present.0.conv_state"].shape == (2, 72, 3)
+        assert outputs["present.0.ssm_state"].shape == (2, 4, 4, 16)
+        session.close()
+
+    def test_latent_projection_imports_and_executes(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-latent.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False, latent=True)
+        model = build_from_gguf(path)["model"]
+        assert model.graph.initializers[
+            "model.layers.1.moe.fc1_latent_proj.weight_t"
+        ].shape == [32, 32]
+        session = OnnxModelSession(model)
+        outputs = session.run(self._inputs(np.asarray([[1, 2]], np.int64)))
+        assert outputs["logits"].shape == (1, 2, 64)
+        session.close()
+
+    def test_prefill_decode_threads_all_state_families(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-state.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False)
+        session = OnnxModelSession(build_from_gguf(path)["model"])
+        histories = np.asarray([[1, 2], [3, 4]], np.int64)
+        prefill = session.run(self._inputs(histories))
+        order = np.asarray([1, 0], np.int64)
+        next_tokens = np.asarray([[5], [6]], np.int64)
+        decode_inputs = {
+            "input_ids": next_tokens,
+            "position_ids": np.full((2, 1), 2, np.int64),
+            "attention_mask": np.ones((2, 3), np.int64),
+            "past_key_values.0.conv_state": prefill["present.0.conv_state"][order],
+            "past_key_values.0.ssm_state": prefill["present.0.ssm_state"][order],
+            "past_key_values.2.key": prefill["present.2.key"][order],
+            "past_key_values.2.value": prefill["present.2.value"][order],
+        }
+        decoded = session.run(decode_inputs)
+        replayed = session.run(decode_inputs)
+        for name in decoded:
+            np.testing.assert_array_equal(decoded[name], replayed[name])
+
+        full_tokens = np.concatenate([histories[order], next_tokens], axis=1)
+        full = session.run(self._inputs(full_tokens))
+        np.testing.assert_allclose(
+            decoded["logits"][:, -1],
+            full["logits"][:, -1],
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        session.close()
+
+    def test_quantized_source_requires_explicit_dequantization(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-q4.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=True)
+        with pytest.raises(ValueError, match=r"keep_quantized=False"):
+            build_from_gguf(path, keep_quantized=True)
+
+        model = build_from_gguf(path, keep_quantized=False)["model"]
+        assert all(node.op_type != "MatMulNBits" for node in model.graph)
+        assert (
+            model.graph.initializers[
+                "model.layers.1.moe.experts.0.up_proj.weight_t"
+            ].const_value.dtype
+            == ir.DataType.FLOAT
+        )
+
+    def test_quantized_expert_only_requires_explicit_dequantization(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-expert-q4.gguf"
+        _write_nemotron_h_moe_gguf(
+            path,
+            quantized=True,
+            quantized_only="blk.1.ffn_up_exps.weight",
+        )
+        with pytest.raises(ValueError, match=r"keep_quantized=False"):
+            build_from_gguf(path, keep_quantized=True)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"omit": "blk.1.ffn_up_exps.weight"}, "tensor closure"),
+            ({"omit": "blk.1.exp_probs_b.bias"}, "tensor closure"),
+            ({"extra": "blk.1.ffn_exp_probs_b.bias"}, "tensor closure"),
+            ({"extra": "blk.1.ffn_up_exps.scale"}, "auxiliary quantization"),
+            (
+                {"latent": True, "omit": "blk.1.ffn_latent_up.weight"},
+                "latent projection",
+            ),
+            (
+                {"malformed_shape": "blk.1.ffn_down_exps.weight"},
+                "tensor shape",
+            ),
+        ],
+    )
+    def test_malformed_sources_fail_before_graph(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        kwargs: dict[str, object],
+        match: str,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-invalid.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False, **kwargs)
+        graph_build = mock.Mock(side_effect=AssertionError("graph construction reached"))
+        monkeypatch.setattr(core_builder, "build_from_module", graph_build)
+        with pytest.raises(ValueError, match=match):
+            build_from_gguf(path)
+        graph_build.assert_not_called()
+
+    def test_mtp_sidecar_fails_before_graph(self, tmp_path: Path, monkeypatch) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-mtp.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False, mtp=True)
+        graph_build = mock.Mock(side_effect=AssertionError("graph construction reached"))
+        monkeypatch.setattr(core_builder, "build_from_module", graph_build)
+        with pytest.raises(NotImplementedError, match="routed experts"):
+            build_from_gguf(path)
+        graph_build.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("options", "match"),
+        [
+            ({"static_cache": True}, "static_cache=True"),
+            ({"task": "text-generation"}, "hybrid-text-generation"),
+        ],
+    )
+    def test_incompatible_task_options_fail_closed(
+        self,
+        tmp_path: Path,
+        options: dict[str, object],
+        match: str,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "nemotron-h-moe-options.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False)
+        with pytest.raises(ValueError, match=match):
+            build_from_gguf(path, **options)
+
+
 class TestBuildGgufStaticCache:
     """Tests for build_from_gguf(static_cache=True).
 
@@ -5184,22 +5552,6 @@ class TestGGUFPreflightGuards:
         assert mtp_blocks == (52,)
         assert mtp_kinds == {52: frozenset({"attention", "moe"})}
 
-    def test_local_nemotron_h_moe_fails_before_graph_build(self, tmp_path: Path):
-        from mobius.integrations.gguf import build_from_gguf
-
-        path = tmp_path / "nemotron-h-moe-q8.gguf"
-        _write_quantized_gguf(path, architecture="nemotron_h_moe")
-
-        with pytest.raises(NotImplementedError) as exc_info:
-            build_from_gguf(path, keep_quantized=True)
-
-        message = str(exc_info.value)
-        assert "intentionally disabled" in message
-        assert "MTP auxiliary block" in message
-        assert "Q5_0/Q5_1" in message
-        assert "llama.cpp/Unsloth" in message
-        assert "Olive" in message
-
     @pytest.mark.parametrize(
         ("architecture", "projection_quantization"),
         [
@@ -5379,23 +5731,6 @@ class TestGGUFPreflightGuards:
         config_extraction.assert_not_called()
         module_lookup.assert_not_called()
         graph_build.assert_not_called()
-
-    def test_remote_nemotron_h_moe_fails_before_download(self):
-        from mobius.integrations.gguf._builder import _resolve_gguf_path
-
-        filename = "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
-        with (
-            mock.patch(
-                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
-                side_effect=NotImplementedError("nemotron_h_moe"),
-            ) as preflight,
-            mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
-            pytest.raises(NotImplementedError, match="nemotron_h_moe"),
-        ):
-            _resolve_gguf_path(f"unsloth/nemotron:{filename}")
-
-        preflight.assert_called_once_with("unsloth/nemotron", filename, revision="main")
-        download.assert_not_called()
 
     def test_remote_deferred_audio_architecture_fails_before_download(self):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
@@ -6115,24 +6450,6 @@ class TestHybridTensorContract:
                         [*names, partial_bias],
                     )
                 )
-
-    def test_nemotron_h_moe_schedule_rejects_with_actionable_error(self) -> None:
-        from mobius.integrations.gguf._builder import (
-            _raise_for_invalid_hybrid_tensor_contract,
-        )
-
-        model = self._FakeGGUF(
-            "nemotron_h",
-            {
-                "nemotron_h.block_count": 2,
-                "nemotron_h.attention.head_count_kv": [0, 2],
-                "nemotron_h.feed_forward_length": [0, 128],
-                "nemotron_h.expert_count": 4,
-            },
-            self._second_cohort_names("nemotron_h"),
-        )
-        with pytest.raises(ValueError, match="MoE GGUF import is deferred"):
-            _raise_for_invalid_hybrid_tensor_contract(model)
 
     def test_partial_fused_and_separate_experts_are_rejected(self) -> None:
         from mobius.integrations.gguf._builder import (

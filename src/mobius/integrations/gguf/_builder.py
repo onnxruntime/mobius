@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+import numpy as np
 import tqdm
 from huggingface_hub import (
     HfApi,
@@ -1281,7 +1282,7 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
     from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
 
     architecture = gguf_model.architecture
-    if architecture in {"jamba", "nemotron_h", "granitehybrid"}:
+    if architecture in {"jamba", "nemotron_h", "nemotron_h_moe", "granitehybrid"}:
         _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model)
         return
     if architecture not in {"lfm2", "lfm2moe", "qwen35", "qwen35moe", "qwen3next"}:
@@ -1705,7 +1706,9 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
 
     architecture = gguf_model.architecture
     metadata = gguf_model.metadata
-    layer_count, layer_types, mtp_count = _derive_hybrid_layout(architecture, metadata)
+    layer_count, layer_types, mtp_count = _derive_hybrid_layout(
+        architecture, metadata, gguf_model.tensor_names
+    )
     assert layer_types is not None
     if mtp_count:
         raise ValueError(f"{architecture} GGUF auxiliary/MTP blocks are not supported")
@@ -1755,7 +1758,7 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
             },
         }
         optional_by_type = {"mamba": set(), "full_attention": set()}
-    elif architecture == "nemotron_h":
+    elif architecture in {"nemotron_h", "nemotron_h_moe"}:
         common = {"attn_norm.weight"}
         required_by_type = {
             "mamba2": {
@@ -1774,11 +1777,23 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 "attn_output.weight",
             },
             "mlp": {"ffn_up.weight", "ffn_down.weight"},
+            "moe": {
+                "ffn_gate_inp.weight",
+                "exp_probs_b.bias",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            },
         }
         optional_by_type = {
             "mamba2": {"ssm_conv1d.bias"},
             "full_attention": {"attn_output.bias"},
             "mlp": {"ffn_up.bias", "ffn_down.bias"},
+            "moe": {
+                "ffn_latent_down.weight",
+                "ffn_latent_up.weight",
+            },
         }
     else:
         common = {
@@ -1818,11 +1833,6 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
 
     expected = set(required_global)
     allowed = required_global | optional_global
-    if architecture == "nemotron_h" and "moe" in layer_types:
-        raise ValueError(
-            "Nemotron-H MoE GGUF import is deferred; fused softmax MoE is incompatible "
-            "with its sigmoid correction-bias routing"
-        )
 
     def require_all_or_none(label: str, names: list[str]) -> None:
         present = sorted(set(names) & actual)
@@ -1854,12 +1864,12 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 for projection in ("q", "k", "v")
             ],
         )
-    if architecture in {"nemotron_h", "granitehybrid"}:
+    if architecture in {"nemotron_h", "nemotron_h_moe", "granitehybrid"}:
         require_all_or_none(
             "attention output projection",
             [f"blk.{index}.attn_output.bias" for index in attention_layers],
         )
-    if architecture == "nemotron_h":
+    if architecture in {"nemotron_h", "nemotron_h_moe"}:
         mlp_layers = [
             index for index, layer_type in enumerate(layer_types) if layer_type == "mlp"
         ]
@@ -1871,6 +1881,26 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 for projection in ("up", "down")
             ],
         )
+        moe_layers = [
+            index for index, layer_type in enumerate(layer_types) if layer_type == "moe"
+        ]
+        require_all_or_none(
+            "MoE latent projection",
+            [
+                f"blk.{index}.ffn_latent_{direction}.weight"
+                for index in moe_layers
+                for direction in ("down", "up")
+            ],
+        )
+        has_latent_metadata = f"{architecture}.moe_latent_size" in metadata
+        has_latent_tensors = any(
+            f"blk.{index}.ffn_latent_down.weight" in actual for index in moe_layers
+        )
+        if has_latent_metadata != has_latent_tensors:
+            raise ValueError(
+                f"{architecture} moe_latent_size metadata and latent projection tensors "
+                "must either both be present or both be absent"
+            )
 
     for index, layer_type in enumerate(layer_types):
         prefix = f"blk.{index}."
@@ -1919,13 +1949,19 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
             f"unexpected={unexpected}, out_of_range={out_of_range}"
         )
 
-    if architecture != "jamba" or not hasattr(gguf_model, "tensor_items_raw"):
+    if architecture not in {"jamba", "nemotron_h", "nemotron_h_moe"} or not hasattr(
+        gguf_model, "tensor_items_raw"
+    ):
         return
 
     shapes = {
         name: tuple(int(dimension) for dimension in shape)
         for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
     }
+    if architecture in {"nemotron_h", "nemotron_h_moe"}:
+        _validate_nemotron_h_tensor_shapes(gguf_model, layer_types, actual)
+        return
+
     hidden = int(metadata["jamba.embedding_length"])
     intermediate = int(metadata["jamba.feed_forward_length"])
     vocab = int(metadata.get("jamba.vocab_size", 0))
@@ -2039,6 +2075,127 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 f"Malformed Jamba GGUF Mamba decay tensor {decay_name!r}: "
                 "ssm_a must contain only finite negative -exp(A_log) values"
             )
+
+
+def _validate_nemotron_h_tensor_shapes(gguf_model, layer_types, actual: set[str]) -> None:
+    """Validate logical Nemotron-H tensor shapes before graph construction."""
+    metadata = gguf_model.metadata
+    arch = gguf_model.architecture
+    shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    heads_raw = metadata[f"{arch}.attention.head_count"]
+    heads_by_layer = (
+        [int(value) for value in heads_raw]
+        if isinstance(heads_raw, (list, tuple, np.ndarray))
+        else [int(heads_raw)] * len(layer_types)
+    )
+    kv_raw = metadata[f"{arch}.attention.head_count_kv"]
+    kv_by_layer = [int(value) for value in kv_raw]
+    head_dim = int(
+        metadata.get(
+            f"{arch}.attention.key_length",
+            hidden // next(value for value in heads_by_layer if value > 0),
+        )
+    )
+    state = int(metadata[f"{arch}.ssm.state_size"])
+    inner = int(metadata[f"{arch}.ssm.inner_size"])
+    groups = int(metadata[f"{arch}.ssm.group_count"])
+    ssm_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    conv = int(metadata[f"{arch}.ssm.conv_kernel"])
+
+    expected: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    if "output.weight" in actual:
+        expected["output.weight"] = (vocab, hidden)
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"blk.{layer}."
+        expected[prefix + "attn_norm.weight"] = (hidden,)
+        if layer_type == "mamba2":
+            conv_width = inner + 2 * groups * state
+            expected.update(
+                {
+                    prefix + "ssm_in.weight": (
+                        2 * inner + 2 * groups * state + ssm_heads,
+                        hidden,
+                    ),
+                    prefix + "ssm_conv1d.weight": (conv_width, conv),
+                    prefix + "ssm_dt.bias": (ssm_heads,),
+                    prefix + "ssm_a": (ssm_heads, 1),
+                    prefix + "ssm_d": (ssm_heads, 1),
+                    prefix + "ssm_norm.weight": (groups, inner // groups),
+                    prefix + "ssm_out.weight": (hidden, inner),
+                }
+            )
+            if prefix + "ssm_conv1d.bias" in actual:
+                expected[prefix + "ssm_conv1d.bias"] = (conv_width,)
+        elif layer_type == "full_attention":
+            heads = heads_by_layer[layer]
+            kv_heads = kv_by_layer[layer]
+            expected.update(
+                {
+                    prefix + "attn_q.weight": (heads * head_dim, hidden),
+                    prefix + "attn_k.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_v.weight": (kv_heads * head_dim, hidden),
+                    prefix + "attn_output.weight": (hidden, heads * head_dim),
+                }
+            )
+            if prefix + "attn_output.bias" in actual:
+                expected[prefix + "attn_output.bias"] = (hidden,)
+        elif layer_type == "mlp":
+            width = int(metadata[f"{arch}.feed_forward_length"][layer])
+            expected.update(
+                {
+                    prefix + "ffn_up.weight": (width, hidden),
+                    prefix + "ffn_down.weight": (hidden, width),
+                }
+            )
+            for projection, size in (("up", width), ("down", hidden)):
+                name = prefix + f"ffn_{projection}.bias"
+                if name in actual:
+                    expected[name] = (size,)
+        else:
+            experts = int(metadata[f"{arch}.expert_count"])
+            expert_width = int(metadata[f"{arch}.expert_feed_forward_length"])
+            shared_width = int(metadata[f"{arch}.expert_shared_feed_forward_length"])
+            latent = metadata.get(f"{arch}.moe_latent_size")
+            expert_input = int(latent) if latent is not None else hidden
+            expected.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "exp_probs_b.bias": (experts,),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_width,
+                        expert_input,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        expert_input,
+                        expert_width,
+                    ),
+                    prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                    prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                }
+            )
+            if latent is not None:
+                expected[prefix + "ffn_latent_down.weight"] = (int(latent), hidden)
+                expected[prefix + "ffn_latent_up.weight"] = (hidden, int(latent))
+
+    malformed = sorted(
+        f"{name}: expected {expected_shape}, got {shapes[name]}"
+        for name, expected_shape in expected.items()
+        if name in shapes and shapes[name] != expected_shape
+    )
+    if malformed:
+        raise ValueError(f"Invalid Nemotron-H GGUF tensor shape(s): {malformed}")
 
 
 def _raise_for_invalid_t5_tensor_contract(gguf_model) -> None:
@@ -2669,6 +2826,7 @@ def build_from_gguf(
         "qwen3next",
         "jamba",
         "nemotron_h",
+        "nemotron_h_moe",
         "granitehybrid",
     }:
         from mobius.tasks import HybridCausalLMTask
@@ -3645,11 +3803,7 @@ def _has_quantized_weights(gguf_model, gguf_arch: str) -> bool:
     for name, _raw, qtype, _shape in gguf_model.tensor_items_raw():
         hf_name = map_gguf_to_hf_names(name, gguf_arch)
         type_id = getattr(qtype, "value", qtype)
-        if (
-            hf_name is not None
-            and hf_name.endswith(".weight")
-            and type_id not in float_type_ids
-        ):
+        if hf_name is not None and name.endswith(".weight") and type_id not in float_type_ids:
             return True
     return False
 
