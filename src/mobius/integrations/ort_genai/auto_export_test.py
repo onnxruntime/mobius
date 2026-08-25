@@ -21,10 +21,12 @@ from mobius.integrations.ort_genai.auto_export import (
     _count_cache_layer_slots,
     _fix_chat_template,
     _fix_tokenizer_config,
+    _get_static_graph_input_dim,
     _graph_input_names,
     _inspect_decoder_abi,
     _introspect_outputs,
     _is_single_model_decoder_package,
+    _make_trt_rtx_embedding_provider_options,
     _resolve_ort_genai_model_type,
     _select_ort_model_type,
     _write_audio_processor_config,
@@ -3240,6 +3242,40 @@ class TestGraphInputNames:
             "attention_mask",
             "position_ids",
         ]
+
+
+class TestTrtRtxProfileHelpers:
+    def test_static_graph_input_dimension_is_component_agnostic(self):
+        from mobius._model_package import ModelPackage
+
+        encoder = _mock_model(inputs=["features"])
+        encoder.graph.inputs[0].shape = ir.Shape(["tokens", 3072])
+        pkg = ModelPackage({"encoder": encoder}, config=mock.MagicMock())
+
+        assert _get_static_graph_input_dim(pkg, "encoder", "features", -1) == 3072
+
+    def test_symbolic_graph_input_dimension_is_rejected(self):
+        from mobius._model_package import ModelPackage
+
+        encoder = _mock_model(inputs=["features"])
+        encoder.graph.inputs[0].shape = ir.Shape(["tokens", "width"])
+        pkg = ModelPackage({"encoder": encoder}, config=mock.MagicMock())
+
+        with pytest.raises(TypeError, match="must be static"):
+            _get_static_graph_input_dim(pkg, "encoder", "features", -1)
+
+    def test_embedding_profiles_use_supplied_bounds(self):
+        options = _make_trt_rtx_embedding_provider_options(
+            image_feature_width=4096,
+            input_id_lengths=(1, 128, 512),
+            image_feature_lengths=(0, 64, 1024),
+        )
+
+        assert options == {
+            "nv_profile_min_shapes": "input_ids:1x1,image_features:0x4096",
+            "nv_profile_opt_shapes": "input_ids:1x128,image_features:64x4096",
+            "nv_profile_max_shapes": "input_ids:1x512,image_features:1024x4096",
+        }
 
 
 class TestIntrospectVisionOutputs:
