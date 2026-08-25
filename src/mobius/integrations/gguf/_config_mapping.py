@@ -25,7 +25,7 @@ __all__ = ["gguf_to_config", "resolve_model_type", "assert_glm_moe_dsa_resolvabl
 import dataclasses
 import logging
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -39,6 +39,9 @@ from mobius._configs import (
     _shallow_fields,
 )
 from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
+
+if TYPE_CHECKING:
+    from mobius._configs import DFlashConfig, Eagle3Config
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,14 @@ _DEFAULT_KEY_MAP: dict[str, str] = {
     "ssm.group_count": "linear_num_key_heads",
     "ssm.time_step_rank": "linear_num_value_heads",
     "ssm.conv_kernel": "linear_conv_kernel_dim",
+}
+
+_DRAFT_KEY_MAP = {
+    "block_size": "block_size",
+    "target_hidden_size": "target_hidden_size",
+    "target_layers": "target_layer_ids",
+    "norm_before_residual": "norm_before_residual",
+    "norm_before_fc": "norm_before_fc",
 }
 
 _MUSE_GLIMMER_KEY_MAP = {
@@ -169,6 +180,7 @@ _T5_KEY_MAP = {
 #: both directions so a typo cannot silently drop config fields.
 _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
+        "draft": _DRAFT_KEY_MAP,
         "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
         "deepseek4": _DEEPSEEK4_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
@@ -1684,6 +1696,63 @@ def _modern_bert_encoder_postprocess(
     return config
 
 
+def _dflash_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> DFlashConfig:
+    from mobius._configs import DFlashConfig
+
+    # The pinned Qwen converter serializes layer-input indices (HF output index + 1).
+    # Mobius consumes decoder-layer outputs, so normalize back to zero-based ids.
+    target_layers = [int(value) - 1 for value in metadata["dflash.target_layers"]]
+    raw_shapes = {name: shape for name, _raw, _qtype, shape in model.tensor_items_raw()}
+    draft_vocab = (
+        int(raw_shapes["d2t"][0])
+        if "d2t" in raw_shapes
+        else len(metadata.get("tokenizer.ggml.tokens", ()))
+    )
+    fields = {field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
+    fields.update(
+        model_type="DFlashDraftModel",
+        vocab_size=len(metadata.get("tokenizer.ggml.tokens", ())),
+        target_layer_ids=target_layers,
+        block_size=int(metadata["dflash.block_size"]),
+        num_target_layers=None,
+        draft_vocab_size=draft_vocab,
+        use_draft_lm_head="output.weight" in model.tensor_names,
+    )
+    return DFlashConfig(**fields)
+
+
+def _eagle3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> Eagle3Config:
+    from mobius._configs import Eagle3Config
+
+    target_layers = [int(value) for value in metadata["eagle3.target_layers"]]
+    raw_shapes = {name: shape for name, _raw, _qtype, shape in model.tensor_items_raw()}
+    target_vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    draft_vocab = int(raw_shapes["d2t"][0]) if "d2t" in raw_shapes else target_vocab
+    fields = {field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
+    fields.update(
+        model_type="Eagle3DraftModel",
+        vocab_size=target_vocab,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        draft_vocab_size=draft_vocab,
+        target_hidden_size=int(metadata["eagle3.target_hidden_size"]),
+        target_layer_ids=target_layers,
+        norm_before_residual=bool(metadata.get("eagle3.norm_before_residual")),
+        norm_before_fc=bool(metadata.get("eagle3.norm_before_fc")),
+        fc_norm=False,
+        use_target_lm_head="output.weight" not in model.tensor_names,
+    )
+    return Eagle3Config(**fields)
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -1692,6 +1761,8 @@ def _modern_bert_encoder_postprocess(
 # model_type keying is what let the Gemma weight processor drift out of reach
 # when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
+    "dflash": _dflash_postprocess,
+    "eagle3": _eagle3_postprocess,
     "dream": _dream_postprocess,
     "llada": _llada_postprocess,
     "llada_moe": _llada_moe_postprocess,

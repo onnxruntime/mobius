@@ -68,7 +68,9 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "cohere2",
         "deci",
         "deepseek4",
+        "dflash",
         "dream",
+        "eagle3",
         "exaone",
         "falcon",
         "gemma",
@@ -150,7 +152,7 @@ class TestCapabilityClosure:
 
     def test_the_supported_set_is_pinned(self) -> None:
         """Gaining or losing support is a deliberate, reviewable change."""
-        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT
+        assert len(supported_architectures()) == _EXPECTED_SUPPORTED_COUNT + 2
 
     def test_quantized_import_set_is_pinned(self) -> None:
         """Builder acceptance and rejection must come from an explicit policy set."""

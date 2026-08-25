@@ -131,6 +131,14 @@ _DIFFUSION_RUNTIME_VALIDATION_PENDING = (
     "multi-step generation parity. Runtime packaging remains deferred until both exist."
 )
 
+_DRAFT_RUNTIME_VALIDATION_PENDING = (
+    "This is a target-coupled speculative draft, never a standalone CausalLM. "
+    "Config extraction, exact tensor closure, target shape/tokenizer validation, and "
+    "synthetic draft execution are covered, but no pinned real GGUF pair has passed "
+    "independent target+draft full-logit/proposed-token parity. Runtime packaging remains "
+    "deferred until that evidence and an acceptance-loop integration exist."
+)
+
 _ENCODER_GRAPH_MISMATCH = {
     "eurobert": (
         "EuroBERT uses pre-norm RMSNorm, RoPE, bias-free split Q/K/V attention, and a "
@@ -191,6 +199,36 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="qwen3",
         model_type="qwen3",
         tensor_map_recipe=("llama",),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="dflash",
+        model_type="DFlashDraftModel",
+        tensor_map_recipe=("dflash",),
+        config_key_map="draft",
+        config_postprocessor="dflash",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "block_size",
+            "target_layers",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_DRAFT_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="eagle3",
+        model_type="Eagle3DraftModel",
+        tensor_map_recipe=("eagle3",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        config_key_map="draft",
+        config_postprocessor="eagle3",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "target_hidden_size",
+            "target_layers",
+        ),
+        runtime=Support.DEFERRED,
+        reason=_DRAFT_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen2moe",

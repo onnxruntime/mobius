@@ -92,7 +92,7 @@ class DFlashDraftTask(ModelTask):
             past_seq_len,
         )
 
-        draft_hidden, present_key_values = module(
+        draft_output, present_key_values = module(
             op,
             noise_embedding=noise_embedding,
             target_hidden=target_hidden,
@@ -101,7 +101,10 @@ class DFlashDraftTask(ModelTask):
             past_key_values=past_key_values,
         )
 
-        builder.add_output(draft_hidden, "draft_hidden")
+        builder.add_output(
+            draft_output,
+            "draft_logits" if config.use_draft_lm_head else "draft_hidden",
+        )
         _register_kv_cache_outputs(
             builder,
             present_key_values,

@@ -71,6 +71,13 @@ def write_gguf_runtime_package(
             "folding. Use direct ONNX Runtime with ORT_DISABLE_ALL, or build without "
             "reuse_gguf_weights."
         )
+    draft_manifest = getattr(pkg, "draft_manifest", None)
+    if draft_manifest is not None:
+        raise ValueError(
+            f"{draft_manifest['architecture']} is a target-coupled speculative draft; "
+            "standalone runtime packaging is unsupported. Save the ONNX auxiliary "
+            "package and draft_manifest.json, then pair it with the exact validated target."
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

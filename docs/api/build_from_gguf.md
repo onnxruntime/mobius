@@ -23,6 +23,7 @@ def build_from_gguf(
     static_cache: bool = False,
     max_seq_len: int | None = None,
     reuse_gguf_weights: bool = False,
+    target_config: str | Path | Mapping[str, object] | None = None,
 ) -> ModelPackage:
 ```
 
@@ -39,6 +40,7 @@ def build_from_gguf(
 | `static_cache` | `bool` | `False` | Build a fixed-width KV cache when the architecture supports it. |
 | `max_seq_len` | `int \| None` | `None` | Static-cache sequence limit. |
 | `reuse_gguf_weights` | `bool` | `False` | Reuse byte-compatible F32/F16 and native IQ/MXFP4 tensor ranges from the original GGUF instead of copying them into ONNX external data. |
+| `target_config` | `str \| Path \| Mapping[str, object] \| None` | `None` | Exact target directory/config plus `tokenizer.json`, or an explicit config mapping with the complete `tokenizer_json` object. Required only for `dflash` and `eagle3`. |
 
 ## Returns
 
@@ -109,6 +111,11 @@ weight buffer and consume startup or execution time. The package avoids a second
 on-disk copy; peak runtime memory and performance remain transform- and
 execution-provider-dependent.
 
+```bash
+# Draft GGUFs require the exact target config and tokenizer directory
+mobius build-gguf draft.gguf --target-config target/ --output output/draft/
+```
+
 ## Behavior
 
 1. Reads GGUF metadata to detect architecture and config
@@ -153,7 +160,9 @@ reason.
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
 | `deci` | — | `llama` | supported | supported |
 | `deepseek4` | — | `deepseek_v4` | supported | supported |
+| `dflash` | — | `DFlashDraftModel` | runtime deferred | supported |
 | `dream` | — | `dream` | runtime deferred | supported |
+| `eagle3` | — | `Eagle3DraftModel` | runtime deferred | supported |
 | `eurobert` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `exaone` | — | `exaone` | runtime deferred | supported |
 | `falcon` | — | `falcon` | supported | supported |
@@ -200,13 +209,84 @@ reason.
 | `starcoder2` | — | `starcoder2` | supported | supported |
 | `t5` | — | `t5` | runtime deferred | supported |
 | `t5encoder` | — | `t5encoder` | runtime deferred | supported |
-
 <!-- END GGUF SUPPORT MATRIX -->
 
 Canonical names are the strings llama.cpp writes into `general.architecture`,
 validated against a vendored census of the 147 architectures llama.cpp defines
 at commit `8d9af256337d1a501250f9bbf4c0859a654bddd6`. Aliases are spellings
 llama.cpp does not emit but that mobius still accepts.
+
+### Speculative draft GGUF contract
+
+`dflash` and `eagle3` are auxiliary speculative-decoding models, never
+standalone causal language models. Both the API and CLI require an explicit
+`target_config`; `task="text-generation"`, static cache, and standalone runtime
+packaging are rejected. A successful build emits `draft_manifest.json` beside
+the ONNX graph. The manifest records canonical JSON SHA-256 values for the
+target config and complete tokenizer, a separate ordered-token vocabulary
+SHA-256, hidden/layer/vocabulary sizes, selected target layers, draft
+depth/head/intermediate/block sizes, output ownership, and any draft-to-target
+(`d2t`) vocabulary map. Canonical hashes are identical for equivalent file and
+mapping inputs and remain stable when a target directory is relocated; absolute
+host paths are not embedded.
+
+The target tokenizer vocabulary must match the GGUF token list in exact ID
+order, and BOS/EOS/PAD IDs are checked when both sides declare them. This proves
+the token-ID contract, not equivalence of tokenizer normalization, pre-tokenizer,
+or merge behavior. The manifest identifies the exact config file or explicit
+mapping used for validation, but Mobius cannot derive a target weight revision
+from GGUF metadata. The caller must pair that manifest with the attested target
+weights; runtime support therefore remains **deferred**.
+
+`config.json` and `tokenizer.json` are size-bounded, schema-checked UTF-8 JSON
+objects. Both resolved resources must remain in one target root; escaping or
+mixed-directory symlinks are rejected. Split `vocab.json`/`merges.txt` or
+`tokenizer.model` alternatives are not reconstructed because doing so would
+lose full normalizer, pre-tokenizer, and added-token semantics.
+
+EAGLE-3 requires exactly three valid `eagle3.target_layers` and matching
+`eagle3.target_hidden_size`; target and draft hidden widths must currently match
+so target-owned embeddings and an optional shared target head have the correct
+width. Its graph accepts target-provided token embeddings,
+the three concatenated target hidden states, recycled draft hidden state, and
+draft KV cache. DFlash validates every `dflash.target_layers` index and positive
+`dflash.block_size`; its graph accepts target hidden-state concatenation, noise
+embeddings, separate Q/K position IDs, and draft KV cache. Pinned DFlash
+layer-input indices are normalized back to zero-based target decoder-output
+indices. DFlash sliding-window schedules are rejected until the graph can model
+their per-layer bounded-cache semantics. DeepSeek-V4/DSpark DFlash tensor
+families likewise fail the pinned Qwen-style suffix closure; they require a
+different graph and are outside this cohort. Draft-owned
+`token_embd.weight` is rejected rather than duplicated or ignored because these
+graphs deliberately consume target-provided embeddings.
+
+When `output.weight` is absent, the graph returns `draft_hidden` for the exact
+target LM head. When present, it returns compact `draft_logits`. If `d2t` is
+present, it must use the pinned I64 representation, be in bounds and unique,
+and be accompanied by the
+draft-owned output projection; the orchestrator takes argmax in draft-vocabulary
+space and maps the proposed ID through `draft_to_target`. Unmapped target IDs
+simply have no draft row. Supported quantized draft projections retain the
+existing MatMulNBits/native route. Integer remaps are never dequantized, and
+`.scale`/`.input_scale` sidecars are rejected when their semantics cannot be
+represented instead of being dropped.
+
+Pinned public artifacts were inspected as availability evidence, not runtime
+parity:
+
+| Architecture | Draft GGUF revision / file | Size / LFS SHA-256 | Exact target |
+|---|---|---|---|
+| `dflash` | `lym00/Qwen3-4B-DFlash-GGUF-Test@9d2ec464a15346d8a7d7a696c06694eb1bf690b5` / `Qwen3-4B-DFlash-q8_0.gguf` | 577,047,072 bytes / `5ecf02bb269fc42277f43961794387fea11ecc367ea2d99e86b2b71cc249aff6` | `Qwen/Qwen3-4B@1cfa9a7208912126459214e8b04321603b3df60c` |
+| `eagle3` | `williamliao/Qwen3-8B-EAGLE3-Speculator-GGUF@44480ff4ea6330788818f7f5fc9a69b326dc4c06` / `Qwen3-8B-speculator.eagle3-F16.gguf` | 2,049,930,400 bytes / `d6cf1f3cf29e9cd72c02fb11f989f5192f2b24e142741fdc2de8cd590140f2f2` | `Qwen/Qwen3-8B@b968826d9c46dd6066d109eabc6255188de91218` |
+
+The DFlash header has 58 tensors (36 Q8_0, 22 F32); it uses the post-pin
+`hidden_norm.weight` spelling and is intentionally rejected by this cohort's
+suffix closure. The EAGLE-3 header has 15 tensors (10 F16, 4 F32, 1 I64),
+including a 32,000-entry `d2t` and a draft-owned target embedding, which this
+external-embedding graph also rejects. No suitably small pinned-format pair was
+found. Neither payload was executed, and independent target/draft logits plus
+multi-step proposed-token parity is still required before runtime can become
+supported.
 
 ### Masked language-diffusion GGUF contract
 
