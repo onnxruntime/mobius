@@ -146,6 +146,7 @@ reason.
 | GGUF architecture | Accepted aliases | mobius `model_type` | Float import | Quantized import |
 |---|---|---|---|---|
 | `arcee` | — | `arcee` | runtime deferred | supported |
+| `arwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `bloom` | — | `bloom` | tensor_map deferred | unreachable |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
@@ -163,7 +164,8 @@ reason.
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
 | `llama` | `mistral` | `llama` | supported | supported |
-| `mamba` | — | `mamba` | supported | supported |
+| `mamba` | — | `mamba` | runtime deferred | rejected |
+| `mamba2` | — | `mamba2` | runtime deferred | rejected |
 | `muse-glimmer` | `muse_glimmer` | `muse_glimmer_text` | supported | supported |
 | `nemotron` | — | `nemotron` | supported | supported |
 | `nemotron_h_moe` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
@@ -178,6 +180,9 @@ reason.
 | `qwen35` | — | `qwen3_5_text` | supported | supported |
 | `qwen35moe` | — | `qwen3_5_moe` | supported | supported |
 | `qwen3moe` | `qwen3_moe` | `qwen3_moe` | runtime deferred | supported |
+| `rwkv6` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `rwkv6qwen2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `rwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `smollm3` | — | `smollm3` | supported | supported |
 | `stablelm` | — | `stablelm` | supported | supported |
 | `starcoder2` | — | `starcoder2` | supported | supported |

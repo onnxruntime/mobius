@@ -2203,27 +2203,24 @@ class TestRecurrentGGUFBuild:
         assert np.count_nonzero(outputs[-1]["present.0.ssm_state"]) > 0
 
     @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
-    def test_quantized_projections_dequantize_without_state_or_logit_loss(
+    def test_quantized_projection_preservation_is_rejected_and_float_import_executes(
         self, tmp_path: Path, architecture: str
     ) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
         path = tmp_path / f"{architecture}-q4.gguf"
         _write_recurrent_gguf(path, architecture, quantized=True)
-        preserved = build_from_gguf(path, keep_quantized=True)["model"]
-        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+        with pytest.raises(ValueError, match="does not support keep_quantized=True"):
+            build_from_gguf(path, keep_quantized=True)
 
-        # Current Mamba projection consumers are ordinary Linear modules, so
-        # quantized source tensors must dequantize rather than attach to an
-        # incompatible MatMulNBits ABI.
-        assert "MatMulNBits" not in {node.op_type for node in preserved.graph}
-        preserved_steps = self._run_steps(preserved, architecture)
+        # Current Mamba projection consumers are ordinary Linear modules.
+        # Explicit float import dequantizes the GGUF source before stateful execution.
+        explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
+        assert "MatMulNBits" not in {node.op_type for node in explicit_float.graph}
         float_steps = self._run_steps(explicit_float, architecture)
-        assert len(preserved_steps) == len(float_steps)
-        for actual, expected in zip(preserved_steps, float_steps):
-            assert set(actual) == set(expected)
-            for name in actual:
-                np.testing.assert_allclose(actual[name], expected[name], rtol=0, atol=0)
+        assert all(np.isfinite(out["logits"]).all() for out in float_steps)
+        assert np.count_nonzero(float_steps[-1]["present.0.conv_state"]) > 0
+        assert np.count_nonzero(float_steps[-1]["present.0.ssm_state"]) > 0
 
     @pytest.mark.parametrize("architecture", ["mamba", "mamba2"])
     def test_static_kv_cache_is_rejected(self, tmp_path: Path, architecture: str) -> None:

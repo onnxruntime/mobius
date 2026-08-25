@@ -260,7 +260,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.time_step_rank",
         ),
         runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="mamba2",
@@ -278,7 +279,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.time_step_rank",
         ),
         runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="starcoder2",

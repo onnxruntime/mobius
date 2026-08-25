@@ -77,7 +77,6 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "granitemoe",
         "hunyuan-dense",
         "llama",
-        "mamba",
         "muse-glimmer",
         "nemotron",
         "olmo",
@@ -162,11 +161,12 @@ class TestCapabilityClosure:
             if spec.is_importable
         }
         assert set(actual) == set(supported_architectures())
-        assert actual["internlm2"] is Support.REJECTED
+        rejected = {"internlm2", "mamba", "mamba2"}
+        assert all(actual[arch] is Support.REJECTED for arch in rejected)
         assert all(
             verdict is Support.SUPPORTED
             for arch, verdict in actual.items()
-            if arch != "internlm2"
+            if arch not in rejected
         )
 
 
