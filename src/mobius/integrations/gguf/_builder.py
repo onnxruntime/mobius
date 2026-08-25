@@ -536,6 +536,7 @@ def _validate_gguf_model(
     _raise_for_malformed_recurrent_tensors(gguf_model)
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
+    _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
@@ -2255,7 +2256,14 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
 
 def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
     """Reject optional llama.cpp encoder heads that the token-output graph omits."""
-    if gguf_model.architecture not in {"bert", "modern-bert"}:
+    if gguf_model.architecture not in {
+        "bert",
+        "modern-bert",
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "jina-bert-v2",
+    }:
         return
     head_tensors = [
         name
@@ -2420,6 +2428,211 @@ def _raise_for_invalid_encoder_tensor_contract(gguf_model) -> None:
         raise ValueError(
             "modern-bert blk.0.attn_norm.weight is present, but Mobius models layer 0 "
             "as the pinned identity-norm variant and will not ignore the tensor"
+        )
+
+
+def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
+    """Validate the exact llama.cpp tensor closure for promoted specialized encoders."""
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    arch = gguf_model.architecture
+    if arch not in {"eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"}:
+        return
+    metadata = gguf_model.metadata
+    geometry = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}" for suffix in geometry if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"{arch} GGUF is missing encoder metadata: {missing_metadata}")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    context = int(metadata[f"{arch}.context_length"])
+    kv_heads = int(metadata.get(f"{arch}.attention.head_count_kv", heads))
+    if min(hidden, intermediate, layers, heads, context) <= 0 or hidden % heads:
+        raise ValueError(f"{arch} GGUF has invalid positive encoder geometry")
+    if kv_heads != heads:
+        raise ValueError(f"{arch} GGUF requires head_count_kv == head_count")
+    head_dim = hidden // heads
+    key_length = int(metadata.get(f"{arch}.attention.key_length", head_dim))
+    value_length = int(metadata.get(f"{arch}.attention.value_length", key_length))
+    if key_length != head_dim or value_length != head_dim:
+        raise ValueError(f"{arch} GGUF requires full-width equal Q/K/V heads")
+    if arch != "jina-bert-v2":
+        rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+        if rope_dim != head_dim:
+            raise ValueError(f"{arch} GGUF requires full-head RoPE")
+
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if vocab <= 0:
+        raise ValueError(f"{arch} GGUF has no positive vocabulary size")
+    token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+
+    actual = {
+        name: tuple(int(dim) for dim in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+        if not is_known_skip(name)
+    }
+    required: dict[str, tuple[int, ...]] = {"token_embd.weight": (vocab, hidden)}
+    optional: dict[str, tuple[int, ...]] = {}
+
+    if arch == "eurobert":
+        required["output_norm.weight"] = (hidden,)
+    elif arch == "neo-bert":
+        required["enc.output_norm.weight"] = (hidden,)
+    else:
+        if token_types <= 0:
+            raise ValueError(f"{arch} tokenizer.ggml.token_type_count must be positive")
+        token_type_shape = (token_types, hidden)
+        if arch == "jina-bert-v2":
+            required["token_types.weight"] = token_type_shape
+        else:
+            optional["token_types.weight"] = token_type_shape
+        required.update(
+            {
+                "token_embd_norm.weight": (hidden,),
+                "token_embd_norm.bias": (hidden,),
+            }
+        )
+
+    optional_families: dict[str, set[str]] = {}
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        if arch in {"eurobert", "neo-bert"}:
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_output.weight": (hidden, hidden),
+                    prefix + "ffn_norm.weight": (hidden,),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            if arch == "eurobert":
+                required.update(
+                    {
+                        prefix + "attn_q.weight": (hidden, hidden),
+                        prefix + "attn_k.weight": (hidden, hidden),
+                        prefix + "attn_v.weight": (hidden, hidden),
+                        prefix + "ffn_gate.weight": (intermediate, hidden),
+                        prefix + "ffn_up.weight": (intermediate, hidden),
+                    }
+                )
+            else:
+                required.update(
+                    {
+                        prefix + "attn_qkv.weight": (3 * hidden, hidden),
+                        prefix + "ffn_up.weight": (2 * intermediate, hidden),
+                    }
+                )
+            continue
+
+        required.update(
+            {
+                prefix + "attn_q.weight": (hidden, hidden),
+                prefix + "attn_k.weight": (hidden, hidden),
+                prefix + "attn_v.weight": (hidden, hidden),
+                prefix + "attn_output.weight": (hidden, hidden),
+                prefix + "attn_output_norm.weight": (hidden,),
+                prefix + "attn_output_norm.bias": (hidden,),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+                prefix + "layer_output_norm.weight": (hidden,),
+                prefix + "layer_output_norm.bias": (hidden,),
+            }
+        )
+        for suffix, shape in {
+            "attn_q.bias": (hidden,),
+            "attn_k.bias": (hidden,),
+            "attn_v.bias": (hidden,),
+            "ffn_up.bias": (intermediate,),
+        }.items():
+            name = prefix + suffix
+            optional[name] = shape
+            optional_families.setdefault(suffix, set()).add(name)
+
+        if arch == "nomic-bert":
+            required.update(
+                {
+                    prefix + "ffn_gate.weight": (intermediate, hidden),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                }
+            )
+            for suffix, shape in {
+                "attn_output.bias": (hidden,),
+                "ffn_down.bias": (hidden,),
+            }.items():
+                name = prefix + suffix
+                optional[name] = shape
+                optional_families.setdefault(suffix, set()).add(name)
+        else:
+            required.update(
+                {
+                    prefix + "attn_output.bias": (hidden,),
+                    prefix + "ffn_down.bias": (hidden,),
+                }
+            )
+            for suffix in (
+                "attn_q_norm.weight",
+                "attn_q_norm.bias",
+                "attn_k_norm.weight",
+                "attn_k_norm.bias",
+                "attn_norm_2.weight",
+                "attn_norm_2.bias",
+                "ffn_gate.weight",
+            ):
+                shape = (intermediate, hidden) if suffix == "ffn_gate.weight" else (hidden,)
+                name = prefix + suffix
+                optional[name] = shape
+                optional_families.setdefault(suffix, set()).add(name)
+
+    present = set(actual)
+    for suffix, family in optional_families.items():
+        selected = family & present
+        if selected and selected != family:
+            raise ValueError(
+                f"{arch} optional tensor family {suffix!r} must be all-layers or absent"
+            )
+
+    if arch == "jina-bert-v2":
+        q_norm = any(name.endswith("attn_q_norm.weight") for name in present)
+        k_norm = any(name.endswith("attn_k_norm.weight") for name in present)
+        q_norm_bias = any(name.endswith("attn_q_norm.bias") for name in present)
+        k_norm_bias = any(name.endswith("attn_k_norm.bias") for name in present)
+        if len({q_norm, k_norm, q_norm_bias, k_norm_bias}) != 1:
+            raise ValueError("jina-bert-v2 Q/K LayerNorm weights and biases must co-occur")
+        extra_weight = any(name.endswith("attn_norm_2.weight") for name in present)
+        extra_bias = any(name.endswith("attn_norm_2.bias") for name in present)
+        if extra_weight != extra_bias:
+            raise ValueError("jina-bert-v2 extra attention norm needs weight and bias")
+        has_gate = any(name.endswith("ffn_gate.weight") for name in present)
+        up_width = intermediate if has_gate else 2 * intermediate
+        for layer in range(layers):
+            required[f"blk.{layer}.ffn_up.weight"] = (up_width, hidden)
+            if f"blk.{layer}.ffn_up.bias" in actual:
+                optional[f"blk.{layer}.ffn_up.bias"] = (up_width,)
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - present)
+    unexpected = sorted(present - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & present
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {arch} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
         )
 
 
@@ -3770,7 +3983,12 @@ def build_from_gguf(
                 f"{gguf_arch} GGUF only supports the mixed-state "
                 f"'hybrid-text-generation' task, got {task!r}"
             )
-    if model_type in {"bert", "modernbert", "t5encoder"}:
+    if model_type in {"bert", "modernbert", "t5encoder"} or gguf_arch in {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "jina-bert-v2",
+    }:
         if static_cache:
             raise ValueError("static_cache is not valid for encoder-only GGUF architectures")
         expected_task = (
@@ -3879,8 +4097,12 @@ def build_from_gguf(
         from mobius.tasks import CausalLMTask
 
         resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
+    elif gguf_arch in {"eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"}:
+        from mobius.tasks import GGUFEncoderFeatureExtractionTask
+
+        resolved_task = GGUFEncoderFeatureExtractionTask()
     elif task is None:
-        resolved_task = _default_task_for_model(model_type)
+        resolved_task = _default_task_for_model(module_type)
     else:
         resolved_task = task
 
@@ -4092,8 +4314,31 @@ def build_from_gguf(
         task_state = resolved_task
     else:
         task_state = dict(sorted(vars(resolved_task).items()))
+    graph_config_fields = dataclasses.asdict(config)
+    if spec.gguf_arch not in {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "jina-bert-v2",
+    }:
+        # These fields were added for specialized encoder graph variants. Keep
+        # the established route fingerprint byte-identical for every existing
+        # architecture so pinned runtime evidence remains valid.
+        for field_name in (
+            "encoder_use_token_type_embeddings",
+            "encoder_q_bias",
+            "encoder_k_bias",
+            "encoder_v_bias",
+            "encoder_ffn_up_bias",
+            "encoder_ffn_down_bias",
+            "encoder_qk_norm",
+            "encoder_extra_attention_norm",
+            "encoder_fused_geglu",
+            "pooling_type",
+        ):
+            graph_config_fields.pop(field_name, None)
     graph_config = json.dumps(
-        dataclasses.asdict(config),
+        graph_config_fields,
         default=str,
         separators=(",", ":"),
         sort_keys=True,

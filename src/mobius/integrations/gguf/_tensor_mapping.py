@@ -534,6 +534,56 @@ _MODERN_BERT_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": "model.layers.{bid}.mlp_norm",
 }
 
+_EUROBERT_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "output_norm": "output_norm",
+    "blk.{bid}.attn_norm": "layers.{bid}.attn_norm",
+    "blk.{bid}.attn_q": "layers.{bid}.attention.q",
+    "blk.{bid}.attn_k": "layers.{bid}.attention.k",
+    "blk.{bid}.attn_v": "layers.{bid}.attention.v",
+    "blk.{bid}.attn_output": "layers.{bid}.attention.output",
+    "blk.{bid}.ffn_norm": "layers.{bid}.ffn_norm",
+    "blk.{bid}.ffn_gate": "layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down",
+}
+
+_NEO_BERT_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "cls": "cls",
+    "cls_out": "classifier",
+    "enc.output_norm": "output_norm",
+    "blk.{bid}.attn_norm": "layers.{bid}.attn_norm",
+    "blk.{bid}.attn_qkv": "layers.{bid}.attention.qkv",
+    "blk.{bid}.attn_output": "layers.{bid}.attention.output",
+    "blk.{bid}.ffn_norm": "layers.{bid}.ffn_norm",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down",
+}
+
+_NOMIC_BERT_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "token_types": "token_type_embeddings",
+    "token_embd_norm": "token_embeddings_norm",
+    "blk.{bid}.attn_q": "layers.{bid}.attention.q",
+    "blk.{bid}.attn_k": "layers.{bid}.attention.k",
+    "blk.{bid}.attn_v": "layers.{bid}.attention.v",
+    "blk.{bid}.attn_output": "layers.{bid}.attention.output",
+    "blk.{bid}.attn_output_norm": "layers.{bid}.attention_output_norm",
+    "blk.{bid}.ffn_gate": "layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down",
+    "blk.{bid}.layer_output_norm": "layers.{bid}.layer_output_norm",
+}
+
+_JINA_BERT_V2_MAPPING: dict[str, str] = {
+    **_NOMIC_BERT_MAPPING,
+    "cls": "cls",
+    "blk.{bid}.attn_q_norm": "layers.{bid}.attention.q_norm",
+    "blk.{bid}.attn_k_norm": "layers.{bid}.attention.k_norm",
+    "blk.{bid}.attn_norm_2": "layers.{bid}.extra_attention_norm",
+}
+
 _T5_MAPPING: dict[str, str] = {
     "token_embd": "shared",
     "output": "lm_head",
@@ -987,6 +1037,10 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "granitehybrid": _GRANITEHYBRID_MAPPING,
         "bert": _BERT_MAPPING,
         "modern_bert": _MODERN_BERT_MAPPING,
+        "eurobert": _EUROBERT_MAPPING,
+        "neo_bert": _NEO_BERT_MAPPING,
+        "nomic_bert": _NOMIC_BERT_MAPPING,
+        "jina_bert_v2": _JINA_BERT_V2_MAPPING,
         "t5": _T5_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,

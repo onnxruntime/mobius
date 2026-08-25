@@ -53,6 +53,7 @@ __all__ = [
     "GPTNeoXCausalLMModel",
     "GPTNeoXJapaneseCausalLMModel",
     "GPTOSSCausalLMModel",
+    "EuroBertGGUFModel",
     "Gemma2CausalLMModel",
     "Gemma3CausalLMModel",
     "Gemma3MultiModalModel",
@@ -81,6 +82,7 @@ __all__ = [
     "InternVL2Model",
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
+    "JinaBertV2GGUFModel",
     "JetMoeCausalLMModel",
     "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
@@ -115,6 +117,8 @@ __all__ = [
     "NanoChatCausalLMModel",
     "NemotronCausalLMModel",
     "NemotronHCausalLMModel",
+    "NeoBertGGUFModel",
+    "NomicBertGGUFModel",
     "NemotronParseForConditionalGeneration",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
@@ -246,6 +250,12 @@ from mobius.models.gemma4 import (
     Gemma4UnifiedModel,
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
+from mobius.models.gguf_encoders import (
+    EuroBertGGUFModel,
+    JinaBertV2GGUFModel,
+    NeoBertGGUFModel,
+    NomicBertGGUFModel,
+)
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel

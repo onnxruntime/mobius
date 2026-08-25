@@ -377,8 +377,8 @@ def test_xverse_processor_exactly_inverts_pinned_q_and_gqa_k_permutations() -> N
 
     def pinned_permute(tensor: torch.Tensor, heads: int) -> torch.Tensor:
         dim = tensor.shape[0] // heads // 2
-        return tensor.reshape(heads, 2, dim, *tensor.shape[1:]).swapaxes(1, 2).reshape_as(
-            tensor
+        return (
+            tensor.reshape(heads, 2, dim, *tensor.shape[1:]).swapaxes(1, 2).reshape_as(tensor)
         )
 
     # Xverse's pinned converter uses all attention heads for Q, but the

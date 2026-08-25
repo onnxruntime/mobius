@@ -374,27 +374,9 @@ _WAVTOKENIZER_DEC_REASON = (
 )
 
 _ENCODER_GRAPH_MISMATCH = {
-    "eurobert": (
-        "EuroBERT uses pre-norm RMSNorm, RoPE, bias-free split Q/K/V attention, and a "
-        "parallel SwiGLU FFN. Neither the post-norm BertModel nor ModernBertModel graph "
-        "matches that architecture."
-    ),
-    "jina-bert-v2": (
-        "JinaBERT v2 uses ALiBi, optional full-width Q/K norms, an extra attention norm, "
-        "and either separate or fused GeGLU inputs. Mobius has no graph with that exact "
-        "combination."
-    ),
     "jina-bert-v3": (
         "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
         "BertModel has absolute positions and no MoE path."
-    ),
-    "neo-bert": (
-        "NeoBERT uses pre-norm RMSNorm, RoPE, fused QKV, and fused SwiGLU. The existing "
-        "encoder graphs differ in normalization and projection layout."
-    ),
-    "nomic-bert": (
-        "NomicBERT uses RoPE and a parallel gated FFN with BERT-style post norms. "
-        "BertModel uses absolute positions and a non-gated sequential GELU FFN."
     ),
     "nomic-bert-moe": (
         "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
@@ -1370,6 +1352,76 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         runtime=Support.DEFERRED,
         reason=_ENCODER_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="eurobert",
+        model_type="eurobert",
+        module_type="eurobert_gguf",
+        tensor_map_recipe=("eurobert",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="neo-bert",
+        model_type="neobert",
+        module_type="neo_bert_gguf",
+        tensor_map_recipe=("neo_bert",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _ENCODER_RUNTIME_VALIDATION_PENDING
+            + " Packed QKV and fused SwiGLU have no complete quantized split route; "
+            "use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="nomic-bert",
+        model_type="nomic_bert",
+        module_type="nomic_bert_gguf",
+        tensor_map_recipe=("nomic_bert",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jina-bert-v2",
+        model_type="bert",
+        module_type="jina_bert_v2_gguf",
+        tensor_map_recipe=("jina_bert_v2",),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _ENCODER_RUNTIME_VALIDATION_PENDING
+            + " Optional Q/K norms and fused GeGLU inputs have no complete packed "
+            "quantization route; use keep_quantized=False."
+        ),
     ),
     *(
         GGUFArchitectureSpec(

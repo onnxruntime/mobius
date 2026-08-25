@@ -2885,6 +2885,91 @@ def _modern_bert_encoder_postprocess(
     return config
 
 
+def _specialized_encoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Resolve tensor-selected variants for the promoted stateless GGUF encoders."""
+    arch = model.architecture
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(f"{arch} GGUF requires head_count_kv == head_count")
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false for encoder import")
+
+    pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
+    if pooling_type not in {0, 1, 2}:
+        raise ValueError(f"{arch}.pooling_type={pooling_type} is not a known encoder pooling")
+    if metadata.get(f"{arch}.classifier.output_labels"):
+        raise ValueError(f"{arch} classifier heads are not part of feature extraction")
+
+    names = set(model.tensor_names)
+    layers = config.num_hidden_layers
+
+    def _all_or_none(suffix: str) -> bool:
+        expected = {f"blk.{layer}.{suffix}" for layer in range(layers)}
+        present = expected & names
+        if present and present != expected:
+            raise ValueError(
+                f"{arch} optional tensor family {suffix!r} must be present in every layer "
+                "or absent entirely"
+            )
+        return bool(present)
+
+    config.pooling_type = pooling_type
+    config.encoder_q_bias = _all_or_none("attn_q.bias")
+    config.encoder_k_bias = _all_or_none("attn_k.bias")
+    config.encoder_v_bias = _all_or_none("attn_v.bias")
+    config.attn_qkv_bias = (
+        config.encoder_q_bias or config.encoder_k_bias or config.encoder_v_bias
+    )
+    config.attn_o_bias = _all_or_none("attn_output.bias")
+    config.encoder_ffn_up_bias = _all_or_none("ffn_up.bias")
+    config.encoder_ffn_down_bias = _all_or_none("ffn_down.bias")
+    config.mlp_bias = config.encoder_ffn_up_bias or config.encoder_ffn_down_bias
+
+    token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+    config.type_vocab_size = token_types
+    config.encoder_use_token_type_embeddings = "token_types.weight" in names
+
+    if arch in {"eurobert", "neo-bert"}:
+        config.type_vocab_size = 0
+        config.encoder_use_token_type_embeddings = False
+        config.hidden_act = "silu"
+        config.attn_qkv_bias = False
+        config.encoder_q_bias = False
+        config.encoder_k_bias = False
+        config.encoder_v_bias = False
+        config.attn_o_bias = False
+        config.encoder_ffn_up_bias = False
+        config.encoder_ffn_down_bias = False
+        config.mlp_bias = False
+    elif arch == "nomic-bert":
+        if token_types <= 0:
+            raise ValueError(
+                "nomic-bert requires tokenizer.ggml.token_type_count even when the "
+                "optional token_types tensor is absent"
+            )
+        config.hidden_act = "silu"
+    else:
+        if token_types <= 0 or not config.encoder_use_token_type_embeddings:
+            raise ValueError("jina-bert-v2 requires its token-type embedding table")
+        config.hidden_act = "gelu"
+        config.rope_type = None
+        config.rope_theta = None
+        config.rope_scaling = None
+        config.partial_rotary_factor = None
+        q_norm = _all_or_none("attn_q_norm.weight")
+        k_norm = _all_or_none("attn_k_norm.weight")
+        if q_norm != k_norm:
+            raise ValueError("jina-bert-v2 Q and K norm families must appear together")
+        config.encoder_qk_norm = q_norm
+        config.encoder_extra_attention_norm = _all_or_none("attn_norm_2.weight")
+        has_gate = _all_or_none("ffn_gate.weight")
+        config.encoder_fused_geglu = not has_gate
+    return config
+
+
 def _dflash_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -3015,6 +3100,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "granitehybrid": _granitehybrid_postprocess,
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
+    "specialized_encoder": _specialized_encoder_postprocess,
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
     "kimi_linear": _kimi_linear_postprocess,
