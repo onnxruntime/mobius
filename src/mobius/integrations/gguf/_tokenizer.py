@@ -1,307 +1,472 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Extract a Hugging Face ``tokenizer.json`` from a GGUF file.
-
-A GGUF checkpoint embeds its tokenizer as ``tokenizer.ggml.*`` metadata
-(tokens, scores/merges, token types, and special-token ids). The onnx-genai
-runtime loads ``<package>/tokenizer.json`` — the ``tokenizers``-library fast
-tokenizer serialization — so a model built from a GGUF file needs that file
-materialized alongside the ONNX weights.
-
-``transformers`` (5.x) can reconstruct a fast tokenizer directly from a GGUF
-file via ``AutoTokenizer.from_pretrained(directory, gguf_file=filename)``; this
-module wraps that and serializes the fast backend to ``tokenizer.json``,
-mirroring the diffusion CLIP tokenizer helper in
-``mobius.integrations.onnx_genai.auto_export``.
-"""
+"""Validate GGUF tokenizer metadata and materialize only exact tokenizer assets."""
 
 from __future__ import annotations
 
-import logging
-import os
+__all__ = [
+    "GGUFTokenizerVerdict",
+    "inspect_gguf_tokenizer",
+    "write_gguf_tokenizer_json",
+]
+
+import dataclasses
+import hashlib
+import json
+import math
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, Literal
 
-_LOGGER = logging.getLogger(__name__)
+from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
+
+TokenizerRoute = Literal["copy", "deferred"]
+
+_BPE_MODELS = frozenset({"gpt2", "hybriddna", "whitespace", "gemma4"})
+_KNOWN_MODELS = frozenset(
+    {"llama", "bert", "t5", "rwkv", "plamo2", "gpt2", "hybriddna", "whitespace", "gemma4"}
+)
+_SPECIAL_ID_KEYS = (
+    "tokenizer.ggml.bos_token_id",
+    "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.eot_token_id",
+    "tokenizer.ggml.eom_token_id",
+    "tokenizer.ggml.unknown_token_id",
+    "tokenizer.ggml.seperator_token_id",
+    "tokenizer.ggml.padding_token_id",
+    "tokenizer.ggml.cls_token_id",
+    "tokenizer.ggml.mask_token_id",
+    "tokenizer.ggml.fim_pre_token_id",
+    "tokenizer.ggml.fim_suf_token_id",
+    "tokenizer.ggml.fim_mid_token_id",
+    "tokenizer.ggml.fim_pad_token_id",
+    "tokenizer.ggml.fim_rep_token_id",
+    "tokenizer.ggml.fim_sep_token_id",
+    "tokenizer.ggml.prefix_token_id",
+    "tokenizer.ggml.suffix_token_id",
+    "tokenizer.ggml.middle_token_id",
+)
+_BOOL_KEYS = (
+    "tokenizer.ggml.add_bos_token",
+    "tokenizer.ggml.add_eos_token",
+    "tokenizer.ggml.add_sep_token",
+    "tokenizer.ggml.add_space_prefix",
+    "tokenizer.ggml.remove_extra_whitespaces",
+    "tokenizer.ggml.normalizer.lowercase",
+    "tokenizer.ggml.normalizer.strip_accents",
+)
+
+# Audited against the pinned C++ loader. ``tokenizer.huggingface.json`` and
+# ``tokenizer.chat_templates`` are converter/extension fields; llama.cpp does
+# not use the former to tokenize and uses the latter only to enumerate names.
+LOADER_CONSUMED_TOKENIZER_FIELDS = frozenset(
+    {
+        "tokenizer.ggml.model",
+        "tokenizer.ggml.pre",
+        "tokenizer.ggml.tokens",
+        "tokenizer.ggml.token_type",
+        "tokenizer.ggml.token_type_count",
+        "tokenizer.ggml.scores",
+        "tokenizer.ggml.merges",
+        "tokenizer.ggml.precompiled_charsmap",
+        "tokenizer.ggml.suppress_tokens",
+        "tokenizer.chat_template",
+        *_SPECIAL_ID_KEYS,
+        *_BOOL_KEYS,
+    }
+)
+CONVERTER_OR_EXTENSION_TOKENIZER_FIELDS = frozenset(
+    {"tokenizer.huggingface.json", "tokenizer.rwkv.world", "tokenizer.chat_templates"}
+)
 
 
-def write_gguf_tokenizer_json(gguf_path: str | Path, output_dir: str | Path) -> str | None:
-    """Write ``tokenizer.json`` for a GGUF-built package.
+@dataclasses.dataclass(frozen=True, slots=True)
+class GGUFTokenizerVerdict:
+    """Validated tokenizer policy for one GGUF source."""
 
-    Reconstructs the fast tokenizer from the GGUF ``tokenizer.ggml.*`` metadata
-    and serializes it to ``<output_dir>/tokenizer.json``. This is best-effort:
-    it logs a warning and returns ``None`` (never raising) when ``transformers``
-    is unavailable or the GGUF's tokenizer model cannot be converted, so the
-    build is not blocked — the onnx-genai runners can be given a
-    ``tokenizer.json`` separately.
+    route: TokenizerRoute
+    model: str | None
+    pre: str | None
+    canonical_pre: str | None
+    reason: str
+    token_count: int
+    tokenizer_sha256: str | None = None
+    metadata_sha256: str | None = None
 
-    Args:
-        gguf_path: Path to the ``.gguf`` file whose embedded tokenizer to emit.
-        output_dir: Package directory to write ``tokenizer.json`` into.
+    @property
+    def materialized(self) -> bool:
+        return self.route == "copy"
 
-    Returns:
-        The written ``tokenizer.json`` path, or ``None`` if it could not be
-        emitted.
-    """
-    gguf_path = Path(gguf_path)
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        _LOGGER.warning(
-            "transformers is not available; skipping tokenizer.json emission. "
-            "The onnx-genai runners will need a tokenizer.json supplied separately."
-        )
+
+def _require_list(metadata: Mapping[str, Any], key: str) -> list[Any] | None:
+    value = metadata.get(key)
+    if value is None:
         return None
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a GGUF array")
+    return value
+
+
+def _validate_chat_templates(metadata: Mapping[str, Any]) -> dict[str, str]:
+    default = metadata.get("tokenizer.chat_template")
+    if default is not None and not isinstance(default, str):
+        raise ValueError("tokenizer.chat_template must be a string")
+    qualified = {
+        key.removeprefix("tokenizer.chat_template."): value
+        for key, value in metadata.items()
+        if key.startswith("tokenizer.chat_template.")
+    }
+    if any(not name or not isinstance(value, str) for name, value in qualified.items()):
+        raise ValueError(
+            "named tokenizer chat templates require non-empty names and string values"
+        )
+    names = _require_list(metadata, "tokenizer.chat_templates")
+    if names is not None:
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("tokenizer.chat_templates must contain non-empty strings")
+        if len(set(names)) != len(names):
+            raise ValueError("tokenizer.chat_templates contains duplicate names")
+        expected = set(names) - {"default"}
+        if expected != set(qualified):
+            raise ValueError(
+                "tokenizer.chat_templates does not exactly match named "
+                "tokenizer.chat_template.<name> fields"
+            )
+        if ("default" in names) != (default is not None):
+            raise ValueError(
+                "tokenizer.chat_templates default entry contradicts tokenizer.chat_template"
+            )
+    templates = dict(sorted(qualified.items()))
+    if default is not None:
+        templates = {"default": default, **templates}
+    return templates
+
+
+def _validate_embedded_tokenizer_json(raw: str, tokens: list[str]) -> str:
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(gguf_path.parent),
-            gguf_file=gguf_path.name,
-            use_fast=True,
-        )
-    except Exception as error:  # best-effort; transformers may not know the arch
-        _LOGGER.info(
-            "transformers could not load a tokenizer from %r (%s); "
-            "reconstructing directly from the GGUF tokenizer metadata.",
-            str(gguf_path),
-            error,
-        )
-        return _reconstruct_tokenizer_from_ggml(gguf_path, output_dir)
-    backend = getattr(tokenizer, "backend_tokenizer", None)
-    if backend is None:
-        _LOGGER.warning(
-            "Reconstructed a slow tokenizer from %r with no fast backend; "
-            "skipping tokenizer.json emission.",
-            str(gguf_path),
-        )
-        return None
-    _ensure_bos_post_processor(backend, gguf_path)
-    path = os.path.join(str(output_dir), "tokenizer.json")
-    backend.save(path)
-    return path
-
-
-def _ensure_bos_post_processor(backend, gguf_path: Path) -> None:
-    """Attach a BOS-prepending post-processor if the GGUF asks for one.
-
-    ``transformers`` (5.x) can reconstruct a fast tokenizer from a GGUF's
-    ``tokenizer.ggml.*`` metadata, but for some architectures (e.g. Gemma,
-    whose GGUF tokenizer is loaded as a ``Unigram`` model) the resulting fast
-    backend does **not** carry the ``add_bos_token`` post-processor. Models
-    like Gemma require the ``<bos>`` prefix — without it, greedy decode
-    degenerates into single-token repetition. This restores that post-processor
-    from the GGUF metadata when the reconstructed tokenizer would otherwise omit
-    it. Best-effort: never raises (a tokenizer without BOS still saves).
-    """
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("tokenizer.huggingface.json is not valid JSON") from error
+    if not isinstance(payload, dict):
+        raise TypeError("tokenizer.huggingface.json must contain a JSON object")
     try:
-        from tokenizers import processors
+        from tokenizers import Tokenizer
 
-        from mobius.integrations.gguf._reader import GGUFModel
-
-        metadata = GGUFModel(str(gguf_path)).metadata
-        if not bool(metadata.get("tokenizer.ggml.add_bos_token", False)):
-            return
-        bos_id = metadata.get("tokenizer.ggml.bos_token_id")
-        tokens = metadata.get("tokenizer.ggml.tokens")
-        if bos_id is None or not tokens:
-            return
-        bos_id = int(bos_id)
-        if bos_id < 0 or bos_id >= len(tokens):
-            return
-        bos_token = tokens[bos_id]
-        # Probe: only attach BOS if the current pipeline does not already emit
-        # it (avoids a doubled ``<bos>`` when transformers did wire it up).
-        try:
-            probe = backend.encode("probe").ids
-            if probe and probe[0] == bos_id:
-                return
-        except Exception:  # pragma: no cover - probing is best-effort
-            pass
-        backend.post_processor = processors.TemplateProcessing(
-            single=f"{bos_token} $A",
-            pair=f"{bos_token} $A {bos_token} $B",
-            special_tokens=[(bos_token, bos_id)],
+        tokenizer = Tokenizer.from_str(raw)
+    except Exception as error:
+        raise ValueError(
+            "tokenizer.huggingface.json is not a loadable tokenizers tokenizer"
+        ) from error
+    actual = [tokenizer.id_to_token(index) for index in range(tokenizer.get_vocab_size())]
+    if actual != tokens:
+        mismatch = next(
+            (
+                index
+                for index, (actual_token, expected_token) in enumerate(zip(actual, tokens))
+                if actual_token != expected_token
+            ),
+            min(len(actual), len(tokens)),
         )
-        _LOGGER.info(
-            "Restored BOS post-processor (%r, id=%d) on GGUF-reconstructed tokenizer.",
-            bos_token,
-            bos_id,
+        raise ValueError(
+            "tokenizer.huggingface.json vocabulary is not identical to "
+            f"tokenizer.ggml.tokens (first mismatch at id {mismatch})"
         )
-    except Exception as error:  # pragma: no cover - best-effort
-        _LOGGER.warning(
-            "Could not verify/restore BOS post-processor for %r: %s.",
-            str(gguf_path),
-            error,
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _tokenizer_metadata_sha256(metadata: Mapping[str, Any]) -> str:
+    tokenizer_metadata = {
+        key: value for key, value in metadata.items() if key.startswith("tokenizer.")
+    }
+    canonical = json.dumps(
+        tokenizer_metadata,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def inspect_gguf_tokenizer(
+    metadata: Mapping[str, Any],
+    *,
+    source: str = "<GGUF>",
+    require_complete: bool = False,
+) -> GGUFTokenizerVerdict:
+    """Validate embedded tokenizer metadata and return an exact route verdict."""
+    tokenizer_keys = [key for key in metadata if key.startswith("tokenizer.")]
+    if not tokenizer_keys:
+        return GGUFTokenizerVerdict(
+            "deferred",
+            None,
+            None,
+            None,
+            f"{source} contains no tokenizer metadata",
+            0,
         )
 
-
-# Pre-tokenizer split rules keyed by `tokenizer.ggml.pre`, applied before the
-# byte-level step (which then runs with `use_regex=False`). These mirror the
-# per-family regexes llama.cpp keeps in `llama_vocab::init_tokenizer`; a family
-# absent from this table falls back to the stock GPT-2 regex.
-_PRE_TOKENIZER_SPLITS: dict[str, tuple[str, ...]] = {
-    "hunyuan-dense": (
-        r"\p{N}{1,3}",
-        r"[\x{4E00}-\x{9FFF}\x{3040}-\x{309F}\x{30A0}-\x{30FF}]+",
-        r"""[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+""",
-    ),
-}
-
-
-def _reconstruct_tokenizer_from_ggml(gguf_path: Path, output_dir: str | Path) -> str | None:
-    """Build ``tokenizer.json`` directly from GGUF ``tokenizer.ggml.*`` metadata.
-
-    Fallback for GGUF architectures whose tokenizer ``transformers`` does not yet
-    support (e.g. ``gemma4``). Reconstructs the fast BPE tokenizer from the
-    embedded tokens + merges + special-token ids.
-
-    Best-effort: logs a warning and returns ``None`` (never raising) when the
-    required metadata or libraries are missing. A failed encode→decode
-    round-trip is reported but **not** fatal — the ids are correct by
-    construction from the ggml ordering, and a small or byte-incomplete vocab
-    cannot necessarily represent arbitrary probe text, so the tokenizer is
-    still written.
-    """
-    try:
-        from tokenizers import Regex, Tokenizer, decoders, pre_tokenizers, processors
-        from tokenizers.models import BPE
-
-        from mobius.integrations.gguf._reader import GGUFModel
-    except ImportError as error:
-        _LOGGER.warning("Cannot reconstruct tokenizer (missing dependency: %s).", error)
-        return None
-
-    try:
-        metadata = GGUFModel(str(gguf_path)).metadata
-        tokens = metadata.get("tokenizer.ggml.tokens")
-        merges_raw = metadata.get("tokenizer.ggml.merges")
-        if not tokens or not merges_raw:
-            _LOGGER.warning(
-                "GGUF %r has no tokenizer.ggml.tokens/merges; skipping tokenizer.json.",
-                str(gguf_path),
+    model = metadata.get("tokenizer.ggml.model")
+    if not isinstance(model, str) or not model:
+        if not require_complete:
+            return GGUFTokenizerVerdict(
+                "deferred",
+                None,
+                None,
+                None,
+                f"{source} contains partial tokenizer metadata without tokenizer.ggml.model",
+                len(metadata.get("tokenizer.ggml.tokens", ())),
             )
-            return None
-        token_types = metadata.get("tokenizer.ggml.token_type") or []
-        unknown_id = int(metadata.get("tokenizer.ggml.unknown_token_id", 0))
-        bos_id = metadata.get("tokenizer.ggml.bos_token_id")
-        add_bos = bool(metadata.get("tokenizer.ggml.add_bos_token", False))
-        add_space_prefix = bool(metadata.get("tokenizer.ggml.add_space_prefix", False))
-        # `tokenizer.ggml.model` names the tokenizer family. "gpt2" is byte-level
-        # BPE, whose vocabulary encodes a leading space as the byte-mapped glyph
-        # 'Ġ'; SentencePiece families ("llama", "t5", ...) instead use '▁'.
-        # These are different alphabets, so the pre-tokenizer and decoder must
-        # follow the declared family — applying Metaspace to a byte-level vocab
-        # silently drops every inter-word space.
-        ggml_model = str(metadata.get("tokenizer.ggml.model") or "").lower()
-        byte_level = ggml_model in ("gpt2", "bloom", "falcon")
+        raise ValueError(f"{source} tokenizer.ggml.model must be a non-empty string")
+    if model not in _KNOWN_MODELS:
+        raise ValueError(f"{source} declares unknown tokenizer.ggml.model {model!r}")
 
-        vocab = {token: index for index, token in enumerate(tokens)}
-        # llama.cpp stores BPE merges as space-joined "left right" pairs.
-        merges = [
-            (parts[0], parts[1]) for merge in merges_raw if len(parts := merge.split(" ")) == 2
-        ]
-        unknown_token = tokens[unknown_id] if unknown_id < len(tokens) else None
-
-        tokenizer = Tokenizer(
-            BPE(
-                vocab=vocab,
-                merges=merges,
-                unk_token=None if byte_level else unknown_token,
-                fuse_unk=not byte_level,
-                byte_fallback=not byte_level,
+    tokens_raw = _require_list(metadata, "tokenizer.ggml.tokens")
+    if not tokens_raw:
+        if not require_complete:
+            return GGUFTokenizerVerdict(
+                "deferred",
+                model,
+                None,
+                None,
+                f"{source} contains no complete tokenizer token table",
+                0,
             )
+        raise ValueError(f"{source} tokenizer.ggml.tokens must be a non-empty string array")
+    if any(not isinstance(token, str) for token in tokens_raw):
+        raise ValueError(f"{source} tokenizer.ggml.tokens must contain only UTF-8 strings")
+    tokens = list(tokens_raw)
+    if len(set(tokens)) != len(tokens):
+        raise ValueError(f"{source} tokenizer.ggml.tokens contains duplicate token strings")
+
+    pre_value = metadata.get("tokenizer.ggml.pre")
+    if pre_value is None and model == "gemma4":
+        pre_value = "gemma4"
+    if model in _BPE_MODELS:
+        if not isinstance(pre_value, str) or not pre_value:
+            raise ValueError(
+                f"{source} BPE tokenizer requires tokenizer.ggml.pre; refusing llama.cpp's "
+                "quality-degrading generic default"
+            )
+        policy = tokenizer_pre_policies().get(pre_value)
+        if policy is None:
+            raise ValueError(f"{source} declares unknown tokenizer.ggml.pre {pre_value!r}")
+    elif pre_value is not None:
+        raise ValueError(
+            f"{source} declares tokenizer.ggml.pre for non-BPE model {model!r}; "
+            "the pinned loader does not consume that combination"
         )
-        if byte_level:
-            # Byte-level BPE: every byte already maps to a printable glyph, so
-            # there is no unknown token and no byte fallback. `add_prefix_space`
-            # stays False because the vocabulary distinguishes 'world' from
-            # 'Ġworld' and the caller's text must not be altered.
-            #
-            # `tokenizer.ggml.pre` names the *split* rule, which is not implied
-            # by the byte-level model: llama.cpp keeps a table of per-family
-            # regexes because families disagree on how digits, CJK, and
-            # punctuation are grouped, and a mismatch changes token ids (the
-            # text still round-trips, so only an id-level check catches it).
-            split_patterns = _PRE_TOKENIZER_SPLITS.get(
-                str(metadata.get("tokenizer.ggml.pre") or "").lower()
-            )
-            byte_level_pre = pre_tokenizers.ByteLevel(
-                add_prefix_space=False, use_regex=not split_patterns
-            )
-            if split_patterns:
-                tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
-                    [
-                        pre_tokenizers.Split(pattern=Regex(pattern), behavior="isolated")
-                        for pattern in split_patterns
-                    ]
-                    + [byte_level_pre]
-                )
-            else:
-                tokenizer.pre_tokenizer = byte_level_pre
-            tokenizer.decoder = decoders.ByteLevel()
-        else:
-            # SentencePiece semantics: '▁' marks word boundaries; unknown bytes
-            # fall back to <0xNN> byte tokens.
-            prepend_scheme = "always" if add_space_prefix else "never"
-            tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
-                replacement="▁", prepend_scheme=prepend_scheme
-            )
-            tokenizer.decoder = decoders.Sequence(
-                [
-                    decoders.Replace("▁", " "),
-                    decoders.ByteFallback(),
-                    decoders.Fuse(),
-                    decoders.Strip(content=" ", left=1, right=0),
-                ]
-            )
-        # Preserve control / user-defined tokens (llama.cpp types 3 and 4) as
-        # atomic special tokens so they are never split.
-        from tokenizers import AddedToken
-
-        special_tokens = [
-            AddedToken(str(tokens[index]), special=True, normalized=False)
-            for index, token_type in enumerate(token_types)
-            if token_type in (3, 4) and index < len(tokens)
-        ]
-        if special_tokens:
-            tokenizer.add_special_tokens(special_tokens)
-
-        if add_bos and bos_id is not None:
-            bos_id = int(bos_id)
-            if 0 <= bos_id < len(tokens):
-                bos_token = tokens[bos_id]
-                tokenizer.post_processor = processors.TemplateProcessing(
-                    single=f"{bos_token} $A",
-                    pair=f"{bos_token} $A {bos_token} $B",
-                    special_tokens=[(bos_token, bos_id)],
-                )
-
-        # Sanity check: encode→decode round-trip. This is a soft signal (a small
-        # or byte-incomplete vocab may not represent arbitrary text); the token
-        # ids are correct by construction from the ggml ordering, so warn rather
-        # than discard a reconstructed tokenizer.
-        for sample in ("Hello, world!", "The capital of France is Paris."):
-            decoded = tokenizer.decode(tokenizer.encode(sample).ids)
-            if decoded.strip() != sample.strip():
-                _LOGGER.warning(
-                    "Reconstructed tokenizer round-trip differs (%r -> %r); "
-                    "emitting anyway (ids follow the GGUF vocab order).",
-                    sample,
-                    decoded,
-                )
-                break
-
-        path = os.path.join(str(output_dir), "tokenizer.json")
-        tokenizer.save(path)
-    except Exception as error:  # best-effort; never block the build
-        _LOGGER.warning(
-            "Failed to reconstruct tokenizer from GGUF metadata %r: %s; "
-            "skipping tokenizer.json emission.",
-            str(gguf_path),
-            error,
-        )
-        return None
     else:
-        _LOGGER.info(
-            "Reconstructed tokenizer.json from GGUF metadata (%d tokens).", len(tokens)
+        policy = None
+
+    token_types = _require_list(metadata, "tokenizer.ggml.token_type")
+    if token_types is not None:
+        if len(token_types) != len(tokens):
+            raise ValueError(
+                "tokenizer.ggml.token_type length must equal tokenizer token count"
+            )
+        if any(type(value) is not int or value not in range(7) for value in token_types):
+            raise ValueError("tokenizer.ggml.token_type values must be integers in [0, 6]")
+
+    scores = _require_list(metadata, "tokenizer.ggml.scores")
+    if scores is not None:
+        if len(scores) != len(tokens):
+            raise ValueError("tokenizer.ggml.scores length must equal tokenizer token count")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in scores
+        ):
+            raise ValueError("tokenizer.ggml.scores must contain finite numeric values")
+
+    merges = _require_list(metadata, "tokenizer.ggml.merges")
+    if model in _BPE_MODELS and pre_value != "kimi-k2" and merges is None:
+        raise ValueError(f"{source} BPE tokenizer requires tokenizer.ggml.merges")
+    if merges is not None:
+        pairs: list[tuple[str, str]] = []
+        vocab = set(tokens)
+        for index, merge in enumerate(merges):
+            if not isinstance(merge, str):
+                raise TypeError(f"tokenizer.ggml.merges[{index}] must be a string")
+            separator = merge.find(" ", 1)
+            if separator < 0:
+                raise ValueError(f"tokenizer.ggml.merges[{index}] has no valid pair separator")
+            pair = (merge[:separator], merge[separator + 1 :])
+            if not all(pair) or pair[0] not in vocab or pair[1] not in vocab:
+                raise ValueError(
+                    f"tokenizer.ggml.merges[{index}] references a token outside the vocabulary"
+                )
+            pairs.append(pair)
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("tokenizer.ggml.merges contains duplicate merge pairs")
+
+    for key in _SPECIAL_ID_KEYS:
+        value = metadata.get(key)
+        if value is not None and (type(value) is not int or value < 0 or value >= len(tokens)):
+            raise ValueError(f"{key} must be an integer in [0, {len(tokens)})")
+    for key in _BOOL_KEYS:
+        value = metadata.get(key)
+        if value is not None and type(value) is not bool:
+            raise ValueError(f"{key} must be a boolean")
+
+    type_count = metadata.get("tokenizer.ggml.token_type_count")
+    if type_count is not None and (type(type_count) is not int or type_count <= 0):
+        raise ValueError("tokenizer.ggml.token_type_count must be a positive integer")
+    suppress = _require_list(metadata, "tokenizer.ggml.suppress_tokens")
+    if suppress is not None and any(
+        type(value) is not int or value < 0 or value >= len(tokens) for value in suppress
+    ):
+        raise ValueError("tokenizer.ggml.suppress_tokens contains an out-of-range token id")
+    if suppress is not None and len(set(suppress)) != len(suppress):
+        raise ValueError("tokenizer.ggml.suppress_tokens contains duplicate token ids")
+    charsmap = _require_list(metadata, "tokenizer.ggml.precompiled_charsmap")
+    if charsmap is not None and any(
+        type(value) is not int or value < -128 or value > 255 for value in charsmap
+    ):
+        raise ValueError("tokenizer.ggml.precompiled_charsmap must contain byte values")
+    if "tokenizer.ggml.byte_fallback" in metadata:
+        raise ValueError(
+            "tokenizer.ggml.byte_fallback is not a pinned GGUF key; byte-fallback semantics "
+            "cannot be inferred from it"
         )
-        return path
+    _validate_chat_templates(metadata)
+
+    embedded = metadata.get("tokenizer.huggingface.json")
+    if embedded is not None:
+        if not isinstance(embedded, str):
+            raise ValueError("tokenizer.huggingface.json must be a string")
+        digest = _validate_embedded_tokenizer_json(embedded, tokens)
+        return GGUFTokenizerVerdict(
+            "copy",
+            model,
+            pre_value,
+            policy.canonical if policy else None,
+            "embedded tokenizers JSON is copied verbatim and its ordered vocabulary "
+            "matches GGUF; pipeline execution is delegated to that artifact",
+            len(tokens),
+            digest,
+            _tokenizer_metadata_sha256(metadata),
+        )
+
+    detail = (
+        f"pre {pre_value!r} selects compiled llama.cpp behavior not serialized in GGUF"
+        if pre_value is not None
+        else f"model {model!r} omits the complete tokenizer pipeline"
+    )
+    return GGUFTokenizerVerdict(
+        "deferred",
+        model,
+        pre_value,
+        policy.canonical if policy else None,
+        f"{detail}; exact ORT tokenizer materialization is unavailable",
+        len(tokens),
+    )
+
+
+def _tokenizer_config(metadata: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    tokens = metadata["tokenizer.ggml.tokens"]
+    config: dict[str, Any] = {}
+    special_map: dict[str, str] = {}
+    names = {
+        "bos_token_id": "bos_token",
+        "eos_token_id": "eos_token",
+        "unknown_token_id": "unk_token",
+        "padding_token_id": "pad_token",
+        "seperator_token_id": "sep_token",
+        "cls_token_id": "cls_token",
+        "mask_token_id": "mask_token",
+    }
+    for suffix, config_name in names.items():
+        value = metadata.get(f"tokenizer.ggml.{suffix}")
+        if value is not None:
+            token = tokens[value]
+            config[config_name] = token
+            special_map[config_name] = token
+    for source_name, config_name in (
+        ("add_bos_token", "add_bos_token"),
+        ("add_eos_token", "add_eos_token"),
+        ("add_sep_token", "add_sep_token"),
+        ("add_space_prefix", "add_prefix_space"),
+        ("remove_extra_whitespaces", "remove_extra_whitespaces"),
+    ):
+        value = metadata.get(f"tokenizer.ggml.{source_name}")
+        if value is not None:
+            config[config_name] = value
+    templates = _validate_chat_templates(metadata)
+    if templates:
+        config["chat_template"] = (
+            templates["default"]
+            if set(templates) == {"default"}
+            else dict(sorted(templates.items()))
+        )
+    return config, special_map
+
+
+def write_gguf_tokenizer_json(
+    gguf_path: str | Path,
+    output_dir: str | Path,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    expected_metadata_sha256: str | None = None,
+) -> str:
+    """Copy an exact embedded tokenizer and reproduce its GGUF-side config."""
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    gguf_path = Path(gguf_path)
+    if metadata is None:
+        metadata = GGUFModel(gguf_path).metadata
+    verdict = inspect_gguf_tokenizer(metadata, source=str(gguf_path), require_complete=True)
+    if not verdict.materialized:
+        raise ValueError(
+            f"Cannot emit a complete ORT tokenizer from {gguf_path}: {verdict.reason}. "
+            "No tokenizer files were written."
+        )
+    if (
+        expected_metadata_sha256 is not None
+        and verdict.metadata_sha256 != expected_metadata_sha256
+    ):
+        raise ValueError(
+            "Tokenizer metadata does not match the expected graph-build identity; "
+            "no tokenizer files were written."
+        )
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    tokenizer_path = output / "tokenizer.json"
+    tokenizer_path.write_bytes(metadata["tokenizer.huggingface.json"].encode("utf-8"))
+    config, special_map = _tokenizer_config(metadata)
+    (output / "tokenizer_config.json").write_text(
+        json.dumps(config, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (output / "special_tokens_map.json").write_text(
+        json.dumps(special_map, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    templates = _validate_chat_templates(metadata)
+    chat_template_path = output / "chat_template.jinja"
+    if "default" in templates:
+        chat_template_path.write_text(
+            templates["default"],
+            encoding="utf-8",
+        )
+    elif chat_template_path.exists():
+        chat_template_path.unlink()
+    manifest = {
+        "format_version": 1,
+        "source": str(gguf_path.resolve()),
+        "route": verdict.route,
+        "model": verdict.model,
+        "pre": verdict.pre,
+        "canonical_pre": verdict.canonical_pre,
+        "token_count": verdict.token_count,
+        "tokenizer_sha256": verdict.tokenizer_sha256,
+        "metadata_sha256": verdict.metadata_sha256,
+        "pipeline_semantics": "delegated_to_embedded_tokenizer_json",
+        "ort_genai_compatible": "delegated",
+    }
+    (output / "gguf_tokenizer_manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return str(tokenizer_path)

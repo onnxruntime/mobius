@@ -24,7 +24,7 @@ import struct
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import tqdm
@@ -621,6 +621,13 @@ def _validate_gguf_model(
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
+    if not allow_mmproj_companion:
+        from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+        # Validate tokenizer identity and tables before config extraction. A
+        # known-but-deferred tokenizer is allowed for graph-only imports; an
+        # unknown or contradictory tokenizer is not.
+        inspect_gguf_tokenizer(gguf_model.metadata, source=source)
 
 
 def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
@@ -1731,7 +1738,11 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
 
     # Split the optional ":filename" suffix before classifying so HF refs like
     # "owner/repo:weights.gguf" are not mistaken for a local path ending in .gguf.
-    repo_id, _, filename = raw.partition(":")
+    repo_revision, _, filename = raw.partition(":")
+    repo_id, revision_separator, requested_revision = repo_revision.partition("@")
+    revision = requested_revision if revision_separator else "main"
+    if not revision:
+        raise ValueError(f"HF GGUF reference {raw!r} has an empty revision")
     if not _looks_like_hf_repo_id(repo_id):
         # Looks like a local path that doesn't exist; let GGUFModel raise
         # FileNotFoundError with the original path.
@@ -1739,7 +1750,9 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
 
     api = HfApi()
     if not filename:
-        files = [f for f in api.list_repo_files(repo_id) if f.endswith(".gguf")]
+        files = [
+            f for f in api.list_repo_files(repo_id, revision=revision) if f.endswith(".gguf")
+        ]
         if not files:
             raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
         if len(files) > 1:
@@ -1754,13 +1767,13 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
         resolved_revision = _preflight_hf_mmproj_companion_file(
             repo_id,
             filename,
-            revision="main",
+            revision=revision,
         )
     else:
         resolved_revision = _preflight_hf_gguf_file(
             repo_id,
             filename,
-            revision="main",
+            revision=revision,
         )
     logger.info("Downloading %s from %s", filename, repo_id)
     if resolved_revision is None:
@@ -1797,6 +1810,7 @@ def build_from_gguf(
     allow_dense_moe: bool | None = None,
     reuse_gguf_weights: bool = False,
     target_config: str | Path | Mapping[str, object] | None = None,
+    _gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
 
@@ -1896,12 +1910,14 @@ def build_from_gguf(
             raise ValueError("static_cache=True is not supported with a companion mmproj.")
         from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
 
+        parsed_source = {"_text_gguf_model": _gguf_model} if _gguf_model is not None else {}
         return build_vlm_from_gguf(
             gguf_path,
             mmproj,
             dtype=dtype,
             execution_provider=execution_provider,
             keep_quantized=keep_quantized,
+            **parsed_source,
         )
 
     from mobius._builder import (
@@ -1937,7 +1953,7 @@ def build_from_gguf(
     #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
     #    (never merged into a second on-disk GGUF); a plain file opens as before.
     gguf_path = _resolve_gguf_path(gguf_path)
-    gguf_model = open_gguf_model(gguf_path)
+    gguf_model = _gguf_model if _gguf_model is not None else open_gguf_model(gguf_path)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
     if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
         raise ValueError(
@@ -1950,6 +1966,9 @@ def build_from_gguf(
             "external tensors interpret the referenced bytes as little-endian. "
             "Build without reuse to convert this file."
         )
+    from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+    tokenizer_verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
     if static_cache and int(gguf_model.metadata.get(f"{gguf_arch}.nextn_predict_layers", 0)):
         raise ValueError(
@@ -2337,6 +2356,8 @@ def build_from_gguf(
 
     if draft_manifest is not None:
         pkg.draft_manifest = draft_manifest
+    pkg.gguf_source_path = str(Path(gguf_path).resolve())
+    pkg.gguf_tokenizer_verdict = tokenizer_verdict
 
     return pkg
 

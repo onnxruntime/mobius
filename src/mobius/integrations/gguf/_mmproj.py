@@ -1036,6 +1036,8 @@ def build_gemma4_vlm_from_gguf(
     image_token_id: int | None = None,
     include_audio: bool = False,
     keep_quantized: bool = True,
+    _text_gguf_model: Any | None = None,
+    _mmproj_gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Build a full Gemma4 multimodal ONNX package from text + mmproj GGUFs.
 
@@ -1085,7 +1087,10 @@ def build_gemma4_vlm_from_gguf(
     from mobius.models.gemma4 import Gemma4Model
     from mobius.tasks._gemma4 import Gemma4Task
 
-    text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
+    resolved_text_path = _resolve_local_path(text_gguf_path)
+    text_gguf = (
+        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+    )
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
 
     preserve_quantization = keep_quantized and _has_quantized_weights(text_gguf, "gemma4")
@@ -1094,7 +1099,12 @@ def build_gemma4_vlm_from_gguf(
             "Text GGUF contains no mapped quantized weights; using the float import path"
         )
 
-    mmproj_gguf = GGUFModel(_resolve_mmproj_companion_path(mmproj_gguf_path))
+    resolved_mmproj_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model
+        if _mmproj_gguf_model is not None
+        else GGUFModel(resolved_mmproj_path)
+    )
     _validate_gguf_model(
         mmproj_gguf,
         source=str(mmproj_gguf_path),
@@ -1222,6 +1232,12 @@ def build_gemma4_vlm_from_gguf(
     state_dict = module.preprocess_weights(state_dict)
     pkg.apply_weights(state_dict)
     logger.info("Applied %d mapped weights to the Gemma4 VLM package", len(state_dict))
+    from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+    pkg.gguf_source_path = str(Path(resolved_text_path).resolve())
+    pkg.gguf_tokenizer_verdict = inspect_gguf_tokenizer(
+        text_gguf.metadata, source=str(resolved_text_path)
+    )
 
     return pkg
 
@@ -1256,6 +1272,8 @@ def build_muse_glimmer_vlm_from_gguf(
     execution_provider: str = "default",
     image_token_id: int | None = None,
     keep_quantized: bool = True,
+    _text_gguf_model: Any | None = None,
+    _mmproj_gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Build a Muse Glimmer decoder + vision + embedding package from GGUFs.
 
@@ -1298,11 +1316,19 @@ def build_muse_glimmer_vlm_from_gguf(
     from mobius.models.muse_glimmer import MuseGlimmerForConditionalGeneration
     from mobius.tasks import MuseGlimmerVLTask
 
-    text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
+    resolved_text_path = _resolve_local_path(text_gguf_path)
+    text_gguf = (
+        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+    )
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
     text_arch = text_gguf.architecture
 
-    mmproj_gguf = GGUFModel(_resolve_mmproj_companion_path(mmproj_gguf_path))
+    resolved_mmproj_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model
+        if _mmproj_gguf_model is not None
+        else GGUFModel(resolved_mmproj_path)
+    )
     _validate_gguf_model(
         mmproj_gguf,
         source=str(mmproj_gguf_path),
@@ -1404,6 +1430,12 @@ def build_muse_glimmer_vlm_from_gguf(
     state_dict = module.preprocess_weights(state_dict)
     pkg.apply_weights(state_dict)
     logger.info("Applied %d mapped weights to the Muse Glimmer VLM package", len(state_dict))
+    from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+    pkg.gguf_source_path = str(Path(resolved_text_path).resolve())
+    pkg.gguf_tokenizer_verdict = inspect_gguf_tokenizer(
+        text_gguf.metadata, source=str(resolved_text_path)
+    )
 
     return pkg
 
@@ -1415,6 +1447,7 @@ def build_vlm_from_gguf(
     dtype: str | None = None,
     execution_provider: str = "default",
     keep_quantized: bool = True,
+    _text_gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Route a text + mmproj pair to the architecture-specific VLM builder.
 
@@ -1424,9 +1457,13 @@ def build_vlm_from_gguf(
     from mobius.integrations.gguf._builder import _validate_gguf_model
     from mobius.integrations.gguf._reader import GGUFModel
 
-    text_gguf = GGUFModel(_resolve_local_path(text_gguf_path))
+    resolved_text_path = _resolve_local_path(text_gguf_path)
+    text_gguf = (
+        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+    )
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
-    mmproj_gguf = GGUFModel(_resolve_mmproj_companion_path(mmproj_gguf_path))
+    resolved_mmproj_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = GGUFModel(resolved_mmproj_path)
     _validate_gguf_model(
         mmproj_gguf,
         source=str(mmproj_gguf_path),
@@ -1436,13 +1473,16 @@ def build_vlm_from_gguf(
     builder = _resolve_vlm_builder(
         text_gguf.architecture, specs[MMProjModality.VISION].projector_type
     )
-    return builder(
-        text_gguf_path,
-        mmproj_gguf_path,
+    pkg = builder(
+        resolved_text_path,
+        resolved_mmproj_path,
         dtype=dtype,
         execution_provider=execution_provider,
         keep_quantized=keep_quantized,
+        _text_gguf_model=text_gguf,
+        _mmproj_gguf_model=mmproj_gguf,
     )
+    return pkg
 
 
 #: Named multimodal assembly entry points that

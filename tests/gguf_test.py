@@ -521,6 +521,8 @@ class TestCLIBuildGGUF:
 
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
+        package.mtp_head = None
+        package.draft_manifest = None
         package.values.return_value = iter(())
         with mock.patch(
             "mobius.integrations.gguf.build_from_gguf",
@@ -583,8 +585,23 @@ class TestCLIBuildGGUF:
 
         package = mock.MagicMock()
         package.__iter__.return_value = iter(())
+        package.mtp_head = None
+        package.draft_manifest = None
         output_dir = tmp_path / "output"
         with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._reader.GGUFModel",
+                return_value=mock.Mock(metadata={}),
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
+                return_value=mock.Mock(materialized=True),
+            ),
             mock.patch(
                 "mobius.integrations.gguf.build_from_gguf",
                 return_value=package,
@@ -610,5 +627,43 @@ class TestCLIBuildGGUF:
             str(tmp_path / "model.gguf"),
             str(output_dir),
             runtime="ort-genai",
-            save_model=False,
+            external_data="onnx",
+            max_shard_size_bytes=None,
+            max_workers=8,
         )
+
+    def test_deferred_runtime_tokenizer_fails_before_graph_or_output(self, tmp_path):
+        from mobius.__main__ import main
+
+        output = tmp_path / "output"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._reader.GGUFModel",
+                return_value=mock.Mock(metadata={}),
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
+                return_value=mock.Mock(
+                    materialized=False, reason="opaque pre-tokenizer is deferred"
+                ),
+            ),
+            mock.patch("mobius.integrations.gguf.build_from_gguf") as build,
+            pytest.raises(SystemExit, match="opaque pre-tokenizer is deferred"),
+        ):
+            main(
+                [
+                    "build-gguf",
+                    str(tmp_path / "model.gguf"),
+                    "--output",
+                    str(output),
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+        build.assert_not_called()
+        assert not output.exists()

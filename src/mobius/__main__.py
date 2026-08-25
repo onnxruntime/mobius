@@ -637,6 +637,27 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             "runtime packaging; omit --runtime to save the auxiliary graph and manifest."
         )
 
+    if runtime is not None:
+        from mobius.integrations.gguf._builder import (
+            _resolve_gguf_path,
+            _validate_gguf_model,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
+
+        # Resolve and validate the exact selected source before graph construction
+        # so a deferred tokenizer cannot leave a graph-only directory behind.
+        gguf_path = _resolve_gguf_path(gguf_path)
+        gguf_model = GGUFModel(gguf_path)
+        _validate_gguf_model(gguf_model, source=str(gguf_path))
+        tokenizer_verdict = inspect_gguf_tokenizer(
+            gguf_model.metadata, source=str(gguf_path), require_complete=True
+        )
+        if not tokenizer_verdict.materialized:
+            raise SystemExit(
+                f"Error: cannot emit a complete {runtime} package: {tokenizer_verdict.reason}"
+            )
+
     pkg = build_from_gguf(
         gguf_path,
         mmproj=mmproj_path,
@@ -647,19 +668,23 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         max_seq_len=args.max_seq_len,
         reuse_gguf_weights=reuse_gguf_weights,
         target_config=target_config,
+        _gguf_model=gguf_model if runtime is not None else None,
     )
 
     if args.release:
         for model in pkg.values():
             strip_debug_metadata(model)
 
-    os.makedirs(output_dir, exist_ok=True)
-    pkg.save(
-        output_dir,
-        external_data=args.external_data,
-        max_shard_size_bytes=_parse_size(args.max_shard_size) if args.max_shard_size else None,
-        max_workers=args.max_workers,
-    )
+    if runtime is None:
+        os.makedirs(output_dir, exist_ok=True)
+        pkg.save(
+            output_dir,
+            external_data=args.external_data,
+            max_shard_size_bytes=(
+                _parse_size(args.max_shard_size) if args.max_shard_size else None
+            ),
+            max_workers=args.max_workers,
+        )
     for name in pkg:
         use_subfolders = len(pkg) > 1
         if use_subfolders:
@@ -685,26 +710,19 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
 
-        # The graph is already saved above; this adds the tokenizer (rebuilt
-        # from the GGUF's embedded ggml metadata, since a GGUF checkpoint has
-        # no Hugging Face source directory) and the runtime's own contract.
         artifacts = write_gguf_runtime_package(
-            pkg, gguf_path, output_dir, runtime=runtime, save_model=False
+            pkg,
+            gguf_path,
+            output_dir,
+            runtime=runtime,
+            external_data=args.external_data,
+            max_shard_size_bytes=(
+                _parse_size(args.max_shard_size) if args.max_shard_size else None
+            ),
+            max_workers=args.max_workers,
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
-        if mtp_head is not None:
-            from mobius.integrations.onnx_genai.inference_metadata import (
-                write_mtp_speculator_metadata,
-            )
-
-            spec_path = write_mtp_speculator_metadata(
-                output_dir,
-                backbone_config=getattr(pkg, "config", None),
-                proposer_config=getattr(mtp_head, "config", None),
-            )
-            if spec_path is not None:
-                print(f"  speculator: {spec_path}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
@@ -1227,10 +1245,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Generate runtime-specific config files after building. "
-            "'onnx-genai' writes inference_metadata.yaml plus a tokenizer.json "
-            "reconstructed from the GGUF's embedded tokenizer metadata; "
-            "'ort-genai' is currently rejected until GGUF cache/tokenizer "
-            "contracts have runtime generation coverage."
+            "Both routes require an exact tokenizer.huggingface.json embedded in "
+            "the GGUF; opaque tokenizer.ggml.pre metadata is not reconstructed. "
+            "'onnx-genai' writes inference_metadata.yaml and 'ort-genai' writes "
+            "genai_config.json."
         ),
     )
     gguf_parser.add_argument(

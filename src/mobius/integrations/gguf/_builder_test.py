@@ -4483,6 +4483,64 @@ class TestGGUFPreflightGuards:
             revision=commit_hash,
         )
 
+    def test_explicit_hub_revision_and_filename_are_preflighted_exactly(self) -> None:
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+
+        commit_hash = "b" * 40
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
+                return_value=commit_hash,
+            ) as preflight,
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value="cached-model.gguf",
+            ) as download,
+        ):
+            assert (
+                _resolve_gguf_path("example/qwen35@release-v1:nested/model.gguf")
+                == "cached-model.gguf"
+            )
+
+        preflight.assert_called_once_with(
+            "example/qwen35", "nested/model.gguf", revision="release-v1"
+        )
+        download.assert_called_once_with(
+            repo_id="example/qwen35",
+            filename="nested/model.gguf",
+            revision=commit_hash,
+        )
+
+    def test_explicit_hub_revision_is_used_for_filename_discovery(self) -> None:
+        from mobius.integrations.gguf._builder import _resolve_gguf_path
+
+        commit_hash = "c" * 40
+        with (
+            mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file",
+                return_value=commit_hash,
+            ) as preflight,
+            mock.patch(
+                "mobius.integrations.gguf._builder.hf_hub_download",
+                return_value="cached-historical.gguf",
+            ) as download,
+        ):
+            api_type.return_value.list_repo_files.return_value = ["historical.gguf"]
+            assert _resolve_gguf_path("example/qwen35@historical") == "cached-historical.gguf"
+
+        api_type.return_value.list_repo_files.assert_called_once_with(
+            "example/qwen35", revision="historical"
+        )
+        preflight.assert_called_once_with(
+            "example/qwen35", "historical.gguf", revision="historical"
+        )
+        download.assert_called_once_with(
+            repo_id="example/qwen35",
+            filename="historical.gguf",
+            revision=commit_hash,
+        )
+
     def test_exact_selected_non_clip_header_rejects_without_payload(self) -> None:
         from mobius.integrations.gguf._builder import (
             _preflight_hf_mmproj_companion_file,
