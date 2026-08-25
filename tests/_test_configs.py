@@ -40,6 +40,7 @@ from mobius._configs import (
     LongcatFlashConfig,
     Mamba2Config,
     MambaConfig,
+    MiniMaxConfig,
     MllamaConfig,
     MoonshineConfig,
     MuseGlimmerConfig,
@@ -1245,12 +1246,35 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     (
         "minimax",
         {
+            "_config_cls": MiniMaxConfig,
             "layer_types": ["full_attention", "lightning_attention"],
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
             "head_dim": TINY_HIDDEN // TINY_HEADS,
         },
         True,
+    ),
+    (
+        "MiniMaxText01",
+        {
+            "_config_cls": MiniMaxConfig,
+            "layer_types": ["full_attention", "lightning_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HIDDEN // TINY_HEADS,
+        },
+        False,
+    ),
+    (
+        "minimax_text_01",
+        {
+            "_config_cls": MiniMaxConfig,
+            "layer_types": ["full_attention", "lightning_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HIDDEN // TINY_HEADS,
+        },
+        False,
     ),
     (
         "gpt_oss",

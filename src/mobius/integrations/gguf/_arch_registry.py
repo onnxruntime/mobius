@@ -1191,14 +1191,31 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="minimax-01",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="minimax",
+        config_key_map="minimax",
+        config_postprocessor="minimax",
+        tensor_map_recipe=("minimax",),
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "residual_scale",
+        ),
         runtime=Support.DEFERRED,
         reason=(
-            "The pinned loader schedule is not periodic and its Lightning Attention "
-            "decay, scaling, residual multipliers, and recurrent rollback semantics "
-            "are not represented by the current MiniMax graph."
+            "Graph import is exact, but released ORT GenAI packaging cannot represent "
+            "the heterogeneous KV/recurrent state slots or bounded rollback snapshots; "
+            "runtime packaging remains tracked by #605."
         ),
     ),
     GGUFArchitectureSpec(

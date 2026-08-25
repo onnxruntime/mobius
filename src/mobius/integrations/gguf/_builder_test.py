@@ -1271,6 +1271,136 @@ def _write_granitehybrid_moe_gguf(
     writer.close()
 
 
+def _write_minimax_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    omit: str | None = None,
+    extra: str | None = None,
+    malformed_shape: str | None = None,
+    recurrent_layers: list[bool] | None = None,
+    norm_eps: float = 1e-5,
+    rope_freq_base: float = 10_000_000.0,
+) -> None:
+    """Write a tiny MiniMax-01 GGUF with one Lightning and one full-attention layer."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 64
+    intermediate = 32
+    vocab = 64
+    heads = 4
+    kv_heads = 2
+    head_dim = 16
+    experts = 2
+    rng = np.random.default_rng(601)
+
+    writer = GGUFWriter(str(path), "minimax-01")
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(2)
+    writer.add_head_count(heads)
+    writer.add_head_count_kv(kv_heads)
+    writer.add_key_length(head_dim)
+    writer.add_value_length(head_dim)
+    writer.add_layer_norm_rms_eps(norm_eps)
+    writer.add_rope_freq_base(rope_freq_base)
+    writer.add_rope_dimension_count(8)
+    writer.add_expert_count(experts)
+    writer.add_expert_used_count(1)
+    writer.add_residual_scale(3.5565588200778455)
+    writer.add_vocab_size(vocab)
+    writer.add_array(
+        "minimax-01.attention.recurrent_layers",
+        recurrent_layers if recurrent_layers is not None else [True, False],
+    )
+
+    def shape_for(name: str, shape: tuple[int, ...]) -> tuple[int, ...]:
+        if name == malformed_shape:
+            return (*shape[:-1], shape[-1] + 1)
+        return shape
+
+    def add_float(
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        expert_base: float | None = None,
+    ) -> None:
+        if name == omit:
+            return
+        shape = shape_for(name, shape)
+        values = rng.normal(0.0, 0.02, shape).astype(np.float32)
+        if expert_base is not None:
+            for expert in range(shape[0]):
+                values[expert].fill(expert_base + expert)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, ...]) -> None:
+        if name == omit:
+            return
+        shape = shape_for(name, shape)
+        assert shape[-1] % 32 == 0
+        raw = np.zeros((*shape[:-1], shape[-1] // 32 * 18), dtype=np.uint8)
+        for index in np.ndindex(shape[:-1]):
+            for block in range(shape[-1] // 32):
+                offset = block * 18
+                raw[(*index, slice(offset, offset + 2))] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[(*index, slice(offset + 2, offset + 18))] = rng.integers(
+                    0, 256, 16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    add_float("output.weight", (vocab, hidden))
+    projection = add_q4 if quantized else add_float
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        add_float(prefix + "attn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_norm.weight", (hidden,))
+        add_float(prefix + "ffn_gate_inp.weight", (experts, hidden))
+        if quantized:
+            projection(prefix + "ffn_gate_exps.weight", (experts, intermediate, hidden))
+            projection(prefix + "ffn_up_exps.weight", (experts, intermediate, hidden))
+            projection(prefix + "ffn_down_exps.weight", (experts, hidden, intermediate))
+        else:
+            add_float(
+                prefix + "ffn_gate_exps.weight",
+                (experts, intermediate, hidden),
+                expert_base=11.0,
+            )
+            add_float(
+                prefix + "ffn_up_exps.weight",
+                (experts, intermediate, hidden),
+                expert_base=21.0,
+            )
+            add_float(
+                prefix + "ffn_down_exps.weight",
+                (experts, hidden, intermediate),
+                expert_base=31.0,
+            )
+        projection(prefix + "attn_output.weight", (hidden, q_width))
+        if layer == 0:
+            projection(prefix + "attn_qkv.weight", (3 * q_width, hidden))
+            projection(prefix + "attn_gate.weight", (q_width, hidden))
+            add_float(prefix + "attn_norm_2.weight", (q_width,))
+        else:
+            projection(prefix + "attn_q.weight", (q_width, hidden))
+            projection(prefix + "attn_k.weight", (kv_width, hidden))
+            projection(prefix + "attn_v.weight", (kv_width, hidden))
+    if extra is not None:
+        add_float(extra, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_nemotron_h_moe_gguf(
     path: Path,
     *,
@@ -5303,6 +5433,184 @@ class TestJambaGGUFBuild:
         assert not graph_build_started
 
 
+class TestMiniMaxGGUFBuild:
+    """MiniMax-01 GGUF import preserves hybrid state and expert tensor order."""
+
+    @staticmethod
+    def _inputs(tokens: np.ndarray, states: dict[str, np.ndarray] | None = None):
+        batch, sequence = tokens.shape
+        if states is None:
+            states = {
+                "past_key_values.0.recurrent_state": np.zeros(
+                    (batch, 4, 16, 16), dtype=np.float32
+                ),
+                "past_key_values.1.key": np.zeros((batch, 2, 0, 16), dtype=np.float32),
+                "past_key_values.1.value": np.zeros((batch, 2, 0, 16), dtype=np.float32),
+            }
+        past = states["past_key_values.1.key"].shape[2]
+        return {
+            "input_ids": tokens,
+            "attention_mask": np.ones((batch, past + sequence), dtype=np.int64),
+            "position_ids": np.broadcast_to(
+                np.arange(past, past + sequence, dtype=np.int64), (batch, sequence)
+            ).copy(),
+            **states,
+        }
+
+    def test_float_import_runtime_save_reload_and_expert_order(self, tmp_path: Path) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "minimax-f32.gguf"
+        _write_minimax_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        model = package["model"]
+        assert [value.name for value in model.graph.inputs if "past_" in value.name] == [
+            "past_key_values.0.recurrent_state",
+            "past_key_values.1.key",
+            "past_key_values.1.value",
+        ]
+        for layer in range(2):
+            for expert in range(2):
+                prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+                np.testing.assert_array_equal(
+                    model.graph.initializers[
+                        f"{prefix}.gate_proj.weight_t"
+                    ].const_value.numpy(),
+                    11.0 + expert,
+                )
+                np.testing.assert_array_equal(
+                    model.graph.initializers[f"{prefix}.up_proj.weight_t"].const_value.numpy(),
+                    21.0 + expert,
+                )
+                np.testing.assert_array_equal(
+                    model.graph.initializers[
+                        f"{prefix}.down_proj.weight_t"
+                    ].const_value.numpy(),
+                    31.0 + expert,
+                )
+
+        session = OnnxModelSession(model)
+        try:
+            prefill = session.run(self._inputs(np.asarray([[1, 2], [3, 4]], np.int64)))
+            snapshot = {
+                "past_key_values.0.recurrent_state": prefill["present.0.recurrent_state"],
+                "past_key_values.1.key": prefill["present.1.key"],
+                "past_key_values.1.value": prefill["present.1.value"],
+            }
+            first = session.run(self._inputs(np.asarray([[5], [6]], np.int64), snapshot))
+            replay = session.run(self._inputs(np.asarray([[5], [6]], np.int64), snapshot))
+            reordered = session.run(
+                self._inputs(
+                    np.asarray([[6], [5]], np.int64),
+                    {name: value[[1, 0]] for name, value in snapshot.items()},
+                )
+            )
+        finally:
+            session.close()
+        for name in first:
+            np.testing.assert_allclose(replay[name], first[name], rtol=0, atol=0)
+            np.testing.assert_allclose(reordered[name], first[name][[1, 0]], rtol=0, atol=0)
+
+        saved = tmp_path / "saved-minimax"
+        package.save(saved, progress_bar=False, check_weights=True)
+        reloaded = ModelPackage.load(saved)["model"]
+        assert [value.name for value in reloaded.graph.outputs] == [
+            value.name for value in model.graph.outputs
+        ]
+
+    def test_quantized_source_preserves_exact_projection_roles(self, tmp_path: Path) -> None:
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "minimax-q4.gguf"
+        _write_minimax_gguf(path, quantized=True)
+        model = build_from_gguf(path, keep_quantized=True)["model"]
+        assert sum(node.op_type == "MatMulNBits" for node in model.graph) >= 19
+        assert all(
+            "norm" not in node.inputs[1].name
+            for node in model.graph
+            if node.op_type == "MatMulNBits"
+        )
+        session = OnnxModelSession(model)
+        try:
+            outputs = session.run(self._inputs(np.asarray([[1, 2]], np.int64)))
+        finally:
+            session.close()
+        assert np.isfinite(outputs["logits"]).all()
+
+    def test_tied_output_uses_embedding_storage(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "minimax-tied.gguf"
+        _write_minimax_gguf(path, quantized=False, omit="output.weight")
+        model = build_from_gguf(path)["model"]
+        assert "lm_head.weight" not in model.graph.initializers
+        assert "model.embed_tokens.weight" in model.graph.initializers
+
+    def test_cli_build(self, tmp_path: Path) -> None:
+        from mobius.__main__ import main
+        from mobius._model_package import ModelPackage
+
+        path = tmp_path / "minimax-cli.gguf"
+        output = tmp_path / "minimax-cli-output"
+        _write_minimax_gguf(path, quantized=False)
+        main(["build-gguf", str(path), "--output", str(output), "--dequantize"])
+        assert "model" in ModelPackage.load(output)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            (
+                {"omit": "blk.0.attn_gate.weight"},
+                "missing=.*blk.0.attn_gate.weight",
+            ),
+            (
+                {"extra": "blk.0.attn_q.weight"},
+                "unexpected=.*blk.0.attn_q.weight",
+            ),
+            (
+                {"extra": "blk.2.attn_q.weight"},
+                "out_of_range=.*blk.2.attn_q.weight",
+            ),
+            (
+                {"malformed_shape": "blk.1.attn_k.weight"},
+                "invalid tensor shape",
+            ),
+            (
+                {"recurrent_layers": [True]},
+                "must contain exactly 2 entries",
+            ),
+            (
+                {"norm_eps": 0.0},
+                "inconsistent architecture metadata",
+            ),
+            (
+                {"rope_freq_base": float("nan")},
+                "inconsistent architecture metadata",
+            ),
+        ],
+    )
+    def test_invalid_contract_rejected_before_graph(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        kwargs: dict,
+        match: str,
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "minimax-invalid.gguf"
+        _write_minimax_gguf(path, quantized=False, **kwargs)
+        graph_build = mock.Mock(side_effect=AssertionError("graph construction reached"))
+        monkeypatch.setattr(core_builder, "build_from_module", graph_build)
+        with pytest.raises(ValueError, match=match):
+            build_from_gguf(path)
+        graph_build.assert_not_called()
+
+
 class TestGraniteHybridMoEGGUFBuild:
     """GraniteHybrid GGUF import preserves mixed state and routed expert order."""
 
@@ -5975,7 +6283,6 @@ class TestGGUFPreflightGuards:
     @pytest.mark.parametrize(
         "architecture",
         [
-            "minimax-01",
             "bailingmoe3",
             "deepseek4",
             "kimi-k3",

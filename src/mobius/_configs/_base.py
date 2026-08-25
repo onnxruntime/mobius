@@ -486,6 +486,16 @@ class ArchitectureConfig(BaseModelConfig):
     topk_method: str = "greedy"
     first_k_dense_replace: int = 0
     n_shared_experts: int | None = None
+    disable_qmoe: bool = False
+
+    # MiniMax-01 hybrid attention and normalized-residual scaling.
+    lightning_norm_eps: float | None = None
+    full_attn_alpha_factor: float = 1.0
+    full_attn_beta_factor: float = 1.0
+    linear_attn_alpha_factor: float = 1.0
+    linear_attn_beta_factor: float = 1.0
+    mlp_alpha_factor: float = 1.0
+    mlp_beta_factor: float = 1.0
 
     # Multi-head Latent Attention (MLA) config — DeepSeek-V2/V3
     q_lora_rank: int | None = None
@@ -1433,6 +1443,64 @@ class CausalLMConfig(ArchitectureConfig):
     Used by Llama, Mistral, Qwen, GPT-2, and similar architectures.
     Inherits all shared transformer fields from :class:`ArchitectureConfig`.
     """
+
+
+@dataclasses.dataclass
+class MiniMaxConfig(CausalLMConfig):
+    """Exact configuration for MiniMax-Text-01 and MiniMax-M1 backbones."""
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> MiniMaxConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        raw_schedule = getattr(config, "attn_type_list", None)
+        if raw_schedule is None:
+            raise ValueError("MiniMax-01 config requires an explicit attn_type_list")
+        if len(raw_schedule) != base.num_hidden_layers:
+            raise ValueError(
+                "MiniMax-01 attn_type_list must contain exactly "
+                f"{base.num_hidden_layers} entries, got {len(raw_schedule)}"
+            )
+        if any(value not in (0, 1, False, True) for value in raw_schedule):
+            raise ValueError("MiniMax-01 attn_type_list entries must be 0 or 1")
+        if not bool(getattr(config, "postnorm", True)):
+            raise ValueError("MiniMax-01 requires postnorm=true")
+        if int(getattr(config, "shared_intermediate_size", 0) or 0):
+            raise ValueError(
+                "MiniMax-01 shared experts are not supported by the pinned GGUF architecture"
+            )
+
+        beta_names = (
+            "layernorm_full_attention_beta",
+            "layernorm_linear_attention_beta",
+            "layernorm_mlp_beta",
+        )
+        betas = {name: float(getattr(config, name, 1.0)) for name in beta_names}
+        if any(not math.isclose(value, 1.0) for value in betas.values()):
+            raise ValueError(f"MiniMax-01 beta residual factors must all equal 1.0: {betas}")
+
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type="minimax",
+            layer_types=[
+                "full_attention" if int(value) == 1 else "lightning_attention"
+                for value in raw_schedule
+            ],
+            hidden_act="silu",
+            norm_topk_prob=True,
+            disable_qmoe=True,
+            lightning_norm_eps=float(getattr(config, "lightning_norm_eps", 1e-6)),
+            full_attn_alpha_factor=float(
+                getattr(config, "layernorm_full_attention_alpha", 1.0)
+            ),
+            full_attn_beta_factor=betas["layernorm_full_attention_beta"],
+            linear_attn_alpha_factor=float(
+                getattr(config, "layernorm_linear_attention_alpha", 1.0)
+            ),
+            linear_attn_beta_factor=betas["layernorm_linear_attention_beta"],
+            mlp_alpha_factor=float(getattr(config, "layernorm_mlp_alpha", 1.0)),
+            mlp_beta_factor=betas["layernorm_mlp_beta"],
+        )
+        return cls(**fields)
 
 
 @dataclasses.dataclass

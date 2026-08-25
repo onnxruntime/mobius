@@ -1299,6 +1299,30 @@ class TestHybridScheduleExtraction:
             "full_attention",
         ]
 
+    def test_minimax_default_interval_is_eight(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        layers, schedule, mtp = _derive_hybrid_layout(
+            "minimax-01", {"minimax-01.block_count": 9}
+        )
+
+        assert (layers, mtp) == (9, 0)
+        assert schedule == ["lightning_attention"] * 7 + [
+            "full_attention",
+            "lightning_attention",
+        ]
+
+    def test_minimax_explicit_schedule_rejects_invalid_interval(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
+
+        metadata = {
+            "minimax-01.block_count": 2,
+            "minimax-01.attention.recurrent_layers": [True, False],
+            "minimax-01.full_attention_interval": 0,
+        }
+        with pytest.raises(ValueError, match="must be positive"):
+            _derive_hybrid_layout("minimax-01", metadata)
+
     def test_dotted_nextn_metadata_is_rejected(self) -> None:
         from mobius.integrations.gguf._config_mapping import _derive_hybrid_layout
 

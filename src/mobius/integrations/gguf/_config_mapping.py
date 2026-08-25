@@ -42,6 +42,7 @@ from mobius._configs import (
     Lfm2MoeConfig,
     Mamba2Config,
     MambaConfig,
+    MiniMaxConfig,
     MuseGlimmerConfig,
     NemotronHConfig,
     Plamo2Config,
@@ -207,6 +208,12 @@ _GRANITEHYBRID_KEY_MAP = {
     "ssm.time_step_rank": "mamba_num_heads",
 }
 
+_MINIMAX_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.value_length": "value_head_dim",
+    "residual_scale": "residual_scale",
+}
+
 _T5_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.relative_buckets_count": "relative_attention_num_buckets",
@@ -229,6 +236,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "jamba": _JAMBA_KEY_MAP,
         "nemotron_h": _NEMOTRON_H_KEY_MAP,
         "granitehybrid": _GRANITEHYBRID_KEY_MAP,
+        "minimax": _MINIMAX_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
 )
@@ -437,6 +445,51 @@ def _derive_hybrid_layout(
                 layer_types.append("full_attention")
         return trunk_layers, layer_types, mtp_count
 
+    if gguf_arch == "minimax-01":
+        recurrent_key = f"{gguf_arch}.attention.recurrent_layers"
+        raw_recurrent = metadata.get(recurrent_key)
+        if raw_recurrent is None:
+            interval = int(metadata.get(f"{gguf_arch}.full_attention_interval", 8))
+            if interval <= 0:
+                raise ValueError(
+                    f"{gguf_arch}.full_attention_interval must be positive, got {interval}"
+                )
+            recurrent = [(layer + 1) % interval != 0 for layer in range(total_layers)]
+        else:
+            if not isinstance(raw_recurrent, (list, tuple, np.ndarray)):
+                raise ValueError(f"{recurrent_key} must be a boolean array")
+            if len(raw_recurrent) != total_layers:
+                raise ValueError(
+                    f"{recurrent_key} must contain exactly {total_layers} entries, "
+                    f"got {len(raw_recurrent)}"
+                )
+            if any(
+                not isinstance(value, (bool, np.bool_, int, np.integer))
+                or int(value) not in (0, 1)
+                for value in raw_recurrent
+            ):
+                raise ValueError(f"{recurrent_key} entries must be booleans or 0/1")
+            recurrent = [bool(value) for value in raw_recurrent]
+            if f"{gguf_arch}.full_attention_interval" in metadata:
+                interval = int(metadata[f"{gguf_arch}.full_attention_interval"])
+                if interval <= 0:
+                    raise ValueError(
+                        f"{gguf_arch}.full_attention_interval must be positive, got {interval}"
+                    )
+                periodic = [(layer + 1) % interval != 0 for layer in range(total_layers)]
+                if recurrent != periodic:
+                    raise ValueError(
+                        "MiniMax-01 recurrent_layers contradicts full_attention_interval"
+                    )
+        return (
+            trunk_layers,
+            [
+                "lightning_attention" if value else "full_attention"
+                for value in recurrent[:trunk_layers]
+            ],
+            mtp_count,
+        )
+
     if gguf_arch not in _DELTA_NET_ARCHITECTURES:
         return trunk_layers, None, mtp_count
 
@@ -625,6 +678,7 @@ def gguf_to_config(
             "nemotron_h_moe",
             "granitehybrid",
             "plamo2",
+            "minimax-01",
         }:
             nonzero = {value for value in values if value}
             if len(nonzero) != 1:
@@ -2538,6 +2592,65 @@ def _t5_postprocess(
     )
 
 
+def _minimax_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> MiniMaxConfig:
+    """Restore the exact pinned MiniMax-01 GGUF execution contract."""
+    arch = model.architecture
+    head_dim = int(metadata[f"{arch}.attention.key_length"])
+    value_dim = int(metadata[f"{arch}.attention.value_length"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    residual_scale = float(metadata[f"{arch}.residual_scale"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    if head_dim <= 0 or value_dim != head_dim:
+        raise ValueError(
+            f"MiniMax-01 requires equal positive key/value lengths, got {head_dim}/{value_dim}"
+        )
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+        raise ValueError(
+            f"MiniMax-01 rope.dimension_count must be positive, even, and <= {head_dim}"
+        )
+    if not math.isfinite(residual_scale) or residual_scale <= 0:
+        raise ValueError("MiniMax-01 residual_scale must be finite and positive")
+    if experts <= 1 or not 1 <= top_k <= experts:
+        raise ValueError(
+            f"MiniMax-01 expert counts are invalid: expert_count={experts}, "
+            f"expert_used_count={top_k}"
+        )
+    if any(
+        key in metadata
+        for key in (
+            f"{arch}.expert_shared_count",
+            f"{arch}.expert_shared_feed_forward_length",
+        )
+    ):
+        raise ValueError("MiniMax-01 pinned GGUF does not support shared experts")
+
+    _, layer_types, _ = _derive_hybrid_layout(arch, metadata, model.tensor_names)
+    assert layer_types is not None
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="minimax",
+        head_dim=head_dim,
+        partial_rotary_factor=rope_dim / head_dim,
+        layer_types=layer_types,
+        hidden_act="silu",
+        norm_topk_prob=True,
+        disable_qmoe=True,
+        lightning_norm_eps=config.rms_norm_eps,
+        full_attn_alpha_factor=residual_scale,
+        full_attn_beta_factor=1.0,
+        linear_attn_alpha_factor=residual_scale,
+        linear_attn_beta_factor=1.0,
+        mlp_alpha_factor=residual_scale,
+        mlp_beta_factor=1.0,
+    )
+    return MiniMaxConfig(**fields)
+
+
 def _bert_encoder_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2677,6 +2790,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
     "t5": _t5_postprocess,
+    "minimax": _minimax_postprocess,
 }
 
 

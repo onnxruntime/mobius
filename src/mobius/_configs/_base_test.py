@@ -7,7 +7,48 @@ from __future__ import annotations
 
 import types
 
-from mobius._configs import ArchitectureConfig, NemotronParseConfig
+import pytest
+
+from mobius._configs import ArchitectureConfig, MiniMaxConfig, NemotronParseConfig
+
+
+def test_minimax_config_extracts_exact_schedule_head_geometry_and_residuals():
+    config = types.SimpleNamespace(
+        model_type="MiniMaxText01",
+        hidden_size=48,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        rope_theta=10_000_000.0,
+        vocab_size=64,
+        attn_type_list=[0, 1],
+        num_local_experts=2,
+        num_experts_per_tok=1,
+        rms_norm_eps=1e-5,
+        postnorm=True,
+        shared_intermediate_size=0,
+        layernorm_full_attention_alpha=3.5,
+        layernorm_full_attention_beta=1.0,
+        layernorm_linear_attention_alpha=3.5,
+        layernorm_linear_attention_beta=1.0,
+        layernorm_mlp_alpha=3.5,
+        layernorm_mlp_beta=1.0,
+    )
+
+    extracted = MiniMaxConfig.from_transformers(config)
+
+    assert extracted.model_type == "minimax"
+    assert extracted.head_dim == 16
+    assert extracted.partial_rotary_factor == pytest.approx(0.5)
+    assert extracted.layer_types == ["lightning_attention", "full_attention"]
+    assert extracted.lightning_norm_eps == pytest.approx(1e-6)
+    assert extracted.full_attn_alpha_factor == pytest.approx(3.5)
+    assert extracted.linear_attn_alpha_factor == pytest.approx(3.5)
+    assert extracted.mlp_alpha_factor == pytest.approx(3.5)
+    assert extracted.disable_qmoe
 
 
 def test_nemotron_parse_maps_raw_mbart_decoder_attention_heads():
