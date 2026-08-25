@@ -1607,6 +1607,9 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
 
 def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
     """Validate the exact BailingMoE/DeepSeek/Dots1 tensor closure."""
+    from mobius.integrations.gguf._config_mapping import (
+        _validate_conventional_moe_rope_scaling,
+    )
     from mobius.integrations.gguf._tensor_mapping import is_known_skip
 
     architecture = gguf_model.architecture
@@ -1614,6 +1617,7 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         return
 
     metadata = gguf_model.metadata
+    _validate_conventional_moe_rope_scaling(metadata, architecture)
     required_suffixes = (
         "context_length",
         "embedding_length",
@@ -1621,10 +1625,6 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         "block_count",
         "attention.head_count",
         "attention.layer_norm_rms_epsilon",
-        "expert_count",
-        "expert_used_count",
-        "expert_feed_forward_length",
-        "expert_shared_count",
     )
     missing_metadata = [
         f"{architecture}.{suffix}"
@@ -1639,13 +1639,31 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
     hidden = int(metadata[f"{architecture}.embedding_length"])
     intermediate = int(metadata[f"{architecture}.feed_forward_length"])
     layers = int(metadata[f"{architecture}.block_count"])
+    dense_prefix = int(metadata.get(f"{architecture}.leading_dense_block_count", 0))
+    has_routed_layers = dense_prefix < layers
+    if has_routed_layers:
+        expert_suffixes = (
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+        )
+        missing_expert_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in expert_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_expert_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: "
+                f"{missing_expert_metadata}"
+            )
     heads = int(metadata[f"{architecture}.attention.head_count"])
     kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
-    experts = int(metadata[f"{architecture}.expert_count"])
-    top_k = int(metadata[f"{architecture}.expert_used_count"])
-    expert_intermediate = int(metadata[f"{architecture}.expert_feed_forward_length"])
-    shared_experts = int(metadata[f"{architecture}.expert_shared_count"])
-    dense_prefix = int(metadata.get(f"{architecture}.leading_dense_block_count", 0))
+    experts = int(metadata.get(f"{architecture}.expert_count", 0))
+    top_k = int(metadata.get(f"{architecture}.expert_used_count", 0))
+    expert_intermediate = int(metadata.get(f"{architecture}.expert_feed_forward_length", 0))
+    shared_experts = int(metadata.get(f"{architecture}.expert_shared_count", 0))
     context = int(metadata[f"{architecture}.context_length"])
     vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
         metadata.get("tokenizer.ggml.tokens", ())
@@ -1657,19 +1675,21 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
             layers,
             heads,
             kv_heads,
-            experts,
-            top_k,
-            expert_intermediate,
-            shared_experts,
             context,
             vocab,
         )
         <= 0
         or hidden % heads
         or heads % kv_heads
-        or top_k > experts
         or not 0 <= dense_prefix <= layers
         or (architecture == "bailingmoe" and dense_prefix)
+        or (
+            has_routed_layers
+            and (
+                min(experts, top_k, expert_intermediate, shared_experts) <= 0
+                or top_k > experts
+            )
+        )
     ):
         raise ValueError(f"{architecture} GGUF has invalid conventional MoE geometry")
 
@@ -1681,22 +1701,19 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         or value_dim != head_dim
         or heads * head_dim != hidden
         or rope_dim <= 0
-        or rope_dim > head_dim
-        or rope_dim % 2
-        or (architecture == "dots1" and (kv_heads != heads or rope_dim != head_dim))
+        or rope_dim != head_dim
+        or (architecture == "dots1" and kv_heads != heads)
     ):
         raise ValueError(f"{architecture} GGUF has invalid attention geometry")
     norm_epsilon = float(metadata[f"{architecture}.attention.layer_norm_rms_epsilon"])
-    route_scale = float(metadata.get(f"{architecture}.expert_weights_scale", 1.0))
-    if math.isclose(route_scale, 0.0):
-        route_scale = 1.0
-    if (
-        not math.isfinite(norm_epsilon)
-        or norm_epsilon <= 0
-        or not math.isfinite(route_scale)
-        or route_scale <= 0
-    ):
+    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
         raise ValueError(f"{architecture} GGUF has invalid normalization or routing scale")
+    if has_routed_layers:
+        route_scale = float(metadata.get(f"{architecture}.expert_weights_scale", 1.0))
+        if math.isclose(route_scale, 0.0):
+            route_scale = 1.0
+        if not math.isfinite(route_scale) or route_scale <= 0:
+            raise ValueError(f"{architecture} GGUF has invalid normalization or routing scale")
 
     actual = {
         name: tuple(int(dimension) for dimension in shape)

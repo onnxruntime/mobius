@@ -3463,7 +3463,7 @@ class TestBuildQuantizedGguf:
             assert f"{stem}.bias" in names
             end = offset + rows
             expected_weight = fused_weight[offset:end]
-            if heads is not None:
+            if heads is not None and architecture != "dots1":
                 expected_weight = _reverse_permute(expected_weight, heads)
             if projection_quantization == "f32":
                 actual_weight = (
@@ -3476,7 +3476,7 @@ class TestBuildQuantizedGguf:
             if fused_scales is not None and fused_zero_points is not None:
                 expected_scales = fused_scales[offset:end]
                 expected_zero_points = fused_zero_points[offset:end]
-                if heads is not None:
+                if heads is not None and architecture != "dots1":
                     expected_scales = _reverse_permute(expected_scales, heads)
                     expected_zero_points = _reverse_permute(expected_zero_points, heads)
                 np.testing.assert_array_equal(

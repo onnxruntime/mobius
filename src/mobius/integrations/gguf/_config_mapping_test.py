@@ -9,6 +9,9 @@ import dataclasses
 
 import pytest
 
+from mobius._registry import registry
+from mobius.components import MLP
+
 
 class _FakeDenseGGUF:
     def __init__(self, architecture: str, metadata: dict, tensor_names: list[str]):
@@ -1049,6 +1052,133 @@ class TestConventionalSharedMoeConfig:
             _FakeDenseGGUF("dots1", metadata, ["output.weight"])
         )
         assert config_without_bias.use_expert_bias is False
+
+    @pytest.mark.parametrize("architecture", ["deepseek", "dots1"])
+    @pytest.mark.parametrize("expert_metadata", ["absent", "zero"])
+    def test_all_dense_schedule_does_not_require_active_experts(
+        self, architecture: str, expert_metadata: str
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata[f"{architecture}.leading_dense_block_count"] = metadata[
+            f"{architecture}.block_count"
+        ]
+        for suffix in (
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+        ):
+            key = f"{architecture}.{suffix}"
+            if expert_metadata == "absent":
+                metadata.pop(key)
+            else:
+                metadata[key] = 0
+        config = gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+
+        assert config.first_k_dense_replace == config.num_hidden_layers
+        assert config.num_local_experts is None
+        assert config.num_experts_per_tok is None
+        assert config.moe_intermediate_size is None
+        assert config.n_shared_experts is None
+        module = registry.get(config.model_type)(config)
+        assert all(isinstance(layer.mlp, MLP) for layer in module.model.layers)
+
+    @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+    @pytest.mark.parametrize("scaling_type", ["linear", "dynamic", "longrope", "unknown"])
+    def test_unsupported_rope_scaling_fails_closed(
+        self, architecture: str, scaling_type: str
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata[f"{architecture}.rope.scaling.type"] = scaling_type
+
+        with pytest.raises(ValueError, match="only unscaled and YaRN RoPE are exact"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+
+    @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+    def test_yarn_rope_scaling_requires_complete_positive_metadata(
+        self, architecture: str
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        if architecture == "bailingmoe":
+            metadata["bailingmoe.leading_dense_block_count"] = 0
+        metadata[f"{architecture}.rope.scaling.type"] = "yarn"
+        metadata[f"{architecture}.rope.scaling.factor"] = 4.0
+
+        with pytest.raises(ValueError, match="missing required metadata"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+
+        metadata[f"{architecture}.rope.scaling.original_context_length"] = 4096
+        config = gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+        assert config.rope_type == "yarn"
+        assert config.rope_scaling == {
+            "type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+        }
+
+    @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+    @pytest.mark.parametrize(
+        ("suffix", "value"),
+        [
+            ("factor", 0.0),
+            ("factor", float("nan")),
+            ("original_context_length", 0),
+        ],
+    )
+    def test_yarn_rope_scaling_rejects_nonpositive_or_nonfinite_values(
+        self, architecture: str, suffix: str, value: float
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata.update(
+            {
+                f"{architecture}.rope.scaling.type": "yarn",
+                f"{architecture}.rope.scaling.factor": 4.0,
+                f"{architecture}.rope.scaling.original_context_length": 4096,
+                f"{architecture}.rope.scaling.{suffix}": value,
+            }
+        )
+
+        with pytest.raises(ValueError, match="must be finite and positive"):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
+
+    @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+    @pytest.mark.parametrize(
+        ("suffix", "value"),
+        [
+            ("yarn_beta_fast", 16.0),
+            ("yarn_beta_slow", 2.0),
+            ("attn_factor", 1.1),
+        ],
+    )
+    def test_yarn_rope_scaling_rejects_unsupported_nondefault_parameters(
+        self, architecture: str, suffix: str, value: float
+    ) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata(architecture)
+        metadata.update(
+            {
+                f"{architecture}.rope.scaling.type": "yarn",
+                f"{architecture}.rope.scaling.factor": 4.0,
+                f"{architecture}.rope.scaling.original_context_length": 4096,
+                f"{architecture}.rope.scaling.{suffix}": value,
+            }
+        )
+
+        with pytest.raises(
+            ValueError, match="must retain the supported pinned loader defaults"
+        ):
+            gguf_to_config(_FakeDenseGGUF(architecture, metadata, ["output.weight"]))
 
     @pytest.mark.parametrize("architecture", ["bailingmoe", "dots1"])
     def test_optional_routing_defaults_match_pinned_loader(self, architecture: str) -> None:

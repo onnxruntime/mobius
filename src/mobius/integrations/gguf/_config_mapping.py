@@ -1322,18 +1322,63 @@ def _moe_postprocess(
     return dataclasses.replace(config, **updates)
 
 
+def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str) -> None:
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if scaling_type in (None, "", "none"):
+        return
+    if scaling_type != "yarn":
+        raise ValueError(
+            f"{arch}.rope.scaling.type={scaling_type!r} is unsupported; "
+            "only unscaled and YaRN RoPE are exact for this architecture"
+        )
+
+    required = ("factor", "original_context_length")
+    missing = [
+        f"{arch}.rope.scaling.{suffix}"
+        for suffix in required
+        if f"{arch}.rope.scaling.{suffix}" not in metadata
+    ]
+    if missing:
+        raise ValueError(f"{arch} YaRN scaling is missing required metadata: {missing}")
+
+    positive_values = {
+        "factor": metadata[f"{arch}.rope.scaling.factor"],
+        "original_context_length": metadata[f"{arch}.rope.scaling.original_context_length"],
+        "yarn_beta_fast": metadata.get(f"{arch}.rope.scaling.yarn_beta_fast", 32.0),
+        "yarn_beta_slow": metadata.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0),
+        "attn_factor": metadata.get(f"{arch}.rope.scaling.attn_factor", 1.0),
+    }
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0
+        for value in positive_values.values()
+    ):
+        raise ValueError(f"{arch} YaRN scaling values must be finite and positive")
+    if (
+        not math.isclose(
+            float(positive_values["yarn_beta_fast"]), 32.0, rel_tol=0.0, abs_tol=0.0
+        )
+        or not math.isclose(
+            float(positive_values["yarn_beta_slow"]), 1.0, rel_tol=0.0, abs_tol=0.0
+        )
+        or not math.isclose(
+            float(positive_values["attn_factor"]), 1.0, rel_tol=0.0, abs_tol=0.0
+        )
+    ):
+        raise ValueError(
+            f"{arch} YaRN metadata must retain the supported pinned loader defaults "
+            "yarn_beta_fast=32, yarn_beta_slow=1, and attn_factor=1"
+        )
+
+
 def _conventional_shared_moe_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
     model: Any,
 ) -> ArchitectureConfig:
     """Restore the exact BailingMoE/DeepSeek/Dots1 routed/shared MoE contract."""
-    config = _moe_postprocess(config, metadata, model)
     arch = model.architecture
     names = set(model.tensor_names)
-    assert config.num_local_experts is not None
-    assert config.num_experts_per_tok is not None
-    assert config.moe_intermediate_size is not None
+    _validate_conventional_moe_rope_scaling(metadata, arch)
 
     dense_prefix = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
     if arch == "bailingmoe":
@@ -1349,6 +1394,64 @@ def _conventional_shared_moe_postprocess(
             f"{arch}.leading_dense_block_count must be in [0, "
             f"{config.num_hidden_layers}], got {dense_prefix}"
         )
+    all_dense = dense_prefix == config.num_hidden_layers
+
+    qkv_bias_layers = []
+    for layer in range(config.num_hidden_layers):
+        fused = f"blk.{layer}.attn_qkv.bias" in names
+        split_count = sum(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        if split_count not in (0, 3) or (fused and split_count):
+            raise ValueError(f"{arch} layer {layer} has a partial or ambiguous Q/K/V bias set")
+        qkv_bias_layers.append(fused or split_count == 3)
+    if any(qkv_bias_layers) and not all(qkv_bias_layers):
+        raise ValueError(f"{arch} Q/K/V bias presence must be uniform across all layers")
+
+    common_updates: dict[str, Any] = {
+        "rope_type": config.rope_type or "default",
+        "hidden_act": "silu",
+        "tie_word_embeddings": arch == "deepseek" and "output.weight" not in names,
+        "attn_qkv_bias": all(qkv_bias_layers),
+        "attn_o_bias": False,
+        "mlp_bias": False,
+        "first_k_dense_replace": dense_prefix,
+        "attn_qk_norm": arch == "dots1",
+        "attn_qk_norm_full": False,
+    }
+    if all_dense:
+        return dataclasses.replace(
+            config,
+            **common_updates,
+            num_local_experts=None,
+            num_experts_per_tok=None,
+            moe_intermediate_size=None,
+            n_shared_experts=None,
+            shared_expert_intermediate_size=None,
+            use_expert_bias=False,
+            disable_qmoe=True,
+        )
+
+    routed_suffixes = [
+        "expert_count",
+        "expert_used_count",
+        "expert_feed_forward_length",
+        "expert_shared_count",
+    ]
+    if arch == "dots1":
+        routed_suffixes.append("expert_gating_func")
+    missing_routed_metadata = [
+        f"{arch}.{suffix}" for suffix in routed_suffixes if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_routed_metadata:
+        raise ValueError(
+            f"{arch} routed layers require MoE metadata: {missing_routed_metadata}"
+        )
+
+    config = _moe_postprocess(config, metadata, model)
+    assert config.num_local_experts is not None
+    assert config.num_experts_per_tok is not None
+    assert config.moe_intermediate_size is not None
 
     n_shared = int(metadata[f"{arch}.expert_shared_count"])
     if n_shared <= 0:
@@ -1410,35 +1513,15 @@ def _conventional_shared_moe_postprocess(
             f"got {route_scale!r}"
         )
 
-    qkv_bias_layers = []
-    for layer in range(config.num_hidden_layers):
-        fused = f"blk.{layer}.attn_qkv.bias" in names
-        split_count = sum(
-            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
-        )
-        if split_count not in (0, 3) or (fused and split_count):
-            raise ValueError(f"{arch} layer {layer} has a partial or ambiguous Q/K/V bias set")
-        qkv_bias_layers.append(fused or split_count == 3)
-    if any(qkv_bias_layers) and not all(qkv_bias_layers):
-        raise ValueError(f"{arch} Q/K/V bias presence must be uniform across all layers")
-
     return dataclasses.replace(
         config,
-        rope_type=config.rope_type or "default",
-        hidden_act="silu",
-        tie_word_embeddings=arch == "deepseek" and "output.weight" not in names,
-        attn_qkv_bias=all(qkv_bias_layers),
-        attn_o_bias=False,
-        mlp_bias=False,
-        first_k_dense_replace=dense_prefix,
+        **common_updates,
         n_shared_experts=n_shared,
         shared_expert_intermediate_size=shared_width,
         scoring_func="softmax" if gating == 1 else "sigmoid",
         topk_method="greedy",
         n_group=1,
         topk_group=1,
-        attn_qk_norm=arch == "dots1",
-        attn_qk_norm_full=False,
         use_expert_bias=use_expert_bias,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=route_scale,

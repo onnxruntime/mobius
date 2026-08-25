@@ -179,6 +179,15 @@ def _process_llama(
         state_dict[f"{prefix}.v_proj.{suffix}"] = value
         del state_dict[name]
 
+    gguf_arch = getattr(config, "_gguf_arch", None)
+    spec = try_get_arch_spec(gguf_arch) if gguf_arch is not None else None
+    if not (
+        spec.llama_qk_permute
+        if spec is not None
+        else needs_llama_qk_permute(getattr(config, "model_type", None))
+    ):
+        return state_dict
+
     for name, tensor in state_dict.items():
         if ".q_proj." in name and name.endswith((".weight", ".bias")):
             state_dict[name] = _reverse_permute(tensor, num_heads)

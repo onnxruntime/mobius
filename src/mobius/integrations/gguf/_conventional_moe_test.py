@@ -122,6 +122,14 @@ def _fixture(
     return _FakeGGUF(architecture, metadata, tensors)
 
 
+def test_dots1_preserves_qwen2_qk_layout_while_llama_derived_promotions_permute() -> None:
+    from mobius.integrations.gguf._arch_registry import get_arch_spec
+
+    assert get_arch_spec("dots1").llama_qk_permute is False
+    assert get_arch_spec("bailingmoe").llama_qk_permute is True
+    assert get_arch_spec("deepseek").llama_qk_permute is True
+
+
 @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
 @pytest.mark.parametrize("fused_qkv", [False, True])
 def test_conventional_moe_exact_tensor_closure(architecture: str, fused_qkv: bool) -> None:
@@ -181,8 +189,23 @@ def test_deepseek_allows_tied_output_but_other_promotions_require_head() -> None
 
 
 @pytest.mark.parametrize("architecture", ["deepseek", "dots1"])
-def test_conventional_moe_all_dense_schedule_is_valid(architecture: str) -> None:
+@pytest.mark.parametrize("expert_metadata", ["absent", "zero"])
+def test_conventional_moe_all_dense_schedule_is_valid_without_active_experts(
+    architecture: str, expert_metadata: str
+) -> None:
     model = _fixture(architecture, dense_prefix=2)
+    suffixes = (
+        "expert_count",
+        "expert_used_count",
+        "expert_feed_forward_length",
+        "expert_shared_count",
+    )
+    for suffix in suffixes:
+        key = f"{architecture}.{suffix}"
+        if expert_metadata == "absent":
+            model.metadata.pop(key)
+        else:
+            model.metadata[key] = 0
 
     _raise_for_invalid_conventional_moe_tensor_contract(model)
 
@@ -198,20 +221,34 @@ def test_conventional_moe_rejects_dense_prefix_outside_layer_range(
         _raise_for_invalid_conventional_moe_tensor_contract(model)
 
 
-@pytest.mark.parametrize(
-    ("metadata_key", "value"),
-    [
-        ("dots1.attention.head_count_kv", 1),
-        ("dots1.rope.dimension_count", 2),
-    ],
-)
+@pytest.mark.parametrize("metadata_key", ["dots1.attention.head_count_kv"])
 def test_dots1_rejects_non_authoritative_attention_geometry(
-    metadata_key: str, value: int
+    metadata_key: str,
 ) -> None:
     model = _fixture("dots1")
-    model.metadata[metadata_key] = value
+    model.metadata[metadata_key] = 1
 
     with pytest.raises(ValueError, match="invalid attention geometry"):
+        _raise_for_invalid_conventional_moe_tensor_contract(model)
+
+
+@pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+def test_conventional_moe_rejects_partial_rope(architecture: str) -> None:
+    model = _fixture(architecture)
+    model.metadata[f"{architecture}.rope.dimension_count"] = 2
+
+    with pytest.raises(ValueError, match="invalid attention geometry"):
+        _raise_for_invalid_conventional_moe_tensor_contract(model)
+
+
+@pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek", "dots1"])
+def test_conventional_moe_tensor_contract_rejects_unsupported_rope_scaling(
+    architecture: str,
+) -> None:
+    model = _fixture(architecture)
+    model.metadata[f"{architecture}.rope.scaling.type"] = "linear"
+
+    with pytest.raises(ValueError, match="only unscaled and YaRN RoPE are exact"):
         _raise_for_invalid_conventional_moe_tensor_contract(model)
 
 

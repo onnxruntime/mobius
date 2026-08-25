@@ -222,6 +222,27 @@ class TestProcessTensorsLlama:
         for model_type in ("olmo2", "cohere2", "exaone", "dream"):
             assert not needs_llama_qk_permute(model_type)
 
+    def test_dots1_qwen2_qk_values_remain_in_checkpoint_order(self) -> None:
+        config = self._make_config(model_type="dots1", num_heads=4, num_kv_heads=4)
+        config._gguf_arch = "dots1"
+        config.head_dim = 16
+        fused_qkv = torch.arange(192 * 8, dtype=torch.float32).reshape(192, 8)
+
+        result = process_tensors(
+            {"model.layers.0.self_attn.qkv_proj.weight": fused_qkv},
+            config,
+        )
+
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"], fused_qkv[:64]
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.k_proj.weight"], fused_qkv[64:128]
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.v_proj.weight"], fused_qkv[128:]
+        )
+
     def test_reverse_matches_hf_reference_head_dim_64(self) -> None:
         """Reverse permute must match HF's reference for real head dims.
 
