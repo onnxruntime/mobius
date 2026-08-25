@@ -1026,6 +1026,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     # --- Mixture of Experts ---
     "mixtral": "mistralai/Mixtral-8x7B-v0.1",
     "phimoe": "microsoft/Phi-tiny-MoE-instruct",
+    "phimoe_gguf": "microsoft/Phi-tiny-MoE-instruct",
     "qwen2_moe": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_5_moe": "Qwen/Qwen3.5-MoE-A3B-128K",
