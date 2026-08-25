@@ -374,9 +374,7 @@ def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
     # every other sidecar retains the stronger identity binding below.
     legacy_gemma3 = (
         _canonical_text_architecture(text_gguf.architecture) == "gemma3"
-        and projector_type_for_modality(
-            mmproj_gguf.metadata, MMProjModality.VISION
-        )
+        and projector_type_for_modality(mmproj_gguf.metadata, MMProjModality.VISION)
         == "gemma3"
         and "general.name" not in mmproj_gguf.metadata
     )
@@ -710,9 +708,7 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
             "mm.soft_emb_norm.weight",
         ):
             _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
-        _expect_mmproj_shape(
-            mmproj_gguf, "mm.input_projection.weight", (hidden, projection)
-        )
+        _expect_mmproj_shape(mmproj_gguf, "mm.input_projection.weight", (hidden, projection))
         for layer in range(layers):
             prefix = f"v.blk.{layer}."
             for stem in ("ln1", "ln2"):
@@ -721,16 +717,12 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
             for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
                 _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
                 _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
-            # llama.cpp stores these matrices in inference orientation. The
-            # loader transposes them into HF Linear [out, in] orientation.
-            _expect_mmproj_shape(
-                mmproj_gguf, prefix + "ffn_up.weight", (hidden, intermediate)
-            )
-            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (intermediate,))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.weight", (hidden, intermediate))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (hidden,))
             _expect_mmproj_shape(
                 mmproj_gguf, prefix + "ffn_down.weight", (intermediate, hidden)
             )
-            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (intermediate,))
         return
 
     if spec.projector_type == "gemma4v":
@@ -1158,9 +1150,10 @@ def _mmproj_gemma3_vision_to_hf(mmproj_gguf: Any) -> dict:
         if hf_name is None:
             continue
         values = np.array(mmproj_gguf.get_tensor(name)).astype(np.float32)
-        if name.endswith(("ffn_up.weight", "ffn_down.weight")):
-            values = values.T
-        state_dict[hf_name] = torch.from_numpy(values.copy())
+        if name == "mm.soft_emb_norm.weight":
+            # llama.cpp bakes OffsetRMSNorm's +1 into GGUF norm scales.
+            values = values - 1.0
+        state_dict[hf_name] = torch.from_numpy(values)
     return state_dict
 
 
@@ -1293,9 +1286,7 @@ def build_gemma3_vlm_from_gguf(
     )
 
     if preserve_quantization:
-        text_state = _load_quantized_state_dict(
-            text_gguf, "gemma3", module.decoder, config
-        )
+        text_state = _load_quantized_state_dict(text_gguf, "gemma3", module.decoder, config)
     else:
         text_state = _load_dequantized_state_dict(text_gguf, "gemma3")
     float_state = {
@@ -1304,7 +1295,9 @@ def build_gemma3_vlm_from_gguf(
         if not key.endswith((".scales", ".zero_points", ".qweight"))
         and value.dtype != torch.uint8
     }
-    retained_state = {key: value for key, value in text_state.items() if key not in float_state}
+    retained_state = {
+        key: value for key, value in text_state.items() if key not in float_state
+    }
     config._gguf_arch = text_gguf.architecture
     float_state = _normalize_gguf_weights(process_tensors(float_state, config))
     text_state = {**float_state, **retained_state}

@@ -103,9 +103,13 @@ def test_registry_and_verdict_views_are_immutable() -> None:
 
 
 def test_graph_import_is_conservative_and_artifact_backed() -> None:
-    assert supported_projector_types() == ("gemma4v", "muse-glimmer")
+    assert supported_projector_types() == ("gemma3", "gemma4v", "muse-glimmer")
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
-    assert set(pins) == {"gemma4-e2b-f16", "muse-glimmer-30b-bf16"}
+    assert set(pins) == {
+        "gemma3-4b-f16",
+        "gemma4-e2b-f16",
+        "muse-glimmer-30b-bf16",
+    }
     for projector_type in supported_projector_types():
         spec = get_projector_spec(projector_type)
         assert spec.is_importable
@@ -114,6 +118,19 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         assert spec.real_artifact_ids
         assert all(artifact_id in pins for artifact_id in spec.real_artifact_ids)
         assert all(pins[artifact_id].parity_test for artifact_id in spec.real_artifact_ids)
+
+
+def test_gemma3_real_artifact_pin_matches_huggingface_api_metadata() -> None:
+    pin = next(pin for pin in MMPROJ_ARTIFACT_PINS if pin.artifact_id == "gemma3-4b-f16")
+    assert pin.repository == "ggml-org/gemma-3-4b-it-GGUF"
+    assert pin.revision == "ab31416aceb30cd095cb34cc27eea120940964e4"
+    assert pin.filename == "mmproj-model-f16.gguf"
+    assert pin.size == 851_251_104
+    assert pin.lfs_sha256 == (
+        "8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb"
+    )
+    assert pin.tensor_qtypes == (("F32", 276), ("F16", 163))
+    assert pin.tensor_count == 439
 
 
 def test_vlm_text_cohort_records_exact_companion_identity_without_support_claims() -> None:

@@ -17,7 +17,7 @@ from mobius import build_from_gguf
 |---|---:|---|
 | Architectures | 147 | graph verdicts: {'deferred': 85, 'rejected': 2, 'supported': 60}; importable: 58; quantized import: {'rejected': 11, 'supported': 136}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
-| Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
+| Serialized projector strings | 60 | {'graph-importable': 3, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
 
 `SUPPORTED` means the named capability is implemented and mechanically tested. `DEFERRED` means it is intentionally unavailable pending the stated work. `REJECTED` means the input or route is invalid by policy. Graph support proves construction/execution only; runtime support additionally requires a pinned real artifact, independent parity, and deterministic generation or stateful semantics. Tokenizer `copy` delegates algorithm semantics to an embedded, vocabulary-identical tokenizer JSON. A `pinned-source` route additionally binds an immutable Hub revision, exact asset hashes, and all reconstructible GGUF tokenizer semantics.
@@ -386,7 +386,7 @@ before graph construction or durable output.
 | `gemma` | — | model=`gemma`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `gemma-embedding` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Gemma Embedding is a bidirectional stateless embedding graph with alternating sliding-window attention, four norm sites, sqrt(hidden) embedding scaling, and optional pooling/dense modules. Causal Gemma3 text/VLM tasks expose the wrong ABI. |
 | `gemma2` | — | model=`gemma2`; tensor=`llama`+`gemma2_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
-| `gemma3` | — | model=`gemma3_text`; tensor=`llama`+`gemma3_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
+| `gemma3` | — | model=`gemma3_text`; tensor=`llama`+`gemma3_extras`; mmproj=`gemma3` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `gemma3n` | — | none (fails before config extraction) | exact-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Gemma3n GGUF is the text member of a vision-and-audio package whose gemma3nv and gemma3na clip companions carry distinct encoders and projectors. The text graph's per-layer embeddings, multimodal token replacement, processor assumptions, and package roles have not been validated against those pinned sidecar ABIs. |
 | `gemma4` | — | model=`gemma4_text`; tensor=`llama`+`gemma4_extras`; mmproj=`gemma4` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `gemma4-assistant` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Gemma4 Assistant is a standalone target-coupled model with pre/post projections, masked embeddings, scalar layer scales, its own KV cache, and a live target-model context. It is neither Gemma4 text nor the target-config-only draft/MTP ABI. |
@@ -1119,12 +1119,12 @@ VLM graph owns their serialized contract:
   similarly named registrations remain valid for Hugging Face builds but are not
   reused as GGUF aliases.
 
-The existing 60 serialized projector verdicts are unchanged. In particular,
+The registry covers all 60 serialized projector types. In particular,
 `qwen2vl_merger`, `qwen2.5vl_merger`, `qwen3vl_merger`, `pixtral`, `llama4`,
 `paddleocr`, `cogvlm`, `deepseekocr`, `deepseekocr2`, `hunyuanvl`, `gemma3nv`,
-and `gemma3na` remain deferred. Only the exact `gemma4`+`gemma4v` and
-`muse-glimmer`+`muse-glimmer` pairings are graph-importable; their runtime
-verdicts remain deferred.
+and `gemma3na` remain deferred. Only the exact `gemma3`+`gemma3`,
+`gemma4`+`gemma4v`, and `muse-glimmer`+`muse-glimmer` pairings are
+graph-importable; their runtime verdicts remain deferred.
 
 The vendored census records suffix-exact conditional loader unions for ten
 architectures, including CogVLM visual-expert banks, Gemma3n AltUp/Laurel and
@@ -1180,7 +1180,7 @@ errors rather than silently dropped.
 | `dots3note_v` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | Dots3Note vision pyramid MoE is not implemented. |
 | `dots_ocr` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | DotsOCR vision merger is not implemented. |
 | `exaone4_5` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | EXAONE 4.5 vision merger is not implemented. |
-| `gemma3` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | Gemma3 mmproj feature selection and projector tensor map are not implemented. |
+| `gemma3` | vision | `gemma3` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3-4b-f16` |
 | `gemma3na` | audio | `gemma3n` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | Gemma3n audio sidecar routing is not implemented. |
 | `gemma3nv` | vision | `gemma3n` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | Gemma3n vision sidecar routing is not implemented. |
 | `gemma4a` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | The sidecar carries a.pre_encode tensors that the current audio map drops, and independent Conformer parity is not established. |

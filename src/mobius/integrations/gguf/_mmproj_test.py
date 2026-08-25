@@ -169,6 +169,60 @@ def _write_clip_mmproj_gguf(
     writer.close()
 
 
+def _write_gemma3_mmproj_gguf(
+    path: Path,
+    *,
+    extra_tensor: str | None = None,
+) -> None:
+    """Write the exact 1-block Gemma3 closure in llama.cpp orientation."""
+    from gguf import GGUFWriter
+
+    hidden = _VISION_HIDDEN
+    intermediate = _VISION_FFN
+    writer = GGUFWriter(str(path), "clip")
+    writer.add_string("clip.projector_type", "gemma3")
+    writer.add_bool("clip.has_vision_encoder", True)
+    writer.add_uint32("clip.vision.embedding_length", hidden)
+    writer.add_uint32("clip.vision.feed_forward_length", intermediate)
+    writer.add_uint32("clip.vision.block_count", 1)
+    writer.add_uint32("clip.vision.attention.head_count", _VISION_HEADS)
+    writer.add_uint32("clip.vision.image_size", _IMAGE_SIZE)
+    writer.add_uint32("clip.vision.patch_size", _PATCH_SIZE)
+    writer.add_uint32("clip.vision.projection_dim", _TEXT_HIDDEN)
+    writer.add_array("clip.vision.image_mean", [0.5, 0.5, 0.5])
+    writer.add_array("clip.vision.image_std", [0.5, 0.5, 0.5])
+    writer.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+
+    def add(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.random.randn(*shape).astype(np.float32))
+
+    add("v.patch_embd.weight", (hidden, 3, _PATCH_SIZE, _PATCH_SIZE))
+    add("v.patch_embd.bias", (hidden,))
+    add("v.position_embd.weight", ((_IMAGE_SIZE // _PATCH_SIZE) ** 2, hidden))
+    add("v.post_ln.weight", (hidden,))
+    add("v.post_ln.bias", (hidden,))
+    add("mm.soft_emb_norm.weight", (hidden,))
+    add("mm.input_projection.weight", (hidden, _TEXT_HIDDEN))
+    prefix = "v.blk.0."
+    for stem in ("ln1", "ln2"):
+        add(prefix + stem + ".weight", (hidden,))
+        add(prefix + stem + ".bias", (hidden,))
+    for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+        add(prefix + stem + ".weight", (hidden, hidden))
+        add(prefix + stem + ".bias", (hidden,))
+    add(prefix + "ffn_down.weight", (intermediate, hidden))
+    add(prefix + "ffn_down.bias", (intermediate,))
+    add(prefix + "ffn_up.weight", (hidden, intermediate))
+    add(prefix + "ffn_up.bias", (hidden,))
+    if extra_tensor is not None:
+        add(extra_tensor, (1,))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_minimal_gguf(
     path: Path,
     architecture: str,
@@ -704,6 +758,104 @@ class TestMultimodalPreflightGuards:
             pytest.raises(NotImplementedError, match="packed Q8_0"),
         ):
             _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+
+class TestGemma3Preflight:
+    def _pair(self, tmp_path: Path, *, extra_tensor: str | None = None):
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        text_path = tmp_path / "gemma3.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_minimal_gguf(text_path, "gemma3")
+        _write_gemma3_mmproj_gguf(mmproj_path, extra_tensor=extra_tensor)
+        return GGUFModel(str(text_path)), GGUFModel(str(mmproj_path))
+
+    def test_exact_tensor_closure_accepts_pinned_legacy_identity(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path)
+        specs = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        assert specs[MMProjModality.VISION].projector_type == "gemma3"
+        assert len(mmproj.tensor_names) == 23
+
+    def test_generic_dispatch_resolves_only_the_exact_gemma3_pair(self):
+        from mobius.integrations.gguf._mmproj import (
+            _resolve_vlm_builder,
+            build_gemma3_vlm_from_gguf,
+        )
+
+        assert _resolve_vlm_builder("gemma3", "gemma3") is build_gemma3_vlm_from_gguf
+        with pytest.raises(ValueError, match="targets"):
+            _resolve_vlm_builder("gemma4", "gemma3")
+
+    def test_exact_tensor_closure_rejects_unknown_tensor(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path, extra_tensor="v.pre_ln.weight")
+        with pytest.raises(ValueError, match=r"outside the pinned.*closure"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    @pytest.mark.parametrize("qtype", ["F32", "F16", "BF16"])
+    def test_float_storage_types_are_accepted(self, tmp_path: Path, qtype: str):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path)
+        with mock.patch.object(
+            mmproj,
+            "get_tensor_type",
+            return_value=SimpleNamespace(name=qtype),
+        ):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_packed_vision_tensor_is_rejected(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
+        from mobius.integrations.gguf._mmproj_registry import MMProjModality
+
+        text, mmproj = self._pair(tmp_path)
+        original = mmproj.get_tensor_type
+        with (
+            mock.patch.object(
+                mmproj,
+                "get_tensor_type",
+                side_effect=lambda name: (
+                    SimpleNamespace(name="Q4_K")
+                    if name == "v.patch_embd.weight"
+                    else original(name)
+                ),
+            ),
+            pytest.raises(NotImplementedError, match="packed Q4_K"),
+        ):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+
+    def test_config_derives_4x4_pool_and_soft_tokens(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import (
+            read_mmproj_gemma3_vision_config,
+        )
+
+        _, mmproj = self._pair(tmp_path)
+        config = read_mmproj_gemma3_vision_config(mmproj)
+        assert config.pooling_kernel_size == 4
+        assert config.mm_tokens_per_image == 1
+        assert config.position_embedding_size == 16
+
+    def test_values_map_without_transpose_and_projector_norm_is_unoffset(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import (
+            _mmproj_gemma3_vision_to_hf,
+        )
+
+        _, mmproj = self._pair(tmp_path)
+        mapped = _mmproj_gemma3_vision_to_hf(mmproj)
+        np.testing.assert_array_equal(
+            mapped["vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight"].numpy(),
+            mmproj.get_tensor("v.blk.0.ffn_down.weight"),
+        )
+        np.testing.assert_allclose(
+            mapped["multi_modal_projector.mm_soft_emb_norm.weight"].numpy(),
+            mmproj.get_tensor("mm.soft_emb_norm.weight") - 1.0,
+        )
 
 
 class TestReadVisionConfig:

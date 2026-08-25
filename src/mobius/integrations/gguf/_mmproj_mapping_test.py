@@ -10,6 +10,7 @@ import pytest
 from mobius.integrations.gguf._mmproj_mapping import (
     is_mmproj_stat_tensor,
     map_mmproj_audio_to_hf,
+    map_mmproj_gemma3_vision_to_hf,
     map_mmproj_vision_to_hf,
 )
 
@@ -125,6 +126,39 @@ class TestVisionMapping:
 
     def test_audio_tensor_not_mapped_by_vision(self):
         assert map_mmproj_vision_to_hf("a.blk.0.attn_q.weight") is None
+
+
+class TestGemma3VisionMapping:
+    @pytest.mark.parametrize(
+        ("gguf_name", "expected"),
+        [
+            (
+                "v.patch_embd.weight",
+                "vision_tower.vision_model.embeddings.patch_embedding.weight",
+            ),
+            (
+                "v.blk.2.attn_out.bias",
+                "vision_tower.vision_model.encoder.layers.2.self_attn.out_proj.bias",
+            ),
+            (
+                "v.blk.4.ffn_up.weight",
+                "vision_tower.vision_model.encoder.layers.4.mlp.fc2.weight",
+            ),
+            (
+                "mm.soft_emb_norm.weight",
+                "multi_modal_projector.mm_soft_emb_norm.weight",
+            ),
+            (
+                "mm.input_projection.weight",
+                "multi_modal_projector.mm_input_projection_weight",
+            ),
+        ],
+    )
+    def test_names_match_gemma3_preprocessor(self, gguf_name: str, expected: str):
+        assert map_mmproj_gemma3_vision_to_hf(gguf_name) == expected
+
+    def test_unknown_tensor_is_not_silently_mapped(self):
+        assert map_mmproj_gemma3_vision_to_hf("v.pre_ln.weight") is None
 
 
 class TestAudioMapping:

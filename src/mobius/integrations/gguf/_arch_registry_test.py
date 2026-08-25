@@ -1505,7 +1505,11 @@ class TestPinnedRemainingVLMTextCohort:
             for spec in iter_arch_specs()
             if spec.vlm_builder is not None
         }
-        assert exact == {"gemma4": "gemma4", "muse-glimmer": "muse_glimmer"}
+        assert exact == {
+            "gemma3": "gemma3",
+            "gemma4": "gemma4",
+            "muse-glimmer": "muse_glimmer",
+        }
 
 
 class TestRejectionsAreActionable:
