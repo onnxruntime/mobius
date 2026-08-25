@@ -2336,6 +2336,7 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 "or both positive"
             )
         dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+        dense_ffn_biases = {"ffn_gate.bias", "ffn_up.bias", "ffn_down.bias"}
         routed_ffn = {
             "ffn_gate_inp.weight",
             "ffn_gate_exps.weight",
@@ -2378,6 +2379,9 @@ def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
                 "rope_freqs.weight",
             },
         }
+        if not num_experts:
+            for optional in optional_by_type.values():
+                optional.update(dense_ffn_biases)
         forbidden_ffn = dense_ffn if num_experts else routed_ffn | shared_ffn
         present_forbidden = sorted(
             f"blk.{index}.{suffix}"

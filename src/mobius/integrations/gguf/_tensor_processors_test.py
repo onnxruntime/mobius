@@ -457,6 +457,42 @@ class TestProcessTensorsMamba:
             torch.tensor([3.0, 4.0]),
         )
 
+    def test_nemotron_h_restores_attention_and_mamba_values(self) -> None:
+        config = SimpleNamespace(
+            model_type="nemotron_h",
+            _gguf_arch="nemotron_h",
+            layer_types=["mamba2", "full_attention"],
+            num_attention_heads=2,
+            num_key_value_heads=1,
+        )
+        q = torch.arange(32, dtype=torch.float32).reshape(8, 4)
+        k = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+
+        def permute(tensor: torch.Tensor, heads: int) -> torch.Tensor:
+            return (
+                tensor.reshape(heads, 2, tensor.shape[0] // heads // 2, *tensor.shape[1:])
+                .swapaxes(1, 2)
+                .reshape(tensor.shape)
+            )
+
+        state_dict = {
+            "backbone.layers.1.mixer.q_proj.weight": permute(q, 2),
+            "backbone.layers.1.mixer.k_proj.weight": permute(k, 1),
+            "backbone.layers.0.mixer.A_log": -torch.exp(torch.tensor([[0.0], [1.0]])),
+            "backbone.layers.0.mixer.D": torch.tensor([[3.0], [4.0]]),
+        }
+
+        result = process_tensors(state_dict, config)
+
+        torch.testing.assert_close(result["backbone.layers.1.mixer.q_proj.weight"], q)
+        torch.testing.assert_close(result["backbone.layers.1.mixer.k_proj.weight"], k)
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.A_log"], torch.tensor([0.0, 1.0])
+        )
+        torch.testing.assert_close(
+            result["backbone.layers.0.mixer.D"], torch.tensor([3.0, 4.0])
+        )
+
     def test_granitehybrid_dense_gate_up_fusion_preserves_order(self) -> None:
         config = SimpleNamespace(
             model_type="granitemoehybrid",
@@ -468,10 +504,14 @@ class TestProcessTensorsMamba:
         )
         gate = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         up = torch.arange(8, 16, dtype=torch.float32).reshape(2, 4)
+        gate_bias = torch.tensor([101.0, 102.0])
+        up_bias = torch.tensor([201.0, 202.0])
         a_log = torch.tensor([[-1.0], [-2.0]])
         state_dict = {
             "model.layers.0.shared_mlp.gate_proj.weight": gate,
             "model.layers.0.shared_mlp.up_proj.weight": up,
+            "model.layers.0.shared_mlp.gate_proj.bias": gate_bias,
+            "model.layers.0.shared_mlp.up_proj.bias": up_bias,
             "model.layers.0.mamba.A_log": a_log,
             "model.layers.0.mamba.D": torch.ones(2, 1),
             "model.layers.0.mamba.norm.weight": torch.ones(1, 4),
@@ -483,6 +523,12 @@ class TestProcessTensorsMamba:
             result["model.layers.0.shared_mlp.input_linear.weight"],
             torch.cat((gate, up), dim=0),
         )
+        torch.testing.assert_close(
+            result["model.layers.0.shared_mlp.input_linear.bias"],
+            torch.cat((gate_bias, up_bias), dim=0),
+        )
+        assert "model.layers.0.shared_mlp.gate_proj.bias" not in result
+        assert "model.layers.0.shared_mlp.up_proj.bias" not in result
         torch.testing.assert_close(
             result["model.layers.0.mamba.A_log"], torch.log(-a_log).flatten()
         )
@@ -511,6 +557,32 @@ class TestProcessTensorsMamba:
         assert fused.shape == (2, 4, 4)
         torch.testing.assert_close(fused[:, :2], gate)
         torch.testing.assert_close(fused[:, 2:], up)
+
+    @pytest.mark.parametrize(
+        "state_dict",
+        [
+            {
+                "model.layers.0.shared_mlp.up_proj.bias": torch.ones(2),
+            },
+            {
+                "model.layers.0.block_sparse_moe.gate_proj.weight": torch.ones(2, 3, 4),
+                "model.layers.0.block_sparse_moe.up_proj.weight": torch.ones(2, 4, 4),
+            },
+        ],
+    )
+    def test_granitehybrid_gate_up_fusion_fails_closed(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> None:
+        config = SimpleNamespace(
+            model_type="granitemoehybrid",
+            _gguf_arch="granitehybrid",
+            layer_types=[],
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+
+        with pytest.raises(ValueError, match=r"missing paired|same rank-3 shape"):
+            process_tensors(state_dict, config)
 
 
 class TestProcessTensorsNoop:
