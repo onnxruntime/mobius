@@ -168,7 +168,7 @@ from mobius.models.segformer import SegformerForSemanticSegmentation
 from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
-from mobius.models.t5 import T5ForConditionalGeneration
+from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
@@ -808,6 +808,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
     "switch_transformers": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
     "t5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
+    "t5encoder": ModelRegistration(T5EncoderModel, task="t5-text-encoding"),
     "trocr": ModelRegistration(TrOCRForConditionalGeneration, task="seq2seq"),
     "umt5": ModelRegistration(T5ForConditionalGeneration, task="seq2seq"),
     "xlm-prophetnet": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),

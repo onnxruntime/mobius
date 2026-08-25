@@ -156,6 +156,13 @@ _MAMBA_KEY_MAP = {
     "ssm.time_step_rank": "time_step_rank",
 }
 
+_T5_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.relative_buckets_count": "relative_attention_num_buckets",
+    "decoder_block_count": "num_decoder_layers",
+    "decoder_start_token_id": "decoder_start_token_id",
+}
+
 #: Named architecture-specific key maps that :attr:`GGUFArchitectureSpec.
 #: config_key_map` selects. Every name here must be referenced by a spec and
 #: every name a spec references must exist here; ``_arch_registry_test`` checks
@@ -166,6 +173,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "deepseek4": _DEEPSEEK4_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
         "mamba": _MAMBA_KEY_MAP,
+        "t5": _T5_KEY_MAP,
     }
 )
 
@@ -530,6 +538,8 @@ def gguf_to_config(
         rope_scaling=rope_scaling,
         rms_norm_eps=hf_fields.get("rms_norm_eps", 1e-5),
         hidden_act=hidden_act,
+        pad_token_id=int(metadata.get("tokenizer.ggml.padding_token_id", 0)),
+        eos_token_id=metadata.get("tokenizer.ggml.eos_token_id"),
         tie_word_embeddings=_infer_tie_embeddings(model),
         # Projection biases are not in GGUF metadata; infer from tensor
         # presence. Qwen2/Qwen3 carry Q/K/V biases — omitting them breaks
@@ -539,6 +549,9 @@ def gguf_to_config(
         mlp_bias=_infer_mlp_bias(model),
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
+        num_decoder_layers=hf_fields.get("num_decoder_layers"),
+        decoder_start_token_id=hf_fields.get("decoder_start_token_id"),
+        relative_attention_num_buckets=hf_fields.get("relative_attention_num_buckets", 32),
         # MoE fields (None when not present → non-MoE model)
         num_local_experts=hf_fields.get("num_local_experts"),
         num_experts_per_tok=hf_fields.get("num_experts_per_tok"),
@@ -1372,6 +1385,82 @@ def _validate_encoder_metadata(
         )
 
 
+def _t5_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Apply the pinned llama.cpp T5 defaults and reject unrepresentable variants."""
+    arch = model.architecture
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{arch}.attention.head_count_kv", heads))
+    if heads <= 0 or kv_heads != heads:
+        raise ValueError(
+            f"{arch} requires multi-head attention with head_count_kv == head_count; "
+            f"got {kv_heads} and {heads}"
+        )
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    key_length = int(metadata.get(f"{arch}.attention.key_length", hidden // heads))
+    value_length = int(metadata.get(f"{arch}.attention.value_length", hidden // heads))
+    if key_length <= 0 or value_length != key_length:
+        raise ValueError(
+            f"{arch} requires equal positive attention key/value lengths; "
+            f"got key={key_length}, value={value_length}"
+        )
+    if int(metadata[f"{arch}.feed_forward_length"]) <= 0:
+        raise ValueError(f"{arch}.feed_forward_length must be greater than zero")
+
+    encoder_layers = int(metadata[f"{arch}.block_count"])
+    decoder_layers = (
+        int(metadata.get("t5.decoder_block_count", encoder_layers)) if arch == "t5" else None
+    )
+    names = set(model.tensor_names)
+    encoder_bias_layers = [
+        i for i in range(encoder_layers) if f"enc.blk.{i}.attn_rel_b.weight" in names
+    ]
+    decoder_bias_layers = (
+        [i for i in range(decoder_layers or 0) if f"dec.blk.{i}.attn_rel_b.weight" in names]
+        if arch == "t5"
+        else None
+    )
+    if not encoder_bias_layers or encoder_bias_layers[0] != 0:
+        raise ValueError(f"{arch} GGUF must contain enc.blk.0.attn_rel_b.weight")
+    if arch == "t5" and (not decoder_bias_layers or decoder_bias_layers[0] != 0):
+        raise ValueError("t5 GGUF must contain dec.blk.0.attn_rel_b.weight")
+
+    layer_prefixes = [
+        *(f"enc.blk.{i}" for i in range(encoder_layers)),
+        *(f"dec.blk.{i}" for i in range(decoder_layers or 0)),
+    ]
+    gated = [f"{prefix}.ffn_gate.weight" in names for prefix in layer_prefixes]
+    if any(gated) and not all(gated):
+        raise ValueError(
+            f"{arch} GGUF mixes gated and non-gated FFN layers; one global T5 "
+            "activation contract cannot represent that layout"
+        )
+    is_gated = bool(gated and gated[0])
+    if is_gated:
+        raise ValueError(
+            f"{arch} GGUF gated FFNs are ambiguous: the pinned converter does not "
+            "serialize feed_forward_proj or dense_act_fn, so identical metadata and "
+            "tensor shapes can represent gated-gelu, gated-silu, or other activations. "
+            "Pinned llama.cpp always executes these tensors as tanh-approximate GELU, "
+            "but Mobius cannot prove that this matches the source checkpoint."
+        )
+    return dataclasses.replace(
+        config,
+        head_dim=key_length,
+        num_key_value_heads=heads,
+        num_decoder_layers=decoder_layers,
+        hidden_act="relu",
+        is_gated_act=False,
+        scale_decoder_outputs=False,
+        relative_attention_max_distance=128,
+        encoder_relative_attention_bias_layers=encoder_bias_layers,
+        decoder_relative_attention_bias_layers=decoder_bias_layers,
+    )
+
+
 def _bert_encoder_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -1436,6 +1525,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "mamba2": _mamba2_postprocess,
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
+    "t5": _t5_postprocess,
 }
 
 

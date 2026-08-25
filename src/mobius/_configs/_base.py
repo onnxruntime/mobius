@@ -460,8 +460,11 @@ class ArchitectureConfig(BaseModelConfig):
 
     # Encoder-decoder config
     num_decoder_layers: int | None = None
+    decoder_start_token_id: int | None = None
     relative_attention_num_buckets: int = 32
     relative_attention_max_distance: int = 128
+    encoder_relative_attention_bias_layers: list[int] | None = None
+    decoder_relative_attention_bias_layers: list[int] | None = None
     is_gated_act: bool = False
     scale_decoder_outputs: bool | None = None
 
@@ -1026,11 +1029,18 @@ class ArchitectureConfig(BaseModelConfig):
                 getattr(config, "num_decoder_layers", None)
                 or getattr(config, "decoder_layers", None)
             ),
+            decoder_start_token_id=getattr(config, "decoder_start_token_id", None),
             relative_attention_num_buckets=getattr(
                 config, "relative_attention_num_buckets", 32
             ),
             relative_attention_max_distance=getattr(
                 config, "relative_attention_max_distance", 128
+            ),
+            encoder_relative_attention_bias_layers=getattr(
+                config, "encoder_relative_attention_bias_layers", None
+            ),
+            decoder_relative_attention_bias_layers=getattr(
+                config, "decoder_relative_attention_bias_layers", None
             ),
             is_gated_act=getattr(config, "is_gated_act", False),
             scale_decoder_outputs=getattr(config, "scale_decoder_outputs", None),
@@ -1481,6 +1491,7 @@ class NemotronParseConfig(ArchitectureConfig):
         )
         fields.update(
             model_type="nemotron_parse",
+            decoder_start_token_id=int(getattr(config, "decoder_start_token_id", 2)),
             bos_token_id=getattr(config, "bos_token_id", fields.get("bos_token_id")),
             eos_token_id=getattr(config, "eos_token_id", fields.get("eos_token_id")),
             pad_token_id=getattr(config, "pad_token_id", fields["pad_token_id"]),
@@ -1511,7 +1522,6 @@ class NemotronParseConfig(ArchitectureConfig):
             image_width=image_width,
             vision_max_grid_size=max_resolution // patch_size,
             num_summary_tokens=3,
-            decoder_start_token_id=int(getattr(config, "decoder_start_token_id", 2)),
             scale_embedding=bool(getattr(decoder, "scale_embedding", True)),
             add_final_layer_norm=bool(getattr(decoder, "add_final_layer_norm", True)),
         )

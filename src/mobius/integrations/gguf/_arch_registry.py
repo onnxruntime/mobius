@@ -531,12 +531,43 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     GGUFArchitectureSpec(
         gguf_arch="t5",
         model_type="t5",
-        tensor_map=Support.DEFERRED,
-        quantized_import=Support.REJECTED,
+        tensor_map_recipe=("t5",),
+        config_key_map="t5",
+        config_postprocessor="t5",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "attention.relative_buckets_count",
+        ),
+        runtime=Support.DEFERRED,
         reason=(
-            "T5 is an encoder-decoder with separate enc.*/dec.* tensor namespaces, "
-            "relative attention bias, and cross-attention, none of which the "
-            "decoder-only GGUF tensor mapping models. " + _NO_TENSOR_MAP
+            "Graph import is covered, but no independent full-logit and generation "
+            "parity run has yet validated a pinned real T5 GGUF runtime package."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="t5encoder",
+        model_type="t5encoder",
+        tensor_map_recipe=("t5",),
+        config_key_map="t5",
+        config_postprocessor="t5",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "attention.relative_buckets_count",
+        ),
+        runtime=Support.DEFERRED,
+        reason=(
+            "Encoder hidden-state import is covered, but the pinned real artifact lacks "
+            "independent provenance and full hidden-state parity evidence."
         ),
     ),
     GGUFArchitectureSpec(

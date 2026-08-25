@@ -194,7 +194,8 @@ reason.
 | `smollm3` | — | `smollm3` | supported | supported |
 | `stablelm` | — | `stablelm` | supported | supported |
 | `starcoder2` | — | `starcoder2` | supported | supported |
-| `t5` | — | `t5` | tensor_map deferred | unreachable |
+| `t5` | — | `t5` | runtime deferred | supported |
+| `t5encoder` | — | `t5encoder` | runtime deferred | supported |
 
 <!-- END GGUF SUPPORT MATRIX -->
 
@@ -241,6 +242,48 @@ weight loading, so no independent embedding or reranker-logit parity is claimed.
 EuroBERT, JinaBERT v2/v3, NeoBERT, NomicBERT, and NomicBERT-MoE remain deferred
 because their pinned normalization, ALiBi/RoPE, gated FFN, Q/K norm, or routed
 expert semantics do not match the existing encoder graphs.
+
+### T5 and T5-encoder GGUF contract
+
+`t5` produces separate `encoder` and `decoder` components with masked encoder
+states, decoder self-attention cache, and cross-attention cache. The same decoder
+graph handles prefill (empty cross cache plus encoder states) and decode (populated
+cross cache plus zero-length encoder states). `t5encoder` produces only a `model`
+component with `input_ids` and `attention_mask` inputs and a
+`last_hidden_state` output; it has no decoder, logits, or cache.
+
+The importer preserves unequal encoder/decoder layer counts, head width,
+feed-forward width, RMS-norm epsilon, relative-position buckets, decoder start,
+EOS, and padding token IDs. Layer 0 must own each stack's relative-attention bias;
+later per-layer overrides remain attached to their source layer. Non-gated files
+use ReLU. Gated files are rejected as ambiguous: pinned llama.cpp executes any
+gate tensor through tanh-approximate `LLM_FFN_GELU`/`ggml_geglu_split`, but its
+converter does not serialize `feed_forward_proj` or `dense_act_fn`, so identical
+GGUF metadata and tensor shapes can originate from `gated-gelu`, `gated-silu`,
+or another gated activation. Mixed gated/non-gated layers, GQA, unequal key/value
+widths, fused projections, projection biases, malformed suffixes, and
+`.scale`/`.input_scale` sidecars are rejected before graph construction.
+
+Compatible quantized 2-D projections use `MatMulNBits`. Shared token embeddings
+explicitly dequantize to `Gather`, and relative bias, norms, and other small
+tensors remain float. A `t5encoder` `output.weight` and decoder
+`cross_attn_rel_b.weight` are accepted only with an explicit warning because the
+pinned llama.cpp encoder output and cross-attention graph do not consume them.
+
+Runtime remains **deferred**. The real-file audit pinned these representatives
+before payload download:
+
+| Architecture | GGUF revision and file | Size | LFS SHA-256 | Header evidence |
+|---|---|---:|---|---|
+| T5 | `noumenalabs/t5-small-gguf@222e7698299802b6a592054305063f22759aed0f`<br>`t5-small-f16.gguf` | 122,074,752 | `4331d3b568593e17d0de10c8755705256c2912af4338ecace92fcef0122da646` | 131-tensor full encoder/decoder census; source config/tokenizer `google-t5/t5-small@df1b051c49625cf57a3d0d8d3863ed4d13564fe4` |
+| T5 encoder | `chatpig/t5-base-encoder-gguf@1d307eff4d9de02b9f74cff9a9928187606040ee`<br>`t5base-encoder-q8_0.gguf` | 117,563,552 | `36067e77cb097a99b0a1d47b4e49525c6a0c6c845abb9d22d5798b2633880b54` | 99-tensor encoder census; candidate source config/tokenizer `google-t5/t5-base@a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1`, but conversion provenance is weaker |
+
+Synthetic float and quantized tests cover full hidden states/logits, padding
+masks, save/load, prefill, cached decode, and packed-versus-explicit-dequantized
+parity. They are not independent HuggingFace parity. Full-logit and generated-token
+parity are still required for T5, and independently sourced full encoder-hidden
+parity is still required for T5 encoder, before either runtime verdict can become
+supported.
 
 ### Pure recurrent Mamba evidence
 
