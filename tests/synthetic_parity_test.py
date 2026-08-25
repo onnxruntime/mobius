@@ -548,7 +548,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             i for i, lt in enumerate(layer_types) if lt in ("full_attention", "attention")
         ]
 
-    if hf_model_type == "lfm2":
+    if hf_model_type in {"lfm2", "lfm2_moe"}:
         hf_kwargs["conv_L_cache"] = hf_kwargs.pop("short_conv_kernel", 3)
         hf_kwargs["conv_bias"] = hf_kwargs.pop("short_conv_bias", False)
         hf_kwargs["norm_eps"] = hf_kwargs.pop("rms_norm_eps")
@@ -556,6 +556,8 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "rope_type": "default",
             "rope_theta": 10_000.0,
         }
+        if hf_model_type == "lfm2_moe":
+            hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
 
     # Jamba uses attn_layer_offset/attn_layer_period
     if hf_model_type in ("jamba",) and "layer_types" in hf_kwargs:

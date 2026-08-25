@@ -12,17 +12,19 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig, Lfm2Config
+from mobius._configs import ArchitectureConfig, Lfm2Config, Lfm2MoeConfig
 from mobius.components import (
     MLP,
     Attention,
     Embedding,
     GatedShortConv,
+    MoELayer,
     RMSNorm,
     create_padding_mask,
     initialize_rope,
 )
 from mobius.models.base import CausalLMModel
+from mobius.models.moe import _rename_moe_expert_weights
 
 _ConfigT = TypeVar("_ConfigT", bound=ArchitectureConfig)
 
@@ -140,6 +142,96 @@ class Lfm2DecoderLayer(nn.Module):
         return hidden_states, present_key_value
 
 
+class Lfm2MoETopKGate(nn.Module):
+    """LFM2MoE sigmoid router with selection-only correction bias."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        *,
+        norm_topk_prob: bool,
+        routed_scaling_factor: float,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter([num_experts, hidden_size])
+        self._top_k = top_k
+        self._norm_topk_prob = norm_topk_prob
+        self._routed_scaling_factor = routed_scaling_factor
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        expert_bias: ir.Value | None,
+    ) -> tuple[ir.Value, ir.Value]:
+        router_logits = op.MatMul(hidden_states, op.Transpose(self.weight, perm=[1, 0]))
+        routing_probs = op.Sigmoid(router_logits)
+        selection_scores = routing_probs
+        if expert_bias is not None:
+            # The checkpoint keeps the learned correction bias in fp32. It changes
+            # expert selection but never the probability used to combine experts.
+            selection_scores = op.Add(
+                op.Cast(routing_probs, to=ir.DataType.FLOAT),
+                expert_bias,
+            )
+        _, selected_experts = op.TopK(
+            selection_scores,
+            op.Constant(value_ints=[self._top_k]),
+            axis=-1,
+            _outputs=2,
+        )
+        routing_weights = op.GatherElements(routing_probs, selected_experts, axis=-1)
+        if self._norm_topk_prob:
+            weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
+            routing_weights = op.Div(
+                routing_weights,
+                op.Add(weight_sum, op.CastLike(1e-6, weight_sum)),
+            )
+        if self._routed_scaling_factor != 1.0:  # noqa: RUF069
+            routing_weights = op.Mul(
+                routing_weights,
+                op.CastLike(self._routed_scaling_factor, routing_weights),
+            )
+        return routing_weights, selected_experts
+
+
+class Lfm2MoEFeedForward(MoELayer):
+    """LFM2MoE routed SwiGLU experts with optional selection correction bias."""
+
+    def __init__(self, config: Lfm2MoeConfig):
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        gate = Lfm2MoETopKGate(
+            config.hidden_size,
+            config.num_local_experts,
+            config.num_experts_per_tok,
+            norm_topk_prob=config.norm_topk_prob,
+            routed_scaling_factor=config.routed_scaling_factor,
+        )
+        super().__init__(config, gate=gate)
+        self.expert_bias = (
+            nn.Parameter([config.num_local_experts], dtype=ir.DataType.FLOAT)
+            if config.use_expert_bias
+            else None
+        )
+        if self.expert_bias is not None:
+            self.expert_bias._keep_float32 = True
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        return super().forward(op, hidden_states, self.expert_bias)
+
+
+class Lfm2MoEDecoderLayer(Lfm2DecoderLayer):
+    """LFM2MoE hybrid operator layer with dense-prefix or routed feed-forward."""
+
+    def __init__(self, config: Lfm2MoeConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        if layer_idx >= config.num_dense_layers:
+            self.feed_forward = Lfm2MoEFeedForward(config)
+
+
 class Lfm2TextModel(nn.Module):
     """LFM2 decoder backbone with mixed convolution and full-attention layers."""
 
@@ -197,6 +289,16 @@ class Lfm2TextModel(nn.Module):
         return hidden_states, present_key_values
 
 
+class Lfm2MoETextModel(Lfm2TextModel):
+    """LFM2MoE decoder with the serialized dense-to-expert layer transition."""
+
+    def __init__(self, config: Lfm2MoeConfig):
+        super().__init__(config)
+        self.layers = nn.ModuleList(
+            [Lfm2MoEDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+
+
 class Lfm2CausalLMModel(CausalLMModel):
     """LiquidAI LFM2 causal LM with double-gated short convolutions and QK-norm GQA."""
 
@@ -218,3 +320,27 @@ class Lfm2CausalLMModel(CausalLMModel):
     ) -> dict[str, torch.Tensor]:
         """Map upstream LFM2 projection names to shared mobius components."""
         return super().preprocess_weights(rename_lfm2_weights(state_dict))
+
+
+class Lfm2MoECausalLMModel(CausalLMModel):
+    """LiquidAI LFM2MoE hybrid causal LM with correction-biased sigmoid routing."""
+
+    default_task: str = "hybrid-text-generation"
+    category: str = "Hybrid Convolution+Attention MoE"
+    config_class: type = Lfm2MoeConfig
+
+    def __init__(self, config: Lfm2MoeConfig):
+        config = apply_lfm2_config_defaults(config)
+        super().__init__(config)
+        self.model = Lfm2MoETextModel(config)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
+
+    def preprocess_weights(
+        self,
+        state_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Map dense and routed LFM2MoE weights onto the dedicated graph."""
+        state_dict = rename_lfm2_weights(state_dict)
+        state_dict = _rename_moe_expert_weights(state_dict)
+        return super().preprocess_weights(state_dict)

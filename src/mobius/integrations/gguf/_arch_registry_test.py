@@ -57,7 +57,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 51
+_EXPECTED_SUPPORTED_COUNT = 52
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
@@ -268,6 +268,7 @@ class TestCapabilityClosure:
             "granitehybrid",
             "internlm2",
             "jamba",
+            "lfm2moe",
             "mamba",
             "mamba2",
             "nemotron_h",
@@ -899,14 +900,12 @@ class TestPinnedRemainingHybridCohort:
         "deepseek4",
         "kimi-k3",
         "kimi-linear",
-        "lfm2moe",
     )
     _EXPECTED_TENSOR_COUNTS: ClassVar[dict[str, int]] = {
         "bailingmoe3": 41,
         "deepseek4": 44,
         "kimi-k3": 46,
         "kimi-linear": 40,
-        "lfm2moe": 24,
     }
 
     @pytest.mark.parametrize("architecture", _ARCHITECTURES)
@@ -954,7 +953,6 @@ class TestPinnedRemainingHybridCohort:
             ("deepseek4", ("compressed-cache", "rollback", "ordinary KV")),
             ("kimi-k3", ("matrix state", "latent MoE", "residual banks")),
             ("kimi-linear", ("convolution histories", "matrix state", "correction-bias")),
-            ("lfm2moe", ("rolling convolution", "reorder", "rollback")),
         ],
     )
     def test_state_and_schedule_mismatch_is_explicit(
@@ -964,6 +962,19 @@ class TestPinnedRemainingHybridCohort:
         assert reason is not None
         for term in state_terms:
             assert term in reason
+
+    def test_lfm2moe_graph_and_import_advance_but_runtime_stays_deferred(self) -> None:
+        spec = try_get_arch_spec("lfm2moe")
+        assert spec is not None
+        assert spec.model_type == "lfm2_moe"
+        assert spec.config is Support.SUPPORTED
+        assert spec.tensor_map is Support.SUPPORTED
+        assert spec.graph is Support.SUPPORTED
+        assert spec.runtime is Support.DEFERRED
+        assert spec.quantized_import is Support.REJECTED
+        assert spec.reason is not None
+        assert "representative real-weight GGUF" in spec.reason
+        assert "keep_quantized=False" in spec.reason
 
     def test_hugging_face_deepseek_v4_registration_remains_valid(self) -> None:
         assert "deepseek_v4" in _REGISTRATIONS

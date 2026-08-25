@@ -906,7 +906,7 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
     if architecture in {"jamba", "nemotron_h", "granitehybrid"}:
         _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model)
         return
-    if architecture not in {"lfm2", "qwen35", "qwen35moe", "qwen3next"}:
+    if architecture not in {"lfm2", "lfm2moe", "qwen35", "qwen35moe", "qwen3next"}:
         return
 
     metadata = gguf_model.metadata
@@ -934,7 +934,7 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
                 f"{match.group(1)} (block_count={total_layers})"
             )
 
-    if architecture == "lfm2":
+    if architecture in {"lfm2", "lfm2moe"}:
         required_global = {"token_embd.weight", "token_embd_norm.weight"}
         auxiliary = sorted(
             name
@@ -946,13 +946,7 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
                 "lfm2 causal-LM import does not support embedding/ColBERT head "
                 f"tensor(s): {auxiliary}"
             )
-        common_suffixes = {
-            "attn_norm.weight",
-            "ffn_norm.weight",
-            "ffn_gate.weight",
-            "ffn_up.weight",
-            "ffn_down.weight",
-        }
+        common_suffixes = {"attn_norm.weight", "ffn_norm.weight"}
         full_suffixes = {
             "attn_q.weight",
             "attn_k.weight",
@@ -1019,6 +1013,30 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
         required.update(
             full_suffixes if layer_type == "full_attention" else recurrent_suffixes
         )
+        if architecture == "lfm2":
+            required.update({"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"})
+        elif architecture == "lfm2moe":
+            dense_ffn = {"ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"}
+            routed_ffn = {
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "exp_probs_b.bias",
+            }
+            dense_layers = int(metadata.get("lfm2moe.leading_dense_block_count", 0))
+            if layer < dense_layers:
+                required.update(dense_ffn)
+                wrong_ffn = sorted(layer_names & routed_ffn)
+            else:
+                required.update(routed_ffn)
+                wrong_ffn = sorted(layer_names & dense_ffn)
+            if wrong_ffn:
+                raise ValueError(
+                    f"lfm2moe layer {layer} contains tensor(s) from the wrong "
+                    f"{'routed' if layer < dense_layers else 'dense'} FFN family: "
+                    f"{wrong_ffn}"
+                )
 
         if architecture in {"qwen35moe", "qwen3next"}:
             fused = "ffn_gate_up_exps.weight" in layer_names
@@ -1062,7 +1080,7 @@ def _raise_for_invalid_hybrid_tensor_contract(gguf_model) -> None:
                 required.update(
                     {"attn_qkv.weight", "attn_gate.weight"} if modern else {"ssm_in.weight"}
                 )
-            elif architecture != "lfm2":
+            elif architecture not in {"lfm2", "lfm2moe"}:
                 required.update({"attn_qkv.weight", "attn_gate.weight"})
 
         missing = sorted(required - layer_names)
@@ -2070,6 +2088,7 @@ def build_from_gguf(
         )
     if gguf_arch in {
         "lfm2",
+        "lfm2moe",
         "qwen35",
         "qwen35moe",
         "qwen3next",
@@ -2753,28 +2772,42 @@ def _normalize_gguf_weights(
         # Fused stacked gate/up experts [num_experts, 2*out, ...] are split
         # before ordinary stacked-expert unpacking. This handles float weights
         # and packed MatMulNBits companions without dropping either half.
-        fused_marker = ".mlp.experts.gate_up_proj."
-        if fused_marker in key and value.dim() >= 3:
+        fused_marker = next(
+            (
+                marker
+                for marker in (
+                    ".mlp.experts.gate_up_proj.",
+                    ".feed_forward.experts.gate_up_proj.",
+                )
+                if marker in key
+            ),
+            None,
+        )
+        if fused_marker is not None and value.dim() >= 3:
             prefix, suffix = key.rsplit(fused_marker, 1)
+            container = fused_marker.removesuffix(".gate_up_proj.")
             if value.shape[1] % 2:
                 raise ValueError(
                     f"Fused expert tensor {key!r} has odd gate/up width {value.shape[1]}"
                 )
             gate, up = value.chunk(2, dim=1)
             for i in range(value.shape[0]):
-                result[f"{prefix}.mlp.experts.{i}.gate_proj.{suffix}"] = gate[i]
-                result[f"{prefix}.mlp.experts.{i}.up_proj.{suffix}"] = up[i]
+                result[f"{prefix}{container}.{i}.gate_proj.{suffix}"] = gate[i]
+                result[f"{prefix}{container}.{i}.up_proj.{suffix}"] = up[i]
             continue
 
         # Stacked expert weights [num_experts, out, ...] → per-expert.
         unpacked = False
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            marker = f".mlp.experts.{proj}."
-            if marker in key and value.dim() >= 3:
-                prefix, suffix = key.rsplit(marker, 1)
-                for i in range(value.shape[0]):
-                    result[f"{prefix}.mlp.experts.{i}.{proj}.{suffix}"] = value[i]
-                unpacked = True
+            for container in (".mlp.experts", ".feed_forward.experts"):
+                marker = f"{container}.{proj}."
+                if marker in key and value.dim() >= 3:
+                    prefix, suffix = key.rsplit(marker, 1)
+                    for i in range(value.shape[0]):
+                        result[f"{prefix}{container}.{i}.{proj}.{suffix}"] = value[i]
+                    unpacked = True
+                    break
+            if unpacked:
                 break
         if unpacked:
             continue
@@ -3960,8 +3993,12 @@ def _validate_moe_weight_shape(
     if num_experts is None:
         return
     expert_size = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
-    if ".mlp.experts." in name:
-        projection = name.rsplit(".mlp.experts.", 1)[1].split(".", 1)[0]
+    expert_marker = next(
+        (marker for marker in (".mlp.experts.", ".feed_forward.experts.") if marker in name),
+        None,
+    )
+    if expert_marker is not None:
+        projection = name.rsplit(expert_marker, 1)[1].split(".", 1)[0]
         if projection not in {"gate_proj", "up_proj", "down_proj"}:
             return
         expected = (
@@ -3973,7 +4010,7 @@ def _validate_moe_weight_shape(
             raise ValueError(
                 f"Invalid stacked expert shape for {name}: expected {expected}, got {shape}"
             )
-    elif name.endswith(".mlp.gate.weight"):
+    elif name.endswith((".mlp.gate.weight", ".feed_forward.gate.weight")):
         expected = (num_experts, config.hidden_size)
         if shape != expected:
             raise ValueError(

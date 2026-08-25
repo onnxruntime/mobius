@@ -1605,6 +1605,23 @@ class Lfm2Config(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class Lfm2MoeConfig(CausalLMConfig):
+    """Configuration for LFM2MoE's dense-prefix and routed-expert feed-forwards."""
+
+    num_dense_layers: int = 2
+    use_expert_bias: bool = True
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Lfm2MoeConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        return cls(
+            **_shallow_fields(base),
+            num_dense_layers=getattr(config, "num_dense_layers", 2),
+            use_expert_bias=getattr(config, "use_expert_bias", True),
+        )
+
+
+@dataclasses.dataclass
 class Lfm2VlConfig(Lfm2Config):
     """Configuration for LiquidAI LFM2-VL (SigLIP2 NaFlex + LFM2 decoder).
 

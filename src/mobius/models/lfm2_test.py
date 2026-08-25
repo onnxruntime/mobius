@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import onnx_ir as ir
 
 from mobius import build_from_module
-from mobius._configs import Lfm2Config
+from mobius._configs import Lfm2Config, Lfm2MoeConfig
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius._registry import registry
-from mobius.models.lfm2 import Lfm2CausalLMModel
+from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 
 
 def _hf_config(**overrides):
@@ -107,4 +108,44 @@ def test_cuda_graph_uses_lfm2_fusions():
     assert remaining_norms
     assert all(
         node.attributes.get_int("stash_type") == ir.DataType.FLOAT for node in remaining_norms
+    )
+
+
+def test_lfm2moe_fp16_keeps_selection_bias_and_scores_in_float32():
+    config = Lfm2MoeConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        num_dense_layers=1,
+        vocab_size=256,
+        max_position_embeddings=128,
+        head_dim=16,
+        layer_types=["conv", "full_attention"],
+        short_conv_kernel=3,
+        rope_type="default",
+        rope_theta=10_000.0,
+        dtype=ir.DataType.FLOAT16,
+    )
+    model = build_from_module(
+        Lfm2MoECausalLMModel(config),
+        config,
+        task="hybrid-text-generation",
+    )["model"]
+    SymbolicShapeInferencePass()(model)
+
+    bias_name = "model.layers.1.feed_forward.expert_bias"
+    assert model.graph.initializers[bias_name].dtype == ir.DataType.FLOAT
+    selection_add = next(
+        node
+        for node in model.graph
+        if node.op_type == "Add"
+        and any(value is not None and value.name == bias_name for value in node.inputs)
+    )
+    assert all(
+        value is None or value.dtype == ir.DataType.FLOAT for value in selection_add.inputs
     )
