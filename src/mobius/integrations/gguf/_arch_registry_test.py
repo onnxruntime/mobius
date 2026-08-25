@@ -714,6 +714,183 @@ class TestPinnedRemainingHybridCohort:
         assert try_get_arch_spec("deepseek4").model_type is None
 
 
+class TestPinnedRemainingConventionalMoECohort:
+    """Pin the bounded C02 closure without aliasing incompatible MoE graphs."""
+
+    _ARCHITECTURES = (
+        "arctic",
+        "dbrx",
+        "gpt-oss",
+        "grok",
+        "grovemoe",
+        "smallthinker",
+    )
+    _EXPECTED_TENSOR_COUNTS: ClassVar[dict[str, int]] = {
+        "arctic": 22,
+        "dbrx": 11,
+        "gpt-oss": 24,
+        "grok": 24,
+        "grovemoe": 23,
+        "smallthinker": 18,
+    }
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_loader_inventory_and_expert_sidecars_are_suffix_exact(
+        self, architecture: str
+    ) -> None:
+        upstream = upstream_architectures()[architecture]
+        names = set(upstream.tensor_names)
+        assert len(names) == self._EXPECTED_TENSOR_COUNTS[architecture]
+        assert upstream.expert_tensor_suffixes == ()
+        suffixes = dict(upstream.tensor_suffixes)
+        expected_families = {
+            "output",
+            "blk.{bid}.attn_qkv",
+            "blk.{bid}.attn_output",
+            "blk.{bid}.ffn_gate_exps",
+            "blk.{bid}.ffn_down_exps",
+            "blk.{bid}.ffn_up_exps",
+        }
+        if architecture != "dbrx":
+            expected_families.update(
+                {
+                    "blk.{bid}.attn_q",
+                    "blk.{bid}.attn_k",
+                    "blk.{bid}.attn_v",
+                }
+            )
+        if architecture in {"arctic", "grok"}:
+            expected_families.update(
+                {
+                    "blk.{bid}.ffn_gate",
+                    "blk.{bid}.ffn_down",
+                    "blk.{bid}.ffn_up",
+                }
+            )
+        if architecture == "grovemoe":
+            expected_families.update(
+                {
+                    "blk.{bid}.ffn_gate_chexps",
+                    "blk.{bid}.ffn_down_chexps",
+                    "blk.{bid}.ffn_up_chexps",
+                }
+            )
+        assert set(suffixes) == expected_families
+        projection_suffixes = ("weight", "scale", "input_scale")
+        biased_projection_suffixes = ("weight", "bias", "scale", "input_scale")
+        assert suffixes["blk.{bid}.attn_qkv"] == (
+            projection_suffixes if architecture == "dbrx" else biased_projection_suffixes
+        )
+        for family in ("blk.{bid}.attn_q", "blk.{bid}.attn_k", "blk.{bid}.attn_v"):
+            if architecture != "dbrx":
+                assert suffixes[family] == biased_projection_suffixes
+        assert suffixes["blk.{bid}.attn_output"] == (
+            biased_projection_suffixes if architecture == "gpt-oss" else projection_suffixes
+        )
+        for family in (
+            "blk.{bid}.ffn_gate_exps",
+            "blk.{bid}.ffn_down_exps",
+            "blk.{bid}.ffn_up_exps",
+        ):
+            expected = (
+                biased_projection_suffixes
+                if architecture == "gpt-oss"
+                else projection_suffixes
+            )
+            assert suffixes[family] == expected
+        assert suffixes["output"] == projection_suffixes
+        assert all(name.endswith((".weight", ".bias")) for name in names)
+        assert {
+            "blk.{bid}.ffn_gate_exps.weight",
+            "blk.{bid}.ffn_down_exps.weight",
+            "blk.{bid}.ffn_up_exps.weight",
+        } <= names
+
+    def test_conditional_and_auxiliary_representations_are_not_conflated(self) -> None:
+        arctic = set(upstream_architectures()["arctic"].tensor_names)
+        dbrx = set(upstream_architectures()["dbrx"].tensor_names)
+        gpt_oss = set(upstream_architectures()["gpt-oss"].tensor_names)
+        grok = set(upstream_architectures()["grok"].tensor_names)
+        grove = set(upstream_architectures()["grovemoe"].tensor_names)
+        small = set(upstream_architectures()["smallthinker"].tensor_names)
+
+        assert "blk.{bid}.ffn_norm_exps.weight" in arctic
+        assert "blk.{bid}.attn_qkv.weight" in dbrx
+        assert not {"blk.{bid}.attn_q.weight", "blk.{bid}.attn_k.weight"} & dbrx
+        for names in (arctic, gpt_oss, grok, grove, small):
+            assert {
+                "blk.{bid}.attn_qkv.weight",
+                "blk.{bid}.attn_qkv.bias",
+                "blk.{bid}.attn_q.weight",
+                "blk.{bid}.attn_q.bias",
+                "blk.{bid}.attn_k.weight",
+                "blk.{bid}.attn_k.bias",
+                "blk.{bid}.attn_v.weight",
+                "blk.{bid}.attn_v.bias",
+            } <= names
+        assert "blk.{bid}.attn_sinks.weight" in gpt_oss
+        assert "blk.{bid}.ffn_gate_exps.bias" in gpt_oss
+        assert {
+            "blk.{bid}.layer_output_norm.weight",
+            "blk.{bid}.post_ffw_norm.weight",
+        } <= grok
+        assert {
+            "blk.{bid}.ffn_gate_chexps.weight",
+            "blk.{bid}.ffn_down_chexps.weight",
+            "blk.{bid}.ffn_up_chexps.weight",
+        } <= grove
+        grove_suffixes = dict(upstream_architectures()["grovemoe"].tensor_suffixes)
+        assert grove_suffixes["blk.{bid}.ffn_gate_chexps"] == ("weight",)
+        assert grove_suffixes["blk.{bid}.ffn_down_chexps"] == ("weight",)
+        assert grove_suffixes["blk.{bid}.ffn_up_chexps"] == ("weight",)
+        assert not any("_chexps." in name for name in small)
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_no_false_alias_config_or_tensor_claim_is_reachable(
+        self, architecture: str
+    ) -> None:
+        spec = try_get_arch_spec(architecture)
+        assert spec is not None
+        assert not spec.aliases
+        assert spec.model_type is None
+        assert spec.config_key_map is None
+        assert spec.tensor_map_recipe == ()
+        assert all(verdict is Support.DEFERRED for verdict in spec.verdicts.values())
+        assert architecture not in GGUF_ARCH_TO_MODEL_TYPE
+
+    @pytest.mark.parametrize(
+        ("architecture", "reason_terms"),
+        [
+            ("arctic", ("dense parallel", "separately normalized", "residual topology")),
+            ("dbrx", ("LayerNorm", "fused QKV", "clamp")),
+            ("gpt-oss", ("MXFP4", "expert biases", "attention sinks")),
+            ("grok", ("softcaps", "sqrt(2)/2", "dense-plus-routed")),
+            ("grovemoe", ("separate selections", "adjugate", "Q/K RMSNorm")),
+            ("smallthinker", ("unnormalized", "sigmoid or softmax", "ReLU")),
+        ],
+    )
+    def test_graph_and_routing_mismatch_is_explicit(
+        self, architecture: str, reason_terms: tuple[str, ...]
+    ) -> None:
+        reason = try_get_arch_spec(architecture).reason
+        assert reason is not None
+        for term in reason_terms:
+            assert term in reason
+
+    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    def test_every_architecture_fails_before_graph_construction(
+        self, architecture: str
+    ) -> None:
+        with pytest.raises(UnsupportedGGUFArchitectureError, match=architecture):
+            get_arch_spec(architecture)
+
+    def test_valid_hugging_face_registrations_are_not_reused_as_gguf_aliases(self) -> None:
+        assert {"arctic", "dbrx", "gpt_oss"} <= set(_REGISTRATIONS)
+        assert try_get_arch_spec("arctic").model_type is None
+        assert try_get_arch_spec("dbrx").model_type is None
+        assert try_get_arch_spec("gpt-oss").model_type is None
+
+
 class TestRejectionsAreActionable:
     """An unsupported input must say what it is and what to do instead."""
 

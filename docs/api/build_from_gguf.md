@@ -154,6 +154,7 @@ reason.
 |---|---|---|---|---|
 | `apertus` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `arcee` | — | `arcee` | runtime deferred | supported |
+| `arctic` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `arwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `baichuan` | — | `baichuan` | runtime deferred | supported |
 | `bailingmoe3` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
@@ -162,6 +163,7 @@ reason.
 | `chatglm` | — | `chatglm` | runtime deferred | rejected |
 | `clip` | — | — | config rejected; tensor_map rejected; graph rejected; runtime rejected | unreachable |
 | `cohere2` | — | `cohere2` | runtime deferred | supported |
+| `dbrx` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `deci` | — | `llama` | supported | supported |
 | `deepseek4` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `dflash` | — | `DFlashDraftModel` | runtime deferred | supported |
@@ -176,9 +178,12 @@ reason.
 | `gemma3` | — | `gemma3_text` | supported | supported |
 | `gemma4` | — | `gemma4_text` | supported | supported |
 | `glm-dsa` | `glm_dsa` | `glm_moe_dsa` | tensor_map deferred | unreachable |
+| `gpt-oss` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `gpt2` | — | `gpt2` | supported | supported |
 | `granitehybrid` | — | `granitemoehybrid` | runtime deferred | rejected |
 | `granitemoe` | — | `granitemoe` | runtime deferred | supported |
+| `grok` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
+| `grovemoe` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `hunyuan-dense` | `hunyuan_v1_dense` | `hunyuan_v1_dense` | supported | supported |
 | `internlm2` | — | `internlm2` | supported | rejected |
 | `jamba` | — | `jamba` | runtime deferred | rejected |
@@ -226,6 +231,7 @@ reason.
 | `rwkv6qwen2` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `rwkv7` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `seed_oss` | — | `seed_oss` | runtime deferred | supported |
+| `smallthinker` | — | — | config deferred; tensor_map deferred; graph deferred; runtime deferred | unreachable |
 | `smollm3` | — | `smollm3` | supported | supported |
 | `stablelm` | — | `stablelm` | supported | supported |
 | `starcoder2` | — | `starcoder2` | supported | supported |
@@ -828,6 +834,39 @@ Other C01 candidates remain excluded until their distinct semantics are
 implemented and validated. These include fused/interleaved or dual-form QKV
 (GPT-NeoX and Phi-2), ALiBi (Baichuan and MPT), learned position embeddings
 (StarCoder), and unproven model aliases (Qwen and Command-R).
+
+### Remaining conventional-attention MoE cohort
+
+The next bounded C02 audit covers exactly Arctic, DBRX, GPT-OSS, Grok,
+GroveMoE, and SmallThinker at the pinned llama.cpp commit. All six are
+registered as explicit pre-config deferrals. Existing Hugging Face model
+registrations and similar expert tensor names are deliberately not treated as
+GGUF compatibility evidence.
+
+- Arctic combines a dense parallel SwiGLU branch with a separately normalized
+  routed branch sourced from a different residual.
+- DBRX requires LayerNorm, fused QKV, K/Q/V clamping, and a distinct
+  post-attention normalization point.
+- GPT-OSS requires lossless interleaved gate/up splitting, expert-major MXFP4
+  repacking, expert/router biases, attention sinks, and sliding-window
+  semantics under one ownership contract.
+- Grok combines embedding/attention/logit scales, attention and optional
+  final-logit softcaps, extra norms, and dense-plus-routed residual scaling.
+- GroveMoE shares router logits across normal and grouped chunk-expert banks,
+  performs separate expert selections, and adds a scaled adjugate branch.
+- SmallThinker routes from the unnormalized residual, selects sigmoid or
+  softmax gating from metadata, uses ReLU experts, and has per-layer
+  RoPE/sliding-window scheduling.
+
+The vendored census records every direct loader tensor name, including the
+conditional fused-or-split QKV union and optional biases from the shared loader
+helper, conditional Grok norm spellings, and GPT-OSS expert biases. Per-family
+suffix closure records the generic optional `.scale` and `.input_scale`
+sidecars for output, attention, dense FFN, and standard routed-expert
+projections, while GroveMoE chunk experts are explicitly limited to `.weight`.
+No mapping is installed, so malformed, partial, fused, quantized, or auxiliary
+representations cannot reach config extraction or graph construction. Runtime
+remains deferred by construction.
 
 ## Supported stored quantization types
 
