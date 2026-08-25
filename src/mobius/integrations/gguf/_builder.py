@@ -4310,8 +4310,31 @@ def build_from_gguf(
         task_state = resolved_task
     else:
         task_state = dict(sorted(vars(resolved_task).items()))
+    graph_config_fields = dataclasses.asdict(config)
+    if spec.gguf_arch not in {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "jina-bert-v2",
+    }:
+        # These fields were added for specialized encoder graph variants. Keep
+        # the established route fingerprint byte-identical for every existing
+        # architecture so pinned runtime evidence remains valid.
+        for field_name in (
+            "encoder_use_token_type_embeddings",
+            "encoder_q_bias",
+            "encoder_k_bias",
+            "encoder_v_bias",
+            "encoder_ffn_up_bias",
+            "encoder_ffn_down_bias",
+            "encoder_qk_norm",
+            "encoder_extra_attention_norm",
+            "encoder_fused_geglu",
+            "pooling_type",
+        ):
+            graph_config_fields.pop(field_name, None)
     graph_config = json.dumps(
-        dataclasses.asdict(config),
+        graph_config_fields,
         default=str,
         separators=(",", ":"),
         sort_keys=True,

@@ -135,11 +135,30 @@ class _PackedAttention(nn.Module):
         self.output = Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(self, op, hidden_states, attention_mask, position_embeddings):
-        query, key, value = op.Split(
-            self.qkv(op, hidden_states), axis=-1, num_outputs=3, _outputs=3
+        # NeoBERT packs Q/K/V inside each head: (B, S, N, 3*H), not as
+        # three contiguous model-width regions.
+        packed = op.Reshape(
+            self.qkv(op, hidden_states),
+            [0, 0, self.num_heads, 3 * self.head_dim],
         )
-        query = apply_rotary_pos_emb(op, query, position_embeddings, num_heads=self.num_heads)
-        key = apply_rotary_pos_emb(op, key, position_embeddings, num_heads=self.num_heads)
+        query, key, value = op.Split(packed, axis=-1, num_outputs=3, _outputs=3)
+        query = op.Reshape(query, [0, 0, self.num_heads * self.head_dim])
+        key = op.Reshape(key, [0, 0, self.num_heads * self.head_dim])
+        value = op.Reshape(value, [0, 0, self.num_heads * self.head_dim])
+        query = apply_rotary_pos_emb(
+            op,
+            query,
+            position_embeddings,
+            num_heads=self.num_heads,
+            interleaved=True,
+        )
+        key = apply_rotary_pos_emb(
+            op,
+            key,
+            position_embeddings,
+            num_heads=self.num_heads,
+            interleaved=True,
+        )
         attended = op.Attention(
             query,
             key,
@@ -280,12 +299,14 @@ class _PostNormEncoderLayer(nn.Module):
         if jina and config.encoder_fused_geglu:
             self.mlp = _FusedGatedMLP(
                 config,
-                "gelu",
+                "gelu_pytorch_tanh",
                 up_bias=config.encoder_ffn_up_bias,
                 down_bias=config.encoder_ffn_down_bias,
             )
         else:
-            self.mlp = _ParallelGatedMLP(config, "gelu" if jina else "silu")
+            self.mlp = _ParallelGatedMLP(
+                config, "gelu_pytorch_tanh" if jina else "silu"
+            )
         self.layer_output_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, op, hidden_states, attention_mask, position_embeddings=None):

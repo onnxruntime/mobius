@@ -251,6 +251,49 @@ def test_synthetic_fused_split_values_preserve_gate_up_order() -> None:
     np.testing.assert_allclose(actual, expected)
 
 
+def test_neobert_graph_preserves_per_head_qkv_and_interleaved_rope() -> None:
+    arch = "neo-bert"
+    config = gguf_to_config(_FakeGGUF(arch, _metadata(arch), _tensors(arch)))
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    graph = FeatureExtractionTask().build(module, config)["model"].graph
+
+    attention_splits = [
+        node
+        for node in graph
+        if node.op_type == "Split" and "/attention/" in (node.name or "")
+    ]
+    assert len(attention_splits) == config.num_hidden_layers
+    assert all(node.inputs[0].producer().op_type == "Reshape" for node in attention_splits)
+    rotary_nodes = [node for node in graph if node.op_type == "RotaryEmbedding"]
+    assert len(rotary_nodes) == 2 * config.num_hidden_layers
+    assert all(node.attributes["interleaved"].value == 1 for node in rotary_nodes)
+
+    # A head-interleaved projection must split each head's 3*head_dim chunk.
+    projected = np.arange(24, dtype=np.float32).reshape(1, 1, 2, 12)
+    query, key, value = np.split(projected, 3, axis=-1)
+    np.testing.assert_array_equal(query.reshape(1, 1, 8), [[[*range(4), *range(12, 16)]]])
+    np.testing.assert_array_equal(key.reshape(1, 1, 8), [[[*range(4, 8), *range(16, 20)]]])
+    np.testing.assert_array_equal(value.reshape(1, 1, 8), [[[*range(8, 12), *range(20, 24)]]])
+
+
+def test_jina_uses_tanh_approximate_gelu() -> None:
+    arch = "jina-bert-v2"
+    config = gguf_to_config(_FakeGGUF(arch, _metadata(arch), _tensors(arch)))
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    graph = FeatureExtractionTask().build(module, config)["model"].graph
+    gelu_nodes = [node for node in graph if node.op_type == "Gelu"]
+    assert len(gelu_nodes) == config.num_hidden_layers
+    assert all(node.attributes["approximate"].value == "tanh" for node in gelu_nodes)
+
+
+@pytest.mark.parametrize("arch", ["eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"])
+def test_pooled_specialized_encoder_files_fail_closed(arch: str) -> None:
+    metadata = _metadata(arch)
+    metadata[f"{arch}.pooling_type"] = 1
+    with pytest.raises(ValueError, match="token-level last_hidden_state only"):
+        gguf_to_config(_FakeGGUF(arch, metadata, _tensors(arch)))
+
+
 @pytest.mark.parametrize(
     ("arch", "revision", "metadata_updates", "expected"),
     [
