@@ -25,6 +25,7 @@ from onnxscript import nn
 from mobius._configs import (
     BaseModelConfig,
     Eagle3Config,
+    FalconH1Config,
     Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
@@ -140,6 +141,7 @@ from mobius.models.falcon import (
     FalconCausalLMModel,
     MPTCausalLMModel,
 )
+from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
@@ -450,6 +452,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "ernie4_5": ModelRegistration(ErnieCausalLMModel),
     "exaone4": ModelRegistration(ExaOne4CausalLMModel),
     "falcon": ModelRegistration(FalconCausalLMModel),
+    "falcon_h1": ModelRegistration(
+        FalconH1ForCausalLM,
+        task="falcon-h1-text-generation",
+        config_class=FalconH1Config,
+        test_model_id="tiiuae/Falcon-H1-Tiny-90M-Base",
+        family="falcon-h1",
+    ),
     "gemma": ModelRegistration(GemmaCausalLMModel),
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
     "gemma3": ModelRegistration(Gemma3MultiModalModel, task="vision-language"),

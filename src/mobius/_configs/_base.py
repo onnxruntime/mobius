@@ -2692,6 +2692,150 @@ class BambaConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class FalconH1Config(ArchitectureConfig):
+    """Configuration for Falcon-H1 parallel Attention + Mamba2 decoder layers."""
+
+    mamba_d_ssm: int = 1024
+    mamba_n_heads: int = 128
+    mamba_d_head: int = 8
+    mamba_n_groups: int = 1
+    mamba_d_state: int = 256
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    mamba_chunk_size: int = 256
+    mamba_conv_bias: bool = True
+    mamba_proj_bias: bool = False
+    mamba_norm_before_gate: bool = True
+    mamba_rms_norm: bool = False
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))
+    attention_bias: bool = False
+    projectors_bias: bool = False
+    lm_head_multiplier: float = 1.0
+    embedding_multiplier: float = 1.0
+    mlp_multipliers: tuple[float, float] = (1.0, 1.0)
+    key_multiplier: float = 1.0
+    attention_out_multiplier: float = 1.0
+    attention_in_multiplier: float = 1.0
+    ssm_multipliers: tuple[float, float, float, float, float] = (
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+    )
+    ssm_in_multiplier: float = 1.0
+    ssm_out_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.attn_qkv_bias = self.attention_bias
+        self.attn_o_bias = self.attention_bias
+        if self.hidden_act != "silu":
+            raise ValueError("Falcon-H1 supports only hidden_act='silu'")
+        if (
+            self.head_dim <= 0
+            or self.num_attention_heads <= 0
+            or self.hidden_size != self.num_attention_heads * self.head_dim
+        ):
+            raise ValueError("Falcon-H1 hidden_size must equal num_attention_heads * head_dim")
+        if (
+            self.num_key_value_heads <= 0
+            or self.num_attention_heads % self.num_key_value_heads
+        ):
+            raise ValueError("Falcon-H1 num_key_value_heads must divide num_attention_heads")
+        if self.mamba_d_ssm <= 0 or self.mamba_n_heads <= 0:
+            raise ValueError("Falcon-H1 Mamba dimensions must be positive")
+        if self.mamba_d_ssm % self.mamba_n_heads:
+            raise ValueError("mamba_n_heads must divide mamba_d_ssm")
+        if self.mamba_d_head * self.mamba_n_heads != self.mamba_d_ssm:
+            raise ValueError("mamba_d_head * mamba_n_heads must equal mamba_d_ssm")
+        if (
+            self.mamba_n_groups <= 0
+            or self.mamba_n_heads % self.mamba_n_groups
+            or self.mamba_d_ssm % self.mamba_n_groups
+        ):
+            raise ValueError("mamba_n_groups must divide both mamba_n_heads and mamba_d_ssm")
+        if self.mamba_d_state <= 0 or self.mamba_d_conv <= 0 or self.mamba_chunk_size <= 0:
+            raise ValueError("Falcon-H1 state, convolution, and chunk sizes must be positive")
+        if len(self.mlp_multipliers) != 2:
+            raise ValueError("mlp_multipliers must contain exactly two values")
+        if len(self.ssm_multipliers) != 5:
+            raise ValueError("ssm_multipliers must contain exactly five values")
+        if len(self.time_step_limit) != 2:
+            raise ValueError("time_step_limit must contain exactly two values")
+        time_step_min, time_step_max = self.time_step_limit
+        if time_step_min < 0 or time_step_max < time_step_min:
+            raise ValueError("time_step_limit must be ordered and non-negative")
+        multipliers = (
+            self.embedding_multiplier,
+            self.lm_head_multiplier,
+            self.attention_in_multiplier,
+            self.attention_out_multiplier,
+            self.key_multiplier,
+            self.ssm_in_multiplier,
+            self.ssm_out_multiplier,
+            *self.mlp_multipliers,
+            *self.ssm_multipliers,
+        )
+        if not all(math.isfinite(value) for value in multipliers):
+            raise ValueError("Falcon-H1 multipliers must all be finite")
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> FalconH1Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        fields.pop("embedding_multiplier", None)
+        fields["mlp_bias"] = bool(getattr(config, "mlp_bias", False))
+        d_ssm = getattr(config, "mamba_d_ssm", None)
+        if d_ssm is None:
+            d_ssm = int(getattr(config, "mamba_expand", 2)) * base.hidden_size
+        n_heads = int(getattr(config, "mamba_n_heads", 128))
+        d_head = getattr(config, "mamba_d_head", "auto")
+        if d_head == "auto":
+            if d_ssm % n_heads:
+                raise ValueError("mamba_n_heads must divide mamba_d_ssm")
+            d_head = d_ssm // n_heads
+        time_step_limit = getattr(config, "time_step_limit", None) or (
+            0.0,
+            float("inf"),
+        )
+        return cls(
+            **fields,
+            mamba_d_ssm=int(d_ssm),
+            mamba_n_heads=n_heads,
+            mamba_d_head=int(d_head),
+            mamba_n_groups=int(getattr(config, "mamba_n_groups", 1)),
+            mamba_d_state=int(getattr(config, "mamba_d_state", 256)),
+            mamba_d_conv=int(getattr(config, "mamba_d_conv", 4)),
+            mamba_expand=int(getattr(config, "mamba_expand", 2)),
+            mamba_chunk_size=int(getattr(config, "mamba_chunk_size", 256)),
+            mamba_conv_bias=bool(getattr(config, "mamba_conv_bias", True)),
+            mamba_proj_bias=bool(getattr(config, "mamba_proj_bias", False)),
+            mamba_norm_before_gate=bool(getattr(config, "mamba_norm_before_gate", True)),
+            mamba_rms_norm=bool(getattr(config, "mamba_rms_norm", False)),
+            time_step_limit=tuple(float(value) for value in time_step_limit),
+            attention_bias=bool(getattr(config, "attention_bias", False)),
+            projectors_bias=bool(getattr(config, "projectors_bias", False)),
+            lm_head_multiplier=float(getattr(config, "lm_head_multiplier", 1.0)),
+            embedding_multiplier=float(getattr(config, "embedding_multiplier", 1.0)),
+            mlp_multipliers=tuple(
+                float(value)
+                for value in (getattr(config, "mlp_multipliers", None) or (1.0, 1.0))
+            ),
+            key_multiplier=float(getattr(config, "key_multiplier", 1.0)),
+            attention_out_multiplier=float(getattr(config, "attention_out_multiplier", 1.0)),
+            attention_in_multiplier=float(getattr(config, "attention_in_multiplier", 1.0)),
+            ssm_multipliers=tuple(
+                float(value)
+                for value in (
+                    getattr(config, "ssm_multipliers", None) or (1.0, 1.0, 1.0, 1.0, 1.0)
+                )
+            ),
+            ssm_in_multiplier=float(getattr(config, "ssm_in_multiplier", 1.0)),
+            ssm_out_multiplier=float(getattr(config, "ssm_out_multiplier", 1.0)),
+        )
+
+
+@dataclasses.dataclass
 class GraniteMoeHybridConfig(BambaConfig):
     """Configuration for GraniteMoeHybrid: Mamba2+Attention hybrid with MoE on all layers.
 

@@ -31,6 +31,7 @@ import numpy as np
 
 from mobius._configs import (
     ArchitectureConfig,
+    FalconH1Config,
     Gemma2Config,
     Gemma4Config,
     GraniteMoeHybridConfig,
@@ -149,6 +150,18 @@ _MAMBA_KEY_MAP = {
     "ssm.time_step_rank": "time_step_rank",
 }
 
+_FALCON_H1_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.head_count": "num_attention_heads",
+    "attention.head_count_kv": "num_key_value_heads",
+    "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+    "ssm.conv_kernel": "mamba_d_conv",
+    "ssm.group_count": "mamba_n_groups",
+    "ssm.inner_size": "mamba_d_ssm",
+    "ssm.state_size": "mamba_d_state",
+    "ssm.time_step_rank": "mamba_n_heads",
+}
+
 _JAMBA_KEY_MAP = {
     "attention.head_count": "num_attention_heads",
     "attention.head_count_kv": "num_key_value_heads",
@@ -197,6 +210,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
         "mamba": _MAMBA_KEY_MAP,
+        "falcon_h1": _FALCON_H1_KEY_MAP,
         "jamba": _JAMBA_KEY_MAP,
         "nemotron_h": _NEMOTRON_H_KEY_MAP,
         "granitehybrid": _GRANITEHYBRID_KEY_MAP,
@@ -2067,6 +2081,73 @@ def _mamba2_postprocess(
     return result
 
 
+def _falcon_h1_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> FalconH1Config:
+    """Build exact Falcon-H1 attention and Mamba2 geometry from pinned metadata."""
+    arch = "falcon-h1"
+    d_inner = int(metadata[f"{arch}.ssm.inner_size"])
+    num_heads = int(metadata[f"{arch}.ssm.time_step_rank"])
+    n_groups = int(metadata[f"{arch}.ssm.group_count"])
+    key_dim = int(metadata[f"{arch}.attention.key_length"])
+    value_dim = int(metadata[f"{arch}.attention.value_length"])
+    if key_dim <= 0 or value_dim != key_dim:
+        raise ValueError(
+            "falcon-h1 requires equal positive attention key/value head dimensions"
+        )
+    if config.num_attention_heads * key_dim != config.hidden_size:
+        raise ValueError(
+            "falcon-h1 attention.head_count * attention.key_length must equal embedding_length"
+        )
+    if num_heads <= 0 or d_inner <= 0 or d_inner % num_heads:
+        raise ValueError(
+            "falcon-h1 ssm.time_step_rank must divide the positive ssm.inner_size"
+        )
+    if n_groups <= 0 or num_heads % n_groups or d_inner % n_groups:
+        raise ValueError(
+            "falcon-h1 ssm.group_count must divide both the SSM head count and inner size"
+        )
+
+    names = set(model.tensor_names) if model is not None else set()
+    layers = config.num_hidden_layers
+    conv_biases = {f"blk.{layer}.ssm_conv1d.bias" for layer in range(layers)}
+    ssm_norms = {f"blk.{layer}.ssm_norm.weight" for layer in range(layers)}
+    fields = _base_model_fields(config, FalconH1Config)
+    fields.update(
+        hidden_act="silu",
+        head_dim=key_dim,
+        mamba_d_ssm=d_inner,
+        mamba_n_heads=num_heads,
+        mamba_d_head=d_inner // num_heads,
+        mamba_n_groups=n_groups,
+        mamba_d_state=int(metadata[f"{arch}.ssm.state_size"]),
+        mamba_d_conv=int(metadata[f"{arch}.ssm.conv_kernel"]),
+        mamba_expand=2,
+        mamba_chunk_size=256,
+        mamba_conv_bias=conv_biases.issubset(names),
+        mamba_proj_bias=False,
+        mamba_norm_before_gate=True,
+        mamba_rms_norm=ssm_norms.issubset(names),
+        attention_bias=config.attn_qkv_bias,
+        projectors_bias=False,
+        # The pinned converter folds every Falcon-H1 multiplier into its tensor.
+        embedding_multiplier=1.0,
+        lm_head_multiplier=1.0,
+        mlp_multipliers=(1.0, 1.0),
+        key_multiplier=1.0,
+        attention_in_multiplier=1.0,
+        attention_out_multiplier=1.0,
+        ssm_multipliers=(1.0, 1.0, 1.0, 1.0, 1.0),
+        ssm_in_multiplier=1.0,
+        ssm_out_multiplier=1.0,
+    )
+    result = FalconH1Config(**fields)
+    result.model_type = "falcon_h1"
+    return result
+
+
 def _validate_encoder_metadata(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2301,6 +2382,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "muse_glimmer": _muse_glimmer_postprocess,
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
+    "falcon_h1": _falcon_h1_postprocess,
     "jamba": _jamba_postprocess,
     "lfm2moe": _lfm2moe_postprocess,
     "nemotron_h": _nemotron_h_postprocess,

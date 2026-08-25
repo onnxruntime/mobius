@@ -716,6 +716,114 @@ def _write_recurrent_gguf(
     writer.close()
 
 
+def _write_falcon_h1_gguf(
+    path: Path,
+    *,
+    quantized: bool,
+    omit: str | None = None,
+    biases: bool = False,
+    partial_bias: bool = False,
+    invalid_decay: bool = False,
+) -> None:
+    """Write a complete one-layer Falcon-H1 GGUF at tiny dimensions."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = 32
+    intermediate = 64
+    vocab = 64
+    attn_heads = 4
+    kv_heads = 2
+    head_dim = 8
+    ssm_inner = 32
+    ssm_heads = 4
+    groups = 1
+    state = 8
+    kernel = 4
+    conv_dim = ssm_inner + 2 * groups * state
+    projection_size = 2 * ssm_inner + 2 * groups * state + ssm_heads
+    rng = np.random.default_rng(606)
+
+    writer = GGUFWriter(str(path), "falcon-h1")
+    writer.add_context_length(64)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(1)
+    writer.add_head_count(attn_heads)
+    writer.add_head_count_kv(kv_heads)
+    writer.add_key_length(head_dim)
+    writer.add_value_length(head_dim)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_rope_freq_base(10_000.0)
+    writer.add_vocab_size(vocab)
+    writer.add_ssm_conv_kernel(kernel)
+    writer.add_ssm_inner_size(ssm_inner)
+    writer.add_ssm_state_size(state)
+    writer.add_ssm_time_step_rank(ssm_heads)
+    writer.add_ssm_group_count(groups)
+
+    def add_float(name: str, shape: tuple[int, ...], *, negative: bool = False) -> None:
+        if name == omit:
+            return
+        values = rng.normal(0.0, 0.05, size=shape).astype(np.float32)
+        if negative:
+            values = -np.exp(values)
+        writer.add_tensor(name, values)
+
+    def add_q4(name: str, shape: tuple[int, int]) -> None:
+        if name == omit:
+            return
+        rows, columns = shape
+        assert columns % 32 == 0
+        raw = np.zeros((rows, columns // 32 * 18), dtype=np.uint8)
+        for row in range(rows):
+            for block in range(columns // 32):
+                offset = block * 18
+                raw[row, offset : offset + 2] = np.array(
+                    [rng.uniform(0.01, 0.05)], dtype=np.float16
+                ).view(np.uint8)
+                raw[row, offset + 2 : offset + 18] = rng.integers(
+                    0, 256, size=16, dtype=np.uint8
+                )
+        writer.add_tensor(name, raw, raw_dtype=GGMLQuantizationType.Q4_0)
+
+    projection = add_q4 if quantized else add_float
+    add_float("token_embd.weight", (vocab, hidden))
+    add_float("output_norm.weight", (hidden,))
+    projection("output.weight", (vocab, hidden))
+    add_float("blk.0.attn_norm.weight", (hidden,))
+    projection("blk.0.attn_q.weight", (hidden, hidden))
+    projection("blk.0.attn_k.weight", (kv_heads * head_dim, hidden))
+    projection("blk.0.attn_v.weight", (kv_heads * head_dim, hidden))
+    projection("blk.0.attn_output.weight", (hidden, hidden))
+    if biases or partial_bias:
+        add_float("blk.0.attn_q.bias", (hidden,))
+    if biases:
+        add_float("blk.0.attn_k.bias", (kv_heads * head_dim,))
+        add_float("blk.0.attn_v.bias", (kv_heads * head_dim,))
+        add_float("blk.0.attn_output.bias", (hidden,))
+    add_float("blk.0.ffn_norm.weight", (hidden,))
+    projection("blk.0.ffn_gate.weight", (intermediate, hidden))
+    projection("blk.0.ffn_up.weight", (intermediate, hidden))
+    projection("blk.0.ffn_down.weight", (hidden, intermediate))
+    if biases:
+        add_float("blk.0.ffn_gate.bias", (intermediate,))
+        add_float("blk.0.ffn_up.bias", (intermediate,))
+        add_float("blk.0.ffn_down.bias", (hidden,))
+    # Recurrent tensors are deliberately float even for a quantized source.
+    add_float("blk.0.ssm_in.weight", (projection_size, hidden))
+    add_float("blk.0.ssm_conv1d.weight", (conv_dim, kernel))
+    add_float("blk.0.ssm_conv1d.bias", (conv_dim,))
+    add_float("blk.0.ssm_dt.bias", (ssm_heads,))
+    add_float("blk.0.ssm_a", (ssm_heads, 1), negative=not invalid_decay)
+    add_float("blk.0.ssm_d", (ssm_heads, 1))
+    add_float("blk.0.ssm_out.weight", (hidden, ssm_inner))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 def _write_lfm2_gguf(path: Path, *, quantized: bool) -> None:
     """Write a tiny two-layer LFM2 GGUF with one conv and one attention layer."""
     from gguf import GGMLQuantizationType, GGUFWriter
@@ -4115,6 +4223,154 @@ class TestRecurrentGGUFBuild:
         assert not graph_build_started
 
 
+class TestFalconH1GGUFBuild:
+    """Falcon-H1 GGUF import preserves its parallel graph and four-state ABI."""
+
+    @staticmethod
+    def _initial_inputs(batch: int, tokens: list[list[int]]) -> dict[str, np.ndarray]:
+        sequence = len(tokens[0])
+        return {
+            "input_ids": np.asarray(tokens, dtype=np.int64),
+            "position_ids": np.broadcast_to(
+                np.arange(sequence, dtype=np.int64),
+                (batch, sequence),
+            ).copy(),
+            "attention_mask": np.ones((batch, sequence), dtype=np.int64),
+            "past_key_values.0.key": np.zeros((batch, 2, 0, 8), np.float32),
+            "past_key_values.0.value": np.zeros((batch, 2, 0, 8), np.float32),
+            "past_key_values.0.conv_state": np.zeros((batch, 48, 3), np.float32),
+            "past_key_values.0.ssm_state": np.zeros((batch, 4, 8, 8), np.float32),
+        }
+
+    def test_float_prefill_decode_replay_batch_reorder_and_save_load(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius._model_package import ModelPackage
+        from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "falcon-h1-f32.gguf"
+        _write_falcon_h1_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        output_dir = tmp_path / "saved"
+        package.save(output_dir, progress_bar=False)
+        model = ModelPackage.load(output_dir)["model"]
+        assert [value.name for value in model.graph.outputs] == [
+            "logits",
+            "present.0.key",
+            "present.0.value",
+            "present.0.conv_state",
+            "present.0.ssm_state",
+        ]
+
+        session = OnnxModelSession(model)
+        try:
+            prefill = session.run(self._initial_inputs(2, [[1, 2, 3], [4, 5, 6]]))
+            decode_inputs = {
+                "input_ids": np.asarray([[7], [8]], np.int64),
+                "position_ids": np.asarray([[3], [3]], np.int64),
+                "attention_mask": np.ones((2, 4), np.int64),
+                **{
+                    name.replace("present.", "past_key_values."): value
+                    for name, value in prefill.items()
+                    if name.startswith("present.")
+                },
+            }
+            first = session.run(decode_inputs)
+            replay = session.run(decode_inputs)
+            np.testing.assert_array_equal(first["logits"], replay["logits"])
+
+            reordered = {
+                name: value[::-1].copy() if value.shape[0] == 2 else value
+                for name, value in decode_inputs.items()
+            }
+            reordered["attention_mask"] = decode_inputs["attention_mask"][::-1].copy()
+            swapped = session.run(reordered)
+            np.testing.assert_allclose(swapped["logits"], first["logits"][::-1])
+        finally:
+            session.close()
+
+    def test_quantized_source_dequantizes_and_keep_quantized_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "falcon-h1-q4.gguf"
+        _write_falcon_h1_gguf(path, quantized=True)
+        model = build_from_gguf(path, keep_quantized=False)["model"]
+        assert "MatMulNBits" not in {node.op_type for node in model.graph}
+        with pytest.raises(ValueError, match="keep_quantized=True"):
+            build_from_gguf(path, keep_quantized=True)
+
+    def test_complete_optional_bias_families_select_the_biased_graph(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "falcon-h1-biased.gguf"
+        _write_falcon_h1_gguf(path, quantized=False, biases=True)
+        model = build_from_gguf(path)["model"]
+        assert "model.layers.0.self_attn.q_proj.bias" in model.graph.initializers
+        assert "model.layers.0.self_attn.o_proj.bias" in model.graph.initializers
+        assert "model.layers.0.feed_forward.gate_proj.bias" in model.graph.initializers
+
+    def test_cli_builds_dequantized_graph_package(self, tmp_path: Path) -> None:
+        from mobius.__main__ import main
+
+        path = tmp_path / "falcon-h1-cli.gguf"
+        output_dir = tmp_path / "falcon-h1-cli"
+        _write_falcon_h1_gguf(path, quantized=True)
+        main(
+            [
+                "build-gguf",
+                str(path),
+                "--output",
+                str(output_dir),
+                "--dequantize",
+            ]
+        )
+        assert (output_dir / "model.onnx").is_file()
+
+    def test_static_cache_and_incomplete_closure_fail_before_graph(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        complete = tmp_path / "falcon-h1-static.gguf"
+        _write_falcon_h1_gguf(complete, quantized=False)
+        with pytest.raises(ValueError, match="four-state"):
+            build_from_gguf(complete, static_cache=True)
+
+        incomplete = tmp_path / "falcon-h1-incomplete.gguf"
+        _write_falcon_h1_gguf(
+            incomplete,
+            quantized=False,
+            omit="blk.0.ssm_out.weight",
+        )
+        graph_build_started = False
+
+        def unexpected_graph_build(*args, **kwargs):
+            nonlocal graph_build_started
+            graph_build_started = True
+            raise AssertionError("graph construction must not start")
+
+        monkeypatch.setattr(core_builder, "build_from_module", unexpected_graph_build)
+        with pytest.raises(ValueError, match="tensor closure"):
+            build_from_gguf(incomplete)
+        assert not graph_build_started
+
+        partial_bias = tmp_path / "falcon-h1-partial-bias.gguf"
+        _write_falcon_h1_gguf(
+            partial_bias,
+            quantized=False,
+            partial_bias=True,
+        )
+        with pytest.raises(ValueError, match="biases must be present"):
+            build_from_gguf(partial_bias)
+        assert not graph_build_started
+
+
 class TestBuildGgufStaticCache:
     """Tests for build_from_gguf(static_cache=True).
 
@@ -4409,12 +4665,24 @@ class TestGGUFPreflightGuards:
         module_lookup.assert_not_called()
         graph_build.assert_not_called()
 
+    def test_invalid_decay_fails_before_graph(self, tmp_path: Path, monkeypatch) -> None:
+        from mobius import _builder as core_builder
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "falcon-h1-invalid-decay.gguf"
+        _write_falcon_h1_gguf(path, quantized=False, invalid_decay=True)
+        graph_build = mock.Mock(side_effect=AssertionError("graph construction reached"))
+        monkeypatch.setattr(core_builder, "build_from_module", graph_build)
+
+        with pytest.raises(ValueError, match="finite negative"):
+            build_from_gguf(path)
+        graph_build.assert_not_called()
+
     @pytest.mark.parametrize(
         "architecture",
         [
             "minimax-01",
             "plamo2",
-            "falcon-h1",
             "bailingmoe3",
             "deepseek4",
             "kimi-k3",

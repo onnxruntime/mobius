@@ -201,25 +201,54 @@ class PostGatedRMSNorm(nn.Module):
     before normalization (used by Mamba2/Bamba).
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        group_size: int | None = None,
+    ):
         super().__init__()
+        if group_size is not None and hidden_size % group_size:
+            raise ValueError("hidden_size must be divisible by group_size")
+        self.hidden_size = hidden_size
         self.weight = nn.Parameter([hidden_size])
         self.variance_epsilon = eps
+        self.group_size = group_size
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value):
-        # RMSNorm uses stash_type=1 internally for fp32 variance.
-        normed = op.RMSNormalization(
-            hidden_states,
-            self.weight,
-            epsilon=self.variance_epsilon,
-            stash_type=1,
-            axis=-1,
-        )
+        hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        weight_f32 = op.Cast(self.weight, to=ir.DataType.FLOAT)
+        if self.group_size is not None and self.group_size < self.hidden_size:
+            n_groups = self.hidden_size // self.group_size
+            original_shape = op.Shape(hidden_states)
+            grouped = op.Reshape(hidden_f32, [-1, n_groups, self.group_size])
+            grouped_weight = op.Reshape(weight_f32, [n_groups, self.group_size])
+            variance = op.ReduceMean(
+                op.Mul(grouped, grouped),
+                axes=[-1],
+                keepdims=True,
+            )
+            normed = op.Mul(
+                op.Mul(
+                    grouped,
+                    op.Reciprocal(op.Sqrt(op.Add(variance, self.variance_epsilon))),
+                ),
+                grouped_weight,
+            )
+            normed = op.Reshape(normed, original_shape)
+        else:
+            normed = op.RMSNormalization(
+                hidden_f32,
+                weight_f32,
+                epsilon=self.variance_epsilon,
+                stash_type=1,
+                axis=-1,
+            )
         # Apply gate in fp32: normed * SiLU(gate), then cast back.
         # Matches HF Qwen3_5RMSNormGated which does gate.to(float32).
         g_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         gate_activated = op.Swish(g_f32)
-        result = op.Mul(op.Cast(normed, to=ir.DataType.FLOAT), gate_activated)
+        result = op.Mul(normed, gate_activated)
         return op.CastLike(result, hidden_states)
 
 

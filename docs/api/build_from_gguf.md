@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 90, 'rejected': 3, 'supported': 54}; importable: 52; quantized import: {'rejected': 12, 'supported': 135}; runtime: {'deferred': 144, 'rejected': 3} |
+| Architectures | 147 | graph verdicts: {'deferred': 89, 'rejected': 3, 'supported': 55}; importable: 53; quantized import: {'rejected': 12, 'supported': 135}; runtime: {'deferred': 144, 'rejected': 3} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 2, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become exact-copy only with a validated embedded `tokenizer.huggingface.json` |
@@ -382,7 +382,7 @@ before graph construction or durable output.
 | `exaone-moe` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | EXAONE-MoE serializes a dense trailing NextN block after an iSWA routed/shared expert trunk, but the pinned loader skips appended blocks. Mobius has no exact SWA schedule, remapped global-MTP transform, or executable head contract. |
 | `exaone4` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | EXAONE4 serializes attention/FFN post-norm trailing blocks and NextN tensors with optional synthetic Llama3 RoPE factors, but the pinned loader skips them. No Mobius task owns those preserved-only semantics. |
 | `falcon` | — | model=`falcon`; tensor=`falcon` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
-| `falcon-h1` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Falcon-H1 executes attention and Mamba2 in parallel in every block and requires KV and recurrent states simultaneously; FalconCausalLMModel is not compatible with that graph or state ABI. |
+| `falcon-h1` | — | model=`falcon_h1`; tensor=`falcon_h1` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The dedicated graph and GGUF importer preserve parallel Attention+Mamba2 layers and their four-state ABI, but runtime packaging remains deferred pending heterogeneous-state schema support (onnxruntime/mobius#605) and real full-logit plus deterministic stateful-generation evidence. |
 | `gemma` | — | model=`gemma`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `gemma-embedding` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Gemma Embedding is a bidirectional stateless embedding graph with alternating sliding-window attention, four norm sites, sqrt(hidden) embedding scaling, and optional pooling/dense modules. Causal Gemma3 text/VLM tasks expose the wrong ABI. |
 | `gemma2` | — | model=`gemma2`; tensor=`llama`+`gemma2_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
@@ -583,13 +583,20 @@ real-artifact full-logit and stateful-generation parity.
 - `static_cache=True` and non-hybrid task dispatch are rejected for these mixed
   state ABIs.
 
-`minimax-01`, `plamo2`, and `falcon-h1` are deferred before config extraction.
-MiniMax-01's pinned Lightning schedule and decay/scaling semantics do not match
-the current graph; PLaMo2 needs a dedicated fused-QKV Mamba1/attention graph;
-Falcon-H1 executes attention and Mamba2 in parallel in every block and therefore
-needs KV plus conv/SSM states simultaneously. It is not an alias of ordinary
-Falcon. `nemotron_h_moe` remains rejected because its folded MTP attention+MoE
-head has no equivalent package contract.
+`minimax-01` and `plamo2` are deferred before config extraction. MiniMax-01's
+pinned Lightning schedule and decay/scaling semantics do not match the current
+graph; PLaMo2 needs a dedicated fused-QKV Mamba1/attention graph.
+
+Falcon-H1 graph/import support is dedicated rather than aliased to Falcon. Every
+layer exposes `(key, value, conv_state, ssm_state)` in that order. Static cache is
+rejected, and quantized-source imports require `--dequantize` until the mixed graph
+can preserve only exact attention/FFN MatMul roles. Runtime packaging remains
+deferred pending the heterogeneous-state schema tracked by
+[`onnxruntime/mobius#605`](https://github.com/onnxruntime/mobius/issues/605) and
+real full-logit plus deterministic stateful-generation evidence.
+
+`nemotron_h_moe` remains rejected because its folded MTP attention+MoE head has
+no equivalent package contract.
 
 ### Audio/TTS/codec cohort
 

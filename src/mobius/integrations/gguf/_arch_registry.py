@@ -1172,14 +1172,34 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="falcon-h1",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="falcon_h1",
+        config_key_map="falcon_h1",
+        config_postprocessor="falcon_h1",
+        tensor_map_recipe=("falcon_h1",),
+        tensor_processor="mamba",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "ssm.conv_kernel",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+            "ssm.group_count",
+        ),
         runtime=Support.DEFERRED,
         reason=(
-            "Falcon-H1 executes attention and Mamba2 in parallel in every block and "
-            "requires KV and recurrent states simultaneously; FalconCausalLMModel is "
-            "not compatible with that graph or state ABI."
+            "The dedicated graph and GGUF importer preserve parallel Attention+Mamba2 "
+            "layers and their four-state ABI, but runtime packaging remains deferred "
+            "pending heterogeneous-state schema support (onnxruntime/mobius#605) and "
+            "real full-logit plus deterministic stateful-generation evidence."
         ),
     ),
     # --------------------------------------------------------- Encoder-only

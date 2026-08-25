@@ -529,7 +529,9 @@ def _create_hf_config(model_type: str, config_overrides: dict):
     for key, value in config_overrides.items():
         if key == "_config_cls":
             continue
-        if key in _HF_READONLY_FIELDS:
+        if key in _HF_READONLY_FIELDS and not (
+            model_type == "falcon_h1" and key == "mlp_bias"
+        ):
             continue
         hf_kwargs[key] = value
 

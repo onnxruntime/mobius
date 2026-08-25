@@ -16,7 +16,7 @@ from typing import NamedTuple
 import onnx_ir as ir
 from onnxscript import GraphBuilder
 
-from mobius._configs import BaseModelConfig
+from mobius._configs import BaseModelConfig, FalconH1Config
 
 _FUNCTIONS_DOMAIN = "com.microsoft"
 
@@ -414,7 +414,7 @@ def _register_linear_attention_functions(
     layer_types = getattr(config, "layer_types", None) or []
     has_deltanet = "linear_attention" in layer_types
     has_lightning = "lightning_attention" in layer_types
-    has_mamba2 = "mamba2" in layer_types
+    has_mamba2 = "mamba2" in layer_types or isinstance(config, FalconH1Config)
     has_short_conv = "conv" in layer_types
 
     if not has_deltanet and not has_lightning and not has_mamba2 and not has_short_conv:

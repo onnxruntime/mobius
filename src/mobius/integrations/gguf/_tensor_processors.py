@@ -296,7 +296,7 @@ def _process_mamba(
     ``modeling_gguf_pytorch_utils.py``.
     """
     layer_types = getattr(config, "layer_types", None) or ()
-    is_mamba2 = config.model_type == "mamba2" or "mamba2" in layer_types
+    is_mamba2 = config.model_type in {"mamba2", "falcon_h1"} or "mamba2" in layer_types
     for name, tensor in list(state_dict.items()):
         if "conv1d" in name and name.endswith(".weight"):
             if tensor.dim() == 2:
