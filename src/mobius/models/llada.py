@@ -180,7 +180,7 @@ class _LLaDADecoderLayer(DecoderLayer):
     """
 
     def __init__(self, config: ArchitectureConfig):
-        super().__init__(config)
+        super().__init__(config, linear_class=_quantized_linear_class(config))
         self.self_attn = _LLaDAAttention(config, linear_class=_quantized_linear_class(config))
 
 
