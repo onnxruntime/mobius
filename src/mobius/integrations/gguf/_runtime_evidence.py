@@ -366,14 +366,33 @@ def gguf_artifact_identity(
     filename: str | None = None,
 ) -> GGUFArtifactIdentity:
     """Fingerprint source bytes and parsed tensor census under a canonical architecture."""
-    stat, sha256 = _hash_regular_file(source_path)
-    qtypes = Counter(tensor.tensor_type.name for tensor in gguf_model._reader.tensors)
+    shard_paths = getattr(gguf_model, "shard_paths", None)
+    if shard_paths is None:
+        stat, sha256 = _hash_regular_file(source_path)
+        size = stat.st_size
+    else:
+        paths = tuple(Path(path) for path in shard_paths)
+        if not paths:
+            raise ValueError("A GGUF shard set must contain at least one source file.")
+        digest = hashlib.sha256()
+        size = 0
+        for path in paths:
+            stat, file_sha256 = _hash_regular_file(path)
+            encoded = path.name.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            digest.update(stat.st_size.to_bytes(8, "big"))
+            digest.update(bytes.fromhex(file_sha256))
+            size += stat.st_size
+        sha256 = digest.hexdigest()
+    tensors = gguf_model.reader_tensors()
+    qtypes = Counter(tensor.tensor_type.name for tensor in tensors)
     return GGUFArtifactIdentity(
         architecture=architecture,
         filename=filename or source_path.name,
-        size=stat.st_size,
+        size=size,
         sha256=sha256,
-        tensor_count=len(gguf_model._reader.tensors),
+        tensor_count=len(tensors),
         tensor_qtypes=tuple(sorted(qtypes.items())),
     )
 

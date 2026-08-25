@@ -3912,7 +3912,14 @@ def build_from_gguf(
 
     if draft_manifest is not None:
         pkg.draft_manifest = draft_manifest
-    pkg.gguf_source_path = str(Path(gguf_path).resolve())
+    canonical_source_path = (
+        gguf_model.shard_paths[0] if isinstance(gguf_model, GgufShardSet) else Path(gguf_path)
+    )
+    if isinstance(gguf_model, GgufShardSet):
+        logical_source_filename = (
+            Path(logical_source_filename).with_name(canonical_source_path.name).as_posix()
+        )
+    pkg.gguf_source_path = str(canonical_source_path.resolve())
     pkg.gguf_source_filename = logical_source_filename
     pkg.gguf_architecture = spec.gguf_arch
     pkg.gguf_execution_provider = execution_provider
