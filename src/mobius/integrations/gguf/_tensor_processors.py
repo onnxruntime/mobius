@@ -318,6 +318,15 @@ def _process_mamba(
     return state_dict
 
 
+def _process_nemotron_h(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Invert both inherited GraniteHybrid attention and Mamba2 transforms."""
+    state_dict = _process_llama(state_dict, config)
+    return _process_mamba(state_dict, config)
+
+
 def _process_plamo2(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -433,29 +442,54 @@ def _process_granitehybrid(
     """Invert Granite transforms and reconstruct fused shared/expert gate-up weights."""
     state_dict = _process_llama(state_dict, config)
     state_dict = _process_mamba(state_dict, config)
-    for name in list(state_dict):
-        if name.endswith(".shared_mlp.gate_proj.weight"):
-            prefix = name.removesuffix("gate_proj.weight")
-            up_name = f"{prefix}up_proj.weight"
-            if up_name not in state_dict:
+
+    def fuse_pairs(
+        module_suffix: str,
+        tensor_suffix: str,
+        *,
+        rank: int,
+        dim: int,
+        label: str,
+    ) -> None:
+        gate_suffix = f"{module_suffix}gate_proj.{tensor_suffix}"
+        up_suffix = f"{module_suffix}up_proj.{tensor_suffix}"
+        prefixes = {
+            name.removesuffix(suffix)
+            for name in state_dict
+            for suffix in (gate_suffix, up_suffix)
+            if name.endswith(suffix)
+        }
+        for prefix in prefixes:
+            gate_name = f"{prefix}{gate_suffix}"
+            up_name = f"{prefix}{up_suffix}"
+            present = [name for name in (gate_name, up_name) if name in state_dict]
+            if len(present) != 2:
+                missing = up_name if gate_name in state_dict else gate_name
+                raise ValueError(f"GraniteHybrid {label} is missing paired tensor {missing!r}")
+            gate = state_dict[gate_name]
+            up = state_dict[up_name]
+            if gate.dim() != rank or up.dim() != rank or gate.shape != up.shape:
                 raise ValueError(
-                    f"GraniteHybrid shared FFN is missing paired tensor {up_name!r}"
+                    f"GraniteHybrid {label} gate/up tensors must both have the same "
+                    f"rank-{rank} shape, got {gate_name}={tuple(gate.shape)} and "
+                    f"{up_name}={tuple(up.shape)}"
                 )
-            state_dict[f"{prefix}input_linear.weight"] = torch.cat(
-                (state_dict.pop(name), state_dict.pop(up_name)), dim=0
+            state_dict[f"{prefix}{module_suffix}input_linear.{tensor_suffix}"] = torch.cat(
+                (state_dict.pop(gate_name), state_dict.pop(up_name)), dim=dim
             )
-        elif name.endswith(".block_sparse_moe.gate_proj.weight"):
-            prefix = name.removesuffix("gate_proj.weight")
-            up_name = f"{prefix}up_proj.weight"
-            if up_name not in state_dict:
-                raise ValueError(
-                    f"GraniteHybrid routed experts are missing paired tensor {up_name!r}"
-                )
-            # GGUF stores [E, F, H] gate and up tensors separately while the
-            # Transformers/Mobius module stores [E, 2F, H] in gate-then-up order.
-            state_dict[f"{prefix}input_linear.weight"] = torch.cat(
-                (state_dict.pop(name), state_dict.pop(up_name)), dim=1
-            )
+
+    # HF splits every fused input projection into gate then up along its output
+    # dimension. Reconstruct exactly that order for dense/shared weights and biases.
+    fuse_pairs(".shared_mlp.", "weight", rank=2, dim=0, label="shared FFN weights")
+    fuse_pairs(".shared_mlp.", "bias", rank=1, dim=0, label="shared FFN biases")
+    # Routed experts add a leading expert axis: [E, F, H] -> [E, 2F, H].
+    fuse_pairs(
+        ".block_sparse_moe.",
+        "weight",
+        rank=3,
+        dim=1,
+        label="routed expert weights",
+    )
     return state_dict
 
 
@@ -476,6 +510,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "muse_glimmer": _process_muse_glimmer,
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
+    "nemotron_h": _process_nemotron_h,
     "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
     "kimi_linear": _process_kimi_linear,

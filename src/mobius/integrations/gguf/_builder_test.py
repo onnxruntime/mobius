@@ -1113,6 +1113,7 @@ def _write_granitehybrid_moe_gguf(
     expert_used_count: int = 1,
     shared_width: int = 16,
     attention_biases: bool = True,
+    mlp_biases: bool = False,
     malformed_shape: str | None = None,
 ) -> None:
     """Write a tiny mixed GraniteHybrid GGUF with routed and shared experts."""
@@ -1205,38 +1206,47 @@ def _write_granitehybrid_moe_gguf(
         prefix = f"blk.{layer}."
         add_float(prefix + "attn_norm.weight", (hidden,))
         add_float(prefix + "ffn_norm.weight", (hidden,))
-        add_float(prefix + "ffn_gate_inp.weight", (expert_count, hidden))
         expert_projection = add_q4 if quantized else add_float
-        if quantized:
-            expert_projection(
-                prefix + "ffn_gate_exps.weight",
-                (expert_count, expert_width, hidden),
-            )
-            expert_projection(
-                prefix + "ffn_up_exps.weight",
-                (expert_count, expert_width, hidden),
-            )
-            expert_projection(
-                prefix + "ffn_down_exps.weight",
-                (expert_count, hidden, expert_width),
-            )
+        if not expert_count:
+            expert_projection(prefix + "ffn_gate.weight", (expert_width, hidden))
+            expert_projection(prefix + "ffn_up.weight", (expert_width, hidden))
+            expert_projection(prefix + "ffn_down.weight", (hidden, expert_width))
+            if mlp_biases:
+                add_float(prefix + "ffn_gate.bias", (expert_width,), fill=41.0)
+                add_float(prefix + "ffn_up.bias", (expert_width,), fill=42.0)
+                add_float(prefix + "ffn_down.bias", (hidden,), fill=43.0)
         else:
-            add_float(
-                prefix + "ffn_gate_exps.weight",
-                (expert_count, expert_width, hidden),
-                expert_base=11.0,
-            )
-            add_float(
-                prefix + "ffn_up_exps.weight",
-                (expert_count, expert_width, hidden),
-                expert_base=21.0,
-            )
-            add_float(
-                prefix + "ffn_down_exps.weight",
-                (expert_count, hidden, expert_width),
-                expert_base=31.0,
-            )
-        if shared_width:
+            add_float(prefix + "ffn_gate_inp.weight", (expert_count, hidden))
+            if quantized:
+                expert_projection(
+                    prefix + "ffn_gate_exps.weight",
+                    (expert_count, expert_width, hidden),
+                )
+                expert_projection(
+                    prefix + "ffn_up_exps.weight",
+                    (expert_count, expert_width, hidden),
+                )
+                expert_projection(
+                    prefix + "ffn_down_exps.weight",
+                    (expert_count, hidden, expert_width),
+                )
+            else:
+                add_float(
+                    prefix + "ffn_gate_exps.weight",
+                    (expert_count, expert_width, hidden),
+                    expert_base=11.0,
+                )
+                add_float(
+                    prefix + "ffn_up_exps.weight",
+                    (expert_count, expert_width, hidden),
+                    expert_base=21.0,
+                )
+                add_float(
+                    prefix + "ffn_down_exps.weight",
+                    (expert_count, hidden, expert_width),
+                    expert_base=31.0,
+                )
+        if expert_count and shared_width:
             add_float(prefix + "ffn_gate_shexp.weight", (shared_width, hidden))
             add_float(prefix + "ffn_up_shexp.weight", (shared_width, hidden))
             add_float(prefix + "ffn_down_shexp.weight", (hidden, shared_width))
@@ -1622,11 +1632,24 @@ def _write_nemotron_h_moe_gguf(
         *,
         expert_order: bool = False,
         negative: bool = False,
+        permute_heads: int | None = None,
     ) -> None:
         if name == omit:
             return
         shape = adjusted_shape(name, shape)
         values = rng.normal(0.0, 0.03, size=shape).astype(np.float32)
+        if permute_heads is not None:
+            values = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+            values = (
+                values.reshape(
+                    permute_heads,
+                    2,
+                    shape[0] // permute_heads // 2,
+                    *shape[1:],
+                )
+                .swapaxes(1, 2)
+                .reshape(shape)
+            )
         if negative:
             values = -np.exp(values)
         if expert_order:
@@ -1700,8 +1723,20 @@ def _write_nemotron_h_moe_gguf(
         projection("blk.1.ffn_latent_down.weight", (latent_width, hidden))
         projection("blk.1.ffn_latent_up.weight", (hidden, latent_width))
 
-    projection("blk.2.attn_q.weight", (heads * head_dim, hidden))
-    projection("blk.2.attn_k.weight", (kv_heads * head_dim, hidden))
+    if quantized:
+        projection("blk.2.attn_q.weight", (heads * head_dim, hidden))
+        projection("blk.2.attn_k.weight", (kv_heads * head_dim, hidden))
+    else:
+        add_float(
+            "blk.2.attn_q.weight",
+            (heads * head_dim, hidden),
+            permute_heads=heads,
+        )
+        add_float(
+            "blk.2.attn_k.weight",
+            (kv_heads * head_dim, hidden),
+            permute_heads=kv_heads,
+        )
     projection("blk.2.attn_v.weight", (kv_heads * head_dim, hidden))
     projection("blk.2.attn_output.weight", (hidden, heads * head_dim))
 
@@ -5774,7 +5809,6 @@ class TestJambaGGUFBuild:
                     f"model.layers.1.feed_forward.experts.{expert}.{projection}.weight_t"
                 ].const_value.numpy()
                 np.testing.assert_array_equal(value, expert + 1)
-
         output_dir = tmp_path / "saved-jamba"
         package.save(output_dir, progress_bar=False)
         session = OnnxModelSession(ModelPackage.load(output_dir)["model"])
@@ -6472,6 +6506,32 @@ class TestGraniteHybridMoEGGUFBuild:
             for name in model.graph.initializers
         )
 
+    def test_dense_ffn_biases_are_fused_in_gate_then_up_order(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = tmp_path / "granitehybrid-dense-biased.gguf"
+        _write_granitehybrid_moe_gguf(
+            path,
+            quantized=False,
+            expert_count=0,
+            expert_used_count=0,
+            shared_width=0,
+            mlp_biases=True,
+        )
+
+        model = build_from_gguf(path)["model"]
+        for layer in range(2):
+            prefix = f"model.layers.{layer}.shared_mlp."
+            fused_bias = model.graph.initializers[
+                prefix + "input_linear.bias"
+            ].const_value.numpy()
+            np.testing.assert_array_equal(fused_bias[:32], 41.0)
+            np.testing.assert_array_equal(fused_bias[32:], 42.0)
+            np.testing.assert_array_equal(
+                model.graph.initializers[prefix + "output_linear.bias"].const_value.numpy(),
+                43.0,
+            )
+
     def test_quantized_source_requires_explicit_dequantization(self, tmp_path: Path) -> None:
         from mobius.integrations.gguf import build_from_gguf
 
@@ -6580,6 +6640,18 @@ class TestNemotronHMoEGGUFBuild:
                     f"model.layers.1.moe.experts.{expert}.{projection}.weight_t"
                 ].const_value.numpy()
                 np.testing.assert_array_equal(value, expert + 1)
+        np.testing.assert_array_equal(
+            model.graph.initializers[
+                "model.layers.2.self_attn.q_proj.weight_t"
+            ].const_value.numpy(),
+            np.arange(32 * 32, dtype=np.float32).reshape(32, 32).T,
+        )
+        np.testing.assert_array_equal(
+            model.graph.initializers[
+                "model.layers.2.self_attn.k_proj.weight_t"
+            ].const_value.numpy(),
+            np.arange(16 * 32, dtype=np.float32).reshape(16, 32).T,
+        )
 
         output_dir = tmp_path / "saved-nemotron-h-moe"
         package.save(output_dir, progress_bar=False)
@@ -7940,6 +8012,24 @@ class TestHybridTensorContract:
                         architecture,
                         metadata,
                         [*names, partial_bias],
+                    )
+                )
+
+        if architecture == "granitehybrid":
+            dense_biases = [
+                f"blk.{layer}.ffn_{projection}.bias"
+                for layer in range(2)
+                for projection in ("gate", "up", "down")
+            ]
+            _raise_for_invalid_hybrid_tensor_contract(
+                self._FakeGGUF(architecture, metadata, [*names, *dense_biases])
+            )
+            with pytest.raises(ValueError, match=r"partial dense shared-MLP bias family"):
+                _raise_for_invalid_hybrid_tensor_contract(
+                    self._FakeGGUF(
+                        architecture,
+                        metadata,
+                        [*names, *dense_biases[:-1]],
                     )
                 )
 

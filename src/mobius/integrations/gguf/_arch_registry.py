@@ -1069,7 +1069,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("nemotron_h",),
         config_key_map="nemotron_h",
         config_postprocessor="nemotron_h",
-        tensor_processor="mamba",
+        tensor_processor="nemotron_h",
+        llama_qk_permute=True,
         required_metadata=(
             "attention.layer_norm_rms_epsilon",
             "ssm.conv_kernel",
@@ -1088,7 +1089,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("nemotron_h_moe",),
         config_key_map="nemotron_h",
         config_postprocessor="nemotron_h_moe",
-        tensor_processor="mamba",
+        tensor_processor="nemotron_h",
+        llama_qk_permute=True,
         required_metadata=(
             "attention.layer_norm_rms_epsilon",
             "ssm.conv_kernel",
@@ -1121,6 +1123,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         config_key_map="granitehybrid",
         config_postprocessor="granitehybrid",
         tensor_processor="granitehybrid",
+        llama_qk_permute=True,
         required_metadata=(
             "attention.layer_norm_rms_epsilon",
             "ssm.conv_kernel",

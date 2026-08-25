@@ -1550,6 +1550,8 @@ class TestRejectionsAreActionable:
     def test_nemotron_h_moe_graph_is_supported_but_runtime_is_deferred(self) -> None:
         spec = get_arch_spec("nemotron_h_moe")
         assert spec.model_type == "nemotron_h"
+        assert spec.tensor_processor == "nemotron_h"
+        assert spec.llama_qk_permute is True
         assert spec.config is Support.SUPPORTED
         assert spec.tensor_map is Support.SUPPORTED
         assert spec.graph is Support.SUPPORTED
@@ -1557,6 +1559,14 @@ class TestRejectionsAreActionable:
         assert spec.quantized_import is Support.REJECTED
         assert spec.reason is not None
         assert "onnxruntime/mobius#605" in spec.reason
+
+        dense_spec = get_arch_spec("nemotron_h")
+        assert dense_spec.tensor_processor == "nemotron_h"
+        assert dense_spec.llama_qk_permute is True
+
+        granite_spec = get_arch_spec("granitehybrid")
+        assert granite_spec.tensor_processor == "granitehybrid"
+        assert granite_spec.llama_qk_permute is True
 
 
 class TestDocumentedSupportMatrix:
