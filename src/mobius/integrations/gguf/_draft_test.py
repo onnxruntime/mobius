@@ -565,7 +565,7 @@ def test_dflash_sliding_window_is_rejected_before_graph(tmp_path: Path, monkeypa
     model = GGUFModel(path)
     model.metadata["dflash.attention.sliding_window"] = 1024
     monkeypatch.setattr(
-        "mobius.integrations.gguf._reader.GGUFModel",
+        "mobius.integrations.gguf._shard_set.open_gguf_model",
         lambda _path: model,
     )
     monkeypatch.setattr(

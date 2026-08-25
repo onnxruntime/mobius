@@ -121,7 +121,6 @@ class TestWriteGgufRuntimePackage:
                 out,
             )
         assert pkg.saved_to is None
-        assert pkg.saved_to is None
         assert {path.name: path.read_bytes() for path in out.iterdir()} == {
             "sentinel.bin": b"unchanged"
         }

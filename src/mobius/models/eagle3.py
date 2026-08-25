@@ -27,6 +27,7 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import Eagle3Config
 from mobius.components import MLP, Linear, RMSNorm, create_attention_bias, initialize_rope
 from mobius.components._attention import Attention
+from mobius.models.base import linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -35,19 +36,21 @@ if TYPE_CHECKING:
 class Eagle3Attention(Attention):
     """Llama attention with Q/K/V projected from concatenated 2H input."""
 
-    def __init__(self, config: Eagle3Config):
-        super().__init__(config)
-        self.q_proj = Linear(
+    def __init__(self, config: Eagle3Config, linear_class: type | None = None):
+        if linear_class is None:
+            linear_class = Linear
+        super().__init__(config, linear_class=linear_class)
+        self.q_proj = linear_class(
             2 * config.hidden_size,
             config.num_attention_heads * config.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.k_proj = Linear(
+        self.k_proj = linear_class(
             2 * config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=config.attn_qkv_bias,
         )
-        self.v_proj = Linear(
+        self.v_proj = linear_class(
             2 * config.hidden_size,
             config.num_key_value_heads * config.head_dim,
             bias=config.attn_qkv_bias,
@@ -71,11 +74,12 @@ class Eagle3DraftModel(nn.Module):
         if config.draft_vocab_size is None and not config.use_target_lm_head:
             raise ValueError("Eagle3Config.draft_vocab_size must be set")
         target_hidden = config.target_hidden_size or config.hidden_size
+        linear_class = linear_class_for_config(config) or Linear
         # Number of target aux hidden states fused by fc (3 in every EAGLE-3
         # checkpoint; the fc input is target_hidden_size * num_aux = 3 * hidden).
         self._num_aux = 3
 
-        self.fc = Linear(3 * target_hidden, config.hidden_size, bias=False)
+        self.fc = linear_class(3 * target_hidden, config.hidden_size, bias=False)
         # Optional pre-fc norms (vLLM EAGLE-3): a single RMSNorm over the full
         # fused 3H input (norm_before_fc) and/or a per-aux RMSNorm on each H chunk
         # (fc_norm). Both are absent in the AngelSlim / speculators checkpoints.
@@ -90,14 +94,14 @@ class Eagle3DraftModel(nn.Module):
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = Eagle3Attention(config)
+        self.self_attn = Eagle3Attention(config, linear_class=linear_class)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, linear_class=linear_class)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = (
             None
             if config.use_target_lm_head
-            else Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+            else linear_class(config.hidden_size, config.draft_vocab_size, bias=False)
         )
         self.rotary_emb = initialize_rope(config)
 

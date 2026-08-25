@@ -24,6 +24,7 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import DFlashConfig
 from mobius.components import Linear, RMSNorm, initialize_rope
 from mobius.components._dflash import DFlashDecoderLayer
+from mobius.models.base import linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -70,12 +71,16 @@ class DFlashDraftModel(nn.Module):
                 "dflash.model.build_target_layer_ids()."
             )
 
+        linear_class = linear_class_for_config(config) or Linear
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                DFlashDecoderLayer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         # Project the concatenated target hidden states down to hidden_size.
         # No bias — matches the reference implementation.
-        self.fc = Linear(
+        self.fc = linear_class(
             len(config.target_layer_ids) * config.hidden_size,
             config.hidden_size,
             bias=False,
@@ -83,7 +88,7 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = (
-            Linear(config.hidden_size, config.draft_vocab_size, bias=False)
+            linear_class(config.hidden_size, config.draft_vocab_size, bias=False)
             if config.use_draft_lm_head
             else None
         )
