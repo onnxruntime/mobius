@@ -158,7 +158,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "LLaDAMoEModel": "Alias for llada_moe — covered by src/mobius/models/llada_test.py",
     "rnd1": "Masked-diffusion MoE LM — covered by src/mobius/models/llada_test.py; "
     "non-standard bidirectional I/O has no generic golden-data path",
-    "phimoe_gguf": "GGUF-specific PhiMoE graph variant — covered by GGUF integration tests",
     "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
     "and GGUF integration tests; generic encoder tests require token_type_ids",
     # --- Internal / duplicate aliases ---
