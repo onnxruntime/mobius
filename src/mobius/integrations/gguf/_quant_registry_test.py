@@ -236,6 +236,14 @@ class TestCensusCoverage:
         assert values.size == spec.block_elements
         assert np.isfinite(values).all()
 
+    def test_all_pinned_stored_quantized_types_are_registered(self) -> None:
+        stored_quantized = [
+            spec
+            for spec in iter_quant_specs()
+            if spec.readable and spec.role is StorageRole.QUANTIZED
+        ]
+        assert len(stored_quantized) == 25
+
     @pytest.mark.parametrize("spec", iter_quant_specs(), ids=lambda s: s.name)
     def test_geometry_matches_upstream(self, spec) -> None:
         upstream = upstream_quant_types()[spec.ggml_type_id]
