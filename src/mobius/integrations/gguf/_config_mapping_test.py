@@ -1063,6 +1063,16 @@ class TestConventionalSharedMoeConfig:
         assert config.norm_topk_prob is False
         assert config.routed_scaling_factor == pytest.approx(1.0)
 
+    @pytest.mark.parametrize("route_scale", [-1.0, float("nan"), float("inf")])
+    def test_invalid_routing_scale_is_rejected(self, route_scale: float) -> None:
+        from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+        metadata = self._metadata("deepseek")
+        metadata["deepseek.expert_weights_scale"] = route_scale
+
+        with pytest.raises(ValueError, match="finite positive"):
+            gguf_to_config(_FakeDenseGGUF("deepseek", metadata, ["output.weight"]))
+
     @pytest.mark.parametrize("architecture", ["bailingmoe", "deepseek"])
     def test_fixed_softmax_architectures_reject_sigmoid(self, architecture: str) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config

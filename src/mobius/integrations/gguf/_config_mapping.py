@@ -1404,6 +1404,11 @@ def _conventional_shared_moe_postprocess(
     # llama.cpp uses zero as the serialized default sentinel.
     if math.isclose(route_scale, 0.0):
         route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError(
+            f"{arch}.expert_weights_scale must resolve to a finite positive value, "
+            f"got {route_scale!r}"
+        )
 
     qkv_bias_layers = []
     for layer in range(config.num_hidden_layers):

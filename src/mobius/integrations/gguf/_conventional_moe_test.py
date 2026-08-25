@@ -47,6 +47,7 @@ def _fixture(
         f"{architecture}.block_count": layers,
         f"{architecture}.attention.head_count": heads,
         f"{architecture}.attention.head_count_kv": kv_heads,
+        f"{architecture}.attention.layer_norm_rms_epsilon": 1e-5,
         f"{architecture}.rope.dimension_count": head_dim,
         f"{architecture}.vocab_size": vocab,
         f"{architecture}.expert_count": experts,
@@ -211,4 +212,39 @@ def test_dots1_rejects_non_authoritative_attention_geometry(
     model.metadata[metadata_key] = value
 
     with pytest.raises(ValueError, match="invalid attention geometry"):
+        _raise_for_invalid_conventional_moe_tensor_contract(model)
+
+
+@pytest.mark.parametrize("dense_prefix", [0, 2])
+def test_deepseek_accepts_single_expert_routed_and_all_dense(
+    dense_prefix: int,
+) -> None:
+    model = _fixture("deepseek", dense_prefix=dense_prefix)
+    model.metadata["deepseek.expert_count"] = 1
+    model.metadata["deepseek.expert_used_count"] = 1
+    for name, shape in list(model._tensors.items()):
+        if name.endswith("ffn_gate_inp.weight"):
+            model._tensors[name] = (1, shape[1])
+        elif "_exps." in name:
+            model._tensors[name] = (1, *shape[1:])
+
+    _raise_for_invalid_conventional_moe_tensor_contract(model)
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "value"),
+    [
+        ("attention.layer_norm_rms_epsilon", 0.0),
+        ("attention.layer_norm_rms_epsilon", float("nan")),
+        ("expert_weights_scale", -1.0),
+        ("expert_weights_scale", float("inf")),
+    ],
+)
+def test_conventional_moe_rejects_invalid_scalar_metadata(
+    metadata_key: str, value: float
+) -> None:
+    model = _fixture("deepseek")
+    model.metadata[f"deepseek.{metadata_key}"] = value
+
+    with pytest.raises(ValueError, match="invalid normalization or routing scale"):
         _raise_for_invalid_conventional_moe_tensor_contract(model)

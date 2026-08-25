@@ -1620,6 +1620,7 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         "feed_forward_length",
         "block_count",
         "attention.head_count",
+        "attention.layer_norm_rms_epsilon",
         "expert_count",
         "expert_used_count",
         "expert_feed_forward_length",
@@ -1666,7 +1667,6 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         <= 0
         or hidden % heads
         or heads % kv_heads
-        or experts <= 1
         or top_k > experts
         or not 0 <= dense_prefix <= layers
         or (architecture == "bailingmoe" and dense_prefix)
@@ -1686,6 +1686,17 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         or (architecture == "dots1" and (kv_heads != heads or rope_dim != head_dim))
     ):
         raise ValueError(f"{architecture} GGUF has invalid attention geometry")
+    norm_epsilon = float(metadata[f"{architecture}.attention.layer_norm_rms_epsilon"])
+    route_scale = float(metadata.get(f"{architecture}.expert_weights_scale", 1.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if (
+        not math.isfinite(norm_epsilon)
+        or norm_epsilon <= 0
+        or not math.isfinite(route_scale)
+        or route_scale <= 0
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid normalization or routing scale")
 
     actual = {
         name: tuple(int(dimension) for dimension in shape)
