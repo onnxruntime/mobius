@@ -115,6 +115,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # Bloom: LayerNorm accumulation differs after eps alignment → ~0.019 max diff.
     # Argmax correct, cosine=0.9998 — model is functionally correct.
     "bloom": 0.02,
+    # Jais2 combines LayerNorm with squared-ReLU; ORT/PyTorch accumulation differs
+    # by ~0.0025 while retaining the same argmax and cosine >= 0.99999.
+    "jais2": 0.003,
     # Jamba MoE+Mamba: FP accumulation differences from sequential vs batched expert
     # dispatch, plus Mamba1 SSM single-token decode FP path differences.
     # Argmax correct, cosine=0.998 — model is functionally correct.

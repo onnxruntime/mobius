@@ -24,11 +24,13 @@ from onnxscript import nn
 
 from mobius._configs import (
     BaseModelConfig,
+    CodeShellConfig,
     Eagle3Config,
     FalconH1Config,
     Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    Jais2Config,
     KimiK3Config,
     KimiLinearConfig,
     Lfm2Config,
@@ -43,12 +45,14 @@ from mobius._configs import (
     Plamo2Config,
     SenseNovaU1Config,
     WhisperConfig,
+    XverseConfig,
 )
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
+    CodeShellCausalLMModel,
     Cosmos3EdgeTextModel,
     Cosmos3EdgeVLModel,
     Cosmos3OmniReasonerModel,
@@ -84,6 +88,7 @@ from mobius.models import (
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
+    Jais2CausalLMModel,
     KimiK3CausalLMModel,
     KimiLinearCausalLMModel,
     LayerNormCausalLMModel,
@@ -131,6 +136,7 @@ from mobius.models import (
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
     WhisperForConditionalGeneration,
+    XverseCausalLMModel,
 )
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
@@ -151,8 +157,14 @@ from mobius.models.falcon import (
 from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.gguf_encoders import (
+    EuroBertGGUFModel,
+    JinaBertV2GGUFModel,
+    NeoBertGGUFModel,
+    NomicBertGGUFModel,
+)
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
-from mobius.models.gpt2 import GPT2CausalLMModel
+from mobius.models.gpt2 import GPT2CausalLMModel, ScaledEmbeddingGPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
 from mobius.models.gptj_codegen import CodeGenCausalLMModel, GPTJCausalLMModel
 from mobius.models.granitemoehybrid import GraniteMoeHybridCausalLMModel
@@ -420,7 +432,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "baichuan": ModelRegistration(CausalLMModel),
     "code_llama": ModelRegistration(CausalLMModel),
     "codegen2": ModelRegistration(CausalLMModel),
-    "command_r": ModelRegistration(CausalLMModel),
+    "command_r": ModelRegistration(CohereCausalLMModel),
+    "jais2": ModelRegistration(Jais2CausalLMModel, config_class=Jais2Config),
+    "kclgpt": ModelRegistration(CodeShellCausalLMModel, config_class=CodeShellConfig),
     "csm": ModelRegistration(CausalLMModel),
     "dots1": ModelRegistration(DeepSeekV3CausalLMModel),
     "evolla": ModelRegistration(CausalLMModel),
@@ -433,6 +447,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "ministral3": ModelRegistration(CausalLMModel),
     "mistral": ModelRegistration(CausalLMModel),
     "open-llama": ModelRegistration(CausalLMModel),
+    "xverse": ModelRegistration(XverseCausalLMModel, config_class=XverseConfig),
     "openelm": ModelRegistration(CausalLMModel),
     "qwen2": ModelRegistration(CausalLMModel),
     "seed_oss": ModelRegistration(CausalLMModel),
@@ -445,6 +460,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "apertus": ModelRegistration(ApertusCausalLMModel),
     "arcee": ModelRegistration(ArceeCausalLMModel),
     "bloom": ModelRegistration(BloomCausalLMModel),
+    "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
     "codegen": ModelRegistration(CodeGenCausalLMModel),
     "cohere": ModelRegistration(CohereCausalLMModel),
@@ -803,6 +819,18 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "megatron-bert": ModelRegistration(BertModel, task="feature-extraction"),
     "mobilebert": ModelRegistration(BertModel, task="feature-extraction"),
     "modernbert": ModelRegistration(ModernBertModel, task="feature-extraction"),
+    "eurobert_gguf": ModelRegistration(
+        EuroBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "jina_bert_v2_gguf": ModelRegistration(
+        JinaBertV2GGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "neo_bert_gguf": ModelRegistration(
+        NeoBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "nomic_bert_gguf": ModelRegistration(
+        NomicBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
     "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
     "mra": ModelRegistration(BertModel, task="feature-extraction"),
     "nezha": ModelRegistration(BertModel, task="feature-extraction"),
@@ -821,7 +849,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "xmod": ModelRegistration(BertModel, task="feature-extraction"),
     "yoso": ModelRegistration(BertModel, task="feature-extraction"),
     # --- Absolute positional embeddings (non-RoPE) ---
-    "biogpt": ModelRegistration(GPT2CausalLMModel),
+    "biogpt": ModelRegistration(ScaledEmbeddingGPT2CausalLMModel),
     "ctrl": ModelRegistration(CTRLCausalLMModel),
     "gpt-sw3": ModelRegistration(GPT2CausalLMModel),
     "gpt2": ModelRegistration(GPT2CausalLMModel),
@@ -830,7 +858,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "imagegpt": ModelRegistration(GPT2CausalLMModel),
     "openai-gpt": ModelRegistration(GPT2CausalLMModel),
     "opt": ModelRegistration(OPTCausalLMModel),
-    "xglm": ModelRegistration(GPT2CausalLMModel),
+    "xglm": ModelRegistration(ScaledEmbeddingGPT2CausalLMModel),
     "xlm": ModelRegistration(XLMCausalLMModel),
     # --- Encoder-decoder ---
     "bart": ModelRegistration(BartForConditionalGeneration, task="seq2seq"),
@@ -1013,11 +1041,14 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "zamba2": "Zyphra/Zamba2-1.2B",
     "codegen2": "Salesforce/codegen2-1B",
     "command_r": "CohereForAI/c4ai-command-r-v01",
+    "jais2": "inceptionai/Jais-2-8B-Chat",
+    "kclgpt": "WisdomShell/CodeShell-7B",
     "csm": "sesame/csm-1b",
     "evolla": "westlake-repl/Evolla-10B-hf",
     "nemotron_h": "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
     "nemotron_parse": "nvidia/NVIDIA-Nemotron-Parse-2.0",
     "open-llama": "openlm-research/open_llama_3b",
+    "orion": "OrionStarAI/Orion-14B-Base",
     "persimmon": "adept/persimmon-8b-base",
     "shieldgemma2": "google/shieldgemma-2b",
     "solar_open": "upstage/solar-pro-preview-instruct",
@@ -1068,6 +1099,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "imagegpt": "openai/imagegpt-small",
     "openai-gpt": "openai-community/openai-gpt",
     "xglm": "facebook/xglm-564M",
+    "xverse": "xverse/XVERSE-7B",
     "xlm": "FacebookAI/xlm-mlm-en-2048",
 
     # --- Mixture of Experts ---

@@ -44,7 +44,17 @@ class TestGenaiConfigGeneratorLLM:
         assert decoder["head_size"] == 128
         assert decoder["filename"] == "model.onnx"
 
-    @pytest.mark.parametrize("model_type", ["llama", "qwen2", "gemma4_text", "custom"])
+    @pytest.mark.parametrize(
+        "model_type",
+        [
+            "llama",
+            "qwen2",
+            "gemma4_text",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+            "custom",
+        ],
+    )
     def test_decoder_only_types_are_normalized(self, model_type):
         gen = GenaiConfigGenerator(
             model_type,

@@ -117,16 +117,18 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_vl": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    # Qwen3.5 / Qwen3.6 use the Qwen-VL auxiliary vision+embedding pipeline
-    # but a hybrid DeltaNet/full-attention decoder, so they must select the
-    # native ORT GenAI qwen3_5 model type rather than the Qwen2.5-VL decoder.
+    # Preserve Qwen3.5 / Qwen3.6 source architecture identities here so package
+    # topology selection can distinguish standalone text from dense and MoE
+    # multimodal parents. Standalone text packages are normalized later to the
+    # released generic "decoder" type; multimodal variants retain the matching
+    # Qwen-VL type so the runtime constructs the vision+embedding pipeline.
     "qwen3_5": "qwen3_5",
-    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_text": "qwen3_5_text",
     "qwen3_5_vl": "qwen3_5",
     "qwen3_5_vl_text": "qwen3_5",
-    "qwen3_5_moe": "qwen3_5",
-    "qwen3_5_moe_text": "qwen3_5",
-    "qwen3_5_moe_vl": "qwen3_5",
+    "qwen3_5_moe": "qwen3_5_moe",
+    "qwen3_5_moe_text": "qwen3_5_moe_text",
+    "qwen3_5_moe_vl": "qwen3_5_moe",
     # GLM-OCR uses the Qwen2.5-VL three-model runtime contract: packed image
     # patches, M-RoPE position IDs, an embedding mixer, and a cached decoder.
     "glm_ocr": "qwen2_5_vl",
@@ -144,6 +146,18 @@ _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
     "gpt2": "gpt2",
     "lfm2": "lfm2",
     "lfm2_vl": "lfm2",
+}
+# Composite configs are unwrapped to their text sub-config during config-mode
+# builds. Recover the parent runtime type when the exported package still has
+# the full multimodal topology.
+_UNWRAPPED_VLM_MODEL_TYPES = {
+    "gemma3_text": "gemma3",
+    # Gemma3n must retain its own pipeline: it binds per-layer inputs that the
+    # Gemma3 runtime does not support.
+    "gemma3n_text": "gemma3n",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_vl_text": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5_moe",
 }
 _LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
 _GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
@@ -270,7 +284,10 @@ def _select_ort_model_type(
     ``DecoderOnly_Model``. Decoder-only packages therefore use that type unless
     the runtime has genuinely different behavior: ``gpt2`` selects ``Gpt_Model``,
     ``lfm2`` selects ``LFM2_Model``/``LFM2Cache``, and Phi-3 family names are
-    retained only for LongRoPE cache recomputation after the short-context threshold.
+    retained only for LongRoPE cache recomputation after the short-context
+    threshold. Standalone Qwen3.5 text configs also normalize to ``decoder``:
+    their specialized names dispatch to the same ``DecoderOnly_Model`` and are
+    not available in the latest released ORT GenAI.
 
     Multimodal and encoder-decoder packages retain their architecture-specific
     type because those values select distinct runtime pipelines and position-ID
@@ -1969,16 +1986,8 @@ def write_ort_genai_config(
         # Fall back to fields stored in ArchitectureConfig (set by from_transformers()).
         # This path is taken when hf_model_id is not provided (e.g. --config mode).
         raw_type = getattr(config, "model_type", None) or "unknown"
-        if is_vlm and raw_type == "gemma3_text":
-            # Gemma3 multimodal configs are unwrapped to the text sub-config
-            # during build, but ORT GenAI needs the multimodal parent type.
-            ort_model_type = "gemma3"
-        elif is_vlm and raw_type == "gemma3n_text":
-            # Same unwrapping for Gemma3n, whose parent type is "gemma3n".
-            # Deliberately *not* aliased to "gemma3": the package threads
-            # per_layer_inputs (and optional audio) that gemma3's ORT pipeline
-            # does not bind, so borrowing that type would mis-wire the graph.
-            ort_model_type = "gemma3n"
+        if is_vlm and raw_type in _UNWRAPPED_VLM_MODEL_TYPES:
+            ort_model_type = _UNWRAPPED_VLM_MODEL_TYPES[raw_type]
         else:
             ort_model_type = _select_ort_model_type(
                 raw_type,

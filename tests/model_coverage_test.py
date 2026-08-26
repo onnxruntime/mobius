@@ -161,9 +161,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
     "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
     "real-weight L4/L5 parity remains pending.",
-    "kimi_k3": "Kimi-K3 is a large remote-code KDA/NoPE-MLA/attention-residual "
-    "latent-MoE decoder; L1-L2 and synthetic GGUF execution are covered, while "
-    "real-weight L4/L5 parity remains pending.",
+    "kimi_k3": "Registered tiny checkpoint uses selective MXFP4 compressed-tensors "
+    "unsupported by the generic loader; dedicated model/GGUF tests exist, and "
+    "real-weight L4/L5 awaits an unquantized or supported checkpoint.",
     "lfm2_moe": "LFM2-MoE (8B-A1B) — L1-L2 config validation is covered, while "
     "real-weight L4/L5 golden-data parity requires GPU and remains pending.",
     "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
@@ -176,6 +176,18 @@ _COVERAGE_SKIP: dict[str, str] = {
     "helium": "Alias for mistral — covered by mistral",
     "open-llama": "Alias for llama — covered by llama",
     "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
+    "eurobert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "jina_bert_v2_gguf": "GGUF-only specialized encoder — no native HF model_type route "
+    "for generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT "
+    "parity are covered by _specialized_encoders_test.py.",
+    "neo_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
+    "nomic_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
+    "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
+    "are covered by _specialized_encoders_test.py.",
     "seed_oss": "Internal model — no public HF checkpoint",
     "shieldgemma2": "Alias for gemma2 — covered by gemma2",
     "yi": "Alias for llama — covered by llama",
@@ -241,8 +253,22 @@ _COVERAGE_SKIP: dict[str, str] = {
     "deepseek_v3": "Very large MoE (671B) — no small public checkpoint",
     "deepseek_v4": "Very large MoE (284B) — no small public checkpoint",
     "glm_moe_dsa": "Very large MoE (~1.5T, zai-org/GLM-5.2) — no small public checkpoint",
+    "jais2": "Jais2's smallest public checkpoint is 8B; L1-L3 graph, config, "
+    "weight-alignment, and synthetic parity are covered, but real-weight L4/L5 "
+    "goldens exceed the CPU CI budget.",
+    "kclgpt": "CodeShell's public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and synthetic weight-path coverage are present, but no "
+    "small public artifact exists for bounded L4/L5 golden generation.",
+    "lfm2_moe": "LFM2-MoE is an 8B hybrid recurrent/MoE model with no small public "
+    "checkpoint; dedicated unit and synthetic parity tests cover its graph and "
+    "weight paths.",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
+    "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
+    "covered, but no small public artifact exists for bounded L4/L5 validation.",
     "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
+    "xverse": "Xverse's smallest public checkpoint is 7B; L1 graph, config, "
+    "weight-alignment, and value-based GGUF permutation coverage are present, "
+    "but real-weight L4/L5 goldens exceed the CPU CI budget.",
     # --- Models without test_model_id ---
     "aya_vision": "VL model — no test_model_id yet",
     "chameleon": "VL model — no test_model_id yet",

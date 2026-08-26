@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -26,6 +28,28 @@ def _tiny_overrides() -> dict:
         for model_type, overrides, _representative in CAUSAL_LM_CONFIGS
         if model_type == "falcon_h1"
     )
+
+
+def _linear_attention_state(
+    states: torch.Tensor | Mapping[int, torch.Tensor | None], state_name: str
+) -> torch.Tensor:
+    if isinstance(states, torch.Tensor):
+        return states
+    elif isinstance(states, Mapping):
+        assert set(states) == {0}, (
+            f"Falcon-H1 expected one {state_name} tensor at state index 0, "
+            f"got indices {sorted(states)}"
+        )
+        state = states[0]
+        assert state is not None, (
+            f"Falcon-H1 expected {state_name} at state index 0 to be a tensor, got None"
+        )
+        return state
+    else:
+        raise AssertionError(  # noqa: TRY004 - unexpected test data is an assertion failure
+            f"Falcon-H1 received unexpected {state_name} container type: "
+            f"{type(states).__name__}"
+        )
 
 
 def test_falcon_h1_rejects_invalid_attention_and_ssm_geometry() -> None:
@@ -188,6 +212,10 @@ def test_falcon_h1_prefill_decode_logits_and_four_states_match_transformers() ->
             atol=1e-3,
         )
         for layer, hf_state in enumerate(hf_prefill.past_key_values.layers):
+            hf_conv_state = _linear_attention_state(hf_state.conv_states, "convolution state")
+            hf_recurrent_state = _linear_attention_state(
+                hf_state.recurrent_states, "recurrent state"
+            )
             np.testing.assert_allclose(
                 ort_prefill[f"present.{layer}.key"],
                 hf_state.keys.numpy(),
@@ -200,23 +228,15 @@ def test_falcon_h1_prefill_decode_logits_and_four_states_match_transformers() ->
                 rtol=1e-4,
                 atol=1e-4,
             )
-            # transformers >=5.14 changed conv_states/recurrent_states from a tensor
-            # to a dict keyed by state index; extract the tensor for either version.
-            hf_conv_states = hf_state.conv_states
-            if isinstance(hf_conv_states, dict):
-                hf_conv_states = hf_conv_states[0]
-            hf_recurrent_states = hf_state.recurrent_states
-            if isinstance(hf_recurrent_states, dict):
-                hf_recurrent_states = hf_recurrent_states[0]
             np.testing.assert_allclose(
                 ort_prefill[f"present.{layer}.conv_state"],
-                hf_conv_states[:, :, -(config.mamba_d_conv - 1) :].numpy(),
+                hf_conv_state[:, :, -(config.mamba_d_conv - 1) :].numpy(),
                 rtol=1e-4,
                 atol=1e-4,
             )
             np.testing.assert_allclose(
                 ort_prefill[f"present.{layer}.ssm_state"],
-                hf_recurrent_states.transpose(2, 3).numpy(),
+                hf_recurrent_state.transpose(2, 3).numpy(),
                 rtol=1e-3,
                 atol=1e-3,
             )

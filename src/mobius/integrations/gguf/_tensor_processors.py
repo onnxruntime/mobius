@@ -198,6 +198,45 @@ def _reverse_permute(
     return w.swapaxes(1, 2).reshape(weights.shape)
 
 
+def _process_bloom(
+    state_dict: dict[str, torch.Tensor], config: Any
+) -> dict[str, torch.Tensor]:
+    """Restore Bloom's head-interleaved HF QKV layout from canonical GGUF order."""
+    heads = int(config.num_attention_heads)
+    hidden = int(config.hidden_size)
+    for name, tensor in list(state_dict.items()):
+        if ".query_key_value." not in name:
+            continue
+        tail = tensor.shape[1:]
+        q, k, v = tensor.reshape(3, hidden, *tail)
+        state_dict[name] = torch.stack(
+            (
+                q.reshape(heads, -1, *tail),
+                k.reshape(heads, -1, *tail),
+                v.reshape(heads, -1, *tail),
+            ),
+            dim=1,
+        ).reshape(tensor.shape)
+    return state_dict
+
+
+def _process_xverse(
+    state_dict: dict[str, torch.Tensor], config: Any
+) -> dict[str, torch.Tensor]:
+    """Invert the pinned Xverse converter's architecture-specific Q/K transforms."""
+    q_heads = int(config.num_attention_heads)
+    kv_heads = int(config.num_key_value_heads)
+    for name, tensor in list(state_dict.items()):
+        if name.endswith(".q_proj.weight"):
+            heads = q_heads
+        elif name.endswith(".k_proj.weight"):
+            heads = q_heads // kv_heads if q_heads != kv_heads else q_heads
+        else:
+            continue
+        state_dict[name] = _reverse_permute(tensor, heads)
+    return state_dict
+
+
 def _process_unoffset_norm(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -515,6 +554,8 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "granitehybrid": _process_granitehybrid,
     "kimi_linear": _process_kimi_linear,
     "kimi_k3": _process_kimi_k3,
+    "bloom": _process_bloom,
+    "xverse": _process_xverse,
 }
 
 #: mobius ``model_type`` values that no GGUF architecture maps to, but that a

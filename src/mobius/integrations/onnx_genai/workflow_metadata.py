@@ -127,7 +127,6 @@ from mobius.integrations.onnx_genai.package_facts import (
     attach_package_facts,
     source_declared_value,
 )
-from mobius.tasks._ctc_asr import BATCH_PADDING_SENSITIVE_KEY
 
 
 class _NoAliasSafeDumper(yaml.SafeDumper):
@@ -225,6 +224,11 @@ def _component(
     Only ports in this producer's own vocabulary get a role, and state ports
     never need one: the group that carries them already names its pairs, which
     is also where the fixed-capacity scatter ABI is stated.
+
+    ``batch_capacity`` is intentionally absent. A request-aligned or dynamic
+    batch axis is structural shape information, not proof that co-batching
+    preserves each request's result. Builders may add that semantic permission
+    only after the complete grouped contract has been authored and validated.
     """
     del effects
     named = [str(value.name) for value in (*model.graph.inputs, *model.graph.outputs)]
@@ -9957,23 +9961,6 @@ def build_ctc_asr_workflow_metadata(
     if has_frame_lengths:
         decoding["lengths"] = "frame_lengths"
 
-    # A feature extractor that reduces over the padded time axis makes a row's
-    # values depend on the width of the batch it was padded into.  The fact is
-    # recorded by the task on the built graph; when nobody stated it we leave
-    # the field absent rather than claim rows are independent.
-    normalization = getattr(config, "feat_extract_norm", None)
-    if normalization == "group":
-        batch_invariance = "padding_sensitive"
-    elif normalization == "layer":
-        batch_invariance = "row_independent"
-    else:
-        recorded = model.metadata_props.get(BATCH_PADDING_SENSITIVE_KEY)
-        batch_invariance = (
-            None
-            if recorded is None
-            else ("padding_sensitive" if recorded == "true" else "row_independent")
-        )
-
     profile: dict[str, Any] = {
         "kind": "transcription",
         "version": "1.0",
@@ -9981,11 +9968,6 @@ def build_ctc_asr_workflow_metadata(
         "outputs": profile_outputs,
         "decoding": decoding,
     }
-    # The claim is only checkable when the package also publishes per-row
-    # lengths; without them a reader cannot isolate a row's valid region.
-    if batch_invariance == "row_independent" or has_frame_lengths:
-        if batch_invariance is not None:
-            profile["batch_invariance"] = batch_invariance
 
     metadata: dict[str, Any] = {
         "schema_version": "v1",
@@ -10187,7 +10169,6 @@ def build_encoder_embedding_workflow_metadata(
             "axis": 1,
             "normalize": False,
         }
-        profile["batch_invariance"] = "row_independent"
 
     return {
         "schema_version": "v1",

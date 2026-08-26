@@ -27,4 +27,4 @@ python -m pytest src/mobius/integrations/onnx_genai/ -q
 Set `ONNX_GENAI_SCHEMA=/path/to/inference_metadata.schema.json` to validate
 against a different revision without editing this copy.
 
-Synced from onnx-genai `10dfcd788` (2026-08-22).
+Synced from onnx-genai `cb7baf924` (2026-08-25).

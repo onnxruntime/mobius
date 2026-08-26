@@ -196,6 +196,81 @@ class _FakeHFConfig:
         self.__dict__.update(kwargs)
 
 
+def test_codeshell_config_normalizes_published_hf_fields_and_biases():
+    from mobius._configs import CodeShellConfig
+
+    cfg = _FakeHFConfig(
+        model_type="kclgpt",
+        vocab_size=70144,
+        n_positions=8192,
+        n_embd=4096,
+        n_layer=42,
+        n_head=32,
+        n_inner=16384,
+        activation_function="gelu_pytorch_tanh",
+        layer_norm_epsilon=1e-5,
+        group_query_attention=True,
+        num_query_groups=8,
+        position_embedding_type="rope",
+        rope_scaling=None,
+    )
+    out = CodeShellConfig.from_transformers(cfg)
+    assert (out.hidden_size, out.num_hidden_layers) == (4096, 42)
+    assert (out.num_attention_heads, out.num_key_value_heads) == (32, 8)
+    assert out.intermediate_size == 16384
+    assert out.max_position_embeddings == 8192
+    assert out.attn_qkv_bias and out.attn_o_bias and out.mlp_bias
+    assert out.tie_word_embeddings
+    assert out.rope is not None
+    assert out.rope_theta == pytest.approx(10_000.0)
+
+
+def test_xverse_config_supplies_source_rope_default():
+    from mobius._configs import XverseConfig
+
+    cfg = _FakeHFConfig(
+        model_type="xverse",
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        max_position_embeddings=32,
+        rms_norm_eps=1e-6,
+    )
+    out = XverseConfig.from_transformers(cfg)
+    assert out.rope is not None
+    assert out.rope_theta == pytest.approx(10_000.0)
+
+
+def test_jais2_config_preserves_published_bias_and_norm_fields():
+    from mobius._configs import Jais2Config
+
+    cfg = _FakeHFConfig(
+        model_type="jais2",
+        vocab_size=150272,
+        hidden_size=3328,
+        intermediate_size=26624,
+        num_hidden_layers=32,
+        num_attention_heads=26,
+        num_key_value_heads=26,
+        head_dim=128,
+        hidden_act="relu2",
+        max_position_embeddings=8192,
+        rope_parameters={"rope_theta": 10_000.0, "rope_type": "default"},
+        attention_bias=True,
+        mlp_bias=True,
+        layer_norm_eps=1e-5,
+        tie_word_embeddings=False,
+    )
+    out = Jais2Config.from_transformers(cfg)
+
+    assert out.attn_qkv_bias and out.attn_o_bias
+    assert out.mlp_bias
+    assert out.rms_norm_eps == pytest.approx(1e-5)
+    assert not out.tie_word_embeddings
+
+
 def test_scalar_intermediate_size_passes_through():
     cfg = _FakeHFConfig(
         hidden_size=2048,
