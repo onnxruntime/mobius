@@ -327,9 +327,7 @@ def _dequantize_fp8_tensor(
         for block_col in range(expected_grid_shape[1]):
             col_start = block_col * 128
             col_end = min(col_start + 128, cols)
-            dequantized[row_start:row_end, col_start:col_end].mul_(
-                scale[block_row, block_col]
-            )
+            dequantized[row_start:row_end, col_start:col_end].mul_(scale[block_row, block_col])
     return dequantized
 
 

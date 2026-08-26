@@ -93,6 +93,43 @@ class TestModelPackageDict:
         assert pkg.config is config
 
 
+class TestWeightLoadingReport:
+    def test_roundtrips_with_package(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        pkg.save(str(tmp_path), progress_bar=False)
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.weight_loading_report == pkg.weight_loading_report
+        assert (tmp_path / "weight-loading-report.json").is_file()
+
+    def test_ordinary_resave_removes_stale_report(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+        }
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        pkg.weight_loading_report = None
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "weight-loading-report.json").exists()
+
+    def test_load_rejects_invalid_report(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.save(str(tmp_path), progress_bar=False)
+        (tmp_path / "weight-loading-report.json").write_text('{"format": "unknown"}')
+
+        with pytest.raises(ValueError, match="Invalid weight-loading report"):
+            ModelPackage.load(str(tmp_path))
+
+
 class TestOnnxShardedSave:
     def test_onnx_external_data_is_sharded(self, tmp_path):
         graph = ir.Graph([], [], nodes=[], name="m")

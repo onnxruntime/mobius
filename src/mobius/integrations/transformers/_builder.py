@@ -353,9 +353,8 @@ def build_transformers_model(
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        if (
-            config.block_quant_scheme is not None
-            and hasattr(model_module, "build_fp8_streaming_plan")
+        if config.block_quant_scheme is not None and hasattr(
+            model_module, "build_fp8_streaming_plan"
         ):
             if len(package) != 1:
                 raise ValueError(

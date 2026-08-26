@@ -24,6 +24,45 @@ class _DummyModule(nn.Module):
         self.config = config
 
 
+def test_qwen38_fp8_defaults_to_immutable_integrated_revision(monkeypatch) -> None:
+    calls = []
+
+    def stop_after_config(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        stop_after_config,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            load_weights=False,
+        )
+
+    assert calls == [
+        (
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            {
+                "revision": "41cc25fe32cc20053a59c89716196897580cddf6",
+                "trust_remote_code": False,
+            },
+        )
+    ]
+
+
+def test_qwen38_fp8_rejects_other_revision() -> None:
+    with pytest.raises(ValueError, match="integrated only at immutable revision"):
+        transformers_builder.build_transformers_model(
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            revision="main",
+            load_weights=False,
+        )
+
+
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
     config = make_config(model_type="qwen2")

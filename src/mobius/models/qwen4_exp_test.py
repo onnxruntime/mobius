@@ -1066,7 +1066,9 @@ def test_preprocess_fails_closed_on_missing_or_unexpected_ple_shards():
     config = _config(split_ngram_parts=2)
     module = Qwen4ExpCausalLMModel(config)
     target = "model.layers.0.ple.ple_embedding.ngram_embedding"
-    shard_shape = tuple(module.model.layers[0].ple.ple_embedding.ngram_embedding.shard_0.weight.shape)
+    shard_shape = tuple(
+        module.model.layers[0].ple.ple_embedding.ngram_embedding.shard_0.weight.shape
+    )
     with pytest.raises(ValueError, match=r"missing shard indices \[1\]"):
         module.preprocess_weights({f"{target}.shard_0.weight": torch.zeros(shard_shape)})
     with pytest.raises(ValueError, match=r"Unexpected Qwen4-Exp PLE shard index 2"):
@@ -1156,6 +1158,9 @@ def test_fp8_streaming_plan_prefers_composite_keys_and_classifies_sidecars():
     fallback = "model.layers.0.mlp.experts.0.gate_proj.weight"
     preferred = _source_name(fallback)
     source[fallback] = source[preferred]
+    source[fallback[: -len(".weight")] + ".weight_scale_inv"] = source[
+        preferred[: -len(".weight")] + ".weight_scale_inv"
+    ]
     index = {
         name: ("shard.safetensors", list(tensor.shape), str(tensor.dtype))
         for name, tensor in source.items()
@@ -1199,9 +1204,9 @@ def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_pat
     )
 
     reference_module = Qwen4ExpCausalLMModel(config)
-    reference = build_from_module(
-        reference_module, config, task="qwen4-exp-text-generation"
-    )["model"]
+    reference = build_from_module(reference_module, config, task="qwen4-exp-text-generation")[
+        "model"
+    ]
     apply_weights(reference, dense_targets)
     feeds = _initial_states() | {
         "input_ids": np.array([[2, 3, 4]], dtype=np.int64),
@@ -1229,9 +1234,7 @@ def test_fp8_streaming_plan_rejects_unscaled_projection():
     module = Qwen4ExpCausalLMModel(config)
     model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
     source, _dense = _reduced_fp8_checkpoint(module)
-    scale_name = (
-        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"
-    )
+    scale_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"
     del source[scale_name]
     index = {
         name: (
@@ -1247,6 +1250,57 @@ def test_fp8_streaming_plan_rejects_unscaled_projection():
     }
 
     with pytest.raises(ValueError, match="has no scale"):
+        module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+
+def test_fp8_streaming_plan_validates_ignored_mtp_grid():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    source["mtp.layers.0.dummy.weight"] = torch.ones((129, 129), dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    source["mtp.layers.0.dummy.weight_scale_inv"] = torch.ones((1, 1), dtype=torch.bfloat16)
+    index = {
+        name: (
+            "shard.safetensors",
+            list(tensor.shape),
+            "F8_E4M3"
+            if tensor.dtype == torch.float8_e4m3fn
+            else "BF16"
+            if tensor.dtype == torch.bfloat16
+            else "I64",
+        )
+        for name, tensor in source.items()
+    }
+
+    with pytest.raises(ValueError, match="strict 128x128 blocks"):
+        module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+
+def test_fp8_streaming_plan_rejects_orphan_scale():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    source["model.language_model.orphan.weight_scale_inv"] = torch.ones(
+        (1, 1), dtype=torch.bfloat16
+    )
+    index = {
+        name: (
+            "shard.safetensors",
+            list(tensor.shape),
+            "F8_E4M3"
+            if tensor.dtype == torch.float8_e4m3fn
+            else "BF16"
+            if tensor.dtype == torch.bfloat16
+            else "I64",
+        )
+        for name, tensor in source.items()
+    }
+
+    with pytest.raises(ValueError, match="orphan inverse scale"):
         module.build_fp8_streaming_plan(index, model.graph.initializers)
 
 

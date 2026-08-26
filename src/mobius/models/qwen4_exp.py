@@ -54,6 +54,67 @@ def _source_name_for_qwen4_exp_target(target_name: str) -> str:
     return target_name
 
 
+def validate_qwen4_exp_fp8_header_contract(
+    key_index: Mapping[str, tuple[str, list[int], str]],
+) -> dict[str, int]:
+    """Validate every FP8 weight and inverse scale in a Qwen4-Exp checkpoint."""
+    scaled = 0
+    direct_cast_ple = 0
+    consumed_scales: set[str] = set()
+    for weight_name, (_path, weight_shape, weight_dtype) in key_index.items():
+        if not weight_dtype.startswith("F8"):
+            continue
+        scale_name = (
+            weight_name[: -len(".weight")] + ".weight_scale_inv"
+            if weight_name.endswith(".weight")
+            else weight_name + "_scale_inv"
+        )
+        scale_entry = key_index.get(scale_name)
+        if scale_entry is None:
+            if ".ple.ple_embedding.ngram_embedding.shard_" not in weight_name:
+                raise ValueError(
+                    f"Qwen4-Exp FP8 source '{weight_name}' has no scale and is "
+                    "not an upstream direct-cast PLE embedding shard"
+                )
+            if len(weight_shape) != 2:
+                raise ValueError(
+                    f"Qwen4-Exp direct-cast PLE source '{weight_name}' must be 2-D"
+                )
+            direct_cast_ple += 1
+            continue
+        _scale_path, scale_shape, scale_dtype = scale_entry
+        if len(weight_shape) != 2:
+            raise ValueError(f"Qwen4-Exp scaled FP8 source '{weight_name}' must be 2-D")
+        expected_grid = [
+            (weight_shape[0] + 127) // 128,
+            (weight_shape[1] + 127) // 128,
+        ]
+        if scale_shape != expected_grid:
+            raise ValueError(
+                f"Qwen4-Exp FP8 source '{weight_name}' has scale grid {scale_shape}; "
+                f"expected {expected_grid} for strict 128x128 blocks"
+            )
+        if scale_dtype != "BF16":
+            raise ValueError(
+                f"Qwen4-Exp FP8 source '{weight_name}' has scale dtype {scale_dtype}; "
+                "the pinned checkpoint requires BF16 inverse scales"
+            )
+        consumed_scales.add(scale_name)
+        scaled += 1
+
+    all_scales = {name for name in key_index if name.endswith(".weight_scale_inv")}
+    orphan_scales = sorted(all_scales - consumed_scales)
+    if orphan_scales:
+        raise ValueError(
+            f"Qwen4-Exp checkpoint has {len(orphan_scales)} orphan inverse scale(s), "
+            f"e.g. {orphan_scales[:5]}"
+        )
+    return {
+        "checkpoint_scaled_fp8_tensors": scaled,
+        "checkpoint_direct_cast_fp8_tensors": direct_cast_ple,
+    }
+
+
 def _splitmix64(value: int) -> int:
     value = (value + _SPLITMIX_GAMMA) & _MASK64
     value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
@@ -1225,6 +1286,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
             raise ValueError(
                 "Qwen4-Exp FP8 streaming requires the pinned 128x128 block scheme"
             )
+        header_report = validate_qwen4_exp_fp8_header_contract(key_index)
 
         targets: dict[str, StreamingWeightSource] = {}
         constants: dict[str, torch.Tensor] = {}
@@ -1261,6 +1323,12 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 ignored[lower_priority] = (
                     f"lower-priority alias of preferred source {source_name}"
                 )
+                if lower_priority.endswith(".weight"):
+                    lower_scale = lower_priority[: -len(".weight")] + ".weight_scale_inv"
+                    if lower_scale in key_index:
+                        ignored[lower_scale] = (
+                            f"scale for lower-priority alias {lower_priority}"
+                        )
 
             if initializer.const_value is not None:
                 constants[source_name] = torch.from_numpy(
@@ -1333,9 +1401,8 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 "direct_dense_tensors": modes["direct"],
                 "multimodal_package_complete": False,
                 "multimodal_dependency": "separate stacked Qwen4-Exp multimodal PR",
-                "source_preference": (
-                    "model.language_model.* > language_model.* > model.*"
-                ),
+                "source_preference": ("model.language_model.* > language_model.* > model.*"),
+                **header_report,
             },
         )
 
@@ -1391,8 +1458,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 prefix, suffix = key.split(marker, 1)
                 shard_index = int(suffix[: -len(".weight")])
                 target = (
-                    f"{prefix}.ple.ple_embedding.ngram_embedding."
-                    f"shard_{shard_index}.weight"
+                    f"{prefix}.ple.ple_embedding.ngram_embedding.shard_{shard_index}.weight"
                 )
                 if not 0 <= shard_index < self.config.split_ngram_parts:
                     raise ValueError(
