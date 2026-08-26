@@ -161,6 +161,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "kimi_linear": "Kimi Linear is a 48B remote-code hybrid with a heterogeneous "
     "KDA/MLA state ABI; L1-L2 and synthetic GGUF execution are covered, while "
     "real-weight L4/L5 parity remains pending.",
+    "kimi_k3": "Registered tiny checkpoint uses selective MXFP4 compressed-tensors "
+    "unsupported by the generic loader; dedicated model/GGUF tests exist, and "
+    "real-weight L4/L5 awaits an unquantized or supported checkpoint.",
     "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
     "and GGUF integration tests; generic encoder tests require token_type_ids",
     # --- Internal / duplicate aliases ---
@@ -254,6 +257,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "kclgpt": "CodeShell's public checkpoint is 7B; L1 graph, config, "
     "weight-alignment, and synthetic weight-path coverage are present, but no "
     "small public artifact exists for bounded L4/L5 golden generation.",
+    "lfm2_moe": "LFM2-MoE is an 8B hybrid recurrent/MoE model with no small public "
+    "checkpoint; dedicated unit and synthetic parity tests cover its graph and "
+    "weight paths.",
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
     "covered, but no small public artifact exists for bounded L4/L5 validation.",

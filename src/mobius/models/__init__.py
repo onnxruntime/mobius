@@ -83,6 +83,7 @@ __all__ = [
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JinaBertV2GGUFModel",
+    "Jais2CausalLMModel",
     "JetMoeCausalLMModel",
     "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
@@ -189,6 +190,7 @@ __all__ = [
     "WhisperForConditionalGeneration",
     "MLPWorldModel",
     "XLMCausalLMModel",
+    "XverseCausalLMModel",
     "Zamba2CausalLMModel",
     "mimi_default_config",
     "moshi_depformer_config",
@@ -277,7 +279,9 @@ from mobius.models.kimi_k3 import KimiK3CausalLMModel
 from mobius.models.kimi_linear import KimiLinearCausalLMModel
 from mobius.models.legacy_decoder import (
     CodeShellCausalLMModel,
+    Jais2CausalLMModel,
     LegacyLayerNormCausalLMModel,
+    XverseCausalLMModel,
 )
 from mobius.models.lfm2 import Lfm2CausalLMModel, Lfm2MoECausalLMModel
 from mobius.models.lfm2_vl import Lfm2VlForConditionalGeneration

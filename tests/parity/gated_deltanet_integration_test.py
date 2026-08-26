@@ -14,6 +14,8 @@ Run with::
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import onnx_ir as ir
 import pytest
@@ -56,6 +58,29 @@ _HF_CONFIG = Qwen3_5TextConfig(
     linear_value_head_dim=16,
     linear_conv_kernel_dim=4,
 )
+
+
+def _recurrent_state_tensor(
+    states: torch.Tensor | Mapping[int, torch.Tensor | None],
+) -> torch.Tensor:
+    """Extract the single recurrent-state tensor across Transformers cache ABIs."""
+    if isinstance(states, torch.Tensor):
+        return states
+    elif isinstance(states, Mapping):
+        assert set(states) == {0}, (
+            "Qwen3.5 expected one recurrent-state tensor at state index 0, "
+            f"got indices {sorted(states)}"
+        )
+        state = states[0]
+        assert state is not None, (
+            "Qwen3.5 expected recurrent state at state index 0 to be a tensor, got None"
+        )
+        return state
+    else:
+        raise AssertionError(  # noqa: TRY004 - unexpected test data is an assertion failure
+            "Qwen3.5 received unexpected recurrent-state container type: "
+            f"{type(states).__name__}"
+        )
 
 
 def _build_cache_feeds(
@@ -128,9 +153,9 @@ def parity_outputs():
             position_ids=torch.from_numpy(position_ids),
         )
     hf_logits = hf_out.logits.numpy()
-    # transformers >=5.x stores recurrent state per cache layer
-    # (``cache.layers[idx].recurrent_states``) instead of a top-level list.
-    hf_rec = hf_out.past_key_values.layers[0].recurrent_states.numpy()
+    # transformers >=5.14 stores recurrent state in a mapping keyed by state
+    # index; earlier releases expose the tensor directly.
+    hf_rec = _recurrent_state_tensor(hf_out.past_key_values.layers[0].recurrent_states).numpy()
 
     # ONNX forward — build zero-valued cache feeds from graph inputs.
     base_feeds: dict[str, np.ndarray] = {

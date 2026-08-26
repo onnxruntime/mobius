@@ -88,10 +88,10 @@ from mobius.models import (
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
     InternLM2CausalLMModel,
+    Jais2CausalLMModel,
     KimiK3CausalLMModel,
     KimiLinearCausalLMModel,
     LayerNormCausalLMModel,
-    LegacyLayerNormCausalLMModel,
     Lfm2CausalLMModel,
     Lfm2MoECausalLMModel,
     Lfm2VlForConditionalGeneration,
@@ -136,6 +136,7 @@ from mobius.models import (
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
     WhisperForConditionalGeneration,
+    XverseCausalLMModel,
 )
 from mobius.models.bamba import BambaCausalLMModel
 from mobius.models.bart import BartForConditionalGeneration
@@ -432,7 +433,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "code_llama": ModelRegistration(CausalLMModel),
     "codegen2": ModelRegistration(CausalLMModel),
     "command_r": ModelRegistration(CohereCausalLMModel),
-    "jais2": ModelRegistration(LegacyLayerNormCausalLMModel, config_class=Jais2Config),
+    "jais2": ModelRegistration(Jais2CausalLMModel, config_class=Jais2Config),
     "kclgpt": ModelRegistration(CodeShellCausalLMModel, config_class=CodeShellConfig),
     "csm": ModelRegistration(CausalLMModel),
     "dots1": ModelRegistration(DeepSeekV3CausalLMModel),
@@ -446,7 +447,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "ministral3": ModelRegistration(CausalLMModel),
     "mistral": ModelRegistration(CausalLMModel),
     "open-llama": ModelRegistration(CausalLMModel),
-    "xverse": ModelRegistration(CausalLMModel, config_class=XverseConfig),
+    "xverse": ModelRegistration(XverseCausalLMModel, config_class=XverseConfig),
     "openelm": ModelRegistration(CausalLMModel),
     "qwen2": ModelRegistration(CausalLMModel),
     "seed_oss": ModelRegistration(CausalLMModel),
