@@ -160,9 +160,7 @@ def _rope(
     else:
         half = rotary_dim // 2
         first, second = rotated[..., :half], rotated[..., half:]
-        rotated = torch.cat(
-            (first * cos - second * sin, second * cos + first * sin), dim=-1
-        )
+        rotated = torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
     return torch.cat((rotated, tail), dim=-1)
 
 

@@ -23,12 +23,12 @@ from onnxscript import OpBuilder, nn
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import split_fused_qkv
 from mobius.components import (
+    FCMLP,
+    MLP,
     Attention,
     Embedding,
-    FCMLP,
     LayerNorm,
     Linear,
-    MLP,
     RMSNorm,
     create_attention_bias,
     initialize_rope,
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 
 def _alibi_slopes(num_heads: int, max_bias: float) -> list[float]:
     """Return llama.cpp's power-of-two ALiBi slope schedule."""
-    closest_power_of_2 = 1 << int(math.floor(math.log2(num_heads)))
+    closest_power_of_2 = 1 << math.floor(math.log2(num_heads))
     first = 2.0 ** (-max_bias / closest_power_of_2)
     second = 2.0 ** (-(max_bias / 2.0) / closest_power_of_2)
     return [
@@ -97,15 +97,17 @@ class _LegacyGGUFDecoderLayer(nn.Module):
         super().__init__()
         norm_class = LayerNorm if layer_norm else RMSNorm
         self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = norm_class(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = Attention(config, scale=config.attention_scale)
-        self.mlp = MLP(config) if gated_mlp else FCMLP(
-            config.hidden_size,
-            config.intermediate_size,
-            activation=config.hidden_act or "gelu",
-            bias=config.mlp_bias,
+        self.mlp = (
+            MLP(config)
+            if gated_mlp
+            else FCMLP(
+                config.hidden_size,
+                config.intermediate_size,
+                activation=config.hidden_act or "gelu",
+                bias=config.mlp_bias,
+            )
         )
         self._parallel_residual = parallel_residual
 
@@ -151,7 +153,9 @@ class _LegacyGGUFTextModel(nn.Module):
         self._dtype = config.dtype
         self._alibi_max_bias = config.alibi_max_bias
         self._num_heads = config.num_attention_heads
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
         layer_norm = architecture in {"gptneox", "jais", "mpt"}
         gated_mlp = architecture in {"jais", "refact", "ernie4_5"}
         self.layers = nn.ModuleList(
@@ -218,7 +222,9 @@ class _OpenELMTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.embed_tokens = Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
         self.layers = nn.ModuleList()
         for heads, kv_heads, intermediate in zip(
             config.layer_attention_head_counts,
@@ -358,9 +364,7 @@ class ExactLegacyGGUFCausalLMModel(nn.Module):
             hidden = self.config.hidden_size
             for layer in range(self.config.num_hidden_layers):
                 prefix = f"model.layers.{layer}"
-                state_dict.setdefault(
-                    f"{prefix}.input_layernorm.bias", torch.zeros(hidden)
-                )
+                state_dict.setdefault(f"{prefix}.input_layernorm.bias", torch.zeros(hidden))
                 state_dict.setdefault(
                     f"{prefix}.post_attention_layernorm.bias", torch.zeros(hidden)
                 )

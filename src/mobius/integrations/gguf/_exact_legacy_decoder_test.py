@@ -143,14 +143,17 @@ def test_exact_legacy_config_tensor_and_graph_closure(architecture: str) -> None
         if not name.startswith("const_") and ".rotary_emb." not in name
     }
     assert graph_weights - {"model.embed_tokens.weight"} <= set(processed)
-    assert config.model_type == {
-        "gptneox": "gpt_neox",
-        "jais": "jais",
-        "mpt": "mpt",
-        "refact": "refact",
-        "ernie4_5": "ernie4_5",
-        "openelm": "openelm",
-    }[architecture]
+    assert (
+        config.model_type
+        == {
+            "gptneox": "gpt_neox",
+            "jais": "jais",
+            "mpt": "mpt",
+            "refact": "refact",
+            "ernie4_5": "ernie4_5",
+            "openelm": "openelm",
+        }[architecture]
+    )
     assert spec.runtime is Support.DEFERRED
     if architecture == "ernie4_5":
         assert config.rope_interleave
@@ -164,18 +167,10 @@ def test_openelm_preserves_per_layer_geometry_and_fused_row_order() -> None:
     assert config.layer_intermediate_sizes == (24, 32)
     module = registry.get("gguf_legacy")(config)
     fused = torch.arange((8 + 2 * 4) * 16, dtype=torch.float32).reshape(16, 16)
-    state = module.preprocess_weights(
-        {"model.layers.0.self_attn.qkv_proj.weight": fused}
-    )
-    torch.testing.assert_close(
-        state["model.layers.0.self_attn.q_proj.weight"], fused[:8]
-    )
-    torch.testing.assert_close(
-        state["model.layers.0.self_attn.k_proj.weight"], fused[8:12]
-    )
-    torch.testing.assert_close(
-        state["model.layers.0.self_attn.v_proj.weight"], fused[12:]
-    )
+    state = module.preprocess_weights({"model.layers.0.self_attn.qkv_proj.weight": fused})
+    torch.testing.assert_close(state["model.layers.0.self_attn.q_proj.weight"], fused[:8])
+    torch.testing.assert_close(state["model.layers.0.self_attn.k_proj.weight"], fused[8:12])
+    torch.testing.assert_close(state["model.layers.0.self_attn.v_proj.weight"], fused[12:])
 
 
 def test_gptneox_uses_default_rope_when_frequency_base_is_omitted() -> None:
@@ -184,8 +179,8 @@ def test_gptneox_uses_default_rope_when_frequency_base_is_omitted() -> None:
 
     config = gguf_to_config(model)
     assert config.rope_type == "default"
-    assert config.rope_theta == 10_000.0
-    assert config.partial_rotary_factor == 0.5
+    assert config.rope_theta == pytest.approx(10_000.0)
+    assert config.partial_rotary_factor == pytest.approx(0.5)
     assert config.head_dim == 4
 
     module = registry.get("gguf_legacy")(config)
@@ -206,9 +201,7 @@ def test_gptneox_splits_converter_reformatted_qkv_rows() -> None:
     converted = torch.cat(
         tuple(hf_fused[:, index].reshape(hidden, hidden) for index in range(3))
     )
-    state = module.preprocess_weights(
-        {"model.layers.0.self_attn.qkv_proj.weight": converted}
-    )
+    state = module.preprocess_weights({"model.layers.0.self_attn.qkv_proj.weight": converted})
 
     for index, projection in enumerate(("q", "k", "v")):
         torch.testing.assert_close(
@@ -300,9 +293,7 @@ def test_exact_legacy_static_cache_fails_closed() -> None:
         ),
         (
             "openelm",
-            lambda model: model.metadata.__setitem__(
-                "openelm.attention.head_count_kv", [1]
-            ),
+            lambda model: model.metadata.__setitem__("openelm.attention.head_count_kv", [1]),
             "block_count",
         ),
     ],
