@@ -476,6 +476,21 @@ def test_state_manifest_preserves_layer_membership_and_oga_fails_closed(tmp_path
         write_ort_genai_config(package, str(tmp_path))
 
 
+def test_ort_genai_text_export_also_fails_before_writing_artifacts(tmp_path):
+    from mobius.integrations.ort_genai.auto_export import export_package
+
+    config = _config()
+    package = build_from_module(
+        Qwen4ExpCausalLMModel(config),
+        config,
+        task="qwen4-exp-text-generation",
+    )
+    output_dir = tmp_path / "output"
+    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
+        export_package(package, str(output_dir))
+    assert not output_dir.exists()
+
+
 def test_processor_config_matches_qwen4exp_graph_contract(tmp_path):
     from mobius.integrations.ort_genai.auto_export import (
         _write_vision_processor_config,
