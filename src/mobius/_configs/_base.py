@@ -1993,16 +1993,19 @@ class KimiK3Config(CausalLMConfig):
     def from_transformers(cls, config, parent_config=None) -> KimiK3Config:
         parent = parent_config or config
         text = _as_attribute_config(getattr(config, "text_config", None)) or config
-        base = ArchitectureConfig.from_transformers(text, parent)
+        quantization_config = getattr(text, "quantization_config", None)
+        if hasattr(quantization_config, "to_dict"):
+            quantization_config = quantization_config.to_dict()
         if (
-            base.quantization is not None
-            and base.quantization.quant_method == "compressed-tensors"
+            isinstance(quantization_config, dict)
+            and quantization_config.get("quant_method") == "compressed-tensors"
         ):
             raise NotImplementedError(
                 "Kimi-K3 compressed-tensors checkpoints use selective MXFP4 routed "
                 "experts, which are not representable by the generic quantized-linear "
                 "loader. Use a GGUF checkpoint or an unquantized state dict."
             )
+        base = ArchitectureConfig.from_transformers(text, parent)
         linear = _as_attribute_config(getattr(text, "linear_attn_config", None))
         if linear is None:
             raise ValueError("Kimi-K3 requires text_config.linear_attn_config")

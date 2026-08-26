@@ -77,6 +77,18 @@ class QuantizationConfig:
                 "onnxruntime_USE_FP4_QMOE=ON). Export the unquantized (bf16) "
                 "checkpoint instead, or quantize the bf16 export via Olive."
             )
+        # compressed-tensors is a container format, not an INT4 method. Its
+        # ``bits``/``group_size`` values live inside ordered config groups and
+        # may describe FP8 and NVFP4 simultaneously. Parsing it as this coarse
+        # config would emit integer MatMulNBits nodes for FP4 E2M1 bytes.
+        from mobius.integrations.compressed_tensors import (
+            CompressedTensorsConfig,
+            is_compressed_tensors_config,
+        )
+
+        if is_compressed_tensors_config(qc):
+            CompressedTensorsConfig.parse(qc)
+            return None
         # Block-scaled fp8 (E4M3 weight + 2D UE8M0 block scale) and packed-fp4
         # routed experts (I8-packed E2M1 nibbles + UE8M0 micro-scale) are a
         # mixed-precision layout this INT4/per-tensor path cannot load — the

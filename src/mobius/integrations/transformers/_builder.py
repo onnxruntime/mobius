@@ -16,6 +16,10 @@ from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import _download_weights
+from mobius.integrations.compressed_tensors import (
+    CompressedTensorsConfig,
+    stream_compressed_tensors_to_package,
+)
 from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
@@ -219,6 +223,7 @@ def build_transformers_model(
             "Pass text_only=True to export the qwen4_exp_text causal decoder."
         )
 
+    compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
     if text_only:
         from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
@@ -242,6 +247,31 @@ def build_transformers_model(
         parent_config=parent_config,
         module_class=module_class,
     )
+    if (
+        compressed_tensors_config is not None
+        and fp8_kv_cache
+        and compressed_tensors_config.kv_cache_scheme is not None
+    ):
+        layer_types = config.layer_types
+        if not layer_types:
+            raise ValueError(
+                "Cannot validate this compressed-tensors checkpoint's FP8 KV-cache "
+                "scales because the decoder does not declare per-layer attention types."
+            )
+        expected_scale_layers = {
+            index
+            for index, layer_type in enumerate(layer_types)
+            if layer_type == "full_attention"
+        }
+        provided_scale_layers = set(kv_cache_scales or {})
+        if provided_scale_layers != expected_scale_layers:
+            missing = sorted(expected_scale_layers - provided_scale_layers)
+            extra = sorted(provided_scale_layers - expected_scale_layers)
+            raise ValueError(
+                "fp8_kv_cache=True requires the pinned checkpoint's complete per-layer "
+                "k_scale/v_scale map; partial maps would silently use unit scales. "
+                f"Missing layers: {missing}; unexpected layers: {extra}."
+            )
 
     if text_only:
         config = _strip_to_text_only(config, model_type)
@@ -300,6 +330,15 @@ def build_transformers_model(
                 model_id,
                 config,
                 revision=revision,
+            )
+        elif compressed_tensors_config is not None:
+            stream_compressed_tensors_to_package(
+                package,
+                model_id,
+                compressed_tensors_config,
+                preprocess_weights=getattr(model_module, "preprocess_weights", None),
+                revision=revision,
+                fp8_kv_cache=fp8_kv_cache,
             )
         else:
             state_dict = _download_weights(model_id, revision=revision)

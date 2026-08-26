@@ -298,6 +298,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         super().__init__(models or {})
         self.config = config
         self.gguf_quantization_report: GGUFQuantizationReport | None = None
+        self.quantization_report: Any = None
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
         self.mtp_head: ModelPackage | None = None
