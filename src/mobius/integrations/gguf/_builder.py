@@ -1175,7 +1175,7 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
     from mobius.integrations.gguf._tensor_mapping import is_known_skip
 
     architecture = gguf_model.architecture
-    if architecture not in {"baichuan", "chatglm", "phi2", "seed_oss"}:
+    if architecture not in {"apertus", "baichuan", "chatglm", "phi2", "seed_oss"}:
         return
 
     metadata = gguf_model.metadata
@@ -1279,7 +1279,7 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
         "output_norm.weight": (hidden,),
     }
     optional: dict[str, tuple[int, ...]] = {}
-    if architecture in {"baichuan", "phi2"}:
+    if architecture in {"apertus", "baichuan", "phi2"}:
         required["output.weight"] = (vocab, hidden)
     elif architecture in {"chatglm", "seed_oss"}:
         optional["output.weight"] = (vocab, hidden)
@@ -1365,7 +1365,7 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
                         prefix + "ffn_down.weight": (hidden, intermediate),
                     }
                 )
-        if architecture == "baichuan":
+        if architecture in {"apertus", "baichuan"}:
             required[prefix + "ffn_norm.weight"] = (hidden,)
         if architecture in {"baichuan", "seed_oss"}:
             required[prefix + "ffn_gate.weight"] = (intermediate, hidden)
@@ -1396,6 +1396,23 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
                     prefix + "attn_v.bias": (kv_dim,),
                 }
             )
+        elif architecture == "apertus":
+            required.update(
+                {
+                    prefix + "attn_q_norm.weight": (head_dim,),
+                    prefix + "attn_k_norm.weight": (head_dim,),
+                }
+            )
+            optional.update(
+                {
+                    prefix + "attn_q.bias": (q_dim,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                    prefix + "attn_output.bias": (hidden,),
+                    prefix + "attn_q_norm.bias": (head_dim,),
+                    prefix + "attn_k_norm.bias": (head_dim,),
+                }
+            )
 
     if architecture == "seed_oss":
         attention_scale = float(metadata.get("seed_oss.attention.scale", 0.0))
@@ -1422,6 +1439,21 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
         present_biases = set(qkv_biases) & set(actual)
         if present_biases and present_biases != set(qkv_biases):
             raise ValueError("ChatGLM QKV bias must be present in every layer or none")
+
+    if architecture == "apertus":
+        for family in (
+            ("attn_q.bias", "attn_k.bias", "attn_v.bias"),
+            ("attn_output.bias",),
+        ):
+            family_names = {
+                f"blk.{layer}.{suffix}" for layer in range(layers) for suffix in family
+            }
+            present = family_names & set(actual)
+            if present and present != family_names:
+                raise ValueError(
+                    "Apertus projection biases must be present for every corresponding "
+                    f"projection in every layer or absent entirely: {sorted(present)}"
+                )
 
     allowed = set(required) | set(optional)
     shape_checked = set(allowed)

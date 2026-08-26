@@ -197,7 +197,7 @@ def test_dense_cohort_registry_runtime_is_deferred(
     assert not spec.aliases
 
 
-@pytest.mark.parametrize("architecture", ["apertus", "minicpm3"])
+@pytest.mark.parametrize("architecture", ["apertus", "minicpm3", "openelm", "mpt"])
 def test_dense_graph_mismatches_fail_before_config(architecture) -> None:
     model = _FakeGGUF(architecture, {}, {})
     with pytest.raises(UnsupportedGGUFArchitectureError, match="before config extraction"):

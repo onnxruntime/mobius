@@ -457,6 +457,8 @@ class ArchitectureConfig(BaseModelConfig):
 
     attn_qk_norm: bool = False
     attn_qk_norm_full: bool = False
+    attn_q_norm_biases: tuple[bool, ...] | None = None
+    attn_k_norm_biases: tuple[bool, ...] | None = None
     mlp_bias: bool = False
     attention_scale: float | None = None
     alibi_max_bias: float | None = None
@@ -464,6 +466,13 @@ class ArchitectureConfig(BaseModelConfig):
     layer_intermediate_sizes: tuple[int, ...] = ()
     layer_attention_head_counts: tuple[int, ...] = ()
     layer_attention_kv_head_counts: tuple[int, ...] = ()
+
+    # Apertus xIELU parameters. GGUF stores these learned per-layer scalars as
+    # metadata rather than tensors, so they must survive config replacement.
+    xielu_alpha_p: tuple[float, ...] | None = None
+    xielu_alpha_n: tuple[float, ...] | None = None
+    xielu_beta: tuple[float, ...] | None = None
+    xielu_eps: tuple[float, ...] | None = None
 
     # Encoder-specific config
     type_vocab_size: int = 0

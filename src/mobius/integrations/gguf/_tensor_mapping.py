@@ -127,6 +127,11 @@ _COMMAND_R_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
 }
 
+_APERTUS_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 _DFLASH_MAPPING: dict[str, str] = {
     "fc": "fc",
     "enc.output_norm": "hidden_norm",
@@ -1031,6 +1036,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "starcoder": _STARCODER_MAPPING,
         "qwen1_extras": _QWEN1_EXTRAS,
         "command_r_extras": _COMMAND_R_EXTRAS,
+        "apertus_extras": _APERTUS_EXTRAS,
         "lfm2": _LFM2_MAPPING,
         "lfm2_moe_extras": _LFM2_MOE_EXTRAS,
         "dflash": _DFLASH_MAPPING,

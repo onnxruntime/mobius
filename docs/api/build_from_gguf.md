@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 64, 'rejected': 2, 'supported': 81}; importable: 80; quantized import: {'rejected': 26, 'supported': 121}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
+| Architectures | 147 | graph verdicts: {'deferred': 63, 'rejected': 2, 'supported': 82}; importable: 81; quantized import: {'rejected': 27, 'supported': 120}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 5, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
@@ -344,7 +344,7 @@ before graph construction or durable output.
 | Canonical architecture | Aliases | Import route | Tensor exactness | Config/tensor/graph/runtime/quantized import | Restriction or evidence gap |
 |---|---|---|---|---|---|
 | `afmoe` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | AFMoE combines sandwich norms, Q/K norms, sigmoid-gated attention, MuP embedding scaling, a dense prefix, correction-biased routed/shared experts, and optional interleaved sliding-window attention. Mobius has no graph or cache task owning that complete topology or its expert sidecars. |
-| `apertus` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned Apertus converter emits a serialized Llama-3 rope_freqs tensor that the pinned loader consumes as per-dimension RoPE factors. The current Mobius Apertus graph computes RoPE frequencies from scalar config and cannot represent that tensor without changing attention semantics. |
+| `apertus` | — | model=`apertus`; tensor=`llama`+`apertus_extras` | exact-direct-loader-conditional-union | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `arcee` | — | model=`arcee`; tensor=`arcee` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `arctic` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The pinned Arctic graph is not a standard pre-norm MoE block: every layer runs a dense parallel SwiGLU branch, then adds a separately normalized routed-expert branch computed from the pre-attention residual. Mobius's generic MoE graph replaces the dense FFN instead, so aliasing the existing Hugging Face 'arctic' registration would change residual topology and normalization. |
 | `arwkv7` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | ARWKV7 wraps RWKV7's delta-rule matrix recurrence in a distinct one-shift RMSNorm/Qwen residual topology with optional five-versus-six-way interpolation, optional gate/group norm, and Qwen SwiGLU. Treating it as RWKV7, Qwen, or Mamba would accept the wrong tensor closure and state ABI. |
@@ -537,9 +537,9 @@ graphs are therefore never selected.
 ### Dense C01 cohort
 
 The pinned llama.cpp `8d9af256337d1a501250f9bbf4c0859a654bddd6` dense cohort
-adds bounded graph import for 32-layer `baichuan`, modern `chatglm`, `phi2`, and
-64-layer `seed_oss`. Runtime remains deferred until a pinned real GGUF has
-independent full-logit and generation parity.
+adds bounded graph import for `apertus`, 32-layer `baichuan`, modern `chatglm`,
+`phi2`, and 64-layer `seed_oss`. Runtime remains deferred until a pinned real
+GGUF has independent full-logit and generation parity.
 
 - Baichuan accepts only the 7B RoPE graph, reverses the converter Q/K permutation,
   and rejects the 40-layer hardcoded-ALiBi path. Phi-2 requires its complete bias
@@ -549,12 +549,15 @@ independent full-logit and generation parity.
   not yet losslessly covered. Seed-OSS maps `post_attention_norm` exactly and permits
   either an explicit output or effective ownership by the token embedding, and
   accepts Q/K/V biases only as a complete all-layer family.
-- `apertus`, `minicpm3`, `openelm`, and `mpt` are explicit pre-config deferrals.
-  Apertus's serialized Llama-3 `rope_freqs` tensor supplies per-dimension factors
-  that the current scalar-config Mobius RoPE graph cannot consume. The others'
+- Apertus consumes serialized Llama-3 `rope_freqs` or LongRoPE short/long
+  per-dimension factors exactly, applies Q/K RMSNorm before RoPE, owns xIELU
+  metadata values as graph initializers, and maps optional Q/K norm and attention
+  output biases. Quantized projections remain packed; quantized RoPE factors are
+  rejected.
+- `minicpm3`, `openelm`, and `mpt` remain explicit pre-config deferrals. Their
   MLA/scaling topology, per-layer fused/tied topology, and optional learned
-  positions/QK norms/clipping/AWQ/bias closure are likewise not represented by
-  current Mobius graphs.
+  positions/QK norms/clipping/AWQ/bias closure are not represented by current
+  Mobius graphs.
 
 ### Second hybrid cohort
 

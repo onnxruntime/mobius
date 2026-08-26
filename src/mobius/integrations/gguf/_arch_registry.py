@@ -235,12 +235,6 @@ _MPT_GRAPH_REASON = (
     "whole closure safely, and the current MPT preprocessing overwrites norm biases."
 )
 
-_APERTUS_GRAPH_REASON = (
-    "The pinned Apertus converter emits a serialized Llama-3 rope_freqs tensor that "
-    "the pinned loader consumes as per-dimension RoPE factors. The current Mobius "
-    "Apertus graph computes RoPE frequencies from scalar config and cannot represent "
-    "that tensor without changing attention semantics."
-)
 
 _RECURRENT_RUNTIME_VALIDATION_PENDING = (
     "Config extraction, exact pinned tensor-name closure, GGUF value transforms, and "
@@ -1800,11 +1794,18 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="apertus",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="apertus",
+        tensor_map_recipe=("llama", "apertus_extras"),
+        config_postprocessor="apertus",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "xielu.alpha_n",
+            "xielu.alpha_p",
+            "xielu.beta",
+            "xielu.eps",
+        ),
         runtime=Support.DEFERRED,
-        reason=_APERTUS_GRAPH_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="minicpm3",

@@ -1285,6 +1285,103 @@ def _seed_oss_postprocess(
     )
 
 
+def _apertus_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    """Restore Apertus values serialized outside ordinary GGUF weight tensors."""
+    arch = "apertus"
+    layers = config.num_hidden_layers
+
+    def per_layer(suffix: str) -> tuple[float, ...]:
+        raw = metadata[f"{arch}.xielu.{suffix}"]
+        values = list(raw) if isinstance(raw, (list, tuple, np.ndarray)) else [raw] * layers
+        if len(values) != layers:
+            raise ValueError(
+                f"{arch}.xielu.{suffix} must be a scalar or contain {layers} values, "
+                f"got {len(values)}"
+            )
+        result = tuple(float(value) for value in values)
+        if not all(np.isfinite(result)):
+            raise ValueError(f"{arch}.xielu.{suffix} must contain only finite values")
+        return result
+
+    names = set(model.tensor_names)
+    rope_names = names & {
+        "rope_freqs.weight",
+        "rope_factors_long.weight",
+        "rope_factors_short.weight",
+    }
+    raw_types = {
+        name: getattr(qtype, "value", qtype)
+        for name, _raw, qtype, _shape in model.tensor_items_raw()
+        if name in rope_names
+    }
+    if any(type_id not in {0, 1, 30} for type_id in raw_types.values()):
+        raise ValueError("Apertus serialized RoPE factors must use F32/F16/BF16 storage")
+
+    if rope_names == {"rope_freqs.weight"}:
+        factors = np.asarray(model.get_tensor("rope_freqs.weight"), dtype=np.float32).reshape(
+            -1
+        )
+        short_factors = long_factors = factors
+        original_context = config.max_position_embeddings
+    elif rope_names == {"rope_factors_long.weight", "rope_factors_short.weight"}:
+        original_context_raw = metadata.get(f"{arch}.rope.scaling.original_context_length")
+        if original_context_raw is None:
+            raise ValueError(
+                "Apertus LongRoPE factors require apertus.rope.scaling.original_context_length"
+            )
+        original_context = int(original_context_raw)
+        if original_context <= 1 or original_context > config.max_position_embeddings:
+            raise ValueError(
+                "Apertus LongRoPE original context length must be greater than 1 "
+                "and no larger than the configured context length"
+            )
+        long_factors = np.asarray(
+            model.get_tensor("rope_factors_long.weight"), dtype=np.float32
+        ).reshape(-1)
+        short_factors = np.asarray(
+            model.get_tensor("rope_factors_short.weight"), dtype=np.float32
+        ).reshape(-1)
+    else:
+        raise ValueError(
+            "Apertus GGUF must contain exactly rope_freqs.weight or the complete "
+            "rope_factors_long.weight/rope_factors_short.weight pair"
+        )
+
+    expected = config.head_dim // 2
+    for name, factors in (("short", short_factors), ("long", long_factors)):
+        if (
+            factors.shape != (expected,)
+            or not np.all(np.isfinite(factors))
+            or np.any(factors <= 0)
+        ):
+            raise ValueError(
+                f"Apertus {name} RoPE factors must have shape ({expected},) and be "
+                "finite positive values"
+            )
+
+    q_biases = tuple(f"blk.{layer}.attn_q_norm.bias" in names for layer in range(layers))
+    k_biases = tuple(f"blk.{layer}.attn_k_norm.bias" in names for layer in range(layers))
+    return dataclasses.replace(
+        config,
+        hidden_act="xielu",
+        attn_qk_norm=True,
+        attn_q_norm_biases=q_biases,
+        attn_k_norm_biases=k_biases,
+        rope_type="longrope",
+        rope_scaling={
+            "short_factor": short_factors.tolist(),
+            "long_factor": long_factors.tolist(),
+        },
+        original_max_position_embeddings=original_context,
+        xielu_alpha_p=per_layer("alpha_p"),
+        xielu_alpha_n=per_layer("alpha_n"),
+        xielu_beta=per_layer("beta"),
+        xielu_eps=per_layer("eps"),
+    )
+
+
 def _moe_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -3393,6 +3490,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "chatglm": _chatglm_postprocess,
     "phi2": _phi2_postprocess,
     "seed_oss": _seed_oss_postprocess,
+    "apertus": _apertus_postprocess,
     "gemma3": _gemma3_postprocess,
     "gemma4": _gemma4_postprocess,
     "muse_glimmer": _muse_glimmer_postprocess,
