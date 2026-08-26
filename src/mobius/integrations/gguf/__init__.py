@@ -63,6 +63,10 @@ from mobius.integrations.gguf._tokenizer import (
     materialize_gguf_tokenizer,
     write_gguf_tokenizer_json,
 )
+from mobius.integrations.gguf._tokenizer_census import (
+    GGUFTokenizerRouteAudit,
+    tokenizer_route_census,
+)
 
 __all__ = [
     "build_from_gguf",
@@ -70,9 +74,11 @@ __all__ = [
     "build_gemma4_vlm_from_gguf",
     "build_qwen_vlm_from_gguf",
     "GGUFTokenizerAsset",
+    "GGUFTokenizerRouteAudit",
     "GGUFTokenizerSource",
     "materialize_evidenced_gguf_tokenizer",
     "materialize_gguf_tokenizer",
+    "tokenizer_route_census",
     "write_gguf_runtime_package",
     "write_gguf_tokenizer_json",
     "verify_gguf_reuse_manifest",

@@ -37,22 +37,28 @@ def test_document_is_concise_and_reason_coded() -> None:
     assert len(document.splitlines()) < 500
     assert "RUNTIME_EVIDENCE_PENDING" in document
     assert "qwen3.5-0.8b-q4-tokenizer" in document
-    assert "IDs 0-248069" in document
-    assert "Qwen3.5 full model runtime remains **deferred**" in document
+    assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document
+    assert "deferred-compiled-semantics" in document
+    assert "does not claim graph or runtime support." in " ".join(document.split())
 
 
-def test_tokenizer_evidence_row_has_exactly_four_markdown_columns() -> None:
-    row = next(
+def test_tokenizer_evidence_rows_have_exactly_four_markdown_columns() -> None:
+    evidence_ids = {
+        "lfm2-350m-f16-tokenizer",
+        "qwen2.5-0.5b-instruct-q8-tokenizer",
+        "qwen3.5-0.8b-q4-tokenizer",
+        "smollm-135m-f16-tokenizer",
+    }
+    rows = [
         line
         for line in render_document().splitlines()
-        if line.startswith("| `qwen3.5-0.8b-q4-tokenizer`")
-    )
-    parts = re.split(r"(?<!\\)\|", row)
-    assert parts[0] == parts[-1] == ""
-    cells = [part.strip() for part in parts[1:-1]]
-    assert len(cells) == 4
-    assert r"<\|im_start\|>" in cells[3]
-    assert r"<\|audio_start\|>" in cells[3]
+        if line.startswith("| `") and line.split("`", 2)[1] in evidence_ids
+    ]
+    assert len(rows) == 4
+    for row in rows:
+        parts = re.split(r"(?<!\\)\|", row)
+        assert parts[0] == parts[-1] == ""
+        assert len([part.strip() for part in parts[1:-1]]) == 4
 
 
 def test_architecture_restrictions_are_concise_and_fully_registry_derived() -> None:

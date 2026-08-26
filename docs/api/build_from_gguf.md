@@ -12,7 +12,7 @@ Support is capability-specific: graph import does not imply runtime packaging.
 | Architectures | 147 | graph verdicts: {'deferred': 55, 'rejected': 2, 'supported': 90}; importable: 89; quantized import: {'rejected': 31, 'supported': 116}; runtime: {'deferred': 142, 'rejected': 2, 'supported': 3} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 5, 'runtime-supported': 0} |
-| Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or exact artifact-scoped tokenizer evidence |
+| Tokenizer pre identifiers | 87 | 56 semantic groups; route dispositions: {'deferred-compiled-semantics': 83, 'validated-pinned-source': 4} |
 
 `SUPPORTED` means the named capability is implemented and mechanically tested. `DEFERRED` means it is intentionally unavailable pending the stated work. `REJECTED` means the input or route is invalid by policy. Graph support proves construction/execution only; runtime support additionally requires a pinned real artifact, independent parity, and deterministic generation or stateful semantics. Tokenizer `copy` requires embedded ordered-vocabulary identity; `pinned-source` also binds the complete GGUF artifact, immutable Hub assets, reconstruction policy, semantic hashes, and representative token-ID vectors.
 
@@ -64,13 +64,16 @@ evidence match.
 | `smollm-135m-f16-onnxruntime-1.29.0` | `neopolita/smollm-135m-gguf@22cca988936eafe92908e7558907c3964e10bba7`<br>`ggml-model-f16.gguf`<br>270,885,504 B<br>`ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2` | `HuggingFaceTB/SmolLM-135M@1d461723eec654e65efdc40cf49301c89c0c92f4` | `HuggingFaceTB/SmolLM-135M@1d461723eec654e65efdc40cf49301c89c0c92f4`<br>`special_tokens_map.json` 831 B `e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3`, `tokenizer.json` 2,104,556 B `9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c`, `tokenizer_config.json` 3,685 B `238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8`<br>metadata `46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc` | onnx-genai 1.29.0; full-logit; dynamic KV cache prefill plus 20 cache-threaded decode steps |
 | `smollm-135m-f16-ort-genai-0.15.2` | `neopolita/smollm-135m-gguf@22cca988936eafe92908e7558907c3964e10bba7`<br>`ggml-model-f16.gguf`<br>270,885,504 B<br>`ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2` | `HuggingFaceTB/SmolLM-135M@1d461723eec654e65efdc40cf49301c89c0c92f4` | `HuggingFaceTB/SmolLM-135M@1d461723eec654e65efdc40cf49301c89c0c92f4`<br>`special_tokens_map.json` 831 B `e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3`, `tokenizer.json` 2,104,556 B `9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c`, `tokenizer_config.json` 3,685 B `238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8`<br>metadata `46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc` | ort-genai 0.15.2; full-logit; ORT GenAI prefill plus 20 cache-threaded decode steps |
 
-Qwen2.5 remains covered only by its existing runtime evidence record above.
+Runtime support above is independent from tokenizer materialization support below.
 
 ## Tokenizer evidence
 
 | Evidence ID | GGUF identity | Official source | Exact tokenizer proof |
 |---|---|---|---|
-| `qwen3.5-0.8b-q4-tokenizer` | `ggml-org/Qwen3.5-0.8B-GGUF@8fea620810c4afa23dd6443f999a48574c1611a3`<br>`Qwen3.5-0.8B-Q4_0.gguf`<br>563,036,064 B<br>`57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf`<br>320 tensors: F32=133, Q4_0=186, Q8_0=1 | `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`<br>`config.json` 2,907 B `b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204`<br>`chat_template.jinja` 7,755 B `273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80`, `tokenizer.json` 12,807,982 B `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42`, `tokenizer_config.json` 16,709 B `49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c` | GGUF metadata `45302b58b2086a666a874652d0e9e1d5b4b26e786ffbaf9362a4f902eba0b10d`<br>248,320 ordered tokens `5ee0f927bcaa4b9fe85c244776ae9487468e427f83e053fc81f2a186f14936a3`<br>247,587 ordered merges `7e299304d9ad9dc312acdbcb1f6ccf0dce1256bf1aa986d651f13814dfd27e7b`<br>official source IDs `0..248076`; deterministic unused `[PAD{id}]` IDs `248077..248319`; embedding rows=248,320<br>materialized `a78b900eb4cd335bba249158066db523ce221f744e2b6144692bb81673d551af`<br>`Hello, world! 12345` → `[9419, 11, 1814, 0, 220, 16, 17, 18, 19, 20]`<br>`  spaced  text\n` → `[220, 61674, 220, 1414, 198]`<br>`\u4f60\u597d\uff0c\u4e16\u754c\uff01` → `[109266, 3709, 96748, 6115]`<br>`Caf\xe9 \u2014 \u03ba\u03cc\u03c3\u03bc\u03bf\u03c2 \U0001f680` → `[34, 2492, 933, 1892, 166265, 203260, 10838, 248, 222]`<br>`<\|im_start\|>user\nHello<\|im_end\|>\n<\|im_start\|>assistant\n` → `[248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198]`<br>`<\|audio_start\|><\|audio_pad\|><\|audio_end\|>` → `[248070, 248076, 248071]` |
+| `lfm2-350m-f16-tokenizer` | `LiquidAI/LFM2-350M-GGUF@8fdc9d526b7ed346b19257551b05816c7912ecc2`<br>`LFM2-350M-F16.gguf`<br>711,482,304 B<br>`379ffdcbf08147c0313f6f1ce7ff558a2bc935eda633f4b46c52347032419c42` | `LiquidAI/LFM2-350M@73e3c253078a3b97c2e14b4c4665679f4d9b6d56`<br>`config.json` 999 B `fd3b3fba4e50e7b9a22bd41cbab59e9b28e319b2de19668d7fd9777c8d1a9ba1`<br>`chat_template.jinja` 209 B `a805e50fed68938a076b07e2e602639611b50b1ced0e50f11eb92f1ba25be4dc`, `special_tokens_map.json` 434 B `742aefe2b7dec496e8caffdba03a75d0c1a9925d53bd3f3e0d388c96b591b6f4`, `tokenizer.json` 4,732,426 B `98cff83b4f6d7e9d8929bebc62b07e92cf1b3f99c80d16bafe8b84a75448f40b`, `tokenizer_config.json` 91,509 B `36f511115e9d8952cbc9d15d9a20dfa7ce7d1444940e5c1dc42a762020c99bf5` | metadata `e5626d605bb50bc53fdb0fbfcf374fb33dfbaa0cc698d9746ba1e9b0b7e6d07d`<br>tokens 65,536 `c004fd0578dbfbff394335a7d5f95e78a8cdbbff6abc8c389ba2290637be58b6`<br>merges 63,683 `c70042d0b5969460432a218556522dedee908735a3e4cf70f27936353c5b3f65`<br>types `ffe1ea561257dc6e1f2c257b99b4913d63e9d6b896cf2f9da1a3d2cac316d4b4`; scores=0<br>source IDs `0..65535`; no GGUF-only padding extension; rows=65,536<br>materialized `e7b7960966e2ed43a22b00431246cf820d5e2751bec58c44f0184cbe9b8d18c9`<br>`Hello, world! 12345` → `[36309, 521, 2031, 510, 730, 10293, 2637]`<br>`  spaced  text\n` → `[730, 56551, 730, 3304, 708]`<br>`\u4f60\u597d\uff0c\u4e16\u754c\uff01` → `[11754, 6400, 1198, 11370, 8668]`<br>`Caf\xe9 \u2014 \u03ba\u03cc\u03c3\u03bc\u03bf\u03c2 \U0001f680` → `[544, 2305, 860, 2180, 59955, 49122, 27443, 16883, 51332, 23805, 758, 732]`<br>`<\|startoftext\|><\|im_start\|>user\nHello<\|im_end\|>` → `[1, 6, 6423, 708, 36309, 7]` |
+| `qwen2.5-0.5b-instruct-q8-tokenizer` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF@9217f5db79a29953eb74d5343926648285ec7e67`<br>`qwen2.5-0.5b-instruct-q8_0.gguf`<br>675,710,816 B<br>`ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e` | `Qwen/Qwen2.5-0.5B-Instruct@a338b55dd21219a5f4da42bc11a9313d1a27d4cc`<br>`config.json` 659 B `18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45`<br>`tokenizer.json` 7,031,645 B `c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539`, `tokenizer_config.json` 7,308 B `5214600ee45ca2f887ce2eede8910378a0111ea99d657428bcbce94778e65a92` | metadata `8fc8ef848104e931f14ae03d9581699d54813a2ff952fb7caac0654e8aa27ee3`<br>tokens 151,936 `e2fadeac783c911f535d21f858f43127672a1d261af510d3f895e34bd2f6fb10`<br>merges 151,387 `24fa2ae2a398e50784a1fff678482094af4f63e6783d35686726abacda8dc371`<br>types `17ccfa7767a8721474dc0fd21ca1308fdfd04e0f64036efbfa97f3e16e5f18f1`; scores=0<br>source IDs `0..151935`; no GGUF-only padding extension; rows=151,936<br>materialized `be55f66f0643df9d3c1b5dc55ae552b0e334f219a3a5f8338e6864f8eb3a8ac5`<br>`Hello, world! 12345` → `[9707, 11, 1879, 0, 220, 16, 17, 18, 19, 20]`<br>`  spaced  text\n` → `[220, 63828, 220, 1467, 198]`<br>`\u4f60\u597d\uff0c\u4e16\u754c\uff01` → `[108386, 3837, 99489, 6313]`<br>`Caf\xe9 \u2014 \u03ba\u03cc\u03c3\u03bc\u03bf\u03c2 \U0001f680` → `[34, 2577, 963, 1959, 71638, 75195, 43928, 43123, 27554, 45642, 11162, 248, 222]`<br>`<\|im_start\|>user\nHello<\|im_end\|>\n` → `[151644, 872, 198, 9707, 151645, 198]` |
+| `qwen3.5-0.8b-q4-tokenizer` | `ggml-org/Qwen3.5-0.8B-GGUF@8fea620810c4afa23dd6443f999a48574c1611a3`<br>`Qwen3.5-0.8B-Q4_0.gguf`<br>563,036,064 B<br>`57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf` | `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`<br>`config.json` 2,907 B `b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204`<br>`chat_template.jinja` 7,755 B `273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80`, `tokenizer.json` 12,807,982 B `5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42`, `tokenizer_config.json` 16,709 B `49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c` | metadata `45302b58b2086a666a874652d0e9e1d5b4b26e786ffbaf9362a4f902eba0b10d`<br>tokens 248,320 `5ee0f927bcaa4b9fe85c244776ae9487468e427f83e053fc81f2a186f14936a3`<br>merges 247,587 `7e299304d9ad9dc312acdbcb1f6ccf0dce1256bf1aa986d651f13814dfd27e7b`<br>types `f6fdca1063d1ae1cc77ba1f5087d259f044c2634e64b65e31bc844ec00e9acab`; scores=0<br>source IDs `0..248076`; unused `[PAD{id}]` IDs `248077..248319`; rows=248,320<br>materialized `a78b900eb4cd335bba249158066db523ce221f744e2b6144692bb81673d551af`<br>`Hello, world! 12345` → `[9419, 11, 1814, 0, 220, 16, 17, 18, 19, 20]`<br>`  spaced  text\n` → `[220, 61674, 220, 1414, 198]`<br>`\u4f60\u597d\uff0c\u4e16\u754c\uff01` → `[109266, 3709, 96748, 6115]`<br>`Caf\xe9 \u2014 \u03ba\u03cc\u03c3\u03bc\u03bf\u03c2 \U0001f680` → `[34, 2492, 933, 1892, 166265, 203260, 10838, 248, 222]`<br>`<\|im_start\|>user\nHello<\|im_end\|>\n<\|im_start\|>assistant\n` → `[248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198]`<br>`<\|audio_start\|><\|audio_pad\|><\|audio_end\|>` → `[248070, 248076, 248071]` |
+| `smollm-135m-f16-tokenizer` | `neopolita/smollm-135m-gguf@22cca988936eafe92908e7558907c3964e10bba7`<br>`ggml-model-f16.gguf`<br>270,885,504 B<br>`ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2` | `HuggingFaceTB/SmolLM-135M@1d461723eec654e65efdc40cf49301c89c0c92f4`<br>`config.json` 724 B `a1fe6f43e20f7a6c6dbc6380222af9526b5cef262446391a281c038249e3e3b7`<br>`special_tokens_map.json` 831 B `e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3`, `tokenizer.json` 2,104,556 B `9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c`, `tokenizer_config.json` 3,685 B `238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8` | metadata `46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc`<br>tokens 49,152 `ecc2f33f7cdf683196646ea97b005f82398e5ddbb0e143fbe95a402277eb1788`<br>merges 48,900 `3d6f4016bc9b70ea16f0f01b1dadb4504ad99c5eaa8584b81997dc65168e136b`<br>types `3a92d63c9763834e17f2d93490d5a9643fa07057f2799168d67d7812d08e31aa`; scores=0<br>source IDs `0..49151`; no GGUF-only padding extension; rows=49,152<br>materialized `9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c`<br>`Hello, world! 12345` → `[19556, 28, 905, 17, 216, 33, 34, 35, 36, 37]`<br>`  spaced  text\n` → `[216, 23861, 216, 1694, 198]`<br>`\u4f60\u597d\uff0c\u4e16\u754c\uff01` → `[18645, 250, 48392, 138, 12831, 7906, 240, 178, 239, 230, 8083, 219]`<br>`Caf\xe9 \u2014 \u03ba\u03cc\u03c3\u03bc\u03bf\u03c2 \U0001f680` → `[51, 1939, 2756, 1841, 31953, 36180, 18751, 16674, 39346, 15107, 244, 218]`<br>`<\|endoftext\|>` → `[0]` |
 
 ```python
 from mobius.integrations.gguf import materialize_evidenced_gguf_tokenizer
@@ -78,12 +81,10 @@ from mobius.integrations.gguf import materialize_evidenced_gguf_tokenizer
 materialize_evidenced_gguf_tokenizer("Qwen3.5-0.8B-Q4_0.gguf", "tokenizer")
 ```
 
-Qwen3.5 tokenizer materialization uses `pinned-source`, not embedded `copy`: official
-`tokenizer.json` covers IDs 0-248069, official `tokenizer_config.json` adds IDs
-248070-248076, and only the GGUF embedding-alignment suffix 248077-248319 is reconstructed
-as non-special unused `[PAD{id}]` tokens. Every ordered token, merge, special ID, source
-asset, chat template, representative encoding, and the final materialized hash is checked
-before output. Qwen3.5 full model runtime remains **deferred**.
+Each row is independently artifact-scoped. Evidence proves ordered tokens, merges or scores,
+token types, special IDs, source pipeline/config assets, representative encodings, embedding
+alignment, any non-matchable padding extension, and the final materialized hash. It does not
+claim graph or runtime support.
 
 ## Supported GGUF architectures
 
@@ -357,100 +358,100 @@ Reason codes are concise user-facing categories; detailed architecture audits re
 
 ## Tokenizer pre-types
 
-The pre-type is never sufficient evidence by itself. Each row defaults to deferred; only an
-embedded exact JSON or a complete artifact-scoped evidence record can materialize a tokenizer.
+The pre-type is never sufficient evidence by itself. The generated census preserves all aliases
+and gives every route an exact evidence ID or concrete compiled-semantics blocker.
 
 <!-- BEGIN GGUF TOKENIZER PRE SUPPORT MATRIX -->
 
-| Exact identifier | Canonical semantic group | Pinned pre-type | Default route | Exactness/restriction |
+| Exact identifier | Semantic group / pre-type | Default policy | Current status | Evidence / blocker |
 |---|---|---|---|---|
-| `a.x-4.0` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `afmoe` | `afmoe` | `AFMOE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `bailingmoe` | `bailingmoe` | `BAILINGMOE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `bailingmoe2` | `bailingmoe` | `BAILINGMOE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `bloom` | `bloom` | `BLOOM` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `chameleon` | `chameleon` | `CHAMELEON` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `chatglm-bpe` | `glm4` | `CHATGLM4` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `codeshell` | `codeshell` | `CODESHELL` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `cohere2moe` | `tiny_aya` | `TINY_AYA` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `command-r` | `command-r` | `COMMAND_R` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `dbrx` | `dbrx` | `DBRX` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `deepseek-coder` | `deepseek-coder` | `DEEPSEEK_CODER` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `deepseek-llm` | `deepseek-llm` | `DEEPSEEK_LLM` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `deepseek-r1-qwen` | `qwen2` | `QWEN2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `deepseek-v3` | `deepseek-v3` | `DEEPSEEK3_LLM` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `default` | `default` | `DEFAULT` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `exaone` | `exaone` | `EXAONE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `exaone-moe` | `exaone-moe` | `EXAONE_MOE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `exaone4` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `f2llmv2` | `qwen2` | `QWEN2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `falcon` | `falcon` | `FALCON` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `falcon-h1` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `falcon3` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `gemma4` | `gemma4` | `GEMMA4` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `gigachat` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `glm4` | `glm4` | `CHATGLM4` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `gpt-2` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `gpt-4o` | `gpt-4o` | `GPT4O` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `gpt3-finnish` | `gpt3-finnish` | `GPT3_FINNISH` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `granite-docling` | `granite-docling` | `GRANITE_DOCLING` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `granite-embed-multi-311m` | `gemma4` | `GEMMA4` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `granite-embed-multi-97m` | `granite-embed-multi-97m` | `GRANITE_EMB_MULTI` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `grok-2` | `grok-2` | `GROK_2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `hunyuan` | `hunyuan` | `HUNYUAN` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `hunyuan-dense` | `hunyuan-dense` | `HUNYUAN_DENSE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jais` | `jais` | `JAIS` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jais-2` | `jais-2` | `JAIS2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-de` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-es` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-v1-en` | `jina-v1-en` | `GPT2_ADD_SEP` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-v2-code` | `jina-v1-en` | `GPT2_ADD_SEP` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-v2-de` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-v2-es` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `jina-v5-nano` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `joyai-llm` | `joyai-llm` | `JOYAI_LLM` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `kanana2` | `gpt-4o` | `GPT4O` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `kimi-k2` | `kimi-k2` | `KIMI_K2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `kormo` | `qwen2` | `QWEN2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `laguna` | `laguna` | `LAGUNA` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `lfm2` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `llada-moe` | `bailingmoe` | `BAILINGMOE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `llama-bpe` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `llama-v3` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `llama3` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `llama4` | `gpt-4o` | `GPT4O` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `megrez` | `megrez` | `QWEN2_CLEAN_SPACES` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `mellum` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `mellum2` | `mellum2` | `MELLUM2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `midm-2.0` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `minerva-7b` | `minerva-7b` | `MINERVA` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `minicpm5` | `minicpm5` | `MINICPM5` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `minimax-m2` | `minimax-m2` | `MINIMAX_M2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `modern-bert` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `mpt` | `mpt` | `MPT` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `olmo` | `olmo` | `OLMO` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `phi-2` | `gpt-2` | `GPT2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `pixtral` | `llama3` | `LLAMA3` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `poro-chat` | `poro-chat` | `PORO` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `qwen2` | `qwen2` | `QWEN2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `qwen35` | `qwen35` | `QWEN35` | `deferred` | ARTIFACT_PINNED — Exact pinned-source materialization is available only for `qwen3.5-0.8b-q4-tokenizer`; every other artifact remains deferred. |
-| `refact` | `refact` | `REFACT` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `roberta-bpe` | `jina-v1-en` | `GPT2_ADD_SEP` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `sarvam-moe` | `sarvam-moe` | `SARVAM_MOE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `seed-coder` | `seed-coder` | `SEED_CODER` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `smaug-bpe` | `smaug-bpe` | `SMAUG` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `smollm` | `smollm` | `SMOLLM` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `solar-open` | `solar-open` | `SOLAR_OPEN` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `stablelm2` | `stablelm2` | `STABLELM2` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `starcoder` | `starcoder` | `STARCODER` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `superbpe` | `superbpe` | `SUPERBPE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `talkie` | `gpt-4o` | `GPT4O` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `tekken` | `tekken` | `TEKKEN` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `tiny_aya` | `tiny_aya` | `TINY_AYA` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `trillion` | `trillion` | `TRILLION` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `viking` | `viking` | `VIKING` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `whitespace` | `whitespace` | `WHITESPACE` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
-| `youtu` | `youtu` | `YOUTU` | `deferred` | TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or artifact-scoped pinned-source evidence. |
+| `a.x-4.0` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `afmoe` | `afmoe` / `AFMOE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `bailingmoe` | `bailingmoe` / `BAILINGMOE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `bailingmoe2` | `bailingmoe` / `BAILINGMOE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `bloom` | `bloom` / `BLOOM` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `chameleon` | `chameleon` / `CHAMELEON` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `chatglm-bpe` | `glm4` / `CHATGLM4` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `codeshell` | `codeshell` / `CODESHELL` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `cohere2moe` | `tiny_aya` / `TINY_AYA` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `command-r` | `command-r` / `COMMAND_R` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `dbrx` | `dbrx` / `DBRX` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `deepseek-coder` | `deepseek-coder` / `DEEPSEEK_CODER` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `deepseek-llm` | `deepseek-llm` / `DEEPSEEK_LLM` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `deepseek-r1-qwen` | `qwen2` / `QWEN2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `deepseek-v3` | `deepseek-v3` / `DEEPSEEK3_LLM` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `default` | `default` / `DEFAULT` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `exaone` | `exaone` / `EXAONE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `exaone-moe` | `exaone-moe` / `EXAONE_MOE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `exaone4` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `f2llmv2` | `qwen2` / `QWEN2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `falcon` | `falcon` / `FALCON` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `falcon-h1` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `falcon3` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `gemma4` | `gemma4` / `GEMMA4` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `gigachat` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `glm4` | `glm4` / `CHATGLM4` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `gpt-2` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `gpt-4o` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `gpt3-finnish` | `gpt3-finnish` / `GPT3_FINNISH` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `granite-docling` | `granite-docling` / `GRANITE_DOCLING` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `granite-embed-multi-311m` | `gemma4` / `GEMMA4` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `granite-embed-multi-97m` | `granite-embed-multi-97m` / `GRANITE_EMB_MULTI` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `grok-2` | `grok-2` / `GROK_2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `hunyuan` | `hunyuan` / `HUNYUAN` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `hunyuan-dense` | `hunyuan-dense` / `HUNYUAN_DENSE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jais` | `jais` / `JAIS` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jais-2` | `jais-2` / `JAIS2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-de` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-es` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-v1-en` | `jina-v1-en` / `GPT2_ADD_SEP` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-v2-code` | `jina-v1-en` / `GPT2_ADD_SEP` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-v2-de` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-v2-es` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `jina-v5-nano` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `joyai-llm` | `joyai-llm` / `JOYAI_LLM` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `kanana2` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `kimi-k2` | `kimi-k2` / `KIMI_K2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `kormo` | `qwen2` / `QWEN2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `laguna` | `laguna` / `LAGUNA` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `lfm2` | `llama3` / `LLAMA3` | `deferred` | `validated-pinned-source` | `lfm2-350m-f16-tokenizer` |
+| `llada-moe` | `bailingmoe` / `BAILINGMOE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `llama-bpe` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `llama-v3` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `llama3` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `llama4` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `megrez` | `megrez` / `QWEN2_CLEAN_SPACES` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `mellum` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `mellum2` | `mellum2` / `MELLUM2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `midm-2.0` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `minerva-7b` | `minerva-7b` / `MINERVA` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `minicpm5` | `minicpm5` / `MINICPM5` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `minimax-m2` | `minimax-m2` / `MINIMAX_M2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `modern-bert` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `mpt` | `mpt` / `MPT` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `olmo` | `olmo` / `OLMO` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `phi-2` | `gpt-2` / `GPT2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `pixtral` | `llama3` / `LLAMA3` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `poro-chat` | `poro-chat` / `PORO` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `qwen2` | `qwen2` / `QWEN2` | `deferred` | `validated-pinned-source` | `qwen2.5-0.5b-instruct-q8-tokenizer` |
+| `qwen35` | `qwen35` / `QWEN35` | `deferred` | `validated-pinned-source` | `qwen3.5-0.8b-q4-tokenizer` |
+| `refact` | `refact` / `REFACT` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `roberta-bpe` | `jina-v1-en` / `GPT2_ADD_SEP` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `sarvam-moe` | `sarvam-moe` / `SARVAM_MOE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `seed-coder` | `seed-coder` / `SEED_CODER` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `smaug-bpe` | `smaug-bpe` / `SMAUG` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `smollm` | `smollm` / `SMOLLM` | `deferred` | `validated-pinned-source` | `smollm-135m-f16-tokenizer` |
+| `solar-open` | `solar-open` / `SOLAR_OPEN` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `stablelm2` | `stablelm2` / `STABLELM2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `starcoder` | `starcoder` / `STARCODER` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `superbpe` | `superbpe` / `SUPERBPE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `talkie` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `tekken` | `tekken` / `TEKKEN` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `tiny_aya` | `tiny_aya` / `TINY_AYA` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `trillion` | `trillion` / `TRILLION` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `viking` | `viking` / `VIKING` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `whitespace` | `whitespace` / `WHITESPACE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
+| `youtu` | `youtu` / `YOUTU` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 
 <!-- END GGUF TOKENIZER PRE SUPPORT MATRIX -->
 

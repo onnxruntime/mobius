@@ -160,9 +160,7 @@ def test_talkie_weight_mapping_owns_every_and_only_graph_parameter() -> None:
     source = _FakeTalkieGGUF()
     config = gguf_to_config(source)
     graph = CausalLMTask().build(TalkieForCausalLM(config), config)["model"].graph
-    mapped = {
-        map_gguf_to_hf_names(name, "talkie") for name in source.tensor_names
-    }
+    mapped = {map_gguf_to_hf_names(name, "talkie") for name in source.tensor_names}
     graph_weights = {
         name.removesuffix("_t")
         for name in graph.initializers
@@ -254,9 +252,7 @@ def test_talkie_nonzero_prefill_decode_and_logit_scale() -> None:
             past_value=reference_value,
             start_position=3,
         )
-        np.testing.assert_allclose(
-            decode["logits"], expected_decode, rtol=2e-4, atol=2e-4
-        )
+        np.testing.assert_allclose(decode["logits"], expected_decode, rtol=2e-4, atol=2e-4)
         assert decode["present.0.key"].shape == (1, 1, 4, 4)
         np.testing.assert_allclose(
             decode["present.0.key"][:, 0],

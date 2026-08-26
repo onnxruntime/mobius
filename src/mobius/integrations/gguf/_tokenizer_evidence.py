@@ -7,6 +7,7 @@ from __future__ import annotations
 
 __all__ = [
     "GGUFTokenizerEvidence",
+    "iter_tokenizer_evidence",
     "matching_tokenizer_evidence",
     "tokenizer_evidence",
 ]
@@ -29,6 +30,7 @@ class GGUFTokenizerEvidence:
 
     evidence_id: str
     architecture: str
+    pre_identifier: str
     repository: str
     revision: str
     filename: str
@@ -47,7 +49,10 @@ class GGUFTokenizerEvidence:
     deterministic_padding_range: tuple[int, int]
     ordered_vocabulary_sha256: str
     merge_count: int
-    ordered_merges_sha256: str
+    ordered_merges_sha256: str | None
+    score_count: int
+    ordered_scores_sha256: str | None
+    ordered_token_types_sha256: str
     materialized_tokenizer_sha256: str
     special_token_ids: tuple[tuple[str, int], ...]
     representative_encodings: tuple[tuple[str, tuple[int, ...]], ...]
@@ -58,7 +63,7 @@ class GGUFTokenizerEvidence:
             self.lfs_sha256,
             self.tokenizer_metadata_sha256,
             self.ordered_vocabulary_sha256,
-            self.ordered_merges_sha256,
+            self.ordered_token_types_sha256,
             self.materialized_tokenizer_sha256,
         )
         if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in revisions):
@@ -72,7 +77,6 @@ class GGUFTokenizerEvidence:
                 self.token_count,
                 self.source_token_count,
                 self.embedding_vocabulary_size,
-                self.merge_count,
             )
             <= 0
         ):
@@ -104,6 +108,26 @@ class GGUFTokenizerEvidence:
         )
         if tuple(sorted(self.special_token_ids)) != self.special_token_ids:
             raise ValueError("Tokenizer evidence special token IDs must be sorted by token")
+        if self.merge_count < 0 or (
+            (self.merge_count == 0) != (self.ordered_merges_sha256 is None)
+        ):
+            raise ValueError("Tokenizer evidence merge count and digest disagree")
+        if (
+            self.ordered_merges_sha256 is not None
+            and re.fullmatch(r"[0-9a-f]{64}", self.ordered_merges_sha256) is None
+        ):
+            raise ValueError("Tokenizer evidence merge digest must be lowercase SHA-256")
+        if self.score_count < 0 or (
+            (self.score_count == 0) != (self.ordered_scores_sha256 is None)
+        ):
+            raise ValueError("Tokenizer evidence score count and digest disagree")
+        if (
+            self.ordered_scores_sha256 is not None
+            and re.fullmatch(r"[0-9a-f]{64}", self.ordered_scores_sha256) is None
+        ):
+            raise ValueError("Tokenizer evidence score digest must be lowercase SHA-256")
+        if self.merge_count == 0 and self.score_count == 0:
+            raise ValueError("Tokenizer evidence requires ordered merges or ordered scores")
         if not self.representative_encodings or any(
             not text or not token_ids for text, token_ids in self.representative_encodings
         ):
@@ -125,6 +149,7 @@ class GGUFTokenizerEvidence:
 _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="qwen3.5-0.8b-q4-tokenizer",
     architecture="qwen35",
+    pre_identifier="qwen35",
     repository="ggml-org/Qwen3.5-0.8B-GGUF",
     revision="8fea620810c4afa23dd6443f999a48574c1611a3",
     filename="Qwen3.5-0.8B-Q4_0.gguf",
@@ -164,6 +189,11 @@ _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     ordered_vocabulary_sha256="5ee0f927bcaa4b9fe85c244776ae9487468e427f83e053fc81f2a186f14936a3",
     merge_count=247_587,
     ordered_merges_sha256="7e299304d9ad9dc312acdbcb1f6ccf0dce1256bf1aa986d651f13814dfd27e7b",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "f6fdca1063d1ae1cc77ba1f5087d259f044c2634e64b65e31bc844ec00e9acab"
+    ),
     materialized_tokenizer_sha256=(
         "a78b900eb4cd335bba249158066db523ce221f744e2b6144692bb81673d551af"
     ),
@@ -203,14 +233,219 @@ _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     ),
 )
 
+_SMOLLM_135M_F16_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="smollm-135m-f16-tokenizer",
+    architecture="llama",
+    pre_identifier="smollm",
+    repository="neopolita/smollm-135m-gguf",
+    revision="22cca988936eafe92908e7558907c3964e10bba7",
+    filename="ggml-model-f16.gguf",
+    size=270_885_504,
+    lfs_sha256="ec8c775c16944a7e4b5251f97b3f848500dcc3e701b0d492ce9055cea42138a2",
+    tensor_count=272,
+    tensor_qtypes=(("F16", 211), ("F32", 61)),
+    tokenizer_repository="HuggingFaceTB/SmolLM-135M",
+    tokenizer_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
+    source_config_asset=(
+        "config.json",
+        724,
+        "a1fe6f43e20f7a6c6dbc6380222af9526b5cef262446391a281c038249e3e3b7",
+    ),
+    tokenizer_metadata_sha256="46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc",
+    tokenizer_assets=(
+        (
+            "special_tokens_map.json",
+            831,
+            "e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3",
+        ),
+        (
+            "tokenizer.json",
+            2_104_556,
+            "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+        ),
+        (
+            "tokenizer_config.json",
+            3_685,
+            "238ad6b60d48e471624ea70bc79e92f2611844d5016471fee8c167854bcb98e8",
+        ),
+    ),
+    token_count=49_152,
+    source_token_count=49_152,
+    embedding_vocabulary_size=49_152,
+    deterministic_padding_range=(49_152, 49_151),
+    ordered_vocabulary_sha256="ecc2f33f7cdf683196646ea97b005f82398e5ddbb0e143fbe95a402277eb1788",
+    merge_count=48_900,
+    ordered_merges_sha256="3d6f4016bc9b70ea16f0f01b1dadb4504ad99c5eaa8584b81997dc65168e136b",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "3a92d63c9763834e17f2d93490d5a9643fa07057f2799168d67d7812d08e31aa"
+    ),
+    materialized_tokenizer_sha256=(
+        "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+    ),
+    special_token_ids=(("<|endoftext|>", 0),),
+    representative_encodings=(
+        ("Hello, world! 12345", (19556, 28, 905, 17, 216, 33, 34, 35, 36, 37)),
+        ("  spaced  text\n", (216, 23861, 216, 1694, 198)),
+        ("你好，世界！", (18645, 250, 48392, 138, 12831, 7906, 240, 178, 239, 230, 8083, 219)),  # noqa: RUF001
+        (
+            "Café — κόσμος 🚀",
+            (51, 1939, 2756, 1841, 31953, 36180, 18751, 16674, 39346, 15107, 244, 218),
+        ),
+        ("<|endoftext|>", (0,)),
+    ),
+)
+
+_QWEN25_05B_Q8_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="qwen2.5-0.5b-instruct-q8-tokenizer",
+    architecture="qwen2",
+    pre_identifier="qwen2",
+    repository="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    revision="9217f5db79a29953eb74d5343926648285ec7e67",
+    filename="qwen2.5-0.5b-instruct-q8_0.gguf",
+    size=675_710_816,
+    lfs_sha256="ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    tensor_count=291,
+    tensor_qtypes=(("F32", 121), ("Q8_0", 170)),
+    tokenizer_repository="Qwen/Qwen2.5-0.5B-Instruct",
+    tokenizer_revision="a338b55dd21219a5f4da42bc11a9313d1a27d4cc",
+    source_config_asset=(
+        "config.json",
+        659,
+        "18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45",
+    ),
+    tokenizer_metadata_sha256="8fc8ef848104e931f14ae03d9581699d54813a2ff952fb7caac0654e8aa27ee3",
+    tokenizer_assets=(
+        (
+            "tokenizer.json",
+            7_031_645,
+            "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+        ),
+        (
+            "tokenizer_config.json",
+            7_308,
+            "5214600ee45ca2f887ce2eede8910378a0111ea99d657428bcbce94778e65a92",
+        ),
+    ),
+    token_count=151_936,
+    source_token_count=151_936,
+    embedding_vocabulary_size=151_936,
+    deterministic_padding_range=(151_936, 151_935),
+    ordered_vocabulary_sha256="e2fadeac783c911f535d21f858f43127672a1d261af510d3f895e34bd2f6fb10",
+    merge_count=151_387,
+    ordered_merges_sha256="24fa2ae2a398e50784a1fff678482094af4f63e6783d35686726abacda8dc371",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "17ccfa7767a8721474dc0fd21ca1308fdfd04e0f64036efbfa97f3e16e5f18f1"
+    ),
+    materialized_tokenizer_sha256=(
+        "be55f66f0643df9d3c1b5dc55ae552b0e334f219a3a5f8338e6864f8eb3a8ac5"
+    ),
+    special_token_ids=(("<|endoftext|>", 151643), ("<|im_end|>", 151645)),
+    representative_encodings=(
+        ("Hello, world! 12345", (9707, 11, 1879, 0, 220, 16, 17, 18, 19, 20)),
+        ("  spaced  text\n", (220, 63828, 220, 1467, 198)),
+        ("你好，世界！", (108386, 3837, 99489, 6313)),  # noqa: RUF001
+        (
+            "Café — κόσμος 🚀",
+            (34, 2577, 963, 1959, 71638, 75195, 43928, 43123, 27554, 45642, 11162, 248, 222),
+        ),
+        ("<|im_start|>user\nHello<|im_end|>\n", (151644, 872, 198, 9707, 151645, 198)),
+    ),
+)
+
+_LFM2_350M_F16_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="lfm2-350m-f16-tokenizer",
+    architecture="lfm2",
+    pre_identifier="lfm2",
+    repository="LiquidAI/LFM2-350M-GGUF",
+    revision="8fdc9d526b7ed346b19257551b05816c7912ecc2",
+    filename="LFM2-350M-F16.gguf",
+    size=711_482_304,
+    lfs_sha256="379ffdcbf08147c0313f6f1ce7ff558a2bc935eda633f4b46c52347032419c42",
+    tensor_count=148,
+    tensor_qtypes=(("F16", 93), ("F32", 55)),
+    tokenizer_repository="LiquidAI/LFM2-350M",
+    tokenizer_revision="73e3c253078a3b97c2e14b4c4665679f4d9b6d56",
+    source_config_asset=(
+        "config.json",
+        999,
+        "fd3b3fba4e50e7b9a22bd41cbab59e9b28e319b2de19668d7fd9777c8d1a9ba1",
+    ),
+    tokenizer_metadata_sha256="e5626d605bb50bc53fdb0fbfcf374fb33dfbaa0cc698d9746ba1e9b0b7e6d07d",
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            209,
+            "a805e50fed68938a076b07e2e602639611b50b1ced0e50f11eb92f1ba25be4dc",
+        ),
+        (
+            "special_tokens_map.json",
+            434,
+            "742aefe2b7dec496e8caffdba03a75d0c1a9925d53bd3f3e0d388c96b591b6f4",
+        ),
+        (
+            "tokenizer.json",
+            4_732_426,
+            "98cff83b4f6d7e9d8929bebc62b07e92cf1b3f99c80d16bafe8b84a75448f40b",
+        ),
+        (
+            "tokenizer_config.json",
+            91_509,
+            "36f511115e9d8952cbc9d15d9a20dfa7ce7d1444940e5c1dc42a762020c99bf5",
+        ),
+    ),
+    token_count=65_536,
+    source_token_count=65_536,
+    embedding_vocabulary_size=65_536,
+    deterministic_padding_range=(65_536, 65_535),
+    ordered_vocabulary_sha256="c004fd0578dbfbff394335a7d5f95e78a8cdbbff6abc8c389ba2290637be58b6",
+    merge_count=63_683,
+    ordered_merges_sha256="c70042d0b5969460432a218556522dedee908735a3e4cf70f27936353c5b3f65",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "ffe1ea561257dc6e1f2c257b99b4913d63e9d6b896cf2f9da1a3d2cac316d4b4"
+    ),
+    materialized_tokenizer_sha256=(
+        "e7b7960966e2ed43a22b00431246cf820d5e2751bec58c44f0184cbe9b8d18c9"
+    ),
+    special_token_ids=(("<|im_end|>", 7), ("<|pad|>", 0), ("<|startoftext|>", 1)),
+    representative_encodings=(
+        ("Hello, world! 12345", (36309, 521, 2031, 510, 730, 10293, 2637)),
+        ("  spaced  text\n", (730, 56551, 730, 3304, 708)),
+        ("你好，世界！", (11754, 6400, 1198, 11370, 8668)),  # noqa: RUF001
+        (
+            "Café — κόσμος 🚀",
+            (544, 2305, 860, 2180, 59955, 49122, 27443, 16883, 51332, 23805, 758, 732),
+        ),
+        ("<|startoftext|><|im_start|>user\nHello<|im_end|>", (1, 6, 6423, 708, 36309, 7)),
+    ),
+)
+
 _TOKENIZER_EVIDENCE = MappingProxyType(
-    {_QWEN35_08B_Q4_TOKENIZER.evidence_id: _QWEN35_08B_Q4_TOKENIZER}
+    {
+        record.evidence_id: record
+        for record in (
+            _LFM2_350M_F16_TOKENIZER,
+            _QWEN25_05B_Q8_TOKENIZER,
+            _QWEN35_08B_Q4_TOKENIZER,
+            _SMOLLM_135M_F16_TOKENIZER,
+        )
+    }
 )
 
 
 def tokenizer_evidence(evidence_id: str) -> GGUFTokenizerEvidence | None:
     """Return exact tokenizer evidence by stable ID."""
     return _TOKENIZER_EVIDENCE.get(evidence_id)
+
+
+def iter_tokenizer_evidence() -> tuple[GGUFTokenizerEvidence, ...]:
+    """Return every tokenizer evidence record in stable evidence-ID order."""
+    return tuple(_TOKENIZER_EVIDENCE[key] for key in sorted(_TOKENIZER_EVIDENCE))
 
 
 def matching_tokenizer_evidence(
@@ -237,11 +472,14 @@ def matching_tokenizer_evidence(
 
     token_count, vocabulary_sha256 = sequence_digest("tokenizer.ggml.tokens")
     merge_count, merges_sha256 = sequence_digest("tokenizer.ggml.merges")
+    score_count, scores_sha256 = sequence_digest("tokenizer.ggml.scores")
+    token_type_count, token_types_sha256 = sequence_digest("tokenizer.ggml.token_type")
     token_types = metadata.get("tokenizer.ggml.token_type")
     matches = [
         evidence
         for evidence in _TOKENIZER_EVIDENCE.values()
         if evidence.architecture == architecture
+        and evidence.pre_identifier == metadata.get("tokenizer.ggml.pre")
         and evidence.filename == identity.filename
         and evidence.size == identity.size
         and evidence.lfs_sha256 == identity.sha256
@@ -251,7 +489,11 @@ def matching_tokenizer_evidence(
         and evidence.token_count == token_count
         and evidence.ordered_vocabulary_sha256 == vocabulary_sha256
         and evidence.merge_count == merge_count
-        and evidence.ordered_merges_sha256 == merges_sha256
+        and evidence.ordered_merges_sha256 == (merges_sha256 or None)
+        and evidence.score_count == score_count
+        and evidence.ordered_scores_sha256 == (scores_sha256 or None)
+        and evidence.token_count == token_type_count
+        and evidence.ordered_token_types_sha256 == token_types_sha256
         and gguf_model.get_tensor_shape("token_embd.weight")[0]
         == evidence.embedding_vocabulary_size
         and all(
