@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 83
+_EXPECTED_SUPPORTED_COUNT = 85
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "codeshell",
@@ -69,6 +69,7 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "gptneox",
         "jais",
         "jais2",
+        "minicpm",
         "mpt",
         "openelm",
         "orion",
@@ -192,6 +193,8 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "llada",
         "llada-moe",
         "llama",
+        "minicpm",
+        "minicpm3",
         "minimax-01",
         "modern-bert",
         "muse-glimmer",

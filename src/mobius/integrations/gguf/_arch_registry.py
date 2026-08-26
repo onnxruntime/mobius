@@ -1826,12 +1826,48 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
-        gguf_arch="minicpm3",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        gguf_arch="minicpm",
+        model_type="minicpm",
+        module_type="minicpm_gguf",
+        config_key_map="minicpm",
+        config_postprocessor="minicpm",
+        tensor_map_recipe=("llama",),
+        tensor_processor="llama",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "embedding_scale",
+            "residual_scale",
+            "logit_scale",
+        ),
+        llama_qk_permute=True,
         runtime=Support.DEFERRED,
-        reason=_MINICPM3_GRAPH_REASON,
+        reason=(
+            "Exact dense graph import, tensor closure, scaling, LongRoPE factors, "
+            "Q/K transforms, and expanded dynamic K/V cache are covered. Runtime "
+            "packaging remains deferred pending pinned real-weight generation parity; "
+            "routed-expert MiniCPM files are rejected by the dense-only boundary."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="minicpm3",
+        model_type="minicpm3",
+        module_type="minicpm3_gguf",
+        config_key_map="minicpm3",
+        config_postprocessor="minicpm3",
+        tensor_map_recipe=("minicpm3",),
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "attention.key_length",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        reason=(
+            "Exact Q/KV-LoRA MLA graph import with expanded K/V cache is covered. "
+            "Runtime packaging remains deferred pending pinned real-weight generation "
+            "parity; latent cache/state sidecars remain unsupported."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="openelm",
@@ -2153,6 +2189,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "gptneox",
             "jais",
             "jais2",
+            "minicpm",
             "plm",
             "orion",
             "pangu-embedded",

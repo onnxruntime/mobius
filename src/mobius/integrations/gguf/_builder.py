@@ -537,6 +537,7 @@ def _validate_gguf_model(
     _raise_for_unsupported_encoder_heads(gguf_model)
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
     _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model)
+    _raise_for_invalid_minicpm_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
@@ -672,6 +673,176 @@ def _raise_for_invalid_minimax_tensor_contract(gguf_model) -> None:
     }
     if malformed:
         raise ValueError(f"MiniMax-01 GGUF has invalid tensor shape(s): {malformed}")
+
+
+def _raise_for_invalid_minicpm_tensor_contract(gguf_model) -> None:
+    """Validate the exact dense MiniCPM/MiniCPM3 loader closure and geometry."""
+    architecture = gguf_model.architecture
+    if architecture not in {"minicpm", "minicpm3"}:
+        return
+
+    metadata = gguf_model.metadata
+    required_geometry = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    missing_geometry = [
+        f"{architecture}.{suffix}"
+        for suffix in required_geometry
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_geometry:
+        raise ValueError(
+            f"{architecture} GGUF is missing required geometry: {missing_geometry}"
+        )
+
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+    context = int(metadata[f"{architecture}.context_length"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    if min(hidden, intermediate, layers, heads, kv_heads, context, vocab) <= 0:
+        raise ValueError(f"{architecture} GGUF has non-positive model geometry")
+    if hidden % heads or heads % kv_heads:
+        raise ValueError(f"{architecture} GGUF has invalid attention head geometry")
+    if int(metadata.get(f"{architecture}.expert_count", 0)):
+        raise ValueError(
+            f"{architecture} routed-expert GGUF is outside the exact dense graph subset"
+        )
+    if architecture == "minicpm3":
+        mla_metadata = (
+            "attention.key_length",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "rope.dimension_count",
+        )
+        missing_mla = [
+            f"{architecture}.{suffix}"
+            for suffix in mla_metadata
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_mla:
+            raise ValueError(f"minicpm3 GGUF is missing required MLA geometry: {missing_mla}")
+
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {"output.weight": (vocab, hidden)}
+
+    if architecture == "minicpm":
+        head_dim = hidden // heads
+        kv_dim = kv_heads * head_dim
+        rope_dim = int(metadata.get("minicpm.rope.dimension_count", head_dim))
+        if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+            raise ValueError("minicpm GGUF has invalid rotary dimension")
+        if "rope_freqs.weight" in actual:
+            raise ValueError(
+                "MiniCPM GGUF with serialized rope_freqs.weight is unsupported: "
+                "the exact per-dimension frequency factors are not representable "
+                "by the current rotary graph"
+            )
+        for rope_name in (
+            "rope_factors_long.weight",
+            "rope_factors_short.weight",
+        ):
+            optional[rope_name] = (rope_dim // 2,)
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            if prefix + "attn_qkv.weight" in actual:
+                raise ValueError(
+                    "MiniCPM fused QKV is unsupported because its Q and K rows require "
+                    "different exact permutations; split Q/K/V tensors are required"
+                )
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_q.weight": (hidden, hidden),
+                    prefix + "attn_k.weight": (kv_dim, hidden),
+                    prefix + "attn_v.weight": (kv_dim, hidden),
+                    prefix + "attn_output.weight": (hidden, hidden),
+                    prefix + "ffn_norm.weight": (hidden,),
+                    prefix + "ffn_gate.weight": (intermediate, hidden),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional.update(
+                {
+                    prefix + "attn_q.bias": (hidden,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                    prefix + "attn_output.bias": (hidden,),
+                    prefix + "ffn_gate.bias": (intermediate,),
+                    prefix + "ffn_up.bias": (intermediate,),
+                    prefix + "ffn_down.bias": (hidden,),
+                }
+            )
+    else:
+        if kv_heads != heads:
+            raise ValueError("minicpm3 GGUF requires one expanded K/V head per query head")
+        qk_dim = int(metadata["minicpm3.attention.key_length"])
+        rope_dim = int(metadata["minicpm3.rope.dimension_count"])
+        q_rank = int(metadata["minicpm3.attention.q_lora_rank"])
+        kv_rank = int(metadata["minicpm3.attention.kv_lora_rank"])
+        value_dim = hidden // heads
+        nope_dim = qk_dim - rope_dim
+        if min(q_rank, kv_rank, value_dim, nope_dim, rope_dim) <= 0 or rope_dim % 2:
+            raise ValueError("minicpm3 GGUF has invalid MLA geometry")
+        optional.update(
+            {
+                "rope_factors_long.weight": (rope_dim // 2,),
+                "rope_factors_short.weight": (rope_dim // 2,),
+            }
+        )
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_q_a.weight": (q_rank, hidden),
+                    prefix + "attn_q_a_norm.weight": (q_rank,),
+                    prefix + "attn_q_b.weight": (heads * qk_dim, q_rank),
+                    prefix + "attn_kv_a_mqa.weight": (
+                        kv_rank + rope_dim,
+                        hidden,
+                    ),
+                    prefix + "attn_kv_a_norm.weight": (kv_rank,),
+                    prefix + "attn_kv_b.weight": (
+                        heads * (nope_dim + value_dim),
+                        kv_rank,
+                    ),
+                    prefix + "attn_output.weight": (hidden, heads * value_dim),
+                    prefix + "ffn_norm.weight": (hidden,),
+                    prefix + "ffn_gate.weight": (intermediate, hidden),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required) - set(optional))
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in set(actual) & (set(required) | set(optional))
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
+        )
 
 
 def _raise_for_invalid_kimi_linear_tensor_contract(gguf_model) -> None:

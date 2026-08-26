@@ -247,6 +247,20 @@ _KIMI_K3_KEY_MAP = {
     "activation.situ_linear_beta": "activation_situ_linear_beta",
 }
 
+_MINICPM_KEY_MAP = {
+    "embedding_scale": "embedding_multiplier",
+    "residual_scale": "residual_multiplier",
+    # The pinned converter serializes hidden_size / dim_model_base. The graph
+    # divides the normalized hidden state by this value before the LM head.
+    "logit_scale": "logits_scaling",
+}
+
+_MINICPM3_KEY_MAP = {
+    "attention.q_lora_rank": "q_lora_rank",
+    "attention.kv_lora_rank": "kv_lora_rank",
+    "rope.dimension_count": "qk_rope_head_dim",
+}
+
 _CONVENTIONAL_SHARED_MOE_KEY_MAP = {
     "leading_dense_block_count": "first_k_dense_replace",
 }
@@ -277,6 +291,8 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minimax": _MINIMAX_KEY_MAP,
         "kimi_linear": _KIMI_LINEAR_KEY_MAP,
         "kimi_k3": _KIMI_K3_KEY_MAP,
+        "minicpm": _MINICPM_KEY_MAP,
+        "minicpm3": _MINICPM3_KEY_MAP,
         "conventional_shared_moe": _CONVENTIONAL_SHARED_MOE_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
@@ -2214,6 +2230,147 @@ def _pangu_embedded_postprocess(
     )
 
 
+def _minicpm_longrope(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+    *,
+    rope_dim: int,
+) -> ArchitectureConfig:
+    tensor_names = set(getattr(model, "tensor_names", ()) or ())
+    long_name = "rope_factors_long.weight"
+    short_name = "rope_factors_short.weight"
+    present = {name for name in (long_name, short_name) if name in tensor_names}
+    if not present:
+        return config
+    if present != {long_name, short_name}:
+        raise ValueError(
+            "MiniCPM LongRoPE requires both rope_factors_long.weight and "
+            "rope_factors_short.weight"
+        )
+    if model is None or not hasattr(model, "get_tensor"):
+        raise ValueError("MiniCPM LongRoPE factors could not be read from the GGUF model")
+
+    long_factor = np.asarray(model.get_tensor(long_name), dtype=np.float32).reshape(-1)
+    short_factor = np.asarray(model.get_tensor(short_name), dtype=np.float32).reshape(-1)
+    expected = rope_dim // 2
+    if (
+        rope_dim <= 0
+        or rope_dim % 2
+        or long_factor.shape != (expected,)
+        or short_factor.shape != (expected,)
+        or not np.all(np.isfinite(long_factor))
+        or not np.all(np.isfinite(short_factor))
+        or np.any(long_factor <= 0)
+        or np.any(short_factor <= 0)
+    ):
+        raise ValueError(
+            f"MiniCPM LongRoPE factors must be finite positive vectors of length {expected}"
+        )
+
+    arch = model.architecture
+    original_context = metadata.get(f"{arch}.rope.scaling.original_context_length")
+    if original_context is None:
+        # MiniCPM3's pinned converter omits scaling metadata. Its published
+        # checkpoint has original_context == context and identical factor tables.
+        if not np.array_equal(long_factor, short_factor):
+            raise ValueError(
+                "MiniCPM LongRoPE with distinct long/short factors requires "
+                "rope.scaling.original_context_length"
+            )
+        original_context = config.max_position_embeddings
+    original_context = int(original_context)
+    if not 0 < original_context <= config.max_position_embeddings:
+        raise ValueError("MiniCPM LongRoPE original context is outside the model context")
+
+    return dataclasses.replace(
+        config,
+        rope_type="longrope",
+        rope_scaling={
+            "long_factor": long_factor.tolist(),
+            "short_factor": short_factor.tolist(),
+        },
+        original_max_position_embeddings=original_context,
+    )
+
+
+def _minicpm_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    arch = model.architecture
+    scales = {
+        "embedding_multiplier": float(metadata[f"{arch}.embedding_scale"]),
+        "residual_multiplier": float(metadata[f"{arch}.residual_scale"]),
+        "logits_scaling": float(metadata[f"{arch}.logit_scale"]),
+    }
+    if any(not math.isfinite(value) or value <= 0 for value in scales.values()):
+        raise ValueError(
+            "MiniCPM embedding, residual, and logit scales must be finite positive"
+        )
+    if int(metadata.get(f"{arch}.expert_count", 0)):
+        raise ValueError("MiniCPM routed-expert GGUF is outside the exact dense graph subset")
+    config = dataclasses.replace(
+        config,
+        rope_type=config.rope_type or "default",
+        embedding_multiplier=scales["embedding_multiplier"],
+        residual_multiplier=scales["residual_multiplier"],
+        logits_scaling=scales["logits_scaling"],
+    )
+    rope_dim = int(
+        metadata.get(
+            f"{arch}.rope.dimension_count",
+            config.head_dim,
+        )
+    )
+    return _minicpm_longrope(
+        config,
+        metadata,
+        model,
+        rope_dim=rope_dim,
+    )
+
+
+def _minicpm3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    arch = model.architecture
+    heads = config.num_attention_heads
+    qk_dim = int(metadata[f"{arch}.attention.key_length"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    value_dim = config.hidden_size // heads
+    q_rank = int(metadata[f"{arch}.attention.q_lora_rank"])
+    kv_rank = int(metadata[f"{arch}.attention.kv_lora_rank"])
+    if config.hidden_size % heads or not 0 < rope_dim < qk_dim:
+        raise ValueError("MiniCPM3 has invalid MLA head geometry")
+    if min(q_rank, kv_rank, value_dim) <= 0:
+        raise ValueError("MiniCPM3 LoRA ranks and value head width must be positive")
+    if int(metadata.get(f"{arch}.expert_count", 0)):
+        raise ValueError("MiniCPM3 pinned GGUF graph is dense-only")
+
+    config = dataclasses.replace(
+        config,
+        head_dim=qk_dim,
+        num_key_value_heads=heads,
+        q_lora_rank=q_rank,
+        kv_lora_rank=kv_rank,
+        qk_nope_head_dim=qk_dim - rope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=value_dim,
+        partial_rotary_factor=1.0,
+        rope_type=config.rope_type or "default",
+        rope_interleave=False,
+        embedding_multiplier=12.0,
+        residual_multiplier=1.4 / math.sqrt(config.num_hidden_layers),
+        logits_scaling=config.hidden_size / 256.0,
+        hidden_act="silu",
+    )
+    return _minicpm_longrope(config, metadata, model, rope_dim=rope_dim)
+
+
 def _gemma4_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -3652,6 +3809,8 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "minimax": _minimax_postprocess,
     "kimi_linear": _kimi_linear_postprocess,
     "kimi_k3": _kimi_k3_postprocess,
+    "minicpm": _minicpm_postprocess,
+    "minicpm3": _minicpm3_postprocess,
 }
 
 

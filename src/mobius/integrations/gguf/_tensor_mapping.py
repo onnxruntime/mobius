@@ -996,6 +996,24 @@ _KIMI_K3_MAPPING: dict[str, str] = {
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_a"]
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_b"]
 
+_MINICPM3_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_kv_b": "model.layers.{bid}.self_attn.kv_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -1095,6 +1113,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minimax": _MINIMAX_MAPPING,
         "kimi_linear": _KIMI_LINEAR_MAPPING,
         "kimi_k3": _KIMI_K3_MAPPING,
+        "minicpm3": _MINICPM3_MAPPING,
     }
 )
 
