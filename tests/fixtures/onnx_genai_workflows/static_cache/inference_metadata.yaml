@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 schema_version: v1.1
+=======
+schema_version: v1.2
+>>>>>>> 031ee3b2 (test(onnx-genai): refresh token authority fixtures)
 pipeline:
   workflow:
     manifest:
@@ -42,18 +46,6 @@ pipeline:
         source:
           kind: request
         required: true
-      package.eos_ids:
-        contract:
-          dtype: int64
-          rank: 1
-          shape:
-          - E
-        role:
-          kind: opaque
-        source:
-          kind: literal
-        required: false
-        default: 127
       package.one_token:
         contract:
           dtype: int64
@@ -132,12 +124,12 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: eos_token_ids
         source:
-          kind: application
-          name: eos_ids
-        required: false
-        default: 127
+          kind: request
+        required: true
       request.eos_lengths:
         contract:
           dtype: int64
@@ -148,12 +140,12 @@ pipeline:
             kind: request_aligned
             axis: 0
         role:
-          kind: opaque
+          kind: runtime
+          version: '1.0'
+          role: eos_token_lengths
         source:
-          kind: application
-          name: eos_lengths
-        required: false
-        default: 1
+          kind: request
+        required: true
       request.row_max_iterations:
         contract:
           dtype: int64
@@ -1368,3 +1360,9 @@ pipeline:
           rank: 1
           shape:
           - 1
+package:
+  tokenizer:
+    byte_level: false
+    special_tokens:
+      eos_token_id:
+      - 127
