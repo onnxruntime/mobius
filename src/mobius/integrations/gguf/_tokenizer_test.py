@@ -580,6 +580,20 @@ def test_non_smollm_pipeline_is_bound_by_exact_asset_hashes() -> None:
     assert hashlib.sha256(materialized).hexdigest() == tokenizer_sha256
 
 
+def test_special_added_token_proves_legacy_config_omission() -> None:
+    metadata = _metadata(pre="gpt-2")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(metadata)
+    config = json.loads(payloads["tokenizer_config.json"])
+    config.pop("bos_token")
+    config.pop("eos_token")
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    tokenizer_sha256, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    assert hashlib.sha256(materialized).hexdigest() == tokenizer_sha256
+
+
 def test_deterministic_unused_padding_extends_bpe_vocab_without_matching_input() -> None:
     source_metadata = _metadata(pre="qwen2")
     source_metadata.pop("tokenizer.ggml.scores")

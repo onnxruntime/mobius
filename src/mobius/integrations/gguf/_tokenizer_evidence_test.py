@@ -8,12 +8,18 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 from mobius.integrations.gguf import _tokenizer_evidence
 from mobius.integrations.gguf._runtime_evidence import GGUFArtifactIdentity, runtime_evidence
+from mobius.integrations.gguf._tokenizer_alias_evidence import (
+    TOKENIZER_DISPATCH_SOURCE_PATH,
+    TOKENIZER_DISPATCH_SOURCE_SHA256,
+    tokenizer_alias_evidence,
+)
 from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_evidence import (
     iter_tokenizer_evidence,
@@ -48,6 +54,7 @@ def test_qwen35_tokenizer_evidence_is_exact_and_runtime_independent() -> None:
 def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> None:
     records = iter_tokenizer_evidence()
     assert [(record.pre_identifier, record.architecture) for record in records] == [
+        ("gpt-2", "gpt2"),
         ("lfm2", "lfm2"),
         ("qwen2", "qwen2"),
         ("qwen35", "qwen35"),
@@ -87,8 +94,9 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
         for status in {record.current_status for record in census}
     }
     assert statuses == {
-        "deferred-compiled-semantics": 83,
-        "validated-pinned-source": 4,
+        "deferred-compiled-semantics": 45,
+        "deferred-pinned-artifact-evidence": 16,
+        "validated-pinned-source": 26,
     }
     for record in census:
         assert (record.evidence_id is None) == (record.blocker_category is not None)
@@ -99,6 +107,47 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
             assert record.artifact_revision is not None
             assert record.tokenizer_revision is not None
             assert record.tokenizer_assets
+
+
+def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_tokenizer_alias_batch2.json"
+    expected = json.loads(path.read_text(encoding="utf-8"))
+    assert len(expected) == 38
+    assert len({row[0] for row in expected}) == 38
+    census = {record.identifier: record for record in tokenizer_route_census()}
+    proofs = tokenizer_alias_evidence()
+
+    actual = [
+        [
+            identifier,
+            census[identifier].semantic_group,
+            census[identifier].pre_type,
+            census[identifier].evidence_id,
+        ]
+        for identifier, *_ in expected
+    ]
+    assert actual == expected
+    assert all(identifier in proofs for identifier, *_ in expected)
+    assert {row[0] for row in expected if row[3] is not None} == {
+        identifier
+        for evidence in iter_tokenizer_evidence()
+        for identifier in evidence.validated_identifiers
+        if identifier in {row[0] for row in expected}
+    }
+    assert {proof.source_path for proof in proofs.values()} == {TOKENIZER_DISPATCH_SOURCE_PATH}
+    assert {proof.source_sha256 for proof in proofs.values()} == {
+        TOKENIZER_DISPATCH_SOURCE_SHA256
+    }
+
+
+def test_shared_evidence_requires_identical_pinned_dispatch_behavior() -> None:
+    evidence = tokenizer_evidence("gpt2-q4-tokenizer")
+    assert evidence is not None
+    with pytest.raises(ValueError, match="exact pinned semantic group"):
+        dataclasses.replace(
+            evidence,
+            validated_identifiers=("gpt-2", "qwen2"),
+        )
 
 
 def test_existing_qwen25_runtime_tokenizer_evidence_remains_pinned() -> None:

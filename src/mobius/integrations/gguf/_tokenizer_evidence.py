@@ -22,6 +22,8 @@ from typing import Any
 
 from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
 from mobius.integrations.gguf._tokenizer import GGUFTokenizerAsset, GGUFTokenizerSource
+from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
+from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -31,6 +33,7 @@ class GGUFTokenizerEvidence:
     evidence_id: str
     architecture: str
     pre_identifier: str
+    validated_identifiers: tuple[str, ...]
     repository: str
     revision: str
     filename: str
@@ -98,6 +101,41 @@ class GGUFTokenizerEvidence:
             )
         if tuple(sorted(self.tokenizer_assets)) != self.tokenizer_assets:
             raise ValueError("Tokenizer evidence assets must be sorted")
+        policies = tokenizer_pre_policies()
+        if (
+            not self.validated_identifiers
+            or tuple(sorted(set(self.validated_identifiers))) != self.validated_identifiers
+            or self.pre_identifier not in self.validated_identifiers
+        ):
+            raise ValueError(
+                "Tokenizer evidence identifiers must be sorted, unique, and include pre"
+            )
+        try:
+            witness = policies[self.pre_identifier]
+            aliases = tuple(policies[identifier] for identifier in self.validated_identifiers)
+        except KeyError as error:
+            raise ValueError(
+                f"Tokenizer evidence contains an unknown identifier: {error.args[0]}"
+            ) from error
+        if any(
+            alias.canonical != witness.canonical or alias.pre_type != witness.pre_type
+            for alias in aliases
+        ):
+            raise ValueError(
+                "Tokenizer evidence may be shared only across an exact pinned semantic group"
+            )
+        if len(self.validated_identifiers) > 1:
+            proofs = tokenizer_alias_evidence()
+            if any(
+                identifier not in proofs
+                or proofs[identifier].pre_type != witness.pre_type
+                or proofs[identifier].flag_overrides
+                != proofs[self.pre_identifier].flag_overrides
+                for identifier in self.validated_identifiers
+            ):
+                raise ValueError(
+                    "Shared tokenizer evidence requires exact pinned dispatch proof for every alias"
+                )
         GGUFTokenizerSource(
             self.tokenizer_repository,
             self.tokenizer_revision,
@@ -150,6 +188,7 @@ _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="qwen3.5-0.8b-q4-tokenizer",
     architecture="qwen35",
     pre_identifier="qwen35",
+    validated_identifiers=("qwen35",),
     repository="ggml-org/Qwen3.5-0.8B-GGUF",
     revision="8fea620810c4afa23dd6443f999a48574c1611a3",
     filename="Qwen3.5-0.8B-Q4_0.gguf",
@@ -233,10 +272,102 @@ _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     ),
 )
 
+_GPT2_Q4_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="gpt2-q4-tokenizer",
+    architecture="gpt2",
+    pre_identifier="gpt-2",
+    validated_identifiers=(
+        "a.x-4.0",
+        "exaone4",
+        "gigachat",
+        "gpt-2",
+        "jina-de",
+        "jina-es",
+        "jina-v2-de",
+        "jina-v2-es",
+        "mellum",
+        "modern-bert",
+        "phi-2",
+    ),
+    repository="QuantFactory/gpt2-GGUF",
+    revision="7eae6f079f0164bff66b86eea5159f7a368f9381",
+    filename="gpt2.Q4_0.gguf",
+    size=106_554_880,
+    lfs_sha256="d52ac7ed12e1f87cbc93473912f5c213d7c7d6f2a0112ea9d78533d0d7bd3632",
+    tensor_count=149,
+    tensor_qtypes=(("F32", 99), ("Q4_0", 49), ("Q6_K", 1)),
+    tokenizer_repository="openai-community/gpt2",
+    tokenizer_revision="607a30d783dfa663caf39e06633721c8d4cfcd7e",
+    source_config_asset=(
+        "config.json",
+        665,
+        "0daed7749b4f02b8f76240d5444551d7b08712dab4d0adb8239c56ba823bb7b4",
+    ),
+    tokenizer_metadata_sha256="b2417176025f8500d864004b0bf93b1403dc3c52238f6628f82fb0e3c498977e",
+    tokenizer_assets=(
+        (
+            "tokenizer.json",
+            1_355_256,
+            "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6",
+        ),
+        (
+            "tokenizer_config.json",
+            26,
+            "5e04eb606e3a1583530a42e36c2a6b6615c86f34fe77e44d9ddeb43ff940931f",
+        ),
+    ),
+    token_count=50_257,
+    source_token_count=50_257,
+    embedding_vocabulary_size=50_257,
+    deterministic_padding_range=(50_257, 50_256),
+    ordered_vocabulary_sha256="2d4e96560e324abcfaeaac6d24016c22f354ef9da213432b451e9a860b21d508",
+    merge_count=50_000,
+    ordered_merges_sha256="e707935c815087d8103fec742a07d7e8b50d1acf997ddcde53c73213db1141a4",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "aeaf4bf6f00438b0ef9ee1edb6e58616d49b4735d520393af901b7ccf1e3a218"
+    ),
+    materialized_tokenizer_sha256=(
+        "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6"
+    ),
+    special_token_ids=(("<|endoftext|>", 50_256),),
+    representative_encodings=(
+        ("Hello, world! 12345", (15496, 11, 995, 0, 17031, 2231)),
+        ("  spaced  text\n", (220, 38980, 220, 2420, 198)),
+        (
+            "你好，世界！",  # noqa: RUF001
+            (19526, 254, 25001, 121, 171, 120, 234, 10310, 244, 45911, 234, 171, 120, 223),
+        ),
+        (
+            "Café — κόσμος 🚀",
+            (
+                34,
+                1878,
+                2634,
+                851,
+                7377,
+                118,
+                139,
+                234,
+                38392,
+                34703,
+                26517,
+                35558,
+                12520,
+                248,
+                222,
+            ),
+        ),
+        ("<|endoftext|>", (50_256,)),
+    ),
+)
+
 _SMOLLM_135M_F16_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="smollm-135m-f16-tokenizer",
     architecture="llama",
     pre_identifier="smollm",
+    validated_identifiers=("smollm",),
     repository="neopolita/smollm-135m-gguf",
     revision="22cca988936eafe92908e7558907c3964e10bba7",
     filename="ggml-model-f16.gguf",
@@ -301,6 +432,7 @@ _QWEN25_05B_Q8_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="qwen2.5-0.5b-instruct-q8-tokenizer",
     architecture="qwen2",
     pre_identifier="qwen2",
+    validated_identifiers=("deepseek-r1-qwen", "f2llmv2", "kormo", "qwen2"),
     repository="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
     revision="9217f5db79a29953eb74d5343926648285ec7e67",
     filename="qwen2.5-0.5b-instruct-q8_0.gguf",
@@ -360,6 +492,17 @@ _LFM2_350M_F16_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="lfm2-350m-f16-tokenizer",
     architecture="lfm2",
     pre_identifier="lfm2",
+    validated_identifiers=(
+        "falcon-h1",
+        "falcon3",
+        "jina-v5-nano",
+        "lfm2",
+        "llama-bpe",
+        "llama-v3",
+        "llama3",
+        "midm-2.0",
+        "pixtral",
+    ),
     repository="LiquidAI/LFM2-350M-GGUF",
     revision="8fdc9d526b7ed346b19257551b05816c7912ecc2",
     filename="LFM2-350M-F16.gguf",
@@ -429,6 +572,7 @@ _TOKENIZER_EVIDENCE = MappingProxyType(
     {
         record.evidence_id: record
         for record in (
+            _GPT2_Q4_TOKENIZER,
             _LFM2_350M_F16_TOKENIZER,
             _QWEN25_05B_Q8_TOKENIZER,
             _QWEN35_08B_Q4_TOKENIZER,

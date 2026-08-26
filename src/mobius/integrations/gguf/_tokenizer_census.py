@@ -11,14 +11,22 @@ import dataclasses
 import functools
 from typing import Literal
 
+from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
 from mobius.integrations.gguf._tokenizer_evidence import (
     GGUFTokenizerEvidence,
     iter_tokenizer_evidence,
 )
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 
-TokenizerAuditStatus = Literal["validated-pinned-source", "deferred-compiled-semantics"]
-TokenizerBlocker = Literal["compiled-llama.cpp-semantic-dependency"]
+TokenizerAuditStatus = Literal[
+    "validated-pinned-source",
+    "deferred-pinned-artifact-evidence",
+    "deferred-compiled-semantics",
+]
+TokenizerBlocker = Literal[
+    "pinned-artifact-source-parity-pending",
+    "compiled-llama.cpp-semantic-dependency",
+]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -42,8 +50,10 @@ class GGUFTokenizerRouteAudit:
     blocker_category: TokenizerBlocker | None
 
 
-def _evidenced_route(evidence: GGUFTokenizerEvidence) -> GGUFTokenizerRouteAudit:
-    policy = tokenizer_pre_policies()[evidence.pre_identifier]
+def _evidenced_route(
+    identifier: str, evidence: GGUFTokenizerEvidence
+) -> GGUFTokenizerRouteAudit:
+    policy = tokenizer_pre_policies()[identifier]
     return GGUFTokenizerRouteAudit(
         identifier=policy.identifier,
         semantic_group=policy.canonical,
@@ -69,22 +79,32 @@ def _evidenced_route(evidence: GGUFTokenizerEvidence) -> GGUFTokenizerRouteAudit
 def tokenizer_route_census() -> tuple[GGUFTokenizerRouteAudit, ...]:
     """Return all exact routes, including aliases, in identifier order."""
     evidenced = {
-        evidence.pre_identifier: _evidenced_route(evidence)
+        identifier: _evidenced_route(identifier, evidence)
         for evidence in iter_tokenizer_evidence()
+        for identifier in evidence.validated_identifiers
     }
-    if len(evidenced) != len(iter_tokenizer_evidence()):
-        raise RuntimeError("Tokenizer evidence contains duplicate exact pre identifiers")
+    expected_count = sum(
+        len(evidence.validated_identifiers) for evidence in iter_tokenizer_evidence()
+    )
+    if len(evidenced) != expected_count:
+        raise RuntimeError("Tokenizer evidence contains duplicate validated identifiers")
 
     records = []
+    alias_proofs = tokenizer_alias_evidence()
     for identifier, policy in sorted(tokenizer_pre_policies().items()):
         record = evidenced.get(identifier)
         if record is None:
+            dispatch_proven = identifier in alias_proofs
             record = GGUFTokenizerRouteAudit(
                 identifier=identifier,
                 semantic_group=policy.canonical,
                 pre_type=policy.pre_type,
                 default_policy=policy.default_route,
-                current_status="deferred-compiled-semantics",
+                current_status=(
+                    "deferred-pinned-artifact-evidence"
+                    if dispatch_proven
+                    else "deferred-compiled-semantics"
+                ),
                 evidence_id=None,
                 artifact_repository=None,
                 artifact_revision=None,
@@ -94,7 +114,11 @@ def tokenizer_route_census() -> tuple[GGUFTokenizerRouteAudit, ...]:
                 tokenizer_repository=None,
                 tokenizer_revision=None,
                 tokenizer_assets=(),
-                blocker_category="compiled-llama.cpp-semantic-dependency",
+                blocker_category=(
+                    "pinned-artifact-source-parity-pending"
+                    if dispatch_proven
+                    else "compiled-llama.cpp-semantic-dependency"
+                ),
             )
         records.append(record)
     return tuple(records)
