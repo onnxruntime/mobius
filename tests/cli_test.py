@@ -1107,13 +1107,13 @@ class TestCLIBuildGGUF:
     ) -> None:
         from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
 
-        gguf_path = tmp_path / "talkie.gguf"
+        gguf_path = tmp_path / "pockettts.gguf"
         output_dir = tmp_path / "must-not-exist"
-        _write_gated_gguf(gguf_path, architecture="talkie", quantized=quantized)
+        _write_gated_gguf(gguf_path, architecture="pockettts", quantized=quantized)
 
         with pytest.raises(
             UnsupportedGGUFArchitectureError,
-            match=r"talkie.*before config extraction",
+            match=r"pockettts.*before config extraction",
         ):
             main(
                 [

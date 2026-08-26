@@ -523,6 +523,7 @@ def _validate_gguf_model(
         allow_mmproj_companion=allow_mmproj_companion,
     )
     _raise_for_invalid_bitnet_tensor_contract(gguf_model)
+    _raise_for_invalid_talkie_tensor_contract(gguf_model)
     from mobius.integrations.gguf._mtp import validate_mtp_tensor_contract
 
     validate_mtp_tensor_contract(gguf_model)
@@ -539,6 +540,7 @@ def _validate_gguf_model(
     _raise_for_invalid_encoder_tensor_contract(gguf_model)
     _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model)
     _raise_for_invalid_minicpm_tensor_contract(gguf_model)
+    _raise_for_invalid_embedding_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
@@ -671,6 +673,98 @@ def _raise_for_invalid_bitnet_tensor_contract(gguf_model) -> None:
             "Invalid BitNet GGUF tensor closure (the output projection must be tied to "
             "token_embd.weight): "
             f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_talkie_tensor_contract(gguf_model) -> None:
+    """Require the exact pinned scalar-sidecar Talkie graph and tensor closure."""
+    if gguf_model.architecture != "talkie":
+        return
+
+    arch = "talkie"
+    metadata = gguf_model.metadata
+    required_metadata = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.layer_norm_rms_epsilon",
+        "rope.freq_base",
+        "rope.dimension_count",
+        "logit_scale",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}"
+        for suffix in required_metadata
+        if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"Talkie GGUF is missing required metadata: {missing_metadata}")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata[f"{arch}.attention.head_count_kv"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    context = int(metadata[f"{arch}.context_length"])
+    eps = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    logit_scale = float(metadata[f"{arch}.logit_scale"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if (
+        min(hidden, intermediate, layers, heads, kv_heads, rope_dim, context, vocab) <= 0
+        or hidden % heads
+        or heads != kv_heads
+        or rope_dim != hidden // heads
+        or rope_dim % 2
+        or not all(math.isfinite(value) for value in (eps, rope_base, logit_scale))
+        or eps <= 0
+        or rope_base <= 0
+    ):
+        raise ValueError("Talkie GGUF has inconsistent geometry or non-finite metadata")
+    if metadata.get(f"{arch}.rope.scaling.type") not in {None, "", "none"}:
+        raise ValueError("Talkie requires unscaled full-head NeoX RoPE")
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output.weight": (vocab, hidden),
+    }
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_q.weight": (hidden, hidden),
+                prefix + "attn_k.weight": (hidden, hidden),
+                prefix + "attn_v.weight": (hidden, hidden),
+                prefix + "attn_output.weight": (hidden, hidden),
+                prefix + "attn_q_norm.weight": (heads, 1),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+                prefix + "layer_output_scale.weight": (1,),
+            }
+        )
+
+    actual = {
+        name: tuple(int(dim) for dim in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required))
+    malformed = {
+        name: (required[name], actual[name])
+        for name in set(required) & set(actual)
+        if actual[name] != required[name]
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid Talkie tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
         )
 
 
@@ -3474,6 +3568,163 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
         )
 
 
+def _raise_for_invalid_embedding_tensor_contract(gguf_model) -> None:
+    """Validate an exact profile before conditional loader fields reach config mapping."""
+    arch = gguf_model.architecture
+    if arch not in {"gemma-embedding", "llama-embed"}:
+        return
+    metadata = gguf_model.metadata
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.layer_norm_rms_epsilon",
+        "rope.dimension_count",
+        "rope.freq_base",
+        "attention.causal",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}"
+        for suffix in required_suffixes
+        if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"{arch} GGUF is missing embedding metadata: {missing_metadata}")
+    if arch == "gemma-embedding" and f"{arch}.attention.sliding_window" not in metadata:
+        raise ValueError("gemma-embedding requires attention.sliding_window")
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{arch}.attention.head_count_kv", heads))
+    if (
+        min(hidden, intermediate, layers, heads, kv_heads) <= 0
+        or hidden % heads
+        or heads % kv_heads
+    ):
+        raise ValueError(f"{arch} has invalid embedding geometry")
+    head_dim = hidden // heads
+    if int(metadata[f"{arch}.rope.dimension_count"]) != head_dim:
+        raise ValueError(f"{arch} requires full-head default RoPE")
+    if int(metadata.get(f"{arch}.attention.key_length", head_dim)) != head_dim:
+        raise ValueError(f"{arch} key_length variants are unsupported")
+    if int(metadata.get(f"{arch}.attention.value_length", head_dim)) != head_dim:
+        raise ValueError(f"{arch} value_length variants are unsupported")
+    if int(metadata.get(f"{arch}.expert_count", 0)):
+        raise ValueError(f"{arch} MoE loader profile is unsupported")
+    rope_type = metadata.get(f"{arch}.rope.scaling.type")
+    if rope_type not in {None, "none"}:
+        raise ValueError(f"{arch} rope scaling variant {rope_type!r} is unsupported")
+
+    names = set(gguf_model.tensor_names)
+    forbidden = sorted(
+        name
+        for name in names
+        if (
+            "attn_qkv." in name
+            or name.endswith(".bias")
+            or "rope_factors_" in name
+            or "rope_freqs." in name
+            or "_exps." in name
+            or "_shexp." in name
+            or "ffn_gate_inp." in name
+        )
+    )
+    if forbidden:
+        raise ValueError(
+            f"{arch} unsupported fused/bias/MoE/rope tensor variant(s): {forbidden}"
+        )
+
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+    if vocab <= 0:
+        raise ValueError(f"{arch} has no positive vocabulary size")
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        # llama.cpp loads/ties this tensor but graph<true> never consumes it.
+        "output.weight": (vocab, hidden),
+    }
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_q.weight": (q_width, hidden),
+                prefix + "attn_k.weight": (kv_width, hidden),
+                prefix + "attn_v.weight": (kv_width, hidden),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+        )
+        if arch == "gemma-embedding":
+            required.update(
+                {
+                    prefix + "attn_q_norm.weight": (head_dim,),
+                    prefix + "attn_k_norm.weight": (head_dim,),
+                    prefix + "post_attention_norm.weight": (hidden,),
+                    prefix + "post_ffw_norm.weight": (hidden,),
+                }
+            )
+
+    if arch == "gemma-embedding":
+        has_dense_2 = "dense_2.weight" in names
+        has_dense_3 = "dense_3.weight" in names
+        if (has_dense_2 or has_dense_3) and int(metadata.get(f"{arch}.pooling_type", 0)) == 0:
+            raise ValueError("gemma-embedding dense modules require a pooled output")
+        dense_2_keys = (f"{arch}.dense_2_feat_in", f"{arch}.dense_2_feat_out")
+        dense_3_keys = (f"{arch}.dense_3_feat_in", f"{arch}.dense_3_feat_out")
+        if has_dense_2 != all(key in metadata for key in dense_2_keys):
+            raise ValueError("gemma-embedding dense_2 tensor and metadata must co-occur")
+        if has_dense_3 != all(key in metadata for key in dense_3_keys):
+            raise ValueError("gemma-embedding dense_3 tensor and metadata must co-occur")
+        current_width = hidden
+        if has_dense_2:
+            dense_in = int(metadata[dense_2_keys[0]])
+            dense_out = int(metadata[dense_2_keys[1]])
+            if dense_in != hidden or dense_out <= 0:
+                raise ValueError("gemma-embedding dense_2 dimensions are incompatible")
+            optional["dense_2.weight"] = (dense_out, dense_in)
+            current_width = dense_out
+        if has_dense_3:
+            dense_in = int(metadata[dense_3_keys[0]])
+            dense_out = int(metadata[dense_3_keys[1]])
+            if dense_in != current_width or dense_out != hidden:
+                raise ValueError("gemma-embedding dense_3 dimensions are incompatible")
+            optional["dense_3.weight"] = (dense_out, dense_in)
+
+    actual = {
+        name: tuple(int(dim) for dim in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {arch} embedding tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
 def _raise_for_invalid_mamba_hybrid_tensor_contract(gguf_model) -> None:
     """Require the exact dense tensor family for each audited hybrid layer."""
     import numpy as np
@@ -4844,6 +5095,8 @@ def build_from_gguf(
         "neo-bert",
         "nomic-bert",
         "jina-bert-v2",
+        "gemma-embedding",
+        "llama-embed",
     }:
         if static_cache:
             raise ValueError("static_cache is not valid for encoder-only GGUF architectures")
@@ -4957,6 +5210,10 @@ def build_from_gguf(
         from mobius.tasks import GGUFEncoderFeatureExtractionTask
 
         resolved_task = GGUFEncoderFeatureExtractionTask()
+    elif gguf_arch in {"gemma-embedding", "llama-embed"}:
+        from mobius.tasks import GGUFEmbeddingFeatureExtractionTask
+
+        resolved_task = GGUFEmbeddingFeatureExtractionTask()
     elif task is None:
         resolved_task = _default_task_for_model(module_type)
     else:
@@ -5176,6 +5433,8 @@ def build_from_gguf(
         "neo-bert",
         "nomic-bert",
         "jina-bert-v2",
+        "gemma-embedding",
+        "llama-embed",
     }:
         # These fields were added for specialized encoder graph variants. Keep
         # the established route fingerprint byte-identical for every existing
@@ -5191,6 +5450,8 @@ def build_from_gguf(
             "encoder_extra_attention_norm",
             "encoder_fused_geglu",
             "pooling_type",
+            "embedding_dense_2_out",
+            "embedding_dense_3_in",
         ):
             graph_config_fields.pop(field_name, None)
     graph_config = json.dumps(

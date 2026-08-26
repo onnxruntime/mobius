@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 86
+_EXPECTED_SUPPORTED_COUNT = 89
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -78,6 +78,8 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "plm",
         "qwen",
         "refact",
+        "gemma-embedding",
+        "llama-embed",
         "starcoder",
         "xverse",
     }
@@ -307,9 +309,11 @@ class TestCapabilityClosure:
             "chatglm",
             "ernie4_5",
             "eurobert",
+            "gemma-embedding",
             "granitehybrid",
             "internlm2",
             "jina-bert-v2",
+            "llama-embed",
             "lfm2moe",
             "mamba",
             "mamba2",
@@ -329,6 +333,7 @@ class TestCapabilityClosure:
             "qwen",
             "refact",
             "starcoder",
+            "talkie",
             "xverse",
         }
         assert all(actual[arch] is Support.REJECTED for arch in rejected)
@@ -951,7 +956,6 @@ class TestPinnedAudioCohort:
         [
             "pockettts",
             "qwen3tts",
-            "talkie",
             "wavtokenizer-dec",
         ],
     )

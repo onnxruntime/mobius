@@ -405,11 +405,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "conditional Q/K norms for large variants, tied output, and logit scaling. The "
         "canonical command-r and cohere2 GGUF contracts are distinct and cannot alias."
     ),
-    "gemma-embedding": (
-        "Gemma Embedding is a bidirectional stateless embedding graph with alternating "
-        "sliding-window attention, four norm sites, sqrt(hidden) embedding scaling, and "
-        "optional pooling/dense modules. Causal Gemma3 text/VLM tasks expose the wrong ABI."
-    ),
     "gptneox": (
         "GPT-NeoX GGUF requires fused biased QKV, bias-bearing LayerNorm/GELU blocks, "
         "partial RoPE, and metadata-selected parallel versus sequential residual topology. "
@@ -522,12 +517,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "interleaved sliding-window attention, a dense prefix, and sigmoid "
         "correction-biased routed/shared experts. Mobius has no exact graph or iSWA cache "
         "contract."
-    ),
-    "llama-embed": (
-        "llama-embed is a canonical embedding architecture that inherits Llama's "
-        "conditional tensor loader but exposes the embedding graph rather than causal "
-        "logits. Mobius has no GGUF embedding task/package contract for this ID, so it "
-        "must not alias ordinary llama."
     ),
     "mellum": (
         "Mellum requires an untied head, Q/K norms, routed experts in every layer, and a "
@@ -1448,6 +1437,49 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "quantization route; use keep_quantized=False."
         ),
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="gemma-embedding",
+        model_type="gemma3_text",
+        module_type="gemma_embedding_gguf",
+        tensor_map_recipe=("gemma_embedding",),
+        config_postprocessor="gguf_embedding",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_rms_epsilon",
+            "attention.sliding_window",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "The exact float embedding graph and package ABI are covered, but no "
+            "onnxruntime-genai embedding package schema/runtime evidence is recorded. "
+            "Packed projection preservation is deliberately rejected pending value-level "
+            "proof for this dedicated graph; use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="llama-embed",
+        model_type="llama",
+        module_type="llama_embed_gguf",
+        tensor_map_recipe=("llama_embedding",),
+        config_postprocessor="gguf_embedding",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Only the complete dense, split-QKV, unbiased, default-RoPE float profile is "
+            "promoted. MoE, fused-QKV, bias-bearing, and rope-factor/scaled variants fail "
+            "closed before config extraction. Runtime packaging and packed value "
+            "preservation remain unproven; use keep_quantized=False."
+        ),
+    ),
     *(
         GGUFArchitectureSpec(
             gguf_arch=architecture,
@@ -2179,11 +2211,31 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="talkie",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="talkie",
+        tensor_map_recipe=("talkie",),
+        config_postprocessor="talkie",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "logit_scale",
+        ),
         runtime=Support.DEFERRED,
-        reason=_TALKIE_GRAPH_REASON,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "The exact pinned scalar-sidecar float graph is covered, including weight-free "
+            "RMSNorm, inverse NeoX RoPE, post-RoPE Q/K normalization, per-head Q gain, "
+            "embedding skip, causal KV cache, and logit scaling. The public GGUF stores "
+            "embedding skip as a hidden-width vector and omits pinned logit_scale metadata, "
+            "so it is not evidence for this promoted scalar profile. Runtime packaging and "
+            "packed projection preservation remain deferred; use keep_quantized=False."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="wavtokenizer-dec",
@@ -2211,6 +2263,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ernie4_5",
             "gptneox",
             "jais",
+            "gemma-embedding",
             "jais2",
             "minicpm",
             "plm",
@@ -2219,6 +2272,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "qwen",
             "refact",
             "starcoder",
+            "llama-embed",
             "xverse",
         }
     ),

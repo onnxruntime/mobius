@@ -159,6 +159,7 @@ from mobius.models.falcon import (
 from mobius.models.falcon_h1 import FalconH1ForCausalLM
 from mobius.models.fun_asr import FunASRForConditionalGeneration
 from mobius.models.gemma3n import Gemma3nCausalLMModel, Gemma3nMultiModalModel
+from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGUFModel
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,
@@ -199,6 +200,7 @@ from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
+from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
@@ -467,6 +469,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "apertus": ModelRegistration(ApertusCausalLMModel),
     "arcee": ModelRegistration(ArceeCausalLMModel),
     "bitnet": ModelRegistration(BitNetCausalLMModel),
+    "talkie": ModelRegistration(TalkieForCausalLM),
     "bloom": ModelRegistration(BloomCausalLMModel),
     "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
@@ -848,6 +851,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "nomic_bert_gguf": ModelRegistration(
         NomicBertGGUFModel, task="gguf-encoder-feature-extraction"
     ),
+    "gemma_embedding_gguf": ModelRegistration(
+        GemmaEmbeddingGGUFModel, task="gguf-embedding-feature-extraction"
+    ),
+    "llama_embed_gguf": ModelRegistration(
+        LlamaEmbedGGUFModel, task="gguf-embedding-feature-extraction"
+    ),
     "mpnet": ModelRegistration(BertModel, task="feature-extraction"),
     "mra": ModelRegistration(BertModel, task="feature-extraction"),
     "nezha": ModelRegistration(BertModel, task="feature-extraction"),
@@ -1043,6 +1052,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "arcee": "arcee-ai/AFM-4.5B-Base",
     "bitnet": "microsoft/bitnet-b1.58-2B-4T",
+    "talkie": "PocketAiHub/talkie-1930-13b-it-GGUF",
     "diffllama": "kajuma/DiffLlama-0.3B-handcut",
     "doge": "SmallDoge/Doge-20M",
     "dots1": "rednote-hilab/dots.llm1.inst",
@@ -1079,6 +1089,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma2": "google/gemma-2-2b",
     "gemma3": "google/gemma-3-4b-it",
     "gemma3_text": "google/gemma-3-1b-pt",
+    "gemma_embedding_gguf": "unsloth/embeddinggemma-300m-GGUF",
     # No text-only gemma3n checkpoint was ever published; the -it releases are
     # multimodal, and "gemma3n_text" reaches the text path via _TEXT_ONLY_MODEL_TYPE.
     "gemma3n": "google/gemma-3n-E4B-it",
@@ -1086,6 +1097,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
     "internlm2": "internlm/internlm2_5-7b-chat",
+    "llama_embed_gguf": "mradermacher/llama-embed-nemotron-8b-GGUF",
     "nemotron": "nvidia/Nemotron-Mini-4B-Instruct",
     "olmo": "allenai/OLMo-1B-hf",
     "olmo2": "allenai/OLMo-2-1124-7B",

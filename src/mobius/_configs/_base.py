@@ -486,6 +486,8 @@ class ArchitectureConfig(BaseModelConfig):
     encoder_extra_attention_norm: bool = False
     encoder_fused_geglu: bool = False
     pooling_type: int = 0
+    embedding_dense_2_out: int | None = None
+    embedding_dense_3_in: int | None = None
 
     # Encoder-decoder config
     num_decoder_layers: int | None = None

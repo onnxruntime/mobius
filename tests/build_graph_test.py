@@ -436,7 +436,8 @@ class TestBuildEncoderGraph:
         input_names = {inp.name for inp in model.graph.inputs}
         assert "input_ids" in input_names
         assert "attention_mask" in input_names
-        assert "token_type_ids" in input_names
+        if model_type not in {"gemma_embedding_gguf", "llama_embed_gguf"}:
+            assert "token_type_ids" in input_names
 
         output_names = {out.name for out in model.graph.outputs}
         assert "last_hidden_state" in output_names

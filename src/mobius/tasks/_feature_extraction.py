@@ -73,3 +73,26 @@ class GGUFEncoderFeatureExtractionTask(FeatureExtractionTask):
             if getattr(config, "pooling_type", 0) in {1, 2}
             else "last_hidden_state"
         )
+
+
+class GGUFEmbeddingFeatureExtractionTask(ModelTask):
+    """Two-input stateless ABI for canonical GGUF embedding architectures."""
+
+    model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
+
+    def build(self, module: nn.Module, config: BaseModelConfig) -> ModelPackage:
+        batch = ir.SymbolicDim("batch")
+        seq_len = ir.SymbolicDim("sequence_length")
+        graph, builder = _make_graph()
+        input_ids = builder.input("input_ids", dtype=ir.DataType.INT64, shape=[batch, seq_len])
+        attention_mask = builder.input(
+            "attention_mask", dtype=ir.DataType.INT64, shape=[batch, seq_len]
+        )
+        output = module(builder.op, input_ids=input_ids, attention_mask=attention_mask)
+        name = (
+            "sentence_embedding"
+            if getattr(config, "pooling_type", 0) != 0
+            else "last_hidden_state"
+        )
+        builder.add_output(output, name)
+        return ModelPackage({"model": _make_model(graph)}, config=config)

@@ -1,0 +1,18 @@
+model_id: "PocketAiHub/talkie-1930-13b-it-GGUF"
+model_type: "talkie"
+revision: "47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The year 1930 was"
+
+level: "L4+L5"
+skip_reason: "The pinned public GGUF stores each embedding-skip gain as a hidden-width vector and omits the pinned llama.cpp logit_scale key, so it is outside the promoted scalar-sidecar profile and must fail closed."
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Synthetic nonzero ORT parity covers inverse NeoX RoPE, post-RoPE weight-free Q/K RMSNorm, per-head Q gain, embedding skip, logit scaling, causal prefill, and cached decode. The real public artifact is useful configuration evidence but cannot validate the exact pinned stock-llama.cpp tensor/metadata closure. Runtime packaging and packed projection preservation remain deferred."

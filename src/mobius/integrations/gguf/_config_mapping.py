@@ -1458,6 +1458,24 @@ def _moe_postprocess(
     return dataclasses.replace(config, **updates)
 
 
+def _talkie_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore Talkie's causal scalar-gain and inverse-NeoX-RoPE profile."""
+    arch = model.architecture
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        attn_qk_norm=False,
+        logit_scale=float(metadata[f"{arch}.logit_scale"]),
+        rope_type="default",
+        rope_interleave=False,
+    )
+
+
 def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str) -> None:
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
     if scaling_type in (None, "", "none"):
@@ -3508,6 +3526,71 @@ def _specialized_encoder_postprocess(
     return config
 
 
+def _gguf_embedding_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Select only exact stateless profiles from the two conditional loaders."""
+    arch = model.architecture
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false")
+    pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
+    if pooling_type not in {0, 1, 2, 3}:
+        raise ValueError(f"{arch}.pooling_type={pooling_type} is unsupported")
+    if metadata.get(f"{arch}.classifier.output_labels"):
+        raise ValueError(f"{arch} classifier/reranker heads are not feature extraction")
+
+    head_dim = config.hidden_size // config.num_attention_heads
+    if config.head_dim != head_dim:
+        raise ValueError(f"{arch} requires full-head RoPE")
+    key_length = int(metadata.get(f"{arch}.attention.key_length", head_dim))
+    value_length = int(metadata.get(f"{arch}.attention.value_length", head_dim))
+    if key_length != head_dim or value_length != head_dim:
+        raise ValueError(f"{arch} requires equal full-width Q/K/V heads")
+
+    fields = _shallow_fields(config)
+    fields.update(
+        pooling_type=pooling_type,
+        hidden_act="gelu_pytorch_tanh" if arch == "gemma-embedding" else "silu",
+        attention_multiplier=(
+            head_dim**-0.5
+            if arch == "gemma-embedding"
+            else float(metadata.get(f"{arch}.attention.scale", head_dim**-0.5))
+        ),
+    )
+    if arch == "gemma-embedding":
+        pattern = int(metadata.get(f"{arch}.attention.sliding_window_pattern", 6))
+        if pattern <= 0:
+            raise ValueError("gemma-embedding sliding_window_pattern must be positive")
+        fields.update(
+            layer_types=[
+                ("sliding_attention" if layer % pattern < pattern - 1 else "full_attention")
+                for layer in range(config.num_hidden_layers)
+            ],
+            rope_local_base_freq=float(metadata.get(f"{arch}.rope.freq_base_swa", 10_000.0)),
+            embedding_dense_2_out=(
+                int(metadata[f"{arch}.dense_2_feat_out"])
+                if "dense_2.weight" in model.tensor_names
+                else None
+            ),
+            embedding_dense_3_in=(
+                int(metadata[f"{arch}.dense_3_feat_in"])
+                if "dense_3.weight" in model.tensor_names
+                else None
+            ),
+        )
+    else:
+        fields.update(
+            layer_types=["full_attention"] * config.num_hidden_layers,
+            sliding_window=None,
+            rope_local_base_freq=None,
+            embedding_dense_2_out=None,
+            embedding_dense_3_in=None,
+        )
+    return ArchitectureConfig(**fields)
+
+
 def _dflash_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -3814,6 +3897,8 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
     "specialized_encoder": _specialized_encoder_postprocess,
+    "gguf_embedding": _gguf_embedding_postprocess,
+    "talkie": _talkie_postprocess,
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
     "kimi_linear": _kimi_linear_postprocess,
