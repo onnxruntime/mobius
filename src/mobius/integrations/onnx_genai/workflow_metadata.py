@@ -134,6 +134,9 @@ class _NoAliasSafeDumper(yaml.SafeDumper):
         return True
 
 
+_CTC_TOKEN_ROLES = tuple(role for role in TEXT_TOKEN_ROLES if role.name == "pad_token_id")
+
+
 def _dump_yaml(metadata: dict[str, Any], handle: Any) -> None:
     yaml.dump(metadata, handle, Dumper=_NoAliasSafeDumper, sort_keys=False)
 
@@ -141,14 +144,6 @@ def _dump_yaml(metadata: dict[str, Any], handle: Any) -> None:
 def _source_model_value(source: str | None, name: str, fallback: Any) -> Any:
     """Resolve a value from packaged runtime metadata when available."""
     return source_declared_value(source, name, fallback)
-
-
-def _source_token_id(source: str | None, name: str, fallback: Any) -> int:
-    """Resolve a generation token ID from packaged runtime metadata when available."""
-    fallback = _source_model_value(source, name, fallback)
-    if isinstance(fallback, list):
-        fallback = fallback[0] if fallback else 0
-    return int(fallback or 0)
 
 
 def _contract(value: ir.Value) -> dict[str, Any]:
@@ -6437,7 +6432,6 @@ def build_vlm_workflow_metadata(
     batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch]})
     batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
-    eos = _source_token_id(source, "eos_token_id", getattr(config, "eos_token_id", 0))
     inputs: dict[str, Any] = {
         "request.prompt_tokens": {
             "contract": _contract(token_input),
@@ -6472,18 +6466,14 @@ def build_vlm_workflow_metadata(
             "default": -1,
         },
         "request.eos_ids": {
-            "contract": {"dtype": "int64", "rank": 2, "shape": [batch, "num_eos"]},
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "eos_ids"},
-            "required": False,
-            "default": eos,
-        },
-        "request.eos_lengths": {
-            "contract": batch_int,
-            "role": {"kind": "opaque"},
-            "source": {"kind": "application", "name": "eos_lengths"},
-            "required": False,
-            "default": 1,
+            "contract": (
+                {"dtype": "int64", "rank": 2, "shape": [batch, "num_eos"]}
+                if cache_pairs
+                else {"dtype": "int64", "rank": 1, "shape": ["num_eos"]}
+            ),
+            "role": {"kind": "runtime", "version": "1.0", "role": "eos_token_ids"},
+            "source": {"kind": "request"},
+            "required": True,
         },
         "request.row_max_iterations": {
             "contract": batch_int,
@@ -6492,13 +6482,22 @@ def build_vlm_workflow_metadata(
             "required": False,
             "default": -1,
         },
-        "package.eos_ids": {
-            "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
-            "role": {"kind": "opaque"},
-            "source": {"kind": "literal"},
-            "required": False,
-            "default": eos,
-        },
+        **(
+            {
+                "request.eos_lengths": {
+                    "contract": batch_int,
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "eos_token_lengths",
+                    },
+                    "source": {"kind": "request"},
+                    "required": True,
+                },
+            }
+            if cache_pairs
+            else {}
+        ),
         "package.max_context": {
             "contract": control_int,
             "role": {"kind": "opaque"},
@@ -7315,7 +7314,7 @@ def build_vlm_workflow_metadata(
         },
     }
     metadata = {
-        "schema_version": "v1",
+        "schema_version": "v1.2",
         "preprocessing": preprocessing,
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
@@ -8533,10 +8532,6 @@ def _build_autoregressive_workflow_metadata(
     batch_int = _request_aligned({"dtype": "int64", "rank": 1, "shape": [batch_dimension]})
     batch_bool = _request_aligned({"dtype": "bool", "rank": 1, "shape": [batch_dimension]})
     control_int = {"dtype": "int64", "rank": 1, "shape": [1]}
-    # The published `special_tokens.eos` fact is resolved the same way, so a
-    # repackaged checkpoint cannot state one stop id for its termination policy
-    # and a different one for the same role.
-    eos_token_id = _source_token_id(source, "eos_token_id", getattr(config, "eos_token_id", 0))
     workflow_inputs.update(
         {
             "request.max_iterations": {
@@ -8548,13 +8543,6 @@ def _build_autoregressive_workflow_metadata(
                 },
                 "source": {"kind": "request", "field": "max_output_tokens"},
                 "required": True,
-            },
-            "package.eos_ids": {
-                "contract": {"dtype": "int64", "rank": 1, "shape": ["E"]},
-                "role": {"kind": "opaque"},
-                "source": {"kind": "literal"},
-                "required": False,
-                "default": eos_token_id,
             },
             "package.one_token": {
                 "contract": batch_int,
@@ -8608,17 +8596,23 @@ def _build_autoregressive_workflow_metadata(
                         "rank": 2,
                         "shape": [batch_dimension, "num_eos"],
                     },
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": "eos_ids"},
-                    "required": False,
-                    "default": eos_token_id,
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "eos_token_ids",
+                    },
+                    "source": {"kind": "request"},
+                    "required": True,
                 },
                 "request.eos_lengths": {
                     "contract": batch_int,
-                    "role": {"kind": "opaque"},
-                    "source": {"kind": "application", "name": "eos_lengths"},
-                    "required": False,
-                    "default": 1,
+                    "role": {
+                        "kind": "runtime",
+                        "version": "1.0",
+                        "role": "eos_token_lengths",
+                    },
+                    "source": {"kind": "request"},
+                    "required": True,
                 },
                 "request.row_max_iterations": {
                     "contract": batch_int,
@@ -8632,6 +8626,17 @@ def _build_autoregressive_workflow_metadata(
                 },
             }
         )
+    else:
+        workflow_inputs["request.eos_ids"] = {
+            "contract": {"dtype": "int64", "rank": 1, "shape": ["num_eos"]},
+            "role": {
+                "kind": "runtime",
+                "version": "1.0",
+                "role": "eos_token_ids",
+            },
+            "source": {"kind": "request"},
+            "required": True,
+        }
     stochastic_sampler = sampler != "greedy"
     sampler_with_rng = stochastic_sampler or bool(cache_pairs)
     if sampler_with_rng:
@@ -9377,7 +9382,7 @@ def _build_autoregressive_workflow_metadata(
                 "termination",
                 {
                     "tokens": "sample.body",
-                    "eos_ids": ("termination.eos_ids" if cache_pairs else "package.eos_ids"),
+                    "eos_ids": ("termination.eos_ids" if cache_pairs else "request.eos_ids"),
                     **({"eos_lengths": "termination.eos_lengths"} if cache_pairs else {}),
                     "iteration": "loop.iteration",
                     "max_iterations": (
@@ -9551,7 +9556,7 @@ def _build_autoregressive_workflow_metadata(
         },
     }
     metadata = {
-        "schema_version": "1.0",
+        "schema_version": "v1.2",
         **({"preprocessing": {"audio": audio_program}} if audio_program is not None else {}),
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
@@ -10178,10 +10183,10 @@ def build_ctc_asr_workflow_metadata(
         },
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
-    # The transcript is rendered from class ids, so the class table is the
-    # package's tokenizer. Publishing it under the same roles a decoder uses
-    # means ``blank_id`` above and the ``pad`` role name one id, not two.
-    attach_package_facts(metadata, source, config)
+    # CTC uses the padding class as its blank id. BOS/EOS are unrelated
+    # HuggingFace config defaults here and must not imply autoregressive
+    # generation semantics for this logits-only workflow.
+    attach_package_facts(metadata, source, config, roles=_CTC_TOKEN_ROLES)
     return metadata
 
 
@@ -10195,7 +10200,13 @@ def write_ctc_asr_workflow_metadata(
     """Write one-file CTC ASR metadata into *output_dir*."""
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_ctc_asr_workflow_metadata(pkg, config, source=source)
-    attach_package_facts(metadata, source, config, package_dir=output_dir)
+    attach_package_facts(
+        metadata,
+        source,
+        config,
+        roles=_CTC_TOKEN_ROLES,
+        package_dir=output_dir,
+    )
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
         _dump_yaml(metadata, handle)

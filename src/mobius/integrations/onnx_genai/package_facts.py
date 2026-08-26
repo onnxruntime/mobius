@@ -6,28 +6,28 @@
 A published package carries neural graphs and the workflow that drives them, but
 a request arrives as text and media.  Turning that request into the token stream
 the graphs consume requires the vocabulary contract the package was built
-against: which algorithm produced the ids, how many ids exist, and which id
-plays each semantic role.  onnx-genai calls that section ``package.tokenizer``
+against: which algorithm produced the ids, how many ids exist, and which numeric ids
+play each execution-relevant role.  onnx-genai calls that section ``package.tokenizer``
 (``PackageFacts``/``TokenizerFacts`` in ``onnx-genai-metadata``), and it is the
 only place a front end looks for those facts.
 
-Two of those roles are load-bearing rather than informational:
+Two of those facts are load-bearing rather than informational:
 
-``eos``
+``eos_token_id``
     The workflow's termination policy already compares generated ids against a
     stop id.  Publishing the same id under a role means a caller can render and
     trim a transcript without re-deriving it from a side file.
 
-``image_placeholder``
+``image_token_id``
     The prompt token whose position an image's features replace.  A multimodal
     package that omits it declares no place in the token stream for its own
     image features, so an attached image is preprocessed and then dropped.
 
-Every value here is read from the package's own artifacts.  The algorithm,
-vocabulary size and byte-level flag come from the packaged tokenizer definition;
-each special token pairs a config-declared id with the surface form that id has
-in that same vocabulary.  A role the package does not declare is simply absent,
-because a guessed special token is worse than a missing one.
+Every value here is read from the package's own artifacts or resolved config.
+The algorithm, vocabulary size and byte-level flag come from the packaged
+tokenizer definition; numeric token IDs come from the package's runtime config.
+Token spellings and chat templates remain authoritative in tokenizer assets,
+so execution metadata never carries a second, potentially stale vocabulary.
 
 Nothing in this module knows a model name or a literal token id: architecture
 defaults belong to the config adapters under :mod:`mobius._configs`, and reach
@@ -47,9 +47,8 @@ from mobius.integrations.onnx_genai.inference_metadata import _source_asset_path
 
 _LOGGER = logging.getLogger(__name__)
 
-#: Semantic role naming the prompt token that stands for one whole image.
-#: Fixed by the onnx-genai runtime, which looks this role up by name.
-IMAGE_PLACEHOLDER_ROLE: Final = "image_placeholder"
+#: Schema field naming the prompt token that stands for one whole image.
+IMAGE_PLACEHOLDER_ROLE: Final = "image_token_id"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,21 +62,24 @@ class SpecialTokenRole:
 
     name: str
     fields: tuple[str, ...]
+    multiple: bool = False
 
 
 #: Roles every text-producing package can state about its own vocabulary.
 TEXT_TOKEN_ROLES: Final[tuple[SpecialTokenRole, ...]] = (
-    SpecialTokenRole("bos", ("bos_token_id",)),
-    SpecialTokenRole("eos", ("eos_token_id",)),
-    SpecialTokenRole("pad", ("pad_token_id",)),
-    SpecialTokenRole("unk", ("unk_token_id",)),
+    SpecialTokenRole("pad_token_id", ("pad_token_id",)),
+    SpecialTokenRole("bos_token_id", ("bos_token_id",)),
+    SpecialTokenRole("eos_token_id", ("eos_token_id",), multiple=True),
+    SpecialTokenRole("sep_token_id", ("sep_token_id",)),
+    SpecialTokenRole("decoder_start_token_id", ("decoder_start_token_id",)),
 )
 
 #: Roles a package adds when a modality's features replace a prompt token.
 MEDIA_TOKEN_ROLES: Final[tuple[SpecialTokenRole, ...]] = (
     SpecialTokenRole(IMAGE_PLACEHOLDER_ROLE, ("image_token_id",)),
-    SpecialTokenRole("audio_placeholder", ("audio_token_id",)),
-    SpecialTokenRole("video_placeholder", ("video_token_id",)),
+    SpecialTokenRole("video_token_id", ("video_token_id",)),
+    SpecialTokenRole("audio_token_id", ("audio_token_id",)),
+    SpecialTokenRole("vision_start_token_id", ("vision_start_token_id",)),
 )
 
 #: Nested config objects searched after the root for a role's id.  A composite
@@ -116,13 +118,30 @@ TOKENIZER_ARTIFACT_NAMES: Final[tuple[str, ...]] = (
 
 @dataclasses.dataclass(frozen=True)
 class SpecialTokenFact:
-    """One special token, pinned by id and exact surface bytes."""
+    """Compatibility value for callers of the former text-bearing API.
+
+    New metadata uses :class:`TokenFacts`; token content remains in tokenizer
+    assets. Keeping this value exported avoids breaking existing imports.
+    """
 
     id: int
     content: str
 
     def to_metadata(self) -> dict[str, Any]:
         return {"id": self.id, "content": self.content}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenFacts:
+    """Numeric model and control-token facts owned by the package."""
+
+    values: Mapping[str, int | tuple[int, ...]] = dataclasses.field(default_factory=dict)
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            name: list(value) if isinstance(value, tuple) else value
+            for name, value in self.values.items()
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,30 +158,27 @@ class TokenizerArtifact:
 class TokenizerFacts:
     """Tokenizer facts and package-relative artifacts.
 
-    Mirrors onnx-genai's ``TokenizerFacts``.  ``algorithm`` and ``vocab_size``
-    are required by that contract; the rest are omitted when empty rather than
-    published as defaults.
+    Mirrors onnx-genai's ``TokenizerFacts``. ``algorithm`` and ``vocab_size``
+    are omitted when no tokenizer definition is available, while numeric token
+    facts can still describe the package's execution contract.
     """
 
-    algorithm: str
-    vocab_size: int
+    algorithm: str | None = None
+    vocab_size: int | None = None
     byte_level: bool = False
     artifacts: tuple[TokenizerArtifact, ...] = ()
-    special_tokens: Mapping[str, SpecialTokenFact] = dataclasses.field(default_factory=dict)
+    special_tokens: TokenFacts = dataclasses.field(default_factory=TokenFacts)
 
     def to_metadata(self) -> dict[str, Any]:
-        facts: dict[str, Any] = {
-            "algorithm": self.algorithm,
-            "vocab_size": self.vocab_size,
-            "byte_level": self.byte_level,
-        }
+        facts: dict[str, Any] = {"byte_level": self.byte_level}
+        if self.algorithm is not None:
+            facts["algorithm"] = self.algorithm
+        if self.vocab_size is not None:
+            facts["vocab_size"] = self.vocab_size
         if self.artifacts:
             facts["artifacts"] = [artifact.to_metadata() for artifact in self.artifacts]
-        if self.special_tokens:
-            facts["special_tokens"] = {
-                role: token.to_metadata()
-                for role, token in sorted(self.special_tokens.items())
-            }
+        if self.special_tokens.values:
+            facts["special_tokens"] = self.special_tokens.to_metadata()
         return facts
 
 
@@ -433,12 +449,21 @@ def _config_value(config: Any, field: str) -> Any:
 
 
 def _token_id(value: Any) -> int | None:
-    """Coerce a declared token id, taking the first of a stop-id list."""
-    if isinstance(value, (list, tuple)):
-        value = value[0] if value else None
+    """Coerce one declared token id."""
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value if value >= 0 else None
+
+
+def _token_ids(value: Any) -> tuple[int, ...]:
+    """Coerce an ordered token-id set without silently dropping multi-EOS."""
+    values = value if isinstance(value, (list, tuple)) else (value,)
+    result: list[int] = []
+    for candidate in values:
+        token_id = _token_id(candidate)
+        if token_id is not None and token_id not in result:
+            result.append(token_id)
+    return tuple(result)
 
 
 _MISSING: Final = object()
@@ -491,41 +516,39 @@ def source_declared_roles(
     return declared
 
 
-def build_special_tokens(
-    definition: TokenizerDefinition,
+def build_token_facts(
     config: Any,
     roles: Iterable[SpecialTokenRole],
     *,
     declared: Mapping[str, Any] | None = None,
-) -> dict[str, SpecialTokenFact]:
-    """Resolve declared roles against the packaged vocabulary.
+) -> TokenFacts:
+    """Resolve numeric package token facts.
 
     ``declared`` overrides the config for roles the emitting workflow has
     already resolved for itself, so a document never states one id for its
     termination policy and a different one for the same role here.
 
-    A role survives only when both halves of the fact are known: an id the
-    package declares *and* the exact surface bytes that id has in this
-    vocabulary.  An id with no surface form is a stale config field pointing
-    outside the shipped vocabulary, and publishing it would let a front end
-    splice a token the tokenizer cannot render.
+    Multi-valued roles preserve their declared order. Scalar roles take exactly
+    one non-negative integer. Token spellings remain in tokenizer assets.
     """
     declared = declared or {}
-    special_tokens: dict[str, SpecialTokenFact] = {}
+    values: dict[str, int | tuple[int, ...]] = {}
     for role in roles:
-        token_id = _token_id(declared.get(role.name))
-        if token_id is None:
+        value = declared.get(role.name)
+        if value is None:
             for field in role.fields:
-                token_id = _token_id(_config_value(config, field))
-                if token_id is not None:
+                value = _config_value(config, field)
+                if value is not None:
                     break
-        if token_id is None:
+        if role.multiple:
+            token_ids = _token_ids(value)
+            if token_ids:
+                values[role.name] = token_ids
             continue
-        content = definition.surface_forms.get(token_id)
-        if not content:
-            continue
-        special_tokens[role.name] = SpecialTokenFact(id=token_id, content=content)
-    return special_tokens
+        token_id = _token_id(value)
+        if token_id is not None:
+            values[role.name] = token_id
+    return TokenFacts(values)
 
 
 def build_tokenizer_facts(
@@ -560,8 +583,11 @@ def build_tokenizer_facts(
     address nothing, so the vocabulary is the width a caller can actually render.
     """
     definition = read_tokenizer_definition(package_dir) or read_tokenizer_definition(source)
-    if definition is None or definition.vocab_size <= 0:
-        return None
+    special_tokens = build_token_facts(
+        config,
+        roles,
+        declared=source_declared_roles(source, roles),
+    )
     artifacts = ()
     if package_dir is not None:
         artifacts = tuple(
@@ -569,17 +595,14 @@ def build_tokenizer_facts(
             for name in TOKENIZER_ARTIFACT_NAMES
             if os.path.isfile(os.path.join(package_dir, name))
         )
+    if definition is None and not artifacts and not special_tokens.values:
+        return None
     return TokenizerFacts(
-        algorithm=definition.algorithm,
-        vocab_size=definition.vocab_size,
-        byte_level=definition.byte_level,
+        algorithm=definition.algorithm if definition is not None else None,
+        vocab_size=definition.vocab_size if definition is not None else None,
+        byte_level=definition.byte_level if definition is not None else False,
         artifacts=artifacts,
-        special_tokens=build_special_tokens(
-            definition,
-            config,
-            roles,
-            declared=source_declared_roles(source, roles),
-        ),
+        special_tokens=special_tokens,
     )
 
 
@@ -602,4 +625,5 @@ def attach_package_facts(
     tokenizer = build_tokenizer_facts(source, config, roles=roles, package_dir=package_dir)
     if tokenizer is None:
         return
+    metadata["schema_version"] = "v1.2"
     metadata.setdefault("package", {})["tokenizer"] = tokenizer.to_metadata()
