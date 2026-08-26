@@ -11,11 +11,15 @@ import pytest
 import torch
 
 from mobius._builder import build_from_module
-from mobius._configs import Qwen4ExpConfig
+from mobius._configs import Qwen4ExpConfig, VisionConfig
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.models.qwen4_exp import Qwen4ExpCausalLMModel, Qwen4ExpQSAIndexer
+from mobius.models.qwen4_exp import (
+    Qwen4ExpCausalLMModel,
+    Qwen4ExpForConditionalGeneration,
+    Qwen4ExpQSAIndexer,
+)
 
 
 def _config(**overrides) -> Qwen4ExpConfig:
@@ -156,9 +160,46 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert config.mrope_section == [11, 11, 10]
     assert config.mamba_ssm_dtype == ir.DataType.FLOAT
 
+    multimodal = Qwen4ExpConfig.from_transformers(
+        SimpleNamespace(
+            model_type="qwen4_exp",
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            language_model_only=False,
+            text_config=text,
+            vision_config=SimpleNamespace(
+                model_type="qwen4_exp",
+                hidden_size=1152,
+                intermediate_size=4304,
+                num_hidden_layers=27,
+                num_attention_heads=16,
+                patch_size=16,
+                temporal_patch_size=2,
+                spatial_merge_size=2,
+                num_position_embeddings=2304,
+                out_hidden_size=2560,
+                hidden_act="gelu_pytorch_tanh",
+                deepstack_visual_indexes=[],
+            ),
+            image_token_id=248056,
+            video_token_id=248057,
+            vision_start_token_id=248053,
+            vision_end_token_id=248054,
+            tie_word_embeddings=False,
+        )
+    )
+    assert multimodal.model_type == "qwen4_exp"
+    assert multimodal.vision is not None
+    assert multimodal.vision.out_hidden_size == 2560
+    assert multimodal.image_token_id == 248056
+    assert multimodal.video_token_id == 248057
+    assert multimodal.vision_start_token_id == 248053
+    assert multimodal.vision_end_token_id == 248054
+    assert multimodal.deepstack_visual_indexes == []
 
-def test_mtp_metadata_is_preserved_but_dedicated_embeddings_fail_closed():
-    assert _config(mtp_num_hidden_layers=1).mtp_num_hidden_layers == 1
+
+def test_mtp_modes_fail_closed():
+    with pytest.raises(ValueError, match="MTP is unsupported"):
+        _config(mtp_num_hidden_layers=1)
     with pytest.raises(ValueError, match="dedicated MTP embeddings"):
         _config(mtp_use_dedicated_embeddings=True)
 
@@ -233,16 +274,76 @@ def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache(interle
 def test_registry_routes_composite_and_text_model_types():
     from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
-    for architecture in (
-        "qwen4_exp",
-        "qwen4_exp_text",
-        "Qwen4ExpForConditionalGeneration",
-    ):
+    for architecture in ("qwen4_exp", "Qwen4ExpForConditionalGeneration"):
         registration = registry.get_registration(architecture)
-        assert registration.module_class is Qwen4ExpCausalLMModel
+        assert registration.module_class is Qwen4ExpForConditionalGeneration
         assert registration.config_class is Qwen4ExpConfig
-        assert registration.task == "qwen4-exp-text-generation"
+        assert registration.task == "qwen4-exp-vision-language"
+    registration = registry.get_registration("qwen4_exp_text")
+    assert registration.module_class is Qwen4ExpCausalLMModel
+    assert registration.config_class is Qwen4ExpConfig
+    assert registration.task == "qwen4-exp-text-generation"
     assert _TEXT_ONLY_MODEL_TYPE["qwen4_exp"] == "qwen4_exp_text"
+
+
+def test_multimodal_package_exposes_exact_three_model_io():
+    config = _config(
+        model_type="qwen4_exp",
+        vision=VisionConfig(
+            model_type="qwen4_exp_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=16,
+            num_position_embeddings=16,
+            hidden_act="gelu_pytorch_tanh",
+            deepstack_visual_indexes=[],
+        ),
+        image_token_id=30,
+        video_token_id=31,
+        vision_start_token_id=29,
+        vision_end_token_id=28,
+        mrope_section=[1, 1, 0],
+        mrope_interleaved=True,
+        deepstack_visual_indexes=[],
+    )
+    module = Qwen4ExpForConditionalGeneration(config)
+    package = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-vision-language",
+    )
+
+    assert set(package) == {"decoder", "vision_encoder", "embedding"}
+    decoder_inputs = {value.name: value for value in package["decoder"].graph.inputs}
+    decoder_outputs = {value.name for value in package["decoder"].graph.outputs}
+    assert {"inputs_embeds", "ple_input_ids", "past_position_ids"} <= decoder_inputs.keys()
+    assert "input_ids" not in decoder_inputs
+    assert decoder_inputs["position_ids"].shape[0] == 4
+    assert decoder_inputs["past_position_ids"].shape[0] == 4
+    assert {
+        "present_position_ids",
+        "present.0.conv_state",
+        "present.0.recurrent_state",
+        "present.0.ple_conv_state",
+        "present.0.ple_context",
+        "present.1.key",
+        "present.1.value",
+        "present.1.index_key",
+    } <= decoder_outputs
+    assert {value.name for value in package["vision_encoder"].graph.inputs} == {
+        "pixel_values",
+        "image_grid_thw",
+    }
+    assert {value.name for value in package["embedding"].graph.inputs} == {
+        "input_ids",
+        "image_features",
+        "video_features",
+    }
 
 
 def test_graph_exposes_exact_heterogeneous_state_abi():
@@ -338,7 +439,6 @@ def test_preprocess_validates_packed_experts_and_joins_ple_shards():
     module = Qwen4ExpCausalLMModel(config)
     embedding_rows = module.model.layers[0].ple.ple_embedding.ngram_embedding.weight.shape[0]
     state = {
-        "mtp.fc_embedding.weight": torch.zeros(16, 16),
         "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.arange(
             2 * 16 * 16, dtype=torch.float32
         ).reshape(2, 16, 16),

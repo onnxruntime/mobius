@@ -119,6 +119,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_5_vl_text": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
+    "qwen4_exp": "qwen4_exp",
+    "qwen4_exp_text": "qwen4_exp",
     # Preserve Qwen3.5 / Qwen3.6 source architecture identities here so package
     # topology selection can distinguish standalone text from dense and MoE
     # multimodal parents. Standalone text packages are normalized later to the
@@ -160,6 +162,7 @@ _UNWRAPPED_VLM_MODEL_TYPES = {
     "qwen3_5_text": "qwen3_5",
     "qwen3_5_vl_text": "qwen3_5",
     "qwen3_5_moe_text": "qwen3_5_moe",
+    "qwen4_exp_text": "qwen4_exp",
 }
 _LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
 _GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
@@ -175,8 +178,10 @@ _DECODER_SEMANTIC_INPUTS = frozenset(
 )
 _CACHE_NAME = re.compile(
     r"^(?P<prefix>.+\.)(?P<index>[0-9]+)\.(?P<kind>"
-    r"key|value|conv_state|recurrent_state|ssm_state)$"
+    r"key|value|conv_state|recurrent_state|ssm_state|"
+    r"index_key|ple_conv_state|ple_context)$"
 )
+_QWEN4_EXP_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
 
 
 @dataclass(frozen=True)
@@ -234,6 +239,8 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen3_5_moe_vl",
         "qwen3_5_moe_text",
         "videochat_flash_qwen",
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 _QWEN35_VL_MODEL_TYPES = frozenset(
@@ -523,17 +530,67 @@ def _load_generation_config(model_id: str):
 def _graph_input_names(model: ir.Model) -> list[str]:
     """Return non-KV-cache input names from an ONNX model graph.
 
-    Filters out KV cache inputs (``past_key_values.*`` and ``past_*``)
-    since those are represented as template patterns in genai_config.json,
-    not as literal graph input names.
+    Filters out indexed cache inputs (``past_key_values.*``), since those
+    are represented as template patterns in genai_config.json. Semantic state
+    such as ``past_position_ids`` remains explicit and graph-derived.
     """
     return [
         inp.name
         for inp in model.graph.inputs
-        if inp.name is not None
-        and not inp.name.startswith("past_key_values.")
-        and not inp.name.startswith("past_")
+        if inp.name is not None and not inp.name.startswith("past_key_values.")
     ]
+
+
+def _inspect_qwen4_multimodal_abi(
+    model: ir.Model,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Describe every Qwen4-Exp decoder input/output from the graph."""
+    input_names = [value.name for value in model.graph.inputs if value.name is not None]
+    output_names = [value.name for value in model.graph.outputs if value.name is not None]
+    input_cache = _cache_names(input_names)
+    output_cache = _cache_names(output_names)
+
+    inputs = {name: name for name in input_names if not name.startswith("past_key_values.")}
+    outputs = {name: name for name in output_names if not name.startswith("present.")}
+    if {"inputs_embeds", "ple_input_ids", "past_position_ids"} - inputs.keys():
+        raise ValueError(
+            "Qwen4-Exp multimodal decoder must expose inputs_embeds, "
+            "ple_input_ids, and past_position_ids"
+        )
+    if "present_position_ids" not in outputs:
+        raise ValueError("Qwen4-Exp multimodal decoder must expose present_position_ids")
+
+    input_roles = set(input_cache)
+    output_roles = set(output_cache)
+    if input_roles != output_roles:
+        raise ValueError(
+            "Qwen4-Exp decoder state roles must match between inputs and outputs: "
+            f"inputs={sorted(input_roles)}, outputs={sorted(output_roles)}"
+        )
+    for role in sorted(input_roles):
+        if set(input_cache[role]) != set(output_cache[role]):
+            raise ValueError(
+                f"Qwen4-Exp decoder state role {role!r} has mismatched layer indices"
+            )
+        input_key = (
+            "past_key_names"
+            if role == "key"
+            else "past_value_names"
+            if role == "value"
+            else f"past_{role}_names"
+        )
+        output_key = (
+            "present_key_names"
+            if role == "key"
+            else "present_value_names"
+            if role == "value"
+            else f"present_{role}_names"
+        )
+        inputs[input_key] = _name_template(input_cache[role], label=f"Qwen4-Exp past-{role}")
+        outputs[output_key] = _name_template(
+            output_cache[role], label=f"Qwen4-Exp present-{role}"
+        )
+    return inputs, outputs
 
 
 def _count_cache_layer_slots(model: ir.Model | None) -> int | None:
@@ -1526,9 +1583,18 @@ def _write_genai_config(
         decoder_inputs = decoder_abi.inputs
         decoder_outputs = decoder_abi.outputs
     else:
-        decoder_inputs = _introspect_inputs(pkg, decoder_key)
-        decoder_outputs = None
-        if decoder_inputs is not None:
+        if (
+            decoder_model is not None
+            and getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES
+        ):
+            decoder_inputs, decoder_outputs = _inspect_qwen4_multimodal_abi(decoder_model)
+        else:
+            decoder_inputs = _introspect_inputs(pkg, decoder_key)
+            decoder_outputs = None
+        if (
+            decoder_inputs is not None
+            and getattr(config, "model_type", None) not in _QWEN4_EXP_MODEL_TYPES
+        ):
             # Multimodal runtime types retain their architecture-specific cache contract.
             decoder_inputs["past_key_names"] = "past_key_values.%d.key"
             decoder_inputs["past_value_names"] = "past_key_values.%d.value"
@@ -1714,6 +1780,7 @@ def _write_genai_config(
                 if (
                     model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}
                     or model_type in _QWEN35_VL_MODEL_TYPES
+                    or model_type in _QWEN4_EXP_MODEL_TYPES
                 ):
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)

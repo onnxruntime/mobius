@@ -11,9 +11,9 @@ state ABI is defined by :class:`mobius.tasks.Qwen4ExpCausalLMTask`.
 
 from __future__ import annotations
 
-import logging
 import math
 from collections import defaultdict
+from typing import ClassVar
 
 import numpy as np
 import onnx_ir as ir
@@ -35,6 +35,7 @@ from mobius.components import (
 )
 from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.moe import Qwen2MoELayer
+from mobius.models.qwen_vl import Qwen25VLEmbeddingModel, Qwen3VLVisionEncoderModel
 
 _INT64_MAX = 9223372036854775807
 _MASK64 = (1 << 64) - 1
@@ -42,7 +43,6 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
-logger = logging.getLogger(__name__)
 
 
 def _splitmix64(value: int) -> int:
@@ -780,15 +780,16 @@ class Qwen4ExpSparseAttention(Qwen35Attention):
         op: OpBuilder,
         hidden_states: ir.Value,
         attention_bias: ir.Value,
-        current_position_embeddings: tuple[ir.Value, ir.Value],
-        full_position_embeddings: tuple[ir.Value, ir.Value],
+        position_embeddings: tuple[ir.Value, ir.Value],
+        qsa_current_position_embeddings: tuple[ir.Value, ir.Value],
+        qsa_full_position_embeddings: tuple[ir.Value, ir.Value],
         past_key_value: tuple[ir.Value, ir.Value, ir.Value],
     ):
         sparse_bias, present_index_key = self.indexer(
             op,
             hidden_states,
-            current_position_embeddings,
-            full_position_embeddings,
+            qsa_current_position_embeddings,
+            qsa_full_position_embeddings,
             attention_bias,
             past_key_value[2],
         )
@@ -796,7 +797,7 @@ class Qwen4ExpSparseAttention(Qwen35Attention):
             op,
             hidden_states,
             sparse_bias,
-            current_position_embeddings,
+            position_embeddings,
             (past_key_value[0], past_key_value[1]),
         )
         return output, (present_key, present_value, present_index_key)
@@ -937,8 +938,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         hidden_states: ir.Value,
         input_ids: ir.Value,
         attention_bias: ir.Value,
-        current_position_embeddings: tuple[ir.Value, ir.Value],
-        full_position_embeddings: tuple[ir.Value, ir.Value],
+        position_embeddings: tuple[ir.Value, ir.Value],
+        qsa_current_position_embeddings: tuple[ir.Value, ir.Value],
+        qsa_full_position_embeddings: tuple[ir.Value, ir.Value],
         past_state: tuple[ir.Value, ...],
         token_mask: ir.Value,
     ):
@@ -973,8 +975,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 op,
                 mixed,
                 attention_bias,
-                current_position_embeddings,
-                full_position_embeddings,
+                position_embeddings,
+                qsa_current_position_embeddings,
+                qsa_full_position_embeddings,
                 past_state,
             )
         hidden_states = Qwen4ExpGatedResidual.inject(op, output, residual, inject)
@@ -1012,25 +1015,47 @@ class Qwen4ExpTextModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_position_ids: ir.Value,
         past_key_values: list[tuple[ir.Value, ...]],
+        *,
+        inputs_embeds: ir.Value | None = None,
+        ple_input_ids: ir.Value | None = None,
+        qsa_position_ids: ir.Value | None = None,
+        past_qsa_position_ids: ir.Value | None = None,
     ):
-        embeddings = self.embed_tokens(op, input_ids)
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("Qwen4-Exp requires input_ids or inputs_embeds")
+            embeddings = self.embed_tokens(op, input_ids)
+        else:
+            embeddings = inputs_embeds
+        if ple_input_ids is None:
+            if input_ids is None:
+                raise ValueError(
+                    "Qwen4-Exp inputs_embeds execution requires explicit ple_input_ids"
+                )
+            ple_input_ids = input_ids
         hidden_states = op.Concat(*[embeddings for _ in range(self._hc_count)], axis=-1)
-        all_position_ids = op.Concat(past_position_ids, position_ids, axis=1)
-        current_position_embeddings = self.rotary_emb(op, position_ids)
-        full_position_embeddings = self.rotary_emb(op, all_position_ids)
+        all_position_ids = op.Concat(past_position_ids, position_ids, axis=-1)
+        position_embeddings = self.rotary_emb(op, position_ids)
+        if qsa_position_ids is None:
+            qsa_position_ids = position_ids
+        if past_qsa_position_ids is None:
+            past_qsa_position_ids = past_position_ids
+        all_qsa_position_ids = op.Concat(past_qsa_position_ids, qsa_position_ids, axis=-1)
+        qsa_current_position_embeddings = self.rotary_emb(op, qsa_position_ids)
+        qsa_full_position_embeddings = self.rotary_emb(op, all_qsa_position_ids)
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=ple_input_ids,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
         total_length = op.Shape(attention_mask, start=1, end=2)
-        current_length = op.Shape(input_ids, start=1, end=2)
+        current_length = op.Shape(ple_input_ids, start=1, end=2)
         current_start = op.Sub(total_length, current_length)
         current_token_mask = op.Not(
             op.Equal(
@@ -1043,14 +1068,13 @@ class Qwen4ExpTextModel(nn.Module):
                 op.Constant(value_int=0),
             )
         )
-        ple_input_ids = input_ids
         if self._eos_token_id is not None:
             ple_input_ids = op.Where(
                 current_token_mask,
-                input_ids,
+                ple_input_ids,
                 op.Expand(
                     op.Constant(value_int=self._eos_token_id),
-                    op.Shape(input_ids),
+                    op.Shape(ple_input_ids),
                 ),
             )
 
@@ -1061,8 +1085,9 @@ class Qwen4ExpTextModel(nn.Module):
                 hidden_states,
                 ple_input_ids,
                 attention_bias,
-                current_position_embeddings,
-                full_position_embeddings,
+                position_embeddings,
+                qsa_current_position_embeddings,
+                qsa_full_position_embeddings,
                 past_state,
                 current_token_mask,
             )
@@ -1103,6 +1128,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
             position_ids,
             past_position_ids,
             past_key_values,
+            ple_input_ids=input_ids,
         )
         return self.lm_head(op, hidden_states), presents, present_position_ids
 
@@ -1114,11 +1140,11 @@ class Qwen4ExpCausalLMModel(nn.Module):
         ple_shards: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
         indexer_projections: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
         parameter_map = dict(self.named_parameters())
-        skipped_mtp = 0
+        unsupported_mtp: list[str] = []
         for original_key, value in state_dict.items():
             key = original_key
             if key.startswith("mtp."):
-                skipped_mtp += 1
+                unsupported_mtp.append(key)
                 continue
             if key.startswith("model.language_model."):
                 key = f"model.{key[len('model.language_model.') :]}"
@@ -1247,12 +1273,10 @@ class Qwen4ExpCausalLMModel(nn.Module):
                     f"expected {expected_shape}"
                 )
             cleaned[target] = combined
-        if skipped_mtp:
-            logger.warning(
-                "Skipped %d Qwen4-Exp MTP tensors. The pinned official "
-                "Qwen4ExpForCausalLM runtime also ignores mtp.* because it "
-                "defines no MTP forward equation or NextN cache ABI.",
-                skipped_mtp,
+        if unsupported_mtp:
+            raise ValueError(
+                "Qwen4-Exp checkpoint contains unsupported MTP tensors; refusing "
+                f"to omit state: {unsupported_mtp[:3]}"
             )
         qc = getattr(self.config, "quantization", None)
         return preprocess_quantized_weights(
@@ -1261,3 +1285,98 @@ class Qwen4ExpCausalLMModel(nn.Module):
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=None,
         )
+
+
+class Qwen4ExpVLDecoderModel(Qwen4ExpCausalLMModel):
+    """Qwen4-Exp decoder with independent multimodal embeddings and PLE token IDs."""
+
+    def forward(
+        self,
+        op: OpBuilder,
+        inputs_embeds: ir.Value,
+        ple_input_ids: ir.Value,
+        attention_mask: ir.Value,
+        position_ids: ir.Value,
+        past_position_ids: ir.Value,
+        past_key_values: list[tuple[ir.Value, ...]],
+    ):
+        qsa_position_ids = op.Squeeze(op.Slice(position_ids, [0], [1], [0]), [0])
+        past_qsa_position_ids = op.Squeeze(op.Slice(past_position_ids, [0], [1], [0]), [0])
+        mrope_position_ids = op.Slice(position_ids, [1], [4], [0])
+        past_mrope_position_ids = op.Slice(past_position_ids, [1], [4], [0])
+        hidden_states, presents, present_position_ids = self.model(
+            op,
+            None,
+            attention_mask,
+            mrope_position_ids,
+            past_mrope_position_ids,
+            past_key_values,
+            inputs_embeds=inputs_embeds,
+            ple_input_ids=ple_input_ids,
+            qsa_position_ids=qsa_position_ids,
+            past_qsa_position_ids=past_qsa_position_ids,
+        )
+        present_qsa_position_ids = op.Concat(
+            op.Slice(past_position_ids, [0], [1], [0]),
+            op.Slice(position_ids, [0], [1], [0]),
+            axis=-1,
+        )
+        present_position_ids = op.Concat(
+            present_qsa_position_ids,
+            present_position_ids,
+            axis=0,
+        )
+        return self.lm_head(op, hidden_states), presents, present_position_ids
+
+
+class Qwen4ExpForConditionalGeneration(nn.Module):
+    """Qwen3.8 Flash-Next/Qwen4-Exp three-model vision-language pipeline.
+
+    Reuses the source-identical Qwen3/Qwen3.5 packed vision encoder and
+    embedding mixer, while preserving the Qwen4-Exp decoder's independent PLE
+    token stream and heterogeneous recurrent, QSA, and position state.
+    """
+
+    default_task: str = "qwen4-exp-vision-language"
+    category: str = "Multimodal"
+    config_class: type = Qwen4ExpConfig
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.rotary_emb",
+            "model.language_model.hyper_connection_mixer",
+            "lm_head",
+        ),
+        "vision_encoder": ("model.visual",),
+        "embedding": ("model.language_model.embed_tokens",),
+    }
+
+    def __init__(self, config: Qwen4ExpConfig):
+        super().__init__()
+        if config.vision is None:
+            raise ValueError("Qwen4-Exp multimodal export requires a vision config")
+        if config.deepstack_visual_indexes:
+            raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
+        self.config = config
+        self.decoder = Qwen4ExpVLDecoderModel(config)
+        self.vision_encoder = Qwen3VLVisionEncoderModel(config)
+        self.embedding = Qwen25VLEmbeddingModel(config)
+
+    def forward(self, op: OpBuilder, **kwargs):
+        raise NotImplementedError(
+            "Qwen4ExpForConditionalGeneration uses Qwen4ExpVisionLanguageTask, "
+            "which builds decoder, vision_encoder, and embedding independently."
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route official composite weights to the three ONNX components."""
+        decoder = self.decoder.preprocess_weights(dict(state_dict))
+        vision = self.vision_encoder.preprocess_weights(dict(state_dict))
+        result = {f"decoder.{name}": value for name, value in decoder.items()}
+        result.update((f"vision_encoder.{name}", value) for name, value in vision.items())
+        embed = decoder.get("model.embed_tokens.weight")
+        if embed is not None:
+            result["embedding.embed_tokens.weight"] = embed
+        return result

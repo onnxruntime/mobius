@@ -222,12 +222,6 @@ def build_transformers_model(
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
 
-    if _is_qwen4_exp_composite(parent_config) and not text_only:
-        raise ValueError(
-            "Qwen4-Exp multimodal export is not implemented in this text-core PR. "
-            "Pass text_only=True to export the qwen4_exp_text causal decoder."
-        )
-
     compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
     if text_only:
         from mobius._registry import _TEXT_ONLY_MODEL_TYPE

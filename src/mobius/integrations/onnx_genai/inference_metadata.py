@@ -734,14 +734,21 @@ def _processor_values(
 _STATE_INPUT = re.compile(
     r"^past_key_values\.(?P<layer>\d+)\."
     r"(?:(?P<scope>self|cross)\.)?"
-    r"(?P<role>key|value|conv_state|recurrent_state|ssm_state)$"
+    r"(?P<role>key|value|conv_state|recurrent_state|ssm_state|"
+    r"index_key|ple_conv_state|ple_context)$"
 )
 _STATIC_CACHE_PORT = re.compile(
     r"^(?P<updated>updated_)?(?P<role>key|value)_cache\.(?P<layer>\d+)$"
 )
 _REPLACE_ROLES = {
     "lightning_attention": {"recurrent_state"},
-    "linear_attention": {"conv_state", "recurrent_state"},
+    "linear_attention": {
+        "conv_state",
+        "recurrent_state",
+        "ple_conv_state",
+        "ple_context",
+    },
+    "qwen_sparse_attention": {"index_key"},
     "conv": {"conv_state"},
     "mamba": {"conv_state", "ssm_state"},
     "mamba2": {"conv_state", "ssm_state"},
@@ -1085,6 +1092,26 @@ def _decoder_io(
         io["cross_kv_outputs"] = cross_kv_outputs
     if state_pairs:
         io["state_pairs"] = state_pairs
+    past_position_ids = input_by_name.get("past_position_ids")
+    present_position_ids = output_by_name.get("present_position_ids")
+    if (past_position_ids is None) != (present_position_ids is None):
+        raise ValueError(
+            "Decoder position history must expose paired past_position_ids and "
+            "present_position_ids ports"
+        )
+    if past_position_ids is not None and present_position_ids is not None:
+        if past_position_ids.dtype != present_position_ids.dtype:
+            raise ValueError(
+                "Decoder position history must preserve dtype across decode steps"
+            )
+        io.setdefault("state_pairs", []).append(
+            {
+                "input": past_position_ids.name,
+                "output": present_position_ids.name,
+                "init": "zeros",
+                "update": "replace",
+            }
+        )
     consumed_outputs = set(kv_outputs) | set(cross_kv_outputs)
     hidden_outputs = [
         port
