@@ -55,14 +55,21 @@ def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> Non
     records = iter_tokenizer_evidence()
     assert [(record.pre_identifier, record.architecture) for record in records] == [
         ("gpt-2", "gpt2"),
+        ("jina-v2-code", "jina-bert-v2"),
         ("lfm2", "lfm2"),
         ("qwen2", "qwen2"),
         ("qwen35", "qwen35"),
+        ("roberta-bpe", "bert"),
         ("smollm", "llama"),
     ]
     assert all(record.token_count > 0 for record in records)
     assert all(record.ordered_token_types_sha256 for record in records)
     assert all(record.representative_encodings for record in records)
+    assert all(
+        record.representative_special_encodings
+        for record in records
+        if record.pre_identifier in {"jina-v2-code", "roberta-bpe"}
+    )
     assert all(record.source_config_asset[0] == "config.json" for record in records)
 
 
@@ -95,18 +102,33 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     }
     assert statuses == {
         "deferred-compiled-semantics": 45,
-        "deferred-pinned-artifact-evidence": 16,
-        "validated-pinned-source": 26,
+        "deferred-pinned-artifact-evidence": 14,
+        "validated-pinned-source": 28,
     }
     for record in census:
         assert (record.evidence_id is None) == (record.blocker_category is not None)
         if record.evidence_id is None:
-            assert record.artifact_repository is None
-            assert record.tokenizer_repository is None
+            assert (record.artifact_repository is None) == (
+                record.candidate_disposition is None
+            )
+            assert (record.tokenizer_repository is None) == (
+                record.candidate_disposition is None
+            )
         else:
             assert record.artifact_revision is not None
             assert record.tokenizer_revision is not None
             assert record.tokenizer_assets
+            assert record.candidate_disposition is None
+
+    jina_v1 = next(record for record in census if record.identifier == "jina-v1-en")
+    assert jina_v1.blocker_category == "pinned-candidate-source-token-mismatch"
+    assert jina_v1.artifact_revision == "34fdafe5a08b64246bcbfdbf0b8a23f818baf8e3"
+    assert jina_v1.artifact_sha256 == (
+        "dbd88c851aaf373569d38e25d34203f8e7ab17a899f767f1f035245cb00b1188"
+    )
+    assert jina_v1.tokenizer_revision == "aca45de6945b5dc6399abcd2a9c55ded5dc9111f"
+    assert jina_v1.candidate_disposition is not None
+    assert "token id 5" in jina_v1.candidate_disposition
 
 
 def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:
@@ -148,6 +170,20 @@ def test_shared_evidence_requires_identical_pinned_dispatch_behavior() -> None:
             evidence,
             validated_identifiers=("gpt-2", "qwen2"),
         )
+
+
+def test_gpt2_add_sep_evidence_has_exact_special_token_witnesses() -> None:
+    expected = {
+        "jina-v2-code-q8-tokenizer": (0, 10564, 16, 7550, 5, 53737, 2),
+        "roberta-bpe-q2-tokenizer": (0, 31414, 6, 232, 328, 17072, 1898, 2),
+    }
+    for evidence_id, token_ids in expected.items():
+        evidence = tokenizer_evidence(evidence_id)
+        assert evidence is not None
+        assert evidence.representative_special_encodings == (
+            ("Hello, world! 12345", token_ids),
+        )
+        assert evidence.special_token_ids[0] == ("</s>", 2)
 
 
 def test_existing_qwen25_runtime_tokenizer_evidence_remains_pinned() -> None:

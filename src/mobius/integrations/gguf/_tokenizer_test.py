@@ -546,6 +546,81 @@ def test_compact_evidence_mismatch_leaves_no_partial_output(
     assert not output.exists()
 
 
+def test_special_encoding_evidence_mismatch_leaves_no_partial_output(
+    tmp_path: Path, monkeypatch
+) -> None:
+    metadata = _metadata(pre="smollm")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(metadata)
+    source = _pinned_source(metadata, payloads)
+    source = GGUFTokenizerSource(
+        source.repository,
+        source.revision,
+        source.assets,
+        source.metadata_sha256,
+        representative_special_encodings=(("hello", (999,)),),
+    )
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="representative special encoding differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+        )
+
+    assert not output.exists()
+
+
+def test_gpt2_add_sep_accepts_exact_roberta_post_processor() -> None:
+    metadata = _metadata(pre="jina-v2-code")
+    metadata.pop("tokenizer.ggml.scores")
+    metadata["tokenizer.ggml.add_eos_token"] = True
+    metadata["tokenizer.ggml.seperator_token_id"] = 1
+    payloads = _pinned_payloads(metadata)
+    config = json.loads(payloads["tokenizer_config.json"])
+    config.pop("add_bos_token")
+    config.pop("add_eos_token")
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["post_processor"] = {
+        "type": "RobertaProcessing",
+        "sep": ["<eos>", 1],
+        "cls": ["<bos>", 2],
+        "trim_offsets": True,
+        "add_prefix_space": False,
+    }
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
+def test_gpt2_add_sep_rejects_post_processor_without_exact_sep() -> None:
+    metadata = _metadata(pre="roberta-bpe")
+    metadata.pop("tokenizer.ggml.scores")
+    metadata["tokenizer.ggml.add_eos_token"] = True
+    metadata["tokenizer.ggml.seperator_token_id"] = 1
+    payloads = _pinned_payloads(metadata)
+    config = json.loads(payloads["tokenizer_config.json"])
+    config.pop("add_bos_token")
+    config.pop("add_eos_token")
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["post_processor"] = {
+        "type": "RobertaProcessing",
+        "sep": ["<unk>", 3],
+        "cls": ["<bos>", 2],
+        "trim_offsets": True,
+        "add_prefix_space": False,
+    }
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    with pytest.raises(ValueError, match="cannot prove GGUF add_eos_token"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
 def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
     metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)

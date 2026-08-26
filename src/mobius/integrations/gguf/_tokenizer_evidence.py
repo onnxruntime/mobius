@@ -59,6 +59,7 @@ class GGUFTokenizerEvidence:
     materialized_tokenizer_sha256: str
     special_token_ids: tuple[tuple[str, int], ...]
     representative_encodings: tuple[tuple[str, tuple[int, ...]], ...]
+    representative_special_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         revisions = (self.revision, self.tokenizer_revision)
@@ -170,6 +171,17 @@ class GGUFTokenizerEvidence:
             not text or not token_ids for text, token_ids in self.representative_encodings
         ):
             raise ValueError("Tokenizer evidence requires non-empty representative encodings")
+        if any(
+            not text or not token_ids
+            for text, token_ids in self.representative_special_encodings
+        ):
+            raise ValueError(
+                "Tokenizer evidence representative special encodings must be non-empty"
+            )
+        if witness.pre_type == "GPT2_ADD_SEP" and not self.representative_special_encodings:
+            raise ValueError(
+                "GPT2_ADD_SEP evidence requires a representative special-token encoding"
+            )
 
     @property
     def source(self) -> GGUFTokenizerSource:
@@ -181,6 +193,7 @@ class GGUFTokenizerEvidence:
             self.tokenizer_metadata_sha256,
             self.materialized_tokenizer_sha256,
             self.representative_encodings,
+            self.representative_special_encodings,
         )
 
 
@@ -360,6 +373,235 @@ _GPT2_Q4_TOKENIZER = GGUFTokenizerEvidence(
             ),
         ),
         ("<|endoftext|>", (50_256,)),
+    ),
+)
+
+_JINA_V2_CODE_Q8_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="jina-v2-code-q8-tokenizer",
+    architecture="jina-bert-v2",
+    pre_identifier="jina-v2-code",
+    validated_identifiers=("jina-v2-code",),
+    repository="ggml-org/jina-embeddings-v2-base-code-Q8_0-GGUF",
+    revision="05e79e9a6c8b99491e92ebb28d753268f8601e3c",
+    filename="jina-embeddings-v2-base-code-q8_0.gguf",
+    size=172_869_280,
+    lfs_sha256="3bd1722f09350209aa3ada93df55882666c58194bfbbbe81c30545d731cb4e7a",
+    tensor_count=268,
+    tensor_qtypes=(("F32", 183), ("Q8_0", 85)),
+    tokenizer_repository="jinaai/jina-embeddings-v2-base-code",
+    tokenizer_revision="516f4baf13dec4ddddda8631e019b5737c8bc250",
+    source_config_asset=(
+        "config.json",
+        1_216,
+        "e426aa684c7f9a95c5f020aa855faf93a24f065f5fad0c9e17b124670cabdea6",
+    ),
+    tokenizer_metadata_sha256="30161844cf4cd814a532f368f372a6ba0c7c2c7d86d9678f9816505122e889e5",
+    tokenizer_assets=(
+        (
+            "special_tokens_map.json",
+            280,
+            "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+        ),
+        (
+            "tokenizer.json",
+            2_561_316,
+            "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5",
+        ),
+        (
+            "tokenizer_config.json",
+            493,
+            "f477aeb15ff9f78d3c1ddf2361d2b0b8b20cf55220f839f29a37f3a18efddd89",
+        ),
+    ),
+    token_count=61_056,
+    source_token_count=61_056,
+    embedding_vocabulary_size=61_056,
+    deterministic_padding_range=(61_056, 61_055),
+    ordered_vocabulary_sha256="5a8d8f6a0dad37e10cb27a75ece22d44e96259419bdfe8f4e334a676483d9f78",
+    merge_count=60_795,
+    ordered_merges_sha256="3c0cca5349df26b361d55c0498b4a46fb52a92a05e185754cf709b8de160c5da",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "821b8840b71bceb8d52cacc36f2cc574f0c2e73f8df002cc0936566e6ba20043"
+    ),
+    materialized_tokenizer_sha256=(
+        "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5"
+    ),
+    special_token_ids=(
+        ("</s>", 2),
+        ("<mask>", 4),
+        ("<pad>", 1),
+        ("<s>", 0),
+        ("<unk>", 3),
+    ),
+    representative_encodings=(
+        ("Hello, world! 12345", (10564, 16, 7550, 5, 53737)),
+        ("  spaced  text\n", (225, 4113, 72, 225, 1460, 203)),
+        ("你好，世界！", (12552, 19692, 2397, 47406, 32039, 19513)),  # noqa: RUF001
+        (
+            "Café — κόσμος 🚀",
+            (39, 1326, 2521, 25956, 31085, 20788, 10123, 59430, 14535, 30975),
+        ),
+        (
+            (
+                "def fibonacci(n: int) -> int:\n"
+                "    return n if n < 2 else fibonacci(n-1) + fibonacci(n-2)"
+            ),
+            (
+                406,
+                23852,
+                267,
+                33404,
+                12,
+                82,
+                30,
+                577,
+                13,
+                1882,
+                577,
+                30,
+                287,
+                437,
+                321,
+                392,
+                321,
+                318,
+                491,
+                723,
+                23852,
+                267,
+                33404,
+                12,
+                82,
+                17,
+                21,
+                13,
+                464,
+                23852,
+                267,
+                33404,
+                12,
+                82,
+                17,
+                22,
+                13,
+            ),
+        ),
+    ),
+    representative_special_encodings=(
+        ("Hello, world! 12345", (0, 10564, 16, 7550, 5, 53737, 2)),
+    ),
+)
+
+_ROBERTA_BPE_Q2_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="roberta-bpe-q2-tokenizer",
+    architecture="bert",
+    pre_identifier="roberta-bpe",
+    validated_identifiers=("roberta-bpe",),
+    repository="mradermacher/quora-roberta-base-GGUF",
+    revision="7a6d5816bb01c2d917978fb36825d9fec3ce4ff4",
+    filename="quora-roberta-base.Q2_K.gguf",
+    size=67_888_768,
+    lfs_sha256="1d31ba38f70d6f1456cfbd10c48dc6100a11a9b90558e110a9fb4d940b77cb49",
+    tensor_count=201,
+    tensor_qtypes=(("F16", 1), ("F32", 126), ("Q2_K", 37), ("Q3_K", 36), ("Q6_K", 1)),
+    tokenizer_repository="sentence-transformers/stsb-roberta-base",
+    tokenizer_revision="32d471df2968a46d1fe447d66a9275e8e63fcf12",
+    source_config_asset=(
+        "config.json",
+        672,
+        "05fac50b3f0e2782f88ba1349ede146230005edef945fb336eeb6f9a8d815940",
+    ),
+    tokenizer_metadata_sha256="9bc381b15c316f8ced2658ec079c0b2d5ea6c6dcddb615f2a6966bbb717bde74",
+    tokenizer_assets=(
+        (
+            "special_tokens_map.json",
+            239,
+            "378eb3bf733eb16e65792d7e3fda5b8a4631387ca04d2015199c4d4f22ae554d",
+        ),
+        (
+            "tokenizer.json",
+            1_355_881,
+            "33465117406b9007673e8ba283f7f1383d9b5094df947481af60eec94ed7d7bd",
+        ),
+        (
+            "tokenizer_config.json",
+            1_172,
+            "5992009790ef0a4ba5910d1e0dc04c4e0601d416131501080c694231548bf666",
+        ),
+    ),
+    token_count=50_265,
+    source_token_count=50_265,
+    embedding_vocabulary_size=50_265,
+    deterministic_padding_range=(50_265, 50_264),
+    ordered_vocabulary_sha256="db935e2c7440742d76167108001403b9c51be6de99a5f677d70be0771e446cf5",
+    merge_count=50_000,
+    ordered_merges_sha256="e707935c815087d8103fec742a07d7e8b50d1acf997ddcde53c73213db1141a4",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "70211118fea54968b4980f036554fd37269fc3c205dddbfc2b21004f570df7c3"
+    ),
+    materialized_tokenizer_sha256=(
+        "33465117406b9007673e8ba283f7f1383d9b5094df947481af60eec94ed7d7bd"
+    ),
+    special_token_ids=(
+        ("</s>", 2),
+        ("<mask>", 50_264),
+        ("<pad>", 1),
+        ("<s>", 0),
+        ("<unk>", 3),
+    ),
+    representative_encodings=(
+        ("Hello, world! 12345", (31414, 6, 232, 328, 17072, 1898)),
+        ("  spaced  text\n", (1437, 42926, 1437, 2788, 50118)),
+        (
+            "你好，世界！",  # noqa: RUF001
+            (
+                47856,
+                21402,
+                48975,
+                10809,
+                43251,
+                4394,
+                14285,
+                46015,
+                25448,
+                49127,
+                14285,
+                43251,
+                4394,
+                10172,
+            ),
+        ),
+        (
+            "Café — κόσμος 🚀",
+            (
+                347,
+                2001,
+                1140,
+                93,
+                43662,
+                3070,
+                45704,
+                14285,
+                47721,
+                47049,
+                46122,
+                47756,
+                8103,
+                15113,
+                7471,
+            ),
+        ),
+        (
+            "The quick brown fox jumps over the lazy dog.",
+            (133, 2119, 6219, 23602, 13855, 81, 5, 22414, 2335, 4),
+        ),
+    ),
+    representative_special_encodings=(
+        ("Hello, world! 12345", (0, 31414, 6, 232, 328, 17072, 1898, 2)),
     ),
 )
 
@@ -573,9 +815,11 @@ _TOKENIZER_EVIDENCE = MappingProxyType(
         record.evidence_id: record
         for record in (
             _GPT2_Q4_TOKENIZER,
+            _JINA_V2_CODE_Q8_TOKENIZER,
             _LFM2_350M_F16_TOKENIZER,
             _QWEN25_05B_Q8_TOKENIZER,
             _QWEN35_08B_Q4_TOKENIZER,
+            _ROBERTA_BPE_Q2_TOKENIZER,
             _SMOLLM_135M_F16_TOKENIZER,
         )
     }

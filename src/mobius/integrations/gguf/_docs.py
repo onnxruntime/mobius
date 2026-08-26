@@ -247,6 +247,13 @@ def _tokenizers() -> str:
             if record.evidence_id is not None
             else f"`{record.blocker_category}`"
         )
+        if record.candidate_disposition is not None:
+            disposition += (
+                f"; `{record.artifact_repository}@{record.artifact_revision}` / "
+                f"`{record.artifact_filename}` vs "
+                f"`{record.tokenizer_repository}@{record.tokenizer_revision}`: "
+                f"{record.candidate_disposition}"
+            )
         if record.identifier in alias_proofs:
             disposition += (
                 f"; `llama-vocab.cpp:L{alias_proofs[record.identifier].dispatch_line}`"
@@ -316,6 +323,10 @@ def _tokenizer_evidence_table() -> str:
             f"`{text.encode('unicode_escape').decode()}` → `{list(token_ids)}`"
             for text, token_ids in evidence.representative_encodings
         )
+        special_encodings = "<br>".join(
+            f"`{text.encode('unicode_escape').decode()}` + specials → `{list(token_ids)}`"
+            for text, token_ids in evidence.representative_special_encodings
+        )
         padding_start, padding_end = evidence.deterministic_padding_range
         padding = (
             f"unused `[PAD{{id}}]` IDs `{padding_start}..{padding_end}`"
@@ -340,6 +351,7 @@ def _tokenizer_evidence_table() -> str:
             f"source IDs `0..{evidence.source_token_count - 1}`; {padding}; "
             f"rows={evidence.embedding_vocabulary_size:,}<br>"
             f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
+            f"{'<br>' + special_encodings if special_encodings else ''}"
         )
         rows.append(
             "| "

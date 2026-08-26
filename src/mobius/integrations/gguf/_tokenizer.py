@@ -170,6 +170,7 @@ class GGUFTokenizerSource:
     metadata_sha256: str
     materialized_tokenizer_sha256: str | None = None
     representative_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    representative_special_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         if self.repository.count("/") != 1 or not all(self.repository.split("/")):
@@ -191,6 +192,13 @@ class GGUFTokenizerSource:
             )
         if any(not text or not token_ids for text, token_ids in self.representative_encodings):
             raise ValueError("Tokenizer source representative encodings must be non-empty")
+        if any(
+            not text or not token_ids
+            for text, token_ids in self.representative_special_encodings
+        ):
+            raise ValueError(
+                "Tokenizer source representative special encodings must be non-empty"
+            )
         names = tuple(asset.filename for asset in self.assets)
         if "tokenizer.json" not in names:
             raise ValueError("Tokenizer source must include tokenizer.json")
@@ -917,6 +925,32 @@ def _validate_unused_padding_is_non_matchable(
                 )
 
 
+def _roberta_processor_proves_special_insertion(
+    tokenizer_json: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    gguf_name: str,
+) -> bool:
+    processor = tokenizer_json.get("post_processor")
+    if not isinstance(processor, Mapping) or processor.get("type") != "RobertaProcessing":
+        return False
+    processor_name, token_id_name = {
+        "add_bos_token": ("cls", "bos_token_id"),
+        "add_eos_token": ("sep", "eos_token_id"),
+        "add_sep_token": ("sep", "seperator_token_id"),
+    }[gguf_name]
+    token_id = metadata.get(f"tokenizer.ggml.{token_id_name}")
+    value = processor.get(processor_name)
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    return (
+        type(token_id) is int
+        and isinstance(tokens, list)
+        and 0 <= token_id < len(tokens)
+        and isinstance(value, list)
+        and len(value) == 2
+        and value == [tokens[token_id], token_id]
+    )
+
+
 def _validate_pinned_tokenizer(
     metadata: Mapping[str, Any],
     payloads: Mapping[str, bytes],
@@ -1074,10 +1108,26 @@ def _validate_pinned_tokenizer(
         if expected is None:
             continue
         if actual is None:
+            if expected is True and _roberta_processor_proves_special_insertion(
+                tokenizer_json, metadata, gguf_name
+            ):
+                continue
             if expected is not False:
                 raise ValueError(f"Pinned tokenizer cannot prove GGUF {config_name}")
         elif actual is not expected:
             raise ValueError(f"Pinned tokenizer {config_name} differs from GGUF")
+
+    policy = tokenizer_pre_policies().get(pre)
+    if (
+        policy is not None
+        and policy.pre_type == "GPT2_ADD_SEP"
+        and not _roberta_processor_proves_special_insertion(
+            tokenizer_json, metadata, "add_sep_token"
+        )
+    ):
+        raise ValueError(
+            f"Pinned tokenizer post-processor cannot prove GGUF pre {pre!r} SEP insertion"
+        )
 
     expected_prefix = metadata.get("tokenizer.ggml.add_space_prefix")
     if expected_prefix is not None:
@@ -1108,6 +1158,7 @@ def _validate_pinned_tokenizer(
         "tokenizer.ggml.tokens",
         "tokenizer.ggml.merges",
         "tokenizer.ggml.token_type",
+        "tokenizer.ggml.token_type_count",
         "tokenizer.ggml.bos_token_id",
         "tokenizer.ggml.eos_token_id",
         "tokenizer.ggml.unknown_token_id",
@@ -1248,7 +1299,7 @@ def materialize_gguf_tokenizer(
             "Materialized tokenizer digest differs from exact tokenizer evidence: "
             f"expected {source.materialized_tokenizer_sha256}, got {tokenizer_sha256}"
         )
-    if source.representative_encodings:
+    if source.representative_encodings or source.representative_special_encodings:
         try:
             from tokenizers import Tokenizer
 
@@ -1262,6 +1313,13 @@ def materialize_gguf_tokenizer(
             if actual_ids != expected_ids:
                 raise ValueError(
                     "Materialized tokenizer representative encoding differs for "
+                    f"{text!r}: expected {expected_ids}, got {actual_ids}"
+                )
+        for text, expected_ids in source.representative_special_encodings:
+            actual_ids = tuple(tokenizer.encode(text, add_special_tokens=True).ids)
+            if actual_ids != expected_ids:
+                raise ValueError(
+                    "Materialized tokenizer representative special encoding differs for "
                     f"{text!r}: expected {expected_ids}, got {actual_ids}"
                 )
     payloads["tokenizer.json"] = tokenizer_payload
