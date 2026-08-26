@@ -399,7 +399,7 @@ and gives every route an exact evidence ID or concrete compiled-semantics blocke
 | `gigachat` | `gpt-2` / `GPT2` | `deferred` | `validated-pinned-source` | `gpt2-q4-tokenizer`; `llama-vocab.cpp:L2191` |
 | `glm4` | `glm4` / `CHATGLM4` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-artifact-source-parity-pending`; `llama-vocab.cpp:L2256` |
 | `gpt-2` | `gpt-2` / `GPT2` | `deferred` | `validated-pinned-source` | `gpt2-q4-tokenizer`; `llama-vocab.cpp:L2187` |
-| `gpt-4o` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-artifact-source-parity-pending`; `llama-vocab.cpp:L2307` |
+| `gpt-4o` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-candidate-identifier-mismatch`; `mradermacher/oh-dcft-v3.1-gpt-4o-mini-GGUF@41c1d48055e3192a907c0ffc2a886288e9040e33` / `oh-dcft-v3.1-gpt-4o-mini.Q2_K.gguf` vs `Xenova/gpt-4o@7956d98f2a83b2751a98ea7136fdf7fe6cf54e69`: name-only candidate rejected: its complete GGUF header dispatches llama-bpe, not gpt-4o, and has 128256 tokens; the pinned llama.cpp fingerprint source has 200000 vocabulary entries plus 2 added tokens and is tokenizer-only, with no model config, chat template, or embedding rows; `llama-vocab.cpp:L2307` |
 | `gpt3-finnish` | `gpt3-finnish` / `GPT3_FINNISH` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 | `granite-docling` | `granite-docling` / `GRANITE_DOCLING` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 | `granite-embed-multi-311m` | `gemma4` / `GEMMA4` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-artifact-source-parity-pending`; `llama-vocab.cpp:L2203` |
@@ -426,7 +426,7 @@ and gives every route an exact evidence ID or concrete compiled-semantics blocke
 | `llama-bpe` | `llama3` / `LLAMA3` | `deferred` | `validated-pinned-source` | `lfm2-350m-f16-tokenizer`; `llama-vocab.cpp:L2150` |
 | `llama-v3` | `llama3` / `LLAMA3` | `deferred` | `validated-pinned-source` | `lfm2-350m-f16-tokenizer`; `llama-vocab.cpp:L2149` |
 | `llama3` | `llama3` / `LLAMA3` | `deferred` | `validated-pinned-source` | `lfm2-350m-f16-tokenizer`; `llama-vocab.cpp:L2148` |
-| `llama4` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-artifact-source-parity-pending`; `llama-vocab.cpp:L2308` |
+| `llama4` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-candidate-incomplete-shard`; `ggml-org/Llama-4-Scout-17B-16E-Instruct-GGUF@42675345da11ade9203a5187595da7b74d4ff2ac` / `Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00002-of-00002.gguf` vs `meta-llama/Llama-4-Scout-17B-16E-Instruct@92f3b1597a195b523d8d9e5700e57e4fbb8f20d3`: the only pinned Q4_K_M file within 16 GiB is shard 2 of 2; its complete header has only split metadata, 145 of 628 tensors, no tokenizer fields, and no embedding tensor, while shard 1 is 49848377344 bytes; `llama-vocab.cpp:L2308` |
 | `megrez` | `megrez` / `QWEN2_CLEAN_SPACES` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 | `mellum` | `gpt-2` / `GPT2` | `deferred` | `validated-pinned-source` | `gpt2-q4-tokenizer`; `llama-vocab.cpp:L2195` |
 | `mellum2` | `mellum2` / `MELLUM2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |

@@ -132,6 +132,27 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     assert jina_v1.candidate_disposition is not None
     assert "token id 5" in jina_v1.candidate_disposition
 
+    gpt4o = next(record for record in census if record.identifier == "gpt-4o")
+    assert gpt4o.blocker_category == "pinned-candidate-identifier-mismatch"
+    assert gpt4o.artifact_revision == "41c1d48055e3192a907c0ffc2a886288e9040e33"
+    assert gpt4o.artifact_sha256 == (
+        "e14b14b73e0f7f35b234df7c5f1a585869d1fb3634331d489b4184b61cec5d29"
+    )
+    assert gpt4o.tokenizer_revision == "7956d98f2a83b2751a98ea7136fdf7fe6cf54e69"
+    assert gpt4o.candidate_disposition is not None
+    assert "dispatches llama-bpe, not gpt-4o" in gpt4o.candidate_disposition
+
+    llama4 = next(record for record in census if record.identifier == "llama4")
+    assert llama4.blocker_category == "pinned-candidate-incomplete-shard"
+    assert llama4.artifact_revision == "42675345da11ade9203a5187595da7b74d4ff2ac"
+    assert llama4.artifact_size == 15_511_520_608
+    assert llama4.artifact_sha256 == (
+        "53d9a61b90e38330daa4bb07afe56aa3e74a3d3aa31d344c053ebbdcfe5d59fe"
+    )
+    assert llama4.tokenizer_revision == "92f3b1597a195b523d8d9e5700e57e4fbb8f20d3"
+    assert llama4.candidate_disposition is not None
+    assert "145 of 628 tensors" in llama4.candidate_disposition
+
     talkie = tokenizer_evidence("talkie-13b-q4-native-tokenizer")
     assert talkie is not None
     assert talkie.reconstruct_gpt4o_from_gguf

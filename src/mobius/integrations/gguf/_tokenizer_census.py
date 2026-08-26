@@ -25,6 +25,8 @@ TokenizerAuditStatus = Literal[
 ]
 TokenizerBlocker = Literal[
     "pinned-artifact-source-parity-pending",
+    "pinned-candidate-identifier-mismatch",
+    "pinned-candidate-incomplete-shard",
     "pinned-candidate-source-merge-mismatch",
     "pinned-candidate-source-token-mismatch",
     "compiled-llama.cpp-semantic-dependency",
@@ -54,6 +56,45 @@ class GGUFTokenizerRouteAudit:
 
 
 _PINNED_CANDIDATE_DISPOSITIONS = {
+    "gpt-4o": GGUFTokenizerRouteAudit(
+        identifier="gpt-4o",
+        semantic_group="gpt-4o",
+        pre_type="GPT4O",
+        default_policy="deferred",
+        current_status="deferred-pinned-artifact-evidence",
+        evidence_id=None,
+        artifact_repository="mradermacher/oh-dcft-v3.1-gpt-4o-mini-GGUF",
+        artifact_revision="41c1d48055e3192a907c0ffc2a886288e9040e33",
+        artifact_filename="oh-dcft-v3.1-gpt-4o-mini.Q2_K.gguf",
+        artifact_size=3_179_132_928,
+        artifact_sha256="e14b14b73e0f7f35b234df7c5f1a585869d1fb3634331d489b4184b61cec5d29",
+        tokenizer_repository="Xenova/gpt-4o",
+        tokenizer_revision="7956d98f2a83b2751a98ea7136fdf7fe6cf54e69",
+        tokenizer_assets=(
+            (
+                "special_tokens_map.json",
+                98,
+                "7003e1e385ae2f4b32ca9ca8637c352553922adad120266cf82238155a21dd16",
+            ),
+            (
+                "tokenizer.json",
+                9_729_051,
+                "43a3ad4618a6a938f8c2614154ea10c31ad53a62d5683ae0b0e6133575cef07e",
+            ),
+            (
+                "tokenizer_config.json",
+                236,
+                "71424d4750066a6f9bcfea0699576c4284327ff25d388d42419506bcfb5535ab",
+            ),
+        ),
+        blocker_category="pinned-candidate-identifier-mismatch",
+        candidate_disposition=(
+            "name-only candidate rejected: its complete GGUF header dispatches llama-bpe, "
+            "not gpt-4o, and has 128256 tokens; the pinned llama.cpp fingerprint source has "
+            "200000 vocabulary entries plus 2 added tokens and is tokenizer-only, with no "
+            "model config, chat template, or embedding rows"
+        ),
+    ),
     "jina-v1-en": GGUFTokenizerRouteAudit(
         identifier="jina-v1-en",
         semantic_group="jina-v1-en",
@@ -94,6 +135,34 @@ _PINNED_CANDIDATE_DISPOSITIONS = {
         candidate_disposition=(
             "ordered token id 5 differs: GGUF is empty while the official tokenizer is "
             "U+0000; deterministic padding starts only at id 60516"
+        ),
+    ),
+    "llama4": GGUFTokenizerRouteAudit(
+        identifier="llama4",
+        semantic_group="gpt-4o",
+        pre_type="GPT4O",
+        default_policy="deferred",
+        current_status="deferred-pinned-artifact-evidence",
+        evidence_id=None,
+        artifact_repository="ggml-org/Llama-4-Scout-17B-16E-Instruct-GGUF",
+        artifact_revision="42675345da11ade9203a5187595da7b74d4ff2ac",
+        artifact_filename="Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00002-of-00002.gguf",
+        artifact_size=15_511_520_608,
+        artifact_sha256="53d9a61b90e38330daa4bb07afe56aa3e74a3d3aa31d344c053ebbdcfe5d59fe",
+        tokenizer_repository="meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        tokenizer_revision="92f3b1597a195b523d8d9e5700e57e4fbb8f20d3",
+        tokenizer_assets=(
+            (
+                "tokenizer.json",
+                27_948_578,
+                "172c9eb4beafc72601690da3ccfcede5c2e6806a8d5ec1fca33e22acea8023a4",
+            ),
+        ),
+        blocker_category="pinned-candidate-incomplete-shard",
+        candidate_disposition=(
+            "the only pinned Q4_K_M file within 16 GiB is shard 2 of 2; its complete "
+            "header has only split metadata, 145 of 628 tensors, no tokenizer fields, and "
+            "no embedding tensor, while shard 1 is 49848377344 bytes"
         ),
     ),
 }
