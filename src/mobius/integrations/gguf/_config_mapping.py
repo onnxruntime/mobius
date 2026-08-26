@@ -679,19 +679,25 @@ def gguf_to_config(
     num_attention_heads = hf_fields["num_attention_heads"]
     if isinstance(num_attention_heads, (list, np.ndarray)):
         values = [int(value) for value in num_attention_heads]
-        if canonical_arch not in {"plamo2", "nemotron_h", "nemotron_h_moe"}:
+        if canonical_arch not in {"openelm", "plamo2", "nemotron_h", "nemotron_h_moe"}:
             raise ValueError(
                 f"{canonical_arch} has unsupported per-layer attention head counts"
             )
         nonzero = {value for value in values if value}
-        if len(nonzero) != 1:
+        if canonical_arch == "openelm":
+            if not values or min(values) <= 0:
+                raise ValueError("openelm attention head counts must all be positive")
+            num_attention_heads = values[0]
+            nonzero = set()
+        if nonzero and len(nonzero) != 1:
             raise ValueError(
                 f"{canonical_arch} attention layers must use one consistent non-zero "
                 "head count"
             )
-        if not nonzero:
+        if canonical_arch != "openelm" and not nonzero:
             raise ValueError(f"{canonical_arch} GGUF has no attention layer")
-        num_attention_heads = nonzero.pop()
+        if nonzero:
+            num_attention_heads = nonzero.pop()
     if canonical_arch in {"mamba", "mamba2"}:
         # Pure recurrent GGUFs deliberately write attention.head_count=0.
         # The temporary ArchitectureConfig still needs a nonzero placeholder;
@@ -734,6 +740,10 @@ def gguf_to_config(
             if not nonzero:
                 raise ValueError(f"{canonical_arch} GGUF has no attention layer KV-head count")
             num_kv_heads = nonzero.pop()
+        elif canonical_arch == "openelm":
+            if not values or min(values) <= 0:
+                raise ValueError("openelm KV-head counts must all be positive")
+            num_kv_heads = values[0]
         else:
             # Per-layer array → pick the majority value (sliding layers dominate)
             num_kv_heads = max(set(values), key=values.count)
@@ -941,6 +951,11 @@ def gguf_to_config(
     swiglu_limit = hf_fields.get("swiglu_limit", 0.0)
     if isinstance(swiglu_limit, (list, np.ndarray)):
         swiglu_limit = swiglu_limit[0] if len(swiglu_limit) else 0.0
+
+    if canonical_arch == "openelm" and isinstance(
+        hf_fields.get("intermediate_size"), (list, tuple, np.ndarray)
+    ):
+        hf_fields["intermediate_size"] = int(hf_fields["intermediate_size"][0])
 
     config = ArchitectureConfig(
         hidden_size=hidden_size,
@@ -3275,6 +3290,82 @@ def _conventional_legacy_postprocess(
     )
 
 
+def _exact_legacy_gguf_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    """Materialize only the architecture variants admitted by strict validation."""
+    architecture = model.architecture
+    fields: dict[str, Any] = {
+        "model_type": {
+            "gptneox": "gpt_neox",
+            "jais": "jais",
+            "mpt": "mpt",
+            "refact": "refact",
+            "ernie4_5": "ernie4_5",
+            "openelm": "openelm",
+        }[architecture],
+        "hidden_act": {
+            "gptneox": "gelu",
+            "jais": "silu",
+            "mpt": "gelu",
+            "refact": "silu",
+            "ernie4_5": "silu",
+            "openelm": "silu",
+        }[architecture],
+        "use_parallel_residual": architecture == "gptneox",
+        # Older conventional GGUFs may serialize the rotary dimension while
+        # omitting the default 10,000 frequency base. These architectures
+        # still execute RoPE in the pinned loaders.
+        "rope_type": (
+            "default" if architecture in {"gptneox", "ernie4_5", "openelm"} else None
+        ),
+        "rope_interleave": architecture == "ernie4_5",
+        "alibi_max_bias": (
+            float(metadata[f"{architecture}.attention.max_alibi_bias"])
+            if architecture in {"jais", "mpt"}
+            else 8.0
+            if architecture == "refact"
+            else None
+        ),
+        "attention_scale": (1.0 / config.head_dim if architecture == "jais" else None),
+        "tie_word_embeddings": (
+            architecture == "openelm"
+            or (
+                architecture in {"mpt", "refact", "ernie4_5"}
+                and "output.weight" not in model.tensor_names
+            )
+        ),
+        "attn_qkv_bias": architecture in {"gptneox", "jais"}
+        or (architecture == "mpt" and config.attn_qkv_bias),
+        "attn_o_bias": architecture in {"gptneox", "jais"}
+        or (architecture == "mpt" and config.attn_o_bias),
+        "mlp_bias": architecture in {"gptneox", "jais"}
+        or (architecture == "mpt" and config.mlp_bias),
+    }
+    if architecture == "gptneox":
+        heads = int(metadata["gptneox.attention.head_count"])
+        head_dim = int(metadata["gptneox.embedding_length"]) // heads
+        rotary_dim = int(metadata.get("gptneox.rope.dimension_count", head_dim))
+        fields.update(
+            head_dim=head_dim,
+            partial_rotary_factor=rotary_dim / head_dim,
+        )
+    if architecture == "openelm":
+        heads = tuple(int(value) for value in metadata["openelm.attention.head_count"])
+        kv_heads = tuple(int(value) for value in metadata["openelm.attention.head_count_kv"])
+        intermediate = tuple(int(value) for value in metadata["openelm.feed_forward_length"])
+        fields.update(
+            num_attention_heads=heads[0],
+            num_key_value_heads=kv_heads[0],
+            intermediate_size=intermediate[0],
+            layer_attention_head_counts=heads,
+            layer_attention_kv_head_counts=kv_heads,
+            layer_intermediate_sizes=intermediate,
+            attn_qk_norm=True,
+        )
+    return dataclasses.replace(config, **fields)
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -3284,6 +3375,7 @@ def _conventional_legacy_postprocess(
 # when an architecture's model_type gained a ``_text`` suffix.
 _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "conventional_legacy": _conventional_legacy_postprocess,
+    "exact_legacy_gguf": _exact_legacy_gguf_postprocess,
     "dflash": _dflash_postprocess,
     "eagle3": _eagle3_postprocess,
     "dream": _dream_postprocess,

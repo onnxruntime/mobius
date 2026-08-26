@@ -1809,19 +1809,103 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="openelm",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="openelm",
+        module_type="gguf_legacy",
+        tensor_map_recipe=("legacy_layernorm", "exact_legacy_gguf_extras"),
+        config_postprocessor="exact_legacy_gguf",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "feed_forward_length",
+        ),
         runtime=Support.DEFERRED,
-        reason=_OPENELM_GRAPH_REASON,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because every OpenELM layer stores "
+            "fused QKV rows that must be split into per-layer Q/K/V graph projections."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="mpt",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="mpt",
+        module_type="gguf_legacy",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="exact_legacy_gguf",
+        required_metadata=("attention.layer_norm_epsilon", "attention.max_alibi_bias"),
         runtime=Support.DEFERRED,
-        reason=_MPT_GRAPH_REASON,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " The admitted subset rejects learned positions, Q/K norms, KQV clipping, "
+            "AWQ activation scales, and inconsistent optional bias families. Quantization "
+            "preservation is rejected because fused QKV must be split."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="gptneox",
+        model_type="gpt_neox",
+        module_type="gguf_legacy",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="exact_legacy_gguf",
+        required_metadata=("attention.layer_norm_epsilon", "use_parallel_residual"),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " The admitted subset requires parallel residual MHA. Quantization "
+            "preservation is rejected because fused QKV rows must be split."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jais",
+        model_type="jais",
+        module_type="gguf_legacy",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="exact_legacy_gguf",
+        required_metadata=("attention.layer_norm_epsilon", "attention.max_alibi_bias"),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Converter-baked MuP scales are retained exactly, while fused biased QKV "
+            "must be split and therefore cannot preserve packed quantization."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="refact",
+        model_type="refact",
+        module_type="gguf_legacy",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="exact_legacy_gguf",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Import is narrowed to split, bias-free dense tensors with one KV head; "
+            "loaded-but-unexecuted expert, RoPE-factor, and bias families are rejected. "
+            "Quantization preservation is rejected because this dedicated graph does not "
+            "yet provide quantization-aware projection targets; use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="ernie4_5",
+        model_type="ernie4_5",
+        module_type="gguf_legacy",
+        tensor_map_recipe=("legacy_layernorm",),
+        config_postprocessor="exact_legacy_gguf",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Import is narrowed to the dense split-Q/K/V, split-SwiGLU, full-RoPE "
+            "variant and rejects all expert, fused, sectioned-position, and bias alternatives. "
+            "Quantization preservation is rejected because this dedicated graph does not "
+            "yet provide quantization-aware projection targets; use keep_quantized=False."
+        ),
     ),
     # ------------------------------------------------ known but not importable
     GGUFArchitectureSpec(
@@ -2022,7 +2106,19 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         )
         for architecture, reason in _FINAL_CENSUS_DEFERRED_REASONS.items()
         if architecture
-        not in {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
+        not in {
+            "codeshell",
+            "command-r",
+            "ernie4_5",
+            "gptneox",
+            "jais",
+            "jais2",
+            "orion",
+            "qwen",
+            "refact",
+            "starcoder",
+            "xverse",
+        }
     ),
     GGUFArchitectureSpec(
         gguf_arch="arwkv7",

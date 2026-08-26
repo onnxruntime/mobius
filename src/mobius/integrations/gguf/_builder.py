@@ -1439,9 +1439,247 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
         )
 
 
+def _raise_for_invalid_exact_legacy_decoder_tensor_contract(gguf_model) -> None:
+    """Validate narrowed executable unions for six conventional GGUF decoders."""
+    architecture = gguf_model.architecture
+    supported = {"gptneox", "jais", "mpt", "refact", "ernie4_5", "openelm"}
+    if architecture not in supported:
+        return
+    metadata = gguf_model.metadata
+    common = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+    )
+    missing_metadata = [
+        f"{architecture}.{suffix}"
+        for suffix in common
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{architecture} GGUF is missing required decoder metadata: {missing_metadata}"
+        )
+
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    context = int(metadata[f"{architecture}.context_length"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    raw_heads = metadata[f"{architecture}.attention.head_count"]
+    raw_kv_heads = metadata.get(f"{architecture}.attention.head_count_kv", raw_heads)
+    raw_ffn = metadata[f"{architecture}.feed_forward_length"]
+    if architecture == "openelm":
+        if not all(
+            isinstance(value, (list, tuple, np.ndarray))
+            for value in (
+                raw_heads,
+                raw_kv_heads,
+                raw_ffn,
+            )
+        ):
+            raise ValueError("openelm head and feed-forward metadata must be per-layer arrays")
+        heads_by_layer = tuple(int(value) for value in raw_heads)
+        kv_heads_by_layer = tuple(int(value) for value in raw_kv_heads)
+        ffn_by_layer = tuple(int(value) for value in raw_ffn)
+        if not all(
+            len(values) == layers
+            for values in (
+                heads_by_layer,
+                kv_heads_by_layer,
+                ffn_by_layer,
+            )
+        ):
+            raise ValueError(
+                "openelm per-layer arrays must contain exactly block_count entries"
+            )
+    else:
+        heads = int(raw_heads)
+        kv_heads = int(raw_kv_heads)
+        intermediate = int(raw_ffn)
+        heads_by_layer = (heads,) * layers
+        kv_heads_by_layer = (kv_heads,) * layers
+        ffn_by_layer = (intermediate,) * layers
+
+    head_dim = int(
+        metadata.get(
+            f"{architecture}.attention.key_length",
+            hidden // heads_by_layer[0] if heads_by_layer[0] else 0,
+        )
+    )
+    if (
+        min(hidden, layers, context, vocab, head_dim) <= 0
+        or min(heads_by_layer) <= 0
+        or min(kv_heads_by_layer) <= 0
+        or min(ffn_by_layer) <= 0
+        or any(heads % kv for heads, kv in zip(heads_by_layer, kv_heads_by_layer))
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid exact decoder geometry")
+    if architecture != "openelm" and hidden != heads_by_layer[0] * head_dim:
+        raise ValueError(f"{architecture} attention heads do not span embedding_length")
+    if architecture in {"gptneox", "jais"} and kv_heads_by_layer[0] != heads_by_layer[0]:
+        raise ValueError(f"{architecture} exact GGUF subset requires multi-head attention")
+    if architecture == "refact" and kv_heads_by_layer[0] != 1:
+        raise ValueError("refact exact GGUF subset requires exactly one KV head")
+    if architecture == "gptneox" and not bool(metadata["gptneox.use_parallel_residual"]):
+        raise ValueError("gptneox exact GGUF subset requires use_parallel_residual=true")
+    if architecture in {"jais", "mpt"}:
+        max_bias = float(metadata[f"{architecture}.attention.max_alibi_bias"])
+        if not math.isfinite(max_bias) or max_bias <= 0:
+            raise ValueError(
+                f"{architecture}.attention.max_alibi_bias must be finite and positive"
+            )
+    if architecture == "mpt":
+        clip = float(metadata.get("mpt.attention.clamp_kqv", 0.0) or 0.0)
+        if clip:
+            raise ValueError("mpt exact GGUF subset rejects nonzero attention.clamp_kqv")
+    if architecture in {"jais", "mpt", "refact"}:
+        position_keys = sorted(
+            key for key in metadata if key.startswith(f"{architecture}.rope.")
+        )
+        if position_keys:
+            raise ValueError(
+                f"{architecture} exact ALiBi subset rejects RoPE metadata: {position_keys}"
+            )
+    if architecture in {"gptneox", "ernie4_5", "openelm"}:
+        rope_dim = int(metadata.get(f"{architecture}.rope.dimension_count", head_dim))
+        if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+            raise ValueError(f"{architecture} has invalid rotary dimension")
+        if architecture in {"ernie4_5", "openelm"} and rope_dim != head_dim:
+            raise ValueError(f"{architecture} exact subset requires full-head RoPE")
+    if "ernie4_5.rope.dimension_sections" in metadata:
+        raise ValueError("ernie4_5 exact dense subset rejects rope.dimension_sections")
+    if architecture in {"ernie4_5", "refact"}:
+        forbidden_metadata = sorted(
+            key
+            for key in metadata
+            if key.startswith(
+                (
+                    f"{architecture}.expert",
+                    f"{architecture}.leading_dense",
+                    f"{architecture}.interleave_moe",
+                )
+            )
+        )
+        if forbidden_metadata:
+            raise ValueError(
+                f"{architecture} exact dense subset rejects MoE metadata: {forbidden_metadata}"
+            )
+
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {}
+    if architecture in {"gptneox", "jais"}:
+        required["output.weight"] = (vocab, hidden)
+        required["output_norm.bias"] = (hidden,)
+    elif architecture != "openelm":
+        optional["output.weight"] = (vocab, hidden)
+
+    mpt_bias_names: list[str] = ["output_norm.bias"]
+    for layer, (heads, kv_heads, intermediate) in enumerate(
+        zip(heads_by_layer, kv_heads_by_layer, ffn_by_layer)
+    ):
+        prefix = f"blk.{layer}."
+        q_dim = heads * head_dim
+        kv_dim = kv_heads * head_dim
+        required[prefix + "attn_norm.weight"] = (hidden,)
+        required[prefix + "ffn_norm.weight"] = (hidden,)
+        required[prefix + "attn_output.weight"] = (hidden, q_dim)
+        if architecture in {"gptneox", "jais"}:
+            required[prefix + "attn_norm.bias"] = (hidden,)
+            required[prefix + "ffn_norm.bias"] = (hidden,)
+            required[prefix + "attn_output.bias"] = (hidden,)
+        elif architecture == "mpt":
+            mpt_bias_names.extend(
+                [
+                    prefix + "attn_norm.bias",
+                    prefix + "ffn_norm.bias",
+                    prefix + "attn_qkv.bias",
+                    prefix + "attn_output.bias",
+                    prefix + "ffn_up.bias",
+                    prefix + "ffn_down.bias",
+                ]
+            )
+
+        if architecture in {"gptneox", "jais", "mpt", "openelm"}:
+            required[prefix + "attn_qkv.weight"] = (q_dim + 2 * kv_dim, hidden)
+            if architecture in {"gptneox", "jais"}:
+                required[prefix + "attn_qkv.bias"] = (q_dim + 2 * kv_dim,)
+        else:
+            required.update(
+                {
+                    prefix + "attn_q.weight": (q_dim, hidden),
+                    prefix + "attn_k.weight": (kv_dim, hidden),
+                    prefix + "attn_v.weight": (kv_dim, hidden),
+                }
+            )
+        if architecture == "openelm":
+            required[prefix + "attn_q_norm.weight"] = (head_dim,)
+            required[prefix + "attn_k_norm.weight"] = (head_dim,)
+
+        if architecture in {"jais", "refact", "ernie4_5", "openelm"}:
+            required[prefix + "ffn_gate.weight"] = (intermediate, hidden)
+        required[prefix + "ffn_up.weight"] = (intermediate, hidden)
+        required[prefix + "ffn_down.weight"] = (hidden, intermediate)
+        if architecture == "gptneox":
+            required[prefix + "ffn_up.bias"] = (intermediate,)
+            required[prefix + "ffn_down.bias"] = (hidden,)
+        elif architecture == "jais":
+            required[prefix + "ffn_gate.bias"] = (intermediate,)
+            required[prefix + "ffn_up.bias"] = (intermediate,)
+            required[prefix + "ffn_down.bias"] = (hidden,)
+
+    if architecture == "mpt":
+        present = {name for name in mpt_bias_names if name in actual}
+        if present and present != set(mpt_bias_names):
+            raise ValueError(
+                "mpt exact GGUF subset requires every optional bias family or none"
+            )
+        if present:
+            for name in mpt_bias_names:
+                if name.endswith("attn_qkv.bias"):
+                    layer = int(name.split(".")[1])
+                    shape = (
+                        heads_by_layer[layer] * head_dim
+                        + 2 * kv_heads_by_layer[layer] * head_dim,
+                    )
+                elif name.endswith("ffn_up.bias"):
+                    layer = int(name.split(".")[1])
+                    shape = (ffn_by_layer[layer],)
+                else:
+                    shape = (hidden,)
+                required[name] = shape
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            f"Invalid {architecture} exact GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
 def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
     """Validate the complete pinned tensor census for conventional legacy decoders."""
     architecture = gguf_model.architecture
+    if architecture in {"gptneox", "jais", "mpt", "refact", "ernie4_5", "openelm"}:
+        _raise_for_invalid_exact_legacy_decoder_tensor_contract(gguf_model)
+        return
     supported = {
         "bloom",
         "codeshell",
@@ -4102,6 +4340,18 @@ def build_from_gguf(
 
     tokenizer_verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
+    if static_cache and gguf_arch in {
+        "gptneox",
+        "jais",
+        "mpt",
+        "refact",
+        "ernie4_5",
+        "openelm",
+    }:
+        raise ValueError(
+            f"static_cache=True is not supported for exact legacy {gguf_arch} GGUF models; "
+            "their dedicated decoder layers currently implement dynamic KV cache only."
+        )
     if static_cache and int(gguf_model.metadata.get(f"{gguf_arch}.nextn_predict_layers", 0)):
         raise ValueError(
             "static_cache=True cannot represent the GGUF MTP head's independent "

@@ -57,9 +57,23 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 74
+_EXPECTED_SUPPORTED_COUNT = 80
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
-    {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
+    {
+        "codeshell",
+        "command-r",
+        "ernie4_5",
+        "gptneox",
+        "jais",
+        "jais2",
+        "mpt",
+        "openelm",
+        "orion",
+        "qwen",
+        "refact",
+        "starcoder",
+        "xverse",
+    }
 )
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
@@ -279,6 +293,7 @@ class TestCapabilityClosure:
         assert set(actual) == set(supported_architectures())
         rejected = {
             "chatglm",
+            "ernie4_5",
             "eurobert",
             "granitehybrid",
             "internlm2",
@@ -293,8 +308,13 @@ class TestCapabilityClosure:
             "phi2",
             "bloom",
             "codeshell",
+            "gptneox",
+            "jais",
+            "mpt",
+            "openelm",
             "orion",
             "qwen",
+            "refact",
             "starcoder",
             "xverse",
         }

@@ -52,6 +52,7 @@ __all__ = [
     "GPTJCausalLMModel",
     "GPTNeoXCausalLMModel",
     "GPTNeoXJapaneseCausalLMModel",
+    "ExactLegacyGGUFCausalLMModel",
     "GPTOSSCausalLMModel",
     "EuroBertGGUFModel",
     "Gemma2CausalLMModel",
@@ -258,6 +259,7 @@ from mobius.models.gguf_encoders import (
     NeoBertGGUFModel,
     NomicBertGGUFModel,
 )
+from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
