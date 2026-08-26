@@ -18,7 +18,7 @@
   ["jina-de", "gpt-2", "GPT2", "gpt2-q4-tokenizer"],
   ["jina-es", "gpt-2", "GPT2", "gpt2-q4-tokenizer"],
   ["jina-v1-en", "jina-v1-en", "GPT2_ADD_SEP", null],
-  ["jina-v2-code", "jina-v1-en", "GPT2_ADD_SEP", null],
+  ["jina-v2-code", "jina-v1-en", "GPT2_ADD_SEP", "jina-v2-code-q8-tokenizer"],
   ["jina-v2-de", "gpt-2", "GPT2", "gpt2-q4-tokenizer"],
   ["jina-v2-es", "gpt-2", "GPT2", "gpt2-q4-tokenizer"],
   ["jina-v5-nano", "llama3", "LLAMA3", "lfm2-350m-f16-tokenizer"],
@@ -34,7 +34,7 @@
   ["modern-bert", "gpt-2", "GPT2", "gpt2-q4-tokenizer"],
   ["phi-2", "gpt-2", "GPT2", "gpt2-q4-tokenizer"],
   ["pixtral", "llama3", "LLAMA3", "lfm2-350m-f16-tokenizer"],
-  ["roberta-bpe", "jina-v1-en", "GPT2_ADD_SEP", null],
+  ["roberta-bpe", "jina-v1-en", "GPT2_ADD_SEP", "roberta-bpe-q2-tokenizer"],
   ["talkie", "gpt-4o", "GPT4O", null],
   ["tiny_aya", "tiny_aya", "TINY_AYA", null]
 ]

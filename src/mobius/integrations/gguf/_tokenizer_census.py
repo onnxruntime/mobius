@@ -25,6 +25,7 @@ TokenizerAuditStatus = Literal[
 ]
 TokenizerBlocker = Literal[
     "pinned-artifact-source-parity-pending",
+    "pinned-candidate-source-token-mismatch",
     "compiled-llama.cpp-semantic-dependency",
 ]
 
@@ -48,6 +49,53 @@ class GGUFTokenizerRouteAudit:
     tokenizer_revision: str | None
     tokenizer_assets: tuple[tuple[str, int, str], ...]
     blocker_category: TokenizerBlocker | None
+    candidate_disposition: str | None
+
+
+_PINNED_CANDIDATE_DISPOSITIONS = {
+    "jina-v1-en": GGUFTokenizerRouteAudit(
+        identifier="jina-v1-en",
+        semantic_group="jina-v1-en",
+        pre_type="GPT2_ADD_SEP",
+        default_policy="deferred",
+        current_status="deferred-pinned-artifact-evidence",
+        evidence_id=None,
+        artifact_repository="gpustack/jina-reranker-v1-tiny-en-GGUF",
+        artifact_revision="34fdafe5a08b64246bcbfdbf0b8a23f818baf8e3",
+        artifact_filename="jina-reranker-v1-tiny-en-Q2_K.gguf",
+        artifact_size=31_645_024,
+        artifact_sha256="dbd88c851aaf373569d38e25d34203f8e7ab17a899f767f1f035245cb00b1188",
+        tokenizer_repository="jinaai/jina-reranker-v1-tiny-en",
+        tokenizer_revision="aca45de6945b5dc6399abcd2a9c55ded5dc9111f",
+        tokenizer_assets=(
+            (
+                "config.json",
+                1_206,
+                "dc70646aa6c9e75e3c513cc9c037f35ad54308001c3961d45c0f69749bcfb022",
+            ),
+            (
+                "special_tokens_map.json",
+                280,
+                "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+            ),
+            (
+                "tokenizer.json",
+                2_030_772,
+                "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902",
+            ),
+            (
+                "tokenizer_config.json",
+                1_215,
+                "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa",
+            ),
+        ),
+        blocker_category="pinned-candidate-source-token-mismatch",
+        candidate_disposition=(
+            "ordered token id 5 differs: GGUF is empty while the official tokenizer is "
+            "U+0000; deterministic padding starts only at id 60516"
+        ),
+    ),
+}
 
 
 def _evidenced_route(
@@ -72,6 +120,7 @@ def _evidenced_route(
             sorted((evidence.source_config_asset, *evidence.tokenizer_assets))
         ),
         blocker_category=None,
+        candidate_disposition=None,
     )
 
 
@@ -93,6 +142,8 @@ def tokenizer_route_census() -> tuple[GGUFTokenizerRouteAudit, ...]:
     alias_proofs = tokenizer_alias_evidence()
     for identifier, policy in sorted(tokenizer_pre_policies().items()):
         record = evidenced.get(identifier)
+        if record is None:
+            record = _PINNED_CANDIDATE_DISPOSITIONS.get(identifier)
         if record is None:
             dispatch_proven = identifier in alias_proofs
             record = GGUFTokenizerRouteAudit(
@@ -119,6 +170,7 @@ def tokenizer_route_census() -> tuple[GGUFTokenizerRouteAudit, ...]:
                     if dispatch_proven
                     else "compiled-llama.cpp-semantic-dependency"
                 ),
+                candidate_disposition=None,
             )
         records.append(record)
     return tuple(records)
