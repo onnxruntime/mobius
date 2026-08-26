@@ -170,6 +170,9 @@ class TestResolveOrtGenaiModelType:
         # fallback still supplies the Qwen3 reasoning-token IDs.
         assert _resolve_ort_genai_model_type("qwen3_moe") == "qwen3"
 
+    def test_qwen25_text_subconfig_maps_to_multimodal_runtime(self):
+        assert _resolve_ort_genai_model_type("qwen2_5_vl_text") == "qwen2_5_vl"
+
     def test_gemma4_unified_model_types(self):
         # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
         # reuses the multimodal "gemma4" ORT GenAI pipeline; its standalone
@@ -328,6 +331,43 @@ class TestWriteProcessorConfig:
         norm_attrs = transforms[3]["operation"]["attrs"]
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
+
+    def test_qwen25_text_config_writes_packed_patch_processor(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=14,
+            spatial_merge_size=2,
+            model_type="qwen2_5_vl",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="qwen2_5_vl_text",
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+        assert data["processor"]["name"] == "qwen2_5_image_processor"
+        transforms = data["processor"]["transforms"]
+        assert transforms[-1]["operation"] == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            },
+        }
+        normalize = next(
+            transform["operation"]
+            for transform in transforms
+            if transform["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["qwen2_5_vl"] == 1
 
     def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
         vision = types.SimpleNamespace(
