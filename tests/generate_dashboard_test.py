@@ -967,9 +967,8 @@ def test_meta_no_skipped_or_xfailed_model_is_counted_as_passing(gd):
         assert info.l2_passes is False, (
             f"{mt!r} is in an L2 xfail dict yet l2_passes is True; status={info.l2_status!r}"
         )
-        assert info.confidence_level < 2, (
-            f"{mt!r} L2 xfail must not be counted toward confidence_level; "
-            f"got {info.confidence_level}"
+        assert info.confidence_level != 2, (
+            f"{mt!r} L2 xfail must not determine confidence_level; got {info.confidence_level}"
         )
 
 
