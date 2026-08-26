@@ -40,7 +40,7 @@ from pathlib import Path
 
 import pytest
 
-from mobius._registry import _TEST_MODEL_IDS, registry
+from mobius._registry import registry
 from mobius._testing.golden import (
     discover_test_cases,
     golden_path_for_case,
@@ -123,7 +123,9 @@ def _all_registered() -> list[str]:
 def _all_registered_with_test_id() -> dict[str, str]:
     """Return {model_type: test_model_id} for registered models with one."""
     return {
-        arch: model_id for arch, model_id in _TEST_MODEL_IDS.items() if arch in registry._map
+        arch: registration.test_model_id
+        for arch, registration in registry._map.items()
+        if registration.test_model_id is not None
     }
 
 
@@ -169,10 +171,22 @@ _COVERAGE_SKIP: dict[str, str] = {
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
+    "deepseek": "Legacy DeepSeek-V3 registry alias; graph/config coverage is shared with "
+    "deepseek_v3, whose real-checkpoint evidence owns the family claim.",
     "deepseek_v2_moe": "Alias for deepseek_v2 — covered by deepseek_v2",
+    "gguf_legacy": "Internal graph selected only after strict GGUF metadata validation; "
+    "covered by exact legacy GGUF builder and runtime tests.",
     "gpt_oss": "Internal model — no public HF checkpoint",
     "helium": "Alias for mistral — covered by mistral",
+    "minicpm_gguf": "GGUF-only MiniCPM ABI variant; native config coverage uses minicpm, "
+    "while GGUF metadata and runtime coverage exercise this exact route.",
+    "minicpm3_gguf": "GGUF-only MiniCPM3 ABI variant; native config coverage uses minicpm3, "
+    "while GGUF metadata and runtime coverage exercise this exact route.",
     "open-llama": "Alias for llama — covered by llama",
+    "pangu_embedded": "Internal embedded-model family selected from package metadata; "
+    "no standalone Hugging Face model_type/config route exists.",
+    "plm": "L1/L2 and dedicated GGUF parity cover the architecture; reproducible L4/L5 "
+    "golden data for the pinned PLM checkpoint is not yet checked in.",
     "phimoe_gguf": "GGUF-only PhiMoE routing variant — checkpoint coverage uses phimoe",
     "eurobert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
     "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
@@ -416,7 +430,7 @@ class TestL1L3GraphBuildCoverage:
 
 
 class TestL2ConfigValidation:
-    """L2: every model needs a ``test_model_id`` in ``_TEST_MODEL_IDS``.
+    """L2: every model needs a registered ``test_model_id``.
 
     This allows ``arch_validation_test.py`` to fetch and validate its
     HuggingFace config.
@@ -425,29 +439,28 @@ class TestL2ConfigValidation:
     def test_all_models_have_test_model_id_or_skip(self):
         """Aggregate check: every registered model needs a test_model_id."""
         all_reg = _all_registered()
-        missing = [
-            mt for mt in all_reg if mt not in _TEST_MODEL_IDS and mt not in _COVERAGE_SKIP
-        ]
+        with_test_id = _all_registered_with_test_id()
+        missing = [mt for mt in all_reg if mt not in with_test_id and mt not in _COVERAGE_SKIP]
         if missing:
             pytest.fail(
                 f"{len(missing)} registered model(s) have no "
                 f"test_model_id in _registry.py and are not in "
                 f"_COVERAGE_SKIP:\n"
                 + "\n".join(f"  {mt}" for mt in missing)
-                + "\n\nFix: add test_model_id to _TEST_MODEL_IDS "
+                + "\n\nFix: set test_model_id on the model registration "
                 "in src/mobius/_registry.py."
             )
 
     @pytest.mark.parametrize("arch", _all_registered())
     def test_model_has_test_model_id(self, arch: str):
         """Per-model check for test_model_id (L2)."""
-        if arch in _TEST_MODEL_IDS:
+        if arch in _all_registered_with_test_id():
             return  # Has test_model_id — pass even if in _COVERAGE_SKIP
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
         pytest.fail(
-            f"Model '{arch}' has no test_model_id in "
-            f"_TEST_MODEL_IDS. Add one for L2 config validation."
+            f"Model '{arch}' has no registered test_model_id. "
+            "Set one in src/mobius/_registry.py for L2 config validation."
         )
 
 
