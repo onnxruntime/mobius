@@ -62,6 +62,8 @@ _GRAPH_ONLY_XFAILS: dict[str, str] = {
     "florence2": "Florence2 DaViT vision encoder is multi-stage (not standard ViT)",
     "got_ocr2": "VisionConfig missing without trust_remote_code",
     "janus": "VisionConfig.hidden_size missing without trust_remote_code",
+    "kimi_k3": "Selective MXFP4 compressed-tensors experts are unsupported by the "
+    "generic quantized-linear loader",
     "molmo": "VisionConfig missing without trust_remote_code",
     "ovis2": "VisionConfig missing without trust_remote_code",
 }

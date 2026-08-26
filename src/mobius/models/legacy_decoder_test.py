@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import torch
 
 from mobius._configs import CodeShellConfig, Jais2Config, XverseConfig
-from mobius.models.base import CausalLMModel
 from mobius.models.legacy_decoder import (
     CodeShellCausalLMModel,
-    LegacyLayerNormCausalLMModel,
+    Jais2CausalLMModel,
+    XverseCausalLMModel,
 )
 from mobius.tasks import CausalLMTask
 
@@ -32,6 +32,12 @@ def _codeshell_hf_config() -> SimpleNamespace:
         position_embedding_type="rope",
         rope_scaling=None,
     )
+
+
+def test_specialized_model_config_classes_match_their_architectures() -> None:
+    assert Jais2CausalLMModel.config_class is Jais2Config
+    assert CodeShellCausalLMModel.config_class is CodeShellConfig
+    assert XverseCausalLMModel.config_class is XverseConfig
 
 
 def test_codeshell_real_hf_names_close_graph_and_preserve_qkv_values() -> None:
@@ -105,7 +111,7 @@ def test_xverse_hf_config_builds_rotary_embeddings() -> None:
         rms_norm_eps=1e-6,
     )
     config = XverseConfig.from_transformers(hf_config)
-    module = CausalLMModel(config)
+    module = XverseCausalLMModel(config)
     graph = CausalLMTask().build(module, config)["model"]
 
     assert module.model.rotary_emb is not None
@@ -131,7 +137,7 @@ def test_jais2_hf_config_emits_and_closes_all_bias_weights() -> None:
         tie_word_embeddings=False,
     )
     config = Jais2Config.from_transformers(hf_config)
-    module = LegacyLayerNormCausalLMModel(config)
+    module = Jais2CausalLMModel(config)
     graph = CausalLMTask().build(module, config)["model"]
     graph_weights = {
         name: value
