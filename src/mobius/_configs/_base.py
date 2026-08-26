@@ -494,6 +494,7 @@ class ArchitectureConfig(BaseModelConfig):
     n_group: int = 1
     topk_group: int = 1
     routed_scaling_factor: float = 1.0
+    routing_weight_normalization_floor: float | None = None
     scoring_func: str = "softmax"
     topk_method: str = "greedy"
     first_k_dense_replace: int = 0

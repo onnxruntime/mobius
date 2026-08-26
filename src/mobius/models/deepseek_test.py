@@ -112,6 +112,48 @@ def test_sigmoid_gate_without_optional_correction_bias_has_no_bias_parameter():
     assert [name for name, _ in gate.named_parameters()] == ["weight"]
 
 
+def test_dots1_routing_normalization_uses_pinned_llama_floor():
+    config = make_config(
+        hidden_size=1,
+        num_local_experts=2,
+        num_experts_per_tok=2,
+        scoring_func="sigmoid",
+        use_expert_bias=False,
+        norm_topk_prob=True,
+        routing_weight_normalization_floor=6.103515625e-5,
+    )
+    gate = DeepSeekMoEGate(config)
+    gate.weight.const_value = ir.tensor(np.ones((2, 1), dtype=np.float32))
+
+    hidden = ir.Value(
+        name="hidden_states",
+        shape=ir.Shape([1, 1, 1]),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    graph = ir.Graph(
+        inputs=[hidden],
+        outputs=[],
+        nodes=[],
+        name="dots1_routing_floor",
+        opset_imports={"": OPSET_VERSION},
+    )
+    builder = GraphBuilder(graph)
+    routing_weights, _ = gate(builder.op, hidden)
+    routing_weights.name = "routing_weights"
+    graph.outputs.append(routing_weights)
+
+    session = ort.InferenceSession(
+        ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString(),
+        providers=["CPUExecutionProvider"],
+    )
+    actual = session.run(None, {"hidden_states": np.array([[[-11.0]]], dtype=np.float32)})[0]
+    score = 1.0 / (1.0 + np.exp(11.0))
+    expected = np.full((1, 1, 2), score / 6.103515625e-5, dtype=np.float32)
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=1e-8)
+    assert actual.sum() < 1.0
+
+
 @pytest.mark.parametrize(
     ("scoring_func", "expects_bias"),
     [("softmax", False), ("sigmoid", True)],

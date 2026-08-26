@@ -1522,6 +1522,7 @@ def _conventional_shared_moe_postprocess(
         topk_method="greedy",
         n_group=1,
         topk_group=1,
+        routing_weight_normalization_floor=(6.103515625e-5 if arch == "dots1" else None),
         use_expert_bias=use_expert_bias,
         norm_topk_prob=norm_topk_prob,
         routed_scaling_factor=route_scale,

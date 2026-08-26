@@ -72,6 +72,7 @@ class DeepSeekMoEGate(nn.Module):
         self.topk_group = config.topk_group
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
+        self.routing_weight_normalization_floor = config.routing_weight_normalization_floor
         self.scoring_func = config.scoring_func
         self.topk_method = config.topk_method
         explicit_expert_bias = getattr(config, "use_expert_bias", None)
@@ -110,8 +111,13 @@ class DeepSeekMoEGate(nn.Module):
         # Normalize weights (V3 with norm_topk_prob=True)
         if self.norm_topk_prob:
             weight_sum = op.ReduceSum(routing_weights, [-1], keepdims=True)
-            eps = 1e-20
-            routing_weights = op.Div(routing_weights, op.Add(weight_sum, eps))
+            if self.routing_weight_normalization_floor is None:
+                denominator = op.Add(weight_sum, 1e-20)
+            else:
+                denominator = op.Max(
+                    weight_sum, float(self.routing_weight_normalization_floor)
+                )
+            routing_weights = op.Div(routing_weights, denominator)
 
         # Apply routing scale
         routing_weights = op.Mul(routing_weights, float(self.routed_scaling_factor))

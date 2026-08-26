@@ -1030,6 +1030,9 @@ class TestConventionalSharedMoeConfig:
         assert config.n_group == config.topk_group == 1
         assert config.norm_topk_prob is (architecture != "deepseek")
         assert config.routed_scaling_factor == pytest.approx(1.25)
+        assert config.routing_weight_normalization_floor == (
+            6.103515625e-5 if architecture == "dots1" else None
+        )
         assert config.attn_qk_norm is qk_norm
         assert config.tie_word_embeddings is False
 
