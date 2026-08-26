@@ -9,7 +9,7 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config
+from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -105,6 +105,100 @@ class TestGemma4ModelPreprocessWeights:
         key = "decoder.model.layers.0.router.scale"
         assert key in result
         assert abs(result[key].item() - expected) < 1e-6
+
+    def test_olive_quantized_decoder_sidecars_are_preprocessed(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            ),
+        )
+        model = Gemma4Model(config)
+        fake_sd = {
+            "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.0.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+        }
+
+        result = model.preprocess_weights(fake_sd)
+
+        weight_key = "decoder.model.layers.0.self_attn.q_proj.weight"
+        scales_key = "decoder.model.layers.0.self_attn.q_proj.scales"
+        assert result[weight_key].shape == (64, 4, 8)
+        assert result[weight_key].dtype == torch.uint8
+        assert (
+            result[scales_key]
+            is fake_sd["model.language_model.layers.0.self_attn.q_proj.weight_scales"]
+        )
+
+    def test_top_level_lm_head_routes_to_decoder(self):
+        model = Gemma4Model(_tiny_gemma4_config(tie_word_embeddings=False))
+        weight = torch.randn(256, 64)
+
+        result = model.preprocess_weights({"lm_head.weight": weight})
+
+        assert result["decoder.lm_head.weight"] is weight
+
+    @pytest.mark.parametrize(
+        ("quantize_embeddings", "quantize_lm_head", "state_dict"),
+        [
+            (
+                True,
+                False,
+                {
+                    "model.language_model.embed_tokens.weight_qweight": torch.zeros(
+                        256, 32, dtype=torch.uint8
+                    )
+                },
+            ),
+            (
+                False,
+                True,
+                {"lm_head.weight_qweight": torch.zeros(256, 32, dtype=torch.uint8)},
+            ),
+        ],
+    )
+    def test_quantized_embedding_or_lm_head_fails_closed(
+        self,
+        quantize_embeddings,
+        quantize_lm_head,
+        state_dict,
+    ):
+        config = _tiny_gemma4_config(
+            tie_word_embeddings=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_embeddings=quantize_embeddings,
+                quantize_lm_head=quantize_lm_head,
+            ),
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Quantized embeddings and LM heads are not yet supported",
+        ):
+            Gemma4Model(config).preprocess_weights(state_dict)
+
+    def test_gguf_quantized_tables_keep_canonical_weight_path(self):
+        config = _tiny_gemma4_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="gguf",
+                sym=True,
+                quantize_embeddings=True,
+                quantize_lm_head=True,
+            ),
+        )
+
+        assert Gemma4Model(config).preprocess_weights({}) == {}
 
     def test_per_expert_scale_not_folded(self):
         """router.per_expert_scale should NOT be multiplied by scale_factor."""
