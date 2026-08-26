@@ -498,6 +498,10 @@ def test_granite_fallback_oracle_does_not_promote_exact_identifier() -> None:
     )
     assert oracle["fallback_native_tokenize_mismatch_count"] == 0
     assert oracle["fallback_native_detokenize_mismatch_count"] == 0
+    assert [token_id for _, token_id in oracle["gguf_only_user_defined_tokens"]] == list(
+        range(262_145, 262_152)
+    )
+    assert oracle["forced_control_eog_ids"] == [262_149]
     assert record.evidence_id is None
     assert oracle["fixed_count"] == 32
     assert oracle["case_count"] == len(oracle["modes"]) * (

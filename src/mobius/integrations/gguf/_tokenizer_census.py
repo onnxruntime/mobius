@@ -184,7 +184,9 @@ _PINNED_CANDIDATE_DISPOSITIONS = {
             "complete modern-bert artifact rejected for this exact identifier: it declares no "
             "tokenizer.ggml.pre, so pinned llama.cpp uses fallback gemma4 rather than "
             "granite-embed-multi-311m. Its artifact-scoped fallback reconstruction matches 480 "
-            "pinned tokenize/detokenize cases, but cannot prove the absent identifier"
+            "pinned tokenize/detokenize cases. GGUF-only IDs 262145..262151 are type-4 "
+            "user-defined tokens; fallback gemma4 promotes only ID 262149 "
+            "(<|tool_response>) to control/EOG. This cannot prove the absent identifier"
         ),
         artifact_architecture="modern-bert",
         declared_pre_identifier=None,

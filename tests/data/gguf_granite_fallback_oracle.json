@@ -5,6 +5,16 @@
   "declared_pre_identifier": null,
   "effective_fallback_pre_identifier": "gemma4",
   "requested_identifier": "granite-embed-multi-311m",
+  "gguf_only_user_defined_tokens": [
+    ["<|channel>", 262145],
+    ["<channel|>", 262146],
+    ["<|tool_call>", 262147],
+    ["<tool_call|>", 262148],
+    ["<|tool_response>", 262149],
+    ["<tool_response|>", 262150],
+    ["<|\"|>", 262151]
+  ],
+  "forced_control_eog_ids": [262149],
   "seed": 650,
   "random_count": 128,
   "random_alphabet_sha256": "2397123199954cab1c1ebc19a8c070ea1ea61762fcbbd7159e2a85b058c78bf3",
