@@ -78,6 +78,24 @@ class TestGemma4CausalLMPreprocessWeights:
         expected = 2.0 * (64**-0.5)  # hidden_size=64
         assert abs(result["model.layers.0.router.scale"].item() - expected) < 1e-6
 
+    def test_quantized_moe_experts_fail_closed(self):
+        config = _tiny_gemma4_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            )
+        )
+        state_dict = {
+            "model.layers.0.experts.gate_up_proj_qweight": torch.zeros(
+                4, 64, 32, dtype=torch.uint8
+            )
+        }
+
+        with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
+            Gemma4CausalLMModel(config).preprocess_weights(state_dict)
+
 
 class TestGemma4ModelPreprocessWeights:
     """Test Gemma4Model.preprocess_weights (multimodal path)."""
@@ -107,6 +125,24 @@ class TestGemma4ModelPreprocessWeights:
         key = "decoder.model.layers.0.router.scale"
         assert key in result
         assert abs(result[key].item() - expected) < 1e-6
+
+    def test_quantized_moe_experts_fail_closed(self):
+        config = _tiny_gemma4_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            )
+        )
+        state_dict = {
+            "model.language_model.layers.0.experts.down_proj.weight_scales": torch.ones(
+                4, 64, 2
+            )
+        }
+
+        with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
+            Gemma4Model(config).preprocess_weights(state_dict)
 
     def test_olive_quantized_decoder_sidecars_are_preprocessed(self):
         config = _tiny_gemma4_config(

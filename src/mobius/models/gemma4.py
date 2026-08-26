@@ -35,6 +35,7 @@ from onnxscript import OpBuilder, nn
 from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
 from mobius._configs import ArchitectureConfig, Gemma4Config
 from mobius._weight_utils import (
+    is_packed_quant_key,
     preprocess_quantized_weights,
     vlm_decoder_weights,
     vlm_embedding_weights,
@@ -343,6 +344,30 @@ def _remap_moe_expert_weights(
     Shared by ``Gemma4CausalLMModel`` and ``Gemma4Model`` to avoid
     duplicating the rename/fold logic.
     """
+    packed_expert_key = next(
+        (
+            key
+            for key in state_dict
+            if is_packed_quant_key(key)
+            and any(
+                expert_name in key
+                for expert_name in (
+                    ".experts.gate_up_proj",
+                    ".experts.down_proj",
+                    ".fc1_experts_weights",
+                    ".fc2_experts_weights",
+                )
+            )
+        ),
+        None,
+    )
+    if packed_expert_key is not None:
+        raise NotImplementedError(
+            "Quantized Gemma4 MoE experts are not yet supported: the graph "
+            "currently requires float fc1_experts_weights and fc2_experts_weights "
+            f"parameters, but packed checkpoint key {packed_expert_key!r} was found."
+        )
+
     # experts.gate_up_proj → fc1_experts_weights
     # experts.down_proj    → fc2_experts_weights
     for key in list(state_dict.keys()):
