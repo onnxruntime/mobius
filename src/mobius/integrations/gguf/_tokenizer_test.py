@@ -580,7 +580,7 @@ def test_non_smollm_pipeline_is_bound_by_exact_asset_hashes() -> None:
     assert hashlib.sha256(materialized).hexdigest() == tokenizer_sha256
 
 
-def test_deterministic_unused_padding_is_materialized_as_added_tokens() -> None:
+def test_deterministic_unused_padding_extends_bpe_vocab_without_matching_input() -> None:
     source_metadata = _metadata(pre="qwen2")
     source_metadata.pop("tokenizer.ggml.scores")
     payloads = _pinned_payloads(source_metadata)
@@ -598,27 +598,43 @@ def test_deterministic_unused_padding_is_materialized_as_added_tokens() -> None:
 
     _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
-    tokenizer = json.loads(materialized)
-    assert tokenizer["added_tokens"][-2:] == [
-        {
-            "id": 7,
-            "content": "[PAD7]",
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": False,
-        },
-        {
-            "id": 8,
-            "content": "[PAD8]",
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": False,
-        },
+    from tokenizers import Tokenizer
+
+    tokenizer_json = json.loads(materialized)
+    tokenizer = Tokenizer.from_str(materialized.decode())
+    assert tokenizer_json["model"]["vocab"]["[PAD7]"] == 7
+    assert tokenizer_json["model"]["vocab"]["[PAD8]"] == 8
+    assert all(
+        token["content"] not in {"[PAD7]", "[PAD8]"}
+        for token in tokenizer_json["added_tokens"]
+    )
+    assert [tokenizer.id_to_token(index) for index in range(9)] == metadata[
+        "tokenizer.ggml.tokens"
     ]
+    for text in ("[PAD7]", "prefix[PAD7]suffix", "[PAD8]", "prefix[PAD8]suffix"):
+        assert not ({7, 8} & set(tokenizer.encode(text, add_special_tokens=False).ids))
+
+
+def test_matchable_unused_padding_reconstruction_fails_closed() -> None:
+    source_metadata = _metadata(pre="qwen2")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    tokenizer_json = json.loads(payloads["tokenizer.json"])
+    tokenizer_json["model"]["ignore_merges"] = True
+    tokenizer_json["pre_tokenizer"] = {"type": "WhitespaceSplit"}
+    payloads["tokenizer.json"] = json.dumps(tokenizer_json).encode()
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "[PAD7]",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        5,
+    ]
+
+    with pytest.raises(ValueError, match="unused padding token 7 is matchable"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
 def test_source_config_and_unused_padding_reconstruct_exact_ordered_vocabulary() -> None:
@@ -651,27 +667,27 @@ def test_source_config_and_unused_padding_reconstruct_exact_ordered_vocabulary()
 
     _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
-    tokenizer = json.loads(materialized)
-    assert tokenizer["added_tokens"][-2:] == [
-        {
-            "id": 7,
-            "content": "<|audio_start|>",
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": True,
-        },
-        {
-            "id": 8,
-            "content": "[PAD8]",
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": False,
-        },
+    from tokenizers import Tokenizer
+
+    tokenizer_json = json.loads(materialized)
+    tokenizer = Tokenizer.from_str(materialized.decode())
+    assert tokenizer_json["model"]["vocab"]["<|audio_start|>"] == 7
+    assert tokenizer_json["model"]["vocab"]["[PAD8]"] == 8
+    assert tokenizer_json["added_tokens"][-1] == {
+        "id": 7,
+        "content": "<|audio_start|>",
+        "single_word": False,
+        "lstrip": False,
+        "rstrip": False,
+        "normalized": False,
+        "special": True,
+    }
+    assert [tokenizer.id_to_token(index) for index in range(9)] == metadata[
+        "tokenizer.ggml.tokens"
     ]
+    assert tokenizer.encode("<|audio_start|>", add_special_tokens=False).ids == [7]
+    for text in ("[PAD8]", "prefix[PAD8]suffix"):
+        assert 8 not in tokenizer.encode(text, add_special_tokens=False).ids
 
 
 def test_source_config_added_token_must_match_exact_gguf_id() -> None:

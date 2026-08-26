@@ -17,7 +17,10 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from mobius.integrations.gguf._arch_registry import iter_arch_specs
+from mobius.integrations.gguf._arch_registry import (
+    _RUNTIME_VALIDATION_PENDING,
+    iter_arch_specs,
+)
 from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_PINS,
     iter_projector_specs,
@@ -27,7 +30,7 @@ from mobius.integrations.gguf._quant_registry import (
     render_quant_support_matrix,
 )
 from mobius.integrations.gguf._runtime_evidence import runtime_evidence
-from mobius.integrations.gguf._spec import StorageRole, Support
+from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
 from mobius.integrations.gguf._tokenizer_evidence import tokenizer_evidence
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 from mobius.integrations.gguf._upstream import (
@@ -146,6 +149,17 @@ def _reason_code(verdicts: dict[str, Support]) -> str:
     return "EVIDENCED_SCOPE — Runtime publication is limited to registry-linked immutable evidence."
 
 
+def _architecture_reason(spec: GGUFArchitectureSpec) -> str:
+    capabilities = dict(spec.capabilities)
+    code = _reason_code(capabilities).partition(" — ")[0]
+    reason = spec.reason
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(f"{spec.gguf_arch}: architecture registry reason must be non-empty")
+    restriction_source = reason.removeprefix(_RUNTIME_VALIDATION_PENDING).strip() or reason
+    restriction = re.split(r"(?<=[.!?])\s+", restriction_source, maxsplit=1)[0]
+    return f"{code} — {restriction}"
+
+
 def _architectures() -> str:
     rows = [
         (
@@ -177,7 +191,7 @@ def _architectures() -> str:
         else:
             route = "none (no graph construction route)"
         exactness = upstream[spec.gguf_arch].tensor_closure_status or "not claimed"
-        reason = _reason_code(dict(spec.capabilities))
+        reason = _architecture_reason(spec)
         rows.append(
             f"| `{spec.gguf_arch}` | {aliases} | {_cell(route)} | {_cell(exactness)} | "
             f"{_cell(_status(spec.capabilities))} | {_cell(reason)} |"

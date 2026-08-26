@@ -13,8 +13,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from mobius.integrations.gguf import _tokenizer_evidence
-from mobius.integrations.gguf._runtime_evidence import GGUFArtifactIdentity
-from mobius.integrations.gguf._runtime_evidence import runtime_evidence
+from mobius.integrations.gguf._runtime_evidence import GGUFArtifactIdentity, runtime_evidence
 from mobius.integrations.gguf._tokenizer_evidence import (
     matching_tokenizer_evidence,
     tokenizer_evidence,
@@ -36,7 +35,7 @@ def test_qwen35_tokenizer_evidence_is_exact_and_runtime_independent() -> None:
     assert evidence.embedding_vocabulary_size == 248_320
     assert evidence.merge_count == 247_587
     assert evidence.materialized_tokenizer_sha256 == (
-        "d91d6b29a588b072bd90f3598ee9097049b8082f0bc43e8a3b41da604bdfe1ee"
+        "a78b900eb4cd335bba249158066db523ce221f744e2b6144692bb81673d551af"
     )
     assert runtime_evidence("qwen3.5-0.8b-q4-tokenizer") is None
 

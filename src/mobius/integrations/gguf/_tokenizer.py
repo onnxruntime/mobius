@@ -827,6 +827,24 @@ def _reconstruct_missing_added_tokens(
     added_tokens = tokenizer_json.get("added_tokens")
     if not isinstance(added_tokens, list):
         return None
+    model = tokenizer_json.get("model")
+    if not isinstance(model, Mapping) or model.get("type") != "BPE":
+        return None
+    vocab = model.get("vocab")
+    if not isinstance(vocab, dict):
+        return None
+    model_ids = list(vocab.values())
+    if (
+        any(type(token_id) is not int for token_id in model_ids)
+        or len(set(model_ids)) != len(model_ids)
+        or set(model_ids) != set(range(len(model_ids)))
+    ):
+        return None
+    if any(
+        vocab.get(token) != token_id
+        for token_id, token in enumerate(expected_tokens[: len(model_ids)])
+    ):
+        return None
 
     decoder = config.get("added_tokens_decoder", {})
     if not isinstance(decoder, Mapping):
@@ -860,6 +878,12 @@ def _reconstruct_missing_added_tokens(
                 f"tokenizer.json and tokenizer_config.json contradict added token {token_id}"
             )
 
+    for token_id in range(len(model_ids), len(expected_tokens)):
+        expected = expected_tokens[token_id]
+        if expected in vocab:
+            return None
+        vocab[expected] = token_id
+
     for token_id in range(len(actual_tokens), len(expected_tokens)):
         token = decoded.get(token_id)
         if token is None:
@@ -868,17 +892,29 @@ def _reconstruct_missing_added_tokens(
                 return None
             if token_types is None or token_types[token_id] != 5:
                 raise ValueError("GGUF vocabulary padding must contain only unused tokens")
-            token = {
-                "id": token_id,
-                "content": expected,
-                "single_word": False,
-                "lstrip": False,
-                "rstrip": False,
-                "normalized": False,
-                "special": False,
-            }
+            continue
         added_tokens.append(token)
     return json.dumps(tokenizer_json, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def _validate_unused_padding_is_non_matchable(
+    tokenizer: Any,
+    expected_tokens: list[str],
+    token_types: list[int] | None,
+    *,
+    extension_start: int,
+) -> None:
+    if token_types is None:
+        return
+    for token_id in range(extension_start, len(expected_tokens)):
+        token = expected_tokens[token_id]
+        if token_types[token_id] != 5 or token != f"[PAD{token_id}]":
+            continue
+        for text in (token, f"ordinary{token}text"):
+            if token_id in tokenizer.encode(text, add_special_tokens=False).ids:
+                raise ValueError(
+                    f"GGUF unused padding token {token_id} is matchable by ordinary input"
+                )
 
 
 def _validate_pinned_tokenizer(
@@ -919,6 +955,7 @@ def _validate_pinned_tokenizer(
         actual_tokens,
     )
     if reconstructed is not None:
+        extension_start = len(actual_tokens)
         raw_tokenizer = reconstructed
         try:
             tokenizer = Tokenizer.from_str(raw_tokenizer.decode("utf-8"))
@@ -930,6 +967,12 @@ def _validate_pinned_tokenizer(
             tokenizer.id_to_token(index)
             for index in range(tokenizer.get_vocab_size(with_added_tokens=True))
         ]
+        _validate_unused_padding_is_non_matchable(
+            tokenizer,
+            expected_tokens,
+            token_types,
+            extension_start=extension_start,
+        )
     if actual_tokens != expected_tokens:
         mismatch = next(
             (
@@ -971,7 +1014,7 @@ def _validate_pinned_tokenizer(
             if isinstance(token, Mapping) and isinstance(token.get("id"), int)
         }
         expected_non_special_added_ids = {
-            index for index, token_type in enumerate(token_types) if token_type in {4, 5}
+            index for index, token_type in enumerate(token_types) if token_type == 4
         }
         if any(
             index not in source_added_tokens

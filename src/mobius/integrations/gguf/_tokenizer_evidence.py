@@ -65,14 +65,17 @@ class GGUFTokenizerEvidence:
             raise ValueError("Tokenizer evidence revisions must be immutable 40-hex commits")
         if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests):
             raise ValueError("Tokenizer evidence digests must be lowercase SHA-256")
-        if min(
-            self.size,
-            self.tensor_count,
-            self.token_count,
-            self.source_token_count,
-            self.embedding_vocabulary_size,
-            self.merge_count,
-        ) <= 0:
+        if (
+            min(
+                self.size,
+                self.tensor_count,
+                self.token_count,
+                self.source_token_count,
+                self.embedding_vocabulary_size,
+                self.merge_count,
+            )
+            <= 0
+        ):
             raise ValueError("Tokenizer evidence counts and artifact size must be positive")
         if (
             self.source_config_asset[0] != "config.json"
@@ -102,14 +105,13 @@ class GGUFTokenizerEvidence:
         if tuple(sorted(self.special_token_ids)) != self.special_token_ids:
             raise ValueError("Tokenizer evidence special token IDs must be sorted by token")
         if not self.representative_encodings or any(
-            not text or not token_ids
-            for text, token_ids in self.representative_encodings
+            not text or not token_ids for text, token_ids in self.representative_encodings
         ):
             raise ValueError("Tokenizer evidence requires non-empty representative encodings")
 
     @property
     def source(self) -> GGUFTokenizerSource:
-        """Return the exact source accepted by the materializer."""
+        """The exact source accepted by the materializer."""
         return GGUFTokenizerSource(
             self.tokenizer_repository,
             self.tokenizer_revision,
@@ -163,7 +165,7 @@ _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     merge_count=247_587,
     ordered_merges_sha256="7e299304d9ad9dc312acdbcb1f6ccf0dce1256bf1aa986d651f13814dfd27e7b",
     materialized_tokenizer_sha256=(
-        "d91d6b29a588b072bd90f3598ee9097049b8082f0bc43e8a3b41da604bdfe1ee"
+        "a78b900eb4cd335bba249158066db523ce221f744e2b6144692bb81673d551af"
     ),
     special_token_ids=(
         ("<tts_pad>", 248_072),
@@ -191,7 +193,7 @@ _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
     representative_encodings=(
         ("Hello, world! 12345", (9419, 11, 1814, 0, 220, 16, 17, 18, 19, 20)),
         ("  spaced  text\n", (220, 61674, 220, 1414, 198)),
-        ("你好，世界！", (109266, 3709, 96748, 6115)),
+        ("你好，世界！", (109266, 3709, 96748, 6115)),  # noqa: RUF001
         ("Café — κόσμος 🚀", (34, 2492, 933, 1892, 166265, 203260, 10838, 248, 222)),
         (
             "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
