@@ -25,6 +25,15 @@ def test_document_is_exact_generator_output() -> None:
     assert check_document()
 
 
+def test_document_is_concise_and_reason_coded() -> None:
+    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    assert len(document.splitlines()) < 500
+    assert "RUNTIME_EVIDENCE_PENDING" in document
+    assert "qwen3.5-0.8b-q4-tokenizer" in document
+    assert "IDs 0-248069" in document
+    assert "Qwen3.5 full model runtime remains **deferred**" in document
+
+
 def test_manual_real_artifact_table_covers_every_registry_pin() -> None:
     document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
     for pin in MMPROJ_ARTIFACT_PINS:

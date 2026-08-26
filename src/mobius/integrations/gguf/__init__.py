@@ -59,6 +59,7 @@ from mobius.integrations.gguf._shard_set import (
 from mobius.integrations.gguf._tokenizer import (
     GGUFTokenizerAsset,
     GGUFTokenizerSource,
+    materialize_evidenced_gguf_tokenizer,
     materialize_gguf_tokenizer,
     write_gguf_tokenizer_json,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "build_qwen_vlm_from_gguf",
     "GGUFTokenizerAsset",
     "GGUFTokenizerSource",
+    "materialize_evidenced_gguf_tokenizer",
     "materialize_gguf_tokenizer",
     "write_gguf_runtime_package",
     "write_gguf_tokenizer_json",

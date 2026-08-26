@@ -462,6 +462,7 @@ def test_tokenizer_evidence_metadata_mismatch_rejects_before_download(
     tmp_path: Path, monkeypatch
 ) -> None:
     metadata = _metadata(pre="smollm")
+    metadata.pop("tokenizer.ggml.scores")
     payloads = _pinned_payloads(metadata)
     source = _pinned_source(metadata, payloads)
     source = GGUFTokenizerSource(
@@ -495,6 +496,46 @@ def test_semantic_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch)
     output = tmp_path / "output"
 
     with pytest.raises(ValueError, match="bos_token id differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("materialized_sha256", "encodings", "message"),
+    [
+        ("b" * 64, (), "digest differs"),
+        (None, (("hello", (999,)),), "representative encoding differs"),
+    ],
+)
+def test_compact_evidence_mismatch_leaves_no_partial_output(
+    tmp_path: Path,
+    monkeypatch,
+    materialized_sha256: str | None,
+    encodings: tuple[tuple[str, tuple[int, ...]], ...],
+    message: str,
+) -> None:
+    metadata = _metadata(pre="smollm")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(metadata)
+    source = _pinned_source(metadata, payloads)
+    source = GGUFTokenizerSource(
+        source.repository,
+        source.revision,
+        source.assets,
+        source.metadata_sha256,
+        materialized_sha256,
+        encodings,
+    )
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match=message):
         materialize_gguf_tokenizer(
             tmp_path / "model.gguf",
             output,
@@ -578,6 +619,89 @@ def test_deterministic_unused_padding_is_materialized_as_added_tokens() -> None:
             "special": False,
         },
     ]
+
+
+def test_source_config_and_unused_padding_reconstruct_exact_ordered_vocabulary() -> None:
+    source_metadata = _metadata(pre="qwen35")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "<|audio_start|>",
+        "[PAD8]",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        3,
+        5,
+    ]
+    config = json.loads(payloads["tokenizer_config.json"])
+    config["added_tokens_decoder"] = {
+        "7": {
+            "content": "<|audio_start|>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    }
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    tokenizer = json.loads(materialized)
+    assert tokenizer["added_tokens"][-2:] == [
+        {
+            "id": 7,
+            "content": "<|audio_start|>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        },
+        {
+            "id": 8,
+            "content": "[PAD8]",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": False,
+        },
+    ]
+
+
+def test_source_config_added_token_must_match_exact_gguf_id() -> None:
+    source_metadata = _metadata(pre="qwen35")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "<|audio_start|>",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        3,
+    ]
+    config = json.loads(payloads["tokenizer_config.json"])
+    config["added_tokens_decoder"] = {
+        "7": {
+            "content": "<|wrong|>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    }
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    with pytest.raises(ValueError, match="added token 7 differs from GGUF"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
 @pytest.mark.parametrize(
