@@ -643,9 +643,7 @@ def _gpt4o_payloads(metadata: dict) -> dict[str, bytes]:
                     {"SpecialToken": {"id": "<bos>", "type_id": 1}},
                     {"Sequence": {"id": "B", "type_id": 1}},
                 ],
-                "special_tokens": {
-                    "<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}
-                },
+                "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}},
             },
         ],
     }
@@ -708,17 +706,23 @@ def test_gpt4o_rejects_pipeline_or_template_bos_mismatch(mismatch: str) -> None:
     tokenizer = json.loads(payloads["tokenizer.json"])
     if mismatch == "regex":
         tokenizer["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] += "x"
-        message = "pipeline differs"
     elif mismatch == "decoder":
         tokenizer["decoder"]["trim_offsets"] = False
-        message = "pipeline differs"
     else:
         tokenizer["post_processor"]["processors"][1]["single"].reverse()
-        message = "cannot prove GGUF add_bos_token"
     payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="pipeline differs"):
         _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
+def test_gpt4o_rejects_template_bos_when_gguf_disables_it() -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+    metadata["tokenizer.ggml.add_bos_token"] = False
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        _tokenizer._validate_pinned_tokenizer(metadata, _gpt4o_payloads(metadata))
 
 
 def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:

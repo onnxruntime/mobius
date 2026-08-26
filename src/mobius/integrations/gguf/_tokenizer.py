@@ -1059,7 +1059,12 @@ def _template_processor_proves_bos_insertion(
     )
 
 
-def _canonicalize_gpt4o_pipeline(tokenizer_json: dict[str, Any], *, pre: str) -> None:
+def _canonicalize_gpt4o_pipeline(
+    tokenizer_json: dict[str, Any],
+    metadata: Mapping[str, Any],
+    *,
+    pre: str,
+) -> None:
     pre_tokenizer = tokenizer_json.get("pre_tokenizer")
     source_pre_tokenizer = {
         **_GPT4O_PRE_TOKENIZER,
@@ -1073,13 +1078,8 @@ def _canonicalize_gpt4o_pipeline(tokenizer_json: dict[str, Any], *, pre: str) ->
     }
     post_processor = tokenizer_json.get("post_processor")
     valid_post_processor = post_processor == _GPT4O_POST_BYTE_LEVEL or (
-        isinstance(post_processor, Mapping)
-        and post_processor.get("type") == "Sequence"
-        and isinstance(post_processor.get("processors"), list)
-        and len(post_processor["processors"]) == 2
-        and post_processor["processors"][0] == _GPT4O_POST_BYTE_LEVEL
-        and isinstance(post_processor["processors"][1], Mapping)
-        and post_processor["processors"][1].get("type") == "TemplateProcessing"
+        metadata.get("tokenizer.ggml.add_bos_token") is True
+        and _template_processor_proves_bos_insertion(tokenizer_json, metadata)
     )
     if (
         tokenizer_json.get("normalizer") is not None
@@ -1122,7 +1122,7 @@ def _validate_pinned_tokenizer(
         model["merges"] = metadata.get("tokenizer.ggml.merges")
         config = _canonicalize_gpt4o_tokenizer_config(metadata, config)
     if policy is not None and policy.pre_type == "GPT4O":
-        _canonicalize_gpt4o_pipeline(tokenizer_json, pre=pre)
+        _canonicalize_gpt4o_pipeline(tokenizer_json, metadata, pre=pre)
         raw_tokenizer = json.dumps(
             tokenizer_json, ensure_ascii=False, separators=(",", ":")
         ).encode()

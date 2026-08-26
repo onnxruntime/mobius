@@ -94,6 +94,18 @@ def test_evidence_schema_accepts_scores_instead_of_bpe_merges() -> None:
         )
 
 
+def test_gpt4o_evidence_requires_oracle_at_dispatch_commit() -> None:
+    evidence = tokenizer_evidence("talkie-13b-q4-native-tokenizer")
+    assert evidence is not None
+    with pytest.raises(ValueError, match=r"requires an exact pinned llama\.cpp oracle"):
+        dataclasses.replace(evidence, llamacpp_oracle=None)
+    with pytest.raises(ValueError, match="oracle evidence identity is invalid"):
+        dataclasses.replace(
+            evidence,
+            llamacpp_oracle=("0" * 40, 444, evidence.llamacpp_oracle[2]),
+        )
+
+
 def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() -> None:
     census = tokenizer_route_census()
     assert len(census) == 87

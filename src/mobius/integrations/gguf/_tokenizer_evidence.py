@@ -191,12 +191,17 @@ class GGUFTokenizerEvidence:
             )
         if self.reconstruct_gpt4o_from_gguf and witness.pre_type != "GPT4O":
             raise ValueError("GGUF-native reconstruction is supported only for GPT4O evidence")
+        if witness.pre_type == "GPT4O" and self.llamacpp_oracle is None:
+            raise ValueError("GPT4O evidence requires an exact pinned llama.cpp oracle")
         if self.llamacpp_oracle is not None:
             commit, case_count, digest = self.llamacpp_oracle
+            dispatch = tokenizer_alias_evidence().get(self.pre_identifier)
             if (
                 re.fullmatch(r"[0-9a-f]{40}", commit) is None
                 or case_count <= 0
                 or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or dispatch is None
+                or commit != dispatch.source_commit
             ):
                 raise ValueError("llama.cpp oracle evidence identity is invalid")
 
@@ -551,11 +556,44 @@ _TALKIE_13B_Q4_TOKENIZER = GGUFTokenizerEvidence(
         ("  spaced  text\n", (32, 25_156, 32, 5_272, 10)),
         (
             "你好，世界！",  # noqa: RUF001
-            (228, 189, 160, 229, 165, 189, 239, 188, 140, 57_632, 150, 231, 149, 140, 239, 188, 129),
+            (
+                228,
+                189,
+                160,
+                229,
+                165,
+                189,
+                239,
+                188,
+                140,
+                57_632,
+                150,
+                231,
+                149,
+                140,
+                239,
+                188,
+                129,
+            ),
         ),
         (
             "Café — κόσμος 🚀",
-            (67, 1_063, 1_238, 461, 12_887, 12_562, 6_076, 7_938, 14_917, 32, 240, 159, 154, 128),
+            (
+                67,
+                1_063,
+                1_238,
+                461,
+                12_887,
+                12_562,
+                6_076,
+                7_938,
+                14_917,
+                32,
+                240,
+                159,
+                154,
+                128,
+            ),
         ),
         ("<|user|>hello<|end|>", (65_537, 257, 12_227, 65_536)),
         (
