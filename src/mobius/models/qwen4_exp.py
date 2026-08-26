@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
+from collections.abc import Mapping
 from typing import ClassVar
 
 import numpy as np
@@ -45,6 +46,12 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
 logger = logging.getLogger(__name__)
+
+
+def _source_name_for_qwen4_exp_target(target_name: str) -> str:
+    if target_name.startswith("model."):
+        return f"model.language_model.{target_name[len('model.') :]}"
+    return target_name
 
 
 def _splitmix64(value: int) -> int:
@@ -339,7 +346,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             dtype=ir.DataType.INT64,
             data=ir.tensor(buffers["ngram_heads_offsets"]),
         )
-        self.ngram_embedding = Embedding(padded_vocab_size, embedding_dim // self._ngram_heads)
+        self.ngram_embedding = Qwen4ExpShardedEmbedding(
+            padded_vocab_size,
+            embedding_dim // self._ngram_heads,
+            config.split_ngram_parts,
+        )
 
     def _shifted_tokens(self, op: OpBuilder, history: ir.Value, shift: int) -> ir.Value:
         history_length = op.Shape(history, start=1, end=2)
@@ -389,6 +400,43 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_ids = op.Concat(*blocks, axis=-1)
         embeddings = self.ngram_embedding(op, ngram_ids)
         return op.Reshape(embeddings, [0, 0, -1]), present_context
+
+
+class Qwen4ExpShardedEmbedding(nn.Module):
+    """PLE embedding kept in checkpoint-native row shards for bounded-memory export."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, num_shards: int):
+        super().__init__()
+        if num_shards <= 0 or num_embeddings % num_shards:
+            raise ValueError(
+                "Qwen4-Exp PLE embedding rows must divide split_ngram_parts exactly: "
+                f"{num_embeddings} % {num_shards}"
+            )
+        self._rows_per_shard = num_embeddings // num_shards
+        self._num_shards = num_shards
+        for shard_index in range(num_shards):
+            setattr(
+                self,
+                f"shard_{shard_index}",
+                Embedding(self._rows_per_shard, embedding_dim),
+            )
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
+        result = None
+        for shard_index in range(self._num_shards):
+            start = shard_index * self._rows_per_shard
+            end = start + self._rows_per_shard
+            local_ids = op.Clip(op.Sub(input_ids, start), 0, self._rows_per_shard - 1)
+            gathered = getattr(self, f"shard_{shard_index}")(op, local_ids)
+            selected = op.And(op.GreaterOrEqual(input_ids, start), op.Less(input_ids, end))
+            shard_result = op.Where(
+                op.Unsqueeze(selected, [-1]),
+                gathered,
+                op.CastLike(0.0, gathered),
+            )
+            result = shard_result if result is None else op.Add(result, shard_result)
+        assert result is not None
+        return result
 
 
 class _PLEDepthwiseConv1d(nn.Module):
@@ -1161,12 +1209,142 @@ class Qwen4ExpCausalLMModel(nn.Module):
         )
         return self.lm_head(op, hidden_states), presents, present_position_ids
 
+    def build_fp8_streaming_plan(
+        self,
+        key_index: Mapping[str, tuple[str, list[int], str]],
+        initializers: Mapping[str, ir.Value],
+    ):
+        """Classify every composite-checkpoint tensor for dense streaming export."""
+        from mobius.integrations._weight_loading import (
+            StreamingWeightPlan,
+            StreamingWeightSource,
+        )
+
+        scheme = self.config.block_quant_scheme
+        if scheme is None or tuple(scheme.weight_block_size) != (128, 128):
+            raise ValueError(
+                "Qwen4-Exp FP8 streaming requires the pinned 128x128 block scheme"
+            )
+
+        targets: dict[str, StreamingWeightSource] = {}
+        constants: dict[str, torch.Tensor] = {}
+        ignored: dict[str, str] = {}
+        modes: Counter[str] = Counter()
+
+        for source_name in key_index:
+            if source_name.startswith("model.visual."):
+                ignored[source_name] = "multimodal component belongs to the dependent PR"
+            elif source_name.startswith("mtp."):
+                ignored[source_name] = "MTP sidecar has no authoritative forward/cache ABI"
+            elif source_name.endswith("rotary_emb.inv_freq"):
+                ignored[source_name] = "RoPE frequencies are graph-derived"
+
+        for target_name, initializer in initializers.items():
+            if target_name.startswith("model."):
+                suffix = target_name[len("model.") :]
+                candidates = (
+                    f"model.language_model.{suffix}",
+                    f"language_model.{suffix}",
+                    target_name,
+                )
+            else:
+                candidates = (target_name,)
+            present = [candidate for candidate in candidates if candidate in key_index]
+            if not present:
+                if initializer.const_value is None:
+                    raise ValueError(
+                        f"Qwen4-Exp target '{target_name}' has no checkpoint source"
+                    )
+                continue
+            source_name = present[0]
+            for lower_priority in present[1:]:
+                ignored[lower_priority] = (
+                    f"lower-priority alias of preferred source {source_name}"
+                )
+
+            if initializer.const_value is not None:
+                constants[source_name] = torch.from_numpy(
+                    initializer.const_value.numpy().copy()
+                )
+                continue
+
+            _path, source_shape, source_dtype = key_index[source_name]
+            expected_shape = [int(dim) for dim in initializer.shape]
+            if source_shape != expected_shape:
+                raise ValueError(
+                    f"Qwen4-Exp source '{source_name}' has shape {source_shape}; "
+                    f"target '{target_name}' expects {expected_shape}"
+                )
+            scale_name = (
+                source_name[: -len(".weight")] + ".weight_scale_inv"
+                if source_name.endswith(".weight")
+                else source_name + "_scale_inv"
+            )
+            if source_dtype.startswith("F8"):
+                if scale_name in key_index:
+                    mode = "fp8_block_128"
+                    source = StreamingWeightSource(source_name, mode, scale_name)
+                elif ".ple.ple_embedding.ngram_embedding.shard_" in source_name:
+                    # Upstream leaves nn.Embedding unchanged by the FP8 quantizer.
+                    # Core model loading casts these stored FP8 values directly to
+                    # the BF16 embedding parameter; there is intentionally no scale.
+                    mode = "fp8_cast"
+                    source = StreamingWeightSource(source_name, mode)
+                else:
+                    raise ValueError(
+                        f"Qwen4-Exp FP8 source '{source_name}' has no scale and is "
+                        "not an upstream direct-cast PLE embedding shard"
+                    )
+            elif source_dtype in {"BF16", "F16", "F32"}:
+                mode = "direct"
+                source = StreamingWeightSource(source_name, mode)
+            else:
+                raise ValueError(
+                    f"Qwen4-Exp source '{source_name}' has unsupported dtype {source_dtype}"
+                )
+            targets[target_name] = source
+            modes[mode] += 1
+
+        # Graph optimization can inline these tiny deterministic PLE buffers as
+        # Constant nodes, so validate them from the module parameter contract even
+        # when they no longer appear in graph.initializers.
+        for target_name, parameter in self.named_parameters():
+            if parameter._const_value is None:
+                continue
+            source_name = _source_name_for_qwen4_exp_target(target_name)
+            if source_name in key_index and source_name not in constants:
+                constants[source_name] = torch.from_numpy(
+                    parameter._const_value.numpy().copy()
+                )
+
+        return StreamingWeightPlan(
+            targets=targets,
+            ignored=ignored,
+            constants=constants,
+            report={
+                "checkpoint_family": "Qwen3.8-Flash-Next-FP8",
+                "dense_dtype": "graph-declared (BF16 for the pinned checkpoint)",
+                "native_fp8_reason": (
+                    "No available ONNX Runtime MatMul/MoE ABI consumes F8_E4M3 "
+                    "weights with BF16 128x128 inverse-scale grids exactly."
+                ),
+                "scaled_fp8_tensors": modes["fp8_block_128"],
+                "direct_cast_fp8_tensors": modes["fp8_cast"],
+                "direct_dense_tensors": modes["direct"],
+                "multimodal_package_complete": False,
+                "multimodal_dependency": "separate stacked Qwen4-Exp multimodal PR",
+                "source_preference": (
+                    "model.language_model.* > language_model.* > model.*"
+                ),
+            },
+        )
+
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Map official packed experts and sharded PLE tables to ONNX parameters."""
         cleaned: dict[str, torch.Tensor] = {}
-        ple_shards: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+        ple_shards: dict[str, set[int]] = {}
         indexer_projections: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
         parameter_map = dict(self.named_parameters())
         skipped_mtp = 0
@@ -1212,9 +1390,24 @@ class Qwen4ExpCausalLMModel(nn.Module):
             if marker in key and key.endswith(".weight"):
                 prefix, suffix = key.split(marker, 1)
                 shard_index = int(suffix[: -len(".weight")])
-                ple_shards[f"{prefix}.ple.ple_embedding.ngram_embedding.weight"][
-                    shard_index
-                ] = value
+                target = (
+                    f"{prefix}.ple.ple_embedding.ngram_embedding."
+                    f"shard_{shard_index}.weight"
+                )
+                if not 0 <= shard_index < self.config.split_ngram_parts:
+                    raise ValueError(
+                        f"Unexpected Qwen4-Exp PLE shard index {shard_index} for {target}"
+                    )
+                parameter = parameter_map.get(target)
+                if parameter is None or tuple(value.shape) != tuple(parameter.shape):
+                    expected_shape = None if parameter is None else tuple(parameter.shape)
+                    raise ValueError(
+                        f"Qwen4-Exp PLE shard {target} has shape {tuple(value.shape)}, "
+                        f"expected {expected_shape}"
+                    )
+                base = f"{prefix}.ple.ple_embedding.ngram_embedding"
+                ple_shards.setdefault(base, set()).add(shard_index)
+                cleaned[target] = value
                 continue
 
             if key.endswith(".mlp.experts.gate_up_proj"):
@@ -1281,27 +1474,13 @@ class Qwen4ExpCausalLMModel(nn.Module):
 
         for target, shards in ple_shards.items():
             expected = set(range(self.config.split_ngram_parts))
-            if set(shards) != expected:
-                missing = sorted(expected - set(shards))
-                unexpected = sorted(set(shards) - expected)
+            if shards != expected:
+                missing = sorted(expected - shards)
+                unexpected = sorted(shards - expected)
                 raise ValueError(
                     f"Qwen4-Exp PLE table {target} has missing shard indices {missing} "
                     f"and unexpected shard indices {unexpected}"
                 )
-            parameter = parameter_map.get(target)
-            if parameter is None:
-                raise ValueError(f"Unexpected Qwen4-Exp PLE table: {target}")
-            combined = torch.cat(
-                [shards[index] for index in range(self.config.split_ngram_parts)],
-                dim=0,
-            )
-            expected_shape = tuple(int(dim) for dim in parameter.shape)
-            if tuple(combined.shape) != expected_shape:
-                raise ValueError(
-                    f"Qwen4-Exp PLE table {target} has shape {tuple(combined.shape)}, "
-                    f"expected {expected_shape}"
-                )
-            cleaned[target] = combined
         if skipped_mtp:
             logger.warning(
                 "Skipped %d Qwen4-Exp MTP sidecar tensors. Ordinary upstream "

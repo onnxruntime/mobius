@@ -84,8 +84,6 @@ publish an MTP task. Dedicated MTP embeddings fail closed because no flattened
 NextN cache ABI exists. Alternative vision geometries and nonempty DeepStack
 configurations also fail closed.
 
-FP8/NVFP4 checkpoint lowering remains outside this implementation.
-
 ## GGUF header support and payload guard
 
 The pinned GGUF is a text-only `general.architecture=qwen4exp` split set:
@@ -121,3 +119,50 @@ fail closed instead of emitting missing bindings, unsupported semantic keys, or
 lossy `%d` cache templates. The decoder graph carries a separate
 `mobius.state_manifest` metadata document with explicit role-to-layer
 membership for direct ONNX Runtime orchestration.
+
+## Pinned FP8 checkpoint
+
+`unsloth/Qwen3.8-Flash-Next-FP8` is accepted only at immutable revision
+`41cc25fe32cc20053a59c89716196897580cddf6`. Its 131 safetensors headers were
+range-read without downloading the 185.5 GB tensor payload. The committed
+schema evidence records the config/index hashes, complete tensor census, and
+canonical header-schema hash.
+
+The checkpoint uses three text-weight paths:
+
+- 73,728 routed-expert matrices use `F8_E4M3` values plus BF16 inverse-scale
+  grids. Every grid is validated as exactly
+  `[ceil(rows / 128), ceil(cols / 128)]`.
+- 128 PLE embedding shards are stored as unscaled FP8. This is not guessed
+  from a missing scale: the pinned Transformers quantizer replaces
+  `Linear`/expert modules only, leaving `nn.Embedding` unchanged, so core
+  loading performs a direct dtype cast. Mobius keeps those shards separate in
+  the ONNX graph instead of concatenating a roughly 95 GiB dense table during
+  export.
+- Remaining text weights are ordinary BF16 tensors. The 943-entry
+  `modules_to_not_convert` list resolves completely against the pinned header.
+
+Mobius emits a **dense fallback**, not a native-FP8 package. Each target tensor
+is read and reconstructed independently, bounding host memory by one dense
+target plus its small scale grid. `weight-loading-report.json` states
+`native_fp8: false` and records the exact reason: no available ONNX Runtime
+MatMul/MoE ABI consumes this FP8/BF16 128x128 layout exactly. Missing scales,
+wrong grids, changed deterministic PLE buffers, orphan scales, unknown source
+tensors, and missing graph targets all fail closed.
+
+```bash
+mobius build \
+  --model unsloth/Qwen3.8-Flash-Next-FP8 \
+  --revision 41cc25fe32cc20053a59c89716196897580cddf6 \
+  --text-only \
+  --external-data safetensors \
+  --max-shard-size 5GB \
+  output/
+```
+
+The FP8 loader currently targets the text-only component and reports visual
+tensors separately. The branch includes the multimodal graph implementation,
+but FP8 visual-package loading is not claimed until every visual tensor is
+classified through the same strict streaming contract. The MTP sidecar remains
+excluded for the same authoritative-forward/cache-ABI reason documented above.
+NVFP4 checkpoint lowering remains out of scope.

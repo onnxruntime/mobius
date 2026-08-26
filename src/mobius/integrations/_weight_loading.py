@@ -15,16 +15,22 @@ checkpoints that only publish ``pytorch_model.bin`` are loaded with
 from __future__ import annotations
 
 __all__ = [
+    "StreamingWeightPlan",
+    "StreamingWeightSource",
     "apply_weights",
+    "stream_preprocessed_safetensors_to_model",
     "stream_safetensors_to_model",
     "external_data_checksums",
 ]
 
 import concurrent.futures
+import dataclasses
 import hashlib
 import json
 import logging
 import pathlib
+from collections.abc import Callable, Mapping
+from typing import Literal
 
 import onnx_ir as ir
 import safetensors.torch
@@ -43,6 +49,25 @@ _WEIGHT_INDEX_NAME = "model.safetensors.index.json"
 _SINGLE_WEIGHT_NAME = "model.safetensors"
 _PYTORCH_WEIGHT_INDEX_NAME = "pytorch_model.bin.index.json"
 _SINGLE_PYTORCH_WEIGHT_NAME = "pytorch_model.bin"
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamingWeightSource:
+    """One checkpoint tensor bound to one dense ONNX initializer."""
+
+    source_name: str
+    mode: Literal["direct", "fp8_cast", "fp8_block_128"] = "direct"
+    scale_name: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamingWeightPlan:
+    """Complete fail-closed source classification for a streaming export."""
+
+    targets: Mapping[str, StreamingWeightSource]
+    ignored: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    constants: Mapping[str, torch.Tensor] = dataclasses.field(default_factory=dict)
+    report: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 def _assign_weight(
@@ -261,6 +286,53 @@ def _local_weight_paths(model_dir: pathlib.Path) -> tuple[list[str], str] | None
     return paths, weight_format
 
 
+def _dequantize_fp8_tensor(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    name: str,
+    target_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Reconstruct one scalar- or 128x128-block-scaled FP8 tensor."""
+    if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+        raise ValueError(f"Weight '{name}' is not an FP8 tensor: {weight.dtype}")
+    scale = scale.to(target_dtype)
+    if scale.ndim == 0:
+        return weight.to(target_dtype) * scale
+    if scale.ndim != 2:
+        raise ValueError(
+            f"FP8 weight '{name}' has scale with shape {tuple(scale.shape)}; "
+            "expected a scalar or 2-D block scale grid"
+        )
+    if weight.ndim != 2:
+        raise ValueError(
+            f"FP8 weight '{name}' has a 2-D scale grid but is "
+            f"{weight.ndim}-D; block scaling requires a 2-D weight"
+        )
+
+    rows, cols = weight.shape
+    expected_grid_shape = ((rows + 127) // 128, (cols + 127) // 128)
+    if tuple(scale.shape) != expected_grid_shape:
+        raise ValueError(
+            f"FP8 weight '{name}' has scale grid shape {tuple(scale.shape)}; "
+            f"expected {expected_grid_shape} for weight shape {tuple(weight.shape)}"
+        )
+
+    # Mutate one dense target tensor tile-by-tile instead of materializing an
+    # expanded scale grid the size of the weight.
+    dequantized = weight.to(target_dtype)
+    for block_row in range(expected_grid_shape[0]):
+        row_start = block_row * 128
+        row_end = min(row_start + 128, rows)
+        for block_col in range(expected_grid_shape[1]):
+            col_start = block_col * 128
+            col_end = min(col_start + 128, cols)
+            dequantized[row_start:row_end, col_start:col_end].mul_(
+                scale[block_row, block_col]
+            )
+    return dequantized
+
+
 def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Dequantize FP8 weights and return a new dict with float tensors.
 
@@ -301,49 +373,13 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
         else:
             scale_key = key + "_scale_inv"
 
-        if scale_key in result:
-            # Cast scale to bfloat16 to guarantee the output dtype is bfloat16,
-            # even when weight_scale_inv is stored as FP32 in the checkpoint.
-            scale = result[scale_key].to(torch.bfloat16)
-            if scale.ndim == 0:
-                result[key] = result[key].to(torch.bfloat16) * scale
-            elif scale.ndim == 2:
-                weight = result[key]
-                if weight.ndim != 2:
-                    raise ValueError(
-                        f"FP8 weight '{key}' has a 2-D scale grid but is "
-                        f"{weight.ndim}-D; block scaling requires a 2-D weight"
-                    )
-
-                rows, cols = weight.shape
-                expected_grid_shape = ((rows + 127) // 128, (cols + 127) // 128)
-                if tuple(scale.shape) != expected_grid_shape:
-                    raise ValueError(
-                        f"FP8 weight '{key}' has scale grid shape {tuple(scale.shape)}; "
-                        f"expected {expected_grid_shape} for weight shape {tuple(weight.shape)}"
-                    )
-
-                # Scale each 128-by-128 tile in the BF16 output. This avoids
-                # allocating a full expanded scale tensor for large expert weights.
-                dequantized = weight.to(torch.bfloat16)
-                for block_row in range(expected_grid_shape[0]):
-                    row_start = block_row * 128
-                    row_end = min(row_start + 128, rows)
-                    for block_col in range(expected_grid_shape[1]):
-                        col_start = block_col * 128
-                        col_end = min(col_start + 128, cols)
-                        dequantized[row_start:row_end, col_start:col_end].mul_(
-                            scale[block_row, block_col]
-                        )
-                result[key] = dequantized
-            else:
-                raise ValueError(
-                    f"FP8 weight '{key}' has scale with shape {tuple(scale.shape)}; "
-                    "expected a scalar or 2-D block scale grid"
-                )
-        else:
-            logger.warning("FP8 weight '%s' has no scale_inv — casting without scaling", key)
-            result[key] = result[key].to(torch.bfloat16)
+        if scale_key not in result:
+            raise ValueError(
+                f"FP8 weight '{key}' has no '{scale_key}' tensor. Refusing to "
+                "guess an implicit scale; an architecture-specific loader must "
+                "explicitly classify any direct-cast FP8 storage."
+            )
+        result[key] = _dequantize_fp8_tensor(result[key], result[scale_key], name=key)
 
     # Remove auxiliary FP8 tensors (not needed in the ONNX graph)
     aux_suffixes = (".weight_scale_inv", ".activation_scale", ".input_scale")
@@ -501,6 +537,177 @@ def _assign_lazy_from_shard(
         shape=ir.Shape(initializer.shape),
         name=name,
     )
+
+
+def _assign_lazy_preprocessed(
+    initializer: ir.Value,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_name: str,
+) -> None:
+    """Bind a direct or dense-dequantized source with one-tensor working memory."""
+    source_path, source_shape, source_dtype = key_index[source.source_name]
+    onnx_dtype = initializer.dtype
+    assert onnx_dtype is not None
+    target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+
+    def tensor_func(
+        p: str = source_path,
+        k: str = source.source_name,
+        mode: str = source.mode,
+        scale_name: str | None = source.scale_name,
+        dt: torch.dtype = target_dtype,
+        n: str = target_name,
+    ) -> tensor_adapters.TorchTensor:
+        with safe_open(p, framework="pt") as handle:
+            tensor = handle.get_tensor(k)
+        if mode == "fp8_block_128":
+            assert scale_name is not None
+            scale_path = key_index[scale_name][0]
+            with safe_open(scale_path, framework="pt") as handle:
+                scale = handle.get_tensor(scale_name)
+            tensor = _dequantize_fp8_tensor(tensor, scale, name=k, target_dtype=dt)
+        elif mode == "fp8_cast":
+            if not source_dtype.startswith("F8"):
+                raise ValueError(
+                    f"Streaming source '{k}' was classified fp8_cast but has dtype "
+                    f"{source_dtype}"
+                )
+            tensor = tensor.to(dt)
+        elif mode == "direct":
+            if source_dtype.startswith("F8"):
+                raise ValueError(
+                    f"Streaming source '{k}' is FP8 but was not explicitly classified "
+                    "as scaled or direct-cast FP8"
+                )
+            if tensor.dtype != dt:
+                tensor = tensor.to(dt)
+        else:
+            raise AssertionError(f"Unknown streaming weight mode: {mode}")
+        return tensor_adapters.TorchTensor(tensor, name=n)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=onnx_dtype,
+        shape=ir.Shape(source_shape),
+        name=target_name,
+    )
+
+
+def stream_preprocessed_safetensors_to_model(
+    model: ir.Model,
+    model_id: str,
+    planner: Callable[
+        [Mapping[str, tuple[str, list[int], str]], Mapping[str, ir.Value]],
+        StreamingWeightPlan,
+    ],
+    *,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Stream a fully classified transformed checkpoint into a dense ONNX graph.
+
+    The planner must classify every source tensor as a target, a consumed scale,
+    a validated deterministic constant, or an explicitly ignored sidecar tensor.
+    Any unclassified key, missing target, malformed FP8 grid, or changed constant
+    fails before serialization. The resulting package is dense; this path never
+    claims native FP8 preservation.
+    """
+    paths = _resolve_shard_paths(model_id, revision)
+    key_index = _shard_key_index(paths)
+    plan = planner(key_index, model.graph.initializers)
+
+    consumed = set(plan.ignored) | set(plan.constants)
+    assigned: set[str] = set()
+    for target_name, source in plan.targets.items():
+        initializer = model.graph.initializers.get(target_name)
+        if initializer is None:
+            raise ValueError(f"Streaming plan targets unknown initializer '{target_name}'")
+        if initializer.const_value is not None:
+            raise ValueError(f"Streaming plan targets constant initializer '{target_name}'")
+        if source.source_name not in key_index:
+            raise ValueError(f"Streaming source '{source.source_name}' does not exist")
+        source_path, source_shape, source_dtype = key_index[source.source_name]
+        del source_path
+        expected_shape = [int(dim) for dim in initializer.shape]
+        if expected_shape != source_shape:
+            raise ValueError(
+                f"Weight shape mismatch for '{target_name}': model expects "
+                f"{expected_shape}, checkpoint source '{source.source_name}' has "
+                f"{source_shape}"
+            )
+        if source.mode == "fp8_block_128":
+            if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
+                raise ValueError(
+                    f"Scaled FP8 source '{source.source_name}' has dtype {source_dtype}"
+                )
+            if source.scale_name is None or source.scale_name not in key_index:
+                raise ValueError(
+                    f"Scaled FP8 source '{source.source_name}' has no scale tensor"
+                )
+            _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+            expected_grid = [
+                (source_shape[0] + 127) // 128,
+                (source_shape[1] + 127) // 128,
+            ]
+            if len(source_shape) != 2 or scale_shape != expected_grid:
+                raise ValueError(
+                    f"FP8 source '{source.source_name}' has scale grid {scale_shape}; "
+                    f"expected {expected_grid} for strict 128x128 blocks"
+                )
+            if scale_dtype not in {"BF16", "F32"}:
+                raise ValueError(
+                    f"FP8 source '{source.source_name}' has unsupported scale dtype "
+                    f"{scale_dtype}; expected BF16 or F32"
+                )
+            consumed.add(source.scale_name)
+        _assign_lazy_preprocessed(initializer, source, key_index, target_name)
+        consumed.add(source.source_name)
+        assigned.add(target_name)
+
+    for source_name, expected in plan.constants.items():
+        path, shape, _dtype = key_index[source_name]
+        if list(expected.shape) != shape:
+            raise ValueError(
+                f"Deterministic source '{source_name}' has shape {shape}; "
+                f"expected {list(expected.shape)}"
+            )
+        with safe_open(path, framework="pt") as handle:
+            actual = handle.get_tensor(source_name)
+        if not torch.equal(actual.cpu(), expected.cpu()):
+            raise ValueError(
+                f"Deterministic source '{source_name}' does not match the graph constant"
+            )
+
+    missing_targets = sorted(
+        name
+        for name, initializer in model.graph.initializers.items()
+        if initializer.const_value is None and name not in assigned
+    )
+    if missing_targets:
+        raise ValueError(
+            f"{len(missing_targets)} graph initializer(s) are missing from the "
+            f"streaming plan (e.g. {missing_targets[:5]})"
+        )
+    unclassified = sorted(set(key_index) - consumed)
+    if unclassified:
+        raise ValueError(
+            f"{len(unclassified)} checkpoint tensor(s) are unclassified by the "
+            f"streaming plan (e.g. {unclassified[:5]})"
+        )
+
+    report = {
+        "format": "mobius.weight-loading-report.v1",
+        "source": model_id,
+        "revision": revision,
+        "output_weight_format": "dense",
+        "native_fp8": False,
+        "assigned_tensors": len(assigned),
+        "validated_constants": len(plan.constants),
+        "ignored_tensors": len(plan.ignored),
+        **dict(plan.report),
+    }
+    model.metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
+    return report
 
 
 def stream_safetensors_to_model(

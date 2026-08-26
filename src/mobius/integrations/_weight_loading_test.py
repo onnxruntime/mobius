@@ -900,14 +900,14 @@ class TestDequantizeFP8Weights:
         assert "model.weight_proj.weight" in result
         assert result["model.weight_proj.weight"].dtype == torch.bfloat16
 
-    def test_missing_scale_casts_without_scaling(self):
-        """FP8 weight without scale_inv is cast to bfloat16 without scaling."""
+    def test_missing_scale_fails_closed(self):
+        """Generic FP8 loading must not guess an implicit unit scale."""
         from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0, 2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
         state_dict = {"orphan.weight": fp8_weight}
-        result = _dequantize_fp8_weights(state_dict)
-        assert result["orphan.weight"].dtype == torch.bfloat16
+        with pytest.raises(ValueError, match="Refusing to guess an implicit scale"):
+            _dequantize_fp8_weights(state_dict)
 
     def test_fp32_scale_produces_bf16_output(self):
         """FP32 weight_scale_inv should still produce bfloat16 output."""

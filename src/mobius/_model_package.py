@@ -54,6 +54,7 @@ _PACKAGE_MANIFEST = ".mobius-package.json"
 _PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
 _MTP_SIDECAR_BASENAME = ".mobius-mtp"
 _QUANTIZATION_REPORT = "quantization_report.json"
+_WEIGHT_LOADING_REPORT = "weight-loading-report.json"
 
 
 def _read_mtp_sidecar_name(directory: str) -> str | None:
@@ -135,6 +136,7 @@ def _validate_mtp_chain(package: ModelPackage) -> None:
             if collision_key in {
                 _PACKAGE_MANIFEST.casefold(),
                 _QUANTIZATION_REPORT.casefold(),
+                _WEIGHT_LOADING_REPORT.casefold(),
             }:
                 raise ValueError(
                     f"ModelPackage component name {name!r} is reserved for package metadata."
@@ -306,6 +308,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         self.config = config
         self.gguf_quantization_report: GGUFQuantizationReport | None = None
         self.quantization_report: object | None = None
+        self.weight_loading_report: dict[str, object] | None = None
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
         self.mtp_head: ModelPackage | None = None
@@ -498,6 +501,15 @@ class ModelPackage(UserDict[str, ir.Model]):
             stale_reuse_manifest = os.path.join(directory, "gguf-reuse.json")
             if os.path.isfile(stale_reuse_manifest):
                 os.remove(stale_reuse_manifest)
+        report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+        if self.weight_loading_report is not None:
+            if os.path.islink(report_path):
+                raise ValueError("Weight-loading report must not be a symlink.")
+            with open(report_path, "w", encoding="utf-8") as file:
+                json.dump(self.weight_loading_report, file, indent=2, sort_keys=True)
+                file.write("\n")
+        elif os.path.isfile(report_path):
+            os.remove(report_path)
         if include_policy_components:
             self.save_policy_components(directory, check_weights=check_weights)
         if include_adapter_artifacts:
@@ -915,6 +927,18 @@ class ModelPackage(UserDict[str, ir.Model]):
             package.gguf_quantization_report = GGUFQuantizationReport.read_json(
                 quantization_report_path
             )
+        report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+        if os.path.lexists(report_path):
+            if os.path.islink(report_path) or not os.path.isfile(report_path):
+                raise ValueError("Weight-loading report must be a regular file.")
+            with open(report_path, encoding="utf-8") as file:
+                report = json.load(file)
+            if (
+                not isinstance(report, dict)
+                or report.get("format") != "mobius.weight-loading-report.v1"
+            ):
+                raise ValueError("Invalid weight-loading report.")
+            package.weight_loading_report = report
         package._load_policy_components(directory)
         if mtp_dir is not None:
             package.mtp_head = cls._load(mtp_dir, ancestors)

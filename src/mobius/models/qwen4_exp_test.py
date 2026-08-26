@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import json
+import pathlib
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import onnx_ir as ir
 import pytest
+import safetensors.torch
 import torch
 
 from mobius._builder import build_from_module
@@ -17,6 +19,12 @@ from mobius._configs import Qwen4ExpConfig, VisionConfig
 from mobius._registry import registry
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
+from mobius.integrations._block_quant import BlockQuantScheme
+from mobius.integrations._weight_loading import (
+    _dequantize_fp8_tensor,
+    apply_weights,
+    stream_preprocessed_safetensors_to_model,
+)
 from mobius.models.qwen4_exp import (
     Qwen4ExpCausalLMModel,
     Qwen4ExpForConditionalGeneration,
@@ -169,11 +177,17 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
         mtp_num_hidden_layers=0,
     )
     config = Qwen4ExpConfig.from_transformers(
-        SimpleNamespace(
+        text,
+        parent_config=SimpleNamespace(
             model_type="qwen4_exp",
             text_config=text,
             tie_word_embeddings=False,
-        )
+            quantization_config={
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+                "activation_scheme": "dynamic",
+            },
+        ),
     )
 
     assert config.model_type == "qwen4_exp_text"
@@ -193,6 +207,31 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert config.mrope_interleaved
     assert config.mrope_section == [11, 11, 10]
     assert config.mamba_ssm_dtype == ir.DataType.FLOAT
+    assert config.block_quant_scheme is not None
+    assert config.block_quant_scheme.weight_block_size == (128, 128)
+
+
+def test_immutable_fp8_schema_fixture_matches_integration_contract():
+    fixture_path = (
+        pathlib.Path(__file__).parents[3]
+        / "testdata/evidence/causal-lm/qwen3.8-flash-next-fp8-schema.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    source = fixture["source_checkpoint"]
+    quantization = fixture["quantization_contract"]
+    export = fixture["mobius_export"]
+
+    assert source["repository"] == "unsloth/Qwen3.8-Flash-Next-FP8"
+    assert source["revision"] == "41cc25fe32cc20053a59c89716196897580cddf6"
+    assert source["index"]["tensor_payload_bytes"] == 185_502_232_570
+    assert source["shards"]["count"] == 131
+    assert fixture["header_census"]["tensor_count"] == 152_089
+    assert quantization["weight_block_size"] == [128, 128]
+    assert quantization["scaled_fp8_pairs"]["text_core"] == 73_728
+    assert quantization["scaled_fp8_pairs"]["invalid_or_missing_grids"] == 0
+    assert quantization["ple_direct_cast"]["count"] == 128
+    assert export["native_fp8"] is False
+    assert export["multimodal_package_complete"] is False
 
     parent = SimpleNamespace(
         model_type="qwen4_exp",
@@ -886,7 +925,7 @@ def test_parameter_names_match_upstream_modules():
     names = {name for name, _ in module.named_parameters()}
     assert "model.layers.0.attn_hyper_connection.input_mix_weight_down.weight" in names
     assert "model.layers.0.mlp_hyper_connection.block_inject_weight.weight" in names
-    assert "model.layers.0.ple.ple_embedding.ngram_embedding.weight" in names
+    assert "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight" in names
     assert "model.layers.1.self_attn.indexer.index_qk_proj.weight" in names
     assert "model.layers.1.mlp.experts.gate_up_proj" in names
     assert "model.layers.1.mlp.experts.down_proj" in names
@@ -908,26 +947,31 @@ def test_moe_executes_only_packed_topk_experts():
 def test_preprocess_validates_packed_experts_and_joins_ple_shards():
     config = _config(split_ngram_parts=2)
     module = Qwen4ExpCausalLMModel(config)
-    embedding_rows = module.model.layers[0].ple.ple_embedding.ngram_embedding.weight.shape[0]
+    embedding = module.model.layers[0].ple.ple_embedding.ngram_embedding
+    shard_rows = embedding.shard_0.weight.shape[0]
+    embedding_width = embedding.shard_0.weight.shape[1]
     state = {
         "model.language_model.layers.0.mlp.experts.gate_up_proj": torch.arange(
             2 * 16 * 16, dtype=torch.float32
         ).reshape(2, 16, 16),
         "model.language_model.layers.0.mlp.experts.down_proj": torch.zeros(2, 16, 8),
         "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight": (
-            torch.zeros(embedding_rows // 2, 2)
+            torch.zeros(shard_rows, embedding_width)
         ),
         "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight": (
-            torch.ones(embedding_rows - embedding_rows // 2, 2)
+            torch.ones(shard_rows, embedding_width)
         ),
     }
     result = module.preprocess_weights(state)
 
     assert result["model.layers.0.mlp.experts.gate_up_proj"].shape == (2, 16, 16)
     assert result["model.layers.0.mlp.experts.down_proj"].shape == (2, 16, 8)
-    ple = result["model.layers.0.ple.ple_embedding.ngram_embedding.weight"]
-    assert ple.shape == (embedding_rows, 2)
-    assert torch.all(ple[embedding_rows // 2 :] == 1)
+    assert torch.all(
+        result["model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"] == 0
+    )
+    assert torch.all(
+        result["model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight"] == 1
+    )
     assert not any(key.startswith("mtp.") for key in result)
 
 
@@ -1022,16 +1066,188 @@ def test_preprocess_fails_closed_on_missing_or_unexpected_ple_shards():
     config = _config(split_ngram_parts=2)
     module = Qwen4ExpCausalLMModel(config)
     target = "model.layers.0.ple.ple_embedding.ngram_embedding"
+    shard_shape = tuple(module.model.layers[0].ple.ple_embedding.ngram_embedding.shard_0.weight.shape)
     with pytest.raises(ValueError, match=r"missing shard indices \[1\]"):
-        module.preprocess_weights({f"{target}.shard_0.weight": torch.zeros(1, 2)})
-    with pytest.raises(ValueError, match=r"unexpected shard indices \[2\]"):
+        module.preprocess_weights({f"{target}.shard_0.weight": torch.zeros(shard_shape)})
+    with pytest.raises(ValueError, match=r"Unexpected Qwen4-Exp PLE shard index 2"):
         module.preprocess_weights(
             {
-                f"{target}.shard_0.weight": torch.zeros(1, 2),
-                f"{target}.shard_1.weight": torch.zeros(1, 2),
-                f"{target}.shard_2.weight": torch.zeros(1, 2),
+                f"{target}.shard_0.weight": torch.zeros(shard_shape),
+                f"{target}.shard_1.weight": torch.zeros(shard_shape),
+                f"{target}.shard_2.weight": torch.zeros(shard_shape),
             }
         )
+
+
+def _fp8_config(**overrides) -> Qwen4ExpConfig:
+    return _config(
+        block_quant_scheme=BlockQuantScheme(
+            quant_method="fp8",
+            weight_fmt="e4m3",
+            weight_block_size=(128, 128),
+            activation_scheme="dynamic",
+        ),
+        **overrides,
+    )
+
+
+def _source_name(target_name: str) -> str:
+    if target_name.startswith("model."):
+        return f"model.language_model.{target_name[len('model.') :]}"
+    return target_name
+
+
+def _quantize_blocks(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = weight.shape
+    scales = torch.empty(
+        ((rows + 127) // 128, (cols + 127) // 128),
+        dtype=torch.bfloat16,
+    )
+    quantized = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    for block_row in range(scales.shape[0]):
+        row_slice = slice(block_row * 128, min((block_row + 1) * 128, rows))
+        for block_col in range(scales.shape[1]):
+            col_slice = slice(block_col * 128, min((block_col + 1) * 128, cols))
+            block = weight[row_slice, col_slice]
+            scale = max(float(block.abs().max()) / 400.0, 2**-20)
+            scales[block_row, block_col] = scale
+            quantized[row_slice, col_slice] = (block / scale).to(torch.float8_e4m3fn)
+    return quantized, scales
+
+
+def _reduced_fp8_checkpoint(
+    module: Qwen4ExpCausalLMModel,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    torch.manual_seed(41)
+    source: dict[str, torch.Tensor] = {}
+    dense_targets: dict[str, torch.Tensor] = {}
+    for target_name, parameter in module.named_parameters():
+        source_name = _source_name(target_name)
+        if parameter._const_value is not None:
+            source[source_name] = torch.from_numpy(parameter._const_value.numpy().copy())
+            continue
+        shape = tuple(int(dim) for dim in parameter.shape)
+        value = torch.randn(shape, dtype=torch.float32) * 0.02
+        if ".mlp.experts." in target_name and target_name.endswith(".weight"):
+            quantized, scale = _quantize_blocks(value)
+            source[source_name] = quantized
+            source[source_name[: -len(".weight")] + ".weight_scale_inv"] = scale
+            dense_targets[target_name] = _dequantize_fp8_tensor(
+                quantized, scale, name=source_name, target_dtype=torch.float32
+            )
+        elif ".ple.ple_embedding.ngram_embedding.shard_" in target_name:
+            stored = value.to(torch.float8_e4m3fn)
+            source[source_name] = stored
+            dense_targets[target_name] = stored.to(torch.float32)
+        else:
+            stored = value.to(torch.bfloat16)
+            source[source_name] = stored
+            dense_targets[target_name] = stored.to(torch.float32)
+    source["model.visual.blocks.0.dummy.weight"] = torch.ones(1, dtype=torch.bfloat16)
+    source["mtp.layers.0.dummy.weight"] = torch.ones(1, dtype=torch.bfloat16)
+    return source, dense_targets
+
+
+def test_fp8_streaming_plan_prefers_composite_keys_and_classifies_sidecars():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    _config_value, _built_module, model = _build(config)
+    source, _dense = _reduced_fp8_checkpoint(module)
+    fallback = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    preferred = _source_name(fallback)
+    source[fallback] = source[preferred]
+    index = {
+        name: ("shard.safetensors", list(tensor.shape), str(tensor.dtype))
+        for name, tensor in source.items()
+    }
+    index = {
+        name: (
+            path,
+            shape,
+            {
+                "torch.bfloat16": "BF16",
+                "torch.float32": "F32",
+                "torch.float8_e4m3fn": "F8_E4M3",
+                "torch.int64": "I64",
+            }[dtype],
+        )
+        for name, (path, shape, dtype) in index.items()
+    }
+
+    plan = module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+    assert plan.targets[fallback].source_name == preferred
+    assert plan.ignored[fallback].startswith("lower-priority alias")
+    assert any(reason.startswith("multimodal component") for reason in plan.ignored.values())
+    assert any(reason.startswith("MTP sidecar") for reason in plan.ignored.values())
+    assert plan.report["native_fp8_reason"]
+    assert plan.report["multimodal_package_complete"] is False
+
+
+def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, dense_targets = _reduced_fp8_checkpoint(module)
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+
+    report = stream_preprocessed_safetensors_to_model(
+        model,
+        str(tmp_path),
+        module.build_fp8_streaming_plan,
+        revision="reduced-independent-fixture",
+    )
+
+    reference_module = Qwen4ExpCausalLMModel(config)
+    reference = build_from_module(
+        reference_module, config, task="qwen4-exp-text-generation"
+    )["model"]
+    apply_weights(reference, dense_targets)
+    feeds = _initial_states() | {
+        "input_ids": np.array([[2, 3, 4]], dtype=np.int64),
+        "attention_mask": np.ones((1, 3), dtype=np.int64),
+        "position_ids": np.arange(3, dtype=np.int64)[None],
+    }
+    streamed_session = OnnxModelSession(model)
+    reference_session = OnnxModelSession(reference)
+    try:
+        streamed = streamed_session.run(feeds)["logits"]
+        expected = reference_session.run(feeds)["logits"]
+    finally:
+        streamed_session.close()
+        reference_session.close()
+
+    np.testing.assert_allclose(streamed, expected, rtol=1e-5, atol=1e-6)
+    assert report["native_fp8"] is False
+    assert report["output_weight_format"] == "dense"
+    assert report["scaled_fp8_tensors"] > 0
+    assert report["direct_cast_fp8_tensors"] == config.split_ngram_parts
+
+
+def test_fp8_streaming_plan_rejects_unscaled_projection():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    scale_name = (
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"
+    )
+    del source[scale_name]
+    index = {
+        name: (
+            "shard.safetensors",
+            list(tensor.shape),
+            "F8_E4M3"
+            if tensor.dtype == torch.float8_e4m3fn
+            else "BF16"
+            if tensor.dtype == torch.bfloat16
+            else "I64",
+        )
+        for name, tensor in source.items()
+    }
+
+    with pytest.raises(ValueError, match="has no scale"):
+        module.build_fp8_streaming_plan(index, model.graph.initializers)
 
 
 def _initial_states() -> dict[str, np.ndarray]:
