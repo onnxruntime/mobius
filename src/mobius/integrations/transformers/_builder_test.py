@@ -58,6 +58,33 @@ def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     download.assert_called_once_with("fake/model", revision=None)
 
 
+def test_qwen4_composite_architecture_requires_text_only(monkeypatch) -> None:
+    hf_config = type(
+        "HFConfig",
+        (),
+        {
+            "model_type": "renamed_qwen4",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+        },
+    )()
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "qwen4_exp_text"),
+    )
+
+    with pytest.raises(ValueError, match="Pass text_only=True"):
+        transformers_builder.build_transformers_model(
+            "fake/qwen4",
+            load_weights=False,
+        )
+
+
 def test_glm_full_attention_overrides_use_dsa_for_glm_moe_dsa(monkeypatch) -> None:
     """``--glm-full-attention`` forces ``config.use_dsa=False`` for GLM-5.2."""
     hf_config = type("HFConfig", (), {"model_type": "glm_moe_dsa"})()

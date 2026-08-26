@@ -266,6 +266,10 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         # constructed here.  Text parity is covered by the real-weight
         # integration test (test_gemma4_unified_12b_text_prefill).
         "gemma4_unified_text",
+        # The composite and architecture alias share qwen4_exp_text's graph.
+        # Run parity once through the canonical standalone text model type.
+        "qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 
@@ -494,8 +498,19 @@ def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
     hf_kwargs.pop("no_rope_layers", None)
 
 
+def _adapt_qwen4_exp_text_config(hf_kwargs: dict) -> None:
+    hf_kwargs["head_dim"] = hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
+    hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": "default",
+        "rope_theta": 10_000.0,
+        "partial_rotary_factor": hf_kwargs.pop("partial_rotary_factor", 1.0),
+    }
+
+
 _HF_CONFIG_ADAPTERS = {
     "muse_glimmer_text": _adapt_muse_glimmer_text_config,
+    "qwen4_exp_text": _adapt_qwen4_exp_text_config,
 }
 
 
@@ -1240,6 +1255,11 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "position_ids": position_ids,
+        **(
+            {"past_position_ids": np.zeros((1, 0), dtype=np.int64)}
+            if model_type == "qwen4_exp_text"
+            else {}
+        ),
     }
     # Add zero-valued past KV cache feeds with correct shapes:
     # batch=1, past_sequence_len=0, other dims from model spec
@@ -1259,7 +1279,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
                 shape.append(1)
             else:
                 shape.append(0)
-        feeds[name] = np.zeros(shape, dtype=np.float32)
+        dtype = np.int64 if inp.dtype == ir.DataType.INT64 else np.float32
+        feeds[name] = np.zeros(shape, dtype=dtype)
 
     try:
         onnx_out = session.run(feeds)

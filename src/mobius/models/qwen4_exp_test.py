@@ -183,6 +183,19 @@ def test_exact_config_guards(override, message):
         _config(**override)
 
 
+def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache():
+    config = _config(partial_rotary_factor=0.5)
+    _config_value, _module, model = _build(config)
+    rng = np.random.default_rng(5)
+    for value in model.graph.initializers.values():
+        if value.const_value is None:
+            value.const_value = ir.tensor(
+                rng.normal(0.0, 0.02, [int(dim) for dim in value.shape]).astype(np.float32)
+            )
+    session = OnnxModelSession(model)
+    session.close()
+
+
 def test_registry_routes_composite_and_text_model_types():
     from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
@@ -243,6 +256,25 @@ def test_bfloat16_graph_keeps_only_recurrent_math_and_state_in_float32():
     assert linear_attention.outputs[1].dtype == config.mamba_ssm_dtype
 
 
+def test_bfloat16_router_projects_before_float32_softmax():
+    _config_value, _module, model = _build(_config(dtype=ir.DataType.BFLOAT16))
+    router_matmul = next(
+        node
+        for node in model.graph
+        if node.op_type == "MatMul"
+        and node.outputs[0].name is not None
+        and ".mlp.gate." in node.outputs[0].name
+    )
+    assert [value.dtype for value in router_matmul.inputs] == [
+        ir.DataType.BFLOAT16,
+        ir.DataType.BFLOAT16,
+    ]
+    router_cast = router_matmul.outputs[0].consumers()[0]
+    assert router_cast.op_type == "Cast"
+    assert router_cast.outputs[0].dtype == ir.DataType.FLOAT
+    assert router_cast.outputs[0].consumers()[0].op_type == "Softmax"
+
+
 def test_parameter_names_match_upstream_modules():
     _config_value, module, _model = _build()
     names = {name for name, _ in module.named_parameters()}
@@ -250,11 +282,24 @@ def test_parameter_names_match_upstream_modules():
     assert "model.layers.0.mlp_hyper_connection.block_inject_weight.weight" in names
     assert "model.layers.0.ple.ple_embedding.ngram_embedding.weight" in names
     assert "model.layers.1.self_attn.indexer.index_qk_proj.weight" in names
-    assert "model.layers.1.mlp.experts.0.gate_proj.weight" in names
+    assert "model.layers.1.mlp.experts.gate_up_proj" in names
+    assert "model.layers.1.mlp.experts.down_proj" in names
     assert "model.layers.1.mlp.shared_expert_gate.weight" in names
 
 
-def test_preprocess_unpacks_experts_and_joins_ple_shards():
+def test_moe_executes_only_packed_topk_experts():
+    _config_value, _module, model = _build()
+    expert_nodes = [
+        node
+        for node in model.graph
+        if node.outputs[0].name is not None and ".mlp.experts." in node.outputs[0].name
+    ]
+    assert sum(node.op_type == "Gather" for node in expert_nodes) == 4
+    assert sum(node.op_type == "MatMul" for node in expert_nodes) == 4
+    assert not any(".mlp.experts.0." in name for name in model.graph.initializers)
+
+
+def test_preprocess_validates_packed_experts_and_joins_ple_shards():
     config = _config(split_ngram_parts=2)
     module = Qwen4ExpCausalLMModel(config)
     embedding_rows = module.model.layers[0].ple.ple_embedding.ngram_embedding.weight.shape[0]
@@ -273,18 +318,8 @@ def test_preprocess_unpacks_experts_and_joins_ple_shards():
     }
     result = module.preprocess_weights(state)
 
-    assert result["model.layers.0.mlp.experts.0.gate_proj.weight"].shape == (
-        8,
-        16,
-    )
-    assert result["model.layers.0.mlp.experts.1.up_proj.weight"].shape == (
-        8,
-        16,
-    )
-    assert result["model.layers.0.mlp.experts.1.down_proj.weight"].shape == (
-        16,
-        8,
-    )
+    assert result["model.layers.0.mlp.experts.gate_up_proj"].shape == (2, 16, 16)
+    assert result["model.layers.0.mlp.experts.down_proj"].shape == (2, 16, 8)
     ple = result["model.layers.0.ple.ple_embedding.ngram_embedding.weight"]
     assert ple.shape == (embedding_rows, 2)
     assert torch.all(ple[embedding_rows // 2 :] == 1)

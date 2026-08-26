@@ -194,6 +194,27 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_local_qwen4_composite_requires_remote_text_only_route(self, tmp_path):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "config.json").write_text(
+            """{
+  "model_type": "qwen4_exp",
+  "architectures": ["Qwen4ExpForConditionalGeneration"],
+  "text_config": {"model_type": "qwen4_exp_text"}
+}"""
+        )
+        with pytest.raises(SystemExit, match="cannot be silently exported as text-only"):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(config_dir),
+                    str(tmp_path / "output"),
+                    "--no-weights",
+                ]
+            )
+
     def test_text_only_with_component_errors(self):
         """The text-only feature is rejected when combined with --component."""
         with (
@@ -813,6 +834,24 @@ class TestCLIBuildRuntime:
         call_kwargs = mock_export.call_args
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
         assert call_kwargs.kwargs.get("trust_remote_code") is False
+
+    def test_qwen4_ort_genai_rejects_before_saving_package(self, tmp_path):
+        pkg = mock.MagicMock()
+        pkg.config = SimpleNamespace(model_type="qwen4_exp_text")
+        args = SimpleNamespace(
+            runtime="ort-genai",
+            external_data="onnx",
+            execution_provider="cpu",
+            max_shard_size=None,
+            max_workers=1,
+            no_weights=False,
+            release=False,
+        )
+
+        with pytest.raises(SystemExit, match="Qwen4-Exp"):
+            _save_package(pkg, str(tmp_path), args, None, None)
+
+        pkg.save.assert_not_called()
 
     def test_runtime_ort_genai_propagates_trust_remote_code(self):
         """--trust-remote-code also applies to runtime config generation."""

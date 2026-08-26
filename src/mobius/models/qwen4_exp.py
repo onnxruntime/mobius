@@ -21,17 +21,18 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import Qwen4ExpConfig
+from mobius._weight_utils import preprocess_quantized_weights
 from mobius.components import (
     Embedding,
+    GatedDeltaNet,
     Linear,
+    Qwen35Attention,
     SoftmaxTopKGate,
     create_attention_bias,
     get_activation,
     initialize_rope,
 )
-from mobius.components._attention import Qwen35Attention
-from mobius.components._gated_deltanet import GatedDeltaNet
-from mobius.models.base import CausalLMModel
+from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.moe import Qwen2MoELayer
 
 _INT64_MAX = 9223372036854775807
@@ -460,7 +461,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         self._ratio = config.indexer_compress_ratio
         self._block_topk = self._budget // self._ratio
         self._rotary_dim = int(config.head_dim * (config.partial_rotary_factor or 1.0))
-        self._interleaved = config.rope_interleave
+        self._frequency_dim = self._rotary_dim // 2
         self.index_qk_proj = Linear(
             config.hidden_size,
             (self._n_heads + 1) * self._head_dim,
@@ -483,23 +484,23 @@ class Qwen4ExpQSAIndexer(nn.Module):
             axis=-1,
             _outputs=2,
         )
-        if self._interleaved:
-            pairs = op.Reshape(rotary, [0, 0, num_heads, self._rotary_dim // 2, 2])
-            real, imaginary = op.Split(pairs, [1, 1], axis=-1, _outputs=2)
-            rotated_half = op.Reshape(
-                op.Concat(op.Neg(imaginary), real, axis=-1),
-                [0, 0, num_heads, self._rotary_dim],
-            )
-        else:
-            first, second = op.Split(
-                rotary,
-                [self._rotary_dim // 2, self._rotary_dim // 2],
-                axis=-1,
-                _outputs=2,
-            )
-            rotated_half = op.Concat(op.Neg(second), first, axis=-1)
-        cos = op.Unsqueeze(position_embeddings[0], [2])
-        sin = op.Unsqueeze(position_embeddings[1], [2])
+        first, second = op.Split(
+            rotary,
+            [self._rotary_dim // 2, self._rotary_dim // 2],
+            axis=-1,
+            _outputs=2,
+        )
+        rotated_half = op.Concat(op.Neg(second), first, axis=-1)
+        # Mobius RoPE caches one value per frequency. Upstream expands those
+        # frequencies across both rotary halves with torch.cat((freqs, freqs)).
+        cos = op.Unsqueeze(
+            op.Concat(position_embeddings[0], position_embeddings[0], axis=-1),
+            [2],
+        )
+        sin = op.Unsqueeze(
+            op.Concat(position_embeddings[1], position_embeddings[1], axis=-1),
+            [2],
+        )
         rotary = op.Add(op.Mul(rotary, cos), op.Mul(rotated_half, sin))
         return op.Concat(rotary, passthrough, axis=-1)
 
@@ -639,12 +640,23 @@ class Qwen4ExpQSAIndexer(nn.Module):
                 axis=0,
             ),
         )
-        ordered_visible_indices = op.Expand(
-            op.Unsqueeze(ordered_visible_indices, [2]),
-            op.Concat(batch, query_length, max_blocks, total_length, axis=0),
+        flat_candidate_ordinals = op.Reshape(
+            candidate_ordinals,
+            op.Concat(batch, query_length, op.Constant(value_ints=[-1]), axis=0),
         )
-        candidate_indices = op.GatherElements(
-            ordered_visible_indices, candidate_ordinals, axis=3
+        candidate_indices = op.Reshape(
+            op.GatherElements(
+                ordered_visible_indices,
+                flat_candidate_ordinals,
+                axis=2,
+            ),
+            op.Concat(
+                batch,
+                query_length,
+                max_blocks,
+                op.Constant(value_ints=[self._ratio]),
+                axis=0,
+            ),
         )
         block_valid = op.Less(op.Unsqueeze(block_ids, [0, 1]), query_num_blocks)
         key_blocks = self._gather_per_query(
@@ -659,13 +671,13 @@ class Qwen4ExpQSAIndexer(nn.Module):
                 op,
                 full_position_embeddings[0],
                 block_starts,
-                self._rotary_dim,
+                self._frequency_dim,
             ),
             self._gather_per_query(
                 op,
                 full_position_embeddings[1],
                 block_starts,
-                self._rotary_dim,
+                self._frequency_dim,
             ),
         )
         flat_block_shape = op.Concat(
@@ -677,7 +689,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         flat_position_shape = op.Concat(
             op.Mul(batch, query_length),
             max_blocks,
-            op.Constant(value_ints=[self._rotary_dim]),
+            op.Constant(value_ints=[self._frequency_dim]),
             axis=0,
         )
         pooled = self._rotate(
@@ -812,17 +824,83 @@ class Qwen4ExpMoEBlock(Qwen2MoELayer):
             norm_topk_prob=config.norm_topk_prob,
         )
         super().__init__(config, gate=gate)
+        self.experts = Qwen4ExpExperts(config)
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        routing_weights, selected_experts = self.gate(op, hidden_states)
+        expert_output = self.experts(
+            op,
+            hidden_states,
+            selected_experts,
+            routing_weights,
+        )
+        shared_output = self.shared_expert(op, hidden_states)
+        shared_gate = op.Sigmoid(self.shared_expert_gate(op, hidden_states))
+        return op.Add(expert_output, op.Mul(shared_output, shared_gate))
+
+
+class Qwen4ExpExperts(nn.Module):
+    """Packed expert weights evaluated only for each token's selected experts."""
+
+    def __init__(self, config: Qwen4ExpConfig):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.moe_intermediate_size is not None
+        self._intermediate_size = config.moe_intermediate_size
+        self.gate_up_proj = nn.Parameter(
+            [
+                config.num_local_experts,
+                2 * config.moe_intermediate_size,
+                config.hidden_size,
+            ]
+        )
+        self.down_proj = nn.Parameter(
+            [
+                config.num_local_experts,
+                config.hidden_size,
+                config.moe_intermediate_size,
+            ]
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        selected_experts: ir.Value,
+        routing_weights: ir.Value,
+    ) -> ir.Value:
+        # Gather only top-k expert matrices for each token:
+        # gate_up: (B, S, K, 2I, H), hidden: (B, S, 1, H, 1).
+        gate_up = op.Gather(self.gate_up_proj, selected_experts, axis=0)
+        hidden_column = op.Unsqueeze(hidden_states, [2, 4])
+        projected = op.Squeeze(op.MatMul(gate_up, hidden_column), [-1])
+        gate, up = op.Split(
+            projected,
+            [self._intermediate_size, self._intermediate_size],
+            axis=-1,
+            _outputs=2,
+        )
+        activated = op.Mul(op.Swish(gate), up)
+
+        # down: (B, S, K, H, I) @ (B, S, K, I, 1) -> (B, S, K, H).
+        down = op.Gather(self.down_proj, selected_experts, axis=0)
+        expert_output = op.Squeeze(
+            op.MatMul(down, op.Unsqueeze(activated, [-1])),
+            [-1],
+        )
+        weighted = op.Mul(expert_output, op.Unsqueeze(routing_weights, [-1]))
+        return op.ReduceSum(weighted, [-2], keepdims=False)
 
 
 class Qwen4ExpTopKGate(SoftmaxTopKGate):
     """Qwen4 router with the upstream float32 softmax/renormalization path."""
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        logits = op.MatMul(
-            op.Cast(hidden_states, to=ir.DataType.FLOAT),
-            op.Transpose(op.Cast(self.weight, to=ir.DataType.FLOAT), perm=[1, 0]),
+        logits = op.MatMul(hidden_states, op.Transpose(self.weight, perm=[1, 0]))
+        probabilities = op.Softmax(
+            op.Cast(logits, to=ir.DataType.FLOAT),
+            axis=-1,
         )
-        probabilities = op.Softmax(logits, axis=-1)
         routing_weights, selected_experts = op.TopK(
             probabilities,
             op.Constant(value_ints=[self.top_k]),
@@ -890,7 +968,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.linear_attn is not None:
             mixed = op.Mul(mixed, op.Unsqueeze(op.CastLike(token_mask, mixed), [-1]))
             output, conv_state, recurrent_state = self.linear_attn(
-                op, mixed, past_state[0], past_state[1], token_mask
+                op, mixed, past_state[0], past_state[1]
             )
             present_state: tuple[ir.Value, ...] = (
                 conv_state,
@@ -1005,7 +1083,7 @@ class Qwen4ExpTextModel(nn.Module):
         )
 
 
-class Qwen4ExpCausalLMModel(CausalLMModel):
+class Qwen4ExpCausalLMModel(nn.Module):
     """Qwen3.8 Flash-Next/Qwen4-Exp causal decoder with exact text-core semantics."""
 
     default_task: str = "qwen4-exp-text-generation"
@@ -1096,16 +1174,6 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
                         f"Qwen4-Exp packed gate_up_proj has shape {tuple(value.shape)}, "
                         f"expected {expected_shape}"
                     )
-                prefix = key[: -len("experts.gate_up_proj")]
-                half = value.shape[1] // 2
-                for expert_index in range(value.shape[0]):
-                    cleaned[f"{prefix}experts.{expert_index}.gate_proj.weight"] = value[
-                        expert_index, :half
-                    ]
-                    cleaned[f"{prefix}experts.{expert_index}.up_proj.weight"] = value[
-                        expert_index, half:
-                    ]
-                continue
             if key.endswith(".mlp.experts.down_proj"):
                 expected_shape = (
                     self.config.num_local_experts,
@@ -1117,12 +1185,6 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
                         f"Qwen4-Exp packed down_proj has shape {tuple(value.shape)}, "
                         f"expected {expected_shape}"
                     )
-                prefix = key[: -len("experts.down_proj")]
-                for expert_index in range(value.shape[0]):
-                    cleaned[f"{prefix}experts.{expert_index}.down_proj.weight"] = value[
-                        expert_index
-                    ]
-                continue
             cleaned[key] = value
 
         for target, shards in ple_shards.items():
@@ -1155,4 +1217,10 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
                 "defines no MTP forward equation or NextN cache ABI.",
                 skipped_mtp,
             )
-        return super().preprocess_weights(cleaned)
+        qc = getattr(self.config, "quantization", None)
+        return preprocess_quantized_weights(
+            cleaned,
+            qc,
+            tie_embeddings=effective_tie_word_embeddings(self.config),
+            qmoe_target_path=None,
+        )

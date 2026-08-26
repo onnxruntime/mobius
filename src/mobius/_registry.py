@@ -672,6 +672,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         config_class=Qwen4ExpConfig,
         family="qwen",
         variant="moe+gdn+qsa+ple",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "qwen4_exp_text": ModelRegistration(
         Qwen4ExpCausalLMModel,
@@ -679,6 +680,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         config_class=Qwen4ExpConfig,
         family="qwen",
         variant="moe+gdn+qsa+ple",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "Qwen4ExpForConditionalGeneration": ModelRegistration(
         Qwen4ExpCausalLMModel,
@@ -686,6 +688,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         config_class=Qwen4ExpConfig,
         family="qwen",
         variant="text-core",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_vl_moe": ModelRegistration(MoECausalLMModel),
@@ -1060,6 +1063,9 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llama": "meta-llama/Llama-3.2-1B",
     "mistral": "mistralai/Mistral-7B-v0.1",
     "qwen2": "Qwen/Qwen2.5-0.5B",
+    "qwen4_exp": "Qwen/Qwen3.8-Flash-Next",
+    "qwen4_exp_text": "Qwen/Qwen3.8-Flash-Next",
+    "Qwen4ExpForConditionalGeneration": "Qwen/Qwen3.8-Flash-Next",
     "plamo2": "pfnet/plamo-2-1b",
     "cohere": "CohereForAI/c4ai-command-r7b-12-2024",
     "cohere2": "CohereForAI/c4ai-command-r7b-12-2024",

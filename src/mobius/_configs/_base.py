@@ -1552,6 +1552,7 @@ class Qwen4ExpConfig(CausalLMConfig):
     indexer_budget: int | None = None
     indexer_compress_ratio: int | None = None
     output_gate_type: str | None = None
+    linear_qk_l2norm_eps: float = 1e-6
     mamba_ssm_dtype: ir.DataType = ir.DataType.FLOAT
     mtp_num_hidden_layers: int = 0
     mtp_use_dedicated_embeddings: bool = False
@@ -1597,12 +1598,14 @@ class Qwen4ExpConfig(CausalLMConfig):
                 "Qwen4-Exp requires mamba_ssm_dtype=float32 for the pinned "
                 "Gated-DeltaNet recurrence"
             )
+        if self.rope_interleave:
+            raise ValueError("Qwen4-Exp uses half-split RoPE; rope_interleave must be false")
         if not self.num_local_experts or self.num_local_experts <= 0:
-            raise ValueError("Qwen4-Exp num_experts must be > 0")
+            raise ValueError("Qwen4-Exp num_local_experts must be > 0")
         if not self.num_experts_per_tok or not (
             0 < self.num_experts_per_tok <= self.num_local_experts
         ):
-            raise ValueError("Qwen4-Exp num_experts_per_tok must be in [1, num_experts]")
+            raise ValueError("Qwen4-Exp num_experts_per_tok must be in [1, num_local_experts]")
         if not self.moe_intermediate_size or self.moe_intermediate_size <= 0:
             raise ValueError("Qwen4-Exp moe_intermediate_size must be > 0")
         if (

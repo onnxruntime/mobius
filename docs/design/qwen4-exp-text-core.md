@@ -7,8 +7,11 @@ Mobius implements the text decoder identified by Hugging Face
 The implementation is pinned to:
 
 - `Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c`
-- `unsloth/Qwen3.8-Flash-Next-FP8@41cc25fe32cc20053a59c89716196897580cddf6`
 - `huggingface/transformers@598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1`
+
+Exported models record that pin as `mobius.semantic_reference_revision` and
+record the caller's requested checkpoint revision separately as
+`mobius.source_revision` (`unpinned` when no revision was supplied).
 
 ## Exported architecture
 
@@ -20,6 +23,9 @@ token selection, and PLE hashed n-gram embeddings with their dilated
 convolution and token-context states. The pinned BF16 checkpoint keeps
 DeltaNet recurrent math and recurrent cache state in float32, while convolution
 state, projections, sparse-attention caches, and logits remain in model dtype.
+Official safetensors are loaded through a bounded-memory transform: packed
+experts are sliced lazily and the PLE table is allocated once, then populated
+one checkpoint shard at a time.
 
 The flattened cache ABI is:
 

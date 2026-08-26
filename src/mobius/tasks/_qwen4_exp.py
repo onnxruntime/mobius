@@ -175,7 +175,7 @@ class Qwen4ExpCausalLMTask(ModelTask):
             "linear=conv_state,recurrent_state[,ple_conv_state,ple_context];"
             "qsa=key,value,index_key"
         )
-        model.metadata_props["mobius.upstream_revision"] = (
+        model.metadata_props["mobius.semantic_reference_revision"] = (
             "Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c;"
             "transformers@598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1"
         )
