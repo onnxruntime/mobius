@@ -219,7 +219,9 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
 
     def build(self, module: nn.Module, config: Qwen4ExpConfig) -> ModelPackage:
         self._validate_components(module)
-        if config.deepstack_visual_indexes:
+        if config.deepstack_visual_indexes or (
+            config.vision is not None and config.vision.deepstack_visual_indexes
+        ):
             raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
         models = {
             "decoder": self._build_decoder(module.decoder, config),

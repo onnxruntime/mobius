@@ -120,10 +120,12 @@ def _resolve_module_class(
     parent_config,
     module_class: type[nn.Module] | None,
     task: str | ModelTask | None,
+    *,
+    allow_parent_architecture_override: bool = True,
 ) -> tuple[type[nn.Module], str | ModelTask | None, str]:
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
-    if architectures and architectures[0] in registry:
+    if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None
         architecture_class = registry.get(architecture_key)
@@ -240,6 +242,7 @@ def build_transformers_model(
         parent_config,
         module_class,
         task,
+        allow_parent_architecture_override=not text_only,
     )
     config = _config_from_hf(
         hf_config,

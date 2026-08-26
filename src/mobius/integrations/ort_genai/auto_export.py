@@ -507,6 +507,17 @@ def _write_runtime_compatibility(
         "uses_main_only_state_groups": False,
         "heterogeneous_state_manifest": "deferred: https://github.com/onnxruntime/mobius/issues/605",
     }
+    if model_type == "qwen4_exp":
+        metadata.update(
+            released_runtime_support=False,
+            limitation=(
+                "Released onnxruntime-genai does not yet register the qwen4_exp "
+                "four-axis position and heterogeneous PLE/QSA state executor."
+            ),
+            heterogeneous_state_manifest=(
+                "graph-derived:genai_config.json#model.decoder.inputs,outputs"
+            ),
+        )
     path = os.path.join(output_dir, "runtime_compatibility.json")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -1653,16 +1664,24 @@ def _write_genai_config(
             # must reject on the mere presence of standard Attention, not
             # only when GQA is completely absent (partial GQA fusion still
             # leaves the unfused standard Attention layers broken).
-            raise ValueError(
-                "This decoder graph mixes com.microsoft.LinearAttention "
-                "(recurrent state, requires past_present_share_buffer=True) "
-                "with standard (non-GQA) Attention (incompatible with "
-                "past_present_share_buffer=True). This EP/dtype combination "
-                "cannot produce a runnable genai_config -- pick an EP/dtype "
-                "that lowers *all* full-attention layers to "
-                "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
-            )
-        supports_in_place_kv_cache = has_gqa or has_recurrent_state
+            if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
+                # Qwen4-Exp's QSA mask is graph-computed and intentionally does
+                # not match the ordinary GQA rewrite. Preserve the complete
+                # graph-derived metadata instead of rejecting export based on a
+                # released runtime's shared-buffer limitation.
+                supports_in_place_kv_cache = False
+            else:
+                raise ValueError(
+                    "This decoder graph mixes com.microsoft.LinearAttention "
+                    "(recurrent state, requires past_present_share_buffer=True) "
+                    "with standard (non-GQA) Attention (incompatible with "
+                    "past_present_share_buffer=True). This EP/dtype combination "
+                    "cannot produce a runnable genai_config -- pick an EP/dtype "
+                    "that lowers *all* full-attention layers to "
+                    "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
+                )
+        else:
+            supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
     sliding_window = None
     window_size = getattr(config, "sliding_window", None)

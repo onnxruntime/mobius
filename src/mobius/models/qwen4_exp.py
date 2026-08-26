@@ -11,6 +11,7 @@ state ABI is defined by :class:`mobius.tasks.Qwen4ExpCausalLMTask`.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
 from typing import ClassVar
@@ -35,7 +36,7 @@ from mobius.components import (
 )
 from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.moe import Qwen2MoELayer
-from mobius.models.qwen_vl import Qwen25VLEmbeddingModel, Qwen3VLVisionEncoderModel
+from mobius.models.qwen_vl import Qwen3VLVisionEncoderModel, Qwen25VLEmbeddingModel
 
 _INT64_MAX = 9223372036854775807
 _MASK64 = (1 << 64) - 1
@@ -43,6 +44,7 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
+logger = logging.getLogger(__name__)
 
 
 def _splitmix64(value: int) -> int:
@@ -1140,11 +1142,11 @@ class Qwen4ExpCausalLMModel(nn.Module):
         ple_shards: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
         indexer_projections: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
         parameter_map = dict(self.named_parameters())
-        unsupported_mtp: list[str] = []
+        skipped_mtp = 0
         for original_key, value in state_dict.items():
             key = original_key
             if key.startswith("mtp."):
-                unsupported_mtp.append(key)
+                skipped_mtp += 1
                 continue
             if key.startswith("model.language_model."):
                 key = f"model.{key[len('model.language_model.') :]}"
@@ -1273,10 +1275,12 @@ class Qwen4ExpCausalLMModel(nn.Module):
                     f"expected {expected_shape}"
                 )
             cleaned[target] = combined
-        if unsupported_mtp:
-            raise ValueError(
-                "Qwen4-Exp checkpoint contains unsupported MTP tensors; refusing "
-                f"to omit state: {unsupported_mtp[:3]}"
+        if skipped_mtp:
+            logger.warning(
+                "Skipped %d Qwen4-Exp MTP sidecar tensors. Ordinary upstream "
+                "next-token inference does not execute the MTP module, and Mobius "
+                "does not expose an unsupported NextN task or cache ABI.",
+                skipped_mtp,
             )
         qc = getattr(self.config, "quantization", None)
         return preprocess_quantized_weights(
@@ -1355,7 +1359,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         super().__init__()
         if config.vision is None:
             raise ValueError("Qwen4-Exp multimodal export requires a vision config")
-        if config.deepstack_visual_indexes:
+        if config.deepstack_visual_indexes or config.vision.deepstack_visual_indexes:
             raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
         self.config = config
         self.decoder = Qwen4ExpVLDecoderModel(config)

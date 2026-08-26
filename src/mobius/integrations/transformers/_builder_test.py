@@ -58,31 +58,24 @@ def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     download.assert_called_once_with("fake/model", revision=None)
 
 
-def test_qwen4_composite_architecture_requires_text_only(monkeypatch) -> None:
-    hf_config = type(
-        "HFConfig",
-        (),
-        {
-            "model_type": "renamed_qwen4",
-            "architectures": ["Qwen4ExpForConditionalGeneration"],
-        },
-    )()
-    monkeypatch.setattr(
-        transformers_builder,
-        "_load_transformers_config",
-        lambda *args, **kwargs: (hf_config, False),
-    )
-    monkeypatch.setattr(
-        transformers_builder,
-        "_select_primary_config",
-        lambda value: (value, value, "qwen4_exp_text"),
-    )
+def test_text_only_resolution_ignores_multimodal_parent_architecture() -> None:
+    from mobius.models import Qwen4ExpCausalLMModel
 
-    with pytest.raises(ValueError, match="Pass text_only=True"):
-        transformers_builder.build_transformers_model(
-            "fake/qwen4",
-            load_weights=False,
-        )
+    parent = type(
+        "Qwen4ExpParent",
+        (),
+        {"architectures": ["Qwen4ExpForConditionalGeneration"]},
+    )()
+    module_class, task, model_type = transformers_builder._resolve_module_class(
+        "qwen4_exp_text",
+        parent,
+        None,
+        None,
+        allow_parent_architecture_override=False,
+    )
+    assert module_class is Qwen4ExpCausalLMModel
+    assert task is None
+    assert model_type == "qwen4_exp_text"
 
 
 def test_transformers_build_routes_compressed_tensors_to_streaming_loader(

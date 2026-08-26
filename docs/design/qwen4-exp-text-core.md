@@ -1,8 +1,10 @@
-# Qwen4-Exp text core
+# Qwen4-Exp multimodal pipeline
 
-Mobius implements the text decoder identified by Hugging Face
-`model_type=qwen4_exp_text`, including the composite
-`Qwen4ExpForConditionalGeneration` route when `text_only=True`.
+Mobius implements both the `qwen4_exp_text` decoder and the
+`Qwen4ExpForConditionalGeneration` composite published as
+`Qwen/Qwen3.8-Flash-Next`. The composite exports a standard three-model package:
+`decoder`, `vision_encoder`, and `embedding`. `text_only=True` selects the same
+decoder without the vision stages.
 
 The implementation is pinned to:
 
@@ -41,6 +43,24 @@ QSA layer:
   key, value, index_key
 ```
 
+The multimodal decoder takes fused `inputs_embeds` and the original lexical
+`ple_input_ids` as independent inputs. Position state has shape `[4, B, S]`:
+channel 0 drives causal/QSA indexing and channels 1–3 carry temporal, height,
+and width M-RoPE positions.
+
+## Vision and embedding reuse
+
+The checkpoint's vision config proves identity with the no-DeepStack Qwen3.5
+tower: 27 blocks, hidden size 1152, intermediate size 4304, 16 heads, patch
+size 16, temporal patch size 2, spatial merge size 2, and 2304 learned position
+embeddings. Mobius reuses the Qwen3 vision implementation with DeepStack
+disabled and the merger projected to the decoder width of 2560.
+
+The embedding graph keeps image and video streams distinct. It scatters
+`image_features` at token 248056 and `video_features` at token 248057 while
+preserving the original token IDs for PLE. The processor contract is the pinned
+Qwen3 processor with vision start/end tokens 248053/248054.
+
 QSA uses standard ONNX operators to reproduce the selected-token mask, then
 runs ordinary dense attention under that mask. This is numerically faithful,
 including contiguous left padding, but it does not provide the memory savings
@@ -48,20 +68,13 @@ of a dedicated sparse-attention runtime kernel.
 
 ## Guarded features
 
-The pinned official Transformers implementation explicitly ignores `mtp.*`
-checkpoint tensors and does not define the `fc_embedding`/`fc_hidden`
-combination equation or a flattened NextN cache ABI. Mobius follows that
-ordinary-decoder behavior: it preserves the source MTP metadata, warns while
-dropping sidecar-only tensors, and exports the same next-token causal model.
-Configurations with dedicated MTP embeddings fail closed because omitting
-those embeddings could change the decoder contract. A future standalone
-NextN sidecar requires an authoritative execution equation and cache ABI.
+The pinned ordinary Transformers forward preserves MTP metadata but does not
+execute its `mtp.*` sidecar. Mobius mirrors that next-token route and does not
+publish an MTP task. Dedicated MTP embeddings fail closed because no flattened
+NextN cache ABI exists. Alternative vision geometries and nonempty DeepStack
+configurations also fail closed.
 
-FP8/NVFP4 checkpoint lowering and the multimodal wrapper remain outside this
-text-core implementation. The nested `qwen4_exp_text` configuration and
-architecture registration are present so a later multimodal wrapper can reuse
-the existing Qwen3/Qwen3.5 vision and embedding components without aliasing
-this decoder.
+FP8/NVFP4 checkpoint lowering remains outside this implementation.
 
 ## GGUF header support and payload guard
 
@@ -87,6 +100,5 @@ IQ4_NL down tensors, while the released runtime has neither a mixed-format
 sparse native-block MoE ABI nor real-weight execution evidence. Treating these
 as ordinary affine `MatMulNBits` would be incorrect. Explicit float
 dequantization is also rejected because the PLE table alone expands beyond the
-bounded single-tensor materialization policy. The exact header/config/mapping
-support is therefore a fail-closed foundation for future runtime ABI work, not
-a quantized execution claim.
+bounded single-tensor materialization policy. The exact header/config/mapping support is therefore a fail-closed foundation
+for future runtime ABI work, not a quantized execution claim.

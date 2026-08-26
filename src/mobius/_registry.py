@@ -1048,8 +1048,7 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "qwen3_5_moe_vl": "qwen3_5_moe_text",
     "qwen3_5_moe_text": "qwen3_5_moe_text",
     # Qwen3.8 Flash-Next is published as a multimodal qwen4_exp composite.
-    # This PR supports its exact text core only; callers must opt into the
-    # existing text-only extraction path until the wrapper is implemented.
+    # text_only=True selects the same exact decoder without the vision stages.
     "qwen4_exp": "qwen4_exp_text",
     "qwen4_exp_text": "qwen4_exp_text",
 }
@@ -1275,6 +1274,8 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen3_5_vl": "Qwen/Qwen3.5-2B",
     "qwen3_5_vl_text": "Qwen/Qwen3.5-2B",
     "qwen3_vl_single": "Qwen/Qwen3-VL-2B-Instruct",
+    "qwen4_exp": "Qwen/Qwen3.8-Flash-Next",
+    "qwen4_exp_text": "Qwen/Qwen3.8-Flash-Next",
     "sam2": "facebook/sam2-hiera-base-plus",
     "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct",
     "video_llava": "LanguageBind/Video-LLaVA-7B-hf",
@@ -1455,6 +1456,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_5": "qwen",
     "qwen3_5_moe_vl": "qwen",
     "qwen3_5_vl": "qwen",
+    "qwen4_exp": "qwen",
+    "qwen4_exp_text": "qwen",
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",

@@ -753,6 +753,7 @@ _REPLACE_ROLES = {
     "mamba": {"conv_state", "ssm_state"},
     "mamba2": {"conv_state", "ssm_state"},
 }
+_NO_KV_LAYER_TYPES = set(_REPLACE_ROLES) - {"qwen_sparse_attention"}
 _STATELESS_LAYER_TYPES = {"mlp", "moe"}
 
 
@@ -809,7 +810,7 @@ def _state_and_kv_pairs(
             layer_type = str(layer_types[layer])
 
         if role in {"key", "value"}:
-            if layer_type in _REPLACE_ROLES or layer_type in _STATELESS_LAYER_TYPES:
+            if layer_type in _NO_KV_LAYER_TYPES or layer_type in _STATELESS_LAYER_TYPES:
                 raise ValueError(
                     f"Decoder port {input_port.name!r} declares KV role {role!r}, but "
                     f"config.layer_types[{layer}]={layer_type!r} does not declare KV "
@@ -929,12 +930,24 @@ _POSITION_PROGRAM_REGISTRY = (
         ),
         sections_attribute="mrope_section",
     ),
+    _PositionProgram(
+        rank=4,
+        axes=("qsa", "temporal", "height", "width"),
+        generation="processor_coordinates",
+        continuation="carry_state",
+        matches=lambda config: (
+            getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+            and bool(getattr(config, "mrope_interleaved", False))
+            and bool(getattr(config, "mrope_section", None))
+        ),
+        sections_attribute="mrope_section",
+    ),
 )
 
 
 def _positions_from_registry(position: _Port, config: Any) -> dict[str, Any]:
     if position.rank == 3:
-        semantic_rank = 3
+        semantic_rank = 4 if position.dims[0] == 4 else 3
     elif position.rank == 2:
         semantic_rank = 1
     else:
@@ -963,7 +976,7 @@ def _positions_from_registry(position: _Port, config: Any) -> dict[str, Any]:
     raise ValueError(
         f"Cannot emit position metadata for decoder port {position.name!r} with "
         f"shape {position.dims}: no position registry entry matches the explicit "
-        "config. Rank-3 axes and continuation are never guessed. Regenerate with "
+        "config. Rank-3 axes and multi-axis continuation are never guessed. Regenerate with "
         "mrope_interleaved/mrope_section declarations or register this position contract."
     )
 

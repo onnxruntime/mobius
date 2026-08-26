@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import onnx_ir as ir
@@ -18,8 +20,10 @@ from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.qwen4_exp import (
     Qwen4ExpCausalLMModel,
     Qwen4ExpForConditionalGeneration,
+    Qwen4ExpVLDecoderModel,
     Qwen4ExpQSAIndexer,
 )
+from mobius.tasks._qwen4_exp import Qwen4ExpVisionLanguageTask
 
 
 def _config(**overrides) -> Qwen4ExpConfig:
@@ -76,6 +80,35 @@ def _build(config: Qwen4ExpConfig | None = None):
     module = Qwen4ExpCausalLMModel(config)
     model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
     return config, module, model
+
+
+def _vl_config(**overrides) -> Qwen4ExpConfig:
+    values = dict(
+        model_type="qwen4_exp",
+        vision=VisionConfig(
+            model_type="qwen4_exp_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=16,
+            num_position_embeddings=16,
+            hidden_act="gelu_pytorch_tanh",
+            deepstack_visual_indexes=[],
+        ),
+        image_token_id=30,
+        video_token_id=31,
+        vision_start_token_id=29,
+        vision_end_token_id=28,
+        mrope_section=[1, 1, 0],
+        mrope_interleaved=True,
+        deepstack_visual_indexes=[],
+    )
+    values.update(overrides)
+    return _config(**values)
 
 
 def test_pinned_config_fields_extract_and_normalize_schedule():
@@ -197,9 +230,8 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert multimodal.deepstack_visual_indexes == []
 
 
-def test_mtp_modes_fail_closed():
-    with pytest.raises(ValueError, match="MTP is unsupported"):
-        _config(mtp_num_hidden_layers=1)
+def test_mtp_metadata_is_preserved_but_dedicated_execution_fails_closed():
+    assert _config(mtp_num_hidden_layers=1).mtp_num_hidden_layers == 1
     with pytest.raises(ValueError, match="dedicated MTP embeddings"):
         _config(mtp_use_dedicated_embeddings=True)
 
@@ -287,30 +319,7 @@ def test_registry_routes_composite_and_text_model_types():
 
 
 def test_multimodal_package_exposes_exact_three_model_io():
-    config = _config(
-        model_type="qwen4_exp",
-        vision=VisionConfig(
-            model_type="qwen4_exp_vision",
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            patch_size=16,
-            temporal_patch_size=2,
-            spatial_merge_size=2,
-            out_hidden_size=16,
-            num_position_embeddings=16,
-            hidden_act="gelu_pytorch_tanh",
-            deepstack_visual_indexes=[],
-        ),
-        image_token_id=30,
-        video_token_id=31,
-        vision_start_token_id=29,
-        vision_end_token_id=28,
-        mrope_section=[1, 1, 0],
-        mrope_interleaved=True,
-        deepstack_visual_indexes=[],
-    )
+    config = _vl_config()
     module = Qwen4ExpForConditionalGeneration(config)
     package = build_from_module(
         module,
@@ -344,6 +353,219 @@ def test_multimodal_package_exposes_exact_three_model_io():
         "image_features",
         "video_features",
     }
+
+
+def test_multimodal_wrapper_fails_closed_without_exact_composite_shape():
+    with pytest.raises(ValueError, match="requires a vision config"):
+        Qwen4ExpForConditionalGeneration(_config(model_type="qwen4_exp"))
+    with pytest.raises(ValueError, match="does not support DeepStack"):
+        Qwen4ExpForConditionalGeneration(
+            _vl_config(
+                vision=VisionConfig(
+                    hidden_size=32,
+                    intermediate_size=64,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    patch_size=16,
+                    out_hidden_size=16,
+                    num_position_embeddings=16,
+                    hidden_act="gelu_pytorch_tanh",
+                    deepstack_visual_indexes=[0],
+                )
+            )
+        )
+
+
+def test_multimodal_embedding_preserves_global_image_and_video_order():
+    from mobius.integrations._weight_loading import apply_weights
+
+    config = _vl_config()
+    package = build_from_module(
+        Qwen4ExpForConditionalGeneration(config),
+        config,
+        task="qwen4-exp-vision-language",
+    )
+    embedding = package["embedding"]
+    weight = torch.arange(config.vocab_size * config.hidden_size, dtype=torch.float32).reshape(
+        config.vocab_size, config.hidden_size
+    )
+    apply_weights(embedding, {"embedding.embed_tokens.weight": weight})
+
+    input_ids = np.array(
+        [
+            [2, config.image_token_id, 3, config.video_token_id],
+            [config.video_token_id, 4, config.image_token_id, 5],
+        ],
+        dtype=np.int64,
+    )
+    image_features = np.stack(
+        [
+            np.full(config.hidden_size, 101.0, dtype=np.float32),
+            np.full(config.hidden_size, 202.0, dtype=np.float32),
+        ]
+    )
+    video_features = np.stack(
+        [
+            np.full(config.hidden_size, 303.0, dtype=np.float32),
+            np.full(config.hidden_size, 404.0, dtype=np.float32),
+        ]
+    )
+    session = OnnxModelSession(embedding)
+    try:
+        actual = session.run(
+            {
+                "input_ids": input_ids,
+                "image_features": image_features,
+                "video_features": video_features,
+            }
+        )["inputs_embeds"]
+    finally:
+        session.close()
+
+    np.testing.assert_array_equal(actual[0, 1], image_features[0])
+    np.testing.assert_array_equal(actual[1, 2], image_features[1])
+    np.testing.assert_array_equal(actual[0, 3], video_features[0])
+    np.testing.assert_array_equal(actual[1, 0], video_features[1])
+    np.testing.assert_array_equal(actual[0, 0], weight[input_ids[0, 0]].numpy())
+
+
+def test_graph_derived_ort_genai_metadata_preserves_all_decoder_state(tmp_path):
+    from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
+
+    config = _vl_config()
+    package = Qwen4ExpVisionLanguageTask().build(
+        Qwen4ExpForConditionalGeneration(config),
+        config,
+    )
+    result = write_ort_genai_config(
+        package,
+        str(tmp_path),
+        ep="cpu",
+        context_length=128,
+    )
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    model = data["model"]
+    assert model["type"] == "qwen4_exp"
+    decoder_inputs = model["decoder"]["inputs"]
+    decoder_outputs = model["decoder"]["outputs"]
+    assert decoder_inputs["ple_input_ids"] == "ple_input_ids"
+    assert decoder_inputs["past_position_ids"] == "past_position_ids"
+    assert decoder_inputs["past_index_key_names"] == "past_key_values.%d.index_key"
+    assert decoder_inputs["past_ple_context_names"] == "past_key_values.%d.ple_context"
+    assert decoder_inputs["past_ple_conv_state_names"] == "past_key_values.%d.ple_conv_state"
+    assert decoder_outputs["present_position_ids"] == "present_position_ids"
+    assert decoder_outputs["present_index_key_names"] == "present.%d.index_key"
+    assert decoder_outputs["present_ple_context_names"] == "present.%d.ple_context"
+    assert model["vision"]["inputs"] == {
+        "pixel_values": "pixel_values",
+        "image_grid_thw": "image_grid_thw",
+    }
+    assert model["embedding"]["inputs"] == {
+        "input_ids": "input_ids",
+        "image_features": "image_features",
+        "video_features": "video_features",
+    }
+    assert data["search"]["past_present_share_buffer"] is False
+    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
+        compatibility = json.load(handle)
+    assert compatibility["released_runtime_support"] is False
+    assert compatibility["heterogeneous_state_manifest"].startswith("graph-derived:")
+
+
+def test_processor_config_matches_qwen4exp_graph_contract(tmp_path):
+    from mobius.integrations.ort_genai.auto_export import (
+        _write_vision_processor_config,
+    )
+
+    image_processor = SimpleNamespace(
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
+        rescale_factor=1.0 / 255.0,
+        resample=3,
+        size={"shortest_edge": 65_536, "longest_edge": 16_777_216},
+    )
+    with mock.patch(
+        "transformers.AutoProcessor.from_pretrained",
+        return_value=SimpleNamespace(image_processor=image_processor),
+    ):
+        path = _write_vision_processor_config(
+            _vl_config(),
+            str(tmp_path),
+            hf_model_id="Qwen/Qwen3.8-Flash-Next",
+            revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+        )
+    assert path is not None
+    with open(path, encoding="utf-8") as handle:
+        processor = json.load(handle)["processor"]
+    transforms = processor["transforms"]
+    assert processor["name"] == "qwen2_5_image_processor"
+    assert [item["operation"]["type"] for item in transforms] == [
+        "DecodeImage",
+        "Resize",
+        "Rescale",
+        "Normalize",
+        "PatchImage",
+    ]
+    assert transforms[1]["operation"]["attrs"]["min_pixels"] == 65_536
+    assert transforms[1]["operation"]["attrs"]["max_pixels"] == 16_777_216
+    assert transforms[3]["operation"]["attrs"]["mean"] == [0.5, 0.5, 0.5]
+    assert transforms[3]["operation"]["attrs"]["std"] == [0.5, 0.5, 0.5]
+    assert transforms[4]["operation"]["attrs"] == {
+        "patch_size": 16,
+        "temporal_patch_size": 2,
+        "merge_size": 2,
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("media_kind", "placeholder", "pixel_name", "grid_name"),
+    [
+        ("images", "<|image_pad|>", "pixel_values", "image_grid_thw"),
+        ("videos", "<|video_pad|>", "pixel_values_videos", "video_grid_thw"),
+    ],
+)
+def test_real_processor_outputs_feed_vision_graph(
+    media_kind, placeholder, pixel_name, grid_name
+):
+    try:
+        from transformers import AutoProcessor
+    except ImportError:
+        pytest.skip("Transformers with Qwen4-Exp processor support is unavailable")
+
+    revision = "f5d08274bafd880402bd16f5e3e6c514136ec06c"
+    try:
+        processor = AutoProcessor.from_pretrained(
+            "Qwen/Qwen3.8-Flash-Next",
+            revision=revision,
+        )
+    except (OSError, ValueError, KeyError) as error:
+        pytest.skip(f"Pinned Qwen4-Exp processor is unavailable: {error}")
+
+    frame = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    media = [frame] if media_kind == "images" else [[frame, frame]]
+    batch = processor(
+        text=[f"<|vision_start|>{placeholder}<|vision_end|>"],
+        **{media_kind: media},
+        return_tensors="np",
+    )
+    pixels = np.asarray(batch[pixel_name])
+    grid = np.asarray(batch[grid_name])
+    vision = build_from_module(
+        Qwen4ExpForConditionalGeneration(_vl_config()),
+        _vl_config(),
+        task="qwen4-exp-vision-language",
+    )["vision_encoder"]
+    graph_inputs = {value.name: value for value in vision.graph.inputs}
+    assert pixels.dtype == np.float32
+    assert pixels.shape[-1] == 3 * 2 * 16 * 16
+    assert grid.dtype == np.int64
+    assert grid.shape[-1] == 3
+    assert graph_inputs["pixel_values"].dtype == ir.DataType.FLOAT
+    assert graph_inputs["pixel_values"].shape[-1] == pixels.shape[-1]
+    assert graph_inputs["image_grid_thw"].dtype == ir.DataType.INT64
 
 
 def test_graph_exposes_exact_heterogeneous_state_abi():
@@ -506,6 +728,32 @@ def test_preprocess_fails_closed_on_incomplete_or_malformed_gguf_indexer_split()
         )
 
 
+def test_multimodal_preprocess_routes_vision_projector_and_shared_embedding():
+    module = Qwen4ExpForConditionalGeneration(_vl_config())
+    embedding = torch.randn(32, 16)
+    merger = torch.randn(128, 128)
+    vision_mlp = torch.randn(64, 32)
+    result = module.preprocess_weights(
+        {
+            "model.language_model.embed_tokens.weight": embedding,
+            "model.visual.merger.linear_fc1.weight": merger,
+            "model.visual.blocks.0.mlp.linear_fc1.weight": vision_mlp,
+        }
+    )
+    assert result["decoder.model.embed_tokens.weight"] is embedding
+    assert result["embedding.embed_tokens.weight"] is embedding
+    assert result["vision_encoder.visual.merger.linear_fc1.weight"] is merger
+    assert result["vision_encoder.visual.blocks.0.mlp.up_proj.weight"] is vision_mlp
+
+
+def test_preprocess_ignores_nonexecuted_mtp_sidecar(caplog):
+    result = Qwen4ExpCausalLMModel(_config()).preprocess_weights(
+        {"mtp.fc_embedding.weight": torch.zeros(16, 16)}
+    )
+    assert result == {}
+    assert "does not expose an unsupported NextN task" in caplog.text
+
+
 def test_preprocess_fails_closed_on_noncanonical_packed_or_deterministic_weights():
     config = _config()
     module = Qwen4ExpCausalLMModel(config)
@@ -604,6 +852,65 @@ def test_random_weight_prefill_matches_token_by_token_decode():
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+def test_multimodal_decoder_matches_text_route_with_identical_positions():
+    text_config, _text_module, text_model = _build()
+    vl_config = _vl_config()
+    vl_decoder = Qwen4ExpVLDecoderModel(vl_config)
+    vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+
+    rng = np.random.default_rng(7)
+    values: dict[str, np.ndarray] = {}
+    for initializer in text_model.graph.initializers.values():
+        if initializer.const_value is None:
+            value = rng.normal(0.0, 0.02, [int(dim) for dim in initializer.shape]).astype(
+                np.float32
+            )
+            initializer.const_value = ir.tensor(value)
+            values[initializer.name] = value
+    for initializer in vl_model.graph.initializers.values():
+        if initializer.const_value is None:
+            initializer.const_value = ir.tensor(values[initializer.name])
+
+    input_ids = np.array([[2, 3, 4, 5]], dtype=np.int64)
+    attention_mask = np.ones((1, 4), dtype=np.int64)
+    text_positions = np.arange(4, dtype=np.int64)[None]
+    embedding_weight = values["model.embed_tokens.weight"]
+    inputs_embeds = embedding_weight[input_ids]
+    multimodal_positions = np.broadcast_to(
+        text_positions[None],
+        (4, 1, 4),
+    ).copy()
+
+    text_session = OnnxModelSession(text_model)
+    vl_session = OnnxModelSession(vl_model)
+    try:
+        text_logits = text_session.run(
+            _initial_states()
+            | {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": text_positions,
+            }
+        )["logits"]
+        vl_states = _initial_states()
+        vl_states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
+        vl_logits = vl_session.run(
+            vl_states
+            | {
+                "inputs_embeds": inputs_embeds,
+                "ple_input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": multimodal_positions,
+            }
+        )["logits"]
+    finally:
+        text_session.close()
+        vl_session.close()
+
+    np.testing.assert_allclose(vl_logits, text_logits, rtol=1e-5, atol=1e-6)
+    assert text_config.hidden_size == vl_config.hidden_size
 
 
 def test_left_padding_matches_unpadded_prefill_and_following_decode():
@@ -788,3 +1095,36 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
     np.testing.assert_allclose(onnx_full, hf_full, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(onnx_full, hf_decode, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(onnx_masked, hf_masked, rtol=1e-3, atol=1e-3)
+
+    # The multimodal decoder receives fused embeddings but must hash the
+    # original lexical IDs through its independent PLE input. With all four
+    # position channels equal (text-only), this route must remain identical.
+    vl_config = _vl_config()
+    vl_decoder = Qwen4ExpVLDecoderModel(vl_config)
+    vl_model = Qwen4ExpVisionLanguageTask._build_decoder(vl_decoder, vl_config)
+    apply_weights(
+        vl_model,
+        vl_decoder.preprocess_weights(dict(hf_model.state_dict())),
+    )
+    with torch.no_grad():
+        inputs_embeds = hf_model.model.embed_tokens(torch.from_numpy(input_ids)).numpy()
+    position_ids_4d = np.broadcast_to(
+        np.arange(4, dtype=np.int64)[None, None, :],
+        (4, 1, 4),
+    ).copy()
+    vl_states = _initial_states()
+    vl_states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
+    vl_session = OnnxModelSession(vl_model)
+    try:
+        vl_logits = vl_session.run(
+            vl_states
+            | {
+                "inputs_embeds": inputs_embeds,
+                "ple_input_ids": input_ids,
+                "attention_mask": np.ones((1, 4), dtype=np.int64),
+                "position_ids": position_ids_4d,
+            }
+        )["logits"]
+    finally:
+        vl_session.close()
+    np.testing.assert_allclose(vl_logits, hf_full, rtol=1e-3, atol=1e-3)

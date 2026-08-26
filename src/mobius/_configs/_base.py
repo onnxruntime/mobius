@@ -1705,11 +1705,6 @@ class Qwen4ExpConfig(CausalLMConfig):
             if self.split_ngram_parts <= 0:
                 raise ValueError("Qwen4-Exp split_ngram_parts must be > 0")
 
-        if self.mtp_num_hidden_layers:
-            raise ValueError(
-                "Qwen4-Exp MTP is unsupported: the pinned official runtime defines "
-                "no MTP execution or NextN cache ABI"
-            )
         if self.mtp_use_dedicated_embeddings:
             raise ValueError(
                 "Qwen4-Exp dedicated MTP embeddings are unsupported: the pinned "
