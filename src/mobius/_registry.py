@@ -498,6 +498,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_revision="62d188c7d58843d7013d5b3ffe198db448787860",
         family="plm",
     ),
+    "pangu_embedded": ModelRegistration(CausalLMModel, family="pangu-embedded"),
     "gemma": ModelRegistration(GemmaCausalLMModel),
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
     "gemma3": ModelRegistration(Gemma3MultiModalModel, task="gemma3-vision-language"),

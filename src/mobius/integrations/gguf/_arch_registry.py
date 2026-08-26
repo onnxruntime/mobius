@@ -443,8 +443,9 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
     ),
     "plamo3": (
         "PLaMo3 requires fused QKV and fused SwiGLU, four norm sites with architecture-"
-        "specific offset transforms, Q/K norm before RoPE, and alternating full/sliding "
-        "attention state. Mobius has no exact iSWA schedule or value transform."
+        "specific offset transforms, Q/K norm before RoPE, and a periodic full/sliding "
+        "attention state (seven sliding layers then one full layer by default). Mobius has "
+        "no exact iSWA cache ABI or value transform."
     ),
     "plm": (
         "PLM uses latent KV projections and normalization with shared RoPE keys, expanded "
@@ -2046,6 +2047,20 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="pangu-embedded",
+        model_type="pangu_embedded",
+        tensor_map_recipe=("llama",),
+        config_postprocessor="pangu_embedded",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Import is intentionally restricted to split Q/K/V tensors and ordinary "
+            "full-head RoPE. Fused QKV and tensor-backed LongRoPE remain fail-closed until "
+            "their packed row and factor-value contracts can be preserved exactly."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="t5",
         model_type="t5",
         tensor_map_recipe=("t5",),
@@ -2140,6 +2155,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "jais2",
             "plm",
             "orion",
+            "pangu-embedded",
             "qwen",
             "refact",
             "starcoder",

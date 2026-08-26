@@ -1718,6 +1718,7 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         "command-r",
         "jais2",
         "orion",
+        "pangu-embedded",
         "qwen",
         "starcoder",
         "xverse",
@@ -1777,13 +1778,16 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         name: tuple(int(dimension) for dimension in shape)
         for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
     }
-    if architecture in {"command-r", "orion", "xverse"}:
+    if architecture in {"command-r", "orion", "pangu-embedded", "xverse"}:
         fused = sorted(name for name in actual if name.endswith(".attn_qkv.weight"))
         if fused:
             raise ValueError(
                 f"{architecture} GGUF fused QKV tensors are not supported; "
                 f"split attn_q/attn_k/attn_v tensors are required: {fused}"
             )
+    pangu_has_qkv_bias = architecture == "pangu-embedded" and any(
+        name.endswith(("attn_q.bias", "attn_k.bias", "attn_v.bias")) for name in actual
+    )
     required: dict[str, tuple[int, ...]] = {}
     optional: dict[str, tuple[int, ...]] = {}
     if architecture == "codeshell":
@@ -1807,10 +1811,10 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         optional["output.weight"] = output_shape
     elif architecture in {"orion", "qwen", "xverse"}:
         required["output.weight"] = output_shape
-    elif architecture in {"bloom", "jais2", "starcoder"}:
+    elif architecture in {"bloom", "jais2", "pangu-embedded", "starcoder"}:
         optional["output.weight"] = output_shape
 
-    gated = architecture in {"command-r", "orion", "qwen", "xverse"}
+    gated = architecture in {"command-r", "orion", "pangu-embedded", "qwen", "xverse"}
     fused_only = architecture in {"bloom", "qwen", "starcoder"}
     separate_only = architecture == "jais2"
     for layer in range(layers):
@@ -1819,7 +1823,7 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
             required[prefix + "attn_norm.bias"] = (hidden,)
         required[prefix + "attn_output.weight"] = (hidden, hidden)
-        if architecture in {"bloom", "codeshell", "jais2", "starcoder"}:
+        if architecture in {"bloom", "codeshell", "jais2", "pangu-embedded", "starcoder"}:
             required[prefix + "attn_output.bias"] = (hidden,)
 
         fused = prefix + "attn_qkv.weight"
@@ -1843,6 +1847,14 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
                         prefix + "attn_v.bias": (kv_dim,),
                     }
                 )
+            elif architecture == "pangu-embedded":
+                qkv_bias_names = {
+                    prefix + "attn_q.bias": (hidden,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                }
+                if pangu_has_qkv_bias:
+                    required.update(qkv_bias_names)
         if architecture != "command-r":
             required[prefix + "ffn_norm.weight"] = (hidden,)
         if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
@@ -1854,6 +1866,10 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         if architecture in {"bloom", "codeshell", "jais2", "starcoder"}:
             required[prefix + "ffn_up.bias"] = (intermediate,)
             required[prefix + "ffn_down.bias"] = (hidden,)
+
+    if architecture == "pangu-embedded":
+        rope_dim = int(metadata.get(f"{architecture}.rope.dimension_count", head_dim))
+        optional["rope_freqs.weight"] = (rope_dim // 2,)
 
     allowed = set(required) | set(optional)
     missing = sorted(set(required) - set(actual))

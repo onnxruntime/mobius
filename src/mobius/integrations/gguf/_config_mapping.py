@@ -2176,6 +2176,44 @@ def _phimoe_postprocess(
     )
 
 
+def _pangu_embedded_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Restore the exact ordinary-RoPE Pangu-Embedded decoder contract."""
+    arch = "pangu-embedded"
+    tensor_names = set(getattr(model, "tensor_names", ()) or ())
+    factor_tensors = tensor_names & {
+        "rope_factors_long.weight",
+        "rope_factors_short.weight",
+    }
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if factor_tensors or scaling_type not in (None, "", "none"):
+        raise ValueError(
+            "pangu-embedded tensor-backed or scaled RoPE is not supported; "
+            "ordinary full-head RoPE is required"
+        )
+
+    head_dim = config.hidden_size // config.num_attention_heads
+    for suffix in ("attention.key_length", "attention.value_length", "rope.dimension_count"):
+        value = metadata.get(f"{arch}.{suffix}")
+        if value is not None and int(value) != head_dim:
+            raise ValueError(f"{arch}.{suffix} must equal head_dim ({head_dim}), got {value}")
+    if not config.attn_o_bias:
+        raise ValueError("pangu-embedded requires attn_output.bias in every layer")
+    if config.mlp_bias:
+        raise ValueError("pangu-embedded does not support FFN projection biases")
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        rope_type="default",
+        rope_scaling=None,
+        partial_rotary_factor=1.0,
+        attn_qk_norm=False,
+    )
+
+
 def _gemma4_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -3586,6 +3624,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
     "granitemoe": _granitemoe_postprocess,
     "phimoe": _phimoe_postprocess,
+    "pangu_embedded": _pangu_embedded_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
     "gemma2": _gemma2_postprocess,
     "baichuan": _baichuan_postprocess,

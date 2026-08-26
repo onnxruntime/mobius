@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from mobius._registry import registry
-from mobius.integrations.gguf._arch_registry import get_arch_spec
+from mobius.integrations.gguf._arch_registry import get_arch_spec, try_get_arch_spec
 from mobius.integrations.gguf._builder import (
     _raise_for_invalid_conventional_decoder_tensor_contract,
 )
@@ -27,6 +27,7 @@ _ARCHITECTURES = (
     "command-r",
     "jais2",
     "orion",
+    "pangu-embedded",
     "qwen",
     "starcoder",
     "xverse",
@@ -54,7 +55,7 @@ def _fixture(architecture: str) -> _FakeGGUF:
     serialized_ffn = 2 * intermediate if architecture == "qwen" else intermediate
     epsilon = (
         "attention.layer_norm_rms_epsilon"
-        if architecture in {"qwen", "xverse"}
+        if architecture in {"pangu-embedded", "qwen", "xverse"}
         else "attention.layer_norm_epsilon"
     )
     metadata = {
@@ -86,7 +87,7 @@ def _fixture(architecture: str) -> _FakeGGUF:
     tensors["output_norm.weight"] = (hidden,)
     if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
         tensors["output_norm.bias"] = (hidden,)
-    if architecture in {"codeshell", "orion", "qwen", "xverse"}:
+    if architecture in {"codeshell", "orion", "pangu-embedded", "qwen", "xverse"}:
         tensors["output.weight"] = (24, hidden)
 
     prefix = "blk.0."
@@ -94,7 +95,7 @@ def _fixture(architecture: str) -> _FakeGGUF:
     if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
         tensors[prefix + "attn_norm.bias"] = (hidden,)
     tensors[prefix + "attn_output.weight"] = (hidden, hidden)
-    if architecture in {"bloom", "codeshell", "jais2", "starcoder"}:
+    if architecture in {"bloom", "codeshell", "jais2", "pangu-embedded", "starcoder"}:
         tensors[prefix + "attn_output.bias"] = (hidden,)
 
     kv_dim = kv_heads * (hidden // heads)
@@ -117,11 +118,19 @@ def _fixture(architecture: str) -> _FakeGGUF:
                     prefix + "attn_v.bias": (kv_dim,),
                 }
             )
+        if architecture == "pangu-embedded":
+            tensors.update(
+                {
+                    prefix + "attn_q.bias": (hidden,),
+                    prefix + "attn_k.bias": (kv_dim,),
+                    prefix + "attn_v.bias": (kv_dim,),
+                }
+            )
     if architecture != "command-r":
         tensors[prefix + "ffn_norm.weight"] = (hidden,)
     if architecture in {"bloom", "codeshell", "jais2", "orion", "starcoder"}:
         tensors[prefix + "ffn_norm.bias"] = (hidden,)
-    if architecture in {"command-r", "orion", "qwen", "xverse"}:
+    if architecture in {"command-r", "orion", "pangu-embedded", "qwen", "xverse"}:
         tensors[prefix + "ffn_gate.weight"] = (intermediate, hidden)
     tensors[prefix + "ffn_up.weight"] = (intermediate, hidden)
     tensors[prefix + "ffn_down.weight"] = (hidden, intermediate)
@@ -164,6 +173,7 @@ def test_conventional_decoder_config_tensor_and_graph_closure(architecture: str)
         ("command-r", "command_r", "silu", 16),
         ("jais2", "jais2", "relu2", 16),
         ("orion", "orion", "silu", 16),
+        ("pangu-embedded", "pangu_embedded", "silu", 16),
         ("qwen", "qwen", "silu", 16),
         ("starcoder", "gpt_bigcode", "gelu_pytorch_tanh", 16),
         ("xverse", "xverse", "silu", 16),
@@ -185,7 +195,7 @@ def test_conventional_decoder_config_defaults_match_source_configs(
 
 
 def test_conventional_decoder_support_and_runtime_verdicts_are_explicit() -> None:
-    supported_quantized = {"command-r", "jais2"}
+    supported_quantized = {"command-r", "jais2", "pangu-embedded"}
     for architecture in _ARCHITECTURES:
         spec = get_arch_spec(architecture)
         assert spec.is_importable
@@ -285,7 +295,7 @@ def test_command_r_rejects_nonpositive_or_nonfinite_logit_scale(
         _raise_for_invalid_conventional_decoder_tensor_contract(model)
 
 
-@pytest.mark.parametrize("architecture", ["command-r", "orion", "xverse"])
+@pytest.mark.parametrize("architecture", ["command-r", "orion", "pangu-embedded", "xverse"])
 def test_unimplemented_fused_qkv_forms_are_rejected_early(architecture: str) -> None:
     model = _fixture(architecture)
     hidden = model.metadata[f"{architecture}.embedding_length"]
@@ -303,6 +313,95 @@ def test_unimplemented_fused_qkv_forms_are_rejected_early(architecture: str) -> 
 
     with pytest.raises(ValueError, match="fused QKV tensors are not supported"):
         _raise_for_invalid_conventional_decoder_tensor_contract(model)
+
+
+def test_pangu_embedded_requires_attention_output_bias() -> None:
+    model = _fixture("pangu-embedded")
+    model._tensors.pop("blk.0.attn_output.bias")
+    model.tensor_names = list(model._tensors)
+
+    with pytest.raises(ValueError, match=r"attn_output\.bias"):
+        _raise_for_invalid_conventional_decoder_tensor_contract(model)
+
+
+def test_pangu_embedded_rejects_partial_qkv_bias() -> None:
+    model = _fixture("pangu-embedded")
+    model._tensors.pop("blk.0.attn_k.bias")
+    model.tensor_names = list(model._tensors)
+
+    with pytest.raises(ValueError, match=r"attn_k\.bias"):
+        _raise_for_invalid_conventional_decoder_tensor_contract(model)
+
+
+@pytest.mark.parametrize("factor", ["rope_factors_long.weight", "rope_factors_short.weight"])
+def test_pangu_embedded_longrope_factors_fail_closed(factor: str) -> None:
+    model = _fixture("pangu-embedded")
+    model._tensors[factor] = (4,)
+    model.tensor_names = list(model._tensors)
+    model.metadata["pangu-embedded.rope.scaling.type"] = "longrope"
+
+    with pytest.raises(ValueError, match="rope_factors"):
+        _raise_for_invalid_conventional_decoder_tensor_contract(model)
+
+
+def test_pangu_embedded_scaled_rope_metadata_fails_closed() -> None:
+    model = _fixture("pangu-embedded")
+    model.metadata["pangu-embedded.rope.scaling.type"] = "longrope"
+    _raise_for_invalid_conventional_decoder_tensor_contract(model)
+
+    with pytest.raises(ValueError, match="ordinary full-head RoPE"):
+        gguf_to_config(model)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "value"),
+    [
+        ("attention.key_length", 3),
+        ("attention.value_length", 3),
+        ("rope.dimension_count", 3),
+    ],
+)
+def test_pangu_embedded_requires_full_head_rope_geometry(suffix: str, value: int) -> None:
+    model = _fixture("pangu-embedded")
+    model.metadata[f"pangu-embedded.{suffix}"] = value
+    _raise_for_invalid_conventional_decoder_tensor_contract(model)
+
+    with pytest.raises(ValueError, match="must equal head_dim"):
+        gguf_to_config(model)
+
+
+def test_pangu_embedded_tied_output_has_single_embedding_owner() -> None:
+    model = _fixture("pangu-embedded")
+    model._tensors.pop("output.weight")
+    model.tensor_names = list(model._tensors)
+    config = gguf_to_config(model)
+    module = registry.get(config.model_type)(config)
+
+    assert config.tie_word_embeddings
+    assert module.lm_head.weight is module.model.embed_tokens.weight
+    graph = CausalLMTask().build(module, config)["model"]
+    assert "model.embed_tokens.weight" in graph.graph.initializers
+    assert "lm_head.weight" not in graph.graph.initializers
+
+
+@pytest.mark.parametrize(
+    ("architecture", "reason_fragments"),
+    [
+        ("maincoder", ("after RoPE", "ordering")),
+        ("mistral4", ("conditional dense/MoE", "overrides graph construction")),
+        ("plamo", ("parallel", "Q/output projection shuffles")),
+        ("plamo3", ("fused QKV", "periodic full/sliding", "iSWA cache ABI")),
+    ],
+)
+def test_remaining_dense_architecture_blockers_are_precise(
+    architecture: str, reason_fragments: tuple[str, ...]
+) -> None:
+    spec = try_get_arch_spec(architecture)
+    assert spec is not None
+    assert not spec.is_importable
+    assert spec.reason is not None
+    for fragment in reason_fragments:
+        assert fragment in spec.reason
 
 
 @pytest.mark.parametrize("fused", [False, True])
