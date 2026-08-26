@@ -266,7 +266,9 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
 
     Some HuggingFace checkpoints (e.g. Ministral-3-3B) store linear layer
     weights as float8_e4m3fn with a scalar ``weight_scale_inv`` tensor.
-    The real weight value is ``fp8_weight.to(bfloat16) * weight_scale_inv``.
+    Others use a two-dimensional grid of inverse scales, with each element
+    applying to a 128-by-128 weight block. The real weight value is
+    ``fp8_weight.to(bfloat16) * weight_scale_inv``.
 
     Dequantization targets bfloat16 because that is the native training
     dtype for FP8-quantized checkpoints — the FP8 values represent
@@ -303,7 +305,42 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
             # Cast scale to bfloat16 to guarantee the output dtype is bfloat16,
             # even when weight_scale_inv is stored as FP32 in the checkpoint.
             scale = result[scale_key].to(torch.bfloat16)
-            result[key] = result[key].to(torch.bfloat16) * scale
+            if scale.ndim == 0:
+                result[key] = result[key].to(torch.bfloat16) * scale
+            elif scale.ndim == 2:
+                weight = result[key]
+                if weight.ndim != 2:
+                    raise ValueError(
+                        f"FP8 weight '{key}' has a 2-D scale grid but is "
+                        f"{weight.ndim}-D; block scaling requires a 2-D weight"
+                    )
+
+                rows, cols = weight.shape
+                expected_grid_shape = ((rows + 127) // 128, (cols + 127) // 128)
+                if tuple(scale.shape) != expected_grid_shape:
+                    raise ValueError(
+                        f"FP8 weight '{key}' has scale grid shape {tuple(scale.shape)}; "
+                        f"expected {expected_grid_shape} for weight shape {tuple(weight.shape)}"
+                    )
+
+                # Scale each 128-by-128 tile in the BF16 output. This avoids
+                # allocating a full expanded scale tensor for large expert weights.
+                dequantized = weight.to(torch.bfloat16)
+                for block_row in range(expected_grid_shape[0]):
+                    row_start = block_row * 128
+                    row_end = min(row_start + 128, rows)
+                    for block_col in range(expected_grid_shape[1]):
+                        col_start = block_col * 128
+                        col_end = min(col_start + 128, cols)
+                        dequantized[row_start:row_end, col_start:col_end].mul_(
+                            scale[block_row, block_col]
+                        )
+                result[key] = dequantized
+            else:
+                raise ValueError(
+                    f"FP8 weight '{key}' has scale with shape {tuple(scale.shape)}; "
+                    "expected a scalar or 2-D block scale grid"
+                )
         else:
             logger.warning("FP8 weight '%s' has no scale_inv — casting without scaling", key)
             result[key] = result[key].to(torch.bfloat16)
