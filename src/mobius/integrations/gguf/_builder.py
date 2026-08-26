@@ -20,9 +20,10 @@ __all__ = ["build_from_gguf"]
 import logging
 import math
 import re
+import shutil
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -34,6 +35,7 @@ from huggingface_hub import (
     get_session,
     hf_hub_download,
     hf_hub_url,
+    try_to_load_from_cache,
 )
 from huggingface_hub.utils import build_hf_headers
 
@@ -351,7 +353,6 @@ def _assert_sparse_moe_graph(pkg, *, source: str, allow_dense: bool) -> None:
 def _preflight_hf_gguf(api: HfApi, repo_id: str, filename: str) -> None:
     """Use Hub metadata to reject known-bad inputs before a multi-GB download."""
     source = f"{repo_id}:{filename}"
-    _raise_for_sharded_gguf(source=source, filename=filename)
     try:
         info = api.model_info(repo_id, expand=["gguf"])
     except TypeError as error:
@@ -402,7 +403,6 @@ def _preflight_hf_gguf_file(
 ) -> str:
     """Validate the exact selected Hub file header and return its immutable revision."""
     source = f"{repo_id}@{revision}:{filename}"
-    _raise_for_sharded_gguf(source=source, filename=filename)
     url = hf_hub_url(repo_id, filename, revision=revision)
     try:
         metadata = get_hf_file_metadata(url)
@@ -4653,6 +4653,185 @@ def _looks_like_hf_repo_id(value: str) -> bool:
     return len(parts) == 2 and all(p and not p.endswith(".gguf") for p in parts)
 
 
+def _select_complete_hf_gguf_set(
+    repo_files: Collection[str],
+    filename: str | None,
+) -> tuple[str, list[str]]:
+    """Select one immutable logical GGUF and enumerate its complete shard set."""
+    gguf_files = sorted(name for name in repo_files if name.lower().endswith(".gguf"))
+    if not gguf_files:
+        raise FileNotFoundError("The Hugging Face repository contains no *.gguf files.")
+
+    if filename is None:
+        plain_files = [
+            name
+            for name in gguf_files
+            if _GGUF_SHARD_FILENAME_RE.search(PurePosixPath(name).name) is None
+        ]
+        shard_groups: dict[tuple[str, str, int], list[str]] = {}
+        for name in gguf_files:
+            path = PurePosixPath(name)
+            match = _GGUF_SHARD_FILENAME_RE.search(path.name)
+            if match is None:
+                continue
+            prefix = path.name[: match.start()]
+            key = (path.parent.as_posix(), prefix, int(match.group("count")))
+            shard_groups.setdefault(key, []).append(name)
+        if len(plain_files) == 1 and not shard_groups:
+            return plain_files[0], plain_files
+        if len(shard_groups) == 1 and not plain_files:
+            group = next(iter(shard_groups.values()))
+            filename = sorted(group)[0]
+        else:
+            raise ValueError(
+                "The Hugging Face repository contains multiple logical GGUF models: "
+                f"{gguf_files}. Specify one via 'owner/repo:<filename.gguf>'."
+            )
+
+    if filename not in gguf_files:
+        raise FileNotFoundError(
+            f"GGUF file {filename!r} is not present in the selected Hugging Face revision."
+        )
+    selected_path = PurePosixPath(filename)
+    selected_match = _GGUF_SHARD_FILENAME_RE.search(selected_path.name)
+    if selected_match is None:
+        return filename, [filename]
+
+    prefix = selected_path.name[: selected_match.start()]
+    count = int(selected_match.group("count"))
+    by_index: dict[int, str] = {}
+    for candidate in gguf_files:
+        candidate_path = PurePosixPath(candidate)
+        if candidate_path.parent != selected_path.parent:
+            continue
+        match = _GGUF_SHARD_FILENAME_RE.search(candidate_path.name)
+        if match is None:
+            continue
+        if (
+            candidate_path.name[: match.start()] != prefix
+            or int(match.group("count")) != count
+        ):
+            continue
+        index = int(match.group("index"))
+        if index in by_index:
+            raise ValueError(
+                f"Duplicate Hugging Face GGUF shard index {index:05d}: "
+                f"{by_index[index]!r} and {candidate!r}."
+            )
+        by_index[index] = candidate
+
+    missing = [index for index in range(1, count + 1) if index not in by_index]
+    if missing:
+        raise ValueError(
+            f"Incomplete Hugging Face GGUF split set for {filename!r}: declared "
+            f"{count} shards but missing indices {[f'{index:05d}' for index in missing]}. "
+            "No payload was downloaded."
+        )
+    extra = sorted(index for index in by_index if index < 1 or index > count)
+    if extra:
+        raise ValueError(
+            f"GGUF split set for {filename!r} has out-of-range shard indices {extra}."
+        )
+    return filename, [by_index[index] for index in range(1, count + 1)]
+
+
+def _existing_disk_usage_path(path: Path) -> Path:
+    """Return the nearest existing ancestor accepted by ``disk_usage``."""
+    candidate = path.expanduser().absolute()
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _preflight_hf_download_space(total_bytes: int, *, cache_path: Path) -> None:
+    """Fail before download when the Hub cache cannot hold the complete set."""
+    if total_bytes < 0:
+        raise ValueError(f"GGUF download size cannot be negative, got {total_bytes} bytes.")
+    if total_bytes == 0:
+        return
+    usage = shutil.disk_usage(_existing_disk_usage_path(cache_path))
+    if usage.free < total_bytes:
+        raise OSError(
+            "Insufficient free space for the complete GGUF split set: "
+            f"requires {total_bytes:,} bytes ({total_bytes / (1 << 30):.2f} GiB), "
+            f"but only {usage.free:,} bytes ({usage.free / (1 << 30):.2f} GiB) "
+            f"are available for the Hugging Face cache at {cache_path}. "
+            "Free space or set HF_HOME/HF_HUB_CACHE to a larger volume; no shard "
+            "download was started."
+        )
+
+
+def _download_hf_gguf_shards(
+    api: HfApi,
+    *,
+    repo_id: str,
+    selected_filename: str,
+    shard_filenames: list[str],
+    revision: str,
+) -> str:
+    """Preflight and download one complete shard set at an immutable revision."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    paths_info = api.get_paths_info(
+        repo_id,
+        shard_filenames,
+        revision=revision,
+        expand=True,
+    )
+    info_by_path = {getattr(info, "path", None): info for info in paths_info}
+    sizes: dict[str, int] = {}
+    required_bytes = 0
+    for name in shard_filenames:
+        info = info_by_path.get(name)
+        size = int(getattr(info, "size", 0) or 0)
+        if info is None or size <= 0:
+            raise ValueError(
+                f"Hugging Face metadata omitted a positive size for GGUF shard "
+                f"{name!r} at {repo_id}@{revision}; no payload was downloaded."
+            )
+        sizes[name] = size
+        cached = try_to_load_from_cache(
+            repo_id,
+            name,
+            cache_dir=HF_HUB_CACHE,
+            revision=revision,
+        )
+        if not (
+            isinstance(cached, str)
+            and Path(cached).is_file()
+            and Path(cached).stat().st_size == size
+        ):
+            required_bytes += size
+
+    total_bytes = sum(sizes.values())
+    _preflight_hf_download_space(required_bytes, cache_path=Path(HF_HUB_CACHE))
+    logger.info(
+        "Downloading complete GGUF split set: %d shards, %.3f GiB total, "
+        "%.3f GiB not cached from %s@%s",
+        len(shard_filenames),
+        total_bytes / float(1 << 30),
+        required_bytes / float(1 << 30),
+        repo_id,
+        revision,
+    )
+
+    downloaded: dict[str, str] = {}
+    for name in shard_filenames:
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=name,
+            revision=revision,
+        )
+        actual_size = Path(local_path).stat().st_size
+        if actual_size != sizes[name]:
+            raise OSError(
+                f"Downloaded GGUF shard {name!r} has {actual_size:,} bytes, "
+                f"expected {sizes[name]:,}; remove the corrupt cache entry and retry."
+            )
+        downloaded[name] = local_path
+    return downloaded[selected_filename]
+
+
 def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bool) -> str:
     """Resolve a GGUF reference with an internal primary/companion context.
 
@@ -4680,37 +4859,44 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
         return raw
 
     api = HfApi()
-    if not filename:
-        files = [
-            f for f in api.list_repo_files(repo_id, revision=revision) if f.endswith(".gguf")
-        ]
-        if not files:
-            raise FileNotFoundError(f"No *.gguf files found in HF repo {repo_id!r}")
-        if len(files) > 1:
-            raise ValueError(
-                f"HF repo {repo_id!r} contains multiple .gguf files: {files}. "
-                f"Specify one via '{repo_id}:<filename.gguf>'."
-            )
-        filename = files[0]
+    if filename and _GGUF_SHARD_FILENAME_RE.search(PurePosixPath(filename).name) is None:
+        selected_files = [filename]
+    else:
+        repo_files = api.list_repo_files(repo_id, revision=revision)
+        filename, selected_files = _select_complete_hf_gguf_set(repo_files, filename or None)
+    primary_filename = selected_files[0]
 
     resolved_revision: str | None
     if allow_mmproj_companion:
+        if len(selected_files) != 1:
+            raise ValueError("Sharded mmproj companion GGUF files are not supported.")
         resolved_revision = _preflight_hf_mmproj_companion_file(
             repo_id,
-            filename,
+            primary_filename,
             revision=revision,
         )
     else:
         resolved_revision = _preflight_hf_gguf_file(
             repo_id,
-            filename,
+            primary_filename,
             revision=revision,
         )
-    logger.info("Downloading %s from %s", filename, repo_id)
     if resolved_revision is None:
         raise RuntimeError(
             f"Hub did not resolve an immutable revision for {repo_id}:{filename}"
         )
+    if len(selected_files) > 1:
+        pinned_files = api.list_repo_files(repo_id, revision=resolved_revision)
+        filename, selected_files = _select_complete_hf_gguf_set(pinned_files, filename)
+        return _download_hf_gguf_shards(
+            api,
+            repo_id=repo_id,
+            selected_filename=filename,
+            shard_filenames=selected_files,
+            revision=resolved_revision,
+        )
+
+    logger.info("Downloading %s from %s", filename, repo_id)
     return hf_hub_download(
         repo_id=repo_id,
         filename=filename,
@@ -4726,6 +4912,29 @@ def _resolve_gguf_path(gguf_path: str | Path) -> str:
 def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
     """Resolve an internal mmproj companion, allowing only ``clip`` Hub metadata."""
     return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
+
+
+def _hub_cache_identity_paths(paths: Collection[Path]) -> list[Path] | None:
+    """Resolve trusted Hub snapshot links to regular blob paths for hashing."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    cache_root = Path(HF_HUB_CACHE).expanduser().absolute()
+    resolved_paths: list[Path] = []
+    for path in paths:
+        absolute = path.expanduser().absolute()
+        try:
+            absolute.relative_to(cache_root)
+        except ValueError:
+            return None
+        resolved = absolute.resolve(strict=True)
+        try:
+            resolved.relative_to(cache_root)
+        except ValueError:
+            return None
+        if not resolved.is_file() or resolved.is_symlink():
+            return None
+        resolved_paths.append(resolved)
+    return resolved_paths
 
 
 def _logical_source_filename(reference: str | Path, resolved_path: str | Path) -> str:
@@ -4780,12 +4989,14 @@ def build_from_gguf(
     error instead of silently falling back to a float model.
 
     Args:
-        gguf_path: Path to the ``.gguf`` file, *or* a HuggingFace Hub
+        gguf_path: Path to a ``.gguf`` file or any member of a complete local
+            split set, *or* a HuggingFace Hub
             reference of the form ``"owner/repo"`` (the repo must
             contain exactly one ``*.gguf`` file) or
             ``"owner/repo:filename.gguf"`` to pick a specific file. HF
             references are downloaded via ``huggingface_hub`` into the
-            standard local cache.
+            standard local cache. A selected Hub shard resolves every sibling
+            at one immutable commit after a total-size/free-space preflight.
         task: Override the model task (e.g. ``"text-generation"``).
             When ``None``, the task is auto-detected from the
             model type.
@@ -4906,7 +5117,7 @@ def build_from_gguf(
     gguf_path = _resolve_gguf_path(gguf_path)
     logical_source_filename = _logical_source_filename(source_reference, gguf_path)
     source_path = Path(gguf_path)
-    if source_path.is_symlink():
+    if source_path.is_symlink() and _GGUF_SHARD_FILENAME_RE.search(source_path.name) is None:
         from huggingface_hub.constants import HF_HUB_CACHE
 
         try:
@@ -4918,6 +5129,10 @@ def build_from_gguf(
             source_path = source_path.resolve(strict=True)
             gguf_path = str(source_path)
     gguf_model = _gguf_model if _gguf_model is not None else open_gguf_model(gguf_path)
+    if isinstance(gguf_model, GgufShardSet):
+        identity_paths = _hub_cache_identity_paths(gguf_model.shard_paths)
+        if identity_paths is not None:
+            gguf_model._set_identity_paths(identity_paths)
     _validate_gguf_model(gguf_model, source=str(gguf_path))
     if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
         raise ValueError(
@@ -7108,9 +7323,6 @@ def _load_quantized_state_dict(
     # per-tensor file offset (mainline byte sizes are wrong).
     tencent_q1_0 = is_tencent_q1_0_layout(gguf_model)
     if tencent_q1_0:
-        gguf_path = str(gguf_model._path)
-        data_section_offset = gguf_model._reader.data_offset
-        tensors_by_name = {t.name: t for t in gguf_model._reader.tensors}
         logger.info(
             "Detected Tencent Q1_0 layout (block_size=512, 2-bit SEQ); "
             "using custom per-tensor parser"
@@ -7568,10 +7780,13 @@ def _load_quantized_state_dict(
             n_repacked += num_experts
         elif should_repack:
             if is_tencent_q1_0_tensor:
+                gguf_path, data_section_offset, reader_tensor = gguf_model._tensor_source(
+                    gguf_name
+                )
                 repacked = parse_tencent_q1_0_tensor(
-                    gguf_path,
+                    str(gguf_path),
                     data_section_offset,
-                    tensors_by_name[gguf_name],
+                    reader_tensor,
                 )
                 if (repacked.bits, repacked.block_size) != (
                     target_bits,
