@@ -1067,7 +1067,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "mistral": "mistralai/Mistral-7B-v0.1",
     "qwen2": "Qwen/Qwen2.5-0.5B",
     "qwen4_exp": "Qwen/Qwen3.8-Flash-Next",
-    "qwen4_exp_text": "Qwen/Qwen3.8-Flash-Next",
+    "qwen4_exp_text": "unsloth/Qwen3.8-Flash-Next-FP8",
     "Qwen4ExpForConditionalGeneration": "Qwen/Qwen3.8-Flash-Next",
     "plamo2": "pfnet/plamo-2-1b",
     "cohere": "CohereForAI/c4ai-command-r7b-12-2024",

@@ -1311,6 +1311,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
     ):
         """Classify every composite-checkpoint tensor for dense streaming export."""
         from mobius.integrations._weight_loading import (
+            StreamingExpertBankSource,
             StreamingWeightPlan,
             StreamingWeightSource,
         )
@@ -1322,7 +1323,10 @@ class Qwen4ExpCausalLMModel(nn.Module):
             )
         header_report = validate_qwen4_exp_fp8_header_contract(key_index)
 
-        targets: dict[str, StreamingWeightSource] = {}
+        targets: dict[
+            str,
+            StreamingWeightSource | StreamingExpertBankSource,
+        ] = {}
         constants: dict[str, torch.Tensor] = {}
         ignored: dict[str, str] = {}
         modes: Counter[str] = Counter()
@@ -1339,7 +1343,65 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 ignored[source_name] = "RoPE frequencies are graph-derived"
                 exclusion_counts["graph_derived"] += 1
 
+        def classify_source(source_name: str) -> StreamingWeightSource:
+            located = key_index.get(source_name)
+            if located is None:
+                raise ValueError(f"Qwen4-Exp checkpoint is missing source '{source_name}'")
+            _path, _source_shape, source_dtype = located
+            scale_name = (
+                source_name[: -len(".weight")] + ".weight_scale_inv"
+                if source_name.endswith(".weight")
+                else source_name + "_scale_inv"
+            )
+            if source_dtype.startswith("F8"):
+                if ".ple.ple_embedding.ngram_embedding.shard_" in source_name:
+                    scale_name = _qwen4_exp_ple_scale_name(source_name)
+                    mode = "fp8_scalar"
+                    source = StreamingWeightSource(
+                        source_name,
+                        mode,
+                        scale_name,
+                        expected_scale=_PINNED_PLE_WEIGHT_SCALE,
+                    )
+                elif scale_name in key_index:
+                    mode = "fp8_block_128"
+                    source = StreamingWeightSource(source_name, mode, scale_name)
+                else:
+                    raise ValueError(f"Qwen4-Exp FP8 source '{source_name}' has no scale")
+            elif source_dtype in {"BF16", "F16", "F32"}:
+                mode = "direct"
+                source = StreamingWeightSource(source_name, mode)
+            else:
+                raise ValueError(
+                    f"Qwen4-Exp source '{source_name}' has unsupported dtype {source_dtype}"
+                )
+            modes[mode] += 1
+            return source
+
         for target_name, initializer in initializers.items():
+            expert_prefix = None
+            projection_names: tuple[str, ...] | None = None
+            if target_name.endswith(".mlp.experts.gate_up_proj"):
+                expert_prefix = target_name[: -len("experts.gate_up_proj")]
+                projection_names = ("gate_proj", "up_proj")
+            elif target_name.endswith(".mlp.experts.down_proj"):
+                expert_prefix = target_name[: -len("experts.down_proj")]
+                projection_names = ("down_proj",)
+            if expert_prefix is not None and projection_names is not None:
+                assert self.config.num_local_experts is not None
+                source_prefix = _source_name_for_qwen4_exp_target(expert_prefix)
+                experts = tuple(
+                    tuple(
+                        classify_source(
+                            f"{source_prefix}experts.{expert_index}.{projection_name}.weight"
+                        )
+                        for projection_name in projection_names
+                    )
+                    for expert_index in range(self.config.num_local_experts)
+                )
+                targets[target_name] = StreamingExpertBankSource(experts)
+                continue
+
             if target_name.startswith("model."):
                 suffix = target_name[len("model.") :]
                 candidates = (
@@ -1374,45 +1436,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 )
                 continue
 
-            _path, source_shape, source_dtype = key_index[source_name]
-            expected_shape = [int(dim) for dim in initializer.shape]
-            if source_shape != expected_shape:
-                raise ValueError(
-                    f"Qwen4-Exp source '{source_name}' has shape {source_shape}; "
-                    f"target '{target_name}' expects {expected_shape}"
-                )
-            scale_name = (
-                source_name[: -len(".weight")] + ".weight_scale_inv"
-                if source_name.endswith(".weight")
-                else source_name + "_scale_inv"
-            )
-            if source_dtype.startswith("F8"):
-                if ".ple.ple_embedding.ngram_embedding.shard_" in source_name:
-                    scale_name = _qwen4_exp_ple_scale_name(source_name)
-                    mode = "fp8_scalar"
-                    source = StreamingWeightSource(
-                        source_name,
-                        mode,
-                        scale_name,
-                        expected_scale=_PINNED_PLE_WEIGHT_SCALE,
-                    )
-                elif scale_name in key_index:
-                    mode = "fp8_block_128"
-                    source = StreamingWeightSource(source_name, mode, scale_name)
-                else:
-                    raise ValueError(
-                        f"Qwen4-Exp FP8 source '{source_name}' has no scale and is "
-                        "not an upstream direct-cast PLE embedding shard"
-                    )
-            elif source_dtype in {"BF16", "F16", "F32"}:
-                mode = "direct"
-                source = StreamingWeightSource(source_name, mode)
-            else:
-                raise ValueError(
-                    f"Qwen4-Exp source '{source_name}' has unsupported dtype {source_dtype}"
-                )
-            targets[target_name] = source
-            modes[mode] += 1
+            targets[target_name] = classify_source(source_name)
 
         # Graph optimization can inline these tiny deterministic PLE buffers as
         # Constant nodes, so validate them from the module parameter contract even

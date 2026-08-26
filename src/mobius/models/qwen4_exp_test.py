@@ -1178,7 +1178,40 @@ def _reduced_fp8_checkpoint(
             continue
         shape = tuple(int(dim) for dim in parameter.shape)
         value = torch.randn(shape, dtype=torch.float32) * 0.02
-        if ".mlp.experts." in target_name and target_name.endswith(".weight"):
+        if target_name.endswith(".mlp.experts.gate_up_proj"):
+            prefix = source_name[: -len("experts.gate_up_proj")]
+            assert module.config.moe_intermediate_size is not None
+            split = module.config.moe_intermediate_size
+            reconstructed = torch.empty_like(value)
+            for expert_index in range(value.shape[0]):
+                for projection_name, projection in (
+                    ("gate_proj", value[expert_index, :split]),
+                    ("up_proj", value[expert_index, split:]),
+                ):
+                    quantized, scale = _quantize_blocks(projection)
+                    weight_name = f"{prefix}experts.{expert_index}.{projection_name}.weight"
+                    source[weight_name] = quantized
+                    source[weight_name[: -len(".weight")] + ".weight_scale_inv"] = scale
+                    row = 0 if projection_name == "gate_proj" else split
+                    reconstructed[
+                        expert_index,
+                        row : row + projection.shape[0],
+                    ] = _independent_dequantize_blocks(quantized, scale)
+            dense_targets[target_name] = reconstructed
+        elif target_name.endswith(".mlp.experts.down_proj"):
+            prefix = source_name[: -len("experts.down_proj")]
+            reconstructed = torch.empty_like(value)
+            for expert_index in range(value.shape[0]):
+                quantized, scale = _quantize_blocks(value[expert_index])
+                weight_name = f"{prefix}experts.{expert_index}.down_proj.weight"
+                source[weight_name] = quantized
+                source[weight_name[: -len(".weight")] + ".weight_scale_inv"] = scale
+                reconstructed[expert_index] = _independent_dequantize_blocks(
+                    quantized,
+                    scale,
+                )
+            dense_targets[target_name] = reconstructed
+        elif ".mlp.experts." in target_name and target_name.endswith(".weight"):
             quantized, scale = _quantize_blocks(value)
             source[source_name] = quantized
             source[source_name[: -len(".weight")] + ".weight_scale_inv"] = scale
@@ -1206,12 +1239,9 @@ def test_fp8_streaming_plan_prefers_composite_keys_and_classifies_sidecars():
     module = Qwen4ExpCausalLMModel(config)
     _config_value, _built_module, model = _build(config)
     source, _dense = _reduced_fp8_checkpoint(module)
-    fallback = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    fallback = "model.layers.0.linear_attn.in_proj_qkv.weight"
     preferred = _source_name(fallback)
     source[fallback] = source[preferred]
-    source[fallback[: -len(".weight")] + ".weight_scale_inv"] = source[
-        preferred[: -len(".weight")] + ".weight_scale_inv"
-    ]
     index = {
         name: ("shard.safetensors", list(tensor.shape), str(tensor.dtype))
         for name, tensor in source.items()

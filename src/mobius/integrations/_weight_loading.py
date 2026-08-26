@@ -15,6 +15,7 @@ checkpoints that only publish ``pytorch_model.bin`` are loaded with
 from __future__ import annotations
 
 __all__ = [
+    "StreamingExpertBankSource",
     "StreamingWeightPlan",
     "StreamingWeightSource",
     "apply_weights",
@@ -72,10 +73,17 @@ class StreamingWeightSource:
 
 
 @dataclasses.dataclass(frozen=True)
+class StreamingExpertBankSource:
+    """Per-expert source matrices packed into one dense rank-3 initializer."""
+
+    experts: tuple[tuple[StreamingWeightSource, ...], ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class StreamingWeightPlan:
     """Complete fail-closed source classification for a streaming export."""
 
-    targets: Mapping[str, StreamingWeightSource]
+    targets: Mapping[str, StreamingWeightSource | StreamingExpertBankSource]
     ignored: Mapping[str, str] = dataclasses.field(default_factory=dict)
     constants: Mapping[str, torch.Tensor] = dataclasses.field(default_factory=dict)
     report: Mapping[str, object] = dataclasses.field(default_factory=dict)
@@ -551,6 +559,56 @@ def _assign_lazy_from_shard(
     )
 
 
+def _materialize_preprocessed_source(
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Read and reconstruct one classified source tensor."""
+    source_path, source_shape, source_dtype = key_index[source.source_name]
+    del source_shape
+    with safe_open(source_path, framework="pt") as handle:
+        tensor = handle.get_tensor(source.source_name)
+    if source.mode == "fp8_block_128":
+        assert source.scale_name is not None
+        scale_path = key_index[source.scale_name][0]
+        with safe_open(scale_path, framework="pt") as handle:
+            scale = handle.get_tensor(source.scale_name)
+        return _dequantize_fp8_tensor(
+            tensor,
+            scale,
+            name=source.source_name,
+            target_dtype=target_dtype,
+        )
+    if source.mode == "fp8_scalar":
+        if not source_dtype.startswith("F8"):
+            raise ValueError(
+                f"Streaming source '{source.source_name}' was classified fp8_scalar "
+                f"but has dtype {source_dtype}"
+            )
+        assert source.scale_name is not None
+        scale_path = key_index[source.scale_name][0]
+        with safe_open(scale_path, framework="pt") as handle:
+            scale = handle.get_tensor(source.scale_name)
+        actual_scale = float(scale.to(torch.float32).item())
+        if source.expected_scale is None or actual_scale != source.expected_scale:
+            raise ValueError(
+                f"FP8 scalar source '{source.source_name}' has scale {actual_scale}; "
+                f"expected pinned value {source.expected_scale}"
+            )
+        tensor = tensor.to(target_dtype)
+        tensor.mul_(scale.to(target_dtype))
+        return tensor
+    if source.mode == "direct":
+        if source_dtype.startswith("F8"):
+            raise ValueError(
+                f"Streaming source '{source.source_name}' is FP8 but was not explicitly "
+                "classified as scaled FP8"
+            )
+        return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+    raise AssertionError(f"Unknown streaming weight mode: {source.mode}")
+
+
 def _assign_lazy_preprocessed(
     initializer: ir.Value,
     source: StreamingWeightSource,
@@ -558,62 +616,62 @@ def _assign_lazy_preprocessed(
     target_name: str,
 ) -> None:
     """Bind a direct or dense-dequantized source with one-tensor working memory."""
-    source_path, source_shape, source_dtype = key_index[source.source_name]
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
     def tensor_func(
-        p: str = source_path,
-        k: str = source.source_name,
-        mode: str = source.mode,
-        scale_name: str | None = source.scale_name,
-        expected_scale: float | None = source.expected_scale,
+        source_spec: StreamingWeightSource = source,
         dt: torch.dtype = target_dtype,
         n: str = target_name,
     ) -> tensor_adapters.TorchTensor:
-        with safe_open(p, framework="pt") as handle:
-            tensor = handle.get_tensor(k)
-        if mode == "fp8_block_128":
-            assert scale_name is not None
-            scale_path = key_index[scale_name][0]
-            with safe_open(scale_path, framework="pt") as handle:
-                scale = handle.get_tensor(scale_name)
-            tensor = _dequantize_fp8_tensor(tensor, scale, name=k, target_dtype=dt)
-        elif mode == "fp8_scalar":
-            if not source_dtype.startswith("F8"):
-                raise ValueError(
-                    f"Streaming source '{k}' was classified fp8_scalar but has dtype "
-                    f"{source_dtype}"
-                )
-            assert scale_name is not None
-            scale_path = key_index[scale_name][0]
-            with safe_open(scale_path, framework="pt") as handle:
-                scale = handle.get_tensor(scale_name)
-            actual_scale = float(scale.to(torch.float32).item())
-            if expected_scale is None or actual_scale != expected_scale:
-                raise ValueError(
-                    f"FP8 scalar source '{k}' has scale {actual_scale}; "
-                    f"expected pinned value {expected_scale}"
-                )
-            tensor = tensor.to(dt)
-            tensor.mul_(scale.to(dt))
-        elif mode == "direct":
-            if source_dtype.startswith("F8"):
-                raise ValueError(
-                    f"Streaming source '{k}' is FP8 but was not explicitly classified "
-                    "as scaled or direct-cast FP8"
-                )
-            if tensor.dtype != dt:
-                tensor = tensor.to(dt)
-        else:
-            raise AssertionError(f"Unknown streaming weight mode: {mode}")
+        tensor = _materialize_preprocessed_source(source_spec, key_index, dt)
         return tensor_adapters.TorchTensor(tensor, name=n)
 
     initializer.const_value = ir.LazyTensor(
         tensor_func,
         dtype=onnx_dtype,
-        shape=ir.Shape(source_shape),
+        shape=ir.Shape(initializer.shape),
+        name=target_name,
+    )
+
+
+def _assign_lazy_expert_bank(
+    initializer: ir.Value,
+    source: StreamingExpertBankSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_name: str,
+) -> None:
+    """Pack independently scaled expert matrices into one dense rank-3 bank."""
+    onnx_dtype = initializer.dtype
+    assert onnx_dtype is not None
+    target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+    target_shape = tuple(int(dim) for dim in initializer.shape)
+
+    def tensor_func(
+        source_spec: StreamingExpertBankSource = source,
+        dt: torch.dtype = target_dtype,
+        n: str = target_name,
+    ) -> tensor_adapters.TorchTensor:
+        output = torch.empty(target_shape, dtype=dt)
+        for expert_index, projections in enumerate(source_spec.experts):
+            row = 0
+            for projection in projections:
+                tensor = _materialize_preprocessed_source(projection, key_index, dt)
+                next_row = row + tensor.shape[0]
+                output[expert_index, row:next_row].copy_(tensor)
+                row = next_row
+            if row != target_shape[1]:
+                raise ValueError(
+                    f"Expert {expert_index} for '{n}' populated {row} rows; "
+                    f"expected {target_shape[1]}"
+                )
+        return tensor_adapters.TorchTensor(output, name=n)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=onnx_dtype,
+        shape=ir.Shape(target_shape),
         name=target_name,
     )
 
@@ -645,24 +703,13 @@ def stream_preprocessed_safetensors_to_model(
     validated_scalar_scales: dict[str, float] = {}
     largest_source_tensor_bytes = 0
     largest_reconstruction_working_set_bytes = 0
-    for target_name, source in plan.targets.items():
-        initializer = model.graph.initializers.get(target_name)
-        if initializer is None:
-            raise ValueError(f"Streaming plan targets unknown initializer '{target_name}'")
-        if initializer.const_value is not None:
-            raise ValueError(f"Streaming plan targets constant initializer '{target_name}'")
-        assert initializer.dtype is not None
+
+    def validate_source(
+        source: StreamingWeightSource,
+    ) -> tuple[list[int], int, int]:
         if source.source_name not in key_index:
             raise ValueError(f"Streaming source '{source.source_name}' does not exist")
-        source_path, source_shape, source_dtype = key_index[source.source_name]
-        del source_path
-        expected_shape = [int(dim) for dim in initializer.shape]
-        if expected_shape != source_shape:
-            raise ValueError(
-                f"Weight shape mismatch for '{target_name}': model expects "
-                f"{expected_shape}, checkpoint source '{source.source_name}' has "
-                f"{source_shape}"
-            )
+        _source_path, source_shape, source_dtype = key_index[source.source_name]
         if source.mode in {"fp8_block_128", "fp8_scalar"}:
             if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
                 raise ValueError(
@@ -672,7 +719,7 @@ def stream_preprocessed_safetensors_to_model(
                 raise ValueError(
                     f"Scaled FP8 source '{source.source_name}' has no scale tensor"
                 )
-            _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+            scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
             if source.mode == "fp8_block_128":
                 expected_grid = [
                     (source_shape[0] + 127) // 128,
@@ -701,7 +748,7 @@ def stream_preprocessed_safetensors_to_model(
                     )
                 actual_scale = validated_scalar_scales.get(source.scale_name)
                 if actual_scale is None:
-                    with safe_open(_scale_path, framework="pt") as handle:
+                    with safe_open(scale_path, framework="pt") as handle:
                         scale = handle.get_tensor(source.scale_name)
                     actual_scale = float(scale.to(torch.float32).item())
                     validated_scalar_scales[source.scale_name] = actual_scale
@@ -718,7 +765,6 @@ def stream_preprocessed_safetensors_to_model(
                 f"dtype {source_dtype}"
             )
         source_bytes = math.prod(source_shape) * source_element_bytes
-        target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
         scale_bytes = 0
         if source.scale_name is not None:
             _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
@@ -729,13 +775,70 @@ def stream_preprocessed_safetensors_to_model(
                     f"byte-size dtype {scale_dtype}"
                 )
             scale_bytes = math.prod(scale_shape) * scale_element_bytes
-        largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
-        largest_reconstruction_working_set_bytes = max(
-            largest_reconstruction_working_set_bytes,
-            source_bytes + target_bytes + scale_bytes,
-        )
-        _assign_lazy_preprocessed(initializer, source, key_index, target_name)
         consumed.add(source.source_name)
+        return source_shape, source_bytes, scale_bytes
+
+    for target_name, source in plan.targets.items():
+        initializer = model.graph.initializers.get(target_name)
+        if initializer is None:
+            raise ValueError(f"Streaming plan targets unknown initializer '{target_name}'")
+        if initializer.const_value is not None:
+            raise ValueError(f"Streaming plan targets constant initializer '{target_name}'")
+        assert initializer.dtype is not None
+        expected_shape = [int(dim) for dim in initializer.shape]
+        target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
+        if isinstance(source, StreamingWeightSource):
+            source_shape, source_bytes, scale_bytes = validate_source(source)
+            if expected_shape != source_shape:
+                raise ValueError(
+                    f"Weight shape mismatch for '{target_name}': model expects "
+                    f"{expected_shape}, checkpoint source '{source.source_name}' has "
+                    f"{source_shape}"
+                )
+            largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+            largest_reconstruction_working_set_bytes = max(
+                largest_reconstruction_working_set_bytes,
+                source_bytes + target_bytes + scale_bytes,
+            )
+            _assign_lazy_preprocessed(initializer, source, key_index, target_name)
+        else:
+            if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
+                raise ValueError(
+                    f"Expert bank '{target_name}' expects shape {expected_shape}, "
+                    f"but the plan has {len(source.experts)} experts"
+                )
+            max_transient_bytes = 0
+            for expert_index, projections in enumerate(source.experts):
+                rows = 0
+                for projection in projections:
+                    source_shape, source_bytes, scale_bytes = validate_source(projection)
+                    if len(source_shape) != 2 or source_shape[1] != expected_shape[2]:
+                        raise ValueError(
+                            f"Expert source '{projection.source_name}' has shape "
+                            f"{source_shape}; expected [rows, {expected_shape[2]}]"
+                        )
+                    rows += source_shape[0]
+                    dense_projection_bytes = (
+                        math.prod(source_shape) * initializer.dtype.bitwidth + 7
+                    ) // 8
+                    largest_source_tensor_bytes = max(
+                        largest_source_tensor_bytes,
+                        source_bytes,
+                    )
+                    max_transient_bytes = max(
+                        max_transient_bytes,
+                        source_bytes + dense_projection_bytes + scale_bytes,
+                    )
+                if rows != expected_shape[1]:
+                    raise ValueError(
+                        f"Expert {expert_index} for '{target_name}' has {rows} rows; "
+                        f"expected {expected_shape[1]}"
+                    )
+            largest_reconstruction_working_set_bytes = max(
+                largest_reconstruction_working_set_bytes,
+                target_bytes + max_transient_bytes,
+            )
+            _assign_lazy_expert_bank(initializer, source, key_index, target_name)
         assigned.add(target_name)
 
     for source_name, expected in plan.constants.items():
