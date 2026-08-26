@@ -704,6 +704,103 @@ def test_source_config_added_token_must_match_exact_gguf_id() -> None:
         _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
+def test_evidenced_materializer_rejects_existing_destination_before_source_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    read_source = mock.Mock()
+    monkeypatch.setattr("mobius.integrations.gguf._reader.GGUFModel", read_source)
+
+    with pytest.raises(FileExistsError, match="non-atomic directory replacement"):
+        _tokenizer.materialize_evidenced_gguf_tokenizer(tmp_path / "model.gguf", output)
+
+    read_source.assert_not_called()
+
+
+def test_evidenced_materializer_rejects_replaced_source_before_publication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = SimpleNamespace(
+        metadata={},
+        source_matches_path=mock.Mock(side_effect=(True, False)),
+    )
+    evidence = SimpleNamespace(
+        source=object(),
+        repository="owner/model",
+        revision="a" * 40,
+        filename="model.gguf",
+        lfs_sha256="b" * 64,
+    )
+    monkeypatch.setattr("mobius.integrations.gguf._reader.GGUFModel", lambda _path: model)
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
+        lambda *_a, **_k: SimpleNamespace(metadata_sha256="c" * 64),
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_evidence",
+        lambda *_a, **_k: evidence,
+    )
+
+    def materialize(_gguf_path, stage, **_kwargs):
+        path = Path(stage) / "tokenizer.json"
+        path.write_text("{}", encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(_tokenizer, "materialize_gguf_tokenizer", materialize)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="changed while tokenizer assets"):
+        _tokenizer.materialize_evidenced_gguf_tokenizer(tmp_path / "model.gguf", output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".output.*.tmp"))
+
+
+def test_evidenced_materializer_atomically_publishes_complete_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = SimpleNamespace(
+        metadata={},
+        source_matches_path=mock.Mock(return_value=True),
+    )
+    evidence = SimpleNamespace(
+        source=object(),
+        repository="owner/model",
+        revision="a" * 40,
+        filename="model.gguf",
+        lfs_sha256="b" * 64,
+    )
+    monkeypatch.setattr("mobius.integrations.gguf._reader.GGUFModel", lambda _path: model)
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
+        lambda *_a, **_k: SimpleNamespace(metadata_sha256="c" * 64),
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_evidence",
+        lambda *_a, **_k: evidence,
+    )
+
+    def materialize(_gguf_path, stage, **_kwargs):
+        path = Path(stage) / "tokenizer.json"
+        path.write_text("{}", encoding="utf-8")
+        (Path(stage) / "gguf_tokenizer_manifest.json").write_text("{}", encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(_tokenizer, "materialize_gguf_tokenizer", materialize)
+    output = tmp_path / "output"
+
+    result = _tokenizer.materialize_evidenced_gguf_tokenizer(tmp_path / "model.gguf", output)
+
+    assert result == str(output / "tokenizer.json")
+    assert sorted(path.name for path in output.iterdir()) == [
+        "gguf_tokenizer_manifest.json",
+        "tokenizer.json",
+    ]
+    assert model.source_matches_path.call_count == 2
+    assert not list(tmp_path.glob(".output.*.tmp"))
+
+
 @pytest.mark.parametrize(
     ("token", "token_type", "message"),
     [

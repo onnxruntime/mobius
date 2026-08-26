@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shutil
 import stat
 import tempfile
 from collections.abc import Mapping
@@ -1114,10 +1115,22 @@ def materialize_evidenced_gguf_tokenizer(
 ) -> str:
     """Materialize a tokenizer only when the complete GGUF artifact has exact evidence."""
     from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.integrations.gguf._runtime_package import _publish_directory_no_replace
     from mobius.integrations.gguf._tokenizer_evidence import matching_tokenizer_evidence
 
     gguf_path = Path(gguf_path)
+    output = Path(output_dir)
+    if output.exists():
+        raise FileExistsError(
+            f"Evidenced tokenizer destination already exists: {output}. "
+            "Refusing a non-atomic directory replacement."
+        )
     model = GGUFModel(gguf_path)
+    if not model.source_matches_path():
+        raise ValueError(
+            "The GGUF source changed while the canonical reader was opening it; "
+            "refusing tokenizer publication."
+        )
     verdict = inspect_gguf_tokenizer(
         model.metadata,
         source=str(gguf_path),
@@ -1128,17 +1141,33 @@ def materialize_evidenced_gguf_tokenizer(
         model,
         metadata_sha256=verdict.metadata_sha256,
     )
-    return materialize_gguf_tokenizer(
-        gguf_path,
-        output_dir,
-        source=evidence.source,
-        metadata=model.metadata,
-        source_identity=(
-            f"hf://{evidence.repository}@{evidence.revision}/{evidence.filename}"
-            f"#sha256={evidence.lfs_sha256}"
-        ),
-        local_files_only=local_files_only,
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", suffix=".tmp", dir=output.parent))
+    try:
+        tokenizer_path = Path(
+            materialize_gguf_tokenizer(
+                gguf_path,
+                stage,
+                source=evidence.source,
+                metadata=model.metadata,
+                source_identity=(
+                    f"hf://{evidence.repository}@{evidence.revision}/{evidence.filename}"
+                    f"#sha256={evidence.lfs_sha256}"
+                ),
+                local_files_only=local_files_only,
+            )
+        )
+        if not model.source_matches_path():
+            raise ValueError(
+                "The GGUF source changed while tokenizer assets were being validated; "
+                "refusing tokenizer publication."
+            )
+        relative_tokenizer_path = tokenizer_path.relative_to(stage)
+        _publish_directory_no_replace(stage, output)
+        return str(output / relative_tokenizer_path)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
 
 
 def materialize_gguf_tokenizer(
