@@ -193,33 +193,33 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert config.mrope_section == [11, 11, 10]
     assert config.mamba_ssm_dtype == ir.DataType.FLOAT
 
-    multimodal = Qwen4ExpConfig.from_transformers(
-        SimpleNamespace(
+    parent = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        language_model_only=False,
+        text_config=text,
+        vision_config=SimpleNamespace(
             model_type="qwen4_exp",
-            architectures=["Qwen4ExpForConditionalGeneration"],
-            language_model_only=False,
-            text_config=text,
-            vision_config=SimpleNamespace(
-                model_type="qwen4_exp",
-                hidden_size=1152,
-                intermediate_size=4304,
-                num_hidden_layers=27,
-                num_attention_heads=16,
-                patch_size=16,
-                temporal_patch_size=2,
-                spatial_merge_size=2,
-                num_position_embeddings=2304,
-                out_hidden_size=2560,
-                hidden_act="gelu_pytorch_tanh",
-                deepstack_visual_indexes=[],
-            ),
-            image_token_id=248056,
-            video_token_id=248057,
-            vision_start_token_id=248053,
-            vision_end_token_id=248054,
-            tie_word_embeddings=False,
-        )
+            hidden_size=1152,
+            intermediate_size=4304,
+            num_hidden_layers=27,
+            num_attention_heads=16,
+            in_channels=3,
+            patch_size=16,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            num_position_embeddings=2304,
+            out_hidden_size=2560,
+            hidden_act="gelu_pytorch_tanh",
+            deepstack_visual_indexes=[],
+        ),
+        image_token_id=248056,
+        video_token_id=248057,
+        vision_start_token_id=248053,
+        vision_end_token_id=248054,
+        tie_word_embeddings=False,
     )
+    multimodal = Qwen4ExpConfig.from_transformers(parent)
     assert multimodal.model_type == "qwen4_exp"
     assert multimodal.vision is not None
     assert multimodal.vision.out_hidden_size == 2560
@@ -228,6 +228,10 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert multimodal.vision_start_token_id == 248053
     assert multimodal.vision_end_token_id == 248054
     assert multimodal.deepstack_visual_indexes == []
+
+    parent.vision_config.in_channels = 1
+    with pytest.raises(ValueError, match="in_channels"):
+        Qwen4ExpConfig.from_transformers(parent)
 
 
 def test_mtp_metadata_is_preserved_but_dedicated_execution_fails_closed():
