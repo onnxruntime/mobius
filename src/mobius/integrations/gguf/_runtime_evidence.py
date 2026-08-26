@@ -11,8 +11,10 @@ __all__ = [
     "GGUFRuntimeEvidence",
     "gguf_artifact_identity",
     "gguf_graph_package_identity",
+    "iter_runtime_evidence",
     "matching_runtime_evidence",
     "runtime_evidence",
+    "validate_quant_runtime_evidence_ids",
     "validate_runtime_evidence_ids",
 ]
 
@@ -74,8 +76,11 @@ class GGUFRuntimeEvidence:
     parity_kind: str
     deterministic_test: str
     stateful_semantics: str
+    execution_provider: str
+    onnxruntime_version: str
     runtime: str
     runtime_version: str
+    result: str = "passed"
 
     def __post_init__(self) -> None:
         text_fields = (
@@ -97,8 +102,11 @@ class GGUFRuntimeEvidence:
             self.parity_kind,
             self.deterministic_test,
             self.stateful_semantics,
+            self.execution_provider,
+            self.onnxruntime_version,
             self.runtime,
             self.runtime_version,
+            self.result,
         )
         if any(not value.strip() for value in text_fields):
             raise ValueError("GGUF runtime evidence fields must be non-empty")
@@ -133,6 +141,10 @@ class GGUFRuntimeEvidence:
         if self.parity_kind not in {"full-logit", "component"}:
             raise ValueError(
                 "GGUF runtime evidence parity_kind must be full-logit or component"
+            )
+        if self.result != "passed":
+            raise ValueError(
+                "GGUF runtime evidence may only support a route after a passed result"
             )
         asset_names = tuple(asset[0] for asset in self.tokenizer_assets)
         if (
@@ -245,6 +257,8 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
         "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]"
     ),
     stateful_semantics="dynamic KV cache prefill plus 20 cache-threaded decode steps",
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="onnx-genai",
     runtime_version="1.29.0",
 )
@@ -265,6 +279,8 @@ _SMOLLM_F16_ORT_GENAI = dataclasses.replace(
     runtime_package_sha256="43568320f669d259d5a570ee04bd6378316ab31ce2fcb6383e75b479b4f2b349",
     deterministic_test="test_smollm_generic_ort_genai_generation",
     stateful_semantics="ORT GenAI prefill plus 20 cache-threaded decode steps",
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="ort-genai",
     runtime_version="0.15.2",
 )
@@ -308,11 +324,13 @@ _QWEN25_Q8_ORT_GENAI = GGUFRuntimeEvidence(
         "tokenizer.json",
         "tokenizer_config.json",
     ),
-    runtime_package_sha256="cb43c76e1bc3db07a6a3631c7a99e7c47b6891807fecffdb3b70fddd9c108173",
+    runtime_package_sha256="df2211e72f43d3ee0aa31e6ff7b2cc9817f7a76d6169d28f96e71b65fd553d69",
     parity_test="test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
     parity_kind="full-logit",
     deterministic_test="test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
     stateful_semantics="dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps",
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="ort-genai",
     runtime_version="0.15.2",
 )
@@ -376,6 +394,8 @@ _LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
         "hybrid convolution and KV state prefill, replay, rollback, reorder, "
         "and 20 decode steps"
     ),
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="ort-genai",
     runtime_version="0.15.2",
 )
@@ -396,6 +416,44 @@ _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType
 def runtime_evidence(evidence_id: str) -> GGUFRuntimeEvidence | None:
     """Return a structured evidence record by stable ID."""
     return _RUNTIME_EVIDENCE.get(evidence_id)
+
+
+def iter_runtime_evidence() -> tuple[GGUFRuntimeEvidence, ...]:
+    """Return every runtime evidence record ordered by stable evidence ID."""
+    return tuple(_RUNTIME_EVIDENCE[key] for key in sorted(_RUNTIME_EVIDENCE))
+
+
+def validate_quant_runtime_evidence_ids(qtype: str, evidence_ids: tuple[str, ...]) -> None:
+    """Require complete preserved-route evidence for a stored quantization type."""
+    if not evidence_ids:
+        raise ValueError("quantized runtime=SUPPORTED requires structured evidence IDs")
+    unknown = sorted(
+        evidence_id
+        for evidence_id in evidence_ids
+        if not evidence_id or runtime_evidence(evidence_id) is None
+    )
+    if unknown:
+        raise ValueError(f"Unknown GGUF quantized runtime evidence IDs: {unknown}")
+    required_state_semantics = ("prefill", "replay", "rollback", "reorder", "decode")
+    invalid = []
+    for evidence_id in evidence_ids:
+        evidence = _RUNTIME_EVIDENCE[evidence_id]
+        qtypes = dict(evidence.tensor_qtypes)
+        if (
+            qtypes.get(qtype, 0) <= 0
+            or evidence.parity_kind != "full-logit"
+            or '"preserve_quantization":true' not in evidence.import_route
+            or evidence.execution_provider != "CPUExecutionProvider"
+            or any(
+                term not in evidence.stateful_semantics for term in required_state_semantics
+            )
+        ):
+            invalid.append(evidence_id)
+    if invalid:
+        raise ValueError(
+            f"GGUF quantized runtime evidence does not prove preserved {qtype} full-logit "
+            f"CPU prefill/decode/replay/rollback/reorder semantics: {sorted(invalid)}"
+        )
 
 
 def validate_runtime_evidence_ids(architecture: str, evidence_ids: tuple[str, ...]) -> None:

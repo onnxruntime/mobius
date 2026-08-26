@@ -3,7 +3,12 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 from gguf import quants
 
@@ -23,6 +28,82 @@ _Q8_0 = 8
 _Q4_K = 12
 _Q1_0 = 41
 _BLOCK_SIZE = 32
+
+
+def _const(name: str, value: np.ndarray) -> ir.Value:
+    result = ir.Value(name=name)
+    tensor = ir.tensor(value)
+    result.const_value = tensor
+    result.dtype = tensor.dtype
+    result.shape = ir.Shape(value.shape)
+    return result
+
+
+def _run_repacked_matmul_round_trip(
+    repacked: RepackedTensor,
+    activation: np.ndarray,
+    *,
+    k_in: int,
+    tmp_path,
+) -> np.ndarray:
+    a = ir.Value(
+        name="A",
+        shape=ir.Shape(activation.shape),
+        type=ir.TensorType(ir.DataType.FLOAT),
+    )
+    weight = _const("B", repacked.weight)
+    scales = _const("scales", repacked.scales.astype(np.float32))
+    assert repacked.zero_points is not None
+    zero_points = _const("zero_points", repacked.zero_points)
+    output = ir.Value(name="Y")
+    node = ir.Node(
+        "com.microsoft",
+        "MatMulNBits",
+        inputs=[a, weight, scales, zero_points],
+        outputs=[output],
+        attributes=ir.convenience.convert_attributes(
+            {
+                "K": k_in,
+                "N": repacked.weight.shape[0],
+                "bits": repacked.bits,
+                "block_size": repacked.block_size,
+            }
+        ),
+    )
+    graph = ir.Graph(
+        inputs=[a],
+        outputs=[output],
+        nodes=[node],
+        initializers=[weight, scales, zero_points],
+        opset_imports={"": 24, "com.microsoft": 1},
+        name="gguf_exact_affine_abi",
+    )
+    first = tmp_path / "first.onnx"
+    second = tmp_path / "round-trip.onnx"
+    ir.save(ir.Model(graph, ir_version=10), first)
+    ir.save(ir.load(first), second)
+    options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "ort-profile")
+    session = ort.InferenceSession(
+        second,
+        sess_options=options,
+        providers=["CPUExecutionProvider"],
+    )
+    result = session.run(None, {"A": activation})[0]
+    profile_path = options.profile_file_prefix
+    profile_file = session.end_profiling()
+    assert profile_file.startswith(profile_path)
+    events = json.loads(Path(profile_file).read_text(encoding="utf-8"))
+    kernels = [
+        event
+        for event in events
+        if event.get("cat") == "Node" and event.get("args", {}).get("op_name") == "MatMulNBits"
+    ]
+    assert kernels
+    assert {event["args"].get("provider") for event in kernels} == {"CPUExecutionProvider"}
+    Path(profile_file).unlink()
+    return result
 
 
 @pytest.mark.parametrize(
@@ -433,6 +514,94 @@ class TestEdgeCases:
         assert result.zero_points.shape == (4, 2)
         assert result.zero_points[0, 0] == 0x88
         assert result.zero_points[0, 1] == 0x88
+
+
+class TestExactAffineRuntimeAbi:
+    """Exact routes survive ONNX package round-trip and execute through ORT."""
+
+    def test_q4_0_codes_scales_zero_points_and_row_tails(self, tmp_path) -> None:
+        n_out, k_in = 3, 70
+        n_blocks = 3
+        source_rows = []
+        packed_blocks = []
+        for row in range(n_out):
+            row_values = []
+            for block_index in range(n_blocks):
+                scale = np.float16(0.125 * (1 + row + block_index))
+                codes = ((np.arange(32) + row + 3 * block_index) % 16).tolist()
+                block = _make_q4_0_block(float(scale), codes)
+                packed_blocks.append(block)
+                row_values.append(
+                    quants.dequantize(
+                        block.reshape(1, -1),
+                        quants.GGMLQuantizationType.Q4_0,
+                    ).ravel()
+                )
+            source_rows.append(np.concatenate(row_values)[:k_in])
+        source = np.stack(source_rows).astype(np.float32)
+        repacked = repack_gguf_tensor(
+            np.concatenate(packed_blocks), _Q4_0, shape=(n_out, k_in)
+        )
+        activation = np.linspace(-1.0, 1.0, 2 * k_in, dtype=np.float32).reshape(2, k_in)
+
+        actual = _run_repacked_matmul_round_trip(
+            repacked, activation, k_in=k_in, tmp_path=tmp_path
+        )
+        np.testing.assert_allclose(actual, activation @ source.T, rtol=1e-5, atol=1e-5)
+
+    def test_q8_0_signed_codes_scales_zero_points_and_row_tails(self, tmp_path) -> None:
+        n_out, k_in = 2, 47
+        source_rows = []
+        packed_blocks = []
+        for row in range(n_out):
+            row_values = []
+            for block_index in range(2):
+                scale = np.float16(0.03125 * (1 + row + block_index))
+                codes = (
+                    (np.arange(32, dtype=np.int16) * (row + 3) + 11 * block_index) % 256 - 128
+                ).astype(np.int8)
+                block = _make_q8_0_block(float(scale), codes.tolist())
+                packed_blocks.append(block)
+                row_values.append(
+                    quants.dequantize(
+                        block.reshape(1, -1),
+                        quants.GGMLQuantizationType.Q8_0,
+                    ).ravel()
+                )
+            source_rows.append(np.concatenate(row_values)[:k_in])
+        source = np.stack(source_rows).astype(np.float32)
+        repacked = repack_gguf_tensor(
+            np.concatenate(packed_blocks), _Q8_0, shape=(n_out, k_in)
+        )
+        activation = np.linspace(0.25, 1.25, 3 * k_in, dtype=np.float32).reshape(3, k_in)
+
+        actual = _run_repacked_matmul_round_trip(
+            repacked, activation, k_in=k_in, tmp_path=tmp_path
+        )
+        np.testing.assert_allclose(actual, activation @ source.T, rtol=1e-5, atol=1e-5)
+
+    def test_q1_0_binary_codes_and_row_tails(self, tmp_path) -> None:
+        n_out, k_in = 2, 129
+        source_rows = []
+        packed_blocks = []
+        for row in range(n_out):
+            row_values = []
+            for block_index in range(2):
+                scale = np.float16(0.25 * (1 + row + block_index))
+                bits = ((np.arange(128) + row + block_index) % 3 == 0).astype(np.uint8)
+                packed_blocks.append(_make_q1_0_block(float(scale), bits.tolist()))
+                row_values.append(np.where(bits == 1, scale, -scale).astype(np.float32))
+            source_rows.append(np.concatenate(row_values)[:k_in])
+        source = np.stack(source_rows)
+        repacked = repack_gguf_tensor(
+            np.concatenate(packed_blocks), _Q1_0, shape=(n_out, k_in)
+        )
+        activation = np.linspace(-0.5, 0.5, k_in, dtype=np.float32)[None, :]
+
+        actual = _run_repacked_matmul_round_trip(
+            repacked, activation, k_in=k_in, tmp_path=tmp_path
+        )
+        np.testing.assert_allclose(actual, activation @ source.T, rtol=1e-5, atol=1e-5)
 
 
 # ---- Q4_K helpers ----

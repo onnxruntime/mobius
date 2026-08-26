@@ -115,9 +115,9 @@ _PINNED_STORED_ROUTES = {
     "Q8_0": ("affine repack", "exact"),
     "Q2_K": ("dequantize/requantize", None),
     "Q3_K": ("dequantize/requantize", None),
-    "Q4_K": ("affine repack", "lossy"),
+    "Q4_K": ("dequantize/requantize", "lossy"),
     "Q5_K": ("dequantize/requantize", None),
-    "Q6_K": ("affine repack", "lossy"),
+    "Q6_K": ("dequantize/requantize", "lossy"),
     "TQ1_0": ("dequantize/requantize", None),
     "TQ2_0": ("dequantize/requantize", None),
     "IQ4_NL": ("native byte-preserved", None),
@@ -313,8 +313,13 @@ class TestStorageInvariants:
         assert spec.lm_head_preserve
 
     @pytest.mark.parametrize("spec", iter_quant_specs(), ids=lambda s: s.name)
-    def test_runtime_stays_deferred_without_real_execution_evidence(self, spec) -> None:
-        if spec.is_quantized_storage:
+    def test_runtime_support_requires_real_execution_evidence(self, spec) -> None:
+        if not spec.is_quantized_storage:
+            return
+        if spec.name == "Q8_0":
+            assert spec.runtime is Support.SUPPORTED
+            assert spec.runtime_evidence_ids == ("qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",)
+        else:
             assert spec.runtime is Support.DEFERRED
             assert "runtime" in spec.runtime_reason.lower()
 
@@ -399,6 +404,16 @@ class TestStorageInvariants:
         assert spec is not None
         assert spec.import_route is QuantImportRoute.AFFINE_REPACK
         assert spec.repack_exactness is RepackExactness.EXACT
+
+    @pytest.mark.parametrize("name", ["Q4_K", "Q6_K"])
+    def test_float_mediated_requantization_is_never_affine_preservation(
+        self, name: str
+    ) -> None:
+        spec = quant_spec_by_name(name)
+        assert spec is not None
+        assert spec.import_route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        assert spec.repack_exactness is RepackExactness.LOSSY
+        assert not spec.preserves_values
 
 
 class TestDocumentedQuantizationMatrix:

@@ -312,8 +312,10 @@ def _runtime_evidence_table() -> str:
             f"`{evidence.config_repository}@{evidence.config_revision}` | "
             f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>{assets}<br>"
             f"metadata `{evidence.tokenizer_metadata_sha256}` | "
-            f"{evidence.runtime} {evidence.runtime_version}; {evidence.parity_kind}; "
-            f"{evidence.stateful_semantics} |"
+            f"ONNX Runtime {evidence.onnxruntime_version} "
+            f"`{evidence.execution_provider}`; {evidence.runtime} "
+            f"{evidence.runtime_version}; result={evidence.result}; "
+            f"{evidence.parity_kind}; {evidence.stateful_semantics} |"
         )
     return "\n".join(rows)
 
@@ -569,6 +571,11 @@ Reason codes are concise user-facing categories; detailed architecture audits re
 <!-- END GGUF SUPPORT MATRIX -->
 
 ## Stored quantization types
+
+The generated machine-readable source for this table is
+`testdata/evidence/gguf_quantization_capabilities.json`. It records parse and exact
+dequantization support separately from conversion, names the implementation transform and
+operator ABI for every tensor role, and treats dequantize/requantize as non-preserving.
 
 <!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->
 

@@ -950,6 +950,7 @@ def test_promoted_gguf_full_runtime_evidence(
     enrollment = yaml.safe_load(case_yaml.read_text(encoding="utf-8"))["ort_genai"]
     installed_version = _installed_ort_genai_version()
     assert installed_version == evidence.runtime_version == "0.15.2"
+    assert ort.__version__ == evidence.onnxruntime_version == "1.29.0"
     assert enrollment["runtime_evidence_id"] == case.evidence_id
     assert enrollment["runtime_versions"] == [installed_version]
 
@@ -1045,6 +1046,15 @@ def test_promoted_gguf_full_runtime_evidence(
         )
     assert len(captured) == 1
     assert captured[0].gguf_import_route == evidence.import_route
+    if dict(evidence.tensor_qtypes).get("Q8_0", 0):
+        graph = captured[0]["model"].graph
+        op_types = Counter(node.op_type for node in graph)
+        assert op_types["MatMulNBits"] > 0
+        assert op_types["GatherBlockQuantized"] == 1
+        assert op_types["BlockQuantizedMatMul"] == 0
+        initializer_names = set(graph.initializers)
+        assert "model.embed_tokens.scales" in initializer_names
+        assert "lm_head.scales" in initializer_names
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
     runtime_identity = gguf_graph_package_identity(output_dir)
