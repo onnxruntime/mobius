@@ -1150,6 +1150,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "longcat_flash": "yujiepan/longcat-flash-tiny-random",
     "minimax": "MiniMaxAI/MiniMax-Text-01",
     "ernie4_5_moe": "baidu/ERNIE-4.5-21B-A3B-PT",
+    "bailing_moe": "baidu/ERNIE-4.5-21B-A3B-PT",
     "flex_olmo": "allenai/Flex-reddit-2x7B-1T",
     "glm4_moe": "zai-org/GLM-4.5-Air",
     "granitemoehybrid": "ibm-granite/granite-4.0-tiny-preview",
@@ -1165,6 +1166,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "deepseek_v2": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v2_moe": "deepseek-ai/DeepSeek-V2-Lite",
     "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek": "deepseek-ai/DeepSeek-V3",
     "deepseek_v4": "deepseek-ai/DeepSeek-V4-Flash",
     # --- GLM-5.2 (MLA + DSA + MoE) ---
     "glm_moe_dsa": "zai-org/GLM-5.2",
