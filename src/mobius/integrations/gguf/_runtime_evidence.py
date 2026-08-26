@@ -488,12 +488,17 @@ def gguf_artifact_identity(
         size = stat.st_size
     else:
         paths = tuple(Path(path) for path in shard_paths)
+        identity_paths = tuple(
+            Path(path) for path in getattr(gguf_model, "identity_paths", paths)
+        )
         if not paths:
             raise ValueError("A GGUF shard set must contain at least one source file.")
+        if len(identity_paths) != len(paths):
+            raise ValueError("GGUF shard identity paths must match the shard set length.")
         digest = hashlib.sha256()
         size = 0
-        for path in paths:
-            stat, file_sha256 = _hash_regular_file(path)
+        for path, identity_path in zip(paths, identity_paths):
+            stat, file_sha256 = _hash_regular_file(identity_path)
             encoded = path.name.encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)

@@ -202,6 +202,39 @@ def test_sharded_artifact_identity_frames_every_shard_and_tensor(tmp_path) -> No
     assert changed.sha256 != identity.sha256
 
 
+def test_sharded_artifact_identity_hashes_regular_aliases_for_snapshot_links(
+    tmp_path,
+) -> None:
+    blobs = tmp_path / "blobs"
+    snapshot = tmp_path / "snapshots" / ("a" * 40)
+    blobs.mkdir()
+    snapshot.mkdir(parents=True)
+    first_blob = blobs / "first-blob"
+    second_blob = blobs / "second-blob"
+    first_blob.write_bytes(b"first")
+    second_blob.write_bytes(b"second")
+    first = snapshot / "model-00001-of-00002.gguf"
+    second = snapshot / "model-00002-of-00002.gguf"
+    first.symlink_to(first_blob)
+    second.symlink_to(second_blob)
+    tensors = [SimpleNamespace(tensor_type=SimpleNamespace(name="F32"))]
+    model = SimpleNamespace(
+        shard_paths=[first, second],
+        identity_paths=[first_blob, second_blob],
+        reader_tensors=lambda: tensors,
+    )
+
+    identity = gguf_artifact_identity(
+        second,
+        model,
+        architecture="llama",
+        filename=first.name,
+    )
+
+    assert identity.filename == first.name
+    assert identity.size == len(b"firstsecond")
+
+
 def test_evidence_id_cannot_cross_architectures(monkeypatch) -> None:
     record = _record(b"pinned-gguf")
     monkeypatch.setattr(

@@ -12,6 +12,10 @@ Usage::
 
     # Text-only model
     pkg = build_from_gguf("path/to/model.gguf")
+    # Any local shard discovers and validates its exact sibling set.
+    pkg = build_from_gguf("path/to/model-00002-of-00003.gguf")
+    # Hub shard references resolve and pin the complete immutable set.
+    pkg = build_from_gguf("owner/repo@commit:model-00002-of-00003.gguf")
     # Supported quantization is preserved by default; pass
     # keep_quantized=False for a fully float model.
 
