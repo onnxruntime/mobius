@@ -1,0 +1,18 @@
+model_id: "microsoft/bitnet-b1.58-2B-4T"
+model_type: "bitnet"
+revision: "04c3b9ad9361b824064a1f25ea60a8be9599b127"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4+L5"
+skip_reason: "No independently generated full-checkpoint prefill or generation golden is available; synthetic full-logit parity covers the dedicated Hugging Face topology without promoting runtime support."
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "L2 uses this pinned Hugging Face config. L4/L5, CLI package, and runtime claims remain waived until a canonical TQ1_0/TQ2_0 GGUF has full-logit prefill and cached-decode parity. The separate pinned GGUF evidence case documents why the public legacy I2_S artifact cannot close that gate."

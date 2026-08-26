@@ -112,7 +112,7 @@ class TestCoverageIsHonest:
 
     @pytest.mark.parametrize(
         "architecture",
-        ["bitnet", "deepseek2", "gemma4-assistant", "graniteswitch", "rwkv7"],
+        ["deepseek2", "gemma4-assistant", "graniteswitch", "rwkv7"],
     )
     def test_deferred_verdict_precedes_mtp_and_qtype_policy(
         self, architecture: str, monkeypatch

@@ -71,6 +71,63 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+_LLAMA_EMBEDDING_MAPPING: dict[str, str] = {
+    "token_embd": "token_embeddings",
+    "output_norm": "output_norm",
+    "blk.{bid}.attn_q": "layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_norm": "layers.{bid}.input_layernorm",
+    "blk.{bid}.ffn_norm": "layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "layers.{bid}.mlp.down_proj",
+}
+
+_GEMMA_EMBEDDING_MAPPING: dict[str, str] = {
+    **_LLAMA_EMBEDDING_MAPPING,
+    "dense_2": "dense_2",
+    "dense_3": "dense_3",
+    "blk.{bid}.attn_q_norm": "layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "layers.{bid}.self_attn.k_norm",
+    "blk.{bid}.post_attention_norm": "layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_norm": "layers.{bid}.pre_feedforward_layernorm",
+    "blk.{bid}.post_ffw_norm": "layers.{bid}.post_feedforward_layernorm",
+}
+
+_BITNET_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_sub_norm": "model.layers.{bid}.self_attn.attn_sub_norm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_sub_norm": "model.layers.{bid}.mlp.ffn_sub_norm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
+_TALKIE_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    # llama.cpp names this tensor as a Q norm, but it is the learned per-head
+    # gain applied after Talkie's weight-free post-RoPE Q normalization.
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_gain@",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.layer_output_scale": "model.layers.{bid}.embed_skip@",
+}
+
 _LEGACY_LAYERNORM_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
     "output": "lm_head",
@@ -1063,6 +1120,10 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "llama_embedding": _LLAMA_EMBEDDING_MAPPING,
+        "gemma_embedding": _GEMMA_EMBEDDING_MAPPING,
+        "bitnet": _BITNET_MAPPING,
+        "talkie": _TALKIE_MAPPING,
         "legacy_layernorm": _LEGACY_LAYERNORM_MAPPING,
         "exact_legacy_gguf_extras": _EXACT_LEGACY_GGUF_EXTRAS,
         "bloom": _BLOOM_MAPPING,

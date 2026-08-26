@@ -11,6 +11,7 @@ __all__ = [
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
     "BertModel",
+    "BitNetCausalLMModel",
     "Blip2Model",
     "BloomCausalLMModel",
     "CLIPVisionModel",
@@ -65,6 +66,7 @@ __all__ = [
     "Gemma4Model",
     "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
+    "GemmaEmbeddingGGUFModel",
     "Glm4CausalLMModel",
     "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
@@ -89,6 +91,7 @@ __all__ = [
     "KimiK3CausalLMModel",
     "KimiLinearCausalLMModel",
     "Llama4CausalLMModel",
+    "LlamaEmbedGGUFModel",
     "DreamModel",
     "LLaDAModel",
     "LLaDAMoEModel",
@@ -200,6 +203,7 @@ __all__ = [
     "moshi_temporal_config",
     "Plamo2ForCausalLM",
     "PLMCausalLMModel",
+    "TalkieForCausalLM",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -213,6 +217,7 @@ from mobius.models.base import (
     LayerNormCausalLMModel,
 )
 from mobius.models.bert import BertModel
+from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel
@@ -256,6 +261,7 @@ from mobius.models.gemma4 import (
     Gemma4UnifiedModel,
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
+from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGUFModel
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,
@@ -399,6 +405,7 @@ from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
+from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.unet import (
     UNet2DConditionModel,
     load_unet_lora_safetensors,

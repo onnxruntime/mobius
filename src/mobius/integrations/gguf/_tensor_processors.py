@@ -198,6 +198,40 @@ def _process_llama(
     return state_dict
 
 
+def _process_bitnet(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Undo Q/K permutation and fold optional llama.cpp projection scales.
+
+    The pinned loader passes each optional scalar ``*.scale`` tensor to
+    ``build_lora_mm`` after dequantizing the stored weight. Mobius's float
+    ``Linear`` has no sidecar input, so multiplying the dequantized matrix by
+    that scalar preserves the same values exactly.
+    """
+    state_dict = _process_llama(state_dict, config)
+    scale_names = [name for name in state_dict if name.endswith(".scale")]
+    for scale_name in scale_names:
+        weight_name = scale_name.removesuffix(".scale") + ".weight"
+        if weight_name not in state_dict:
+            raise ValueError(f"BitNet scale tensor {scale_name!r} has no paired weight")
+        scale = state_dict[scale_name]
+        if scale.numel() != 1 or not torch.isfinite(scale).all():
+            raise ValueError(
+                f"BitNet scale tensor {scale_name!r} must be one finite scalar, "
+                f"got shape {tuple(scale.shape)}"
+            )
+        weight = state_dict[weight_name]
+        if weight.dim() != 2:
+            raise ValueError(
+                f"BitNet scaled projection {weight_name!r} must be rank 2, "
+                f"got shape {tuple(weight.shape)}"
+            )
+        state_dict[weight_name] = weight * scale.reshape(())
+        del state_dict[scale_name]
+    return state_dict
+
+
 def _reverse_permute(
     weights: torch.Tensor,
     n_head: int,
@@ -575,6 +609,7 @@ def _process_granitehybrid(
 # reverse-permuting them corrupts the attention heads. See
 # ``LLAMA_QK_PERMUTE_MODEL_TYPES``.
 _PROCESSOR_IMPLS: dict[str, Any] = {
+    "bitnet": _process_bitnet,
     "llama": _process_llama,
     "unoffset_norm": _process_unoffset_norm,
     "muse_glimmer": _process_muse_glimmer,

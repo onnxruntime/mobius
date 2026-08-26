@@ -144,6 +144,25 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # === Text Generation (Llama-compatible) ===
     ("llama", {}, True),
     (
+        "bitnet",
+        {
+            "hidden_act": "relu2",
+            "tie_word_embeddings": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    (
+        "talkie",
+        {
+            "hidden_act": "silu",
+            "tie_word_embeddings": False,
+            "rms_norm_eps": 1e-5,
+            "logit_scale": 0.5,
+        },
+        True,
+    ),
+    (
         "lfm2",
         {
             "_config_cls": Lfm2Config,
@@ -1797,6 +1816,25 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
 # Encoder-only configs  (task: feature-extraction)
 # ---------------------------------------------------------------------------
 ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "gemma_embedding_gguf",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "pooling_type": 0,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "rope_local_base_freq": 10_000.0,
+        },
+        True,
+    ),
+    (
+        "llama_embed_gguf",
+        {
+            "hidden_act": "silu",
+            "pooling_type": 0,
+        },
+        True,
+    ),
     ("bert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
     ("albert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
     (

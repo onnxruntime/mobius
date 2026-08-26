@@ -7368,7 +7368,7 @@ class TestGGUFPreflightGuards:
         ("architecture", "projection_quantization"),
         [
             pytest.param(architecture, quantization, id=f"{architecture}-{quantization}")
-            for architecture in ("pockettts", "qwen3tts", "talkie", "wavtokenizer-dec")
+            for architecture in ("pockettts", "qwen3tts", "wavtokenizer-dec")
             for quantization in ("f32", "q4_0")
         ],
     )

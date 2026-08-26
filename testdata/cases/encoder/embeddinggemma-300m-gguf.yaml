@@ -1,0 +1,14 @@
+model_id: "unsloth/embeddinggemma-300m-GGUF"
+model_type: "gemma_embedding_gguf"
+revision: "6661a6504c30d8304af13455cb4a5d4f5bc6011f"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4"
+skip_reason: "The pinned public GGUF supplies a real gemma-embedding config/artifact audit, but the gated Google source checkpoint prevents reproducible HF feature parity in the default test environment."
+
+notes: "Exact float GGUF import only. Synthetic nonzero ORT tests cover bidirectional visibility, symmetric sliding attention, padding, pooling, optional dense projections, and the stateless two-input ABI. Runtime packaging and packed projection preservation remain deferred."
