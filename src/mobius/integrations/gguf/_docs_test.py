@@ -123,7 +123,7 @@ def test_generated_census_counts_and_pin_are_closed() -> None:
     blocks = render_blocks()
     assert UPSTREAM_COMMIT in blocks["summary"]
     assert UPSTREAM_DATE in blocks["summary"]
-    assert blocks["architectures"].count("\n| `") == 147
+    assert blocks["architectures"].count("\n| `") == 148
     assert blocks["qtypes"].count("\n| ") == 25
     assert blocks["projectors"].count("\n| `") == 60
     assert blocks["tokenizers"].count("\n| `") == 87

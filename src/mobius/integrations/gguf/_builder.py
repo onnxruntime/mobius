@@ -454,13 +454,11 @@ def _preflight_hf_gguf_file(
             with session.get(metadata.location, headers=headers, stream=True) as response:
                 chunks = read_response(response)
     except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
-        logger.warning(
-            "Bounded GGUF header range read failed for %s (%s); downloading the "
-            "same immutable revision and validating its local header before dispatch.",
-            source,
-            error,
-        )
-        return commit_hash
+        raise RuntimeError(
+            f"Cannot read the bounded GGUF header for {source!r}; refusing payload "
+            "download because architecture and route policy cannot be established. "
+            "No payload was downloaded."
+        ) from error
     try:
         architecture = _gguf_architecture_from_header_prefix(
             b"".join(chunks),
@@ -469,12 +467,11 @@ def _preflight_hf_gguf_file(
     except ValueError as error:
         if "truncated GGUF metadata" not in str(error):
             raise
-        logger.warning(
-            "The selected GGUF metadata header for %s exceeds the bounded range; "
-            "downloading the same immutable revision for full local validation.",
-            source,
-        )
-        return commit_hash
+        raise RuntimeError(
+            f"The selected GGUF metadata header for {source!r} exceeds the bounded "
+            "range; refusing payload download because architecture and route policy "
+            "cannot be established. No payload was downloaded."
+        ) from error
     if expected_architecture is not None and architecture != expected_architecture:
         raise ValueError(
             f"Expected a {expected_architecture!r} mmproj GGUF for {source!r}, "
@@ -485,6 +482,10 @@ def _preflight_hf_gguf_file(
         source=source,
         allow_mmproj_companion=allow_mmproj_companion,
     )
+    if architecture == "qwen4exp":
+        from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_hub_source
+
+        validate_qwen4exp_hub_source(repo_id=repo_id, revision=commit_hash)
     return commit_hash
 
 
@@ -5317,6 +5318,23 @@ def build_from_gguf(
         ):
             raise ValueError(
                 "plamo2 GGUF only supports the dedicated 'plamo2-text-generation' task"
+            )
+    if gguf_arch == "qwen4exp":
+        from mobius.tasks import Qwen4ExpCausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for qwen4exp GGUF models; "
+                "DeltaNet, PLE, QSA, and position histories require the dedicated "
+                "heterogeneous dynamic-state ABI"
+            )
+        if (
+            task is not None
+            and task != "qwen4-exp-text-generation"
+            and not isinstance(task, Qwen4ExpCausalLMTask)
+        ):
+            raise ValueError(
+                "qwen4exp GGUF only supports the dedicated 'qwen4-exp-text-generation' task"
             )
     if gguf_arch in {
         "lfm2",

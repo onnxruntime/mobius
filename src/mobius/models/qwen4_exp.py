@@ -1129,10 +1129,8 @@ class Qwen4ExpCausalLMModel(nn.Module):
             if key.endswith("rotary_emb.inv_freq"):
                 continue
             indexer_marker = ".self_attn.indexer.index_"
-            if indexer_marker in key and key.endswith("_proj.weight"):
+            if key.endswith((".index_q_proj.weight", ".index_k_proj.weight")):
                 prefix, projection = key.rsplit(indexer_marker, 1)
-                if projection not in {"q_proj.weight", "k_proj.weight"}:
-                    raise ValueError(f"Unexpected Qwen4-Exp indexer projection: {key}")
                 indexer_projections[f"{prefix}.self_attn.indexer.index_qk_proj.weight"][
                     projection[0]
                 ] = value

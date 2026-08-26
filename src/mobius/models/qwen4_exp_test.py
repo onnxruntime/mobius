@@ -380,6 +380,16 @@ def test_preprocess_fuses_exact_gguf_indexer_query_and_key_rows():
     torch.testing.assert_close(fused[16:], key)
 
 
+def test_preprocess_preserves_official_fused_hf_indexer_projection():
+    module = Qwen4ExpCausalLMModel(_config())
+    name = "model.layers.1.self_attn.indexer.index_qk_proj.weight"
+    fused = torch.arange(24 * 16, dtype=torch.float32).reshape(24, 16)
+
+    result = module.preprocess_weights({name: fused})
+
+    assert result[name] is fused
+
+
 def test_preprocess_fails_closed_on_incomplete_or_malformed_gguf_indexer_split():
     config = _config()
     module = Qwen4ExpCausalLMModel(config)

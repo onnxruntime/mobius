@@ -918,15 +918,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         quantized_import=Support.REJECTED,
         runtime=Support.DEFERRED,
         reason=(
-            "The exact pinned Qwen3.8 Flash-Next GGUF graph and float tensor mapping "
-            "are implemented, but its only published UD-IQ1_S route cannot be "
-            "preserved truthfully: per_layer_token_embd.weight is a roughly 95 GiB "
-            "logical IQ4_NL embedding with no matching GatherBlockQuantized ABI, "
-            "while the rank-3 routed experts mix IQ1_S gate/up with IQ4_NL down "
-            "banks and have no released mixed-format sparse BlockQuantizedMoE ABI "
-            "or real-weight runtime evidence. Explicit dequantization is also "
-            "rejected for that artifact by the bounded-memory policy before payload "
-            "download."
+            "Exact header/float mapping is implemented. The published UD-IQ1_S "
+            "payload is rejected: its IQ4_NL PLE table has no native gather ABI, "
+            "mixed IQ1_S/IQ4_NL rank-3 experts have no released mixed sparse-MoE "
+            "ABI/runtime evidence, and float dequantization exceeds bounded memory."
         ),
     ),
     # ---------------------------------------------------------------- Gemma
