@@ -45,8 +45,8 @@ QSA layer:
 
 The multimodal decoder takes fused `inputs_embeds` and the original lexical
 `ple_input_ids` as independent inputs. Position state has shape `[4, B, S]`:
-channel 0 drives causal/QSA indexing and channels 1–3 carry temporal, height,
-and width M-RoPE positions.
+channel 0 is the text/causal sequence axis, while channels 1–3 carry temporal,
+height, and width M-RoPE positions used by both sparse attention and QSA.
 
 ## Vision and embedding reuse
 
@@ -59,7 +59,10 @@ disabled and the merger projected to the decoder width of 2560.
 The embedding graph keeps image and video streams distinct. It scatters
 `image_features` at token 248056 and `video_features` at token 248057 while
 preserving the original token IDs for PLE. The processor contract is the pinned
-Qwen3 processor with vision start/end tokens 248053/248054.
+Qwen3 processor with vision start/end tokens 248053/248054. Direct video use
+requires the pinned `video_preprocessor_config.json` and routes its
+`pixel_values_videos`/`video_grid_thw` through the shared vision graph before
+feeding `embedding.video_features`.
 
 QSA uses standard ONNX operators to reproduce the selected-token mask, then
 runs ordinary dense attention under that mask. This is numerically faithful,
@@ -100,5 +103,13 @@ IQ4_NL down tensors, while the released runtime has neither a mixed-format
 sparse native-block MoE ABI nor real-weight execution evidence. Treating these
 as ordinary affine `MatMulNBits` would be incorrect. Explicit float
 dequantization is also rejected because the PLE table alone expands beyond the
-bounded single-tensor materialization policy. The exact header/config/mapping support is therefore a fail-closed foundation
-for future runtime ABI work, not a quantized execution claim.
+bounded single-tensor materialization policy. The exact header/config/mapping
+support is therefore a fail-closed foundation for future runtime ABI work, not
+a quantized execution claim.
+
+Released onnxruntime-genai cannot represent Qwen4-Exp's four-axis position
+state or heterogeneous per-layer PLE/QSA state membership. ORT GenAI export
+therefore fails closed instead of emitting unsupported semantic keys or lossy
+`%d` cache templates. The decoder graph carries a separate
+`mobius.state_manifest` metadata document with explicit role-to-layer
+membership for direct ONNX Runtime orchestration.

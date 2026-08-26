@@ -1304,8 +1304,6 @@ class Qwen4ExpVLDecoderModel(Qwen4ExpCausalLMModel):
         past_position_ids: ir.Value,
         past_key_values: list[tuple[ir.Value, ...]],
     ):
-        qsa_position_ids = op.Squeeze(op.Slice(position_ids, [0], [1], [0]), [0])
-        past_qsa_position_ids = op.Squeeze(op.Slice(past_position_ids, [0], [1], [0]), [0])
         mrope_position_ids = op.Slice(position_ids, [1], [4], [0])
         past_mrope_position_ids = op.Slice(past_position_ids, [1], [4], [0])
         hidden_states, presents, present_position_ids = self.model(
@@ -1317,20 +1315,38 @@ class Qwen4ExpVLDecoderModel(Qwen4ExpCausalLMModel):
             past_key_values,
             inputs_embeds=inputs_embeds,
             ple_input_ids=ple_input_ids,
-            qsa_position_ids=qsa_position_ids,
-            past_qsa_position_ids=past_qsa_position_ids,
+            # QSA rotates its query/index keys with the same multimodal RoPE
+            # coordinates as sparse attention. Channel 0 is only the text/
+            # causal sequence axis retained for generation bookkeeping.
+            qsa_position_ids=mrope_position_ids,
+            past_qsa_position_ids=past_mrope_position_ids,
         )
-        present_qsa_position_ids = op.Concat(
+        present_text_position_ids = op.Concat(
             op.Slice(past_position_ids, [0], [1], [0]),
             op.Slice(position_ids, [0], [1], [0]),
             axis=-1,
         )
         present_position_ids = op.Concat(
-            present_qsa_position_ids,
+            present_text_position_ids,
             present_position_ids,
             axis=0,
         )
         return self.lm_head(op, hidden_states), presents, present_position_ids
+
+
+class Qwen4ExpVisionEncoderModel(Qwen3VLVisionEncoderModel):
+    """Qwen4-Exp vision encoder with a float32 processor boundary."""
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        image_grid_thw: ir.Value,
+    ):
+        # HF image/video processors always emit float32 packed patches. Cast
+        # once to the checkpoint dtype before the Conv3d patch projection.
+        pixel_values = op.CastLike(pixel_values, self.visual.patch_embed.weight)
+        return super().forward(op, pixel_values, image_grid_thw)
 
 
 class Qwen4ExpForConditionalGeneration(nn.Module):
@@ -1363,7 +1379,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
             raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
         self.config = config
         self.decoder = Qwen4ExpVLDecoderModel(config)
-        self.vision_encoder = Qwen3VLVisionEncoderModel(config)
+        self.vision_encoder = Qwen4ExpVisionEncoderModel(config)
         self.embedding = Qwen25VLEmbeddingModel(config)
 
     def forward(self, op: OpBuilder, **kwargs):

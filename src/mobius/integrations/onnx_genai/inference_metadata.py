@@ -932,7 +932,7 @@ _POSITION_PROGRAM_REGISTRY = (
     ),
     _PositionProgram(
         rank=4,
-        axes=("qsa", "temporal", "height", "width"),
+        axes=("text", "temporal", "height", "width"),
         generation="processor_coordinates",
         continuation="carry_state",
         matches=lambda config: (

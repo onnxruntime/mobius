@@ -119,8 +119,6 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "qwen2_5_vl_text": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
-    "qwen4_exp": "qwen4_exp",
-    "qwen4_exp_text": "qwen4_exp",
     # Preserve Qwen3.5 / Qwen3.6 source architecture identities here so package
     # topology selection can distinguish standalone text from dense and MoE
     # multimodal parents. Standalone text packages are normalized later to the
@@ -162,7 +160,6 @@ _UNWRAPPED_VLM_MODEL_TYPES = {
     "qwen3_5_text": "qwen3_5",
     "qwen3_5_vl_text": "qwen3_5",
     "qwen3_5_moe_text": "qwen3_5_moe",
-    "qwen4_exp_text": "qwen4_exp",
 }
 _LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
 _GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
@@ -507,17 +504,6 @@ def _write_runtime_compatibility(
         "uses_main_only_state_groups": False,
         "heterogeneous_state_manifest": "deferred: https://github.com/onnxruntime/mobius/issues/605",
     }
-    if model_type == "qwen4_exp":
-        metadata.update(
-            released_runtime_support=False,
-            limitation=(
-                "Released onnxruntime-genai does not yet register the qwen4_exp "
-                "four-axis position and heterogeneous PLE/QSA state executor."
-            ),
-            heterogeneous_state_manifest=(
-                "graph-derived:genai_config.json#model.decoder.inputs,outputs"
-            ),
-        )
     path = os.path.join(output_dir, "runtime_compatibility.json")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
@@ -550,58 +536,6 @@ def _graph_input_names(model: ir.Model) -> list[str]:
         for inp in model.graph.inputs
         if inp.name is not None and not inp.name.startswith("past_key_values.")
     ]
-
-
-def _inspect_qwen4_multimodal_abi(
-    model: ir.Model,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Describe every Qwen4-Exp decoder input/output from the graph."""
-    input_names = [value.name for value in model.graph.inputs if value.name is not None]
-    output_names = [value.name for value in model.graph.outputs if value.name is not None]
-    input_cache = _cache_names(input_names)
-    output_cache = _cache_names(output_names)
-
-    inputs = {name: name for name in input_names if not name.startswith("past_key_values.")}
-    outputs = {name: name for name in output_names if not name.startswith("present.")}
-    if {"inputs_embeds", "ple_input_ids", "past_position_ids"} - inputs.keys():
-        raise ValueError(
-            "Qwen4-Exp multimodal decoder must expose inputs_embeds, "
-            "ple_input_ids, and past_position_ids"
-        )
-    if "present_position_ids" not in outputs:
-        raise ValueError("Qwen4-Exp multimodal decoder must expose present_position_ids")
-
-    input_roles = set(input_cache)
-    output_roles = set(output_cache)
-    if input_roles != output_roles:
-        raise ValueError(
-            "Qwen4-Exp decoder state roles must match between inputs and outputs: "
-            f"inputs={sorted(input_roles)}, outputs={sorted(output_roles)}"
-        )
-    for role in sorted(input_roles):
-        if set(input_cache[role]) != set(output_cache[role]):
-            raise ValueError(
-                f"Qwen4-Exp decoder state role {role!r} has mismatched layer indices"
-            )
-        input_key = (
-            "past_key_names"
-            if role == "key"
-            else "past_value_names"
-            if role == "value"
-            else f"past_{role}_names"
-        )
-        output_key = (
-            "present_key_names"
-            if role == "key"
-            else "present_value_names"
-            if role == "value"
-            else f"present_{role}_names"
-        )
-        inputs[input_key] = _name_template(input_cache[role], label=f"Qwen4-Exp past-{role}")
-        outputs[output_key] = _name_template(
-            output_cache[role], label=f"Qwen4-Exp present-{role}"
-        )
-    return inputs, outputs
 
 
 def _count_cache_layer_slots(model: ir.Model | None) -> int | None:
@@ -1263,14 +1197,16 @@ def _write_vision_processor_config(
             or 2
         )
 
-        # CLIP-standard normalization defaults
-        image_mean = [0.48145466, 0.4578275, 0.40821073]
-        image_std = [0.26862954, 0.26130258, 0.27577711]
+        is_qwen4_exp = model_type in _QWEN4_EXP_MODEL_TYPES
+        # Qwen4-Exp is pinned to the checkpoint's Qwen processor constants.
+        # Other generic VLMs retain the CLIP-standard fallback.
+        image_mean = [0.5, 0.5, 0.5] if is_qwen4_exp else [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.5, 0.5, 0.5] if is_qwen4_exp else [0.26862954, 0.26130258, 0.27577711]
         rescale_factor = 1.0 / 255.0
-        min_pixels = 784
-        max_pixels = 2371600
+        min_pixels = 65_536 if is_qwen4_exp else 784
+        max_pixels = 16_777_216 if is_qwen4_exp else 2_371_600
         image_size = getattr(vision, "image_size", None)
-        resample = None
+        resample = 3 if is_qwen4_exp else None
 
         if hf_model_id is not None:
             try:
@@ -1305,10 +1241,21 @@ def _write_vision_processor_config(
                             min_pixels = size.get("shortest_edge") or min_pixels
                             max_pixels = size.get("longest_edge") or max_pixels
             except Exception:
+                if is_qwen4_exp:
+                    image_mean = [0.5, 0.5, 0.5]
+                    image_std = [0.5, 0.5, 0.5]
+                    rescale_factor = 1.0 / 255.0
+                    resample = 3
+                    min_pixels = 65_536
+                    max_pixels = 16_777_216
                 logger.warning(
-                    "Could not load HF processor for %s; "
-                    "using CLIP-standard normalization defaults",
+                    "Could not load HF processor for %s; using %s",
                     hf_model_id,
+                    (
+                        "pinned Qwen4-Exp processor constants"
+                        if is_qwen4_exp
+                        else "CLIP-standard normalization defaults"
+                    ),
                     exc_info=True,
                 )
 
@@ -1581,6 +1528,11 @@ def _write_genai_config(
 
     Returns the path to the written file.
     """
+    if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
+        raise ValueError(
+            "onnxruntime-genai cannot represent Qwen4-Exp's heterogeneous "
+            "state contract; use ModelPackage.save() and mobius.state_manifest"
+        )
     from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
 
     # --- Discover decoder inputs from the ONNX graph ---
@@ -1594,18 +1546,9 @@ def _write_genai_config(
         decoder_inputs = decoder_abi.inputs
         decoder_outputs = decoder_abi.outputs
     else:
-        if (
-            decoder_model is not None
-            and getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES
-        ):
-            decoder_inputs, decoder_outputs = _inspect_qwen4_multimodal_abi(decoder_model)
-        else:
-            decoder_inputs = _introspect_inputs(pkg, decoder_key)
-            decoder_outputs = None
-        if (
-            decoder_inputs is not None
-            and getattr(config, "model_type", None) not in _QWEN4_EXP_MODEL_TYPES
-        ):
+        decoder_inputs = _introspect_inputs(pkg, decoder_key)
+        decoder_outputs = None
+        if decoder_inputs is not None:
             # Multimodal runtime types retain their architecture-specific cache contract.
             decoder_inputs["past_key_names"] = "past_key_values.%d.key"
             decoder_inputs["past_value_names"] = "past_key_values.%d.value"
@@ -1664,22 +1607,15 @@ def _write_genai_config(
             # must reject on the mere presence of standard Attention, not
             # only when GQA is completely absent (partial GQA fusion still
             # leaves the unfused standard Attention layers broken).
-            if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
-                # Qwen4-Exp's QSA mask is graph-computed and intentionally does
-                # not match the ordinary GQA rewrite. Preserve the complete
-                # graph-derived metadata instead of rejecting export based on a
-                # released runtime's shared-buffer limitation.
-                supports_in_place_kv_cache = False
-            else:
-                raise ValueError(
-                    "This decoder graph mixes com.microsoft.LinearAttention "
-                    "(recurrent state, requires past_present_share_buffer=True) "
-                    "with standard (non-GQA) Attention (incompatible with "
-                    "past_present_share_buffer=True). This EP/dtype combination "
-                    "cannot produce a runnable genai_config -- pick an EP/dtype "
-                    "that lowers *all* full-attention layers to "
-                    "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
-                )
+            raise ValueError(
+                "This decoder graph mixes com.microsoft.LinearAttention "
+                "(recurrent state, requires past_present_share_buffer=True) "
+                "with standard (non-GQA) Attention (incompatible with "
+                "past_present_share_buffer=True). This EP/dtype combination "
+                "cannot produce a runnable genai_config -- pick an EP/dtype "
+                "that lowers *all* full-attention layers to "
+                "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
+            )
         else:
             supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
@@ -1920,11 +1856,13 @@ def _write_genai_config(
 def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
     """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
     config = getattr(pkg, "config", None)
-    if getattr(config, "model_type", None) == "qwen4_exp_text":
+    if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
         raise ValueError(
-            "ORT GenAI released config cannot represent Qwen4-Exp's "
-            "past_position_ids, QSA index-key cache, and PLE context states. "
-            "Export without --runtime ort-genai and run the ONNX model directly."
+            "onnxruntime-genai 0.15.2 cannot represent Qwen4-Exp's explicit "
+            "four-axis position state or heterogeneous per-layer PLE/QSA state "
+            "membership. Use ModelPackage.save() and the decoder ONNX model's "
+            "'mobius.state_manifest' metadata; refusing to emit an unsupported "
+            "genai_config.json."
         )
     if getattr(config, "model_type", None) == "parakeet_ctc":
         raise ValueError(

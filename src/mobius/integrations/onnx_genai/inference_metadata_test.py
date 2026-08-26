@@ -328,7 +328,7 @@ def test_qwen4_decoder_metadata_preserves_qsa_kv_index_and_four_axis_positions()
         "dtype": "int64",
         "generation": "processor_coordinates",
         "continuation": "carry_state",
-        "axes": ["qsa", "temporal", "height", "width"],
+        "axes": ["text", "temporal", "height", "width"],
         "sections": [1, 1, 0],
     }
 

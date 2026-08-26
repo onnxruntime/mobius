@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+
 import onnx_ir as ir
 from onnxscript import nn
 
@@ -169,6 +171,38 @@ def _finalize_qwen4_decoder(graph, config: Qwen4ExpConfig) -> ir.Model:
     model.metadata_props["mobius.semantic_reference_revision"] = (
         "Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c;"
         "transformers@598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1"
+    )
+    assert config.layer_types is not None
+    layers = []
+    for layer_index, layer_type in enumerate(config.layer_types):
+        if layer_type == "linear_attention":
+            roles = ["conv_state", "recurrent_state"]
+            if layer_index + 1 in (config.ple_layer_ids or []):
+                roles.extend(["ple_conv_state", "ple_context"])
+        else:
+            roles = ["key", "value", "index_key"]
+        layers.append(
+            {
+                "index": layer_index,
+                "type": layer_type,
+                "roles": roles,
+                "update": {
+                    role: "append" if role in {"key", "value"} else "replace" for role in roles
+                },
+            }
+        )
+    model.metadata_props["mobius.state_manifest"] = json.dumps(
+        {
+            "schema_version": 1,
+            "position_state": {
+                "input": "past_position_ids",
+                "output": "present_position_ids",
+                "axes": ["text", "temporal", "height", "width"],
+                "update": "replace",
+            },
+            "layers": layers,
+        },
+        separators=(",", ":"),
     )
     return model
 

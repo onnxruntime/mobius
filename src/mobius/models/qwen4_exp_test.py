@@ -433,7 +433,7 @@ def test_multimodal_embedding_preserves_global_image_and_video_order():
     np.testing.assert_array_equal(actual[0, 0], weight[input_ids[0, 0]].numpy())
 
 
-def test_graph_derived_ort_genai_metadata_preserves_all_decoder_state(tmp_path):
+def test_state_manifest_preserves_layer_membership_and_oga_fails_closed(tmp_path):
     from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
     config = _vl_config()
@@ -441,41 +441,39 @@ def test_graph_derived_ort_genai_metadata_preserves_all_decoder_state(tmp_path):
         Qwen4ExpForConditionalGeneration(config),
         config,
     )
-    result = write_ort_genai_config(
-        package,
-        str(tmp_path),
-        ep="cpu",
-        context_length=128,
-    )
-    with open(result["genai_config"], encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    model = data["model"]
-    assert model["type"] == "qwen4_exp"
-    decoder_inputs = model["decoder"]["inputs"]
-    decoder_outputs = model["decoder"]["outputs"]
-    assert decoder_inputs["ple_input_ids"] == "ple_input_ids"
-    assert decoder_inputs["past_position_ids"] == "past_position_ids"
-    assert decoder_inputs["past_index_key_names"] == "past_key_values.%d.index_key"
-    assert decoder_inputs["past_ple_context_names"] == "past_key_values.%d.ple_context"
-    assert decoder_inputs["past_ple_conv_state_names"] == "past_key_values.%d.ple_conv_state"
-    assert decoder_outputs["present_position_ids"] == "present_position_ids"
-    assert decoder_outputs["present_index_key_names"] == "present.%d.index_key"
-    assert decoder_outputs["present_ple_context_names"] == "present.%d.ple_context"
-    assert model["vision"]["inputs"] == {
-        "pixel_values": "pixel_values",
-        "image_grid_thw": "image_grid_thw",
+    state = json.loads(package["decoder"].metadata_props["mobius.state_manifest"])
+    assert state["position_state"] == {
+        "input": "past_position_ids",
+        "output": "present_position_ids",
+        "axes": ["text", "temporal", "height", "width"],
+        "update": "replace",
     }
-    assert model["embedding"]["inputs"] == {
-        "input_ids": "input_ids",
-        "image_features": "image_features",
-        "video_features": "video_features",
-    }
-    assert data["search"]["past_present_share_buffer"] is False
-    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
-        compatibility = json.load(handle)
-    assert compatibility["released_runtime_support"] is False
-    assert compatibility["heterogeneous_state_manifest"].startswith("graph-derived:")
+    assert state["layers"] == [
+        {
+            "index": 0,
+            "type": "linear_attention",
+            "roles": [
+                "conv_state",
+                "recurrent_state",
+                "ple_conv_state",
+                "ple_context",
+            ],
+            "update": {
+                "conv_state": "replace",
+                "recurrent_state": "replace",
+                "ple_conv_state": "replace",
+                "ple_context": "replace",
+            },
+        },
+        {
+            "index": 1,
+            "type": "qwen_sparse_attention",
+            "roles": ["key", "value", "index_key"],
+            "update": {"key": "append", "value": "append", "index_key": "replace"},
+        },
+    ]
+    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
+        write_ort_genai_config(package, str(tmp_path))
 
 
 def test_processor_config_matches_qwen4exp_graph_contract(tmp_path):
@@ -521,6 +519,74 @@ def test_processor_config_matches_qwen4exp_graph_contract(tmp_path):
         "temporal_patch_size": 2,
         "merge_size": 2,
     }
+
+    fallback_dir = tmp_path / "fallback"
+    fallback_dir.mkdir()
+    with mock.patch(
+        "transformers.AutoProcessor.from_pretrained",
+        side_effect=OSError("offline"),
+    ):
+        fallback_path = _write_vision_processor_config(
+            _vl_config(),
+            str(fallback_dir),
+            hf_model_id="Qwen/Qwen3.8-Flash-Next",
+            revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+        )
+    assert fallback_path is not None
+    with open(fallback_path, encoding="utf-8") as handle:
+        fallback = json.load(handle)["processor"]["transforms"]
+    assert fallback[1]["operation"]["attrs"]["min_pixels"] == 65_536
+    assert fallback[1]["operation"]["attrs"]["max_pixels"] == 16_777_216
+    assert fallback[3]["operation"]["attrs"]["mean"] == [0.5, 0.5, 0.5]
+    assert fallback[3]["operation"]["attrs"]["std"] == [0.5, 0.5, 0.5]
+
+
+def test_bfloat16_vision_graph_casts_float_processor_input_and_loads_in_ort():
+    config = _vl_config(dtype=ir.DataType.BFLOAT16)
+    vision = build_from_module(
+        Qwen4ExpForConditionalGeneration(config),
+        config,
+        task="qwen4-exp-vision-language",
+    )["vision_encoder"]
+    pixel_values = next(value for value in vision.graph.inputs if value.name == "pixel_values")
+    assert pixel_values.dtype == ir.DataType.FLOAT
+    cast = next(
+        node
+        for node in vision.graph
+        if node.op_type in {"Cast", "CastLike"} and node.inputs[0] is pixel_values
+    )
+    assert cast.outputs[0].dtype == ir.DataType.BFLOAT16
+
+    for initializer in vision.graph.initializers.values():
+        if initializer.const_value is not None:
+            continue
+        shape = [int(dim) for dim in initializer.shape]
+        if initializer.dtype == ir.DataType.BFLOAT16:
+            initializer.const_value = ir.Tensor(
+                np.zeros(shape, dtype=np.uint16),
+                dtype=ir.DataType.BFLOAT16,
+            )
+        else:
+            raise AssertionError(f"Unexpected uninitialized vision dtype {initializer.dtype}")
+    import tempfile
+    from pathlib import Path
+
+    import onnxruntime as ort
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory) / "vision.onnx")
+        ir.save(vision, path)
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            ort.InferenceSession(path, providers=["CUDAExecutionProvider"])
+        else:
+            # CPU ORT has no BF16 Conv kernel. Reaching kernel resolution proves
+            # model loading passed graph type validation; before the Cast this
+            # failed earlier with mixed FLOAT/BFLOAT16 Conv inputs.
+            with pytest.raises(
+                ort.capi.onnxruntime_pybind11_state.NotImplemented,
+                match=r"implementation for Conv",
+            ):
+                ort.InferenceSession(path, providers=["CPUExecutionProvider"])
 
 
 @pytest.mark.integration
@@ -909,11 +975,23 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions():
                 "position_ids": multimodal_positions,
             }
         )["logits"]
+        alternate_text_positions = multimodal_positions.copy()
+        alternate_text_positions[0] += 97
+        alternate_logits = vl_session.run(
+            vl_states
+            | {
+                "inputs_embeds": inputs_embeds,
+                "ple_input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": alternate_text_positions,
+            }
+        )["logits"]
     finally:
         text_session.close()
         vl_session.close()
 
     np.testing.assert_allclose(vl_logits, text_logits, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(alternate_logits, vl_logits, rtol=1e-5, atol=1e-6)
     assert text_config.hidden_size == vl_config.hidden_size
 
 
@@ -1129,6 +1207,30 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
                 "position_ids": position_ids_4d,
             }
         )["logits"]
+        alternate_position_ids = position_ids_4d.copy()
+        alternate_position_ids[0] += 97
+        vl_alternate = vl_session.run(
+            vl_states
+            | {
+                "inputs_embeds": inputs_embeds,
+                "ple_input_ids": input_ids,
+                "attention_mask": np.ones((1, 4), dtype=np.int64),
+                "position_ids": alternate_position_ids,
+            }
+        )["logits"]
     finally:
         vl_session.close()
+    with torch.no_grad():
+        hf_positioned = hf_model(
+            torch.from_numpy(input_ids),
+            position_ids=torch.from_numpy(position_ids_4d),
+            use_cache=False,
+        ).logits.numpy()
+        hf_alternate = hf_model(
+            torch.from_numpy(input_ids),
+            position_ids=torch.from_numpy(alternate_position_ids),
+            use_cache=False,
+        ).logits.numpy()
     np.testing.assert_allclose(vl_logits, hf_full, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(vl_alternate, vl_logits, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(hf_alternate, hf_positioned, rtol=1e-3, atol=1e-3)
