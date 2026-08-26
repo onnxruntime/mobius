@@ -33,6 +33,10 @@ _MODEL_LFS_SHA256 = "a0d562e22f1cdcf307ddb9d5967a46dc1deeabd485e7ec27312518b5f0c
 _MODEL_SIZE = 22_568_192_096
 _MODEL_HEADER_LENGTH = 251_128
 _INDEX_TOTAL_SIZE = 23_417_592_488
+_OFFICIAL_BASE_REPOSITORY = "Qwen/Qwen3.8-27B"
+_OFFICIAL_BASE_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+_OFFICIAL_BASE_CONFIG_ETAG = "706cebd746c4b6f2b1d1f892630867acfdfd3df8"
+_OFFICIAL_BASE_CONFIG_SIZE = 4_312
 
 _HEADER_EVIDENCE = {
     "model.language_model.layers.3.self_attn.k_scale": ("BF16", [1], [2563940052, 2563940054]),
@@ -181,6 +185,14 @@ class TestConfig:
         )
         assert parsed.resolve("model.layers.0.mlp.gate_proj") is None
 
+    def test_output_activation_quantization_fails_closed(self):
+        config = _config()
+        config["config_groups"]["group_0"]["output_activations"] = _args(
+            8, "token", dynamic=True
+        )
+        with pytest.raises(CompressedTensorsError, match="output_activations"):
+            CompressedTensorsConfig.parse(config)
+
     def test_exact_parent_ignore_does_not_hide_targeted_child(self):
         parsed = CompressedTensorsConfig.parse(
             _config(
@@ -238,6 +250,7 @@ class TestReconstruction:
             str(tmp_path),
             CompressedTensorsConfig.parse(_config()),
             preprocess_weights=lambda state: {"weight": state["nvfp4.weight"]},
+            fp8_kv_cache=True,
         )
 
         magnitudes = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -251,7 +264,11 @@ class TestReconstruction:
         np.testing.assert_allclose(actual, x @ expected_weight.T, rtol=0, atol=0)
         assert not report.output_is_nvfp4
         assert report.native_weight_formats == ()
-        assert isinstance(package["model"].graph.initializers["weight"].const_value, ir.LazyTensor)
+        assert "not enabled" in report.kv_cache
+        assert any(
+            isinstance(initializer.const_value, ir.LazyTensor)
+            for initializer in package["model"].graph.initializers.values()
+        )
 
     def test_fp8_channel_scale_ort_matmul_parity(self, tmp_path):
         weight = torch.tensor(
@@ -419,6 +436,18 @@ def test_qwen35_vlm_build_and_streaming_load(tmp_path):
         for model in package.values()
         for initializer in model.graph.initializers.values()
     )
+    assert not any(
+        node.op_type == "Transpose"
+        and node.inputs[0] is not None
+        and node.inputs[0].is_initializer()
+        for model in package.values()
+        for node in model.graph
+    )
+    assert any(
+        isinstance(initializer.const_value, ir.LazyTensor)
+        for model in package.values()
+        for initializer in model.graph.initializers.values()
+    )
 
 
 def test_pinned_qwen38_checkpoint_schema_evidence():
@@ -432,14 +461,26 @@ def test_pinned_qwen38_checkpoint_schema_evidence():
         "model_header_length": _MODEL_HEADER_LENGTH,
         "index_total_size": _INDEX_TOTAL_SIZE,
         "header": _HEADER_EVIDENCE,
+        "official_base": {
+            "repository": _OFFICIAL_BASE_REPOSITORY,
+            "revision": _OFFICIAL_BASE_REVISION,
+            "config_etag": _OFFICIAL_BASE_CONFIG_ETAG,
+            "config_size": _OFFICIAL_BASE_CONFIG_SIZE,
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_model_type": "qwen3_5_text",
+            "num_hidden_layers": 64,
+        },
     }
     # Stable JSON serialization makes accidental evidence edits obvious in review.
     encoded = json.dumps(evidence, sort_keys=True)
     assert _REVISION in encoded and _MODEL_LFS_SHA256 in encoded
+    assert _OFFICIAL_BASE_REVISION in encoded
     assert _INDEX_TOTAL_SIZE == 23_417_592_488
-    assert _HEADER_EVIDENCE[
-        "model.language_model.layers.55.mlp.gate_proj.weight_scale"
-    ][:2] == ("F8_E4M3", [17408, 320])
-    assert _HEADER_EVIDENCE[
-        "model.language_model.layers.56.mlp.gate_proj.weight"
-    ][:2] == ("F8_E4M3", [17408, 5120])
+    assert _HEADER_EVIDENCE["model.language_model.layers.55.mlp.gate_proj.weight_scale"][
+        :2
+    ] == ("F8_E4M3", [17408, 320])
+    assert _HEADER_EVIDENCE["model.language_model.layers.56.mlp.gate_proj.weight"][:2] == (
+        "F8_E4M3",
+        [17408, 5120],
+    )

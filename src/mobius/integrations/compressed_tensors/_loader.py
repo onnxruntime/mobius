@@ -15,7 +15,6 @@ import dataclasses
 import logging
 import re
 from collections.abc import Callable, Mapping
-from typing import Any
 
 import onnx_ir as ir
 import torch
@@ -23,6 +22,7 @@ from onnx_ir import tensor_adapters
 from safetensors import safe_open
 
 from mobius._model_package import ModelPackage
+from mobius._optimizations import fold_initializers_after_weights
 from mobius.integrations._weight_loading import _resolve_shard_paths, _shard_key_index
 
 logger = logging.getLogger(__name__)
@@ -37,9 +37,7 @@ _AUX_SUFFIXES = (
     ".k_scale",
     ".v_scale",
 )
-_FP4_VALUES = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-)
+_FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 
 class CompressedTensorsError(ValueError):
@@ -62,39 +60,48 @@ class QuantizationArgs:
     def parse(cls, value: object, *, where: str) -> QuantizationArgs:
         if not isinstance(value, Mapping):
             raise CompressedTensorsError(f"{where} must be an object.")
-        try:
-            num_bits = value["num_bits"]
-            type_name = value["type"]
-            strategy = value["strategy"]
-            symmetric = value["symmetric"]
-            group_size = value.get("group_size")
-            dynamic = value.get("dynamic", False)
-            scale_dtype = value.get("scale_dtype")
-            if not isinstance(num_bits, int) or isinstance(num_bits, bool):
-                raise TypeError("num_bits must be an integer")
-            if not isinstance(type_name, str) or not isinstance(strategy, str):
-                raise TypeError("type and strategy must be strings")
-            if not isinstance(symmetric, bool):
-                raise TypeError("symmetric must be boolean")
-            if group_size is not None and (
-                not isinstance(group_size, int) or isinstance(group_size, bool)
-            ):
-                raise TypeError("group_size must be an integer or null")
-            if not isinstance(dynamic, (bool, str)):
-                raise TypeError("dynamic must be boolean or a string")
-            if scale_dtype is not None and not isinstance(scale_dtype, str):
-                raise TypeError("scale_dtype must be a string or null")
-            return cls(
-                num_bits=num_bits,
-                type=type_name,
-                strategy=strategy,
-                symmetric=symmetric,
-                group_size=group_size,
-                dynamic=dynamic,
-                scale_dtype=scale_dtype,
+        required = ("num_bits", "type", "strategy", "symmetric")
+        missing = [field for field in required if field not in value]
+        if missing:
+            raise CompressedTensorsError(f"Invalid {where}: missing {missing}.")
+        num_bits = value["num_bits"]
+        type_name = value["type"]
+        strategy = value["strategy"]
+        symmetric = value["symmetric"]
+        group_size = value.get("group_size")
+        dynamic = value.get("dynamic", False)
+        scale_dtype = value.get("scale_dtype")
+        if not isinstance(num_bits, int) or isinstance(num_bits, bool):
+            raise CompressedTensorsError(f"Invalid {where}: num_bits must be an integer.")
+        if not isinstance(type_name, str) or not isinstance(strategy, str):
+            raise CompressedTensorsError(
+                f"Invalid {where}: type and strategy must be strings."
             )
-        except (KeyError, TypeError, ValueError) as error:
-            raise CompressedTensorsError(f"Invalid {where}: {value!r}") from error
+        if not isinstance(symmetric, bool):
+            raise CompressedTensorsError(f"Invalid {where}: symmetric must be boolean.")
+        if group_size is not None and (
+            not isinstance(group_size, int) or isinstance(group_size, bool)
+        ):
+            raise CompressedTensorsError(
+                f"Invalid {where}: group_size must be an integer or null."
+            )
+        if not isinstance(dynamic, (bool, str)):
+            raise CompressedTensorsError(
+                f"Invalid {where}: dynamic must be boolean or a string."
+            )
+        if scale_dtype is not None and not isinstance(scale_dtype, str):
+            raise CompressedTensorsError(
+                f"Invalid {where}: scale_dtype must be a string or null."
+            )
+        return cls(
+            num_bits=num_bits,
+            type=type_name,
+            strategy=strategy,
+            symmetric=symmetric,
+            group_size=group_size,
+            dynamic=dynamic,
+            scale_dtype=scale_dtype,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,9 +161,7 @@ class CompressedTensorsConfig:
         raw_groups = value.get("config_groups")
         if not isinstance(raw_groups, Mapping) or not raw_groups:
             raise CompressedTensorsError("config_groups must be a non-empty object.")
-        groups = tuple(
-            _parse_group(str(name), group) for name, group in raw_groups.items()
-        )
+        groups = tuple(_parse_group(str(name), group) for name, group in raw_groups.items())
         formats = {group.format for group in groups}
         required_formats = {"float-quantized", "nvfp4-pack-quantized"}
         if formats != required_formats:
@@ -168,7 +173,9 @@ class CompressedTensorsConfig:
         ignore = value.get("ignore", [])
         if not isinstance(ignore, list) or not all(isinstance(item, str) for item in ignore):
             raise CompressedTensorsError("ignore must be a list of module-name patterns.")
-        _validate_patterns((*ignore, *(target for group in groups for target in group.targets)))
+        _validate_patterns(
+            (*ignore, *(target for group in groups for target in group.targets))
+        )
 
         raw_kv = value.get("kv_cache_scheme")
         kv_cache = (
@@ -241,10 +248,17 @@ def _parse_group(name: str, value: object) -> CompressionGroup:
         raise CompressedTensorsError(f"config_groups.{name} must be an object.")
     format_name = str(value.get("format", ""))
     targets = value.get("targets")
-    if not isinstance(targets, list) or not targets or not all(
-        isinstance(target, str) for target in targets
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or not all(isinstance(target, str) for target in targets)
     ):
         raise CompressedTensorsError(f"config_groups.{name}.targets must be strings.")
+    if value.get("output_activations") is not None:
+        raise CompressedTensorsError(
+            f"config_groups.{name}.output_activations must be null; output "
+            "activation quantization is not represented by the dense fallback."
+        )
     weights = QuantizationArgs.parse(
         value.get("weights"), where=f"config_groups.{name}.weights"
     )
@@ -409,9 +423,7 @@ def _validate_module_layout(
     _require_metadata(key_index, global_key, dtypes={"F32"}, rank=1)
     if key_index[global_key][1] != [1]:
         raise CompressedTensorsError(f"{global_key} must be an F32 scalar stored as [1].")
-    _require_metadata(
-        key_index, f"{module_name}.input_global_scale", dtypes={"F32"}, rank=1
-    )
+    _require_metadata(key_index, f"{module_name}.input_global_scale", dtypes={"F32"}, rank=1)
     if key_index[f"{module_name}.input_global_scale"][1] != [1]:
         raise CompressedTensorsError(
             f"{module_name}.input_global_scale must be an F32 scalar stored as [1]."
@@ -432,8 +444,7 @@ def _require_metadata(
         raise CompressedTensorsError(f"Missing required checkpoint tensor {key!r}.") from error
     if dtype not in dtypes or len(shape) != rank:
         raise CompressedTensorsError(
-            f"{key} must have dtype in {sorted(dtypes)} and rank {rank}, got "
-            f"{dtype} {shape}."
+            f"{key} must have dtype in {sorted(dtypes)} and rank {rank}, got {dtype} {shape}."
         )
 
 
@@ -477,9 +488,7 @@ def _map_source_weight(
     return tuple(mapped)
 
 
-def _find_initializer(
-    package: ModelPackage, mapped_name: str
-) -> tuple[str, ir.Value] | None:
+def _find_initializer(package: ModelPackage, mapped_name: str) -> tuple[str, ir.Value] | None:
     for component_name, model in package.items():
         if mapped_name in model.graph.initializers:
             return f"{component_name}.{mapped_name}", model.graph.initializers[mapped_name]
@@ -489,6 +498,24 @@ def _find_initializer(
             if local_name in model.graph.initializers:
                 return mapped_name, model.graph.initializers[local_name]
     return None
+
+
+def _has_fp8_kv_cache(package: ModelPackage) -> bool:
+    """Return whether the built decoder actually carries the FP8 GQA cache ABI."""
+    gqa_nodes = [
+        node
+        for model in package.values()
+        for node in model.graph
+        if node.domain == "com.microsoft" and node.op_type == "GroupQueryAttention"
+    ]
+    if not gqa_nodes:
+        return False
+    return all(
+        node.attributes.get_int("kv_cache_bit_width", 0) == 8
+        and node.attributes.get_string("k_quant_type", "") == "PER_TENSOR"
+        and node.attributes.get_string("v_quant_type", "") == "PER_TENSOR"
+        for node in gqa_nodes
+    )
 
 
 def stream_compressed_tensors_to_package(
@@ -542,17 +569,13 @@ def stream_compressed_tensors_to_package(
                 )
             continue
         if group.format == "nvfp4-pack-quantized":
-            logical_shape, root_key = _validate_module_layout(
-                key_index, module_name, group
-            )
+            logical_shape, root_key = _validate_module_layout(key_index, module_name, group)
             if f"{module_name}.weight" in key_index:
                 raise CompressedTensorsError(
                     f"{module_name!r} resolves to NVFP4 but stores an ordinary weight."
                 )
         else:
-            logical_shape, root_key = _validate_module_layout(
-                key_index, module_name, group
-            )
+            logical_shape, root_key = _validate_module_layout(key_index, module_name, group)
             if f"{module_name}.weight_packed" in key_index:
                 raise CompressedTensorsError(
                     f"{module_name!r} resolves to FP8 but stores weight_packed."
@@ -568,7 +591,9 @@ def stream_compressed_tensors_to_package(
                 f"FP8 weight {key!r} is not covered by a float-quantized target."
             )
 
-    root_to_layout = {root: (module, group, shape) for module, (group, shape, root) in layouts.items()}
+    root_to_layout = {
+        root: (module, group, shape) for module, (group, shape, root) in layouts.items()
+    }
     assigned: set[int] = set()
     target_sources: dict[int, str] = {}
 
@@ -651,9 +676,16 @@ def stream_compressed_tensors_to_package(
             f"{missing[:5]}."
         )
 
+    # Preserve the standard post-load graph contract without materializing the
+    # checkpoint: these folds create new LazyTensors whose closures transpose or
+    # concatenate one reconstructed projection at serialization time.
+    for model in package.values():
+        fold_initializers_after_weights(model)
+
+    actual_fp8_kv_cache = fp8_kv_cache and _has_fp8_kv_cache(package)
     kv_cache = (
         "FP8 preserved through the explicit EP-gated GQA cache feature"
-        if fp8_kv_cache
+        if actual_fp8_kv_cache
         else "dequantized/float graph cache; checkpoint FP8 cache scheme not enabled"
     )
     report = CompressedTensorsLoadReport(
