@@ -1,0 +1,57 @@
+model_id: "Qwen/Qwen2.5-0.5B-Instruct"
+model_type: "qwen2"
+revision: "7ae557604adf67be50417f59c2c2f167def9a775"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+  revision: "9217f5db79a29953eb74d5343926648285ec7e67"
+  filename: "qwen2.5-0.5b-instruct-q8_0.gguf"
+  size: 675710816
+  lfs_sha256: "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  tensor_count: 291
+  tensor_qtypes:
+    F32: 121
+    Q8_0: 170
+  execution_provider: "cpu"
+  config_sha256: "f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500"
+  preserve_quantization: true
+  keep_quantized: true
+  tokenizer:
+    repository: "Qwen/Qwen2.5-0.5B-Instruct"
+    revision: "a338b55dd21219a5f4da42bc11a9313d1a27d4cc"
+    metadata_sha256: "8fc8ef848104e931f14ae03d9581699d54813a2ff952fb7caac0654e8aa27ee3"
+    identity_status: "exact"
+    assets:
+      - filename: "tokenizer.json"
+        size: 7031645
+        sha256: "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539"
+      - filename: "tokenizer_config.json"
+        size: 7308
+        sha256: "5214600ee45ca2f887ce2eede8910378a0111ea99d657428bcbce94778e65a92"
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 700000000
+  released_capabilities:
+    "0.15.2":
+      generic_decoder: true
+      state_groups: false
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Official Q8_0 GGUF; complete logits and 20-step KV decode are compared to Transformers loading this exact artifact."

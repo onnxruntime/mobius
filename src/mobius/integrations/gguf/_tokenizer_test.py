@@ -526,6 +526,84 @@ def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch)
     assert not output.exists()
 
 
+def test_non_smollm_pipeline_is_bound_by_exact_asset_hashes() -> None:
+    metadata = _metadata(pre="qwen2")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"]["pretokenizers"].reverse()
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    tokenizer_sha256, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    assert hashlib.sha256(materialized).hexdigest() == tokenizer_sha256
+
+
+def test_deterministic_unused_padding_is_materialized_as_added_tokens() -> None:
+    source_metadata = _metadata(pre="qwen2")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "[PAD7]",
+        "[PAD8]",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        5,
+        5,
+    ]
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    tokenizer = json.loads(materialized)
+    assert tokenizer["added_tokens"][-2:] == [
+        {
+            "id": 7,
+            "content": "[PAD7]",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": False,
+        },
+        {
+            "id": 8,
+            "content": "[PAD8]",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("token", "token_type", "message"),
+    [
+        ("[PAD8]", 5, "vocabulary differs"),
+        ("[PAD7]", 1, "padding must contain only unused tokens"),
+    ],
+)
+def test_malformed_deterministic_padding_rejects(
+    token: str, token_type: int, message: str
+) -> None:
+    source_metadata = _metadata(pre="qwen2")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [*source_metadata["tokenizer.ggml.tokens"], token]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        token_type,
+    ]
+
+    with pytest.raises(ValueError, match=message):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
 def test_post_processor_cannot_hide_matching_special_token_flags(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -627,3 +705,92 @@ def test_local_asset_replacement_during_read_rejects(tmp_path: Path) -> None:
         pytest.raises(ValueError, match="changed while it was being read"),
     ):
         _tokenizer._read_regular_file(path, expected=expected)
+
+
+def test_local_hub_cache_symlink_is_resolved_inside_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"{}"
+    source = GGUFTokenizerSource(
+        "owner/tokenizer",
+        "a" * 40,
+        (
+            GGUFTokenizerAsset(
+                "tokenizer.json", len(payload), hashlib.sha256(payload).hexdigest()
+            ),
+        ),
+        "b" * 64,
+    )
+    cache = tmp_path / "hub"
+    blob = cache / "models--owner--tokenizer" / "blobs" / ("c" * 64)
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(payload)
+    snapshot = (
+        cache / "models--owner--tokenizer" / "snapshots" / source.revision / "tokenizer.json"
+    )
+    snapshot.parent.mkdir(parents=True)
+    snapshot.symlink_to(blob)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(snapshot))
+
+    assert _tokenizer._download_tokenizer_assets(source, local_files_only=True) == {
+        "tokenizer.json": payload
+    }
+
+
+def test_local_hub_cache_symlink_escape_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"{}"
+    source = GGUFTokenizerSource(
+        "owner/tokenizer",
+        "a" * 40,
+        (
+            GGUFTokenizerAsset(
+                "tokenizer.json", len(payload), hashlib.sha256(payload).hexdigest()
+            ),
+        ),
+        "b" * 64,
+    )
+    cache = tmp_path / "hub"
+    escaped = tmp_path / "escaped.json"
+    escaped.write_bytes(payload)
+    snapshot = (
+        cache / "models--owner--tokenizer" / "snapshots" / source.revision / "tokenizer.json"
+    )
+    snapshot.parent.mkdir(parents=True)
+    snapshot.symlink_to(escaped)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(snapshot))
+
+    with pytest.raises(ValueError, match="outside the trusted Hub cache"):
+        _tokenizer._download_tokenizer_assets(source, local_files_only=True)
+
+
+def test_local_hub_cache_parent_symlink_escape_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"{}"
+    source = GGUFTokenizerSource(
+        "owner/tokenizer",
+        "a" * 40,
+        (
+            GGUFTokenizerAsset(
+                "tokenizer.json", len(payload), hashlib.sha256(payload).hexdigest()
+            ),
+        ),
+        "b" * 64,
+    )
+    cache = tmp_path / "hub"
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    (escaped / "tokenizer.json").write_bytes(payload)
+    snapshots = cache / "models--owner--tokenizer" / "snapshots"
+    snapshots.parent.mkdir(parents=True)
+    snapshots.symlink_to(escaped, target_is_directory=True)
+    path = snapshots / "tokenizer.json"
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(path))
+
+    with pytest.raises(ValueError, match="outside the trusted Hub cache"):
+        _tokenizer._download_tokenizer_assets(source, local_files_only=True)

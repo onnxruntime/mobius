@@ -475,19 +475,28 @@ def _runtime_version_tuple(version: str) -> tuple[int, int, int]:
 def _write_runtime_compatibility(
     output_dir: str, *, model_type: str, runtime_version: str | None
 ) -> str:
-    if model_type == "decoder" and runtime_version is not None:
-        if _runtime_version_tuple(runtime_version) < _GENERIC_DECODER_MIN_VERSION:
+    minimum_versions = {
+        "decoder": _GENERIC_DECODER_MIN_VERSION,
+        "lfm2": (0, 15, 2),
+    }
+    minimum_version = minimum_versions.get(model_type)
+    if minimum_version is not None and runtime_version is not None:
+        if _runtime_version_tuple(runtime_version) < minimum_version:
             raise ValueError(
-                "Generic ORT GenAI decoder packages require onnxruntime-genai >= 0.14.0; "
-                f"requested {runtime_version}"
+                f"ORT GenAI {model_type} packages require onnxruntime-genai >= "
+                f"{'.'.join(map(str, minimum_version))}; requested {runtime_version}"
             )
+    tested_versions = {
+        "decoder": list(_GENERIC_DECODER_TESTED_VERSIONS),
+        "lfm2": ["0.15.2"],
+    }
     metadata = {
         "runtime": "onnxruntime-genai",
         "model_type": model_type,
-        "minimum_version": "0.14.0" if model_type == "decoder" else None,
-        "tested_versions": (
-            list(_GENERIC_DECODER_TESTED_VERSIONS) if model_type == "decoder" else []
+        "minimum_version": (
+            ".".join(map(str, minimum_version)) if minimum_version is not None else None
         ),
+        "tested_versions": tested_versions.get(model_type, []),
         "uses_main_only_state_groups": False,
         "heterogeneous_state_manifest": "deferred: https://github.com/onnxruntime/mobius/issues/605",
     }

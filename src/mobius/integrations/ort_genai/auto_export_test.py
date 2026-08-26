@@ -32,6 +32,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _uses_compact_sliding_kv_cache,
     _write_audio_processor_config,
     _write_genai_config,
+    _write_runtime_compatibility,
     _write_vision_processor_config,
     auto_export,
     export_package,
@@ -3647,6 +3648,21 @@ def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
             "deferred: https://github.com/onnxruntime/mobius/issues/605"
         ),
     }
+
+
+def test_lfm2_runtime_compatibility_is_pinned_to_released_probe(tmp_path):
+    path = _write_runtime_compatibility(
+        str(tmp_path), model_type="lfm2", runtime_version="0.15.2"
+    )
+    with open(path, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+
+    assert metadata["minimum_version"] == "0.15.2"
+    assert metadata["tested_versions"] == ["0.15.2"]
+    with pytest.raises(ValueError, match=r"lfm2.*>= 0\.15\.2"):
+        _write_runtime_compatibility(
+            str(tmp_path), model_type="lfm2", runtime_version="0.15.1"
+        )
 
 
 def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_path):

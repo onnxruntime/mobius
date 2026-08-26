@@ -639,14 +639,17 @@ def _download_tokenizer_assets(
                     local_files_only=True,
                 )
             )
+            try:
+                cache_root = Path(HF_HUB_CACHE).resolve(strict=True)
+                path.parent.resolve(strict=True).relative_to(cache_root)
+                resolved_path = path.resolve(strict=True)
+                resolved_path.relative_to(cache_root)
+            except ValueError as error:
+                raise ValueError(
+                    f"Cached tokenizer asset is outside the trusted Hub cache: {path}"
+                ) from error
             if path.is_symlink():
-                try:
-                    path.absolute().relative_to(Path(HF_HUB_CACHE).absolute())
-                except ValueError as error:
-                    raise ValueError(
-                        f"Cached tokenizer asset is an untrusted symlink: {path}"
-                    ) from error
-                path = path.resolve(strict=True)
+                path = resolved_path
         else:
             url = hf_hub_url(source.repository, asset.filename, revision=source.revision)
             metadata = get_hf_file_metadata(url)
@@ -770,7 +773,7 @@ def _special_token_content(value: Any, *, key: str) -> str:
 def _validate_pinned_tokenizer(
     metadata: Mapping[str, Any],
     payloads: Mapping[str, bytes],
-) -> str:
+) -> tuple[str, bytes]:
     raw_tokenizer = payloads["tokenizer.json"]
     tokenizer_json = _json_object(raw_tokenizer, filename="tokenizer.json")
     config = _json_object(
@@ -780,6 +783,11 @@ def _validate_pinned_tokenizer(
         payloads.get("special_tokens_map.json", b"{}"),
         filename="special_tokens_map.json",
     )
+    expected_tokens = metadata["tokenizer.ggml.tokens"]
+    model = tokenizer_json.get("model")
+    if not isinstance(model, Mapping):
+        raise TypeError("tokenizer.json must contain a model object")
+
     try:
         from tokenizers import Tokenizer
 
@@ -787,11 +795,48 @@ def _validate_pinned_tokenizer(
     except Exception as error:
         raise ValueError("tokenizer.json is not a loadable tokenizers tokenizer") from error
 
-    expected_tokens = metadata["tokenizer.ggml.tokens"]
     actual_tokens = [
         tokenizer.id_to_token(index)
         for index in range(tokenizer.get_vocab_size(with_added_tokens=True))
     ]
+    if actual_tokens == expected_tokens[: len(actual_tokens)] and len(actual_tokens) < len(
+        expected_tokens
+    ):
+        suffix = expected_tokens[len(actual_tokens) :]
+        added_tokens = tokenizer_json.get("added_tokens")
+        if isinstance(added_tokens, list) and all(
+            token == f"[PAD{index}]" for index, token in enumerate(suffix, len(actual_tokens))
+        ):
+            token_types = metadata.get("tokenizer.ggml.token_type")
+            if token_types is not None and any(
+                token_type != 5 for token_type in token_types[len(actual_tokens) :]
+            ):
+                raise ValueError("GGUF vocabulary padding must contain only unused tokens")
+            for index, token in enumerate(suffix, len(actual_tokens)):
+                added_tokens.append(
+                    {
+                        "id": index,
+                        "content": token,
+                        "single_word": False,
+                        "lstrip": False,
+                        "rstrip": False,
+                        "normalized": False,
+                        "special": False,
+                    }
+                )
+            raw_tokenizer = json.dumps(
+                tokenizer_json, ensure_ascii=False, separators=(",", ":")
+            ).encode()
+            try:
+                tokenizer = Tokenizer.from_str(raw_tokenizer.decode("utf-8"))
+            except Exception as error:
+                raise ValueError(
+                    "tokenizer.json cannot represent deterministic GGUF vocabulary padding"
+                ) from error
+            actual_tokens = [
+                tokenizer.id_to_token(index)
+                for index in range(tokenizer.get_vocab_size(with_added_tokens=True))
+            ]
     if actual_tokens != expected_tokens:
         mismatch = next(
             (
@@ -805,9 +850,6 @@ def _validate_pinned_tokenizer(
             f"Pinned tokenizer vocabulary differs from GGUF at token id {mismatch}"
         )
 
-    model = tokenizer_json.get("model")
-    if not isinstance(model, Mapping):
-        raise TypeError("tokenizer.json must contain a model object")
     if _merge_pairs(model.get("merges")) != _merge_pairs(
         metadata.get("tokenizer.ggml.merges")
     ):
@@ -815,33 +857,44 @@ def _validate_pinned_tokenizer(
             "Pinned tokenizer merge order differs from GGUF tokenizer.ggml.merges"
         )
     pre = metadata.get("tokenizer.ggml.pre")
-    expected_pipeline = _SMOLLM_PIPELINE if pre == "smollm" else None
-    if expected_pipeline is None:
-        raise ValueError(
-            f"Pinned tokenizer pipeline validation is not implemented for GGUF pre {pre!r}"
-        )
-    actual_pipeline = {
-        name: tokenizer_json.get(name)
-        for name in ("normalizer", "pre_tokenizer", "post_processor", "decoder")
-    }
-    if actual_pipeline != expected_pipeline:
+    if (
+        pre == "smollm"
+        and {
+            name: tokenizer_json.get(name)
+            for name in ("normalizer", "pre_tokenizer", "post_processor", "decoder")
+        }
+        != _SMOLLM_PIPELINE
+    ):
         raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
     token_types = metadata.get("tokenizer.ggml.token_type")
     if token_types is not None:
-        unsupported_types = sorted(set(token_types) - {1, 2, 3})
+        unsupported_types = sorted(set(token_types) - {1, 2, 3, 4, 5})
         if unsupported_types:
             raise ValueError(
                 f"Pinned tokenizer identity cannot prove GGUF token types {unsupported_types}"
             )
+        source_added_tokens = {
+            token["id"]: token
+            for token in tokenizer_json.get("added_tokens", ())
+            if isinstance(token, Mapping) and isinstance(token.get("id"), int)
+        }
+        expected_non_special_added_ids = {
+            index for index, token_type in enumerate(token_types) if token_type in {4, 5}
+        }
+        if any(
+            index not in source_added_tokens
+            or source_added_tokens[index].get("special") is not False
+            for index in expected_non_special_added_ids
+        ):
+            raise ValueError(
+                "Pinned tokenizer user-defined/unused-token inventory differs from GGUF"
+            )
         source_special_ids = {
             token["id"]
-            for token in tokenizer_json.get("added_tokens", ())
-            if isinstance(token, Mapping) and token.get("special") is True
+            for token in source_added_tokens.values()
+            if token.get("special") is True
         }
-        expected_special_ids = {
-            index for index, token_type in enumerate(token_types) if token_type in {2, 3}
-        }
-        if source_special_ids != expected_special_ids:
+        if any(token_types[index] not in {2, 3} for index in source_special_ids):
             raise ValueError("Pinned tokenizer special-token inventory differs from GGUF")
 
     special_names = {
@@ -859,6 +912,11 @@ def _validate_pinned_tokenizer(
             continue
         raw_value = config.get(config_name, special_map.get(config_name))
         if raw_value is None:
+            if (
+                config_name == "bos_token"
+                and metadata.get("tokenizer.ggml.add_bos_token") is False
+            ):
+                continue
             raise ValueError(f"Pinned tokenizer omits GGUF special token {config_name}")
         token = _special_token_content(raw_value, key=config_name)
         if tokenizer.token_to_id(token) != expected_id:
@@ -954,7 +1012,7 @@ def _validate_pinned_tokenizer(
         if source_template != expected_template:
             raise ValueError("Pinned tokenizer chat template differs from GGUF")
 
-    return hashlib.sha256(raw_tokenizer).hexdigest()
+    return hashlib.sha256(raw_tokenizer).hexdigest(), raw_tokenizer
 
 
 def materialize_gguf_tokenizer(
@@ -976,7 +1034,8 @@ def materialize_gguf_tokenizer(
     if verdict.metadata_sha256 != source.metadata_sha256:
         raise ValueError("Pinned tokenizer evidence does not match GGUF tokenizer metadata")
     payloads = _download_tokenizer_assets(source, local_files_only=local_files_only)
-    tokenizer_sha256 = _validate_pinned_tokenizer(metadata, payloads)
+    tokenizer_sha256, tokenizer_payload = _validate_pinned_tokenizer(metadata, payloads)
+    payloads["tokenizer.json"] = tokenizer_payload
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
