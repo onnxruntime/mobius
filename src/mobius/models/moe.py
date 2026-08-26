@@ -562,10 +562,10 @@ class Ernie45MoECausalLMModel(CausalLMModel):
     category: str = "Mixture of Experts"
 
     def __init__(self, config: ArchitectureConfig):
-        nn.Module.__init__(self)
-        self.config = config
-        self.model = MoETextModel(config, layer_class=UngatedSharedMoEDecoderLayer)
-        self.lm_head = Linear(config.hidden_size, config.vocab_size, bias=False)
+        super().__init__(config)
+        self._replace_text_model(
+            MoETextModel(config, layer_class=UngatedSharedMoEDecoderLayer)
+        )
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

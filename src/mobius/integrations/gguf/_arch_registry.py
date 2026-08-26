@@ -479,22 +479,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "interleaved sliding-window attention. Mobius has no graph or cache task owning "
         "that complete topology or its expert sidecars."
     ),
-    "bailingmoe": (
-        "BailingMoE requires an untied head, split-and-permuted Q/K/V conversion, and an "
-        "all-layer softmax routed MoE with mandatory shared experts. Mobius has no exact "
-        "expert-major tensor transform, preservation contract, or parity evidence."
-    ),
-    "deepseek": (
-        "The pinned DeepSeek loader switches from dense SwiGLU to softmax routed experts "
-        "with a mandatory parallel shared branch at leading_dense_block_count. Existing "
-        "DeepSeek-family registrations do not establish this GGUF tensor, routing, or "
-        "quantized expert contract."
-    ),
-    "dots1": (
-        "Dots1 adds Q/K norms, a dense prefix, metadata-selected expert gating, optional "
-        "correction bias, and routed plus shared experts. A fixed Qwen/DeepSeek MoE graph "
-        "would silently change its routing contract."
-    ),
     "ernie4_5": (
         "ERNIE 4.5 requires exact fused-QKV and fused-gate/up converter splits plus an "
         "optional attention-output bias and ERNIE-specific position metadata. Similarity "
@@ -1516,6 +1500,50 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         tensor_processor="llama",
         llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="bailingmoe",
+        model_type="bailing_moe",
+        tensor_map_recipe=("llama", "diffusion_fused_qkv", "moe_extras"),
+        config_key_map="conventional_shared_moe",
+        config_postprocessor="conventional_shared_moe",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+        ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="deepseek",
+        model_type="deepseek",
+        tensor_map_recipe=("llama", "diffusion_fused_qkv", "deepseek_shared_moe_extras"),
+        config_key_map="conventional_shared_moe",
+        config_postprocessor="conventional_shared_moe",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="dots1",
+        model_type="dots1",
+        tensor_map_recipe=(
+            "llama",
+            "diffusion_fused_qkv",
+            "moe_qk_norm_extras",
+            "deepseek_shared_moe_extras",
+        ),
+        config_key_map="conventional_shared_moe",
+        config_postprocessor="conventional_shared_moe",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        tensor_processor="llama",
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),

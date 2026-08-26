@@ -222,6 +222,27 @@ class TestProcessTensorsLlama:
         for model_type in ("olmo2", "cohere2", "exaone", "dream"):
             assert not needs_llama_qk_permute(model_type)
 
+    def test_dots1_qwen2_qk_values_remain_in_checkpoint_order(self) -> None:
+        config = self._make_config(model_type="dots1", num_heads=4, num_kv_heads=4)
+        config._gguf_arch = "dots1"
+        config.head_dim = 16
+        fused_qkv = torch.arange(192 * 8, dtype=torch.float32).reshape(192, 8)
+
+        result = process_tensors(
+            {"model.layers.0.self_attn.qkv_proj.weight": fused_qkv},
+            config,
+        )
+
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.q_proj.weight"], fused_qkv[:64]
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.k_proj.weight"], fused_qkv[64:128]
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.v_proj.weight"], fused_qkv[128:]
+        )
+
     def test_reverse_matches_hf_reference_head_dim_64(self) -> None:
         """Reverse permute must match HF's reference for real head dims.
 
@@ -670,3 +691,28 @@ class TestProcessMuseGlimmer:
 
         name = "model.layers.0.self_attn.q_proj.weight"
         assert _needs_qk_permute(name, 32, 2, "muse_glimmer_text") is True
+
+    def test_promoted_moe_fused_qkv_split_matches_separate_value_transform(self) -> None:
+        config = SimpleNamespace(
+            _gguf_arch="dots1",
+            model_type="dots1",
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+        fused = torch.arange(32.0).reshape(16, 2)
+        result = process_tensors(
+            {"model.layers.0.self_attn.qkv_proj.weight": fused.clone()},
+            config,
+        )
+        expected = process_tensors(
+            {
+                "model.layers.0.self_attn.q_proj.weight": fused[:8].clone(),
+                "model.layers.0.self_attn.k_proj.weight": fused[8:12].clone(),
+                "model.layers.0.self_attn.v_proj.weight": fused[12:].clone(),
+            },
+            config,
+        )
+        assert set(result) == set(expected)
+        for name in result:
+            torch.testing.assert_close(result[name], expected[name])

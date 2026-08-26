@@ -57,23 +57,20 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 71
+_EXPECTED_SUPPORTED_COUNT = 74
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {"codeshell", "command-r", "jais2", "orion", "qwen", "starcoder", "xverse"}
 )
 _FINAL_CENSUS_CLOSURE = frozenset(
     {
         "afmoe",
-        "bailingmoe",
         "bailingmoe2",
         "bitnet",
         "codeshell",
         "cohere2moe",
         "command-r",
-        "deepseek",
         "deepseek2",
         "deepseek32",
-        "dots1",
         "dots3note",
         "ernie4_5",
         "ernie4_5-moe",
@@ -149,9 +146,12 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
     {
         "arcee",
         "baichuan",
+        "bailingmoe",
         "bert",
         "cohere2",
         "deci",
+        "deepseek",
+        "dots1",
         "dflash",
         "dream",
         "eagle3",

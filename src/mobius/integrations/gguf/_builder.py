@@ -539,6 +539,7 @@ def _validate_gguf_model(
     _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
+    _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
@@ -1601,6 +1602,269 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         raise ValueError(
             f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
             f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
+    """Validate the exact BailingMoE/DeepSeek/Dots1 tensor closure."""
+    from mobius.integrations.gguf._config_mapping import (
+        _validate_conventional_moe_rope_scaling,
+    )
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    architecture = gguf_model.architecture
+    if architecture not in {"bailingmoe", "deepseek", "dots1"}:
+        return
+
+    metadata = gguf_model.metadata
+    _validate_conventional_moe_rope_scaling(metadata, architecture)
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.layer_norm_rms_epsilon",
+    )
+    missing_metadata = [
+        f"{architecture}.{suffix}"
+        for suffix in required_suffixes
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+        )
+
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    dense_prefix = int(metadata.get(f"{architecture}.leading_dense_block_count", 0))
+    has_routed_layers = dense_prefix < layers
+    if has_routed_layers:
+        expert_suffixes = (
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+        )
+        missing_expert_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in expert_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_expert_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: "
+                f"{missing_expert_metadata}"
+            )
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+    experts = int(metadata.get(f"{architecture}.expert_count", 0))
+    top_k = int(metadata.get(f"{architecture}.expert_used_count", 0))
+    expert_intermediate = int(metadata.get(f"{architecture}.expert_feed_forward_length", 0))
+    shared_experts = int(metadata.get(f"{architecture}.expert_shared_count", 0))
+    context = int(metadata[f"{architecture}.context_length"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    if (
+        min(
+            hidden,
+            intermediate,
+            layers,
+            heads,
+            kv_heads,
+            context,
+            vocab,
+        )
+        <= 0
+        or hidden % heads
+        or heads % kv_heads
+        or not 0 <= dense_prefix <= layers
+        or (architecture == "bailingmoe" and dense_prefix)
+        or (
+            has_routed_layers
+            and (
+                min(experts, top_k, expert_intermediate, shared_experts) <= 0
+                or top_k > experts
+            )
+        )
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid conventional MoE geometry")
+
+    head_dim = int(metadata.get(f"{architecture}.attention.key_length", hidden // heads))
+    value_dim = int(metadata.get(f"{architecture}.attention.value_length", head_dim))
+    rope_dim = int(metadata.get(f"{architecture}.rope.dimension_count", head_dim))
+    if (
+        head_dim <= 0
+        or value_dim != head_dim
+        or heads * head_dim != hidden
+        or rope_dim <= 0
+        or rope_dim != head_dim
+        or (architecture == "dots1" and kv_heads != heads)
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid attention geometry")
+    norm_epsilon = float(metadata[f"{architecture}.attention.layer_norm_rms_epsilon"])
+    if not math.isfinite(norm_epsilon) or norm_epsilon <= 0:
+        raise ValueError(f"{architecture} GGUF has invalid normalization or routing scale")
+    if has_routed_layers:
+        route_scale = float(metadata.get(f"{architecture}.expert_weights_scale", 1.0))
+        if math.isclose(route_scale, 0.0):
+            route_scale = 1.0
+        if not math.isfinite(route_scale) or route_scale <= 0:
+            raise ValueError(f"{architecture} GGUF has invalid normalization or routing scale")
+
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+        if not is_known_skip(name)
+    }
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {}
+    if architecture == "deepseek":
+        optional["output.weight"] = (vocab, hidden)
+    else:
+        required["output.weight"] = (vocab, hidden)
+
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    shared_width = shared_experts * expert_intermediate
+    all_qkv_biases: set[str] = set()
+    routed_correction_biases: set[str] = set()
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+            }
+        )
+        fused_weight = prefix + "attn_qkv.weight"
+        split_weights = {
+            prefix + "attn_q.weight": (q_width, hidden),
+            prefix + "attn_k.weight": (kv_width, hidden),
+            prefix + "attn_v.weight": (kv_width, hidden),
+        }
+        has_fused = fused_weight in actual
+        present_split = set(split_weights) & set(actual)
+        if has_fused == bool(present_split) or (
+            present_split and present_split != set(split_weights)
+        ):
+            raise ValueError(
+                f"{architecture} layer {layer} must contain exactly one complete QKV "
+                "layout: fused attn_qkv or split attn_q/attn_k/attn_v"
+            )
+        if has_fused:
+            required[fused_weight] = (q_width + 2 * kv_width, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_width + 2 * kv_width,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        else:
+            required.update(split_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_width,),
+                prefix + "attn_k.bias": (kv_width,),
+                prefix + "attn_v.bias": (kv_width,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        if alternate_biases & set(actual):
+            raise ValueError(
+                f"{architecture} layer {layer} QKV bias layout does not match its weights"
+            )
+        present_biases = set(selected_biases) & set(actual)
+        if present_biases and present_biases != set(selected_biases):
+            raise ValueError(
+                f"{architecture} layer {layer} has a partial attention Q/K/V projection bias set"
+            )
+        optional.update(selected_biases)
+        all_qkv_biases.update(selected_biases)
+
+        if architecture == "dots1":
+            required.update(
+                {
+                    prefix + "attn_q_norm.weight": (head_dim,),
+                    prefix + "attn_k_norm.weight": (head_dim,),
+                }
+            )
+        if layer < dense_prefix:
+            required.update(
+                {
+                    prefix + "ffn_gate.weight": (intermediate, hidden),
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            continue
+
+        required.update(
+            {
+                prefix + "ffn_gate_inp.weight": (experts, hidden),
+                prefix + "ffn_gate_exps.weight": (
+                    experts,
+                    expert_intermediate,
+                    hidden,
+                ),
+                prefix + "ffn_up_exps.weight": (
+                    experts,
+                    expert_intermediate,
+                    hidden,
+                ),
+                prefix + "ffn_down_exps.weight": (
+                    experts,
+                    hidden,
+                    expert_intermediate,
+                ),
+                prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+            }
+        )
+        if architecture == "dots1":
+            bias_name = prefix + "exp_probs_b.bias"
+            optional[bias_name] = (experts,)
+            routed_correction_biases.add(bias_name)
+        for projection in ("gate", "up", "down"):
+            stem = prefix + f"ffn_{projection}_exps"
+            optional[stem + ".scale"] = (experts,)
+            optional[stem + ".input_scale"] = (experts,)
+
+    present_qkv_biases = all_qkv_biases & set(actual)
+    if present_qkv_biases and present_qkv_biases != all_qkv_biases:
+        raise ValueError(
+            f"{architecture} attention Q/K/V projection biases must be present in every "
+            "layer or absent entirely"
+        )
+    present_correction_biases = routed_correction_biases & set(actual)
+    if present_correction_biases and present_correction_biases != routed_correction_biases:
+        raise ValueError(
+            "dots1 correction bias must be present in every routed layer or absent entirely"
+        )
+
+    allowed = set(required) | set(optional)
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    if missing or unexpected or malformed or out_of_range:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}, out_of_range={out_of_range}"
         )
 
 
@@ -5956,16 +6220,30 @@ def _load_quantized_state_dict(
             for target_stem in fused_projection_targets:
                 n_out = quantized_output_sizes[target_stem]
                 end = offset + n_out
-                state_dict[f"{target_stem}.weight"] = torch.from_numpy(
-                    np.array(repacked.weight[offset:end], copy=True)
+                target_name = f"{target_stem}.weight"
+                weight = torch.from_numpy(np.array(repacked.weight[offset:end], copy=True))
+                scales = torch.from_numpy(np.array(repacked.scales[offset:end], copy=True))
+                zero_points = (
+                    torch.from_numpy(np.array(repacked.zero_points[offset:end], copy=True))
+                    if repacked.zero_points is not None
+                    else None
                 )
-                state_dict[f"{target_stem}.scales"] = torch.from_numpy(
-                    np.array(repacked.scales[offset:end], copy=True)
-                )
-                if repacked.zero_points is not None:
-                    state_dict[f"{target_stem}.zero_points"] = torch.from_numpy(
-                        np.array(repacked.zero_points[offset:end], copy=True)
-                    )
+                if _needs_qk_permute(
+                    target_name,
+                    num_heads,
+                    num_kv_heads,
+                    model_type,
+                    gguf_arch,
+                ):
+                    n_head = num_heads if ".q_proj." in target_name else num_kv_heads
+                    weight = _reverse_permute(weight, n_head)
+                    scales = _reverse_permute(scales, n_head)
+                    if zero_points is not None:
+                        zero_points = _reverse_permute(zero_points, n_head)
+                state_dict[target_name] = weight
+                state_dict[f"{target_stem}.scales"] = scales
+                if zero_points is not None:
+                    state_dict[f"{target_stem}.zero_points"] = zero_points
                 offset = end
             if offset != int(np_shape[0]):
                 raise ValueError(

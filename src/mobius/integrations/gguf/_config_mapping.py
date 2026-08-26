@@ -240,6 +240,10 @@ _KIMI_K3_KEY_MAP = {
     "activation.situ_linear_beta": "activation_situ_linear_beta",
 }
 
+_CONVENTIONAL_SHARED_MOE_KEY_MAP = {
+    "leading_dense_block_count": "first_k_dense_replace",
+}
+
 _T5_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.relative_buckets_count": "relative_attention_num_buckets",
@@ -265,6 +269,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minimax": _MINIMAX_KEY_MAP,
         "kimi_linear": _KIMI_LINEAR_KEY_MAP,
         "kimi_k3": _KIMI_K3_KEY_MAP,
+        "conventional_shared_moe": _CONVENTIONAL_SHARED_MOE_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
 )
@@ -1106,12 +1111,11 @@ def _lfm2moe_postprocess(
         scoring_func="sigmoid",
         norm_topk_prob=True,
         routed_scaling_factor=1.0,
+        use_expert_bias=True,
     )
     return Lfm2MoeConfig(
         **fields,
         num_dense_layers=num_dense_layers,
-        # The pinned loader requires exp_probs_b for every routed layer.
-        use_expert_bias=True,
     )
 
 
@@ -1316,6 +1320,216 @@ def _moe_postprocess(
         updates["norm_topk_prob"] = False
 
     return dataclasses.replace(config, **updates)
+
+
+def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str) -> None:
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if scaling_type in (None, "", "none"):
+        return
+    if scaling_type != "yarn":
+        raise ValueError(
+            f"{arch}.rope.scaling.type={scaling_type!r} is unsupported; "
+            "only unscaled and YaRN RoPE are exact for this architecture"
+        )
+
+    required = ("factor", "original_context_length")
+    missing = [
+        f"{arch}.rope.scaling.{suffix}"
+        for suffix in required
+        if f"{arch}.rope.scaling.{suffix}" not in metadata
+    ]
+    if missing:
+        raise ValueError(f"{arch} YaRN scaling is missing required metadata: {missing}")
+
+    positive_values = {
+        "factor": metadata[f"{arch}.rope.scaling.factor"],
+        "original_context_length": metadata[f"{arch}.rope.scaling.original_context_length"],
+        "yarn_beta_fast": metadata.get(f"{arch}.rope.scaling.yarn_beta_fast", 32.0),
+        "yarn_beta_slow": metadata.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0),
+        "attn_factor": metadata.get(f"{arch}.rope.scaling.attn_factor", 1.0),
+    }
+    if any(
+        not math.isfinite(float(value)) or float(value) <= 0
+        for value in positive_values.values()
+    ):
+        raise ValueError(f"{arch} YaRN scaling values must be finite and positive")
+    if (
+        not math.isclose(
+            float(positive_values["yarn_beta_fast"]), 32.0, rel_tol=0.0, abs_tol=0.0
+        )
+        or not math.isclose(
+            float(positive_values["yarn_beta_slow"]), 1.0, rel_tol=0.0, abs_tol=0.0
+        )
+        or not math.isclose(
+            float(positive_values["attn_factor"]), 1.0, rel_tol=0.0, abs_tol=0.0
+        )
+    ):
+        raise ValueError(
+            f"{arch} YaRN metadata must retain the supported pinned loader defaults "
+            "yarn_beta_fast=32, yarn_beta_slow=1, and attn_factor=1"
+        )
+
+
+def _conventional_shared_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the exact BailingMoE/DeepSeek/Dots1 routed/shared MoE contract."""
+    arch = model.architecture
+    names = set(model.tensor_names)
+    _validate_conventional_moe_rope_scaling(metadata, arch)
+
+    dense_prefix = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if arch == "bailingmoe":
+        # The pinned graph is all-MoE and does not branch on this optional key.
+        # Reject contradictory metadata instead of silently changing its meaning.
+        if dense_prefix != 0:
+            raise ValueError(
+                "bailingmoe.leading_dense_block_count must be zero for the "
+                "pinned all-layer MoE graph"
+            )
+    if not 0 <= dense_prefix <= config.num_hidden_layers:
+        raise ValueError(
+            f"{arch}.leading_dense_block_count must be in [0, "
+            f"{config.num_hidden_layers}], got {dense_prefix}"
+        )
+    all_dense = dense_prefix == config.num_hidden_layers
+
+    qkv_bias_layers = []
+    for layer in range(config.num_hidden_layers):
+        fused = f"blk.{layer}.attn_qkv.bias" in names
+        split_count = sum(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        if split_count not in (0, 3) or (fused and split_count):
+            raise ValueError(f"{arch} layer {layer} has a partial or ambiguous Q/K/V bias set")
+        qkv_bias_layers.append(fused or split_count == 3)
+    if any(qkv_bias_layers) and not all(qkv_bias_layers):
+        raise ValueError(f"{arch} Q/K/V bias presence must be uniform across all layers")
+
+    common_updates: dict[str, Any] = {
+        "rope_type": config.rope_type or "default",
+        "hidden_act": "silu",
+        "tie_word_embeddings": arch == "deepseek" and "output.weight" not in names,
+        "attn_qkv_bias": all(qkv_bias_layers),
+        "attn_o_bias": False,
+        "mlp_bias": False,
+        "first_k_dense_replace": dense_prefix,
+        "attn_qk_norm": arch == "dots1",
+        "attn_qk_norm_full": False,
+    }
+    if all_dense:
+        return dataclasses.replace(
+            config,
+            **common_updates,
+            num_local_experts=None,
+            num_experts_per_tok=None,
+            moe_intermediate_size=None,
+            n_shared_experts=None,
+            shared_expert_intermediate_size=None,
+            use_expert_bias=False,
+            disable_qmoe=True,
+        )
+
+    routed_suffixes = [
+        "expert_count",
+        "expert_used_count",
+        "expert_feed_forward_length",
+        "expert_shared_count",
+    ]
+    if arch == "dots1":
+        routed_suffixes.append("expert_gating_func")
+    missing_routed_metadata = [
+        f"{arch}.{suffix}" for suffix in routed_suffixes if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_routed_metadata:
+        raise ValueError(
+            f"{arch} routed layers require MoE metadata: {missing_routed_metadata}"
+        )
+
+    config = _moe_postprocess(config, metadata, model)
+    assert config.num_local_experts is not None
+    assert config.num_experts_per_tok is not None
+    assert config.moe_intermediate_size is not None
+
+    n_shared = int(metadata[f"{arch}.expert_shared_count"])
+    if n_shared <= 0:
+        raise ValueError(f"{arch}.expert_shared_count must be greater than zero")
+    shared_width = config.moe_intermediate_size * n_shared
+    serialized_shared_width = metadata.get(f"{arch}.expert_shared_feed_forward_length")
+    if serialized_shared_width is not None and int(serialized_shared_width) != shared_width:
+        raise ValueError(
+            f"{arch}.expert_shared_feed_forward_length must equal "
+            f"expert_feed_forward_length * expert_shared_count ({shared_width}), "
+            f"got {serialized_shared_width}"
+        )
+
+    gating = int(metadata.get(f"{arch}.expert_gating_func", 1))
+    if gating not in (1, 2):
+        raise ValueError(
+            f"{arch}.expert_gating_func must be SOFTMAX (1) or SIGMOID (2), got {gating}"
+        )
+    if arch in {"bailingmoe", "deepseek"} and gating != 1:
+        raise ValueError(f"{arch}.expert_gating_func must be SOFTMAX (1), got {gating}")
+
+    all_bias_layers = {
+        layer
+        for layer in range(config.num_hidden_layers)
+        if f"blk.{layer}.exp_probs_b.bias" in names
+    }
+    if arch != "dots1" and all_bias_layers:
+        raise ValueError(f"{arch} does not consume exp_probs_b correction-bias tensors")
+    dense_bias_layers = all_bias_layers & set(range(dense_prefix))
+    if dense_bias_layers:
+        raise ValueError(
+            f"{arch} correction bias is invalid on dense layers {sorted(dense_bias_layers)}"
+        )
+    bias_layers = {
+        layer
+        for layer in range(dense_prefix, config.num_hidden_layers)
+        if layer in all_bias_layers
+    }
+    routed_layers = set(range(dense_prefix, config.num_hidden_layers))
+    if bias_layers and bias_layers != routed_layers:
+        raise ValueError(
+            f"{arch} correction bias must be present for every routed layer or none; "
+            f"found layers {sorted(bias_layers)}, expected {sorted(routed_layers)}"
+        )
+    use_expert_bias = bool(bias_layers)
+
+    norm_topk_prob = (
+        False if arch == "deepseek" else bool(metadata.get(f"{arch}.expert_weights_norm"))
+    )
+    if arch == "deepseek" and metadata.get(f"{arch}.expert_weights_norm"):
+        raise ValueError("deepseek.expert_weights_norm=True is not used by the pinned graph")
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+    # llama.cpp uses zero as the serialized default sentinel.
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError(
+            f"{arch}.expert_weights_scale must resolve to a finite positive value, "
+            f"got {route_scale!r}"
+        )
+
+    return dataclasses.replace(
+        config,
+        **common_updates,
+        n_shared_experts=n_shared,
+        shared_expert_intermediate_size=shared_width,
+        scoring_func="softmax" if gating == 1 else "sigmoid",
+        topk_method="greedy",
+        n_group=1,
+        topk_group=1,
+        routing_weight_normalization_floor=(6.103515625e-5 if arch == "dots1" else None),
+        use_expert_bias=use_expert_bias,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=route_scale,
+        # QMoE's CUDA ABI cannot preserve sigmoid/correction-bias aggregation.
+        # Keep quantized Dots1 on the gate-agnostic dense/block fallback.
+        disable_qmoe=arch == "dots1",
+    )
 
 
 def _diffusion_common_postprocess(
@@ -3078,6 +3292,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "rnd1": _rnd1_postprocess,
     "olmo": _olmo_postprocess,
     "moe": _moe_postprocess,
+    "conventional_shared_moe": _conventional_shared_moe_postprocess,
     "granitemoe": _granitemoe_postprocess,
     "phimoe": _phimoe_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
