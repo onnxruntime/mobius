@@ -408,10 +408,15 @@ def inspect_gguf_tokenizer(
         if policy is None:
             raise ValueError(f"{source} declares unknown tokenizer.ggml.pre {pre_value!r}")
     elif pre_value is not None:
-        # The public PLaMo2 F32 conversion predates per-model tokenizer cleanup
-        # and carries the inert legacy value "default". Validate that exact
-        # known identifier, but keep tokenizer materialization deferred below.
-        if model != "plamo2" or pre_value != "default":
+        # Public PLaMo2 and pinned MiniCPM conversions predate per-model
+        # tokenizer cleanup and carry the inert legacy value "default".
+        # Validate only those architecture-scoped combinations; exact artifact
+        # audits keep tokenizer materialization deferred below.
+        architecture = metadata.get("general.architecture")
+        legacy_default = pre_value == "default" and (
+            model == "plamo2" or (model == "llama" and architecture in {"minicpm", "minicpm3"})
+        )
+        if not legacy_default:
             raise ValueError(
                 f"{source} declares tokenizer.ggml.pre for non-BPE model {model!r}; "
                 "the pinned loader does not consume that combination"

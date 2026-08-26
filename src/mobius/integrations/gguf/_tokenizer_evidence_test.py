@@ -28,6 +28,11 @@ from mobius.integrations.gguf._tokenizer_evidence import (
     tokenizer_blocker_evidence,
     tokenizer_evidence,
 )
+from mobius.integrations.gguf._tokenizer_mismatch_evidence import (
+    iter_tokenizer_mismatch_evidence,
+    tokenizer_mismatch_evidence,
+)
+from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT
 
 
 def test_qwen35_tokenizer_evidence_is_exact_and_runtime_independent() -> None:
@@ -358,6 +363,68 @@ def test_gpt4o_kanana2_oracle_fixture_is_bound_to_evidence() -> None:
     assert oracle["case_count"] == len(oracle["modes"]) * (
         oracle["fixed_count"] + oracle["random_count"]
     )
+
+
+def test_minicpm_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_minicpm_tokenizer_oracle.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    records = iter_tokenizer_mismatch_evidence()
+
+    assert oracle["llamacpp_commit"] == UPSTREAM_COMMIT
+    assert oracle["seed"] == 648
+    assert oracle["random_count"] == 128
+    assert oracle["fixed_count"] == 20
+    assert oracle["random_alphabet_sha256"] == (
+        "0b41be99d8aab5768ed3118bf95f6c647f463966ec251255d143976d085891f8"
+    )
+    assert oracle["case_count_per_route"] == len(oracle["modes"]) * (
+        oracle["fixed_count"] + oracle["random_count"]
+    )
+    assert len(records) == len(oracle["routes"]) == 2
+
+    for fixture in oracle["routes"]:
+        evidence = tokenizer_mismatch_evidence(fixture["evidence_id"])
+        assert evidence is not None
+        assert evidence.llamacpp_oracle == (
+            oracle["llamacpp_commit"],
+            oracle["case_count_per_route"],
+            fixture["ordered_results_sha256"],
+        )
+        assert evidence.source_oracle_sha256 == fixture["source_results_sha256"]
+        assert evidence.lfs_sha256 == fixture["artifact_sha256"]
+        assert evidence.bounded_header_bytes == fixture["bounded_header_bytes"]
+        assert evidence.bounded_header_sha256 == fixture["bounded_header_sha256"]
+        assert evidence.oracle_mismatch_count == fixture["mismatch_count"]
+        assert (
+            list(evidence.oracle_mismatch_count_by_mode) == fixture["mismatch_count_by_mode"]
+        )
+        first = fixture["first_mismatch"]
+        assert evidence.first_mismatch_mode == tuple(first["mode"])
+        assert evidence.first_mismatch == (
+            first["text"],
+            tuple(first["llamacpp_ids"]),
+            tuple(first["source_ids"]),
+        )
+
+
+def test_minicpm_mismatch_evidence_cannot_promote_generic_default() -> None:
+    exact = iter_tokenizer_evidence()
+    mismatches = iter_tokenizer_mismatch_evidence()
+    default = next(
+        record for record in tokenizer_route_census() if record.identifier == "default"
+    )
+
+    assert {record.architecture for record in mismatches} == {"minicpm", "minicpm3"}
+    assert {record.pre_identifier for record in mismatches} == {"default"}
+    assert all(record.oracle_mismatch_count > 0 for record in mismatches)
+    assert all(
+        record.gguf_chat_template_sha256 != record.source_chat_template_sha256
+        for record in mismatches
+    )
+    assert not any(record.pre_identifier == "default" for record in exact)
+    assert default.current_status == "deferred-compiled-semantics"
+    assert default.evidence_id is None
+    assert default.blocker_category == "compiled-llama.cpp-semantic-dependency"
 
 
 def test_shared_evidence_requires_identical_pinned_dispatch_behavior() -> None:
