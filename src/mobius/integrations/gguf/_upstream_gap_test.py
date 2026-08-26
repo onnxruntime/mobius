@@ -5,9 +5,9 @@
 
 The census is vendored so coverage is *measurable*, not so it can be claimed.
 These tests assert the separation directly: mobius covers a small, named subset
-of the 147 upstream architectures, everything else resolves to an explicit
-refusal with a reason, and no architecture becomes "supported" merely by
-appearing in the data file.
+of the 147 upstream architectures plus one separately pinned post-census
+artifact, everything else resolves to an explicit refusal with a reason, and no
+architecture becomes "supported" merely by appearing in the data file.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class TestPinIntegrity:
         assert UPSTREAM_COMMIT == "8d9af256337d1a501250f9bbf4c0859a654bddd6"
 
     def test_counts_match_the_survey(self) -> None:
-        assert len(upstream_architectures()) == 147
+        assert len(upstream_architectures()) == 148
         assert len(upstream_quant_types()) == 43
 
     def test_known_upstream_facts_survive_the_trim(self) -> None:
@@ -84,7 +84,7 @@ class TestCoverageIsHonest:
     """Being in the census must never imply being supported."""
 
     def test_every_upstream_architecture_has_one_explicit_verdict(self) -> None:
-        assert len(iter_arch_specs()) == len(upstream_architectures()) == 147
+        assert len(iter_arch_specs()) == len(upstream_architectures()) == 148
         assert {spec.gguf_arch for spec in iter_arch_specs()} == set(upstream_architectures())
         assert len(supported_architectures()) < len(upstream_architectures())
 

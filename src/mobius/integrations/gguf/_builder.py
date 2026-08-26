@@ -505,7 +505,11 @@ def _preflight_hf_mmproj_companion_file(
 
 
 def _validate_gguf_model(
-    gguf_model, *, source: str, allow_mmproj_companion: bool = False
+    gguf_model,
+    *,
+    source: str,
+    allow_mmproj_companion: bool = False,
+    keep_quantized: bool | None = None,
 ) -> None:
     """Validate a parsed GGUF before config extraction or graph construction."""
     from mobius.integrations.gguf._shard_set import GgufShardSet
@@ -521,6 +525,13 @@ def _validate_gguf_model(
         source=source,
         tensor_names=gguf_model.tensor_names,
         allow_mmproj_companion=allow_mmproj_companion,
+    )
+    from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_tensor_contract
+
+    validate_qwen4exp_tensor_contract(
+        gguf_model,
+        source=source,
+        keep_quantized=keep_quantized,
     )
     _raise_for_invalid_bitnet_tensor_contract(gguf_model)
     _raise_for_invalid_talkie_tensor_contract(gguf_model)
@@ -4832,7 +4843,12 @@ def _download_hf_gguf_shards(
     return downloaded[selected_filename]
 
 
-def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bool) -> str:
+def _resolve_gguf_path_impl(
+    gguf_path: str | Path,
+    *,
+    allow_mmproj_companion: bool,
+    keep_quantized: bool = True,
+) -> str:
     """Resolve a GGUF reference with an internal primary/companion context.
 
     Accepts:
@@ -4888,6 +4904,19 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
     if len(selected_files) > 1:
         pinned_files = api.list_repo_files(repo_id, revision=resolved_revision)
         filename, selected_files = _select_complete_hf_gguf_set(pinned_files, filename)
+        from mobius.integrations.gguf._qwen4_exp import (
+            QWEN4EXP_GGUF_REPO,
+            validate_qwen4exp_hub_artifact,
+        )
+
+        if repo_id == QWEN4EXP_GGUF_REPO:
+            validate_qwen4exp_hub_artifact(
+                api,
+                repo_id=repo_id,
+                revision=resolved_revision,
+                shard_filenames=selected_files,
+                keep_quantized=keep_quantized,
+            )
         return _download_hf_gguf_shards(
             api,
             repo_id=repo_id,
@@ -4904,9 +4933,16 @@ def _resolve_gguf_path_impl(gguf_path: str | Path, *, allow_mmproj_companion: bo
     )
 
 
-def _resolve_gguf_path(gguf_path: str | Path) -> str:
+def _resolve_gguf_path(
+    gguf_path: str | Path,
+    keep_quantized: bool = True,
+) -> str:
     """Resolve a primary GGUF reference without allowing mmproj sidecars."""
-    return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=False)
+    return _resolve_gguf_path_impl(
+        gguf_path,
+        allow_mmproj_companion=False,
+        keep_quantized=keep_quantized,
+    )
 
 
 def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
@@ -5114,7 +5150,7 @@ def build_from_gguf(
     #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
     #    (never merged into a second on-disk GGUF); a plain file opens as before.
     source_reference = str(gguf_path)
-    gguf_path = _resolve_gguf_path(gguf_path)
+    gguf_path = _resolve_gguf_path(gguf_path, keep_quantized)
     logical_source_filename = _logical_source_filename(source_reference, gguf_path)
     source_path = Path(gguf_path)
     if source_path.is_symlink() and _GGUF_SHARD_FILENAME_RE.search(source_path.name) is None:
@@ -5133,7 +5169,11 @@ def build_from_gguf(
         identity_paths = _hub_cache_identity_paths(gguf_model.shard_paths)
         if identity_paths is not None:
             gguf_model._set_identity_paths(identity_paths)
-    _validate_gguf_model(gguf_model, source=str(gguf_path))
+    _validate_gguf_model(
+        gguf_model,
+        source=str(gguf_path),
+        keep_quantized=keep_quantized,
+    )
     if reuse_gguf_weights and isinstance(gguf_model, GgufShardSet):
         raise ValueError(
             "reuse_gguf_weights=True does not yet support multi-shard GGUF sets. "

@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 89
+_EXPECTED_SUPPORTED_COUNT = 90
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -331,6 +331,7 @@ class TestCapabilityClosure:
             "openelm",
             "orion",
             "qwen",
+            "qwen4exp",
             "refact",
             "starcoder",
             "talkie",
@@ -417,9 +418,9 @@ class TestNamespaceHygiene:
         went unmapped or were unreachable.
         """
         assert spec.gguf_arch in upstream_architectures(), (
-            f"{spec.gguf_arch!r} is not one of the 147 architectures llama.cpp "
-            "defines at the pinned commit. If it is a defensive spelling, declare "
-            "it in `aliases` instead of as the canonical name."
+            f"{spec.gguf_arch!r} is not one of the 148 pinned GGUF formats. "
+            "If it is a defensive spelling, declare it in `aliases` instead of "
+            "as the canonical name."
         )
 
     def test_aliases_do_not_collide(self) -> None:
@@ -434,7 +435,7 @@ class TestNamespaceHygiene:
     def test_registry_exactly_closes_the_pinned_census(self) -> None:
         specs = iter_arch_specs()
         _validate_census_closure(specs, frozenset(upstream_architectures()))
-        assert len(specs) == 147
+        assert len(specs) == 148
         assert {spec.gguf_arch for spec in specs} == set(upstream_architectures())
 
     @pytest.mark.parametrize(
@@ -1609,7 +1610,10 @@ class TestRejectionsAreActionable:
             get_arch_spec("rwkv6")
 
     def test_an_unknown_architecture_is_distinguished_from_an_upstream_one(self) -> None:
-        with pytest.raises(UnsupportedGGUFArchitectureError, match="not among the 147"):
+        with pytest.raises(
+            UnsupportedGGUFArchitectureError,
+            match="not among the 148 pinned",
+        ):
             get_arch_spec("definitely-not-real")
 
     def test_legacy_exception_types_still_catch_everything(self) -> None:

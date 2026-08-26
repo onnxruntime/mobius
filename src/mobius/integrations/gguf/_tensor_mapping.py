@@ -946,6 +946,62 @@ _QWEN3NEXT_HYBRID_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_post_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+_QWEN4EXP_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "per_layer_token_embd": ("model.layers.1.ple.ple_embedding.ngram_embedding"),
+    "output_hc_down": "model.hyper_connection_mixer.input_mix_weight_down",
+    "output_hc_norm": "model.hyper_connection_mixer.hc_norm",
+    "output_hc_up": "model.hyper_connection_mixer.input_mix_weight_up",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_inp_shexp": "model.layers.{bid}.mlp.shared_expert_gate",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_expert.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_expert.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_expert.down_proj",
+    "blk.{bid}.hc_attn_down": (
+        "model.layers.{bid}.attn_hyper_connection.input_mix_weight_down"
+    ),
+    "blk.{bid}.hc_attn_up": ("model.layers.{bid}.attn_hyper_connection.input_mix_weight_up"),
+    "blk.{bid}.hc_attn_norm": "model.layers.{bid}.attn_hyper_connection.hc_norm",
+    "blk.{bid}.hc_attn_inject": (
+        "model.layers.{bid}.attn_hyper_connection.block_inject_weight"
+    ),
+    "blk.{bid}.hc_ffn_down": ("model.layers.{bid}.mlp_hyper_connection.input_mix_weight_down"),
+    "blk.{bid}.hc_ffn_up": ("model.layers.{bid}.mlp_hyper_connection.input_mix_weight_up"),
+    "blk.{bid}.hc_ffn_norm": "model.layers.{bid}.mlp_hyper_connection.hc_norm",
+    "blk.{bid}.hc_ffn_inject": ("model.layers.{bid}.mlp_hyper_connection.block_inject_weight"),
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.linear_attn.in_proj_qkv",
+    "blk.{bid}.attn_gate": "model.layers.{bid}.linear_attn.in_proj_z",
+    "blk.{bid}.ssm_beta": "model.layers.{bid}.linear_attn.in_proj_b",
+    "blk.{bid}.ssm_alpha": "model.layers.{bid}.linear_attn.in_proj_a",
+    "blk.{bid}.ssm_conv1d": "model.layers.{bid}.linear_attn.conv1d",
+    "blk.{bid}.ssm_dt": "model.layers.{bid}.linear_attn.dt_bias",
+    "blk.{bid}.ssm_a": "model.layers.{bid}.linear_attn.A_log",
+    "blk.{bid}.ssm_norm": "model.layers.{bid}.linear_attn.norm",
+    "blk.{bid}.ssm_out": "model.layers.{bid}.linear_attn.out_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+    # GGUF serializes the two row ranges independently. The model preprocessor
+    # validates and concatenates them back into HF's fused index_qk_proj.
+    "blk.{bid}.indexer.q_proj": "model.layers.{bid}.self_attn.indexer.index_q_proj",
+    "blk.{bid}.indexer.k_proj": "model.layers.{bid}.self_attn.indexer.index_k_proj",
+    "blk.{bid}.indexer.q_norm": "model.layers.{bid}.self_attn.indexer.q_layernorm",
+    "blk.{bid}.indexer.k_norm": "model.layers.{bid}.self_attn.indexer.k_layernorm",
+    "blk.{bid}.ple_conv1d": "model.layers.{bid}.ple.conv1d",
+    "blk.{bid}.ple_key": "model.layers.{bid}.ple.key_proj",
+    "blk.{bid}.ple_value": "model.layers.{bid}.ple.value_proj",
+    "blk.{bid}.ple_norm_key": "model.layers.{bid}.ple.norm_key",
+    "blk.{bid}.ple_norm_query": "model.layers.{bid}.ple.norm_query",
+    "blk.{bid}.ple_norm_conv": "model.layers.{bid}.ple.norm_conv",
+}
+
 _LFM2_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
     "token_embd_norm": "model.embedding_norm",
@@ -1169,6 +1225,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
         "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
         "qwen3next_hybrid_extras": _QWEN3NEXT_HYBRID_EXTRAS,
+        "qwen4exp": _QWEN4EXP_MAPPING,
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
         "minimax": _MINIMAX_MAPPING,

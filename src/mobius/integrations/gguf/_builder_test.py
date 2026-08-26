@@ -4943,7 +4943,7 @@ class TestLanguageDiffusionDispatch:
         import mobius.integrations.gguf._builder as builder
         import mobius.integrations.gguf._shard_set as shard_set
 
-        monkeypatch.setattr(builder, "_resolve_gguf_path", lambda path: path)
+        monkeypatch.setattr(builder, "_resolve_gguf_path", lambda path, *_args: path)
         monkeypatch.setattr(builder, "_validate_gguf_model", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(builder, "_has_quantized_weights", lambda *_args: False)
         monkeypatch.setattr(shard_set, "open_gguf_model", _DreamGGUF)

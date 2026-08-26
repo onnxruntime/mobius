@@ -1112,6 +1112,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
         """Map official packed experts and sharded PLE tables to ONNX parameters."""
         cleaned: dict[str, torch.Tensor] = {}
         ple_shards: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+        indexer_projections: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
         parameter_map = dict(self.named_parameters())
         skipped_mtp = 0
         for original_key, value in state_dict.items():
@@ -1126,6 +1127,15 @@ class Qwen4ExpCausalLMModel(nn.Module):
             if key.startswith("model.visual."):
                 continue
             if key.endswith("rotary_emb.inv_freq"):
+                continue
+            indexer_marker = ".self_attn.indexer.index_"
+            if indexer_marker in key and key.endswith("_proj.weight"):
+                prefix, projection = key.rsplit(indexer_marker, 1)
+                if projection not in {"q_proj.weight", "k_proj.weight"}:
+                    raise ValueError(f"Unexpected Qwen4-Exp indexer projection: {key}")
+                indexer_projections[f"{prefix}.self_attn.indexer.index_qk_proj.weight"][
+                    projection[0]
+                ] = value
                 continue
             if key.endswith(
                 (
@@ -1177,6 +1187,44 @@ class Qwen4ExpCausalLMModel(nn.Module):
                         f"expected {expected_shape}"
                     )
             cleaned[key] = value
+
+        for target, projections in indexer_projections.items():
+            missing = sorted({"q", "k"} - set(projections))
+            unexpected = sorted(set(projections) - {"q", "k"})
+            if missing or unexpected:
+                raise ValueError(
+                    f"Qwen4-Exp split indexer projection {target} has missing parts "
+                    f"{missing} and unexpected parts {unexpected}"
+                )
+            parameter = parameter_map.get(target)
+            if parameter is None:
+                raise ValueError(f"Unexpected Qwen4-Exp indexer projection: {target}")
+            assert self.config.indexer_n_heads is not None
+            assert self.config.indexer_kv_heads is not None
+            assert self.config.indexer_head_dim is not None
+            query = projections["q"]
+            key = projections["k"]
+            expected_query_rows = self.config.indexer_n_heads * self.config.indexer_head_dim
+            expected_key_rows = self.config.indexer_kv_heads * self.config.indexer_head_dim
+            expected_input = self.config.hidden_size
+            if tuple(query.shape) != (expected_query_rows, expected_input):
+                raise ValueError(
+                    f"Qwen4-Exp indexer query projection {target} has shape "
+                    f"{tuple(query.shape)}, expected {(expected_query_rows, expected_input)}"
+                )
+            if tuple(key.shape) != (expected_key_rows, expected_input):
+                raise ValueError(
+                    f"Qwen4-Exp indexer key projection {target} has shape "
+                    f"{tuple(key.shape)}, expected {(expected_key_rows, expected_input)}"
+                )
+            combined = torch.cat((query, key), dim=0)
+            expected_shape = tuple(int(dim) for dim in parameter.shape)
+            if tuple(combined.shape) != expected_shape:
+                raise ValueError(
+                    f"Qwen4-Exp fused indexer projection {target} has shape "
+                    f"{tuple(combined.shape)}, expected {expected_shape}"
+                )
+            cleaned[target] = combined
 
         for target, shards in ple_shards.items():
             expected = set(range(self.config.split_ngram_parts))

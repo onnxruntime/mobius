@@ -877,6 +877,58 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen4exp",
+        model_type="qwen4_exp_text",
+        tensor_map_recipe=("qwen4exp",),
+        config_key_map="qwen4exp",
+        config_postprocessor="qwen4exp",
+        offset_norm=True,
+        v_head_reorder=True,
+        required_metadata=(
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.layer_norm_rms_epsilon",
+            "attention.compress_ratios",
+            "attention.indexer.head_count",
+            "attention.indexer.key_length",
+            "attention.indexer.top_k",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_feed_forward_length",
+            "hyper_connection.count",
+            "hyper_connection.low_rank",
+            "ple.layers",
+            "ple.ngram_size",
+            "ple.heads_per_ngram",
+            "ple.conv_kernel",
+            "ple.eos_token_id",
+            "ple.layer_multipliers",
+            "ple.head_offsets",
+            "ple.head_vocab_sizes",
+            "embedding_length_per_layer_input",
+            "rope.dimension_sections",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        quantized_import=Support.REJECTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact pinned Qwen3.8 Flash-Next GGUF graph and float tensor mapping "
+            "are implemented, but its only published UD-IQ1_S route cannot be "
+            "preserved truthfully: per_layer_token_embd.weight is a roughly 95 GiB "
+            "logical IQ4_NL embedding with no matching GatherBlockQuantized ABI, "
+            "while the rank-3 routed experts mix IQ1_S gate/up with IQ4_NL down "
+            "banks and have no released mixed-format sparse BlockQuantizedMoE ABI "
+            "or real-weight runtime evidence. Explicit dequantization is also "
+            "rejected for that artifact by the bounded-memory policy before payload "
+            "download."
+        ),
+    ),
     # ---------------------------------------------------------------- Gemma
     GGUFArchitectureSpec(
         gguf_arch="gemma",
@@ -2400,9 +2452,10 @@ def _unknown_architecture_message(architecture: str) -> str:
     prefix = f"Unsupported GGUF architecture: {architecture!r}."
     if upstream is None:
         return (
-            f"{prefix} It is not among the {len(upstream_architectures())} "
-            "architectures llama.cpp defines at the pinned commit, so the file is "
-            "either newer than this build of mobius or not a llama.cpp GGUF. "
+            f"{prefix} It is not among the {len(upstream_architectures())} pinned "
+            "GGUF architecture formats (147 from the llama.cpp census plus explicit "
+            "post-census artifact pins), so the file is either newer than this build "
+            "of mobius or not a recognized pinned GGUF. "
             f"Supported: {', '.join(supported_architectures())}."
         )
     if not upstream.cpp_loader:

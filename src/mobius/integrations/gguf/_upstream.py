@@ -6,7 +6,10 @@
 The JSON payload in ``_upstream_data/llamacpp_pin.json`` was extracted
 mechanically from llama.cpp at commit
 ``8d9af256337d1a501250f9bbf4c0859a654bddd6``: 147 real ``llm_arch`` entries and
-all 43 ``ggml_type`` slots.
+all 43 ``ggml_type`` slots. One newer artifact-owned architecture,
+``qwen4exp``, is pinned separately to the exact Unsloth GGUF revision that
+introduced it; keeping that extension explicit avoids pretending it existed at
+the older llama.cpp census commit.
 
 This data exists to make coverage *measurable*, not to make claims. Nothing
 here implies mobius supports an architecture — support lives in
@@ -28,6 +31,7 @@ from __future__ import annotations
 __all__ = [
     "UPSTREAM_COMMIT",
     "UPSTREAM_DATE",
+    "EXTERNAL_ARCHITECTURE_PINS",
     "UpstreamArchitecture",
     "UpstreamQuantType",
     "upstream_architecture",
@@ -45,6 +49,9 @@ from importlib import resources
 from typing import Any
 
 UPSTREAM_COMMIT = "8d9af256337d1a501250f9bbf4c0859a654bddd6"
+EXTERNAL_ARCHITECTURE_PINS = {
+    "qwen4exp": ("unsloth/Qwen3.8-Flash-Next-GGUF@d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249")
+}
 
 _DATA_PACKAGE = "mobius.integrations.gguf._upstream_data"
 _DATA_FILE = "llamacpp_pin.json"
@@ -163,8 +170,8 @@ def _payload() -> dict[str, Any]:
 
 @functools.lru_cache(maxsize=1)
 def upstream_architectures() -> dict[str, UpstreamArchitecture]:
-    """Return every pinned upstream architecture keyed by GGUF architecture string."""
-    return {
+    """Return the llama.cpp census plus explicitly pinned post-census formats."""
+    architectures = {
         name: UpstreamArchitecture(
             gguf_arch=name,
             cohort=fields["cohort"],
@@ -188,6 +195,86 @@ def upstream_architectures() -> dict[str, UpstreamArchitecture]:
         )
         for name, fields in _payload()["architectures"].items()
     }
+    common = (
+        "blk.{bid}.ffn_down_exps.weight",
+        "blk.{bid}.ffn_gate_exps.weight",
+        "blk.{bid}.ffn_up_exps.weight",
+        "blk.{bid}.ffn_gate_inp.weight",
+        "blk.{bid}.ffn_down_shexp.weight",
+        "blk.{bid}.ffn_gate_shexp.weight",
+        "blk.{bid}.ffn_up_shexp.weight",
+        "blk.{bid}.ffn_gate_inp_shexp.weight",
+        "blk.{bid}.hc_attn_down.weight",
+        "blk.{bid}.hc_attn_up.weight",
+        "blk.{bid}.hc_attn_norm.weight",
+        "blk.{bid}.hc_attn_inject.weight",
+        "blk.{bid}.hc_ffn_down.weight",
+        "blk.{bid}.hc_ffn_up.weight",
+        "blk.{bid}.hc_ffn_norm.weight",
+        "blk.{bid}.hc_ffn_inject.weight",
+    )
+    deltanet = (
+        "blk.{bid}.attn_gate.weight",
+        "blk.{bid}.attn_qkv.weight",
+        "blk.{bid}.ssm_a",
+        "blk.{bid}.ssm_alpha.weight",
+        "blk.{bid}.ssm_beta.weight",
+        "blk.{bid}.ssm_conv1d.weight",
+        "blk.{bid}.ssm_dt.bias",
+        "blk.{bid}.ssm_norm.weight",
+        "blk.{bid}.ssm_out.weight",
+    )
+    qsa = (
+        "blk.{bid}.attn_q.weight",
+        "blk.{bid}.attn_k.weight",
+        "blk.{bid}.attn_v.weight",
+        "blk.{bid}.attn_output.weight",
+        "blk.{bid}.attn_q_norm.weight",
+        "blk.{bid}.attn_k_norm.weight",
+        "blk.{bid}.indexer.q_proj.weight",
+        "blk.{bid}.indexer.k_proj.weight",
+        "blk.{bid}.indexer.q_norm.weight",
+        "blk.{bid}.indexer.k_norm.weight",
+    )
+    ple = (
+        "blk.{bid}.ple_conv1d.weight",
+        "blk.{bid}.ple_key.weight",
+        "blk.{bid}.ple_value.weight",
+        "blk.{bid}.ple_norm_key.weight",
+        "blk.{bid}.ple_norm_query.weight",
+        "blk.{bid}.ple_norm_conv.weight",
+    )
+    architectures["qwen4exp"] = UpstreamArchitecture(
+        gguf_arch="qwen4exp",
+        cohort="C06-hybrid-attn-ssm",
+        cpp_loader=True,
+        dual_moe=False,
+        tensor_names=(
+            "output.weight",
+            "output_hc_down.weight",
+            "output_hc_norm.weight",
+            "output_hc_up.weight",
+            "per_layer_token_embd.weight",
+            "token_embd.weight",
+            *common,
+            *deltanet,
+            *qsa,
+            *ple,
+        ),
+        expert_tensor_suffixes=("weight",),
+        tensor_closure_status="exact pinned 3-shard artifact header closure",
+        loader_source=EXTERNAL_ARCHITECTURE_PINS["qwen4exp"],
+        required_metadata=(
+            "attention.compress_ratios",
+            "attention.indexer.head_count",
+            "attention.indexer.key_length",
+            "attention.indexer.top_k",
+            "hyper_connection.count",
+            "hyper_connection.low_rank",
+            "ple.layers",
+        ),
+    )
+    return architectures
 
 
 @functools.lru_cache(maxsize=1)
