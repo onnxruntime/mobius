@@ -13,8 +13,9 @@ import torch
 from mobius._builder import build_from_module
 from mobius._configs import Qwen4ExpConfig
 from mobius._registry import registry
+from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.models.qwen4_exp import Qwen4ExpCausalLMModel
+from mobius.models.qwen4_exp import Qwen4ExpCausalLMModel, Qwen4ExpQSAIndexer
 
 
 def _config(**overrides) -> Qwen4ExpConfig:
@@ -185,36 +186,50 @@ def test_exact_config_guards(override, message):
 
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache(interleaved):
-    config = _config(partial_rotary_factor=0.5, rope_interleave=interleaved)
-    _config_value, _module, model = _build(config)
-    rotary_nodes = [
-        node
-        for node in model.graph
-        if node.op_type == "RotaryEmbedding" and "/indexer/" in node.name
-    ]
-    assert len(rotary_nodes) == 2
-    assert all(node.attributes["rotary_embedding_dim"].value == 4 for node in rotary_nodes)
-    assert all(node.attributes["interleaved"].value == interleaved for node in rotary_nodes)
+    config = _config(partial_rotary_factor=0.5)
+    # The pinned model is half-split, but the reusable rotation path must
+    # preserve ONNX RotaryEmbedding semantics for either layout.
+    config.rope_interleave = interleaved
+    indexer = Qwen4ExpQSAIndexer(config)
+    builder, op, graph = create_test_builder()
+    value = create_test_input(builder, "value", [1, 3, 2, 8])
+    cos = create_test_input(builder, "cos", [1, 3, 2])
+    sin = create_test_input(builder, "sin", [1, 3, 2])
+    output = indexer._rotate(op, value, (cos, sin), num_heads=2)
+    output.name = "output"
+    graph.outputs.append(output)
+    model = ir.Model(graph, ir_version=11)
+    rotary_node = next(node for node in graph if node.op_type == "RotaryEmbedding")
+    assert rotary_node.attributes["rotary_embedding_dim"].value == 4
+    assert rotary_node.attributes["interleaved"].value == interleaved
 
     rng = np.random.default_rng(5)
-    for value in model.graph.initializers.values():
-        if value.const_value is None:
-            value.const_value = ir.tensor(
-                rng.normal(0.0, 0.02, [int(dim) for dim in value.shape]).astype(np.float32)
-            )
+    value_data = rng.normal(size=(1, 3, 2, 8)).astype(np.float32)
+    cos_data = rng.normal(size=(1, 3, 2)).astype(np.float32)
+    sin_data = rng.normal(size=(1, 3, 2)).astype(np.float32)
     session = OnnxModelSession(model)
     try:
-        outputs = session.run(
-            _initial_states()
-            | {
-                "input_ids": np.array([[2, 3, 4, 5]], dtype=np.int64),
-                "attention_mask": np.ones((1, 4), dtype=np.int64),
-                "position_ids": np.arange(4, dtype=np.int64)[None],
-            }
-        )
+        actual = session.run({"value": value_data, "cos": cos_data, "sin": sin_data})[
+            "output"
+        ]
     finally:
         session.close()
-    assert np.isfinite(outputs["logits"]).all()
+
+    rotary = value_data[..., :4]
+    if interleaved:
+        rotated_half = np.empty_like(rotary)
+        rotated_half[..., 0::2] = -rotary[..., 1::2]
+        rotated_half[..., 1::2] = rotary[..., 0::2]
+        expanded_cos = np.repeat(cos_data[:, :, None, :], 2, axis=-1)
+        expanded_sin = np.repeat(sin_data[:, :, None, :], 2, axis=-1)
+    else:
+        first, second = np.split(rotary, 2, axis=-1)
+        rotated_half = np.concatenate((-second, first), axis=-1)
+        expanded_cos = np.concatenate((cos_data, cos_data), axis=-1)[:, :, None, :]
+        expanded_sin = np.concatenate((sin_data, sin_data), axis=-1)[:, :, None, :]
+    expected_rotary = rotary * expanded_cos + rotated_half * expanded_sin
+    expected = np.concatenate((expected_rotary, value_data[..., 4:]), axis=-1)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_registry_routes_composite_and_text_model_types():
