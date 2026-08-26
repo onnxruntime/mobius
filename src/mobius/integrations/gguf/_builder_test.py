@@ -2343,9 +2343,7 @@ def mixed_native_q5_q8_gguf(tmp_path: Path) -> Path:
 class TestReuseGgufWeights:
     """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
 
-    def test_fsync_file_uses_writable_descriptor_on_windows(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_fsync_file_uses_writable_descriptor_on_windows(self, tmp_path: Path, monkeypatch):
         from mobius.integrations.gguf import _reuse
 
         path = tmp_path / "artifact.bin"
