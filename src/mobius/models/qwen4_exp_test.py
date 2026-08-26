@@ -669,6 +669,8 @@ def test_graph_exposes_exact_heterogeneous_state_abi():
         "present.1.index_key",
     } <= outputs
     assert model.metadata_props["mobius.cache_abi"].startswith("qwen4-exp:position_ids")
+    state = json.loads(model.metadata_props["mobius.state_manifest"])
+    assert state["position_state"]["axes"] == ["text"]
 
 
 def test_bfloat16_graph_keeps_only_recurrent_math_and_state_in_float32():
@@ -966,7 +968,7 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions():
         )["logits"]
         vl_states = _initial_states()
         vl_states["past_position_ids"] = np.zeros((4, 1, 0), dtype=np.int64)
-        vl_logits = vl_session.run(
+        vl_outputs = vl_session.run(
             vl_states
             | {
                 "inputs_embeds": inputs_embeds,
@@ -974,7 +976,8 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions():
                 "attention_mask": attention_mask,
                 "position_ids": multimodal_positions,
             }
-        )["logits"]
+        )
+        vl_logits = vl_outputs["logits"]
         alternate_text_positions = multimodal_positions.copy()
         alternate_text_positions[0] += 97
         alternate_logits = vl_session.run(
@@ -986,12 +989,43 @@ def test_multimodal_decoder_matches_text_route_with_identical_positions():
                 "position_ids": alternate_text_positions,
             }
         )["logits"]
+
+        decode_states = {
+            "past_position_ids": vl_outputs["present_position_ids"],
+            "past_key_values.0.conv_state": vl_outputs["present.0.conv_state"],
+            "past_key_values.0.recurrent_state": vl_outputs["present.0.recurrent_state"],
+            "past_key_values.0.ple_conv_state": vl_outputs["present.0.ple_conv_state"],
+            "past_key_values.0.ple_context": vl_outputs["present.0.ple_context"],
+            "past_key_values.1.key": vl_outputs["present.1.key"],
+            "past_key_values.1.value": vl_outputs["present.1.value"],
+            "past_key_values.1.index_key": vl_outputs["present.1.index_key"],
+        }
+        decode_positions = np.full((4, 1, 1), 4, dtype=np.int64)
+        decode_inputs = {
+            "inputs_embeds": embedding_weight[np.array([[6]], dtype=np.int64)],
+            "ple_input_ids": np.array([[6]], dtype=np.int64),
+            "attention_mask": np.ones((1, 5), dtype=np.int64),
+            "position_ids": decode_positions,
+        }
+        decode_logits = vl_session.run(decode_states | decode_inputs)["logits"]
+        alternate_decode_states = dict(decode_states)
+        alternate_decode_states["past_position_ids"] = decode_states[
+            "past_position_ids"
+        ].copy()
+        alternate_decode_states["past_position_ids"][0] += 97
+        alternate_decode_inputs = dict(decode_inputs)
+        alternate_decode_inputs["position_ids"] = decode_positions.copy()
+        alternate_decode_inputs["position_ids"][0] += 97
+        alternate_decode_logits = vl_session.run(
+            alternate_decode_states | alternate_decode_inputs
+        )["logits"]
     finally:
         text_session.close()
         vl_session.close()
 
     np.testing.assert_allclose(vl_logits, text_logits, rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(alternate_logits, vl_logits, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(alternate_decode_logits, decode_logits, rtol=1e-5, atol=1e-6)
     assert text_config.hidden_size == vl_config.hidden_size
 
 
@@ -1231,6 +1265,30 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
             position_ids=torch.from_numpy(alternate_position_ids),
             use_cache=False,
         ).logits.numpy()
+
+        def hf_cached_decode(prefill_positions, current_positions):
+            cache = DynamicCache(config=hf_config)
+            hf_model(
+                torch.from_numpy(input_ids),
+                position_ids=torch.from_numpy(prefill_positions),
+                past_key_values=cache,
+                use_cache=True,
+            )
+            return hf_model(
+                torch.tensor([[6]], dtype=torch.int64),
+                position_ids=torch.from_numpy(current_positions),
+                past_key_values=cache,
+                use_cache=True,
+            ).logits.numpy()
+
+        decode_position_ids = np.full((4, 1, 1), 4, dtype=np.int64)
+        alternate_decode_position_ids = decode_position_ids.copy()
+        alternate_decode_position_ids[0] += 97
+        hf_decode_positioned = hf_cached_decode(position_ids_4d, decode_position_ids)
+        hf_decode_alternate = hf_cached_decode(
+            alternate_position_ids, alternate_decode_position_ids
+        )
     np.testing.assert_allclose(vl_logits, hf_full, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(vl_alternate, vl_logits, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(hf_alternate, hf_positioned, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(hf_decode_alternate, hf_decode_positioned, rtol=1e-3, atol=1e-3)

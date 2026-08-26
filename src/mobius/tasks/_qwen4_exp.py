@@ -160,7 +160,12 @@ def _register_qwen4_outputs(
             builder.add_output(present[2], f"present.{layer_idx}.index_key")
 
 
-def _finalize_qwen4_decoder(graph, config: Qwen4ExpConfig) -> ir.Model:
+def _finalize_qwen4_decoder(
+    graph,
+    config: Qwen4ExpConfig,
+    *,
+    position_axes: list[str],
+) -> ir.Model:
     model = _make_model(graph)
     _register_linear_attention_functions(model, config)
     model.metadata_props["mobius.cache_abi"] = (
@@ -197,7 +202,7 @@ def _finalize_qwen4_decoder(graph, config: Qwen4ExpConfig) -> ir.Model:
             "position_state": {
                 "input": "past_position_ids",
                 "output": "present_position_ids",
-                "axes": ["text", "temporal", "height", "width"],
+                "axes": position_axes,
                 "update": "replace",
             },
             "layers": layers,
@@ -244,7 +249,7 @@ class Qwen4ExpCausalLMTask(ModelTask):
             states,
         )
         _register_qwen4_outputs(builder, config, logits, presents, present_position_ids)
-        model = _finalize_qwen4_decoder(graph, config)
+        model = _finalize_qwen4_decoder(graph, config, position_axes=["text"])
         return ModelPackage({"model": model}, config=config)
 
 
@@ -312,7 +317,11 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             past_key_values=states,
         )
         _register_qwen4_outputs(builder, config, logits, presents, present_position_ids)
-        return _finalize_qwen4_decoder(graph, config)
+        return _finalize_qwen4_decoder(
+            graph,
+            config,
+            position_axes=["text", "temporal", "height", "width"],
+        )
 
     @staticmethod
     def _build_embedding(embedding: nn.Module, config: Qwen4ExpConfig) -> ir.Model:
