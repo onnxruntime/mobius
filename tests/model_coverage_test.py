@@ -447,7 +447,7 @@ class TestL2ConfigValidation:
                 f"test_model_id in _registry.py and are not in "
                 f"_COVERAGE_SKIP:\n"
                 + "\n".join(f"  {mt}" for mt in missing)
-                + "\n\nFix: add test_model_id to _TEST_MODEL_IDS "
+                + "\n\nFix: set test_model_id on the model registration "
                 "in src/mobius/_registry.py."
             )
 
@@ -459,8 +459,8 @@ class TestL2ConfigValidation:
         if arch in _COVERAGE_SKIP:
             pytest.skip(_COVERAGE_SKIP[arch])
         pytest.fail(
-            f"Model '{arch}' has no test_model_id in "
-            f"_TEST_MODEL_IDS. Add one for L2 config validation."
+            f"Model '{arch}' has no registered test_model_id. "
+            "Set one in src/mobius/_registry.py for L2 config validation."
         )
 
 
