@@ -82,12 +82,16 @@ def test_streaming_loader_maps_packed_experts_and_ple_without_eager_checkpoint(
         initializers["model.layers.0.mlp.experts.gate_up_proj"].const_value.dtype
         == ir.DataType.FLOAT
     )
-    assert (
-        initializers[
-            "model.layers.0.ple.ple_embedding.ngram_embedding.weight"
-        ].const_value.shape
-        == module.model.layers[0].ple.ple_embedding.ngram_embedding.weight.shape
-    )
+    embedding = module.model.layers[0].ple.ple_embedding.ngram_embedding
+    for shard_index in range(config.split_ngram_parts):
+        target = (
+            "model.layers.0.ple.ple_embedding.ngram_embedding."
+            f"shard_{shard_index}.weight"
+        )
+        assert initializers[target].const_value.shape == getattr(
+            embedding,
+            f"shard_{shard_index}",
+        ).weight.shape
 
 
 def _official_package_state(package, config) -> dict[str, torch.Tensor]:
