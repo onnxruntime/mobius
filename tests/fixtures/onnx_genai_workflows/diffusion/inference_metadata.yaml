@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -154,6 +154,7 @@ pipeline:
           roles:
             input_ids: token_ids
             encoder_hidden_states: encoder_hidden_states
+        batch_capacity: {}
       denoiser:
         implementation:
           kind: onnx
@@ -161,10 +162,12 @@ pipeline:
         ports:
           roles:
             encoder_hidden_states: encoder_hidden_states
+        batch_capacity: {}
       vae_decoder:
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx
+        batch_capacity: {}
       solver_step:
         implementation:
           kind: onnx
@@ -227,6 +230,12 @@ pipeline:
             step: step
             schedule: schedule
             next_state: next_state
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
+          - schedule_length
       continue_predicate:
         implementation:
           kind: onnx
@@ -247,6 +256,7 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity: {}
       model_input_scale:
         implementation:
           kind: onnx
@@ -289,6 +299,12 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
+          - schedule_length
       diffusion_schedule:
         implementation:
           kind: onnx
@@ -301,6 +317,7 @@ pipeline:
               rank: 1
               shape:
               - 31
+        batch_capacity: {}
       diffusion_timesteps:
         implementation:
           kind: onnx
@@ -313,6 +330,7 @@ pipeline:
               rank: 1
               shape:
               - 30
+        batch_capacity: {}
       schedule_lookup:
         implementation:
           kind: onnx
@@ -341,6 +359,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - schedule_length
       tensor_scale:
         implementation:
           kind: onnx
@@ -375,6 +396,11 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
       initial_state_scale:
         implementation:
           kind: onnx
@@ -387,6 +413,7 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity: {}
       image_output_clamp:
         implementation:
           kind: onnx
@@ -416,6 +443,11 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - axis_1
+          - axis_2
+          - axis_3
     state:
       latent_state:
         contract:
@@ -517,10 +549,12 @@ pipeline:
         value: denoiser.estimate
         output: noise_estimate
         mode: append
+        axis: 3
       - kind: emit
         value: latent.body
         output: latent_trajectory
         mode: append
+        axis: 3
       - kind: invoke
         component: continue_predicate
         inputs:

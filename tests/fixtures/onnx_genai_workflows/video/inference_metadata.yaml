@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -159,10 +159,12 @@ pipeline:
         ports:
           roles:
             encoder_hidden_states: encoder_hidden_states
+        batch_capacity: {}
       vae_decoder:
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx
+        batch_capacity: {}
       model_input:
         implementation:
           kind: onnx
@@ -207,6 +209,13 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - frames
+          - channels
+          - height
+          - width
+          - schedule_length
       solver_step:
         implementation:
           kind: onnx
@@ -272,6 +281,13 @@ pipeline:
             step: step
             schedule: schedule
             next_state: next_state
+        batch_capacity:
+          uniform_dimensions:
+          - frames
+          - channels
+          - height
+          - width
+          - schedule_length
       continue_predicate:
         implementation:
           kind: onnx
@@ -292,6 +308,7 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity: {}
       video_latent_init:
         implementation:
           kind: onnx
@@ -332,6 +349,12 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - frames
+          - channels
+          - height
+          - width
       schedule_history_append:
         implementation:
           kind: onnx
@@ -365,6 +388,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - history
       video_latent_permute:
         implementation:
           kind: onnx
@@ -396,6 +422,12 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - frames
+          - channels
+          - height
+          - width
       video_latent_unscale:
         implementation:
           kind: onnx
@@ -427,6 +459,12 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - frames
+          - height
+          - width
       video_decode_chunks:
         implementation:
           kind: onnx
@@ -451,6 +489,12 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - latent_frames
+          - height
+          - width
       video_decode_chunk:
         implementation:
           kind: onnx
@@ -490,6 +534,12 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - latent_frames
+          - height
+          - width
       video_conv_cache_init:
         implementation:
           kind: onnx
@@ -533,6 +583,12 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - latent_frames
+          - height
+          - width
       diffusion_schedule:
         implementation:
           kind: onnx
@@ -545,6 +601,7 @@ pipeline:
               rank: 1
               shape:
               - 4
+        batch_capacity: {}
       diffusion_timesteps:
         implementation:
           kind: onnx
@@ -557,6 +614,7 @@ pipeline:
               rank: 1
               shape:
               - 3
+        batch_capacity: {}
       schedule_lookup:
         implementation:
           kind: onnx
@@ -585,6 +643,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - schedule_length
     state:
       latent:
         contract:

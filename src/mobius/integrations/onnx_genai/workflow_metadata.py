@@ -239,6 +239,157 @@ def _component(
     return declaration
 
 
+def _declare_batch_capacities(
+    metadata: dict[str, Any],
+    component_names: Sequence[str],
+) -> None:
+    """Assert independent-row execution for explicitly audited components.
+
+    Presence is the semantic permission; it is never inferred from a dynamic
+    leading axis. For synthesized policy graphs, whose port contracts are part
+    of the workflow dataflow, every non-request symbolic input extent is also
+    declared uniform. Exported model graphs remain authoritative for their own
+    port geometry and therefore contribute an empty capacity declaration.
+    """
+    workflow = metadata["pipeline"]["workflow"]
+    components = workflow["components"]
+    declared = False
+    for name in component_names:
+        component = components.get(name)
+        if component is None:
+            continue
+        uniform_dimensions: list[str] = []
+        for contract in component.get("ports", {}).get("inputs", {}).values():
+            layout = contract.get("batch_layout", {})
+            request_axis = (
+                layout.get("axis")
+                if layout.get("kind") in {"request_aligned", "request_expanded"}
+                else None
+            )
+            for axis, dimension in enumerate(contract.get("shape") or []):
+                if (
+                    axis != request_axis
+                    and isinstance(dimension, str)
+                    and dimension not in uniform_dimensions
+                ):
+                    uniform_dimensions.append(dimension)
+        capacity: dict[str, Any] = {}
+        if uniform_dimensions:
+            capacity["uniform_dimensions"] = uniform_dimensions
+        component["batch_capacity"] = capacity
+        declared = True
+    if declared:
+        metadata["schema_version"] = "v1.1"
+
+
+def _preserve_request_expansion(
+    metadata: dict[str, Any],
+    component_names: Sequence[str],
+    *,
+    factor: int,
+) -> None:
+    """Keep a fixed internal row expansion distinct from request batching."""
+    workflow = metadata["pipeline"]["workflow"]
+    for name in component_names:
+        component = workflow["components"][name]
+        for side in ("inputs", "outputs"):
+            for contract in component.get("ports", {}).get(side, {}).values():
+                shape = contract.get("shape") or []
+                if shape and shape[0] == "batch":
+                    contract["batch_layout"] = {
+                        "kind": "request_expanded",
+                        "axis": 0,
+                        "factor": factor,
+                    }
+
+
+_DECODER_BATCH_COMPONENTS = (
+    "model",
+    "token_sampler",
+    "termination",
+    "token_state_update",
+    "last_token_logits",
+    "decoder_state_initializer",
+    "decoder_step_update",
+    "cache_length_update",
+    "termination_batch_initializer",
+    "token_to_slot",
+    "generated_length_update",
+    "state_init",
+    "step_update",
+    "next_token",
+    "loop_continue",
+)
+
+_DIFFUSION_BATCH_COMPONENTS = (
+    "text_encoder",
+    "denoiser",
+    "vae_decoder",
+    "image_output_clamp",
+    "solver_step",
+    "continue_predicate",
+    "model_input_scale",
+    "diffusion_schedule",
+    "diffusion_timesteps",
+    "schedule_lookup",
+    "tensor_scale",
+    "initial_state_scale",
+    "decoder_input_scale",
+    "history_initializer",
+    "guidance_combine",
+    "latent_row_shape",
+    "latent_noise",
+)
+
+_TTS_BATCH_COMPONENTS = (
+    "talker",
+    "code_predictor",
+    "embedding",
+    "talker_step_embedder",
+    "talker_prefill_embedder",
+    "code_predictor_prefill",
+    "code_predictor_step_embedder",
+    "code_predictor_indices",
+    "talker_text_step",
+    "codec",
+    "last_token_logits",
+    "setup_talker_sampler",
+    "setup_predictor_sampler",
+    "talker_sampler",
+    "predictor_prefill_sampler",
+    "predictor_body_sampler",
+    "continue_predicate",
+    "tts_state_initializer",
+    "token_to_slot",
+    "code_frame_update",
+    "code_history_append",
+    "cache_length_update",
+    "talker_state_initializer",
+    "predictor_state_initializer",
+    "talker_step_update",
+    "predictor_step_update",
+    "codec_layout",
+)
+
+_VIDEO_BATCH_COMPONENTS = (
+    "transformer",
+    "vae_decoder",
+    "model_input",
+    "solver_step",
+    "continue_predicate",
+    "video_latent_init",
+    "schedule_history_append",
+    "video_latent_permute",
+    "video_latent_unscale",
+    "video_decode_chunks",
+    "video_decode_chunk",
+    "video_conv_cache_init",
+    "diffusion_schedule",
+    "diffusion_timesteps",
+    "schedule_lookup",
+)
+
+
 def _grammar_adapter_component(action: str) -> dict[str, Any]:
     """Declare one action of the versioned grammar-guidance adapter ABI."""
 
@@ -2013,6 +2164,14 @@ def build_hierarchical_audio_workflow_metadata(pkg: Any) -> dict[str, Any]:
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
+    expansion = metadata["pipeline"]["workflow"]["inputs"]["request.prompt_tokens"][
+        "contract"
+    ]["batch_layout"]["factor"]
+    _preserve_request_expansion(
+        metadata,
+        ("global_initializer", "global_step_update"),
+        factor=expansion,
+    )
     return metadata
 
 
@@ -3794,7 +3953,9 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "talker_text_step",
     }
     if real_transition_components <= set(pkg.keys()):
-        return _build_real_tts_workflow_metadata(pkg, config)
+        metadata = _build_real_tts_workflow_metadata(pkg, config)
+        _declare_batch_capacities(metadata, _TTS_BATCH_COMPONENTS)
+        return metadata
     required = {
         "talker",
         "code_predictor",
@@ -4243,6 +4404,7 @@ def build_tts_workflow_metadata(pkg: Any, config: Any) -> dict[str, Any]:
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
+    _declare_batch_capacities(metadata, _TTS_BATCH_COMPONENTS)
     return metadata
 
 
@@ -4838,6 +5000,7 @@ def build_diffusion_workflow_metadata(
                 "value": "denoiser.estimate",
                 "output": "noise_estimate",
                 "mode": "append",
+                "axis": 3,
                 "effect_name": "emit",
                 "effect": _effect("emit.0", "emit.1"),
             },
@@ -4846,6 +5009,7 @@ def build_diffusion_workflow_metadata(
                 "value": "latent.body",
                 "output": "latent_trajectory",
                 "mode": "append",
+                "axis": 3,
                 "effect_name": "emit",
                 "effect": _effect("emit.1", "emit.2"),
             },
@@ -4951,6 +5115,7 @@ def build_diffusion_workflow_metadata(
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
+    _declare_batch_capacities(metadata, _DIFFUSION_BATCH_COMPONENTS)
     return metadata
 
 
@@ -6063,6 +6228,7 @@ def build_video_diffusion_workflow_metadata(
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
     add_policy_components_to_workflow(metadata, pkg)
+    _declare_batch_capacities(metadata, _VIDEO_BATCH_COMPONENTS)
     return metadata
 
 
@@ -8071,7 +8237,11 @@ def build_decoder_workflow_metadata(
     """Build the exact workflow-policy contract for an autoregressive decoder."""
     if len(pkg) != 1:
         raise ValueError("decoder workflow requires exactly one neural component")
-    return _build_autoregressive_workflow_metadata(pkg, config, sampler=sampler, source=source)
+    metadata = _build_autoregressive_workflow_metadata(
+        pkg, config, sampler=sampler, source=source
+    )
+    _declare_batch_capacities(metadata, _DECODER_BATCH_COMPONENTS)
+    return metadata
 
 
 def _build_autoregressive_workflow_metadata(

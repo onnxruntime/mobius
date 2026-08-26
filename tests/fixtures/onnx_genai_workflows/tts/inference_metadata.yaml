@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -255,6 +255,7 @@ pipeline:
             position_ids: position_ids
             logits: logits
             last_hidden_state: hidden_states
+        batch_capacity: {}
       code_predictor:
         implementation:
           kind: onnx
@@ -265,10 +266,12 @@ pipeline:
             attention_mask: attention_mask
             position_ids: position_ids
             logits: logits
+        batch_capacity: {}
       embedding:
         implementation:
           kind: onnx
           artifact: embedding/model.onnx
+        batch_capacity: {}
       talker_step_embedder:
         implementation:
           kind: onnx
@@ -276,10 +279,12 @@ pipeline:
         ports:
           roles:
             inputs_embeds: inputs_embeds
+        batch_capacity: {}
       talker_prefill_embedder:
         implementation:
           kind: onnx
           artifact: talker_prefill_embedder/model.onnx
+        batch_capacity: {}
       code_predictor_prefill:
         implementation:
           kind: onnx
@@ -287,6 +292,7 @@ pipeline:
         ports:
           roles:
             inputs_embeds: inputs_embeds
+        batch_capacity: {}
       code_predictor_step_embedder:
         implementation:
           kind: onnx
@@ -294,18 +300,22 @@ pipeline:
         ports:
           roles:
             inputs_embeds: inputs_embeds
+        batch_capacity: {}
       code_predictor_indices:
         implementation:
           kind: onnx
           artifact: code_predictor_indices/model.onnx
+        batch_capacity: {}
       talker_text_step:
         implementation:
           kind: onnx
           artifact: talker_text_step/model.onnx
+        batch_capacity: {}
       codec:
         implementation:
           kind: onnx
           artifact: codec/model.onnx
+        batch_capacity: {}
       last_token_logits:
         implementation:
           kind: onnx
@@ -332,6 +342,10 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - sequence
+          - vocabulary
       setup_talker_sampler:
         implementation:
           kind: onnx
@@ -365,6 +379,9 @@ pipeline:
           parameters:
             mode: greedy
         application_overridable: true
+        batch_capacity:
+          uniform_dimensions:
+          - vocabulary
       setup_predictor_sampler:
         implementation:
           kind: onnx
@@ -398,6 +415,9 @@ pipeline:
           parameters:
             mode: greedy
         application_overridable: true
+        batch_capacity:
+          uniform_dimensions:
+          - vocabulary
       talker_sampler:
         implementation:
           kind: onnx
@@ -431,6 +451,9 @@ pipeline:
           parameters:
             mode: greedy
         application_overridable: true
+        batch_capacity:
+          uniform_dimensions:
+          - vocabulary
       predictor_prefill_sampler:
         implementation:
           kind: onnx
@@ -464,6 +487,9 @@ pipeline:
           parameters:
             mode: greedy
         application_overridable: true
+        batch_capacity:
+          uniform_dimensions:
+          - vocabulary
       predictor_body_sampler:
         implementation:
           kind: onnx
@@ -497,6 +523,9 @@ pipeline:
           parameters:
             mode: greedy
         application_overridable: true
+        batch_capacity:
+          uniform_dimensions:
+          - vocabulary
       continue_predicate:
         implementation:
           kind: onnx
@@ -517,6 +546,7 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity: {}
       tts_state_initializer:
         implementation:
           kind: onnx
@@ -561,6 +591,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - sequence
       token_to_slot:
         implementation:
           kind: onnx
@@ -585,6 +618,7 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity: {}
       code_frame_update:
         implementation:
           kind: onnx
@@ -622,6 +656,7 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity: {}
       code_history_append:
         implementation:
           kind: onnx
@@ -658,6 +693,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - frames
       cache_length_update:
         implementation:
           kind: onnx
@@ -689,6 +727,7 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity: {}
       talker_state_initializer:
         implementation:
           kind: onnx
@@ -722,6 +761,9 @@ pipeline:
               - 3
               - batch
               - sequence_len
+              batch_layout:
+                kind: request_aligned
+                axis: 1
             body_attention_mask:
               dtype: int64
               rank: 2
@@ -738,6 +780,9 @@ pipeline:
               - 3
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 1
             past_key_values.0.key:
               dtype: float32
               rank: 4
@@ -760,6 +805,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - prefill_sequence
       predictor_state_initializer:
         implementation:
           kind: onnx
@@ -923,6 +971,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - prefill_sequence
       talker_step_update:
         implementation:
           kind: onnx
@@ -945,6 +996,9 @@ pipeline:
               - 3
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 1
           outputs:
             next_attention_mask:
               dtype: int64
@@ -962,6 +1016,12 @@ pipeline:
               - 3
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 1
+        batch_capacity:
+          uniform_dimensions:
+          - context
       predictor_step_update:
         implementation:
           kind: onnx
@@ -1005,6 +1065,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - context
       codec_layout:
         implementation:
           kind: onnx
@@ -1032,6 +1095,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - frames
     state:
       last_frame:
         contract:
@@ -1090,6 +1156,9 @@ pipeline:
           - 3
           - batch
           - 1
+          batch_layout:
+            kind: request_aligned
+            axis: 1
         scope: invocation
         initializer: talker.initializer.body_position_ids
         recurrence:
