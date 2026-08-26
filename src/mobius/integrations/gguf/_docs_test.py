@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from mobius.integrations.gguf._docs import (
     _architecture_reason,
     check_document,
     render_blocks,
+    render_document,
     update_document,
 )
 from mobius.integrations.gguf._mmproj_registry import (
@@ -37,6 +39,20 @@ def test_document_is_concise_and_reason_coded() -> None:
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "IDs 0-248069" in document
     assert "Qwen3.5 full model runtime remains **deferred**" in document
+
+
+def test_tokenizer_evidence_row_has_exactly_four_markdown_columns() -> None:
+    row = next(
+        line
+        for line in render_document().splitlines()
+        if line.startswith("| `qwen3.5-0.8b-q4-tokenizer`")
+    )
+    parts = re.split(r"(?<!\\)\|", row)
+    assert parts[0] == parts[-1] == ""
+    cells = [part.strip() for part in parts[1:-1]]
+    assert len(cells) == 4
+    assert r"<\|im_start\|>" in cells[3]
+    assert r"<\|audio_start\|>" in cells[3]
 
 
 def test_architecture_restrictions_are_concise_and_fully_registry_derived() -> None:

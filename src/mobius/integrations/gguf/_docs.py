@@ -310,28 +310,38 @@ def _tokenizer_evidence_table() -> str:
         for text, token_ids in evidence.representative_encodings
     )
     padding_start, padding_end = evidence.deterministic_padding_range
+    identity = (
+        f"`{evidence.repository}@{evidence.revision}`<br>"
+        f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`<br>"
+        f"{evidence.tensor_count} tensors: "
+        f"{', '.join(f'{name}={count}' for name, count in evidence.tensor_qtypes)}"
+    )
+    source = (
+        f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>"
+        f"`{evidence.source_config_asset[0]}` {evidence.source_config_asset[1]:,} B "
+        f"`{evidence.source_config_asset[2]}`<br>{assets}"
+    )
+    proof = (
+        f"GGUF metadata `{evidence.tokenizer_metadata_sha256}`<br>"
+        f"{evidence.token_count:,} ordered tokens "
+        f"`{evidence.ordered_vocabulary_sha256}`<br>"
+        f"{evidence.merge_count:,} ordered merges "
+        f"`{evidence.ordered_merges_sha256}`<br>"
+        f"official source IDs `0..{evidence.source_token_count - 1}`; deterministic "
+        f"unused `[PAD{{id}}]` IDs `{padding_start}..{padding_end}`; "
+        f"embedding rows={evidence.embedding_vocabulary_size:,}<br>"
+        f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
+    )
     return "\n".join(
         (
             "| Evidence ID | GGUF identity | Official source | Exact tokenizer proof |",
             "|---|---|---|---|",
-            (
-                f"| `{evidence.evidence_id}` | `{evidence.repository}@{evidence.revision}`<br>"
-                f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`<br>"
-                f"{evidence.tensor_count} tensors: "
-                f"{', '.join(f'{name}={count}' for name, count in evidence.tensor_qtypes)} | "
-                f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>"
-                f"`{evidence.source_config_asset[0]}` {evidence.source_config_asset[1]:,} B "
-                f"`{evidence.source_config_asset[2]}`<br>{assets} | "
-                f"GGUF metadata `{evidence.tokenizer_metadata_sha256}`<br>"
-                f"{evidence.token_count:,} ordered tokens "
-                f"`{evidence.ordered_vocabulary_sha256}`<br>"
-                f"{evidence.merge_count:,} ordered merges "
-                f"`{evidence.ordered_merges_sha256}`<br>"
-                f"official source IDs `0..{evidence.source_token_count - 1}`; deterministic "
-                f"unused `[PAD{{id}}]` IDs `{padding_start}..{padding_end}`; "
-                f"embedding rows={evidence.embedding_vocabulary_size:,}<br>"
-                f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings} |"
-            ),
+            "| "
+            + " | ".join(
+                _cell(value)
+                for value in (f"`{evidence.evidence_id}`", identity, source, proof)
+            )
+            + " |",
         )
     )
 
