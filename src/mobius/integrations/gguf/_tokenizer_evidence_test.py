@@ -155,6 +155,11 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     assert kanana2.token_count == kanana2.source_token_count == 128_256
     assert kanana2.embedding_vocabulary_size == 128_256
     assert kanana2.representative_special_encodings[0][1][0] == 128_000
+    assert kanana2.llamacpp_oracle == (
+        "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+        444,
+        "ca7875445f21a03eb9a480c6aa96251bf4a8951a6e284dc480ef32eaedb796f5",
+    )
 
 
 def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:
@@ -204,6 +209,25 @@ def test_gpt4o_oracle_fixture_is_bound_to_talkie_evidence() -> None:
     assert len(oracle["fixed_inputs"]) == 20
     assert oracle["case_count"] == (
         len(oracle["modes"]) * (len(oracle["fixed_inputs"]) + oracle["random_count"])
+    )
+
+
+def test_gpt4o_kanana2_oracle_fixture_is_bound_to_evidence() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_gpt4o_kanana2_oracle.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    evidence = tokenizer_evidence("kanana2-1.3b-instruct-q8-tokenizer")
+    assert evidence is not None
+    assert evidence.llamacpp_oracle == (
+        oracle["llamacpp_commit"],
+        oracle["case_count"],
+        oracle["ordered_results_sha256"],
+    )
+    assert evidence.lfs_sha256 == oracle["artifact_sha256"]
+    assert oracle["seed"] == 648
+    assert oracle["random_count"] == 128
+    assert oracle["fixed_count"] == 20
+    assert oracle["case_count"] == len(oracle["modes"]) * (
+        oracle["fixed_count"] + oracle["random_count"]
     )
 
 

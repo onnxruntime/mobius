@@ -474,6 +474,11 @@ _KANANA2_13B_Q8_TOKENIZER = GGUFTokenizerEvidence(
             (128_000, 17_263, 11, 1_666, 0, 220, 9_654, 2_995),
         ),
     ),
+    llamacpp_oracle=(
+        "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+        444,
+        "ca7875445f21a03eb9a480c6aa96251bf4a8951a6e284dc480ef32eaedb796f5",
+    ),
 )
 
 _TALKIE_13B_Q4_TOKENIZER = GGUFTokenizerEvidence(
