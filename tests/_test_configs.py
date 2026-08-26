@@ -927,6 +927,32 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("minicpm", {}, True),
     ("minicpm3", {}, True),
+    (
+        "minicpm_gguf",
+        {
+            "embedding_multiplier": 12.0,
+            "residual_multiplier": 1.4 / TINY_LAYERS**0.5,
+            "logits_scaling": TINY_HIDDEN / 256.0,
+        },
+        True,
+    ),
+    (
+        "minicpm3_gguf",
+        {
+            "head_dim": TINY_HEAD_DIM,
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": TINY_HEAD_DIM,
+            "kv_lora_rank": TINY_HEAD_DIM,
+            "qk_nope_head_dim": TINY_HEAD_DIM // 2,
+            "qk_rope_head_dim": TINY_HEAD_DIM // 2,
+            "v_head_dim": TINY_HEAD_DIM // 2,
+            "embedding_multiplier": 12.0,
+            "residual_multiplier": 1.4 / TINY_LAYERS**0.5,
+            "logits_scaling": TINY_HIDDEN / 256.0,
+            "rope_interleave": False,
+        },
+        True,
+    ),
     ("openelm", {}, True),
     (
         "persimmon",
