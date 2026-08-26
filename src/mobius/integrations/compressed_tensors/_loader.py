@@ -126,15 +126,14 @@ class CompressedTensorsConfig:
 
     @classmethod
     def from_hf_config(cls, hf_config: object) -> CompressedTensorsConfig | None:
-        value = getattr(hf_config, "quantization_config", None)
-        if hasattr(value, "to_dict"):
-            value = value.to_dict()
+        value = _normalize_config_value(getattr(hf_config, "quantization_config", None))
         if not is_compressed_tensors_config(value):
             return None
         return cls.parse(value)
 
     @classmethod
     def parse(cls, value: object) -> CompressedTensorsConfig:
+        value = _normalize_config_value(value)
         if not isinstance(value, Mapping):
             raise CompressedTensorsError("quantization_config must be an object.")
         if str(value.get("quant_method", "")).lower() != "compressed-tensors":
@@ -211,15 +210,12 @@ class CompressedTensorsConfig:
         for group in self.groups:
             for target in group.targets:
                 target_groups[target] = group
-        matches = [
-            (target, group)
-            for target, group in target_groups.items()
-            if _match_name(module_name, target)
-        ]
-        if not matches:
-            return None
-        matches.sort(key=lambda item: (item[0].startswith("re:"), item[0]))
-        return matches[0][1]
+        if exact_group := target_groups.get(module_name):
+            return exact_group
+        for target, group in target_groups.items():
+            if target.startswith("re:") and _match_name(module_name, target):
+                return group
+        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,11 +232,29 @@ class CompressedTensorsLoadReport:
 
 def is_compressed_tensors_config(value: object) -> bool:
     """Return whether *value* declares the compressed-tensors method."""
-    if hasattr(value, "to_dict"):
-        value = value.to_dict()
+    value = _normalize_config_value(value)
     return isinstance(value, Mapping) and (
         str(value.get("quant_method", "")).lower() == "compressed-tensors"
     )
+
+
+def _normalize_config_value(value: object) -> object:
+    """Convert HuggingFace mapping, attribute, and ``to_dict`` configs to plain data."""
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        value = to_dict()
+    if isinstance(value, Mapping):
+        return {key: _normalize_config_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_config_value(item) for item in value]
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, Mapping):
+        return {
+            key: _normalize_config_value(item)
+            for key, item in attributes.items()
+            if not key.startswith("_")
+        }
+    return value
 
 
 def _parse_group(name: str, value: object) -> CompressionGroup:
@@ -330,15 +344,24 @@ def _match_name(name: str, target: str) -> bool:
     return name == target
 
 
-def _load_tensor(
-    key_index: Mapping[str, tuple[str, list[int], str]], key: str
-) -> torch.Tensor:
-    try:
-        path = key_index[key][0]
-    except KeyError as error:
-        raise CompressedTensorsError(f"Missing required checkpoint tensor {key!r}.") from error
-    with safe_open(path, framework="pt", device="cpu") as handle:
-        return handle.get_tensor(key)
+def _load_tensors(
+    key_index: Mapping[str, tuple[str, list[int], str]], keys: tuple[str, ...]
+) -> dict[str, torch.Tensor]:
+    keys_by_path: dict[str, list[str]] = {}
+    for key in keys:
+        try:
+            path = key_index[key][0]
+        except KeyError as error:
+            raise CompressedTensorsError(
+                f"Missing required checkpoint tensor {key!r}."
+            ) from error
+        keys_by_path.setdefault(path, []).append(key)
+
+    tensors: dict[str, torch.Tensor] = {}
+    for path, path_keys in keys_by_path.items():
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            tensors.update((key, handle.get_tensor(key)) for key in path_keys)
+    return tensors
 
 
 def _dequantize_fp8(
@@ -348,8 +371,9 @@ def _dequantize_fp8(
 ) -> torch.Tensor:
     weight_key = f"{module_name}.weight"
     scale_key = f"{module_name}.weight_scale"
-    weight = _load_tensor(key_index, weight_key)
-    scale = _load_tensor(key_index, scale_key)
+    tensors = _load_tensors(key_index, (weight_key, scale_key))
+    weight = tensors[weight_key]
+    scale = tensors[scale_key]
     return (weight.float() * scale.float()).to(target_dtype)
 
 
@@ -358,9 +382,13 @@ def _dequantize_nvfp4(
     module_name: str,
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
-    packed = _load_tensor(key_index, f"{module_name}.weight_packed")
-    scale = _load_tensor(key_index, f"{module_name}.weight_scale")
-    global_scale = _load_tensor(key_index, f"{module_name}.weight_global_scale")
+    packed_key = f"{module_name}.weight_packed"
+    scale_key = f"{module_name}.weight_scale"
+    global_scale_key = f"{module_name}.weight_global_scale"
+    tensors = _load_tensors(key_index, (packed_key, scale_key, global_scale_key))
+    packed = tensors[packed_key]
+    scale = tensors[scale_key]
+    global_scale = tensors[global_scale_key]
     if packed.dtype != torch.uint8 or packed.ndim != 2:
         raise CompressedTensorsError(
             f"{module_name}.weight_packed must be uint8 [N, K/2], got "
@@ -646,7 +674,7 @@ def stream_compressed_tensors_to_package(
                 output_name=qualified_name,
             ) -> tensor_adapters.TorchTensor:
                 if selected_group is None:
-                    tensor = _load_tensor(key_index, source)
+                    tensor = _load_tensors(key_index, (source,))[source]
                     if tensor.dtype != output_dtype:
                         tensor = tensor.to(output_dtype)
                 elif selected_group.format == "float-quantized":

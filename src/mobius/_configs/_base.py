@@ -1994,12 +1994,9 @@ class KimiK3Config(CausalLMConfig):
         parent = parent_config or config
         text = _as_attribute_config(getattr(config, "text_config", None)) or config
         quantization_config = getattr(text, "quantization_config", None)
-        if hasattr(quantization_config, "to_dict"):
-            quantization_config = quantization_config.to_dict()
-        if (
-            isinstance(quantization_config, dict)
-            and quantization_config.get("quant_method") == "compressed-tensors"
-        ):
+        from mobius.integrations.compressed_tensors import is_compressed_tensors_config
+
+        if is_compressed_tensors_config(quantization_config):
             raise NotImplementedError(
                 "Kimi-K3 compressed-tensors checkpoints use selective MXFP4 routed "
                 "experts, which are not representable by the generic quantized-linear "
