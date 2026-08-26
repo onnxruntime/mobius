@@ -639,16 +639,16 @@ def _download_tokenizer_assets(
                     local_files_only=True,
                 )
             )
+            try:
+                cache_root = Path(HF_HUB_CACHE).resolve(strict=True)
+                path.parent.resolve(strict=True).relative_to(cache_root)
+                resolved_path = path.resolve(strict=True)
+                resolved_path.relative_to(cache_root)
+            except ValueError as error:
+                raise ValueError(
+                    f"Cached tokenizer asset is outside the trusted Hub cache: {path}"
+                ) from error
             if path.is_symlink():
-                try:
-                    cache_root = Path(HF_HUB_CACHE).resolve(strict=True)
-                    path.parent.resolve(strict=True).relative_to(cache_root)
-                    resolved_path = path.resolve(strict=True)
-                    resolved_path.relative_to(cache_root)
-                except ValueError as error:
-                    raise ValueError(
-                        f"Cached tokenizer asset is an untrusted symlink: {path}"
-                    ) from error
                 path = resolved_path
         else:
             url = hf_hub_url(source.repository, asset.filename, revision=source.revision)
@@ -799,15 +799,13 @@ def _validate_pinned_tokenizer(
         tokenizer.id_to_token(index)
         for index in range(tokenizer.get_vocab_size(with_added_tokens=True))
     ]
-    if (
-        actual_tokens == expected_tokens[: len(actual_tokens)]
-        and len(actual_tokens) < len(expected_tokens)
+    if actual_tokens == expected_tokens[: len(actual_tokens)] and len(actual_tokens) < len(
+        expected_tokens
     ):
         suffix = expected_tokens[len(actual_tokens) :]
         added_tokens = tokenizer_json.get("added_tokens")
         if isinstance(added_tokens, list) and all(
-            token == f"[PAD{index}]"
-            for index, token in enumerate(suffix, len(actual_tokens))
+            token == f"[PAD{index}]" for index, token in enumerate(suffix, len(actual_tokens))
         ):
             token_types = metadata.get("tokenizer.ggml.token_type")
             if token_types is not None and any(
@@ -859,10 +857,14 @@ def _validate_pinned_tokenizer(
             "Pinned tokenizer merge order differs from GGUF tokenizer.ggml.merges"
         )
     pre = metadata.get("tokenizer.ggml.pre")
-    if pre == "smollm" and {
-        name: tokenizer_json.get(name)
-        for name in ("normalizer", "pre_tokenizer", "post_processor", "decoder")
-    } != _SMOLLM_PIPELINE:
+    if (
+        pre == "smollm"
+        and {
+            name: tokenizer_json.get(name)
+            for name in ("normalizer", "pre_tokenizer", "post_processor", "decoder")
+        }
+        != _SMOLLM_PIPELINE
+    ):
         raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
     token_types = metadata.get("tokenizer.ggml.token_type")
     if token_types is not None:
@@ -884,7 +886,9 @@ def _validate_pinned_tokenizer(
             or source_added_tokens[index].get("special") is not False
             for index in expected_non_special_added_ids
         ):
-            raise ValueError("Pinned tokenizer user-defined/unused-token inventory differs from GGUF")
+            raise ValueError(
+                "Pinned tokenizer user-defined/unused-token inventory differs from GGUF"
+            )
         source_special_ids = {
             token["id"]
             for token in source_added_tokens.values()

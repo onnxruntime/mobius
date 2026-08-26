@@ -174,7 +174,7 @@ def _is_hex(value: str) -> bool:
 
 _SMOLLM_F16_ROUTE = (
     '{"architecture":"llama","config_sha256":'
-    '"b999a219ddf6046f1b6e5c082dab2d00b7ba1682169914430b1a3672fc735498",'
+    '"d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886",'
     '"execution_provider":"cpu","model_type":"llama","module_type":"llama",'
     '"preserve_quantization":false,"registry_import":{"config_key_map":null,'
     '"config_postprocessor":null,"llama_qk_permute":true,"offset_norm":false,'
@@ -296,7 +296,7 @@ _QWEN25_Q8_ORT_GENAI = GGUFRuntimeEvidence(
     ),
     tensor_count=291,
     tensor_qtypes=(("F32", 121), ("Q8_0", 170)),
-    import_route='{"architecture":"qwen2","config_sha256":"4002821420e74a522abaf921e064f23217eac71284d71d6d288171cf7802d068","execution_provider":"cpu","model_type":"qwen2","module_type":"qwen2","preserve_quantization":true,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":[],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"text-generation"},"tensor_map_recipe":["llama"]}',
+    import_route='{"architecture":"qwen2","config_sha256":"f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500","execution_provider":"cpu","model_type":"qwen2","module_type":"qwen2","preserve_quantization":true,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":[],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"text-generation"},"tensor_map_recipe":["llama"]}',
     graph_files=("model.onnx", "model.onnx.data"),
     graph_sha256="b0d1814ea69dddd405e30541e9009ba6fb73930f98538921d5c2eaa4a14f5d2c",
     runtime_package_files=(
@@ -354,7 +354,7 @@ _LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
     ),
     tensor_count=148,
     tensor_qtypes=(("F16", 93), ("F32", 55)),
-    import_route='{"architecture":"lfm2","config_sha256":"69e63a13b046ca5658e4fbf1fac41b76e021ef768b16428cd2baa7c990bef21a","execution_provider":"cpu","model_type":"lfm2","module_type":"lfm2","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":["attention.head_count_kv","attention.layer_norm_rms_epsilon","shortconv.l_cache"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"hybrid-text-generation"},"tensor_map_recipe":["lfm2"]}',
+    import_route='{"architecture":"lfm2","config_sha256":"c961bba579ea33a2472a7c5d3f469c76f1f8c7aae8440a7eaa86bc6e878a42f4","execution_provider":"cpu","model_type":"lfm2","module_type":"lfm2","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":["attention.head_count_kv","attention.layer_norm_rms_epsilon","shortconv.l_cache"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"hybrid-text-generation"},"tensor_map_recipe":["lfm2"]}',
     graph_files=("model.onnx", "model.onnx.data"),
     graph_sha256="2a15694cd5ff9f5c9f798feeca91cc41174842065ada80a18b288478725b3342",
     runtime_package_files=(

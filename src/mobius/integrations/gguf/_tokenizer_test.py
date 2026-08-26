@@ -534,9 +534,7 @@ def test_non_smollm_pipeline_is_bound_by_exact_asset_hashes() -> None:
     tokenizer["pre_tokenizer"]["pretokenizers"].reverse()
     payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
 
-    tokenizer_sha256, materialized = _tokenizer._validate_pinned_tokenizer(
-        metadata, payloads
-    )
+    tokenizer_sha256, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
     assert hashlib.sha256(materialized).hexdigest() == tokenizer_sha256
 
@@ -728,11 +726,7 @@ def test_local_hub_cache_symlink_is_resolved_inside_cache(
     blob.parent.mkdir(parents=True)
     blob.write_bytes(payload)
     snapshot = (
-        cache
-        / "models--owner--tokenizer"
-        / "snapshots"
-        / source.revision
-        / "tokenizer.json"
+        cache / "models--owner--tokenizer" / "snapshots" / source.revision / "tokenizer.json"
     )
     snapshot.parent.mkdir(parents=True)
     snapshot.symlink_to(blob)
@@ -762,16 +756,41 @@ def test_local_hub_cache_symlink_escape_rejects(
     escaped = tmp_path / "escaped.json"
     escaped.write_bytes(payload)
     snapshot = (
-        cache
-        / "models--owner--tokenizer"
-        / "snapshots"
-        / source.revision
-        / "tokenizer.json"
+        cache / "models--owner--tokenizer" / "snapshots" / source.revision / "tokenizer.json"
     )
     snapshot.parent.mkdir(parents=True)
     snapshot.symlink_to(escaped)
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache))
     monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(snapshot))
 
-    with pytest.raises(ValueError, match="untrusted symlink"):
+    with pytest.raises(ValueError, match="outside the trusted Hub cache"):
+        _tokenizer._download_tokenizer_assets(source, local_files_only=True)
+
+
+def test_local_hub_cache_parent_symlink_escape_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"{}"
+    source = GGUFTokenizerSource(
+        "owner/tokenizer",
+        "a" * 40,
+        (
+            GGUFTokenizerAsset(
+                "tokenizer.json", len(payload), hashlib.sha256(payload).hexdigest()
+            ),
+        ),
+        "b" * 64,
+    )
+    cache = tmp_path / "hub"
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    (escaped / "tokenizer.json").write_bytes(payload)
+    snapshots = cache / "models--owner--tokenizer" / "snapshots"
+    snapshots.parent.mkdir(parents=True)
+    snapshots.symlink_to(escaped, target_is_directory=True)
+    path = snapshots / "tokenizer.json"
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_CACHE", str(cache))
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **_kwargs: str(path))
+
+    with pytest.raises(ValueError, match="outside the trusted Hub cache"):
         _tokenizer._download_tokenizer_assets(source, local_files_only=True)

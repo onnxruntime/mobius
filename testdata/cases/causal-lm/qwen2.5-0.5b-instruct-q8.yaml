@@ -15,7 +15,7 @@ gguf:
     F32: 121
     Q8_0: 170
   execution_provider: "cpu"
-  config_sha256: "4002821420e74a522abaf921e064f23217eac71284d71d6d288171cf7802d068"
+  config_sha256: "f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500"
   preserve_quantization: true
   keep_quantized: true
   tokenizer:

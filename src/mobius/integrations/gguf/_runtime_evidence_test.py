@@ -123,6 +123,19 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             tokenizer_repository="attacker/replacement",
             tokenizer_revision=record.tokenizer_revision,
         )
+    with pytest.raises(ValueError, match="No unique GGUF runtime evidence"):
+        matching_runtime_evidence(
+            (record.evidence_id,),
+            architecture="llama",
+            runtime="onnx-genai",
+            source_path=source,
+            gguf_model=_model(),
+            built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
+            import_route='{"route_schema":2}',
+            runtime_version="1.0.0",
+            tokenizer_repository=record.tokenizer_repository,
+            tokenizer_revision=record.tokenizer_revision,
+        )
 
 
 def test_matching_evidence_rejects_source_replaced_after_build(tmp_path, monkeypatch) -> None:
