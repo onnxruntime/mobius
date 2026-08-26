@@ -1,0 +1,22 @@
+{
+  "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+  "artifact_sha256": "4cddb0ecb0ee45fcd1da37c007a608662568477a76ce5e12c14f7b34f002709e",
+  "artifact_architecture": "modern-bert",
+  "declared_pre_identifier": null,
+  "effective_fallback_pre_identifier": "gemma4",
+  "requested_identifier": "granite-embed-multi-311m",
+  "seed": 650,
+  "random_count": 128,
+  "random_alphabet_sha256": "2397123199954cab1c1ebc19a8c070ea1ea61762fcbbd7159e2a85b058c78bf3",
+  "modes": [
+    ["no-add", "no-parse-special"],
+    ["no-add", "parse-special"],
+    ["add-special", "parse-special"]
+  ],
+  "fixed_count": 32,
+  "case_count": 480,
+  "official_copy_mismatch_count": 27,
+  "fallback_native_tokenize_mismatch_count": 0,
+  "fallback_native_detokenize_mismatch_count": 0,
+  "ordered_results_sha256": "e3e9d650377782d75d6ccd652f3e96f12b5a8f8927fc5ab4fb4d1e1c30118c4a"
+}

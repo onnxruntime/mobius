@@ -26,6 +26,7 @@ TokenizerAuditStatus = Literal[
 TokenizerBlocker = Literal[
     "pinned-artifact-source-parity-pending",
     "pinned-candidate-identifier-mismatch",
+    "pinned-candidate-effective-pre-mismatch",
     "pinned-candidate-incomplete-shard",
     "pinned-candidate-source-merge-mismatch",
     "pinned-candidate-source-token-mismatch",
@@ -53,6 +54,9 @@ class GGUFTokenizerRouteAudit:
     tokenizer_assets: tuple[tuple[str, int, str], ...]
     blocker_category: TokenizerBlocker | None
     candidate_disposition: str | None
+    artifact_architecture: str | None = None
+    declared_pre_identifier: str | None = None
+    effective_pre_identifier: str | None = None
 
 
 _PINNED_CANDIDATE_DISPOSITIONS = {
@@ -137,6 +141,55 @@ _PINNED_CANDIDATE_DISPOSITIONS = {
             "U+0000; deterministic padding starts only at id 60516"
         ),
     ),
+    "granite-embed-multi-311m": GGUFTokenizerRouteAudit(
+        identifier="granite-embed-multi-311m",
+        semantic_group="gemma4",
+        pre_type="GEMMA4",
+        default_policy="deferred",
+        current_status="deferred-pinned-artifact-evidence",
+        evidence_id=None,
+        artifact_repository=(
+            "SandLogicTechnologies/granite-embedding-311m-multilingual-r2-GGUF"
+        ),
+        artifact_revision="f142535239859391fbef67aaf886d96500ad9fa8",
+        artifact_filename="granite-embedding-311M-multilingual-r2_IQ4_XS.gguf",
+        artifact_size=240_602_528,
+        artifact_sha256="4cddb0ecb0ee45fcd1da37c007a608662568477a76ce5e12c14f7b34f002709e",
+        tokenizer_repository="ibm-granite/granite-embedding-311m-multilingual-r2",
+        tokenizer_revision="44399559930365213510b1ee2eb15ded83374f0e",
+        tokenizer_assets=(
+            (
+                "config.json",
+                1_191,
+                "e1e3fc842a8e0537e25d6e4c93879698b92ae96722e8c162bef334b57978a3b0",
+            ),
+            (
+                "special_tokens_map.json",
+                694,
+                "cb9e60dcf4d8d314315cb3e761fe4c2e664fda8dbf66d7815372b2639e381182",
+            ),
+            (
+                "tokenizer.json",
+                33_384_821,
+                "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f",
+            ),
+            (
+                "tokenizer_config.json",
+                1_155_500,
+                "7947bdf0378520e69ca412b8c4dacd1cffa8aef099f851fdd5c65aa27c6b36a0",
+            ),
+        ),
+        blocker_category="pinned-candidate-effective-pre-mismatch",
+        candidate_disposition=(
+            "complete modern-bert artifact rejected for this exact identifier: it declares no "
+            "tokenizer.ggml.pre, so pinned llama.cpp uses fallback gemma4 rather than "
+            "granite-embed-multi-311m. Its artifact-scoped fallback reconstruction matches 480 "
+            "pinned tokenize/detokenize cases, but cannot prove the absent identifier"
+        ),
+        artifact_architecture="modern-bert",
+        declared_pre_identifier=None,
+        effective_pre_identifier="gemma4",
+    ),
     "llama4": GGUFTokenizerRouteAudit(
         identifier="llama4",
         semantic_group="gpt-4o",
@@ -191,6 +244,11 @@ def _evidenced_route(
         ),
         blocker_category=None,
         candidate_disposition=None,
+        artifact_architecture=evidence.architecture,
+        declared_pre_identifier=(
+            None if evidence.uses_model_pre_fallback else evidence.pre_identifier
+        ),
+        effective_pre_identifier=evidence.pre_identifier,
     )
 
 
