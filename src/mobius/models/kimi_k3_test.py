@@ -121,10 +121,6 @@ def test_config_rejects_empty_convolution_history() -> None:
         KimiK3Config.from_transformers(parent)
 
 
-def test_model_declares_config_class() -> None:
-    assert KimiK3CausalLMModel.config_class is KimiK3Config
-
-
 def test_model_has_attention_residual_latent_moe_and_untied_head() -> None:
     model = KimiK3CausalLMModel(_config())
 

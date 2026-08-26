@@ -7,16 +7,10 @@ from __future__ import annotations
 
 import torch
 
-from mobius._configs import (
-    ArchitectureConfig,
-    CodeShellConfig,
-    Jais2Config,
-    XverseConfig,
-)
+from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import split_fused_qkv
 from mobius.components import FCMLP
 from mobius.models.base import (
-    CausalLMModel,
     LayerNormCausalLMModel,
     linear_class_for_config,
 )
@@ -56,16 +50,8 @@ class LegacyLayerNormCausalLMModel(LayerNormCausalLMModel):
         return super().preprocess_weights(state_dict)
 
 
-class Jais2CausalLMModel(LegacyLayerNormCausalLMModel):
-    """Jais2 decoder with its published bias and normalization configuration."""
-
-    config_class = Jais2Config
-
-
 class CodeShellCausalLMModel(LegacyLayerNormCausalLMModel):
     """CodeShell decoder accepting both published HF and canonical GGUF names."""
-
-    config_class = CodeShellConfig
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
@@ -95,9 +81,3 @@ class CodeShellCausalLMModel(LegacyLayerNormCausalLMModel):
             # Tied CodeShell graphs have one initializer owned by embed_tokens.
             normalized.pop("lm_head.weight", None)
         return normalized
-
-
-class XverseCausalLMModel(CausalLMModel):
-    """Xverse decoder with source-compatible RoPE configuration defaults."""
-
-    config_class = XverseConfig
