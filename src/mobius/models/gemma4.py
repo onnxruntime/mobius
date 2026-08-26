@@ -146,13 +146,8 @@ def _text_quantization_config(config: Gemma4Config):
     return quantization_config
 
 
-def _text_linear_class(config: Gemma4Config) -> type | None:
-    """Return a QuantizedLinear factory for text projections, or ``None``.
-
-    ``None`` means "use a plain float :class:`Linear`". Only the text decoder
-    projections (attention Q/K/V/O + MLP + LM head) use this; vision and audio
-    linears are always float.
-    """
+def _quantized_linear_class(config: Gemma4Config) -> type | None:
+    """Return the checkpoint's QuantizedLinear factory, or ``None`` when off."""
     quantization_config = _text_quantization_config(config)
     if quantization_config is None:
         return None
@@ -167,6 +162,43 @@ def _text_linear_class(config: Gemma4Config) -> type | None:
         has_zero_point=not quantization_config.sym,
         zero_point_dtype=zero_point_dtype,
     )
+
+
+def _text_linear_class(config: Gemma4Config) -> type | None:
+    """Return a QuantizedLinear factory for text projections, or ``None``."""
+    return _quantized_linear_class(config)
+
+
+def _vision_linear_classes(config: Gemma4Config) -> tuple[type, type]:
+    """Return plain and activation-clipped Linear classes for the vision graph."""
+    quantization_config = _text_quantization_config(config)
+    quantized_linear = _quantized_linear_class(config)
+    if (
+        quantization_config is None
+        or not quantization_config.quantize_vision
+        or quantized_linear is None
+    ):
+        return Linear, ClippableLinear
+
+    class QuantizedClippableLinear(quantized_linear):
+        """MatMulNBits projection with Gemma4's learned activation clipping."""
+
+        def __init__(self, in_features: int, out_features: int, bias: bool = False):
+            super().__init__(in_features, out_features, bias=bias)
+            self.input_min = nn.Parameter([])
+            self.input_max = nn.Parameter([])
+            self.output_min = nn.Parameter([])
+            self.output_max = nn.Parameter([])
+
+        def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+            x = op.Clip(x, self.input_min, self.input_max)
+            return op.Clip(
+                super().forward(op, x),
+                self.output_min,
+                self.output_max,
+            )
+
+    return quantized_linear, QuantizedClippableLinear
 
 
 def _text_embeddings_quantized(config: Gemma4Config) -> bool:
@@ -386,11 +418,12 @@ class Gemma4VisionSelfAttention(nn.Module):
         rope_theta: float = 100.0,
         max_position: int = 128,
         use_clipped_linears: bool = True,
+        linear_class: type | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        linear_class = ClippableLinear if use_clipped_linears else Linear
+        linear_class = linear_class or (ClippableLinear if use_clipped_linears else Linear)
         self.q_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
         self.k_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
         self.v_proj = linear_class(hidden_size, num_heads * self.head_dim, bias=False)
@@ -554,8 +587,10 @@ class Gemma4VisionEncoderLayer(nn.Module):
         rope_theta: float = 100.0,
         max_position: int = 128,
         use_clipped_linears: bool = True,
+        linear_class: type | None = None,
     ):
         super().__init__()
+        linear_class = linear_class or (ClippableLinear if use_clipped_linears else Linear)
         self.self_attn = Gemma4VisionSelfAttention(
             hidden_size,
             num_heads,
@@ -563,6 +598,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
             rope_theta=rope_theta,
             max_position=max_position,
             use_clipped_linears=use_clipped_linears,
+            linear_class=linear_class,
         )
         self.input_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=norm_eps)
@@ -571,7 +607,6 @@ class Gemma4VisionEncoderLayer(nn.Module):
         # Gated MLP: activation(gate_proj) * up_proj -> down_proj (SwiGLU/GEGLU style)
         # HF uses gelu_pytorch_tanh (GELU with tanh approximation); read from config.
         # Use ClippableLinear only when the checkpoint has clipping weights.
-        linear_class = ClippableLinear if use_clipped_linears else Linear
         self.mlp = MLP(
             ArchitectureConfig(
                 hidden_size=hidden_size,
@@ -719,9 +754,15 @@ class _Gemma4VisionPatchEmbedder(nn.Module):
     - ``position_embedding_table`` (Parameter ``[2, pos_emb_size, hidden_size]``)
     """
 
-    def __init__(self, patch_size: int, hidden_size: int, position_embedding_size: int):
+    def __init__(
+        self,
+        patch_size: int,
+        hidden_size: int,
+        position_embedding_size: int,
+        linear_class: type = Linear,
+    ):
         super().__init__()
-        self.input_proj = Linear(3 * patch_size * patch_size, hidden_size, bias=False)
+        self.input_proj = linear_class(3 * patch_size * patch_size, hidden_size, bias=False)
         # Position embedding table: [2, pos_emb_size, hidden] — x and y tables
         self.position_embedding_table = nn.Parameter([2, position_embedding_size, hidden_size])
         self.position_embedding_size = position_embedding_size
@@ -782,10 +823,12 @@ class _Gemma4VisionEncoderCore(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         vc = config.vision  # VisionConfig for the SigLIP encoder
+        linear_class, clippable_linear_class = _vision_linear_classes(config)
         self.patch_embedder = _Gemma4VisionPatchEmbedder(
             patch_size=vc.patch_size or 16,
             hidden_size=vc.hidden_size,
             position_embedding_size=vc.position_embedding_size or 128,
+            linear_class=linear_class,
         )
         self.layers = nn.ModuleList(
             [
@@ -798,6 +841,9 @@ class _Gemma4VisionEncoderCore(nn.Module):
                     rope_theta=vc.rope_theta or 100.0,
                     max_position=vc.position_embedding_size or 128,
                     use_clipped_linears=vc.use_clipped_linears,
+                    linear_class=(
+                        clippable_linear_class if vc.use_clipped_linears else linear_class
+                    ),
                 )
                 for _ in range(vc.num_hidden_layers)
             ]
@@ -2611,7 +2657,8 @@ class _Gemma4VisionEncoderModel(nn.Module):
         # Reduces N patches to N/9 before projection.
         self.pooler = Gemma4VisionPooler(vc.hidden_size, vc.pooling_kernel_size or 3)
         self.projector_norm = ScaleFreeRMSNorm(vc.hidden_size, eps=vc.norm_eps)
-        self.projector = Linear(vc.hidden_size, config.hidden_size, bias=False)
+        linear_class, _ = _vision_linear_classes(config)
+        self.projector = linear_class(vc.hidden_size, config.hidden_size, bias=False)
 
     def forward(
         self,

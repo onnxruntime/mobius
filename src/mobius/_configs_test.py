@@ -1036,8 +1036,8 @@ class TestQuantizationConfig:
         assert qc is not None
         assert qc.sym is False
 
-    def test_from_transformers_olive_embeds_and_lm_head(self):
-        """Olive RTN exports flag quantized embeddings and LM head."""
+    def test_from_transformers_olive_component_flags(self):
+        """Olive RTN exports flags for quantized tables and vision projections."""
         hf = type(
             "HFConfig",
             (),
@@ -1048,6 +1048,7 @@ class TestQuantizationConfig:
                     "group_size": 32,
                     "embeds": True,
                     "lm_head": True,
+                    "quantize_vision": True,
                 }
             },
         )()
@@ -1055,11 +1056,13 @@ class TestQuantizationConfig:
         assert qc is not None
         assert qc.quantize_embeddings is True
         assert qc.quantize_lm_head is True
+        assert qc.quantize_vision is True
 
-    def test_quantize_embed_lm_head_default_false(self):
+    def test_quantize_component_flags_default_false(self):
         qc = QuantizationConfig()
         assert qc.quantize_embeddings is False
         assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is False
 
     def test_architecture_config_has_quantization_field(self):
         config = ArchitectureConfig()
