@@ -187,14 +187,10 @@ def stream_qwen4_exp_safetensors_to_model(
             )
         source_path, source_shape, _dtype = located
         _validate_shape(source_name, source_shape, [int(d) for d in initializer.shape])
-        initializer.const_value = _lazy_source_tensor(
-            initializer, source_path, source_name
-        )
+        initializer.const_value = _lazy_source_tensor(initializer, source_path, source_name)
 
     unassigned = [
-        name
-        for name in parameter_names
-        if model.graph.initializers[name].const_value is None
+        name for name in parameter_names if model.graph.initializers[name].const_value is None
     ]
     if unassigned:
         raise ValueError(f"Qwen4-Exp streaming left initializers unassigned: {unassigned[:5]}")
