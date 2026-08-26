@@ -342,6 +342,18 @@ def _tokenizer_evidence_table() -> str:
             f"`{evidence.source_config_asset[0]}` {evidence.source_config_asset[1]:,} B "
             f"`{evidence.source_config_asset[2]}`<br>{assets}"
         )
+        reconstruction = (
+            f"<br>GGUF-native GPT4O reconstruction; {evidence.source_disposition}"
+            if evidence.reconstruct_gpt4o_from_gguf
+            else ""
+        )
+        oracle = (
+            f"<br>llama.cpp oracle `{evidence.llamacpp_oracle[0]}`: "
+            f"{evidence.llamacpp_oracle[1]} cases "
+            f"`{evidence.llamacpp_oracle[2]}`"
+            if evidence.llamacpp_oracle is not None
+            else ""
+        )
         proof = (
             f"validated identifiers `{list(evidence.validated_identifiers)}`<br>"
             f"metadata `{evidence.tokenizer_metadata_sha256}`<br>"
@@ -352,6 +364,7 @@ def _tokenizer_evidence_table() -> str:
             f"rows={evidence.embedding_vocabulary_size:,}<br>"
             f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
             f"{'<br>' + special_encodings if special_encodings else ''}"
+            f"{reconstruction}{oracle}"
         )
         rows.append(
             "| "

@@ -96,48 +96,6 @@ _PINNED_CANDIDATE_DISPOSITIONS = {
             "U+0000; deterministic padding starts only at id 60516"
         ),
     ),
-    "talkie": GGUFTokenizerRouteAudit(
-        identifier="talkie",
-        semantic_group="gpt-4o",
-        pre_type="GPT4O",
-        default_policy="deferred",
-        current_status="deferred-pinned-artifact-evidence",
-        evidence_id=None,
-        artifact_repository="PocketAiHub/talkie-1930-13b-it-GGUF",
-        artifact_revision="47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694",
-        artifact_filename="talkie-1930-13b-it-Q4_K_M.gguf",
-        artifact_size=8_571_072_704,
-        artifact_sha256="2d6c6c1d98a1b8ffa38b50916454891a31ad844ee69c686e525976867917d7b2",
-        tokenizer_repository="lewtun/talkie-1930-13b-it-hf",
-        tokenizer_revision="6311dedf518470856a8503f2080bb4b54fcb3323",
-        tokenizer_assets=(
-            (
-                "chat_template.jinja",
-                343,
-                "833a35215bfc10d1d9f27fb857123cc24bfef90f770fbc8d79ce37bf4ef4bc4",
-            ),
-            (
-                "config.json",
-                522,
-                "e7f29da9cf0a69571d6a0521cd912dc5c2f0dd151d0e934b87541f4389a9ee30",
-            ),
-            (
-                "tokenizer.json",
-                8_870_742,
-                "cc3813d9d674cf0e86e4171579ba276879c66c2171d993e5776fc5615756a03b",
-            ),
-            (
-                "tokenizer_config.json",
-                247,
-                "e12d422a980eceaecd6ff388c3843b30dd461307d58ec19585953012d7386fc5",
-            ),
-        ),
-        blocker_category="pinned-candidate-source-merge-mismatch",
-        candidate_disposition=(
-            "transformed GGUF retains 65279 of 156379 official merges; first ordered "
-            "mismatch at index 4 is ('Ġ', 'the') versus ('Ġt', 'he')"
-        ),
-    ),
 }
 
 

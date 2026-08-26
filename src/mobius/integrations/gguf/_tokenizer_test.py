@@ -661,6 +661,45 @@ def test_gpt4o_accepts_exact_pipeline_and_template_bos_insertion() -> None:
     _tokenizer._validate_pinned_tokenizer(metadata, _gpt4o_payloads(metadata))
 
 
+def test_gpt4o_canonicalizes_official_regex_to_pinned_llamacpp_regex() -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _gpt4o_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = (
+        _tokenizer._GPT4O_SOURCE_SPLIT_PATTERN
+    )
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    canonical = json.loads(materialized)
+    assert (
+        canonical["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
+        == _tokenizer._GPT4O_SPLIT_PATTERN
+    )
+    assert canonical["model"]["ignore_merges"] is False
+
+
+def test_gpt4o_native_reconstruction_uses_exact_gguf_merge_order() -> None:
+    metadata = _metadata(pre="talkie")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _gpt4o_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["model"]["merges"] = []
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    with pytest.raises(ValueError, match="merge order differs"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(
+        metadata,
+        payloads,
+        reconstruct_gpt4o_from_gguf=True,
+    )
+    assert json.loads(materialized)["model"]["merges"] == ["h i"]
+
+
 @pytest.mark.parametrize("mismatch", ["regex", "decoder", "bos"])
 def test_gpt4o_rejects_pipeline_or_template_bos_mismatch(mismatch: str) -> None:
     metadata = _metadata(pre="kanana2")

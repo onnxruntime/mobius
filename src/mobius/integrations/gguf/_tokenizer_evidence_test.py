@@ -62,6 +62,7 @@ def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> Non
         ("qwen35", "qwen35"),
         ("roberta-bpe", "bert"),
         ("smollm", "llama"),
+        ("talkie", "talkie"),
     ]
     assert all(record.token_count > 0 for record in records)
     assert all(record.ordered_token_types_sha256 for record in records)
@@ -103,8 +104,8 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     }
     assert statuses == {
         "deferred-compiled-semantics": 45,
-        "deferred-pinned-artifact-evidence": 13,
-        "validated-pinned-source": 29,
+        "deferred-pinned-artifact-evidence": 12,
+        "validated-pinned-source": 30,
     }
     for record in census:
         assert (record.evidence_id is None) == (record.blocker_category is not None)
@@ -131,16 +132,22 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     assert jina_v1.candidate_disposition is not None
     assert "token id 5" in jina_v1.candidate_disposition
 
-    talkie = next(record for record in census if record.identifier == "talkie")
-    assert talkie.blocker_category == "pinned-candidate-source-merge-mismatch"
-    assert talkie.artifact_revision == "47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694"
-    assert talkie.artifact_size == 8_571_072_704
-    assert talkie.artifact_sha256 == (
+    talkie = tokenizer_evidence("talkie-13b-q4-native-tokenizer")
+    assert talkie is not None
+    assert talkie.reconstruct_gpt4o_from_gguf
+    assert talkie.revision == "47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694"
+    assert talkie.size == 8_571_072_704
+    assert talkie.lfs_sha256 == (
         "2d6c6c1d98a1b8ffa38b50916454891a31ad844ee69c686e525976867917d7b2"
     )
     assert talkie.tokenizer_revision == "6311dedf518470856a8503f2080bb4b54fcb3323"
-    assert talkie.candidate_disposition is not None
-    assert "65279 of 156379 official merges" in talkie.candidate_disposition
+    assert talkie.source_disposition is not None
+    assert "65279 of 156379 source merges" in talkie.source_disposition
+    assert talkie.llamacpp_oracle == (
+        "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+        444,
+        "484246b629d6eec375ebac3672e4f4d4fb29646d3b331917ec4d2cfe385c3b6a",
+    )
 
     kanana2 = tokenizer_evidence("kanana2-1.3b-instruct-q8-tokenizer")
     assert kanana2 is not None
@@ -179,6 +186,25 @@ def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:
     assert {proof.source_sha256 for proof in proofs.values()} == {
         TOKENIZER_DISPATCH_SOURCE_SHA256
     }
+
+
+def test_gpt4o_oracle_fixture_is_bound_to_talkie_evidence() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_gpt4o_oracle.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    evidence = tokenizer_evidence("talkie-13b-q4-native-tokenizer")
+    assert evidence is not None
+    assert evidence.llamacpp_oracle == (
+        oracle["llamacpp_commit"],
+        oracle["case_count"],
+        oracle["ordered_results_sha256"],
+    )
+    assert evidence.lfs_sha256 == oracle["artifact_sha256"]
+    assert oracle["seed"] == 648
+    assert oracle["random_count"] == 128
+    assert len(oracle["fixed_inputs"]) == 20
+    assert oracle["case_count"] == (
+        len(oracle["modes"]) * (len(oracle["fixed_inputs"]) + oracle["random_count"])
+    )
 
 
 def test_shared_evidence_requires_identical_pinned_dispatch_behavior() -> None:

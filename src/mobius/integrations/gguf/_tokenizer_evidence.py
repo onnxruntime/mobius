@@ -60,6 +60,9 @@ class GGUFTokenizerEvidence:
     special_token_ids: tuple[tuple[str, int], ...]
     representative_encodings: tuple[tuple[str, tuple[int, ...]], ...]
     representative_special_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    reconstruct_gpt4o_from_gguf: bool = False
+    source_disposition: str | None = None
+    llamacpp_oracle: tuple[str, int, str] | None = None
 
     def __post_init__(self) -> None:
         revisions = (self.revision, self.tokenizer_revision)
@@ -182,6 +185,20 @@ class GGUFTokenizerEvidence:
             raise ValueError(
                 "GPT2_ADD_SEP evidence requires a representative special-token encoding"
             )
+        if self.reconstruct_gpt4o_from_gguf != (self.source_disposition is not None):
+            raise ValueError(
+                "GGUF-native reconstruction requires an exact official-source disposition"
+            )
+        if self.reconstruct_gpt4o_from_gguf and witness.pre_type != "GPT4O":
+            raise ValueError("GGUF-native reconstruction is supported only for GPT4O evidence")
+        if self.llamacpp_oracle is not None:
+            commit, case_count, digest = self.llamacpp_oracle
+            if (
+                re.fullmatch(r"[0-9a-f]{40}", commit) is None
+                or case_count <= 0
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            ):
+                raise ValueError("llama.cpp oracle evidence identity is invalid")
 
     @property
     def source(self) -> GGUFTokenizerSource:
@@ -194,6 +211,7 @@ class GGUFTokenizerEvidence:
             self.materialized_tokenizer_sha256,
             self.representative_encodings,
             self.representative_special_encodings,
+            self.reconstruct_gpt4o_from_gguf,
         )
 
 
@@ -426,7 +444,7 @@ _KANANA2_13B_Q8_TOKENIZER = GGUFTokenizerEvidence(
         "552780454e0de07e46ed452dba9c24001a780923e0ba1e4b4d0906cb02c2aeab"
     ),
     materialized_tokenizer_sha256=(
-        "1c4be9ecf77c926456fb82d4cf07ff1218a91907f3408f44895d2b01e0f2b5ab"
+        "1fba3871de7549016b48a7890d46403fe24c59cf39afc9df395ea02c199d1917"
     ),
     special_token_ids=(
         ("<|begin_of_text|>", 128_000),
@@ -455,6 +473,119 @@ _KANANA2_13B_Q8_TOKENIZER = GGUFTokenizerEvidence(
             "Hello, world! 12345",
             (128_000, 17_263, 11, 1_666, 0, 220, 9_654, 2_995),
         ),
+    ),
+)
+
+_TALKIE_13B_Q4_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="talkie-13b-q4-native-tokenizer",
+    architecture="talkie",
+    pre_identifier="talkie",
+    validated_identifiers=("talkie",),
+    repository="PocketAiHub/talkie-1930-13b-it-GGUF",
+    revision="47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694",
+    filename="talkie-1930-13b-it-Q4_K_M.gguf",
+    size=8_571_072_704,
+    lfs_sha256="2d6c6c1d98a1b8ffa38b50916454891a31ad844ee69c686e525976867917d7b2",
+    tensor_count=362,
+    tensor_qtypes=(
+        ("BF16", 80),
+        ("Q4_K", 221),
+        ("Q5_0", 20),
+        ("Q6_K", 21),
+        ("Q8_0", 20),
+    ),
+    tokenizer_repository="lewtun/talkie-1930-13b-it-hf",
+    tokenizer_revision="6311dedf518470856a8503f2080bb4b54fcb3323",
+    source_config_asset=(
+        "config.json",
+        522,
+        "e7f29da9cf0a69571d6a0521cd912dc5c2f0dd151d0e934b87541f4389a9ee30",
+    ),
+    tokenizer_metadata_sha256="7e14f443006afd16e49969f0bfbc5c995edde0075a829f2748e86b9fe4f2da81",
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            343,
+            "833a35215bfc10d1d9f27fb857123cc24bfef90f770fbc8d79ce37bf4ef4bc4d",
+        ),
+        (
+            "tokenizer.json",
+            8_870_742,
+            "cc3813d9d674cf0e86e4171579ba276879c66c2171d993e5776fc5615756a03b",
+        ),
+        (
+            "tokenizer_config.json",
+            247,
+            "e12d422a980eceaecd6ff388c3843b30dd461307d58ec19585953012d7386fc5",
+        ),
+    ),
+    token_count=65_540,
+    source_token_count=65_540,
+    embedding_vocabulary_size=65_540,
+    deterministic_padding_range=(65_540, 65_539),
+    ordered_vocabulary_sha256="f88816a5099baf479e674c8d3c61ed31f97954bd8213d1bf269cbbb883012b9e",
+    merge_count=65_279,
+    ordered_merges_sha256="addf973bfd18babde5e7bfd7fe5f8e7fc3ae2f5fa01a7fdb4aba5c1898f0ec94",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "511820f1cc6c9a5df9e0c93a062ff95f6d602208050aa12296fb66b798ad36cf"
+    ),
+    materialized_tokenizer_sha256=(
+        "63eb55af29f6eb88b2a8caa7966e0202b59f799d4e560bc688b5ac7c5f0453de"
+    ),
+    special_token_ids=(
+        ("<|assistant|>", 65_538),
+        ("<|endoftext|>", 65_535),
+        ("<|end|>", 65_536),
+        ("<|system|>", 65_539),
+        ("<|user|>", 65_537),
+    ),
+    representative_encodings=(
+        ("Hello, world! 12345", (72, 22_882, 44, 1_490, 33, 32, 6_276, 1_400)),
+        ("  spaced  text\n", (32, 25_156, 32, 5_272, 10)),
+        (
+            "你好，世界！",  # noqa: RUF001
+            (228, 189, 160, 229, 165, 189, 239, 188, 140, 57_632, 150, 231, 149, 140, 239, 188, 129),
+        ),
+        (
+            "Café — κόσμος 🚀",
+            (67, 1_063, 1_238, 461, 12_887, 12_562, 6_076, 7_938, 14_917, 32, 240, 159, 154, 128),
+        ),
+        ("<|user|>hello<|end|>", (65_537, 257, 12_227, 65_536)),
+        (
+            "<|system|>Be concise.<|end|><|user|>你好 12345!<|end|><|assistant|>",
+            (
+                65_539,
+                3_664,
+                32_185,
+                46,
+                65_536,
+                65_537,
+                228,
+                189,
+                160,
+                229,
+                165,
+                189,
+                32,
+                6_276,
+                1_400,
+                33,
+                65_536,
+                65_538,
+            ),
+        ),
+    ),
+    reconstruct_gpt4o_from_gguf=True,
+    source_disposition=(
+        "official copy rejected: GGUF retains 65279 of 156379 source merges; first "
+        "ordered mismatch at index 4 is ('Ġ', 'the') versus ('Ġt', 'he')"
+    ),
+    llamacpp_oracle=(
+        "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+        444,
+        "484246b629d6eec375ebac3672e4f4d4fb29646d3b331917ec4d2cfe385c3b6a",
     ),
 )
 
@@ -898,6 +1029,7 @@ _TOKENIZER_EVIDENCE = MappingProxyType(
         for record in (
             _GPT2_Q4_TOKENIZER,
             _KANANA2_13B_Q8_TOKENIZER,
+            _TALKIE_13B_Q4_TOKENIZER,
             _JINA_V2_CODE_Q8_TOKENIZER,
             _LFM2_350M_F16_TOKENIZER,
             _QWEN25_05B_Q8_TOKENIZER,
