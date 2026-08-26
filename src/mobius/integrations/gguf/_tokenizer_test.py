@@ -621,6 +621,110 @@ def test_gpt2_add_sep_rejects_post_processor_without_exact_sep() -> None:
         _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
+def _gpt4o_payloads(metadata: dict) -> dict[str, bytes]:
+    payloads = _pinned_payloads(metadata)
+    config = json.loads(payloads["tokenizer_config.json"])
+    config.pop("add_bos_token")
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"] = _tokenizer._GPT4O_PRE_TOKENIZER
+    tokenizer["post_processor"] = {
+        "type": "Sequence",
+        "processors": [
+            _tokenizer._GPT4O_POST_BYTE_LEVEL,
+            {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                ],
+                "pair": [
+                    {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "<bos>", "type_id": 1}},
+                    {"Sequence": {"id": "B", "type_id": 1}},
+                ],
+                "special_tokens": {"<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}},
+            },
+        ],
+    }
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+    return payloads
+
+
+def test_gpt4o_accepts_exact_pipeline_and_template_bos_insertion() -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+
+    _tokenizer._validate_pinned_tokenizer(metadata, _gpt4o_payloads(metadata))
+
+
+def test_gpt4o_canonicalizes_official_regex_to_pinned_llamacpp_regex() -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _gpt4o_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = (
+        _tokenizer._GPT4O_SOURCE_SPLIT_PATTERN
+    )
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    canonical = json.loads(materialized)
+    assert (
+        canonical["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
+        == _tokenizer._GPT4O_SPLIT_PATTERN
+    )
+    assert canonical["model"]["ignore_merges"] is False
+
+
+def test_gpt4o_native_reconstruction_uses_exact_gguf_merge_order() -> None:
+    metadata = _metadata(pre="talkie")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _gpt4o_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["model"]["merges"] = []
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    with pytest.raises(ValueError, match="merge order differs"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(
+        metadata,
+        payloads,
+        reconstruct_gpt4o_from_gguf=True,
+    )
+    assert json.loads(materialized)["model"]["merges"] == ["h i"]
+
+
+@pytest.mark.parametrize("mismatch", ["regex", "decoder", "bos"])
+def test_gpt4o_rejects_pipeline_or_template_bos_mismatch(mismatch: str) -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _gpt4o_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    if mismatch == "regex":
+        tokenizer["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] += "x"
+    elif mismatch == "decoder":
+        tokenizer["decoder"]["trim_offsets"] = False
+    else:
+        tokenizer["post_processor"]["processors"][1]["single"].reverse()
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
+def test_gpt4o_rejects_template_bos_when_gguf_disables_it() -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+    metadata["tokenizer.ggml.add_bos_token"] = False
+
+    with pytest.raises(ValueError, match="pipeline differs"):
+        _tokenizer._validate_pinned_tokenizer(metadata, _gpt4o_payloads(metadata))
+
+
 def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
     metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)
