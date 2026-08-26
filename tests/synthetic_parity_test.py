@@ -502,6 +502,7 @@ def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
 
 
 def _adapt_qwen4_exp_text_config(hf_kwargs: dict) -> None:
+    """Translate flat Mobius RoPE/expert fields to the strict HF config."""
     hf_kwargs["head_dim"] = hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
     hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
     hf_kwargs["rope_parameters"] = {

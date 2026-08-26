@@ -56,8 +56,9 @@ class StreamingWeightSource:
     """One checkpoint tensor bound to one dense ONNX initializer."""
 
     source_name: str
-    mode: Literal["direct", "fp8_cast", "fp8_block_128"] = "direct"
+    mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
     scale_name: str | None = None
+    expected_scale: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -492,16 +493,19 @@ def _shard_key_index(paths: list[str]) -> dict[str, tuple[str, list[int], str]]:
     """Map each tensor key -> (shard_path, shape, dtype) by reading headers only.
 
     ``safe_open(...).keys()`` and ``get_slice(...).get_shape()`` read only the
-    safetensors header, so this never materializes weight data. When a key
-    appears in more than one shard the first shard wins and a warning is logged.
+    safetensors header, so this never materializes weight data. Duplicate keys
+    are rejected because choosing a shard by traversal order is ambiguous.
     """
     key_index: dict[str, tuple[str, list[int], str]] = {}
     for path in paths:
         with safe_open(path, framework="pt") as handle:
             for key in handle.keys():  # noqa: SIM118 - safe_open handle is not directly iterable
                 if key in key_index:
-                    logger.warning("Duplicate tensor key %r across shards; keeping first", key)
-                    continue
+                    first_path = key_index[key][0]
+                    raise ValueError(
+                        f"Duplicate tensor key {key!r} across safetensors shards "
+                        f"{first_path!r} and {path!r}"
+                    )
                 sliced = handle.get_slice(key)
                 key_index[key] = (path, list(sliced.get_shape()), sliced.get_dtype())
     return key_index
@@ -554,6 +558,7 @@ def _assign_lazy_preprocessed(
         k: str = source.source_name,
         mode: str = source.mode,
         scale_name: str | None = source.scale_name,
+        expected_scale: float | None = source.expected_scale,
         dt: torch.dtype = target_dtype,
         n: str = target_name,
     ) -> tensor_adapters.TorchTensor:
@@ -565,13 +570,23 @@ def _assign_lazy_preprocessed(
             with safe_open(scale_path, framework="pt") as handle:
                 scale = handle.get_tensor(scale_name)
             tensor = _dequantize_fp8_tensor(tensor, scale, name=k, target_dtype=dt)
-        elif mode == "fp8_cast":
+        elif mode == "fp8_scalar":
             if not source_dtype.startswith("F8"):
                 raise ValueError(
-                    f"Streaming source '{k}' was classified fp8_cast but has dtype "
+                    f"Streaming source '{k}' was classified fp8_scalar but has dtype "
                     f"{source_dtype}"
                 )
-            tensor = tensor.to(dt)
+            assert scale_name is not None
+            scale_path = key_index[scale_name][0]
+            with safe_open(scale_path, framework="pt") as handle:
+                scale = handle.get_tensor(scale_name)
+            actual_scale = float(scale.to(torch.float32).item())
+            if expected_scale is None or actual_scale != expected_scale:
+                raise ValueError(
+                    f"FP8 scalar source '{k}' has scale {actual_scale}; "
+                    f"expected pinned value {expected_scale}"
+                )
+            tensor = tensor.to(dt) * scale.to(dt)
         elif mode == "direct":
             if source_dtype.startswith("F8"):
                 raise ValueError(
@@ -616,6 +631,7 @@ def stream_preprocessed_safetensors_to_model(
 
     consumed = set(plan.ignored) | set(plan.constants)
     assigned: set[str] = set()
+    validated_scalar_scales: dict[str, float] = {}
     for target_name, source in plan.targets.items():
         initializer = model.graph.initializers.get(target_name)
         if initializer is None:
@@ -633,7 +649,7 @@ def stream_preprocessed_safetensors_to_model(
                 f"{expected_shape}, checkpoint source '{source.source_name}' has "
                 f"{source_shape}"
             )
-        if source.mode == "fp8_block_128":
+        if source.mode in {"fp8_block_128", "fp8_scalar"}:
             if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
                 raise ValueError(
                     f"Scaled FP8 source '{source.source_name}' has dtype {source_dtype}"
@@ -643,20 +659,43 @@ def stream_preprocessed_safetensors_to_model(
                     f"Scaled FP8 source '{source.source_name}' has no scale tensor"
                 )
             _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
-            expected_grid = [
-                (source_shape[0] + 127) // 128,
-                (source_shape[1] + 127) // 128,
-            ]
-            if len(source_shape) != 2 or scale_shape != expected_grid:
-                raise ValueError(
-                    f"FP8 source '{source.source_name}' has scale grid {scale_shape}; "
-                    f"expected {expected_grid} for strict 128x128 blocks"
-                )
-            if scale_dtype not in {"BF16", "F32"}:
-                raise ValueError(
-                    f"FP8 source '{source.source_name}' has unsupported scale dtype "
-                    f"{scale_dtype}; expected BF16 or F32"
-                )
+            if source.mode == "fp8_block_128":
+                expected_grid = [
+                    (source_shape[0] + 127) // 128,
+                    (source_shape[1] + 127) // 128,
+                ]
+                if len(source_shape) != 2 or scale_shape != expected_grid:
+                    raise ValueError(
+                        f"FP8 source '{source.source_name}' has scale grid {scale_shape}; "
+                        f"expected {expected_grid} for strict 128x128 blocks"
+                    )
+                if scale_dtype not in {"BF16", "F32"}:
+                    raise ValueError(
+                        f"FP8 source '{source.source_name}' has unsupported scale dtype "
+                        f"{scale_dtype}; expected BF16 or F32"
+                    )
+            else:
+                if scale_shape != [1] or scale_dtype != "BF16":
+                    raise ValueError(
+                        f"FP8 scalar source '{source.source_name}' has scale "
+                        f"dtype/shape {scale_dtype}/{scale_shape}; expected BF16/[1]"
+                    )
+                if source.expected_scale is None:
+                    raise ValueError(
+                        f"FP8 scalar source '{source.source_name}' has no pinned "
+                        "expected scale value"
+                    )
+                actual_scale = validated_scalar_scales.get(source.scale_name)
+                if actual_scale is None:
+                    with safe_open(_scale_path, framework="pt") as handle:
+                        scale = handle.get_tensor(source.scale_name)
+                    actual_scale = float(scale.to(torch.float32).item())
+                    validated_scalar_scales[source.scale_name] = actual_scale
+                if actual_scale != source.expected_scale:
+                    raise ValueError(
+                        f"FP8 scalar source '{source.source_name}' has scale "
+                        f"{actual_scale}; expected pinned value {source.expected_scale}"
+                    )
             consumed.add(source.scale_name)
         _assign_lazy_preprocessed(initializer, source, key_index, target_name)
         consumed.add(source.source_name)

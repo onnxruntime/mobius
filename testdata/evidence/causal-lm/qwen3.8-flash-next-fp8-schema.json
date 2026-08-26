@@ -70,16 +70,23 @@
       "scale_dtype": "BF16",
       "invalid_or_missing_grids": 0
     },
-    "ple_direct_cast": {
+    "ple_scalar_scaled": {
       "count": 128,
       "weight_dtype": "F8_E4M3",
-      "scale_tensor_count": 0,
+      "scale_tensor_count": 1,
+      "scale_name": "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale",
+      "scale_dtype": "BF16",
+      "scale_shape": [
+        1
+      ],
+      "scale_bfloat16_bits": "0x3951",
+      "scale_value_float32": 0.00019931793212890625,
       "shape_per_shard": [
         2500012,
         160
       ],
       "total_rows": 320001536,
-      "authority": "Transformers FineGrainedFP8 replaces Linear/Experts only; the unchanged nn.Embedding parameter receives a dtype cast during core model loading"
+      "authority": "the pinned checkpoint publishes one shared BF16 scalar beside the 128 FP8 PLE shards; reconstruction is shard.astype(target_dtype) * weight_scale"
     },
     "deterministic_buffers": {
       "count": 3,
@@ -121,9 +128,19 @@
     "mode": "streaming dense dequantized fallback",
     "native_fp8": false,
     "native_fp8_reason": "No available ONNX Runtime MatMul/MoE ABI consumes F8_E4M3 weights with BF16 128x128 inverse-scale grids exactly.",
-    "peak_host_working_set": "bounded by one output shard plus the largest reconstructed tensor and serializer overhead; dense streaming defaults to 1 GiB shards and rejects limits above 5 GB; PLE remains 128 graph initializers and is never concatenated",
+    "peak_host_working_set": "bounded by one output shard plus the largest reconstructed tensor and serializer overhead; dense streaming defaults to 1 GiB shards, rejects limits above 5 GB, and forces external-data serialization to one worker; PLE remains 128 graph initializers and is never concatenated",
     "multimodal_package_complete": false,
     "multimodal_dependency": "the separate stacked Qwen4-Exp multimodal PR must be incorporated before claiming a complete image-text package",
-    "mtp_exported": false
+    "mtp_exported": false,
+    "excluded_tensors": {
+      "mtp": {
+        "count": 3101,
+        "reason": "no authoritative MTP forward equation or NextN cache ABI"
+      },
+      "visual": {
+        "count": 333,
+        "reason": "multimodal component belongs to the dependent PR"
+      }
+    }
   }
 }

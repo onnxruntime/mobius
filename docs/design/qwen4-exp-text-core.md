@@ -133,10 +133,11 @@ The checkpoint uses three text-weight paths:
 - 73,728 routed-expert matrices use `F8_E4M3` values plus BF16 inverse-scale
   grids. Every grid is validated as exactly
   `[ceil(rows / 128), ceil(cols / 128)]`.
-- 128 PLE embedding shards are stored as unscaled FP8. This is not guessed
-  from a missing scale: the pinned Transformers quantizer replaces
-  `Linear`/expert modules only, leaving `nn.Embedding` unchanged, so core
-  loading performs a direct dtype cast. Mobius keeps those shards separate in
+- 128 PLE embedding shards use `F8_E4M3` storage and one shared BF16
+  `ngram_embedding.weight_scale` scalar. Its pinned payload is BF16 bits
+  `0x3951` (`0.00019931793212890625` as float32). Mobius requires that exact
+  scalar and reconstructs each shard lazily as
+  `shard.astype(target_dtype) * weight_scale`. The shards remain separate in
   the ONNX graph instead of concatenating a roughly 95 GiB dense table during
   export.
 - Remaining text weights are ordinary BF16 tensors. The 943-entry
@@ -145,14 +146,21 @@ The checkpoint uses three text-weight paths:
 Mobius emits a **dense fallback**, not a native-FP8 package. Each target tensor
 is read and reconstructed independently. Because ONNX IR buffers one external
 data shard before flushing it, dense streaming packages default to 1 GiB
-output shards and reject shard limits above 5 GB. The reported host-memory
-bound is therefore one output shard plus the largest reconstructed tensor and
-serializer overhead, rather than the whole checkpoint.
+output shards, reject shard limits above 5 GB, and force external-data
+serialization to one worker. The reported host-memory bound is therefore one
+output shard plus the largest reconstructed tensor and serializer overhead,
+rather than up to eight concurrent shards or the whole checkpoint.
 `weight-loading-report.json` states `native_fp8: false`, records the effective
 shard limit and largest tensor, and gives the exact reason: no available ONNX
 Runtime MatMul/MoE ABI consumes this FP8/BF16 128x128 layout exactly. Missing
 scales, wrong grids, changed deterministic PLE buffers, orphan scales, unknown
 source tensors, and missing graph targets all fail closed.
+
+The report separates excluded checkpoint families instead of hiding them in a
+single aggregate: all 3,101 `mtp.*` tensors are marked
+`mtp_exported: false` with the missing-forward/cache-ABI reason, and all 333
+`model.visual.*` tensors are identified as belonging to the dependent
+multimodal PR.
 
 ```bash
 mobius build \

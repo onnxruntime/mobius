@@ -45,6 +45,7 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
+_PINNED_PLE_WEIGHT_SCALE = 0.00019931793212890625
 logger = logging.getLogger(__name__)
 
 
@@ -54,12 +55,20 @@ def _source_name_for_qwen4_exp_target(target_name: str) -> str:
     return target_name
 
 
+def _qwen4_exp_ple_scale_name(weight_name: str) -> str:
+    marker = ".ngram_embedding.shard_"
+    if marker not in weight_name or not weight_name.endswith(".weight"):
+        raise ValueError(f"Not a Qwen4-Exp PLE shard weight: {weight_name}")
+    prefix, _suffix = weight_name.split(marker, 1)
+    return f"{prefix}.ngram_embedding.weight_scale"
+
+
 def validate_qwen4_exp_fp8_header_contract(
     key_index: Mapping[str, tuple[str, list[int], str]],
 ) -> dict[str, int]:
     """Validate every FP8 weight and inverse scale in a Qwen4-Exp checkpoint."""
     scaled = 0
-    direct_cast_ple = 0
+    scalar_scaled_ple = 0
     consumed_scales: set[str] = set()
     for weight_name, (_path, weight_shape, weight_dtype) in key_index.items():
         if not weight_dtype.startswith("F8"):
@@ -74,13 +83,27 @@ def validate_qwen4_exp_fp8_header_contract(
             if ".ple.ple_embedding.ngram_embedding.shard_" not in weight_name:
                 raise ValueError(
                     f"Qwen4-Exp FP8 source '{weight_name}' has no scale and is "
-                    "not an upstream direct-cast PLE embedding shard"
+                    "not a PLE embedding shard with the pinned shared scalar"
                 )
             if len(weight_shape) != 2:
                 raise ValueError(
-                    f"Qwen4-Exp direct-cast PLE source '{weight_name}' must be 2-D"
+                    f"Qwen4-Exp scalar-scaled PLE source '{weight_name}' must be 2-D"
                 )
-            direct_cast_ple += 1
+            ple_scale_name = _qwen4_exp_ple_scale_name(weight_name)
+            ple_scale = key_index.get(ple_scale_name)
+            if ple_scale is None:
+                raise ValueError(
+                    f"Qwen4-Exp PLE source '{weight_name}' is missing shared scalar "
+                    f"'{ple_scale_name}'"
+                )
+            _ple_scale_path, ple_scale_shape, ple_scale_dtype = ple_scale
+            if ple_scale_shape != [1] or ple_scale_dtype != "BF16":
+                raise ValueError(
+                    f"Qwen4-Exp PLE scalar '{ple_scale_name}' has dtype/shape "
+                    f"{ple_scale_dtype}/{ple_scale_shape}; expected BF16/[1]"
+                )
+            consumed_scales.add(ple_scale_name)
+            scalar_scaled_ple += 1
             continue
         _scale_path, scale_shape, scale_dtype = scale_entry
         if len(weight_shape) != 2:
@@ -102,7 +125,9 @@ def validate_qwen4_exp_fp8_header_contract(
         consumed_scales.add(scale_name)
         scaled += 1
 
-    all_scales = {name for name in key_index if name.endswith(".weight_scale_inv")}
+    all_scales = {
+        name for name in key_index if name.endswith((".weight_scale_inv", ".weight_scale"))
+    }
     orphan_scales = sorted(all_scales - consumed_scales)
     if orphan_scales:
         raise ValueError(
@@ -111,7 +136,7 @@ def validate_qwen4_exp_fp8_header_contract(
         )
     return {
         "checkpoint_scaled_fp8_tensors": scaled,
-        "checkpoint_direct_cast_fp8_tensors": direct_cast_ple,
+        "checkpoint_scalar_scaled_fp8_tensors": scalar_scaled_ple,
     }
 
 
@@ -1292,14 +1317,18 @@ class Qwen4ExpCausalLMModel(nn.Module):
         constants: dict[str, torch.Tensor] = {}
         ignored: dict[str, str] = {}
         modes: Counter[str] = Counter()
+        exclusion_counts: Counter[str] = Counter()
 
         for source_name in key_index:
             if source_name.startswith("model.visual."):
                 ignored[source_name] = "multimodal component belongs to the dependent PR"
+                exclusion_counts["visual"] += 1
             elif source_name.startswith("mtp."):
                 ignored[source_name] = "MTP sidecar has no authoritative forward/cache ABI"
+                exclusion_counts["mtp"] += 1
             elif source_name.endswith("rotary_emb.inv_freq"):
                 ignored[source_name] = "RoPE frequencies are graph-derived"
+                exclusion_counts["graph_derived"] += 1
 
         for target_name, initializer in initializers.items():
             if target_name.startswith("model."):
@@ -1353,11 +1382,14 @@ class Qwen4ExpCausalLMModel(nn.Module):
                     mode = "fp8_block_128"
                     source = StreamingWeightSource(source_name, mode, scale_name)
                 elif ".ple.ple_embedding.ngram_embedding.shard_" in source_name:
-                    # Upstream leaves nn.Embedding unchanged by the FP8 quantizer.
-                    # Core model loading casts these stored FP8 values directly to
-                    # the BF16 embedding parameter; there is intentionally no scale.
-                    mode = "fp8_cast"
-                    source = StreamingWeightSource(source_name, mode)
+                    scale_name = _qwen4_exp_ple_scale_name(source_name)
+                    mode = "fp8_scalar"
+                    source = StreamingWeightSource(
+                        source_name,
+                        mode,
+                        scale_name,
+                        expected_scale=_PINNED_PLE_WEIGHT_SCALE,
+                    )
                 else:
                     raise ValueError(
                         f"Qwen4-Exp FP8 source '{source_name}' has no scale and is "
@@ -1397,8 +1429,24 @@ class Qwen4ExpCausalLMModel(nn.Module):
                     "weights with BF16 128x128 inverse-scale grids exactly."
                 ),
                 "scaled_fp8_tensors": modes["fp8_block_128"],
-                "direct_cast_fp8_tensors": modes["fp8_cast"],
+                "scalar_scaled_fp8_tensors": modes["fp8_scalar"],
                 "direct_dense_tensors": modes["direct"],
+                "excluded_tensors": {
+                    "mtp": {
+                        "count": exclusion_counts["mtp"],
+                        "reason": "no authoritative MTP forward equation or NextN cache ABI",
+                    },
+                    "visual": {
+                        "count": exclusion_counts["visual"],
+                        "reason": "multimodal component belongs to the dependent PR",
+                    },
+                    "graph_derived": {
+                        "count": exclusion_counts["graph_derived"],
+                        "reason": "RoPE frequencies are constructed in the graph",
+                    },
+                },
+                "mtp_exported": False,
+                "visual_exported": False,
                 "multimodal_package_complete": False,
                 "multimodal_dependency": "separate stacked Qwen4-Exp multimodal PR",
                 "source_preference": ("model.language_model.* > language_model.* > model.*"),

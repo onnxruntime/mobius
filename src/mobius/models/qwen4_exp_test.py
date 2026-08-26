@@ -25,6 +25,7 @@ from mobius.integrations._weight_loading import (
     stream_preprocessed_safetensors_to_model,
 )
 from mobius.models.qwen4_exp import (
+    _PINNED_PLE_WEIGHT_SCALE,
     Qwen4ExpCausalLMModel,
     Qwen4ExpForConditionalGeneration,
     Qwen4ExpQSAIndexer,
@@ -228,9 +229,16 @@ def test_immutable_fp8_schema_fixture_matches_integration_contract():
     assert quantization["weight_block_size"] == [128, 128]
     assert quantization["scaled_fp8_pairs"]["text_core"] == 73_728
     assert quantization["scaled_fp8_pairs"]["invalid_or_missing_grids"] == 0
-    assert quantization["ple_direct_cast"]["count"] == 128
+    ple = quantization["ple_scalar_scaled"]
+    assert ple["count"] == 128
+    assert ple["scale_tensor_count"] == 1
+    assert ple["scale_bfloat16_bits"] == "0x3951"
+    assert ple["scale_value_float32"] == _PINNED_PLE_WEIGHT_SCALE
     assert export["native_fp8"] is False
     assert export["multimodal_package_complete"] is False
+    assert export["mtp_exported"] is False
+    assert export["excluded_tensors"]["mtp"]["count"] == 3_101
+    assert export["excluded_tensors"]["visual"]["count"] == 333
 
     parent = SimpleNamespace(
         model_type="qwen4_exp",
@@ -1178,7 +1186,12 @@ def _reduced_fp8_checkpoint(
         elif ".ple.ple_embedding.ngram_embedding.shard_" in target_name:
             stored = value.to(torch.float8_e4m3fn)
             source[source_name] = stored
-            dense_targets[target_name] = stored.to(torch.float32)
+            prefix, _suffix = source_name.split(".shard_", 1)
+            source[f"{prefix}.weight_scale"] = torch.tensor(
+                [_PINNED_PLE_WEIGHT_SCALE],
+                dtype=torch.bfloat16,
+            )
+            dense_targets[target_name] = stored.to(torch.float32) * _PINNED_PLE_WEIGHT_SCALE
         else:
             stored = value.to(torch.bfloat16)
             source[source_name] = stored
@@ -1225,6 +1238,9 @@ def test_fp8_streaming_plan_prefers_composite_keys_and_classifies_sidecars():
     assert any(reason.startswith("MTP sidecar") for reason in plan.ignored.values())
     assert plan.report["native_fp8_reason"]
     assert plan.report["multimodal_package_complete"] is False
+    assert plan.report["mtp_exported"] is False
+    assert plan.report["excluded_tensors"]["mtp"]["count"] == 1
+    assert plan.report["excluded_tensors"]["visual"]["count"] == 1
 
 
 def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_path):
@@ -1264,7 +1280,9 @@ def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_pat
     assert report["native_fp8"] is False
     assert report["output_weight_format"] == "dense"
     assert report["scaled_fp8_tensors"] > 0
-    assert report["direct_cast_fp8_tensors"] == config.split_ngram_parts
+    assert report["scalar_scaled_fp8_tensors"] == config.split_ngram_parts
+    assert report["checkpoint_scalar_scaled_fp8_tensors"] == config.split_ngram_parts
+    assert report["mtp_exported"] is False
 
 
 def test_fp8_streaming_plan_rejects_unscaled_projection():
@@ -1289,6 +1307,47 @@ def test_fp8_streaming_plan_rejects_unscaled_projection():
 
     with pytest.raises(ValueError, match="has no scale"):
         module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+
+def test_fp8_streaming_plan_requires_ple_scalar():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    scale_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale"
+    del source[scale_name]
+    index = {
+        name: (
+            "shard.safetensors",
+            list(tensor.shape),
+            "F8_E4M3"
+            if tensor.dtype == torch.float8_e4m3fn
+            else "BF16"
+            if tensor.dtype == torch.bfloat16
+            else "I64",
+        )
+        for name, tensor in source.items()
+    }
+
+    with pytest.raises(ValueError, match="missing shared scalar"):
+        module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+
+def test_fp8_streaming_rejects_changed_ple_scalar(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    scale_name = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale"
+    source[scale_name] = torch.tensor([0.25], dtype=torch.bfloat16)
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+
+    with pytest.raises(ValueError, match="expected pinned value"):
+        stream_preprocessed_safetensors_to_model(
+            model,
+            str(tmp_path),
+            module.build_fp8_streaming_plan,
+        )
 
 
 def test_fp8_streaming_plan_validates_ignored_mtp_grid():

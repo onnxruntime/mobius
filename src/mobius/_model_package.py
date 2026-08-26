@@ -461,6 +461,10 @@ class ModelPackage(UserDict[str, ir.Model]):
             and self.weight_loading_report.get("output_weight_format") == "dense"
             and self.weight_loading_report.get("native_fp8") is False
         ):
+            # onnx-ir may materialize external-data shards concurrently. Keep
+            # this fallback serial so the documented bound remains one output
+            # shard plus one reconstructed tensor instead of max_workers shards.
+            max_workers = 1
             if max_shard_size_bytes is None:
                 max_shard_size_bytes = _DEFAULT_STREAMING_DENSE_SHARD_BYTES
             if max_shard_size_bytes > _MAX_STREAMING_DENSE_SHARD_BYTES:
@@ -482,9 +486,11 @@ class ModelPackage(UserDict[str, ir.Model]):
                 **self.weight_loading_report,
                 "external_data_shard_limit_bytes": max_shard_size_bytes,
                 "largest_dense_tensor_bytes": largest_tensor_bytes,
+                "serializer_max_workers": max_workers,
                 "serialization_memory_bound": (
                     "one output shard plus the largest reconstructed tensor and "
-                    "serializer overhead"
+                    "serializer overhead; external-data serialization is forced "
+                    "to one worker"
                 ),
             }
         use_subfolders = len(selected) > 1

@@ -108,7 +108,43 @@ class TestWeightLoadingReport:
         assert loaded.weight_loading_report == pkg.weight_loading_report
         assert loaded.weight_loading_report["external_data_shard_limit_bytes"] == 1 << 30
         assert loaded.weight_loading_report["largest_dense_tensor_bytes"] == 0
+        assert loaded.weight_loading_report["serializer_max_workers"] == 1
         assert (tmp_path / "weight-loading-report.json").is_file()
+
+    def test_dense_streaming_forces_serial_external_data_save(self, tmp_path, monkeypatch):
+        workers = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            workers.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        pkg.save(
+            str(tmp_path),
+            max_workers=8,
+            progress_bar=False,
+            check_weights=False,
+        )
+
+        assert workers == [1]
+        assert pkg.weight_loading_report["serializer_max_workers"] == 1
+        assert (
+            "forced to one worker" in pkg.weight_loading_report["serialization_memory_bound"]
+        )
 
     def test_rejects_unbounded_dense_streaming_shard(self, tmp_path):
         pkg = ModelPackage({"model": _make_simple_model()})

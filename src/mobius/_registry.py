@@ -680,6 +680,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         Qwen4ExpCausalLMModel,
         task="qwen4-exp-text-generation",
         config_class=Qwen4ExpConfig,
+        test_model_id="unsloth/Qwen3.8-Flash-Next-FP8",
+        test_revision="41cc25fe32cc20053a59c89716196897580cddf6",
         family="qwen",
         variant="moe+gdn+qsa+ple",
         test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
