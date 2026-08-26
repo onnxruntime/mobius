@@ -56,6 +56,7 @@ def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> Non
     assert [(record.pre_identifier, record.architecture) for record in records] == [
         ("gpt-2", "gpt2"),
         ("jina-v2-code", "jina-bert-v2"),
+        ("kanana2", "qwen3"),
         ("lfm2", "lfm2"),
         ("qwen2", "qwen2"),
         ("qwen35", "qwen35"),
@@ -102,8 +103,8 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     }
     assert statuses == {
         "deferred-compiled-semantics": 45,
-        "deferred-pinned-artifact-evidence": 14,
-        "validated-pinned-source": 28,
+        "deferred-pinned-artifact-evidence": 13,
+        "validated-pinned-source": 29,
     }
     for record in census:
         assert (record.evidence_id is None) == (record.blocker_category is not None)
@@ -140,6 +141,13 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     assert talkie.tokenizer_revision == "6311dedf518470856a8503f2080bb4b54fcb3323"
     assert talkie.candidate_disposition is not None
     assert "65279 of 156379 official merges" in talkie.candidate_disposition
+
+    kanana2 = tokenizer_evidence("kanana2-1.3b-instruct-q8-tokenizer")
+    assert kanana2 is not None
+    assert kanana2.validated_identifiers == ("kanana2",)
+    assert kanana2.token_count == kanana2.source_token_count == 128_256
+    assert kanana2.embedding_vocabulary_size == 128_256
+    assert kanana2.representative_special_encodings[0][1][0] == 128_000
 
 
 def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:

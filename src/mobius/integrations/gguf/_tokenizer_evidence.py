@@ -376,6 +376,88 @@ _GPT2_Q4_TOKENIZER = GGUFTokenizerEvidence(
     ),
 )
 
+_KANANA2_13B_Q8_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="kanana2-1.3b-instruct-q8-tokenizer",
+    architecture="qwen3",
+    pre_identifier="kanana2",
+    validated_identifiers=("kanana2",),
+    repository="dummy9996/kanana-2-1.3b-instruct-GGUF",
+    revision="6c998111f40f3ab7adf65620a6a752230d8c75f6",
+    filename="kanana-2-1.3b-instruct-Q8_0.gguf",
+    size=1_377_890_688,
+    lfs_sha256="0b63b6b68f0c1f0e667ad070808dfee7a03db06fc41c3fe23c9d794841c6f801",
+    tensor_count=354,
+    tensor_qtypes=(("F32", 129), ("Q8_0", 225)),
+    tokenizer_repository="kakaocorp/kanana-2-1.3b-instruct",
+    tokenizer_revision="bf4786aa2a1908adce942d53976270132732f720",
+    source_config_asset=(
+        "config.json",
+        2_019,
+        "fe14b20b4b616d62ca0682312c2fcd2b90d9a836d14a1ff6448db3f533fd15a1",
+    ),
+    tokenizer_metadata_sha256="94c64f4813926cc68c2357c49a4f264a4788422f5b663299de0d6da63c4546e4",
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            10_725,
+            "b8ee6b31575eada17ebbe73d3f1ac65d3efde64f0a25ff922031dec7e1cae3e3",
+        ),
+        (
+            "tokenizer.json",
+            10_057_457,
+            "1c4be9ecf77c926456fb82d4cf07ff1218a91907f3408f44895d2b01e0f2b5ab",
+        ),
+        (
+            "tokenizer_config.json",
+            50_155,
+            "1cdee8fcd4f6209e07e6d9966c8a3ff2d738830d79475193e94e448e153ae2d5",
+        ),
+    ),
+    token_count=128_256,
+    source_token_count=128_256,
+    embedding_vocabulary_size=128_256,
+    deterministic_padding_range=(128_256, 128_255),
+    ordered_vocabulary_sha256="ba8fcb1c6a9186257d3e12f93bd8b77a50378a8e081c524c9c97ff652d34c941",
+    merge_count=127_744,
+    ordered_merges_sha256="04e73d514ad172c5f02929d7517a6a01a9b42630223e365f06b20d6628a8d1b6",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "552780454e0de07e46ed452dba9c24001a780923e0ba1e4b4d0906cb02c2aeab"
+    ),
+    materialized_tokenizer_sha256=(
+        "1c4be9ecf77c926456fb82d4cf07ff1218a91907f3408f44895d2b01e0f2b5ab"
+    ),
+    special_token_ids=(
+        ("<|begin_of_text|>", 128_000),
+        ("<|end_of_text|>", 128_001),
+        ("<|endoftext|>", 128_008),
+        ("<|eom_id|>", 128_005),
+        ("<|eot_id|>", 128_004),
+        ("<|im_end|>", 128_010),
+        ("<|im_start|>", 128_009),
+    ),
+    representative_encodings=(
+        ("Hello, world! 12345", (17_263, 11, 1_666, 0, 220, 9_654, 2_995)),
+        ("  spaced  text\n", (220, 49_580, 220, 2_620, 198)),
+        ("你好，世界！", (117_006, 6_936, 9_428, 31_645)),  # noqa: RUF001
+        (
+            "Café — κόσμος 🚀",
+            (34, 3_685, 1_989, 3_968, 77_914, 70_157, 23_526, 29_669, 98_218, 106_943, 222),
+        ),
+        (
+            "<|im_start|>user\n안녕하세요<|im_end|>",
+            (128_009, 3_043, 198, 15_191, 128_010),
+        ),
+    ),
+    representative_special_encodings=(
+        (
+            "Hello, world! 12345",
+            (128_000, 17_263, 11, 1_666, 0, 220, 9_654, 2_995),
+        ),
+    ),
+)
+
 _JINA_V2_CODE_Q8_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="jina-v2-code-q8-tokenizer",
     architecture="jina-bert-v2",
@@ -815,6 +897,7 @@ _TOKENIZER_EVIDENCE = MappingProxyType(
         record.evidence_id: record
         for record in (
             _GPT2_Q4_TOKENIZER,
+            _KANANA2_13B_Q8_TOKENIZER,
             _JINA_V2_CODE_Q8_TOKENIZER,
             _LFM2_350M_F16_TOKENIZER,
             _QWEN25_05B_Q8_TOKENIZER,

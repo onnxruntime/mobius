@@ -98,6 +98,43 @@ _SMOLLM_PIPELINE = {
         "use_regex": True,
     },
 }
+_GPT4O_SPLIT_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|"
+    r"\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_GPT4O_PRE_TOKENIZER = {
+    "type": "Sequence",
+    "pretokenizers": [
+        {
+            "type": "Split",
+            "pattern": {"Regex": _GPT4O_SPLIT_PATTERN},
+            "behavior": "Isolated",
+            "invert": False,
+        },
+        {
+            "type": "ByteLevel",
+            "add_prefix_space": False,
+            "trim_offsets": True,
+            "use_regex": False,
+        },
+    ],
+}
+_GPT4O_POST_BYTE_LEVEL = {
+    "type": "ByteLevel",
+    "add_prefix_space": True,
+    "trim_offsets": False,
+    "use_regex": True,
+}
+_GPT4O_DECODER = {
+    "type": "ByteLevel",
+    "add_prefix_space": True,
+    "trim_offsets": True,
+    "use_regex": True,
+}
 
 # Audited against the pinned C++ loader. ``tokenizer.huggingface.json`` and
 # ``tokenizer.chat_templates`` are converter/extension fields; llama.cpp does
@@ -951,6 +988,65 @@ def _roberta_processor_proves_special_insertion(
     )
 
 
+def _template_processor_proves_bos_insertion(
+    tokenizer_json: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> bool:
+    processor = tokenizer_json.get("post_processor")
+    if not isinstance(processor, Mapping) or processor.get("type") != "Sequence":
+        return False
+    processors = processor.get("processors")
+    if not isinstance(processors, list) or len(processors) != 2:
+        return False
+    template = processors[1]
+    token_id = metadata.get("tokenizer.ggml.bos_token_id")
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    if (
+        processors[0] != _GPT4O_POST_BYTE_LEVEL
+        or not isinstance(template, Mapping)
+        or template.get("type") != "TemplateProcessing"
+        or type(token_id) is not int
+        or not isinstance(tokens, list)
+        or not 0 <= token_id < len(tokens)
+    ):
+        return False
+    token = tokens[token_id]
+    special = {"SpecialToken": {"id": token, "type_id": 0}}
+    special_pair = {"SpecialToken": {"id": token, "type_id": 1}}
+    return (
+        template.get("single") == [special, {"Sequence": {"id": "A", "type_id": 0}}]
+        and template.get("pair")
+        == [
+            special,
+            {"Sequence": {"id": "A", "type_id": 0}},
+            special_pair,
+            {"Sequence": {"id": "B", "type_id": 1}},
+        ]
+        and template.get("special_tokens", {}).get(token)
+        == {"id": token, "ids": [token_id], "tokens": [token]}
+    )
+
+
+def _validate_gpt4o_pipeline(tokenizer_json: Mapping[str, Any], *, pre: str) -> None:
+    post_processor = tokenizer_json.get("post_processor")
+    valid_post_processor = post_processor == _GPT4O_POST_BYTE_LEVEL or (
+        isinstance(post_processor, Mapping)
+        and post_processor.get("type") == "Sequence"
+        and isinstance(post_processor.get("processors"), list)
+        and len(post_processor["processors"]) == 2
+        and post_processor["processors"][0] == _GPT4O_POST_BYTE_LEVEL
+        and isinstance(post_processor["processors"][1], Mapping)
+        and post_processor["processors"][1].get("type") == "TemplateProcessing"
+    )
+    if (
+        tokenizer_json.get("normalizer") is not None
+        or tokenizer_json.get("pre_tokenizer") != _GPT4O_PRE_TOKENIZER
+        or tokenizer_json.get("decoder") != _GPT4O_DECODER
+        or not valid_post_processor
+    ):
+        raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
+
+
 def _validate_pinned_tokenizer(
     metadata: Mapping[str, Any],
     payloads: Mapping[str, bytes],
@@ -1041,6 +1137,9 @@ def _validate_pinned_tokenizer(
         != _SMOLLM_PIPELINE
     ):
         raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
+    policy = tokenizer_pre_policies().get(pre)
+    if policy is not None and policy.pre_type == "GPT4O":
+        _validate_gpt4o_pipeline(tokenizer_json, pre=pre)
     if token_types is not None:
         unsupported_types = sorted(set(token_types) - {1, 2, 3, 4, 5})
         if unsupported_types:
@@ -1112,12 +1211,17 @@ def _validate_pinned_tokenizer(
                 tokenizer_json, metadata, gguf_name
             ):
                 continue
+            if (
+                gguf_name == "add_bos_token"
+                and expected is True
+                and _template_processor_proves_bos_insertion(tokenizer_json, metadata)
+            ):
+                continue
             if expected is not False:
                 raise ValueError(f"Pinned tokenizer cannot prove GGUF {config_name}")
         elif actual is not expected:
             raise ValueError(f"Pinned tokenizer {config_name} differs from GGUF")
 
-    policy = tokenizer_pre_policies().get(pre)
     if (
         policy is not None
         and policy.pre_type == "GPT2_ADD_SEP"

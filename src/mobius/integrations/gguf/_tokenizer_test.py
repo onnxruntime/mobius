@@ -621,6 +621,67 @@ def test_gpt2_add_sep_rejects_post_processor_without_exact_sep() -> None:
         _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
+def _gpt4o_payloads(metadata: dict) -> dict[str, bytes]:
+    payloads = _pinned_payloads(metadata)
+    config = json.loads(payloads["tokenizer_config.json"])
+    config.pop("add_bos_token")
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    tokenizer["pre_tokenizer"] = _tokenizer._GPT4O_PRE_TOKENIZER
+    tokenizer["post_processor"] = {
+        "type": "Sequence",
+        "processors": [
+            _tokenizer._GPT4O_POST_BYTE_LEVEL,
+            {
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                ],
+                "pair": [
+                    {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"SpecialToken": {"id": "<bos>", "type_id": 1}},
+                    {"Sequence": {"id": "B", "type_id": 1}},
+                ],
+                "special_tokens": {
+                    "<bos>": {"id": "<bos>", "ids": [2], "tokens": ["<bos>"]}
+                },
+            },
+        ],
+    }
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+    return payloads
+
+
+def test_gpt4o_accepts_exact_pipeline_and_template_bos_insertion() -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+
+    _tokenizer._validate_pinned_tokenizer(metadata, _gpt4o_payloads(metadata))
+
+
+@pytest.mark.parametrize("mismatch", ["regex", "decoder", "bos"])
+def test_gpt4o_rejects_pipeline_or_template_bos_mismatch(mismatch: str) -> None:
+    metadata = _metadata(pre="kanana2")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _gpt4o_payloads(metadata)
+    tokenizer = json.loads(payloads["tokenizer.json"])
+    if mismatch == "regex":
+        tokenizer["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] += "x"
+        message = "pipeline differs"
+    elif mismatch == "decoder":
+        tokenizer["decoder"]["trim_offsets"] = False
+        message = "pipeline differs"
+    else:
+        tokenizer["post_processor"]["processors"][1]["single"].reverse()
+        message = "cannot prove GGUF add_bos_token"
+    payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    with pytest.raises(ValueError, match=message):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
 def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
     metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)
