@@ -14,7 +14,9 @@ import pytest
 
 from mobius.integrations.gguf import _tokenizer_evidence
 from mobius.integrations.gguf._runtime_evidence import GGUFArtifactIdentity, runtime_evidence
+from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_evidence import (
+    iter_tokenizer_evidence,
     matching_tokenizer_evidence,
     tokenizer_evidence,
 )
@@ -34,10 +36,69 @@ def test_qwen35_tokenizer_evidence_is_exact_and_runtime_independent() -> None:
     assert evidence.deterministic_padding_range == (248_077, 248_319)
     assert evidence.embedding_vocabulary_size == 248_320
     assert evidence.merge_count == 247_587
+    assert evidence.ordered_token_types_sha256 == (
+        "f6fdca1063d1ae1cc77ba1f5087d259f044c2634e64b65e31bc844ec00e9acab"
+    )
     assert evidence.materialized_tokenizer_sha256 == (
         "a78b900eb4cd335bba249158066db523ce221f744e2b6144692bb81673d551af"
     )
     assert runtime_evidence("qwen3.5-0.8b-q4-tokenizer") is None
+
+
+def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> None:
+    records = iter_tokenizer_evidence()
+    assert [(record.pre_identifier, record.architecture) for record in records] == [
+        ("lfm2", "lfm2"),
+        ("qwen2", "qwen2"),
+        ("qwen35", "qwen35"),
+        ("smollm", "llama"),
+    ]
+    assert all(record.token_count > 0 for record in records)
+    assert all(record.ordered_token_types_sha256 for record in records)
+    assert all(record.representative_encodings for record in records)
+    assert all(record.source_config_asset[0] == "config.json" for record in records)
+
+
+def test_evidence_schema_accepts_scores_instead_of_bpe_merges() -> None:
+    evidence = tokenizer_evidence("qwen3.5-0.8b-q4-tokenizer")
+    assert evidence is not None
+    scores_only = dataclasses.replace(
+        evidence,
+        merge_count=0,
+        ordered_merges_sha256=None,
+        score_count=evidence.token_count,
+        ordered_scores_sha256="a" * 64,
+    )
+    assert scores_only.ordered_merges_sha256 is None
+    with pytest.raises(ValueError, match="ordered merges or ordered scores"):
+        dataclasses.replace(
+            evidence,
+            merge_count=0,
+            ordered_merges_sha256=None,
+        )
+
+
+def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() -> None:
+    census = tokenizer_route_census()
+    assert len(census) == 87
+    assert len({record.identifier for record in census}) == 87
+    statuses = {
+        status: sum(record.current_status == status for record in census)
+        for status in {record.current_status for record in census}
+    }
+    assert statuses == {
+        "deferred-compiled-semantics": 83,
+        "validated-pinned-source": 4,
+    }
+    for record in census:
+        assert (record.evidence_id is None) == (record.blocker_category is not None)
+        if record.evidence_id is None:
+            assert record.artifact_repository is None
+            assert record.tokenizer_repository is None
+        else:
+            assert record.artifact_revision is not None
+            assert record.tokenizer_revision is not None
+            assert record.tokenizer_assets
 
 
 def test_existing_qwen25_runtime_tokenizer_evidence_remains_pinned() -> None:
@@ -50,7 +111,7 @@ def test_existing_qwen25_runtime_tokenizer_evidence_remains_pinned() -> None:
     )
 
 
-def _digest(values: list[str]) -> str:
+def _digest(values: list[object]) -> str:
     payload = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 
@@ -72,6 +133,7 @@ def _small_evidence():
         ordered_vocabulary_sha256=_digest(["a", "<special>"]),
         merge_count=1,
         ordered_merges_sha256=_digest(["a <special>"]),
+        ordered_token_types_sha256=_digest([1, 3]),
         special_token_ids=(("<special>", 1),),
     )
 
@@ -80,6 +142,7 @@ def _small_model():
     return SimpleNamespace(
         architecture="qwen35",
         metadata={
+            "tokenizer.ggml.pre": "qwen35",
             "tokenizer.ggml.tokens": ["a", "<special>"],
             "tokenizer.ggml.merges": ["a <special>"],
             "tokenizer.ggml.token_type": [1, 3],
@@ -120,7 +183,10 @@ def test_matching_evidence_binds_ordered_semantics_and_embedding_rows(
     )
 
 
-@pytest.mark.parametrize("mismatch", ["metadata", "vocabulary", "merges", "special", "rows"])
+@pytest.mark.parametrize(
+    "mismatch",
+    ["metadata", "pre", "vocabulary", "merges", "scores", "token_types", "special", "rows"],
+)
 def test_matching_evidence_fails_closed_on_compact_identity_mismatch(
     tmp_path, monkeypatch, mismatch
 ) -> None:
@@ -129,10 +195,16 @@ def test_matching_evidence_fails_closed_on_compact_identity_mismatch(
     metadata_sha256 = evidence.tokenizer_metadata_sha256
     if mismatch == "metadata":
         metadata_sha256 = "b" * 64
+    elif mismatch == "pre":
+        model.metadata["tokenizer.ggml.pre"] = "qwen2"
     elif mismatch == "vocabulary":
         model.metadata["tokenizer.ggml.tokens"][0] = "changed"
     elif mismatch == "merges":
         model.metadata["tokenizer.ggml.merges"][0] = "<special> a"
+    elif mismatch == "scores":
+        model.metadata["tokenizer.ggml.scores"] = [0.0, 0.0]
+    elif mismatch == "token_types":
+        model.metadata["tokenizer.ggml.token_type"][0] = 2
     elif mismatch == "special":
         model.metadata["tokenizer.ggml.tokens"][1] = "<changed>"
     else:

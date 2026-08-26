@@ -31,7 +31,8 @@ from mobius.integrations.gguf._quant_registry import (
 )
 from mobius.integrations.gguf._runtime_evidence import runtime_evidence
 from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
-from mobius.integrations.gguf._tokenizer_evidence import tokenizer_evidence
+from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
+from mobius.integrations.gguf._tokenizer_evidence import iter_tokenizer_evidence
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 from mobius.integrations.gguf._upstream import (
     UPSTREAM_COMMIT,
@@ -55,6 +56,7 @@ def _summary() -> str:
     qtypes = iter_quant_specs()
     projectors = iter_projector_specs()
     tokenizers = tokenizer_pre_policies()
+    tokenizer_statuses = Counter(record.current_status for record in tokenizer_route_census())
     stored = [spec for spec in qtypes if spec.readable and spec.role is StorageRole.QUANTIZED]
     routed = [
         spec
@@ -94,8 +96,7 @@ def _summary() -> str:
             (
                 f"| Tokenizer pre identifiers | {len(tokenizers)} | "
                 f"{len({policy.canonical for policy in tokenizers.values()})} semantic groups; "
-                "all default to deferred and become materializable only from a validated embedded "
-                "`tokenizer.huggingface.json` or exact artifact-scoped tokenizer evidence |"
+                f"route dispositions: {dict(sorted(tokenizer_statuses.items()))} |"
             ),
             "",
             (
@@ -233,24 +234,21 @@ def _projectors() -> str:
 def _tokenizers() -> str:
     rows = [
         (
-            "| Exact identifier | Canonical semantic group | Pinned pre-type | Default route | "
-            "Exactness/restriction |"
+            "| Exact identifier | Semantic group / pre-type | Default policy | Current status | "
+            "Evidence / blocker |"
         ),
         "|---|---|---|---|---|",
     ]
-    for identifier, policy in sorted(tokenizer_pre_policies().items()):
-        restriction = (
-            "ARTIFACT_PINNED — Exact pinned-source materialization is available only for "
-            "`qwen3.5-0.8b-q4-tokenizer`; every other artifact remains deferred."
-            if identifier == "qwen35"
-            else "TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or "
-            "artifact-scoped pinned-source evidence."
+    for record in tokenizer_route_census():
+        disposition = (
+            f"`{record.evidence_id}`"
+            if record.evidence_id is not None
+            else f"`{record.blocker_category}`"
         )
-        row = (
-            f"| `{identifier}` | `{policy.canonical}` | `{policy.pre_type}` | "
-            f"`{policy.default_route}` | {restriction} |"
+        rows.append(
+            f"| `{record.identifier}` | `{record.semantic_group}` / `{record.pre_type}` | "
+            f"`{record.default_policy}` | `{record.current_status}` | {disposition} |"
         )
-        rows.append(row)
     return "\n".join(rows)
 
 
@@ -299,51 +297,52 @@ def _runtime_evidence_table() -> str:
 
 
 def _tokenizer_evidence_table() -> str:
-    evidence = tokenizer_evidence("qwen3.5-0.8b-q4-tokenizer")
-    if evidence is None:
-        raise ValueError("Missing qwen3.5-0.8b-q4-tokenizer evidence")
-    assets = ", ".join(
-        f"`{name}` {size:,} B `{sha256}`" for name, size, sha256 in evidence.tokenizer_assets
-    )
-    encodings = "<br>".join(
-        f"`{text.encode('unicode_escape').decode()}` → `{list(token_ids)}`"
-        for text, token_ids in evidence.representative_encodings
-    )
-    padding_start, padding_end = evidence.deterministic_padding_range
-    identity = (
-        f"`{evidence.repository}@{evidence.revision}`<br>"
-        f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`<br>"
-        f"{evidence.tensor_count} tensors: "
-        f"{', '.join(f'{name}={count}' for name, count in evidence.tensor_qtypes)}"
-    )
-    source = (
-        f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>"
-        f"`{evidence.source_config_asset[0]}` {evidence.source_config_asset[1]:,} B "
-        f"`{evidence.source_config_asset[2]}`<br>{assets}"
-    )
-    proof = (
-        f"GGUF metadata `{evidence.tokenizer_metadata_sha256}`<br>"
-        f"{evidence.token_count:,} ordered tokens "
-        f"`{evidence.ordered_vocabulary_sha256}`<br>"
-        f"{evidence.merge_count:,} ordered merges "
-        f"`{evidence.ordered_merges_sha256}`<br>"
-        f"official source IDs `0..{evidence.source_token_count - 1}`; deterministic "
-        f"unused `[PAD{{id}}]` IDs `{padding_start}..{padding_end}`; "
-        f"embedding rows={evidence.embedding_vocabulary_size:,}<br>"
-        f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
-    )
-    return "\n".join(
-        (
-            "| Evidence ID | GGUF identity | Official source | Exact tokenizer proof |",
-            "|---|---|---|---|",
+    rows = [
+        "| Evidence ID | GGUF identity | Official source | Exact tokenizer proof |",
+        "|---|---|---|---|",
+    ]
+    for evidence in iter_tokenizer_evidence():
+        assets = ", ".join(
+            f"`{name}` {size:,} B `{sha256}`"
+            for name, size, sha256 in evidence.tokenizer_assets
+        )
+        encodings = "<br>".join(
+            f"`{text.encode('unicode_escape').decode()}` → `{list(token_ids)}`"
+            for text, token_ids in evidence.representative_encodings
+        )
+        padding_start, padding_end = evidence.deterministic_padding_range
+        padding = (
+            f"unused `[PAD{{id}}]` IDs `{padding_start}..{padding_end}`"
+            if padding_start <= padding_end
+            else "no GGUF-only padding extension"
+        )
+        identity = (
+            f"`{evidence.repository}@{evidence.revision}`<br>"
+            f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`"
+        )
+        source = (
+            f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>"
+            f"`{evidence.source_config_asset[0]}` {evidence.source_config_asset[1]:,} B "
+            f"`{evidence.source_config_asset[2]}`<br>{assets}"
+        )
+        proof = (
+            f"metadata `{evidence.tokenizer_metadata_sha256}`<br>"
+            f"tokens {evidence.token_count:,} `{evidence.ordered_vocabulary_sha256}`<br>"
+            f"merges {evidence.merge_count:,} `{evidence.ordered_merges_sha256}`<br>"
+            f"types `{evidence.ordered_token_types_sha256}`; scores={evidence.score_count}<br>"
+            f"source IDs `0..{evidence.source_token_count - 1}`; {padding}; "
+            f"rows={evidence.embedding_vocabulary_size:,}<br>"
+            f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
+        )
+        rows.append(
             "| "
             + " | ".join(
                 _cell(value)
                 for value in (f"`{evidence.evidence_id}`", identity, source, proof)
             )
-            + " |",
+            + " |"
         )
-    )
+    return "\n".join(rows)
 
 
 def _projector_evidence_table() -> str:
@@ -415,7 +414,7 @@ evidence match.
 
 {_runtime_evidence_table()}
 
-Qwen2.5 remains covered only by its existing runtime evidence record above.
+Runtime support above is independent from tokenizer materialization support below.
 
 ## Tokenizer evidence
 
@@ -427,12 +426,10 @@ from mobius.integrations.gguf import materialize_evidenced_gguf_tokenizer
 materialize_evidenced_gguf_tokenizer("Qwen3.5-0.8B-Q4_0.gguf", "tokenizer")
 ```
 
-Qwen3.5 tokenizer materialization uses `pinned-source`, not embedded `copy`: official
-`tokenizer.json` covers IDs 0-248069, official `tokenizer_config.json` adds IDs
-248070-248076, and only the GGUF embedding-alignment suffix 248077-248319 is reconstructed
-as non-special unused `[PAD{{id}}]` tokens. Every ordered token, merge, special ID, source
-asset, chat template, representative encoding, and the final materialized hash is checked
-before output. Qwen3.5 full model runtime remains **deferred**.
+Each row is independently artifact-scoped. Evidence proves ordered tokens, merges or scores,
+token types, special IDs, source pipeline/config assets, representative encodings, embedding
+alignment, any non-matchable padding extension, and the final materialized hash. It does not
+claim graph or runtime support.
 
 ## Supported GGUF architectures
 
@@ -465,8 +462,8 @@ Reason codes are concise user-facing categories; detailed architecture audits re
 
 ## Tokenizer pre-types
 
-The pre-type is never sufficient evidence by itself. Each row defaults to deferred; only an
-embedded exact JSON or a complete artifact-scoped evidence record can materialize a tokenizer.
+The pre-type is never sufficient evidence by itself. The generated census preserves all aliases
+and gives every route an exact evidence ID or concrete compiled-semantics blocker.
 
 <!-- BEGIN GGUF TOKENIZER PRE SUPPORT MATRIX -->
 
