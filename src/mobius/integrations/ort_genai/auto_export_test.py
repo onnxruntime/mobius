@@ -29,6 +29,7 @@ from mobius.integrations.ort_genai.auto_export import (
     _make_trt_rtx_embedding_provider_options,
     _resolve_ort_genai_model_type,
     _select_ort_model_type,
+    _uses_compact_sliding_kv_cache,
     _write_audio_processor_config,
     _write_genai_config,
     _write_vision_processor_config,
@@ -59,6 +60,24 @@ def _mock_model_with_inputs(names: list[str]) -> ir.Model:
 def _mock_model_with_outputs(names: list[str]) -> ir.Model:
     """Create a minimal ir.Model whose graph outputs have the given names."""
     return _mock_model(outputs=names)
+
+
+def test_compact_sliding_kv_cache_requires_matching_graph_contract():
+    model = _mock_model()
+    gqa = ir.Node(
+        op_type="GroupQueryAttention",
+        domain="com.microsoft",
+        inputs=[],
+        num_outputs=1,
+    )
+    model.graph.append(gqa)
+
+    assert not _uses_compact_sliding_kv_cache(model, "cpu")
+    gqa.attributes["sliding_window_cache"] = ir.AttrInt64("sliding_window_cache", 1)
+    assert _uses_compact_sliding_kv_cache(model, "cpu")
+    assert _uses_compact_sliding_kv_cache(model, "cuda")
+    assert not _uses_compact_sliding_kv_cache(model, "dml")
+    assert _uses_compact_sliding_kv_cache(None, "trt-rtx")
 
 
 def _mock_decoder_model(
@@ -3738,12 +3757,7 @@ class TestGemma4RealModel:
         assert "vision" not in data["model"]
         assert "audio" not in data["model"]
         assert "input_ids" in data["model"]["decoder"]["inputs"]
-        assert data["model"]["decoder"]["sliding_window"] == {
-            "window_size": 8,
-            "slide_key_value_cache": False,
-            "slide_inputs": False,
-            "layers": [0],
-        }
+        assert "sliding_window" not in data["model"]["decoder"]
         # No multimodal processor artifacts.
         assert "processor_config" not in result
         assert "audio_processor" not in result

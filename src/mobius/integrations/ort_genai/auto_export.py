@@ -1446,6 +1446,21 @@ def _write_audio_processor_config(
     return path
 
 
+def _uses_compact_sliding_kv_cache(decoder_model: ir.Model | None, ep: str) -> bool:
+    """Whether the graph and EP can keep sliding layers in a compact KV cache."""
+    if ep == "trt-rtx":
+        return True
+    if decoder_model is None or ep not in {"cpu", "cuda"}:
+        return False
+    return any(
+        node.op_type == "GroupQueryAttention"
+        and node.domain == "com.microsoft"
+        and (attribute := node.attributes.get("sliding_window_cache")) is not None
+        and attribute.as_int() == 1
+        for node in decoder_model.graph
+    )
+
+
 def _write_genai_config(
     config: Any,
     output_dir: str,
@@ -1555,7 +1570,13 @@ def _write_genai_config(
 
     sliding_window = None
     window_size = getattr(config, "sliding_window", None)
-    if isinstance(window_size, int) and window_size > 0:
+    # ORT GenAI uses this block to allocate a compact present cache. A
+    # local_window_size mask alone does not compact GQA outputs.
+    if (
+        isinstance(window_size, int)
+        and window_size > 0
+        and _uses_compact_sliding_kv_cache(decoder_model, ep)
+    ):
         layer_types = getattr(config, "layer_types", None)
         local_types = {"local", "sliding_attention", "window_attention"}
         layers = (
