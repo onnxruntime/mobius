@@ -1,36 +1,5 @@
 {
   "$defs": {
-    "AbsentInputKind": {
-      "description": "Supported absent-input fallback kinds.",
-      "oneOf": [
-        {
-          "const": "zeros",
-          "description": "Materialize a zero-initialized tensor.",
-          "type": "string"
-        }
-      ]
-    },
-    "AbsentInputSpec": {
-      "description": "Explicit tensor fallback for an absent optional graph input.",
-      "properties": {
-        "kind": {
-          "$ref": "#/$defs/AbsentInputKind",
-          "description": "Fallback materialization kind."
-        },
-        "shape": {
-          "description": "Runtime-resolved shape of the fallback tensor.",
-          "items": {
-            "$ref": "#/$defs/TensorDimension"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "kind",
-        "shape"
-      ],
-      "type": "object"
-    },
     "AdapterArtifact": {
       "additionalProperties": false,
       "properties": {
@@ -558,7 +527,7 @@
       "type": "object"
     },
     "AudioOutputContent": {
-      "description": "Generic audio-output content-role vocabulary.",
+      "description": "Generic audio-output content-role vocabulary.\n\nAudio arrived at lengths first and named them for what they count:\n`sample_lengths` counts raw samples, `frame_lengths` counts frames\nafter framing, and `valid_frames`/`valid_samples` are the same fact\nspelled as a count of the real entries. They stay, because a program\nthat already emits one keeps loading and because the finer name is\nworth reading. `valid_lengths` joins them as the medium-independent\nspelling, and all five are one role to the validator: the value a\n`padding` entry names must carry one of them, whichever the producer\nchose. See [`LENGTH_CONTENT_ROLES`].",
       "oneOf": [
         {
           "enum": [
@@ -569,7 +538,10 @@
             "valid_samples",
             "sample_lengths",
             "frame_lengths",
-            "validity_mask"
+            "valid_lengths",
+            "validity_mask",
+            "pack_offsets",
+            "pack_owner"
           ],
           "title": "Known standard value"
         },
@@ -583,7 +555,10 @@
               "valid_samples",
               "sample_lengths",
               "frame_lengths",
-              "validity_mask"
+              "valid_lengths",
+              "validity_mask",
+              "pack_offsets",
+              "pack_owner"
             ]
           },
           "title": "Forward-compatible extension value",
@@ -593,7 +568,7 @@
       "type": "string"
     },
     "AudioPreprocessingProgram": {
-      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `ImagePreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
+      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `VisionPreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
       "properties": {
         "outputs": {
           "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
@@ -815,31 +790,8 @@
       ],
       "type": "string"
     },
-    "BatchInvariance": {
-      "description": "Dependence of a row's outputs on the rows batched with it.",
-      "oneOf": [
-        {
-          "enum": [
-            "row_independent",
-            "padding_sensitive"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "row_independent",
-              "padding_sensitive"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "BatchLayout": {
-      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nrequest-aligned exclusive-prefix offset value and `owner` names the\nper-item owner mapping, which together let a runtime split and regroup the\npacked value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
+      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: the items of every request are\nconcatenated along one physical axis, and the ownership companions say which\nrequest each item came from, which is what lets a runtime split and regroup\nthe packed value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -902,9 +854,10 @@
         },
         {
           "additionalProperties": false,
+          "description": "Items belonging to many requests concatenated along one axis.\n\nThere is exactly one packed axis. Structure above the item — frames\ninside clips inside request rows — is ownership, not a second axis: the\ntensor stays a flat run of items and `levels` says how to fold that run\nback into requests.",
           "properties": {
             "axis": {
-              "description": "Packed axis of this value.",
+              "description": "Packed axis of this value.\n\nValidation requires axis zero. A run of items is only splittable\ninto per-request pieces without copying when the items are the\noutermost, contiguous stride of the tensor, and a packed axis\nanywhere else would silently turn every split into a gather.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -913,20 +866,20 @@
               "const": "token_packed",
               "type": "string"
             },
-            "offsets": {
-              "description": "Request-aligned value holding the exclusive prefix offset of each request's items.",
-              "type": "string"
-            },
-            "owner": {
-              "description": "Item-aligned value mapping each packed item to its owning request row.",
-              "type": "string"
+            "levels": {
+              "description": "Ownership chain of the packed axis, innermost level first.\n\nLevel zero owns the physically packed positions; the last level owns\ninto request rows. One level is the ordinary flat case — items in\nrows — and two states one grouping in between, as frames in clips in\nrows. Validation rejects a third: a runtime walks the whole chain on\nevery split, and each level multiplies the states that have to be\nchecked and tested.",
+              "items": {
+                "$ref": "#/$defs/OwnershipLevel"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
             }
           },
           "required": [
             "kind",
-            "offsets",
-            "owner",
-            "axis"
+            "axis",
+            "levels"
           ],
           "type": "object"
         },
@@ -945,6 +898,32 @@
         }
       ]
     },
+    "CapacityBudget": {
+      "additionalProperties": false,
+      "description": "One materialized-footprint bound of an assembled invocation.\n\nA budget bounds what the invocation materializes, not what is nominally\nvalid. A packed dimension's footprint is the sum of the items' valid extents,\nwhich is exactly the packed extent because packing stores no padding; a\npadded dimension's footprint is the enclosing count times the padded extent,\nwhich is the rectangle the runtime allocates and the kernel reads. Budgeting\nthe valid sum instead would let one long and fifteen short items pass a bound\nthe group then blows through.",
+      "properties": {
+        "dimensions": {
+          "description": "Shape symbols whose materialized extents multiply to the bounded\nquantity, in order.\n\nOne symbol bounds that dimension directly — items at an ownership level,\npositions on a packed axis. Several bound an activation-shaped quantity,\nsuch as total padded patch slots, without the package ever naming bytes.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "max_total": {
+          "description": "Largest product of those extents one invocation may carry.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dimensions",
+        "max_total"
+      ],
+      "type": "object"
+    },
     "ChunkedPrefillConfig": {
       "description": "Runtime chunked-prefill preference.",
       "properties": {
@@ -956,6 +935,27 @@
             "integer",
             "null"
           ]
+        }
+      },
+      "type": "object"
+    },
+    "ComponentBatchCapacity": {
+      "additionalProperties": false,
+      "description": "Batching capacity of one invocation of a component.\n\nThis describes the shape of an invocation, never a scheduling policy: which\ndimensions must already agree before two contributions can share a call, and\nhow much the assembled call may materialize. A runtime decides whether to\ngroup at all, and may always group fewer; the package only says what its\nartifact tolerates.\n\nEverything here is keyed by shape symbol rather than by axis index. Ports of\none component routinely differ in rank — a rank-3 payload, a rank-1\ncompanion, a rank-2 pooled output — so an axis index is only meaningful\nrelative to one port, while a symbol names the same quantity on every port\nthat mentions it.",
+      "properties": {
+        "budgets": {
+          "description": "Upper bounds on what one assembled invocation materializes, keyed by\nshape symbol.\n\nThese are static geometry — a fixed position table, an exported\nconstant, a kernel bound — never a measured throughput sweet spot, which\nwould be a cost model and belongs to the runtime. Every entry is an\nupper bound and never an obligation: a runtime may group fewer,\nincluding one. An empty list bounds nothing beyond what the runtime's\nown row budget already bounds.",
+          "items": {
+            "$ref": "#/$defs/CapacityBudget"
+          },
+          "type": "array"
+        },
+        "uniform_dimensions": {
+          "description": "Shape symbols whose extents every item in a group must agree on.\n\nA symbol here names a property of one item — a patch width, a mel bin, a\nframe count of a fixed-length clip — that the artifact cannot vary\nwithin a single call. Items that disagree on it cannot share an\ninvocation, so a scheduler splits them into separate groups.\n\nIt may not name a count: not the extent of a packed axis, and not the\nunit or run count of an ownership level. Those are the numbers a packed\nlayout exists to let vary per request, and pinning one would describe a\nfixed-shape batch the package did not declare. A video whose frame count\nreally is fixed is expressed by pinning the frame dimension of an\nordinary request-aligned tensor and declaring no frame ownership level\nat all.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -1596,494 +1596,6 @@
       },
       "type": "object"
     },
-    "ImageOutputBinding": {
-      "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
-      "properties": {
-        "content": {
-          "$ref": "#/$defs/ImageOutputContent",
-          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label."
-        },
-        "contract": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TensorContract"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
-        },
-        "dtype": {
-          "$ref": "#/$defs/TensorDType",
-          "description": "Declared output dtype. Always explicit; never inferred from the model."
-        },
-        "name": {
-          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
-          "examples": [
-            "image.pixel_values"
-          ],
-          "minLength": 1,
-          "type": "string"
-        },
-        "optional": {
-          "description": "Whether the runtime may omit this output when a model does not need it.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "pad_value": {
-          "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "source": {
-          "description": "Named processor-local value produced by a transform.",
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "required": [
-        "source",
-        "name",
-        "content",
-        "dtype"
-      ],
-      "type": "object"
-    },
-    "ImageOutputContent": {
-      "description": "Generic image-output content-role vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "pixels",
-            "patch_coordinates",
-            "grid_dimensions",
-            "original_size",
-            "transformed_size",
-            "validity_mask"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "pixels",
-              "patch_coordinates",
-              "grid_dimensions",
-              "original_size",
-              "transformed_size",
-              "validity_mask"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "ImageOutputValueRange": {
-      "description": "Numeric interpretation of pixels emitted by an image workflow output.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
-      "enum": [
-        "zero_to_one",
-        "negative_one_to_one",
-        "zero_to_255"
-      ],
-      "type": "string"
-    },
-    "ImagePreprocessingProgram": {
-      "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `pixel_position_ids`,\n`image_grid_thw`, or anything else without introducing runtime model-family\ndispatch.",
-      "properties": {
-        "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
-          "items": {
-            "$ref": "#/$defs/ImageOutputBinding"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "transforms": {
-          "description": "Ordered list of generic transform operations applied to decoded pixels.",
-          "items": {
-            "$ref": "#/$defs/ImageTransform"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "outputs"
-      ],
-      "type": "object"
-    },
-    "ImageSizeSpec": {
-      "anyOf": [
-        {
-          "description": "A single edge length applied to both dimensions.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "description": "Explicit width and height.",
-          "properties": {
-            "height": {
-              "description": "Target height in pixels.",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "width": {
-              "description": "Target width in pixels.",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "width",
-            "height"
-          ],
-          "type": "object"
-        }
-      ],
-      "description": "A square size or an explicit width/height for an image transform."
-    },
-    "ImageTransform": {
-      "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
-      "properties": {
-        "canvas_pad_value": {
-          "description": "RGB canvas fill value applied before dynamic tiling.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "channel_order": {
-          "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "coordinate_order": {
-          "description": "Patch-coordinate component order (`yx` or `xy`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "flatten": {
-          "description": "Whether `patchify` flattens each patch into a single feature vector.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "include_thumbnail": {
-          "description": "Whether a `tile` operation also emits a global thumbnail tile.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "inputs": {
-          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "interpolation": {
-          "description": "Interpolation filter for a `resize` operation — generic string data.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "mask_patch_size": {
-          "description": "Pixel edge represented by one validity-mask cell.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "max_patches": {
-          "description": "Maximum number of spatial patches for a patch-budget resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "max_pixels": {
-          "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "max_tiles": {
-          "description": "Maximum number of local tiles for a `tile` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "mean": {
-          "description": "Per-channel mean for a `normalize` operation (length is model data).",
-          "items": {
-            "format": "float",
-            "type": "number"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "merge_size": {
-          "description": "Spatial patch-group edge controlling packed patch traversal order.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "min_pixels": {
-          "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "mode": {
-          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "op": {
-          "$ref": "#/$defs/ImageTransformOp",
-          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`)."
-        },
-        "outputs": {
-          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `ImageOutputBinding::source`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "pad_value": {
-          "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "patch_order": {
-          "description": "Order patches are emitted in (`merge_groups`, the default, or `raster`).\nIndependent of `merge_size`, which only sets how many patches collapse\ninto one image token.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "patch_size": {
-          "description": "Edge length of a square patch for a `patchify` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "pooling_kernel_size": {
-          "description": "Spatial pooling edge used when resolving a patch-budget resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "scale": {
-          "description": "Scalar multiplier for a `rescale` operation.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "size": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ImageSizeSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Target size for a `resize` operation."
-        },
-        "size_multiple": {
-          "description": "Required divisibility of both resized dimensions.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "std": {
-          "description": "Per-channel standard deviation for a `normalize` operation.",
-          "items": {
-            "format": "float",
-            "type": "number"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "target_length": {
-          "description": "Exact first-axis length produced by a `pad` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "temporal_order": {
-          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "temporal_patch_size": {
-          "description": "Number of identical temporal frames packed into each spatial patch.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "thumbnail_interpolation": {
-          "description": "Interpolation filter used specifically for a global thumbnail.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "thumbnail_order": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ThumbnailOrder"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Ordering of a global thumbnail relative to local tiles."
-        },
-        "tile_size": {
-          "description": "Edge length of a square tile for a `tile` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "op"
-      ],
-      "type": "object"
-    },
-    "ImageTransformOp": {
-      "description": "Generic image transform-operation vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "decode",
-            "decode_rgb",
-            "convert_rgb",
-            "resize",
-            "rescale",
-            "normalize",
-            "tile",
-            "flatten",
-            "patchify",
-            "pad",
-            "emit_original_size",
-            "emit_transformed_size",
-            "emit_validity_mask",
-            "emit_patch_coordinates",
-            "emit_grid_coordinates"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "decode",
-              "decode_rgb",
-              "convert_rgb",
-              "resize",
-              "rescale",
-              "normalize",
-              "tile",
-              "flatten",
-              "patchify",
-              "pad",
-              "emit_original_size",
-              "emit_transformed_size",
-              "emit_validity_mask",
-              "emit_patch_coordinates",
-              "emit_grid_coordinates"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "KeySequenceLengthsSpec": {
       "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
       "properties": {
@@ -2101,135 +1613,6 @@
       },
       "type": "object"
     },
-    "KvAxisStrides": {
-      "description": "Symbolic element stride of each of the four logical KV axes.\n\nThe stride of an axis is the product of the runtime dimensions in its factor\nlist; an **empty** list means unit stride (the innermost, contiguous axis).\nThe innermost axis of every layout the converted kernels honor is\n`head_dim`, whose stride is `1` (empty), because the fp16 read vectorizes\n`head_dim` as `half2` and the fused write addresses it as `dst + d`.\n\nThe two historical layouts map onto this as:\n\n| axis     | head-major BNSH        | seq-major BSNH        |\n|----------|------------------------|-----------------------|\n| batch    | `kv_heads·seq·head_dim`| `seq·kv_heads·head_dim`|\n| head     | `seq·head_dim`         | `head_dim`            |\n| seq      | `head_dim`             | `kv_heads·head_dim`   |\n| head_dim | `1`                    | `1`                   |",
-      "properties": {
-        "batch": {
-          "default": [],
-          "description": "Factors of the batch-axis stride.",
-          "items": {
-            "$ref": "#/$defs/KvStrideDim"
-          },
-          "type": "array"
-        },
-        "head": {
-          "default": [],
-          "description": "Factors of the KV-head-axis stride.",
-          "items": {
-            "$ref": "#/$defs/KvStrideDim"
-          },
-          "type": "array"
-        },
-        "head_dim": {
-          "default": [],
-          "description": "Factors of the head-dim-axis stride. Unit (empty) for every honored\nlayout.",
-          "items": {
-            "$ref": "#/$defs/KvStrideDim"
-          },
-          "type": "array"
-        },
-        "seq": {
-          "default": [],
-          "description": "Factors of the sequence-axis (per-token) stride.",
-          "items": {
-            "$ref": "#/$defs/KvStrideDim"
-          },
-          "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "KvCacheLayout": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/KvNamedLayout",
-          "description": "A readable shorthand for a standard layout. Deserializes from the strings\n`\"head_major_bnsh\"` and `\"seq_major_bsnh\"`; expands to explicit strides\nvia [`KvCacheLayout::resolve_strides`]."
-        },
-        {
-          "$ref": "#/$defs/KvStrideDescriptor",
-          "description": "A fully explicit stride descriptor for layouts the named forms cannot\nexpress."
-        }
-      ],
-      "description": "Physical memory layout of a backend's KV cache tensors, as a stride\ndescriptor.\n\nThis is a **per-backend capability**, not a cross-backend constant: the two\nbackends own their KV buffers independently and never read each other's KV\nbytes, so they may store the cache differently. The ONNX Runtime backend\nrequires head-major BNSH (`[batch, kv_heads, seq, head_dim]`) because ORT's\nGroupQueryAttention past/present is BNSH on every dispatch path (Flash,\ncuDNN SDPA, memory-efficient, XQA). The native backend additionally supports\nseq-major BSNH (`[batch, seq, kv_heads, head_dim]`), which makes each token's\nlive prefix contiguous across heads — shrinking the VMM granule floor by the\n`kv_heads` factor, removing growth-triggered graph re-capture (the append\nstride is sequence-length independent), and making page-level prefix sharing\n(#777) practical. Absent preserves the historical head-major behavior.\n\nLayout preference is per-EP and per-platform rather than a global constant,\nand a JIT backend compiles a specialized kernel per descriptor, so this is a\ndescriptor rather than a closed enum: a raw stride tuple is unreadable, so\nthe common cases are still nameable (`head_major_bnsh`, `seq_major_bsnh`)\nwhile an explicit [`KvStrideDescriptor`] expresses anything the named forms\ncannot (e.g. a token-major view).\n\nOn-device, the native backend selects the layout by stamping the `kv_layout`\nattribute (`0` = BNSH, `1` = BSNH) on its GroupQueryAttention nodes; the\nCUDA EP honors it on the fused fp16 single-token decode pair. Seq-major is\nonly enabled end-to-end once the prefill (flash) read is also converted, so\nthe two never disagree about how a shared cache is physically laid out."
-    },
-    "KvNamedLayout": {
-      "description": "The named, human-readable KV cache layouts.",
-      "oneOf": [
-        {
-          "const": "head_major_bnsh",
-          "description": "Head-major BNSH `[batch, kv_heads, seq, head_dim]`. ORT-compatible; the\ndefault for both backends.",
-          "type": "string"
-        },
-        {
-          "const": "seq_major_bsnh",
-          "description": "Seq-major BSNH `[batch, seq, kv_heads, head_dim]`. Native backend only.",
-          "type": "string"
-        }
-      ]
-    },
-    "KvOwnership": {
-      "description": "Ownership model for a graph's KV cache inputs.",
-      "oneOf": [
-        {
-          "const": "owned",
-          "description": "The graph consumes past KV and emits replacement/extended present KV.",
-          "type": "string"
-        },
-        {
-          "const": "shared",
-          "description": "The graph reads references to KV owned and advanced by another decoder.",
-          "type": "string"
-        }
-      ]
-    },
-    "KvStrideDescriptor": {
-      "description": "A fully explicit KV-cache stride descriptor.\n\nThis is the general form the two named layouts expand into, and the shape a\nfuture layout (e.g. token-major) is expressed in without adding an enum\nvariant. The `reservation_*` fields describe a binding that is a **view into\na larger reservation** rather than the owner of its whole buffer:\ntoken-major stores every layer's tokens in one reservation and hands each\n`(layer, side)` a sub-view, so its per-token (seq) stride is taken over the\nreservation's total token count and its data starts at a non-zero offset.\nBoth historical layouts are whole-buffer bindings: `offset == 0` and no\nreservation override.",
-      "properties": {
-        "reservation_offset_elements": {
-          "description": "Element offset of this binding's first element within the reservation it\nviews. `0` for a binding that owns its whole buffer — the only case the\nconverted kernels honor today.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "reservation_seq_slots": {
-          "description": "Sequence-axis extent, in token slots, of the reservation this binding\nviews when the reservation is larger than the binding's own\n`cache_capacity`. Absent means the binding spans its own capacity (a\nwhole-buffer binding). Present expresses a token-major view whose seq\nstride collapses the per-`(layer, side)` buffer boundary; not honored by\nthe converted path yet.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "strides": {
-          "$ref": "#/$defs/KvAxisStrides",
-          "description": "Symbolic stride of each logical axis."
-        }
-      },
-      "required": [
-        "strides"
-      ],
-      "type": "object"
-    },
-    "KvStrideDim": {
-      "description": "A runtime KV-cache dimension that an axis stride can be a multiple of.\n\nAbsolute element strides are a serving-time property — they depend on the\n`cache_capacity` a runtime picks — so metadata cannot store them as numbers.\nA stride is therefore stored **symbolically**, as the (unordered) set of\nruntime dimensions it multiplies. The concrete element stride of an axis is\nthe product of the sizes of the dimensions in its factor list.",
-      "oneOf": [
-        {
-          "const": "kv_heads",
-          "description": "Number of KV heads (`kv_heads` / `N`).",
-          "type": "string"
-        },
-        {
-          "const": "seq_capacity",
-          "description": "Sequence capacity of the growing axis (`cache_capacity` / `S`).",
-          "type": "string"
-        },
-        {
-          "const": "head_dim",
-          "description": "Per-token head width (`head_dim` / `H`).",
-          "type": "string"
-        }
-      ]
-    },
     "LiteralValue": {
       "anyOf": [
         {
@@ -2243,36 +1626,6 @@
         }
       ],
       "description": "A literal tensor initializer.\n\nA single scalar broadcasts to every element of the declared contract, which\ncovers flags, counters, and zero-filled buffers. Workflows whose constants\nare genuinely per-position -- interleaved stream delay patterns, per-stream\ninitial tokens, fixed schedule tables -- declare the elements explicitly in\nrow-major order instead, so the value stays inside the metadata document and\ndoes not become an out-of-band artifact."
-    },
-    "LoopStatePair": {
-      "description": "One fixed-shape loop-carried recurrent-state port pair.\n\nGeneric and architecture-neutral: the runtime zero/other-initializes `input`\non the first step, runs the graph, and copies `output` back into `input` for\nthe next step (`replace` update). This models any fixed recurrent tensor\n(convolution state, linear-attention recurrent state, and so on) without\nreferencing a model family. It is intentionally distinct from growing KV\nstate, whose logical cells and storage service are declared by a workflow.",
-      "properties": {
-        "init": {
-          "$ref": "#/$defs/StateInitKind",
-          "description": "How `input` is initialized before the first step (e.g. `zeros`)."
-        },
-        "input": {
-          "description": "Graph input port that receives the carried state for this step.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "output": {
-          "description": "Graph output port that produces the next-step state.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "update": {
-          "$ref": "#/$defs/StateUpdateKind",
-          "description": "How `output` becomes the next step's `input` (fixed state uses `replace`)."
-        }
-      },
-      "required": [
-        "input",
-        "output",
-        "init",
-        "update"
-      ],
-      "type": "object"
     },
     "LoraGraphInputBinding": {
       "additionalProperties": false,
@@ -2768,19 +2121,6 @@
           ],
           "description": "Attention architecture and dimensions."
         },
-        "io": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ModelIoSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "deprecated": true,
-          "description": "DEPRECATED, import-only: legacy explicit graph I/O for a bare\nsingle-decoder package.\n\nThe canonical, and only authoritative, expression of a package's\nexecutable graph ABI is the workflow:\n`pipeline.workflow.components.<component>.ports` (with `ports.roles`),\nthe invoke bindings that connect them, and the `state_service` groups\nthat declare model state. A composite package and a bare one-file\ndecoder use that same representation.\n\nThis block remains only so packages written before the workflow existed\nstill load. It is never read directly: [`ModelCapabilities::io`] resolves\nthe workflow first and falls back here, and a document carrying both is\nrejected so the two can never disagree. New producers must not emit it."
-        },
         "max_sequence_length": {
           "description": "Maximum total sequence length, in tokens.",
           "format": "uint",
@@ -2835,219 +2175,44 @@
       },
       "type": "object"
     },
-    "ModelIoSpec": {
-      "additionalProperties": false,
-      "description": "Explicit binding of the graph ports the decode step reads and writes.\n\nEvery field is optional so a model package can declare only the ports its\ngraph exposes. A port left unset is resolved ONLY from an unambiguous\ndtype/shape signal; when the shape cannot disambiguate the port, the runtime\nfails with an actionable error naming the key to declare rather than\ninterpreting a tensor name. A declared port is always authoritative.",
-      "properties": {
-        "aliasing": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StateAliasing"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Whether the graph permits, requires, or forbids the runtime aliasing a\n`present` output onto its paired `past` input.\n\nThis is the graph ABI fact that replaced the old `shared_buffer` policy\nflag: the package states what aliasing its graph is CORRECT under, and\nthe runtime alone decides whether to exploit it (execution provider\ncapability, buffer capacity, and batching are runtime concerns). A graph\nthat reads a `past` region after the paired `present` write would touch\nit must declare `forbidden`, which is the default when the package is\nsilent — silence never grants an optimization."
-        },
-        "attention_mask_input": {
-          "description": "Attention-mask input, if the graph takes one.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "audio_features_input": {
-          "description": "Raw audio-feature prompt input for an encoder-decoder encoder graph\n(e.g. Whisper `audio_features`, a log-mel `[batch, mels, frames]`\ntensor). Declared on the encoder component; a text encoder-decoder uses\n`token_input` instead.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "cross_kv_inputs": {
-          "description": "Cross-attention past-KV cache inputs for an encoder-decoder decoder, in\nthe SAME order as `cross_kv_outputs`. These are the encoder-derived KV\ntensors, distinct from the self-attention `kv_inputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "cross_kv_outputs": {
-          "description": "Cross-attention present-KV cache outputs (produced by the encoder for an\nencoder-decoder model), paired positionally with `cross_kv_inputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "encoder_hidden_states_input": {
-          "description": "Encoder-hidden-states input for an encoder-decoder (cross-attention)\ndecoder graph (e.g. `encoder_hidden_states`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "hidden_output": {
-          "description": "Per-token hidden-state output for embedding / VLM hidden extraction, if\nthe graph exposes a distinct hidden output (e.g. `last_hidden_state`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "inputs_embeds_input": {
-          "description": "Pre-embedded / routed sequence input (e.g. `inputs_embeds`).\n\nMay be declared alongside `token_input` (see its documentation): a graph\nthat consumes both a raw token input and one or more routed sequence\ninputs is explicitly permitted.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "kv_inputs": {
-          "description": "Past-KV cache inputs, in the SAME order as `kv_outputs` (positional\npairing). Length must match `kv_outputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "kv_layout": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/KvCacheLayout"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Physical layout of this backend's KV cache tensors, as a stride\ndescriptor. Accepts a readable named layout (`head_major_bnsh` or\n`seq_major_bsnh`) or a fully explicit [`KvStrideDescriptor`]. This is a\nper-backend capability — each backend owns its KV buffers and never reads\nthe other's KV bytes — so the ORT backend stays head-major while the\nnative backend may declare seq-major. Absent preserves the historical\nhead-major (BNSH) behavior. See [`KvCacheLayout`]."
-        },
-        "kv_outputs": {
-          "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "kv_ownership": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/KvOwnership"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Whether this graph owns past/present KV state or reads target-owned KV.\n\nAbsent preserves the historical `owned` behavior."
-        },
-        "logits_output": {
-          "description": "Logits output.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "optional_inputs": {
-          "additionalProperties": {
-            "$ref": "#/$defs/OptionalInputSpec"
-          },
-          "description": "Optional graph inputs and their explicit absent-value contracts, keyed by\nthe real ONNX input port name.",
-          "type": "object"
-        },
-        "position_ids_input": {
-          "description": "Position-ids input, if the graph takes one.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "sequence_source": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SequenceInputKind"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Which declared sequence port drives autoregressive execution.\n\nAbsent preserves the historical `token_ids` behavior. Declaring\n`inputs_embeds` requires `inputs_embeds_input`; declaring `token_ids`\nrequires `token_input`."
-        },
-        "state_pairs": {
-          "description": "Fixed-shape loop-carried recurrent state ports, distinct from KV cache.\n\nEach pair binds an input port to its matching output port and declares\nhow the input is initialized and how the output feeds the next step\n(`replace` semantics for fixed recurrent tensors). These are neither KV\ncache nor fixed conditioning; the sparse set of state ports comes from\nthis declared list, never expanded from a layer count.",
-          "items": {
-            "$ref": "#/$defs/LoopStatePair"
-          },
-          "minItems": 1,
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "static_cache": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StaticCacheIoSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Explicit port binding for a fixed-buffer TensorScatter static KV cache.\n\nA static-cache decoder scatters each step's K/V into pre-allocated,\nfixed-length buffers via an integer write-index vector and a non-pad\nsequence-length vector, rather than growing/appending a cache. These\ncontrol ports are integer vectors and are therefore SHAPE-indistinguish-\nable from one another, so shape cannot disambiguate them: the ABI must be\ndeclared explicitly. When present, this spec is authoritative and the\nruntime binds exactly these ports. When absent, a graph that exposes the\nscatter ABI is REJECTED with an actionable error naming this key rather\nthan having its integer control ports guessed by name."
-        },
-        "token_input": {
-          "description": "Token-id input (e.g. `input_ids`).\n\nA graph MAY declare this together with `inputs_embeds_input`: some fused\ndecoders consume a raw token stream AND a routed pre-embedded sequence in\nthe same forward pass. The two are not mutually exclusive; declaring both\nis a valid, explicit contract.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
-    "OptionalInputSpec": {
-      "description": "Presence and absent-value contract for one optional graph input.",
-      "properties": {
-        "absent": {
-          "$ref": "#/$defs/AbsentInputSpec",
-          "description": "Tensor value supplied when the presence key is absent."
-        },
-        "presence": {
-          "description": "Opaque, non-empty request presence key; not a port or model name.",
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "required": [
-        "presence",
-        "absent"
-      ],
-      "type": "object"
-    },
     "OutputStage": {
       "enum": [
         "pre_adapter",
         "post_adapter"
       ],
       "type": "string"
+    },
+    "OwnershipLevel": {
+      "additionalProperties": false,
+      "description": "One level of a packed value's ownership chain.\n\nA level is a pair, never a tensor axis: `offsets` gives the exclusive prefix\noffset of each parent's run and `owner` gives the owning position of each\nentry at this level. The two together are what a runtime walks to answer\n\"which request does this item belong to\".\n\nBoth are `shared`, never `request_aligned`. An exclusive prefix sum is not\npermutation-followable — permuting rows does not permute a prefix-offset\nvector, it invalidates it — so a runtime that compacts rebuilds the chain\nrather than gathering it.",
+      "properties": {
+        "extent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackedExtent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where this level's unit count comes from, for a value a component\nproduces.\n\nAbsent is right for a value a component consumes, whose every count the\ncaller assembled. An output states it per level, because the levels of\none chain do not answer together: a token-merging encoder decides how\nmany tokens each clip becomes while leaving which clip belongs to which\nrequest exactly as it found it. A single answer for the whole chain\ncould only be wrong at one end or the other."
+        },
+        "offsets": {
+          "description": "Value holding the exclusive prefix offset of each parent's run at this\nlevel, with a final entry holding the total. Its extent is the parent\ncount plus one.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "owner": {
+          "description": "Value mapping each entry at this level to the position of its parent.\nIts extent is this level's own unit count, which at level zero is the\npacked extent.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "offsets",
+        "owner"
+      ],
+      "type": "object"
     },
     "PackageFacts": {
       "additionalProperties": false,
@@ -3072,6 +2237,42 @@
           "description": "Exact tokenizer, vocabulary, and special-token facts."
         }
       },
+      "type": "object"
+    },
+    "PackedExtent": {
+      "description": "Where the unit count of one ownership level comes from.\n\nNeither answer is derivable from the contract: an output of the same rank\nand symbols as its input may be a per-item transform or a token merger, and\nthe two split at completely different boundaries.",
+      "oneOf": [
+        {
+          "const": "preserved",
+          "description": "The level's units correspond one-to-one, in order, with an input\nlevel's, so the output reuses that input's companions unchanged. A\ncomponent may drop inner levels it has consumed; it may not invent a\ncorrespondence it does not have.",
+          "type": "string"
+        },
+        {
+          "const": "produced",
+          "description": "The graph decides the extent, so the level's companions are outputs of\nthe same component. An input's offsets describe an extent this value\ndoes not have.",
+          "type": "string"
+        }
+      ]
+    },
+    "PaddedDimension": {
+      "additionalProperties": false,
+      "description": "One padded dimension of a value and the companion that bounds it.\n\nThe dimension is named by its shape symbol rather than by an axis index. The\nsame extent sits at different positions in different values — `patches` is\naxis 1 of the pixel tensor and axis 0 of a pooled one — and an index would\nname whichever the author happened to be looking at.\n\nPadding is always appended: the real entries of a padded dimension form a\nprefix. That is what lets one integer per enclosing entry say everything a\nfull boolean mask would say, and it is a rule rather than a convention\nbecause left padding would shift every position-dependent computation and an\ninterior hole cannot be expressed by a length at all.",
+      "properties": {
+        "dimension": {
+          "description": "Shape symbol of the padded dimension of the owning value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "valid_lengths": {
+          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "dimension",
+        "valid_lengths"
+      ],
       "type": "object"
     },
     "PipelineSpec": {
@@ -3120,6 +2321,15 @@
         "components"
       ],
       "type": "object"
+    },
+    "PixelValueRange": {
+      "description": "Numeric interpretation of pixels emitted by an image or video workflow\noutput.\n\nA frame carries the same pixels a still image does, so both output roles\nread their normalization from one contract rather than from two vocabularies\nthat could disagree.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
+      "enum": [
+        "zero_to_one",
+        "negative_one_to_one",
+        "zero_to_255"
+      ],
+      "type": "string"
     },
     "PoolingKind": {
       "description": "Pooling reduction kind.",
@@ -3259,13 +2469,24 @@
         "image": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ImagePreprocessingProgram"
+              "$ref": "#/$defs/VisionPreprocessingProgram"
             },
             {
               "type": "null"
             }
           ],
-          "description": "Typed image preprocessing transform program and its named tensor outputs."
+          "description": "Typed still-image preprocessing program and its named tensor outputs."
+        },
+        "video": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VisionPreprocessingProgram"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Typed video preprocessing program and its named tensor outputs.\n\nA video is a still image plus a temporal axis, so it declares the same\nprogram type: the spatial transforms and their parameters are identical,\nand the temporal ones (`sample_frames`, `pad_frames`) are further\noperations in the same generic vocabulary. Splitting the two would\nduplicate every spatial parameter for no gain, while keeping them one\nkey would hide that a package preprocesses stills and clips differently."
         }
       },
       "type": "object"
@@ -3359,13 +2580,6 @@
           ],
           "description": "Chunked-prefill support and preferred chunk size."
         },
-        "continuous_batching": {
-          "description": "Whether continuous batching may be enabled.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
         "prefix_cache": {
           "description": "Whether prefix caching may be enabled.",
           "type": [
@@ -3403,6 +2617,11 @@
             "adapter_scales",
             "adapter_active"
           ],
+          "type": "string"
+        },
+        {
+          "const": "eos_token_ids",
+          "description": "Token ids that end generation.\n\nA set, not a single id: a model may end a turn with one token and a\nmessage with another, and both must stop. Declaring it here is what lets\nthe runtime's stop policy read a package's EOS from the package instead\nof rediscovering it from tokenizer side-files it may not ship.",
           "type": "string"
         },
         {
@@ -3520,7 +2739,7 @@
           "description": "Generic decoding algorithm selector (e.g. `ctc`)."
         },
         "lengths": {
-          "description": "Profile output role naming the per-row count of valid frames.\n\nPresent when the package is batched with padding: rows are decoded only\nover their own valid frame prefix so a padded batch produces the same\ntranscript per row as an unpadded single-row run.",
+          "description": "Profile output role naming the per-row count of valid frames.\n\nRequired when the logits output pads `time_axis`. The role must map to\nthe exact workflow output named by that dimension's\n`padding.valid_lengths`; CTC then decodes only that valid prefix. An\nunpadded time axis needs no lengths binding.",
           "type": [
             "string",
             "null"
@@ -3550,21 +2769,6 @@
         "class_axis"
       ],
       "type": "object"
-    },
-    "SequenceInputKind": {
-      "description": "Primary autoregressive sequence source for a decoder or proposer graph.",
-      "oneOf": [
-        {
-          "const": "token_ids",
-          "description": "Integer token ids supplied through `token_input`.",
-          "type": "string"
-        },
-        {
-          "const": "inputs_embeds",
-          "description": "Precomputed floating-point embeddings supplied through\n`inputs_embeds_input`.",
-          "type": "string"
-        }
-      ]
     },
     "SequenceLengthScalarBroadcast": {
       "description": "Permitted scalar compatibility for attention key-sequence lengths.",
@@ -3603,9 +2807,49 @@
       ],
       "type": "object"
     },
+    "SessionContinuation": {
+      "description": "How a session-scoped cell rejoins the next invocation.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The cell holds every token this session has seen, and each invocation's\nprompt continues it.\n\nThe value bound to `prompt_input` is the cell's value followed by the\ncaller's tokens; when the invocation completes, the cell becomes that\nconcatenation followed by the tokens published to `tokens_output`. A\nsession that holds no value yet contributes nothing, so the first turn\nof a conversation and a request with no session are the same execution.\n\nThis is what a package whose prefill starts from empty state declares:\nthe conversation is carried as tokens the next prefill consumes, not as\na cache the next prefill would have to be re-authored to accept.",
+          "properties": {
+            "kind": {
+              "const": "prompt_prefix",
+              "type": "string"
+            },
+            "prompt_input": {
+              "description": "Workflow input carrying the `prompt_tokens` runtime role.",
+              "type": "string"
+            },
+            "tokens_output": {
+              "description": "Workflow output carrying the `tokens` role this cell accumulates.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "prompt_input",
+            "tokens_output"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SessionLeaseContract": {
       "additionalProperties": false,
       "properties": {
+        "continuation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionContinuation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How this cell continues one invocation's work into the next.\n\nAbsent means the lease is opaque: the runtime keeps the cell's value for\nthe session and hands it back as the cell's value, which is all a cell\nconsumed by the workflow's own steps needs. A cell the workflow never\nreads — a conversation the *request binding* has to carry — has no such\nreader, so it states which binding continues it here rather than leaving\na runtime to guess."
+        },
         "optimistic_metadata_version": {
           "default": false,
           "type": "boolean"
@@ -4240,27 +3484,6 @@
       ],
       "type": "object"
     },
-    "StateInitKind": {
-      "description": "Loop-carried state initialization vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "zeros"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "zeros"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "StateKind": {
       "description": "Semantic kind of a model state group.",
       "oneOf": [
@@ -4519,102 +3742,10 @@
         }
       ]
     },
-    "StateUpdateKind": {
-      "description": "Loop-carried state update-semantics vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "replace"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "replace"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "StaticCacheIoSpec": {
-      "description": "Explicit port ABI for a fixed-buffer TensorScatter static KV cache.\n\nDescribes GRAPH STRUCTURE, never a model family. The four per-layer cache\nlists pair positionally per layer and must all have the same length: index\n`i` in each list is layer `i`'s key/value input and updated key/value output.",
-      "properties": {
-        "key_cache_inputs": {
-          "description": "Per-layer static key-cache buffer inputs, positional per layer. Length\nmust equal `value_cache_inputs`, `key_cache_outputs`, and\n`value_cache_outputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "key_cache_outputs": {
-          "description": "Per-layer updated key-cache outputs, paired positionally with\n`key_cache_inputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "kv_sequence_length_input": {
-          "description": "Input port carrying the non-pad KV sequence length (`int` vector).\nShape-indistinguishable from `write_indices_input`, so it too must be\nnamed explicitly.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "value_cache_inputs": {
-          "description": "Per-layer static value-cache buffer inputs, paired positionally with\n`key_cache_inputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "value_cache_outputs": {
-          "description": "Per-layer updated value-cache outputs, paired positionally with\n`value_cache_inputs`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "write_indices_input": {
-          "description": "Input port carrying the per-token scatter write positions\n(`int` vector). Shape-indistinguishable from other integer control\ninputs, so it must be named explicitly.",
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "required": [
-        "write_indices_input",
-        "kv_sequence_length_input",
-        "key_cache_inputs",
-        "value_cache_inputs",
-        "key_cache_outputs",
-        "value_cache_outputs"
-      ],
-      "type": "object"
-    },
     "TaskProfile": {
       "additionalProperties": false,
       "description": "One executable task profile that shares the package's common facts.\n\nGenerative and non-generative tasks live in one document. Each profile\ncarries its own version and a requirement class so a strict reader can skip\nan optional profile it does not understand while still rejecting unknown\ncore fields.",
       "properties": {
-        "batch_invariance": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/BatchInvariance"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Whether a row's outputs depend on the other rows batched with it.\n\n`row_independent` means a row produces identical values whether it is\nrun alone or co-batched with rows of any other length, so a runtime may\nbatch freely. `padding_sensitive` means padding a row to the batch width\nchanges its values — for example when a normalization reduces over the\npadded time axis — so a runtime that batches trades accuracy for\nthroughput and must not treat batched results as equal to solo results.\n\nAbsent means unstated, not `row_independent`."
-        },
         "decoding": {
           "anyOf": [
             {
@@ -4685,6 +3816,13 @@
         "optional": {
           "default": false,
           "type": "boolean"
+        },
+        "padding": {
+          "description": "Which dimensions of this tensor may be padded, and where the truth\nabout how much of each entry is real is recorded.\n\nA dense tensor is the only shape a fixed-arity component can consume, so\na group whose items carry different amounts of data has to be padded up\nto a common extent. Nothing in the padded tensor says where the real\nentries stop, and guessing from a sentinel is exactly the hidden\nheuristic this schema refuses: validity is named, typed, and validated\nlike any other value. An empty list means the value carries no padding,\nand a runtime must not introduce any.\n\nOne entry per padded dimension: a clip tensor padded along frames and\nagain along patches states both, because a single companion cannot say\nwhere two independent extents end.",
+          "items": {
+            "$ref": "#/$defs/PaddedDimension"
+          },
+          "type": "array"
         },
         "rank": {
           "format": "uint",
@@ -4835,6 +3973,14 @@
           "minLength": 1,
           "type": "string"
         },
+        "scale": {
+          "description": "Normalizer the target applies to a looked-up row before its backbone\nreads it.\n\nA gathered row is not always the tensor a graph feeds its first block:\nseveral architectures scale the embedding by a constant folded into the\ngraph (`sqrt(hidden_size)` is the common one), so the initializer alone\nis not what a proposer's fused input needs. The proposer stands in for\nthe target's own embedding step, so it must see the *scaled* row — and\nthe factor has to be declared rather than guessed: nothing in a\n`[vocab, hidden]` initializer says whether one was applied, and a\nproposer fed the unscaled row drafts fluent, plausible, uniformly\nrejected tokens. It is the acceptance rate that collapses, not the\noutput, so the failure is invisible to a token-parity check.\n\nAbsent means 1.0: a package whose graph gathers and feeds directly.\n\nSingle precision because that is the precision it is *used* in: the\nfactor multiplies a float16 or float32 table, so declaring more would\npromise an accuracy the application of it discards.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "table": {
           "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix. It\nmust name a real initializer in the target model/artifact.",
           "minLength": 1,
@@ -4904,6 +4050,521 @@
       ],
       "type": "object"
     },
+    "VisionOutputBinding": {
+      "description": "One named tensor output produced by a pixel preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/VisionOutputContent",
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, validity mask, or the offsets/owner map of a packed batch\nat item, frame, or clip granularity) — never a model-family label."
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType",
+          "description": "Declared output dtype. Always explicit; never inferred from the model."
+        },
+        "name": {
+          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
+          "examples": [
+            "image.pixel_values"
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        "optional": {
+          "description": "Whether the runtime may omit this output when a model does not need it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Named processor-local value produced by a transform.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "name",
+        "content",
+        "dtype"
+      ],
+      "type": "object"
+    },
+    "VisionOutputContent": {
+      "description": "Generic pixel-output content-role vocabulary.\n\nA program that packs the media of several requests into one batch\nemits the values that map packed entries back to request rows,\nalongside the pixels themselves. Two roles cover every level:\n`pack_offsets` and `pack_owner`. Which level a value serves is\nstated by the ownership chain that references it, not by its role,\nso a frames-to-clips pair and a clips-to-rows pair carry the same\ntwo roles and a runtime resolves both the same way whatever the\nmedium calls its levels. `valid_lengths` says how much of a padded\ndimension is real, and is shared with the audio vocabulary rather\nthan duplicated.\n\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose. What\neach value must structurally satisfy is stated by its tensor\ncontract — `batch_layout` and `padding` — which is what the\nvalidator enforces.",
+      "oneOf": [
+        {
+          "enum": [
+            "pixels",
+            "patch_coordinates",
+            "grid_dimensions",
+            "original_size",
+            "transformed_size",
+            "validity_mask",
+            "valid_lengths",
+            "pack_offsets",
+            "pack_owner"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "pixels",
+              "patch_coordinates",
+              "grid_dimensions",
+              "original_size",
+              "transformed_size",
+              "validity_mask",
+              "valid_lengths",
+              "pack_offsets",
+              "pack_owner"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "VisionPreprocessingProgram": {
+      "description": "Generic pixel preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad, and for clips sample_frames and pad_frames). In workflow\nmetadata, outputs are materialized by a manifest-pinned preprocessing adapter\ninvocation and bind processor-local values to typed SSA names. A package may\nname an output `pixel_position_ids`, `image_grid_thw`, `video_grid_thw`, or\nanything else without introducing runtime model-family dispatch.\n\nOne program type covers stills and clips, the way one audio program covers\nevery audio family: a frame is an image, so a video program declares the\nsame spatial work plus the temporal operations that select and pad frames.",
+      "properties": {
+        "outputs": {
+          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "items": {
+            "$ref": "#/$defs/VisionOutputBinding"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "transforms": {
+          "description": "Ordered list of generic transform operations applied to decoded pixels.",
+          "items": {
+            "$ref": "#/$defs/VisionTransform"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outputs"
+      ],
+      "type": "object"
+    },
+    "VisionSizeSpec": {
+      "anyOf": [
+        {
+          "description": "A single edge length applied to both dimensions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "Explicit width and height.",
+          "properties": {
+            "height": {
+              "description": "Target height in pixels.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "width": {
+              "description": "Target width in pixels.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "width",
+            "height"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "A square size or an explicit width/height for a pixel transform."
+    },
+    "VisionTransform": {
+      "description": "One generic pixel transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
+      "properties": {
+        "canvas_pad_value": {
+          "description": "RGB canvas fill value applied before dynamic tiling.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "channel_order": {
+          "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coordinate_order": {
+          "description": "Patch-coordinate component order (`yx` or `xy`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flatten": {
+          "description": "Whether `patchify` flattens each patch into a single feature vector.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "fps": {
+          "description": "Frame rate a `sample_frames` operation resamples a clip to.\n\nTemporal parameters, like every other parameter here, are model DATA: a\npackage that preprocesses clips states its own sampling rate and frame\nbudget instead of a runtime inferring them from a model family.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "frame_stride": {
+          "description": "Stride, in decoded frames, between the frames `sample_frames` selects.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "include_thumbnail": {
+          "description": "Whether a `tile` operation also emits a global thumbnail tile.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "inputs": {
+          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "interpolation": {
+          "description": "Interpolation filter for a `resize` operation — generic string data.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mask_patch_size": {
+          "description": "Pixel edge represented by one validity-mask cell.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_patches": {
+          "description": "Maximum number of spatial patches for a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_pixels": {
+          "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_tiles": {
+          "description": "Maximum number of local tiles for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mean": {
+          "description": "Per-channel mean for a `normalize` operation (length is model data).",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "merge_size": {
+          "description": "Spatial patch-group edge controlling packed patch traversal order.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_pixels": {
+          "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "num_frames": {
+          "description": "Exact number of frames a `sample_frames` operation selects from a clip.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "$ref": "#/$defs/VisionTransformOp",
+          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`)."
+        },
+        "outputs": {
+          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `VisionOutputBinding::source`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "patch_order": {
+          "description": "Order patches are emitted in (`merge_groups`, the default, or `raster`).\nIndependent of `merge_size`, which only sets how many patches collapse\ninto one vision token.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "patch_size": {
+          "description": "Edge length of a square patch for a `patchify` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pooling_kernel_size": {
+          "description": "Spatial pooling edge used when resolving a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scale": {
+          "description": "Scalar multiplier for a `rescale` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VisionSizeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Target size for a `resize` operation."
+        },
+        "size_multiple": {
+          "description": "Required divisibility of both resized dimensions.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "std": {
+          "description": "Per-channel standard deviation for a `normalize` operation.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "target_length": {
+          "description": "Exact first-axis length produced by a `pad` operation, or the exact frame\ncount produced by a `pad_frames` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temporal_order": {
+          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "temporal_patch_size": {
+          "description": "Number of identical temporal frames packed into each spatial patch.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "thumbnail_interpolation": {
+          "description": "Interpolation filter used specifically for a global thumbnail.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thumbnail_order": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThumbnailOrder"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ordering of a global thumbnail relative to local tiles."
+        },
+        "tile_size": {
+          "description": "Edge length of a square tile for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "VisionTransformOp": {
+      "description": "Generic pixel transform-operation vocabulary.\n\nOne vocabulary spans stills and clips. A still-image program never\nselects frames; a clip program samples and pads them and then does\nthe same spatial work. `sample_frames` and `pad_frames` are the two\noperations a temporal axis adds, not a second program dialect.",
+      "oneOf": [
+        {
+          "enum": [
+            "decode",
+            "decode_rgb",
+            "convert_rgb",
+            "sample_frames",
+            "resize",
+            "rescale",
+            "normalize",
+            "tile",
+            "flatten",
+            "patchify",
+            "pad",
+            "pad_frames",
+            "emit_original_size",
+            "emit_transformed_size",
+            "emit_validity_mask",
+            "emit_patch_coordinates",
+            "emit_grid_coordinates"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "decode",
+              "decode_rgb",
+              "convert_rgb",
+              "sample_frames",
+              "resize",
+              "rescale",
+              "normalize",
+              "tile",
+              "flatten",
+              "patchify",
+              "pad",
+              "pad_frames",
+              "emit_original_size",
+              "emit_transformed_size",
+              "emit_validity_mask",
+              "emit_patch_coordinates",
+              "emit_grid_coordinates"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
       "properties": {
@@ -4954,6 +4615,17 @@
           "default": false,
           "description": "Allow an application to select another declared component with the same\nversioned contract ABI for this invocation.",
           "type": "boolean"
+        },
+        "batch_capacity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentBatchCapacity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How much one invocation of this component may carry.\n\nAbsence means one request row per invocation: a runtime that wants to\nserve two requests calls the component twice. That is the safe reading\nfor every component whose producer has not thought about batching, so it\nis the default. A component that declares a capacity is stating that its\nartifact accepts several contributions stacked on one axis, which is the\nfact a scheduler needs before it may coalesce work."
         },
         "cache_affects_state": {
           "description": "Non-dataflow facts that change this component's observable state.\n\nCache correctness dependencies of ONNX components are derived from the\nworkflow SSA graph. Native and external components must declare any\nadditional state they read that is not visible as a typed input.",
@@ -5196,7 +4868,7 @@
         "value_range": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ImageOutputValueRange"
+              "$ref": "#/$defs/PixelValueRange"
             },
             {
               "type": "null"
@@ -5525,7 +5197,7 @@
           "additionalProperties": false,
           "properties": {
             "axis": {
-              "description": "Axis along which the output grows; defaults to the final axis.",
+              "description": "Axis along which the output grows; defaults to the final axis.\n\nA rank-four or deeper value must name it: the final axis of a media\ntensor is a spatial extent, never the one an append concatenates.",
               "format": "uint",
               "minimum": 0,
               "type": [
@@ -5584,7 +5256,6 @@
           }
         },
         "required": [
-          "pipeline",
           "model"
         ]
       }
@@ -5667,7 +5338,7 @@
           "type": "null"
         }
       ],
-      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail."
+      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contracts: the still-image,\nvideo, and audio transform programs and their named tensor outputs.\nEvery operation and output is generic, parameterized data — never a\nmodel family, vendor string, or baked-in shape. Absent means the model\ndeclares no native preprocessing program and a runtime must obtain it\nelsewhere or fail."
     },
     "profiles": {
       "additionalProperties": {
@@ -5703,7 +5374,7 @@
       "type": "array"
     },
     "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1.1\"`.\n\nCanonically `\"v<major>.<minor>\"`, matching the `v1` that every writer in\nthis repository already stamps. Absence means the initial `v1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"`, `\"1.0\"` and `\"v1.0\"` that\npredate a canonical form; readers normalize before comparing, so all of\nthem keep loading and `\"1.1\"` is an accepted synonym for `\"v1.1\"`. A\ndocument that uses nothing new keeps stamping what it already stamped —\nrewriting an existing spelling would change the package's semantic\nidentity to say something no reader distinguishes. Bump the major only\nfor breaking schema changes, and the minor whenever a document may carry\na field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.\n\nThat is a statement about *additive* fields, and it is not a promise that\nthis schema never reshapes one it already had. It does, while it is\npre-release: `token_packed` moved its `offsets` and `owner` into a\n`levels` chain in v1.1, and a document written against the flat spelling\ndoes not load at any version. A version says which fields a reader must\nunderstand; it is not a compatibility guarantee spanning a reshape, and\nnothing here silently reads an old spelling as a new one. See\n`reject_flat_token_packed`.",
       "type": [
         "string",
         "null"

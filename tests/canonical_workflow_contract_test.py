@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import copy
 import glob
+import json
 import os
 import re
 from typing import Any
 
+import jsonschema
 import onnx_ir as ir
 import pytest
 import yaml
@@ -54,6 +56,18 @@ CAPACITY = 64
 DEEP_LAYERS = 12
 
 FIXTURE_ROOT = os.path.join(os.path.dirname(__file__), "fixtures", "onnx_genai_workflows")
+SCHEMA_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "src",
+    "mobius",
+    "integrations",
+    "onnx_genai",
+    "_schema",
+    "inference_metadata.schema.json",
+)
+with open(SCHEMA_PATH, encoding="utf-8") as _schema_handle:
+    ONNX_GENAI_SCHEMA = json.load(_schema_handle)
 
 
 def _text_config(**overrides: Any) -> ArchitectureConfig:
@@ -226,6 +240,12 @@ class TestOneSerializedContract:
     def test_the_workflow_is_where_a_package_describes_itself(self, package):
         _, metadata = package
         assert "workflow" in metadata["pipeline"]
+
+    def test_no_producer_emits_retired_batching_declarations(self, package):
+        _, metadata = package
+        serialized = yaml.safe_dump(metadata)
+        assert "batch_invariance:" not in serialized
+        assert "continuous_batching:" not in serialized
 
     def test_no_package_states_its_graph_abi_a_second_time(self, package):
         """The point of one representation is that there is no other one.
@@ -830,6 +850,24 @@ class TestCheckedInPackagesShareTheShape:
             os.path.join(directory, "inference_metadata.yaml"), encoding="utf-8"
         ) as handle:
             return yaml.safe_load(handle)
+
+    def test_no_fixture_contains_retired_batching_declarations(self, directory):
+        serialized = yaml.safe_dump(self._metadata(directory))
+        assert "batch_invariance:" not in serialized
+        assert "continuous_batching:" not in serialized
+
+    def test_fixture_validates_against_current_onnx_genai_schema(self, directory):
+        jsonschema.validate(self._metadata(directory), ONNX_GENAI_SCHEMA)
+
+    def test_fixture_matches_regenerated_metadata(
+        self, directory, materialized_workflow_packages
+    ):
+        relative = os.path.relpath(directory, FIXTURE_ROOT)
+        regenerated = os.path.join(
+            materialized_workflow_packages, relative, "inference_metadata.yaml"
+        )
+        with open(regenerated, encoding="utf-8") as handle:
+            assert self._metadata(directory) == yaml.safe_load(handle)
 
     @staticmethod
     def _artifact_root(directory: str, materialized: str) -> str:
