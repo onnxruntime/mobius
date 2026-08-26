@@ -31,6 +31,7 @@ from mobius.integrations.gguf._quant_registry import (
 )
 from mobius.integrations.gguf._runtime_evidence import runtime_evidence
 from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
+from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
 from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_evidence import iter_tokenizer_evidence
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
@@ -239,12 +240,17 @@ def _tokenizers() -> str:
         ),
         "|---|---|---|---|---|",
     ]
+    alias_proofs = tokenizer_alias_evidence()
     for record in tokenizer_route_census():
         disposition = (
             f"`{record.evidence_id}`"
             if record.evidence_id is not None
             else f"`{record.blocker_category}`"
         )
+        if record.identifier in alias_proofs:
+            disposition += (
+                f"; `llama-vocab.cpp:L{alias_proofs[record.identifier].dispatch_line}`"
+            )
         rows.append(
             f"| `{record.identifier}` | `{record.semantic_group}` / `{record.pre_type}` | "
             f"`{record.default_policy}` | `{record.current_status}` | {disposition} |"
@@ -326,6 +332,7 @@ def _tokenizer_evidence_table() -> str:
             f"`{evidence.source_config_asset[2]}`<br>{assets}"
         )
         proof = (
+            f"validated identifiers `{list(evidence.validated_identifiers)}`<br>"
             f"metadata `{evidence.tokenizer_metadata_sha256}`<br>"
             f"tokens {evidence.token_count:,} `{evidence.ordered_vocabulary_sha256}`<br>"
             f"merges {evidence.merge_count:,} `{evidence.ordered_merges_sha256}`<br>"
@@ -428,8 +435,10 @@ materialize_evidenced_gguf_tokenizer("Qwen3.5-0.8B-Q4_0.gguf", "tokenizer")
 
 Each row is independently artifact-scoped. Evidence proves ordered tokens, merges or scores,
 token types, special IDs, source pipeline/config assets, representative encodings, embedding
-alignment, any non-matchable padding extension, and the final materialized hash. It does not
-claim graph or runtime support.
+alignment, any non-matchable padding extension, and the final materialized hash. Shared rows
+additionally require every exact identifier to select the same implementation and flag overrides
+in pinned `llama-vocab.cpp`; the tokenizer matrix links each promoted route to its dispatch line.
+This does not claim graph or runtime support.
 
 ## Supported GGUF architectures
 

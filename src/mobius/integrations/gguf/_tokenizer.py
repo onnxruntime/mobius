@@ -947,6 +947,11 @@ def _validate_pinned_tokenizer(
         for index in range(tokenizer.get_vocab_size(with_added_tokens=True))
     ]
     token_types = metadata.get("tokenizer.ggml.token_type")
+    source_added_tokens = {
+        token["id"]: token
+        for token in tokenizer_json.get("added_tokens", ())
+        if isinstance(token, Mapping) and isinstance(token.get("id"), int)
+    }
     reconstructed = _reconstruct_missing_added_tokens(
         tokenizer_json,
         config,
@@ -1008,11 +1013,6 @@ def _validate_pinned_tokenizer(
             raise ValueError(
                 f"Pinned tokenizer identity cannot prove GGUF token types {unsupported_types}"
             )
-        source_added_tokens = {
-            token["id"]: token
-            for token in tokenizer_json.get("added_tokens", ())
-            if isinstance(token, Mapping) and isinstance(token.get("id"), int)
-        }
         expected_non_special_added_ids = {
             index for index, token_type in enumerate(token_types) if token_type == 4
         }
@@ -1047,6 +1047,13 @@ def _validate_pinned_tokenizer(
             continue
         raw_value = config.get(config_name, special_map.get(config_name))
         if raw_value is None:
+            source_token = source_added_tokens.get(expected_id)
+            if (
+                source_token is not None
+                and source_token.get("content") == expected_tokens[expected_id]
+                and source_token.get("special") is True
+            ):
+                continue
             if (
                 config_name == "bos_token"
                 and metadata.get("tokenizer.ggml.add_bos_token") is False
