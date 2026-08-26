@@ -29,6 +29,10 @@ from mobius.integrations.gguf._quant_registry import (
     iter_quant_specs,
     render_quant_support_matrix,
 )
+from mobius.integrations.gguf._route_census import (
+    RECENT_PR_DEPENDENCIES,
+    render_remaining_route_batches,
+)
 from mobius.integrations.gguf._runtime_evidence import runtime_evidence
 from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
 from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
@@ -273,6 +277,7 @@ def render_blocks() -> dict[str, str]:
         "qtypes": _qtypes(),
         "projectors": _projectors(),
         "tokenizers": _tokenizers(),
+        "remaining_routes": render_remaining_route_batches(),
     }
 
 
@@ -394,6 +399,10 @@ def _projector_evidence_table() -> str:
 def render_document() -> str:
     """Render the complete concise API document from live registries and evidence."""
     blocks = render_blocks()
+    recent_prs = "; ".join(
+        f"#{record.number} ({record.state_at_audit}) — {record.dependency}"
+        for record in RECENT_PR_DEPENDENCIES
+    )
     return f"""# `build_from_gguf()`
 
 Build ONNX packages directly from GGUF metadata and tensors without tracing PyTorch.
@@ -457,6 +466,15 @@ evidence match.
 {_runtime_evidence_table()}
 
 Runtime support above is independent from tokenizer materialization support below.
+
+## Remaining route work
+
+Every unresolved route is classified once from its authoritative registry. Exact reasons
+remain machine-readable in `_route_census.py`; this table groups only shared next work.
+
+{blocks["remaining_routes"]}
+
+Recent PR dependencies: {recent_prs}.
 
 ## Tokenizer evidence
 
