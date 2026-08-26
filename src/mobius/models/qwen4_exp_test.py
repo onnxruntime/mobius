@@ -209,9 +209,7 @@ def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache(interle
     sin_data = rng.normal(size=(1, 3, 2)).astype(np.float32)
     session = OnnxModelSession(model)
     try:
-        actual = session.run({"value": value_data, "cos": cos_data, "sin": sin_data})[
-            "output"
-        ]
+        actual = session.run({"value": value_data, "cos": cos_data, "sin": sin_data})["output"]
     finally:
         session.close()
 
