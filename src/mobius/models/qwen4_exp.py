@@ -73,21 +73,21 @@ def validate_qwen4_exp_fp8_header_contract(
     for weight_name, (_path, weight_shape, weight_dtype) in key_index.items():
         if not weight_dtype.startswith("F8"):
             continue
-        scale_name = (
-            weight_name[: -len(".weight")] + ".weight_scale_inv"
-            if weight_name.endswith(".weight")
-            else weight_name + "_scale_inv"
-        )
-        scale_entry = key_index.get(scale_name)
-        if scale_entry is None:
-            if ".ple.ple_embedding.ngram_embedding.shard_" not in weight_name:
-                raise ValueError(
-                    f"Qwen4-Exp FP8 source '{weight_name}' has no scale and is "
-                    "not a PLE embedding shard with the pinned shared scalar"
-                )
+        if weight_dtype != "F8_E4M3":
+            raise ValueError(
+                f"Qwen4-Exp FP8 source '{weight_name}' has dtype {weight_dtype}; "
+                "the pinned checkpoint requires F8_E4M3"
+            )
+        if ".ple.ple_embedding.ngram_embedding.shard_" in weight_name:
             if len(weight_shape) != 2:
                 raise ValueError(
                     f"Qwen4-Exp scalar-scaled PLE source '{weight_name}' must be 2-D"
+                )
+            per_shard_scale = weight_name[: -len(".weight")] + ".weight_scale_inv"
+            if per_shard_scale in key_index:
+                raise ValueError(
+                    f"Qwen4-Exp PLE source '{weight_name}' has forbidden per-shard "
+                    f"scale '{per_shard_scale}'; the pinned layout uses one shared scalar"
                 )
             ple_scale_name = _qwen4_exp_ple_scale_name(weight_name)
             ple_scale = key_index.get(ple_scale_name)
@@ -105,6 +105,15 @@ def validate_qwen4_exp_fp8_header_contract(
             consumed_scales.add(ple_scale_name)
             scalar_scaled_ple += 1
             continue
+
+        scale_name = (
+            weight_name[: -len(".weight")] + ".weight_scale_inv"
+            if weight_name.endswith(".weight")
+            else weight_name + "_scale_inv"
+        )
+        scale_entry = key_index.get(scale_name)
+        if scale_entry is None:
+            raise ValueError(f"Qwen4-Exp FP8 source '{weight_name}' has no scale")
         _scale_path, scale_shape, scale_dtype = scale_entry
         if len(weight_shape) != 2:
             raise ValueError(f"Qwen4-Exp scaled FP8 source '{weight_name}' must be 2-D")
@@ -1378,10 +1387,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 else source_name + "_scale_inv"
             )
             if source_dtype.startswith("F8"):
-                if scale_name in key_index:
-                    mode = "fp8_block_128"
-                    source = StreamingWeightSource(source_name, mode, scale_name)
-                elif ".ple.ple_embedding.ngram_embedding.shard_" in source_name:
+                if ".ple.ple_embedding.ngram_embedding.shard_" in source_name:
                     scale_name = _qwen4_exp_ple_scale_name(source_name)
                     mode = "fp8_scalar"
                     source = StreamingWeightSource(
@@ -1390,6 +1396,9 @@ class Qwen4ExpCausalLMModel(nn.Module):
                         scale_name,
                         expected_scale=_PINNED_PLE_WEIGHT_SCALE,
                     )
+                elif scale_name in key_index:
+                    mode = "fp8_block_128"
+                    source = StreamingWeightSource(source_name, mode, scale_name)
                 else:
                     raise ValueError(
                         f"Qwen4-Exp FP8 source '{source_name}' has no scale and is "

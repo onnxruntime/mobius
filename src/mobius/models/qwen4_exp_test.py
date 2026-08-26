@@ -1283,6 +1283,11 @@ def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_pat
     assert report["scalar_scaled_fp8_tensors"] == config.split_ngram_parts
     assert report["checkpoint_scalar_scaled_fp8_tensors"] == config.split_ngram_parts
     assert report["mtp_exported"] is False
+    assert report["largest_source_tensor_bytes"] > 0
+    assert (
+        report["largest_reconstruction_working_set_bytes"]
+        > report["largest_source_tensor_bytes"]
+    )
 
 
 def test_fp8_streaming_plan_rejects_unscaled_projection():
@@ -1330,6 +1335,66 @@ def test_fp8_streaming_plan_requires_ple_scalar():
     }
 
     with pytest.raises(ValueError, match="missing shared scalar"):
+        module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+
+def test_fp8_streaming_plan_rejects_per_shard_ple_scale():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    weight_name = (
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    )
+    weight = source[weight_name]
+    source[weight_name[: -len(".weight")] + ".weight_scale_inv"] = torch.ones(
+        (
+            (weight.shape[0] + 127) // 128,
+            (weight.shape[1] + 127) // 128,
+        ),
+        dtype=torch.bfloat16,
+    )
+    index = {
+        name: (
+            "shard.safetensors",
+            list(tensor.shape),
+            "F8_E4M3"
+            if tensor.dtype == torch.float8_e4m3fn
+            else "BF16"
+            if tensor.dtype == torch.bfloat16
+            else "I64",
+        )
+        for name, tensor in source.items()
+    }
+
+    with pytest.raises(ValueError, match="forbidden per-shard scale"):
+        module.build_fp8_streaming_plan(index, model.graph.initializers)
+
+
+def test_fp8_streaming_plan_rejects_e5m2_ple_storage():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
+    source, _dense = _reduced_fp8_checkpoint(module)
+    weight_name = (
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    )
+    index = {
+        name: (
+            "shard.safetensors",
+            list(tensor.shape),
+            "F8_E4M3"
+            if tensor.dtype == torch.float8_e4m3fn
+            else "BF16"
+            if tensor.dtype == torch.bfloat16
+            else "I64",
+        )
+        for name, tensor in source.items()
+    }
+    path, shape, _dtype = index[weight_name]
+    index[weight_name] = (path, shape, "F8_E5M2")
+
+    with pytest.raises(ValueError, match="pinned checkpoint requires F8_E4M3"):
         module.build_fp8_streaming_plan(index, model.graph.initializers)
 
 

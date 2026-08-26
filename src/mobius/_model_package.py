@@ -486,11 +486,20 @@ class ModelPackage(UserDict[str, ir.Model]):
                 **self.weight_loading_report,
                 "external_data_shard_limit_bytes": max_shard_size_bytes,
                 "largest_dense_tensor_bytes": largest_tensor_bytes,
+                "largest_reconstruction_working_set_bytes": max(
+                    int(
+                        self.weight_loading_report.get(
+                            "largest_reconstruction_working_set_bytes",
+                            0,
+                        )
+                    ),
+                    largest_tensor_bytes,
+                ),
                 "serializer_max_workers": max_workers,
                 "serialization_memory_bound": (
-                    "one output shard plus the largest reconstructed tensor and "
-                    "serializer overhead; external-data serialization is forced "
-                    "to one worker"
+                    "one output shard plus the largest source+dense+scale "
+                    "reconstruction working set and serializer overhead; "
+                    "external-data serialization is forced to one worker"
                 ),
             }
         use_subfolders = len(selected) > 1

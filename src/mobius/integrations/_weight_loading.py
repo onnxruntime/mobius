@@ -28,6 +28,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import pathlib
 from collections.abc import Callable, Mapping
 from typing import Literal
@@ -49,6 +50,15 @@ _WEIGHT_INDEX_NAME = "model.safetensors.index.json"
 _SINGLE_WEIGHT_NAME = "model.safetensors"
 _PYTORCH_WEIGHT_INDEX_NAME = "pytorch_model.bin.index.json"
 _SINGLE_PYTORCH_WEIGHT_NAME = "pytorch_model.bin"
+_SAFETENSORS_DTYPE_BYTES = {
+    "BF16": 2,
+    "F16": 2,
+    "F32": 4,
+    "F64": 8,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I64": 8,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -586,7 +596,8 @@ def _assign_lazy_preprocessed(
                     f"FP8 scalar source '{k}' has scale {actual_scale}; "
                     f"expected pinned value {expected_scale}"
                 )
-            tensor = tensor.to(dt) * scale.to(dt)
+            tensor = tensor.to(dt)
+            tensor.mul_(scale.to(dt))
         elif mode == "direct":
             if source_dtype.startswith("F8"):
                 raise ValueError(
@@ -632,12 +643,15 @@ def stream_preprocessed_safetensors_to_model(
     consumed = set(plan.ignored) | set(plan.constants)
     assigned: set[str] = set()
     validated_scalar_scales: dict[str, float] = {}
+    largest_source_tensor_bytes = 0
+    largest_reconstruction_working_set_bytes = 0
     for target_name, source in plan.targets.items():
         initializer = model.graph.initializers.get(target_name)
         if initializer is None:
             raise ValueError(f"Streaming plan targets unknown initializer '{target_name}'")
         if initializer.const_value is not None:
             raise ValueError(f"Streaming plan targets constant initializer '{target_name}'")
+        assert initializer.dtype is not None
         if source.source_name not in key_index:
             raise ValueError(f"Streaming source '{source.source_name}' does not exist")
         source_path, source_shape, source_dtype = key_index[source.source_name]
@@ -697,6 +711,29 @@ def stream_preprocessed_safetensors_to_model(
                         f"{actual_scale}; expected pinned value {source.expected_scale}"
                     )
             consumed.add(source.scale_name)
+        source_element_bytes = _SAFETENSORS_DTYPE_BYTES.get(source_dtype)
+        if source_element_bytes is None:
+            raise ValueError(
+                f"Streaming source '{source.source_name}' has unsupported byte-size "
+                f"dtype {source_dtype}"
+            )
+        source_bytes = math.prod(source_shape) * source_element_bytes
+        target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
+        scale_bytes = 0
+        if source.scale_name is not None:
+            _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+            scale_element_bytes = _SAFETENSORS_DTYPE_BYTES.get(scale_dtype)
+            if scale_element_bytes is None:
+                raise ValueError(
+                    f"Streaming scale '{source.scale_name}' has unsupported "
+                    f"byte-size dtype {scale_dtype}"
+                )
+            scale_bytes = math.prod(scale_shape) * scale_element_bytes
+        largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+        largest_reconstruction_working_set_bytes = max(
+            largest_reconstruction_working_set_bytes,
+            source_bytes + target_bytes + scale_bytes,
+        )
         _assign_lazy_preprocessed(initializer, source, key_index, target_name)
         consumed.add(source.source_name)
         assigned.add(target_name)
@@ -741,6 +778,8 @@ def stream_preprocessed_safetensors_to_model(
         "assigned_tensors": len(assigned),
         "validated_constants": len(plan.constants),
         "ignored_tensors": len(plan.ignored),
+        "largest_source_tensor_bytes": largest_source_tensor_bytes,
+        "largest_reconstruction_working_set_bytes": (largest_reconstruction_working_set_bytes),
         **dict(plan.report),
     }
     model.metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
