@@ -450,7 +450,7 @@ and gives every route an exact evidence ID or concrete compiled-semantics blocke
 | `stablelm2` | `stablelm2` / `STABLELM2` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 | `starcoder` | `starcoder` / `STARCODER` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 | `superbpe` | `superbpe` / `SUPERBPE` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
-| `talkie` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-artifact-source-parity-pending`; `llama-vocab.cpp:L2310` |
+| `talkie` | `gpt-4o` / `GPT4O` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-candidate-source-merge-mismatch`; `PocketAiHub/talkie-1930-13b-it-GGUF@47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694` / `talkie-1930-13b-it-Q4_K_M.gguf` vs `lewtun/talkie-1930-13b-it-hf@6311dedf518470856a8503f2080bb4b54fcb3323`: transformed GGUF retains 65279 of 156379 official merges; first ordered mismatch at index 4 is ('Ġ', 'the') versus ('Ġt', 'he'); `llama-vocab.cpp:L2310` |
 | `tekken` | `tekken` / `TEKKEN` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |
 | `tiny_aya` | `tiny_aya` / `TINY_AYA` | `deferred` | `deferred-pinned-artifact-evidence` | `pinned-artifact-source-parity-pending`; `llama-vocab.cpp:L2319` |
 | `trillion` | `trillion` / `TRILLION` | `deferred` | `deferred-compiled-semantics` | `compiled-llama.cpp-semantic-dependency` |

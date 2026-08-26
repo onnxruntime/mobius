@@ -130,6 +130,17 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     assert jina_v1.candidate_disposition is not None
     assert "token id 5" in jina_v1.candidate_disposition
 
+    talkie = next(record for record in census if record.identifier == "talkie")
+    assert talkie.blocker_category == "pinned-candidate-source-merge-mismatch"
+    assert talkie.artifact_revision == "47b38329dd30e8b2d6ab8e2fc53f3f2ae789e694"
+    assert talkie.artifact_size == 8_571_072_704
+    assert talkie.artifact_sha256 == (
+        "2d6c6c1d98a1b8ffa38b50916454891a31ad844ee69c686e525976867917d7b2"
+    )
+    assert talkie.tokenizer_revision == "6311dedf518470856a8503f2080bb4b54fcb3323"
+    assert talkie.candidate_disposition is not None
+    assert "65279 of 156379 official merges" in talkie.candidate_disposition
+
 
 def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:
     path = Path(__file__).parents[4] / "tests/data/gguf_tokenizer_alias_batch2.json"
