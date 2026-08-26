@@ -145,10 +145,6 @@ def _all_registered_with_test_id() -> dict[str, str]:
 #   - CausalLM / other models without YAML
 #
 _COVERAGE_SKIP: dict[str, str] = {
-    "qwen4_exp": "Composite alias shares the pinned qwen4_exp_text L2 config route; "
-    "full multimodal coverage belongs to the dependent multimodal PR.",
-    "Qwen4ExpForConditionalGeneration": "Architecture-class alias shares the pinned "
-    "qwen4_exp_text L2 config and graph implementation.",
     # --- Specialized-test models (covered by a co-located test class) ---
     "neo_chat": "SenseNova U1.5 is a 17.5B (~50 GB) five-component package; "
     "L1-L3 use the tiny config and co-located tests, while pinned L4/L5 text, "

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Mapping
 from typing import ClassVar
 

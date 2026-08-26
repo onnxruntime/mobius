@@ -684,7 +684,6 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_revision="41cc25fe32cc20053a59c89716196897580cddf6",
         family="qwen",
         variant="moe+gdn+qsa+ple",
-        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "Qwen4ExpForConditionalGeneration": ModelRegistration(
         Qwen4ExpForConditionalGeneration,

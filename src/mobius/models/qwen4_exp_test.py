@@ -210,36 +210,6 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert config.block_quant_scheme is not None
     assert config.block_quant_scheme.weight_block_size == (128, 128)
 
-
-def test_immutable_fp8_schema_fixture_matches_integration_contract():
-    fixture_path = (
-        pathlib.Path(__file__).parents[3]
-        / "testdata/evidence/causal-lm/qwen3.8-flash-next-fp8-schema.json"
-    )
-    fixture = json.loads(fixture_path.read_text())
-    source = fixture["source_checkpoint"]
-    quantization = fixture["quantization_contract"]
-    export = fixture["mobius_export"]
-
-    assert source["repository"] == "unsloth/Qwen3.8-Flash-Next-FP8"
-    assert source["revision"] == "41cc25fe32cc20053a59c89716196897580cddf6"
-    assert source["index"]["tensor_payload_bytes"] == 185_502_232_570
-    assert source["shards"]["count"] == 131
-    assert fixture["header_census"]["tensor_count"] == 152_089
-    assert quantization["weight_block_size"] == [128, 128]
-    assert quantization["scaled_fp8_pairs"]["text_core"] == 73_728
-    assert quantization["scaled_fp8_pairs"]["invalid_or_missing_grids"] == 0
-    ple = quantization["ple_scalar_scaled"]
-    assert ple["count"] == 128
-    assert ple["scale_tensor_count"] == 1
-    assert ple["scale_bfloat16_bits"] == "0x3951"
-    assert ple["scale_value_float32"] == _PINNED_PLE_WEIGHT_SCALE
-    assert export["native_fp8"] is False
-    assert export["multimodal_package_complete"] is False
-    assert export["mtp_exported"] is False
-    assert export["excluded_tensors"]["mtp"]["count"] == 3_101
-    assert export["excluded_tensors"]["visual"]["count"] == 333
-
     parent = SimpleNamespace(
         model_type="qwen4_exp",
         architectures=["Qwen4ExpForConditionalGeneration"],
@@ -284,6 +254,36 @@ def test_immutable_fp8_schema_fixture_matches_integration_contract():
     parent.video_token_id = 42
     with pytest.raises(ValueError, match="video_token_id 248057"):
         Qwen4ExpConfig.from_transformers(parent)
+
+
+def test_immutable_fp8_schema_fixture_matches_integration_contract():
+    fixture_path = (
+        pathlib.Path(__file__).parents[3]
+        / "testdata/evidence/causal-lm/qwen3.8-flash-next-fp8-schema.json"
+    )
+    fixture = json.loads(fixture_path.read_text())
+    source = fixture["source_checkpoint"]
+    quantization = fixture["quantization_contract"]
+    export = fixture["mobius_export"]
+
+    assert source["repository"] == "unsloth/Qwen3.8-Flash-Next-FP8"
+    assert source["revision"] == "41cc25fe32cc20053a59c89716196897580cddf6"
+    assert source["index"]["tensor_payload_bytes"] == 185_502_232_570
+    assert source["shards"]["count"] == 131
+    assert fixture["header_census"]["tensor_count"] == 152_089
+    assert quantization["weight_block_size"] == [128, 128]
+    assert quantization["scaled_fp8_pairs"]["text_core"] == 73_728
+    assert quantization["scaled_fp8_pairs"]["invalid_or_missing_grids"] == 0
+    ple = quantization["ple_scalar_scaled"]
+    assert ple["count"] == 128
+    assert ple["scale_tensor_count"] == 1
+    assert ple["scale_bfloat16_bits"] == "0x3951"
+    assert ple["scale_value_float32"] == _PINNED_PLE_WEIGHT_SCALE
+    assert export["native_fp8"] is False
+    assert export["multimodal_package_complete"] is False
+    assert export["mtp_exported"] is False
+    assert export["excluded_tensors"]["mtp"]["count"] == 3_101
+    assert export["excluded_tensors"]["visual"]["count"] == 333
 
 
 def test_mtp_metadata_is_preserved_but_dedicated_execution_fails_closed():
