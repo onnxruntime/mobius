@@ -974,7 +974,14 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("gpt2",),
         tensor_processor="gpt2",
         runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because canonical GPT-2 GGUF "
+            "projections must be transposed into graph order, and the current packed "
+            "route cannot transpose values together with their scales and zero-points. "
+            "Use keep_quantized=False for explicit float import."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="mamba",

@@ -31,6 +31,7 @@ Usage::
 from __future__ import annotations
 
 __all__ = [
+    "PACKED_SAFE_PROCESSORS",
     "process_tensors",
     "_reverse_permute",
     "needs_llama_qk_permute",
@@ -587,6 +588,23 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "bloom": _process_bloom,
     "xverse": _process_xverse,
 }
+
+# Processors in this set either touch only tensors that stay floating-point or
+# have an equivalent packed-domain transform in ``_builder._load_gguf_weights``.
+# Any architecture using another processor must reject ``keep_quantized=True``:
+# skipping a projection transform changes represented values even if the packed
+# bytes, scales, and zero-points individually remain well-formed.
+PACKED_SAFE_PROCESSORS = frozenset(
+    {
+        "kimi_k3",
+        "kimi_linear",
+        "llama",
+        "mamba",
+        "muse_glimmer",
+        "plamo2",
+        "unoffset_norm",
+    }
+)
 
 #: mobius ``model_type`` values that no GGUF architecture maps to, but that a
 #: caller may pass directly in a hand-built config.
