@@ -71,6 +71,22 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+_BITNET_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_sub_norm": "model.layers.{bid}.self_attn.attn_sub_norm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_sub_norm": "model.layers.{bid}.mlp.ffn_sub_norm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
 _LEGACY_LAYERNORM_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
     "output": "lm_head",
@@ -1063,6 +1079,7 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "bitnet": _BITNET_MAPPING,
         "legacy_layernorm": _LEGACY_LAYERNORM_MAPPING,
         "exact_legacy_gguf_extras": _EXACT_LEGACY_GGUF_EXTRAS,
         "bloom": _BLOOM_MAPPING,

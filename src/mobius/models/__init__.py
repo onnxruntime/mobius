@@ -11,6 +11,7 @@ __all__ = [
     "BambaCausalLMModel",
     "BartForConditionalGeneration",
     "BertModel",
+    "BitNetCausalLMModel",
     "Blip2Model",
     "BloomCausalLMModel",
     "CLIPVisionModel",
@@ -213,6 +214,7 @@ from mobius.models.base import (
     LayerNormCausalLMModel,
 )
 from mobius.models.bert import BertModel
+from mobius.models.bitnet import BitNetCausalLMModel
 from mobius.models.blip2 import Blip2Model
 from mobius.models.chatglm import ChatGLMCausalLMModel
 from mobius.models.clip import CLIPVisionModel, SigLIPVisionModel

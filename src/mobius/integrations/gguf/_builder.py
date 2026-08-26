@@ -522,6 +522,7 @@ def _validate_gguf_model(
         tensor_names=gguf_model.tensor_names,
         allow_mmproj_companion=allow_mmproj_companion,
     )
+    _raise_for_invalid_bitnet_tensor_contract(gguf_model)
     from mobius.integrations.gguf._mtp import validate_mtp_tensor_contract
 
     validate_mtp_tensor_contract(gguf_model)
@@ -551,6 +552,126 @@ def _validate_gguf_model(
         # known-but-deferred tokenizer is allowed for graph-only imports; an
         # unknown or contradictory tokenizer is not.
         inspect_gguf_tokenizer(gguf_model.metadata, source=source)
+
+
+def _raise_for_invalid_bitnet_tensor_contract(gguf_model) -> None:
+    """Validate the exact pinned BitNet metadata and tensor closure."""
+    if gguf_model.architecture != "bitnet":
+        return
+
+    architecture = "bitnet"
+    metadata = gguf_model.metadata
+    required_geometry = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.layer_norm_rms_epsilon",
+        "rope.freq_base",
+        "rope.dimension_count",
+    )
+    missing_geometry = [
+        f"{architecture}.{suffix}"
+        for suffix in required_geometry
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_geometry:
+        raise ValueError(
+            f"BitNet GGUF is missing required architecture metadata: {missing_geometry}"
+        )
+
+    context = int(metadata["bitnet.context_length"])
+    hidden = int(metadata["bitnet.embedding_length"])
+    intermediate = int(metadata["bitnet.feed_forward_length"])
+    layers = int(metadata["bitnet.block_count"])
+    heads = int(metadata["bitnet.attention.head_count"])
+    kv_heads = int(metadata["bitnet.attention.head_count_kv"])
+    rope_dim = int(metadata["bitnet.rope.dimension_count"])
+    norm_eps = float(metadata["bitnet.attention.layer_norm_rms_epsilon"])
+    rope_base = float(metadata["bitnet.rope.freq_base"])
+    vocab = int(metadata.get("bitnet.vocab_size", 0))
+    if not vocab:
+        vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
+
+    if (
+        min(context, hidden, intermediate, layers, heads, kv_heads, rope_dim, vocab) <= 0
+        or hidden % heads
+        or heads % kv_heads
+        or not math.isfinite(norm_eps)
+        or norm_eps <= 0
+        or not math.isfinite(rope_base)
+        or rope_base <= 0
+    ):
+        raise ValueError("BitNet GGUF has inconsistent architecture geometry or metadata")
+
+    head_dim = hidden // heads
+    key_dim = int(metadata.get("bitnet.attention.key_length", head_dim))
+    value_dim = int(metadata.get("bitnet.attention.value_length", head_dim))
+    if key_dim != head_dim or value_dim != head_dim or rope_dim != head_dim or rope_dim % 2:
+        raise ValueError(
+            "BitNet GGUF requires equal full attention/RoPE head widths: "
+            f"embedding_length/head_count={head_dim}, key_length={key_dim}, "
+            f"value_length={value_dim}, rope.dimension_count={rope_dim}"
+        )
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {}
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_sub_norm.weight": (hidden,),
+                prefix + "attn_q.weight": (q_width, hidden),
+                prefix + "attn_k.weight": (kv_width, hidden),
+                prefix + "attn_v.weight": (kv_width, hidden),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_sub_norm.weight": (intermediate,),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+        )
+        for projection in (
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ):
+            optional[prefix + projection + ".scale"] = (1,)
+
+    # The pinned graph has no independent output tensor: token_embd.weight is
+    # shared by input lookup and the final projection.
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+    }
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    expected = {**required, **optional}
+    malformed = {
+        name: (expected[name], actual[name])
+        for name in set(actual) & allowed
+        if actual[name] != expected[name]
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid BitNet GGUF tensor closure (the output projection must be tied to "
+            "token_embd.weight): "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
 
 
 def _raise_for_invalid_minimax_tensor_contract(gguf_model) -> None:
@@ -4258,6 +4379,12 @@ def _raise_for_unsupported_auxiliary_quantization(gguf_model) -> None:
                 f"Invalid GGUF auxiliary quantization tensor {gguf_name!r}: "
                 f"expected shape {expected}, got {actual}"
             )
+        if architecture == "bitnet" and suffix == ".scale":
+            # BitNet's pinned loader treats this optional [1] tensor as an
+            # output multiplier for the paired projection. The architecture
+            # processor folds it into the dequantized matrix on the explicit
+            # float route; it is not a target quantization sidecar.
+            continue
         raise ValueError(
             f"GGUF auxiliary quantization tensor {gguf_name!r} maps to {hf_name!r}, "
             "but Mobius cannot represent GGUF scale/input_scale sidecars "

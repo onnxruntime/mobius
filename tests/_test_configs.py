@@ -144,6 +144,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     # === Text Generation (Llama-compatible) ===
     ("llama", {}, True),
     (
+        "bitnet",
+        {
+            "hidden_act": "relu2",
+            "tie_word_embeddings": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    (
         "lfm2",
         {
             "_config_cls": Lfm2Config,

@@ -50,6 +50,7 @@ from mobius._configs import (
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
+    BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
     CodeShellCausalLMModel,
@@ -465,6 +466,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     # --- Text Generation (architecture-specific) ---
     "apertus": ModelRegistration(ApertusCausalLMModel),
     "arcee": ModelRegistration(ArceeCausalLMModel),
+    "bitnet": ModelRegistration(BitNetCausalLMModel),
     "bloom": ModelRegistration(BloomCausalLMModel),
     "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
@@ -1040,6 +1042,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "baichuan": "baichuan-inc/Baichuan2-7B-Chat",
     "apertus": "swiss-ai/Apertus-8B-Instruct-2509",
     "arcee": "arcee-ai/AFM-4.5B-Base",
+    "bitnet": "microsoft/bitnet-b1.58-2B-4T",
     "diffllama": "kajuma/DiffLlama-0.3B-handcut",
     "doge": "SmallDoge/Doge-20M",
     "dots1": "rednote-hilab/dots.llm1.inst",

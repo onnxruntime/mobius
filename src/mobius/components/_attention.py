@@ -399,8 +399,12 @@ class Attention(nn.Module):
             static_cache=static_cache,
         )
 
-        attn_output = self.o_proj(op, attn_output)
+        attn_output = self._project_output(op, attn_output)
         return attn_output, (present_key, present_value)
+
+    def _project_output(self, op: OpBuilder, attn_output: ir.Value) -> ir.Value:
+        """Apply architecture-specific processing before the output projection."""
+        return self.o_proj(op, attn_output)
 
     def _forward_gqa(
         self,
@@ -458,7 +462,7 @@ class Attention(nn.Module):
             **gqa_attrs,
         )
 
-        attn_out = self.o_proj(op, attn_out)
+        attn_out = self._project_output(op, attn_out)
         return attn_out, (present_key, present_value)
 
 

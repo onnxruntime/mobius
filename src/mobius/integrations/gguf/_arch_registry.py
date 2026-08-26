@@ -93,6 +93,16 @@ _NO_QUANTIZED_PROJECTION_REASON = (
     "weights. Use keep_quantized=False for explicit float import."
 )
 
+_BITNET_IMPORT_REASON = (
+    "The exact float route is implemented: TQ1_0/TQ2_0 blocks are dequantized by "
+    "the pinned gguf reader, optional scalar projection scales are folded into those "
+    "values, and the dedicated graph owns both sub-norms. Quantization-preserving "
+    "import is rejected because the current MatMulNBits ABI is affine and cannot "
+    "represent BitNet's ternary codebook plus architecture-level scalar sidecars "
+    "without an independently value-proven repack. Runtime packaging remains "
+    "deferred pending real full-logit prefill and cached-decode parity."
+)
+
 _ARCTIC_GGUF_GRAPH_REASON = (
     "The pinned Arctic graph is not a standard pre-norm MoE block: every layer runs a "
     "dense parallel SwiGLU branch, then adds a separately normalized routed-expert branch "
@@ -621,6 +631,18 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
 
 
 _SPECS: tuple[GGUFArchitectureSpec, ...] = (
+    # --------------------------------------------------------------- BitNet
+    GGUFArchitectureSpec(
+        gguf_arch="bitnet",
+        model_type="bitnet",
+        tensor_map_recipe=("bitnet",),
+        tensor_processor="bitnet",
+        llama_qk_permute=True,
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        quantized_import=Support.REJECTED,
+        runtime=Support.DEFERRED,
+        reason=_BITNET_IMPORT_REASON,
+    ),
     # ---------------------------------------------------------------- Llama
     GGUFArchitectureSpec(
         gguf_arch="llama",
@@ -2183,6 +2205,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         for architecture, reason in _FINAL_CENSUS_DEFERRED_REASONS.items()
         if architecture
         not in {
+            "bitnet",
             "codeshell",
             "command-r",
             "ernie4_5",
