@@ -5,19 +5,33 @@
 
 from __future__ import annotations
 
-__all__ = ["DOC_PATH", "check_document", "render_blocks", "update_document"]
+__all__ = [
+    "DOC_PATH",
+    "check_document",
+    "render_blocks",
+    "render_document",
+    "update_document",
+]
 
 import re
 from collections import Counter
 from pathlib import Path
 
-from mobius.integrations.gguf._arch_registry import iter_arch_specs
-from mobius.integrations.gguf._mmproj_registry import iter_projector_specs
+from mobius.integrations.gguf._arch_registry import (
+    _RUNTIME_VALIDATION_PENDING,
+    iter_arch_specs,
+)
+from mobius.integrations.gguf._mmproj_registry import (
+    MMPROJ_ARTIFACT_PINS,
+    iter_projector_specs,
+)
 from mobius.integrations.gguf._quant_registry import (
     iter_quant_specs,
     render_quant_support_matrix,
 )
-from mobius.integrations.gguf._spec import StorageRole, Support
+from mobius.integrations.gguf._runtime_evidence import runtime_evidence
+from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
+from mobius.integrations.gguf._tokenizer_evidence import tokenizer_evidence
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 from mobius.integrations.gguf._upstream import (
     UPSTREAM_COMMIT,
@@ -26,26 +40,6 @@ from mobius.integrations.gguf._upstream import (
 )
 
 DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
-
-_MARKERS = {
-    "summary": ("<!-- BEGIN GGUF CLOSURE SUMMARY -->", "<!-- END GGUF CLOSURE SUMMARY -->"),
-    "architectures": (
-        "<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->",
-        "<!-- END GGUF SUPPORT MATRIX -->",
-    ),
-    "qtypes": (
-        "<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->",
-        "<!-- END GGUF QUANTIZATION MATRIX -->",
-    ),
-    "projectors": (
-        "<!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->",
-        "<!-- END GGUF MMPROJ SUPPORT MATRIX -->",
-    ),
-    "tokenizers": (
-        "<!-- BEGIN GGUF TOKENIZER PRE SUPPORT MATRIX -->",
-        "<!-- END GGUF TOKENIZER PRE SUPPORT MATRIX -->",
-    ),
-}
 
 
 def _cell(value: object) -> str:
@@ -101,7 +95,7 @@ def _summary() -> str:
                 f"| Tokenizer pre identifiers | {len(tokenizers)} | "
                 f"{len({policy.canonical for policy in tokenizers.values()})} semantic groups; "
                 "all default to deferred and become materializable only from a validated embedded "
-                "`tokenizer.huggingface.json` or an exact pinned source in runtime evidence |"
+                "`tokenizer.huggingface.json` or exact artifact-scoped tokenizer evidence |"
             ),
             "",
             (
@@ -110,13 +104,60 @@ def _summary() -> str:
                 "`REJECTED` means the input or route is invalid by policy. Graph support proves "
                 "construction/execution only; runtime support additionally requires a pinned real "
                 "artifact, independent parity, and deterministic generation or stateful semantics. "
-                "Tokenizer `copy` delegates algorithm semantics to an embedded, "
-                "vocabulary-identical tokenizer JSON. A `pinned-source` route additionally binds "
-                "an immutable Hub revision, exact asset hashes, and all reconstructible GGUF "
-                "tokenizer semantics."
+                "Tokenizer `copy` requires embedded ordered-vocabulary identity; `pinned-source` "
+                "also binds the complete GGUF artifact, immutable Hub assets, reconstruction "
+                "policy, semantic hashes, and representative token-ID vectors."
             ),
         )
     )
+
+
+def _reason_code(verdicts: dict[str, Support]) -> str:
+    config = verdicts.get("config", verdicts.get("metadata"))
+    tensor = verdicts.get("tensor_map")
+    graph = verdicts.get("graph")
+    runtime = verdicts.get("runtime")
+    quantized = verdicts.get("quantized_import")
+    if config is Support.REJECTED:
+        return (
+            "CONFIG_REJECTED — The serialized architecture contract is deliberately refused."
+        )
+    if config is not Support.SUPPORTED:
+        return "CONFIG_DEFERRED — Exact configuration ownership is not implemented."
+    if tensor is Support.REJECTED:
+        return "TENSOR_MAP_REJECTED — The serialized tensor contract is deliberately refused."
+    if tensor is not Support.SUPPORTED:
+        return "TENSOR_MAP_DEFERRED — Exact tensor-name closure is not implemented."
+    if graph is Support.REJECTED:
+        return "GRAPH_REJECTED — Executable graph construction is deliberately refused."
+    if graph is not Support.SUPPORTED:
+        return "GRAPH_DEFERRED — Executable graph construction is not implemented."
+    if runtime is Support.REJECTED:
+        return "RUNTIME_REJECTED — Runtime package publication is deliberately refused."
+    if runtime is not Support.SUPPORTED and quantized is Support.REJECTED:
+        return (
+            "RUNTIME_EVIDENCE_PENDING / FLOAT_IMPORT_ONLY — Runtime evidence is incomplete, "
+            "and packed quantized import is unavailable."
+        )
+    if runtime is not Support.SUPPORTED:
+        return (
+            "RUNTIME_EVIDENCE_PENDING — Exact real-artifact parity and deterministic runtime "
+            "semantics are not yet evidenced."
+        )
+    if quantized is Support.REJECTED:
+        return "FLOAT_IMPORT_ONLY — Runtime is evidenced only through explicit float import."
+    return "EVIDENCED_SCOPE — Runtime publication is limited to registry-linked immutable evidence."
+
+
+def _architecture_reason(spec: GGUFArchitectureSpec) -> str:
+    capabilities = dict(spec.capabilities)
+    code = _reason_code(capabilities).partition(" — ")[0]
+    reason = spec.reason
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(f"{spec.gguf_arch}: architecture registry reason must be non-empty")
+    restriction_source = reason.removeprefix(_RUNTIME_VALIDATION_PENDING).strip() or reason
+    restriction = re.split(r"(?<=[.!?])\s+", restriction_source, maxsplit=1)[0]
+    return f"{code} — {restriction}"
 
 
 def _architectures() -> str:
@@ -150,7 +191,7 @@ def _architectures() -> str:
         else:
             route = "none (no graph construction route)"
         exactness = upstream[spec.gguf_arch].tensor_closure_status or "not claimed"
-        reason = spec.reason or "No restriction; evidence record is registry-backed."
+        reason = _architecture_reason(spec)
         rows.append(
             f"| `{spec.gguf_arch}` | {aliases} | {_cell(route)} | {_cell(exactness)} | "
             f"{_cell(_status(spec.capabilities))} | {_cell(reason)} |"
@@ -180,7 +221,7 @@ def _projectors() -> str:
         evidence = (
             "artifact pins=" + ", ".join(f"`{item}`" for item in spec.real_artifact_ids)
             if spec.real_artifact_ids
-            else spec.reason
+            else _reason_code(dict(spec.verdicts))
         )
         rows.append(
             f"| `{spec.projector_type}` | {modalities} | {targets} | "
@@ -198,10 +239,16 @@ def _tokenizers() -> str:
         "|---|---|---|---|---|",
     ]
     for identifier, policy in sorted(tokenizer_pre_policies().items()):
+        restriction = (
+            "ARTIFACT_PINNED — Exact pinned-source materialization is available only for "
+            "`qwen3.5-0.8b-q4-tokenizer`; every other artifact remains deferred."
+            if identifier == "qwen35"
+            else "TOKENIZER_EVIDENCE_REQUIRED — Requires embedded exact JSON or "
+            "artifact-scoped pinned-source evidence."
+        )
         row = (
             f"| `{identifier}` | `{policy.canonical}` | `{policy.pre_type}` | "
-            f"`{policy.default_route}` | Exact-copy only after embedded tokenizer JSON and "
-            "ordered vocabulary validation; otherwise runtime packaging is deferred. |"
+            f"`{policy.default_route}` | {restriction} |"
         )
         rows.append(row)
     return "\n".join(rows)
@@ -218,21 +265,227 @@ def render_blocks() -> dict[str, str]:
     }
 
 
-def _replace(text: str, begin: str, end: str, body: str) -> str:
-    if text.count(begin) != 1 or text.count(end) != 1:
-        raise ValueError(
-            f"Expected exactly one generated block delimited by {begin!r}/{end!r}"
+def _runtime_evidence_table() -> str:
+    records = []
+    seen: set[str] = set()
+    for spec in iter_arch_specs():
+        for evidence_id in spec.runtime_evidence_ids:
+            if evidence_id in seen:
+                continue
+            evidence = runtime_evidence(evidence_id)
+            if evidence is None:
+                raise ValueError(f"Missing runtime evidence {evidence_id!r}")
+            seen.add(evidence_id)
+            records.append(evidence)
+    rows = [
+        "| Evidence ID | GGUF identity | Config identity | Tokenizer identity | Runtime proof |",
+        "|---|---|---|---|---|",
+    ]
+    for evidence in sorted(records, key=lambda item: item.evidence_id):
+        assets = ", ".join(
+            f"`{name}` {size:,} B `{sha256}`"
+            for name, size, sha256 in evidence.tokenizer_assets
         )
-    before, remainder = text.split(begin, 1)
-    _, after = remainder.split(end, 1)
-    return f"{before}{begin}\n\n{body}\n\n{end}{after}"
+        rows.append(
+            f"| `{evidence.evidence_id}` | `{evidence.repository}@{evidence.revision}`<br>"
+            f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}` | "
+            f"`{evidence.config_repository}@{evidence.config_revision}` | "
+            f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>{assets}<br>"
+            f"metadata `{evidence.tokenizer_metadata_sha256}` | "
+            f"{evidence.runtime} {evidence.runtime_version}; {evidence.parity_kind}; "
+            f"{evidence.stateful_semantics} |"
+        )
+    return "\n".join(rows)
+
+
+def _tokenizer_evidence_table() -> str:
+    evidence = tokenizer_evidence("qwen3.5-0.8b-q4-tokenizer")
+    if evidence is None:
+        raise ValueError("Missing qwen3.5-0.8b-q4-tokenizer evidence")
+    assets = ", ".join(
+        f"`{name}` {size:,} B `{sha256}`" for name, size, sha256 in evidence.tokenizer_assets
+    )
+    encodings = "<br>".join(
+        f"`{text.encode('unicode_escape').decode()}` → `{list(token_ids)}`"
+        for text, token_ids in evidence.representative_encodings
+    )
+    padding_start, padding_end = evidence.deterministic_padding_range
+    identity = (
+        f"`{evidence.repository}@{evidence.revision}`<br>"
+        f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`<br>"
+        f"{evidence.tensor_count} tensors: "
+        f"{', '.join(f'{name}={count}' for name, count in evidence.tensor_qtypes)}"
+    )
+    source = (
+        f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>"
+        f"`{evidence.source_config_asset[0]}` {evidence.source_config_asset[1]:,} B "
+        f"`{evidence.source_config_asset[2]}`<br>{assets}"
+    )
+    proof = (
+        f"GGUF metadata `{evidence.tokenizer_metadata_sha256}`<br>"
+        f"{evidence.token_count:,} ordered tokens "
+        f"`{evidence.ordered_vocabulary_sha256}`<br>"
+        f"{evidence.merge_count:,} ordered merges "
+        f"`{evidence.ordered_merges_sha256}`<br>"
+        f"official source IDs `0..{evidence.source_token_count - 1}`; deterministic "
+        f"unused `[PAD{{id}}]` IDs `{padding_start}..{padding_end}`; "
+        f"embedding rows={evidence.embedding_vocabulary_size:,}<br>"
+        f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
+    )
+    return "\n".join(
+        (
+            "| Evidence ID | GGUF identity | Official source | Exact tokenizer proof |",
+            "|---|---|---|---|",
+            "| "
+            + " | ".join(
+                _cell(value)
+                for value in (f"`{evidence.evidence_id}`", identity, source, proof)
+            )
+            + " |",
+        )
+    )
+
+
+def _projector_evidence_table() -> str:
+    rows = [
+        "| Artifact ID | Immutable sidecar | Bytes | SHA-256 | Projector types |",
+        "|---|---|---:|---|---|",
+    ]
+    for pin in MMPROJ_ARTIFACT_PINS:
+        rows.append(
+            f"| `{pin.artifact_id}` | `{pin.repository}@{pin.revision}`<br>"
+            f"`{pin.filename}` | {pin.size:,} | `{pin.lfs_sha256}` | "
+            f"{', '.join(f'`{item}`' for item in pin.projector_types)} |"
+        )
+    return "\n".join(rows)
+
+
+def render_document() -> str:
+    """Render the complete concise API document from live registries and evidence."""
+    blocks = render_blocks()
+    return f"""# `build_from_gguf()`
+
+Build ONNX packages directly from GGUF metadata and tensors without tracing PyTorch.
+Support is capability-specific: graph import does not imply runtime packaging.
+
+<!-- BEGIN GGUF CLOSURE SUMMARY -->
+
+{blocks["summary"]}
+
+<!-- END GGUF CLOSURE SUMMARY -->
+
+## Usage
+
+```python
+from mobius.integrations.gguf import build_from_gguf
+
+package = build_from_gguf("model.gguf")
+package.save("output")
+```
+
+Use `keep_quantized=False` for explicit float import. Pass `mmproj=` only for an
+evidenced multimodal sidecar. The CLI equivalent is `mobius build model.gguf -o output`.
+
+## API
+
+```python
+build_from_gguf(
+    gguf_path,
+    *,
+    task=None,
+    dtype=None,
+    keep_quantized=True,
+    execution_provider="default",
+    mmproj=None,
+    static_cache=False,
+    max_seq_len=None,
+    allow_dense_moe=None,
+    reuse_gguf_weights=False,
+    target_config=None,
+)
+```
+
+The function returns a `ModelPackage`. Import validates architecture metadata, exact tensor
+closure, shapes, qtypes, and selected graph route before publication. Source reuse requires
+the original immutable GGUF at runtime. Runtime packages additionally require an exact
+artifact, graph, tokenizer, runtime version, parity proof, and deterministic state/generation
+evidence match.
+
+## Runtime evidence
+
+{_runtime_evidence_table()}
+
+Qwen2.5 remains covered only by its existing runtime evidence record above.
+
+## Tokenizer evidence
+
+{_tokenizer_evidence_table()}
+
+```python
+from mobius.integrations.gguf import materialize_evidenced_gguf_tokenizer
+
+materialize_evidenced_gguf_tokenizer("Qwen3.5-0.8B-Q4_0.gguf", "tokenizer")
+```
+
+Qwen3.5 tokenizer materialization uses `pinned-source`, not embedded `copy`: official
+`tokenizer.json` covers IDs 0-248069, official `tokenizer_config.json` adds IDs
+248070-248076, and only the GGUF embedding-alignment suffix 248077-248319 is reconstructed
+as non-special unused `[PAD{{id}}]` tokens. Every ordered token, merge, special ID, source
+asset, chat template, representative encoding, and the final materialized hash is checked
+before output. Qwen3.5 full model runtime remains **deferred**.
+
+## Supported GGUF architectures
+
+Reason codes are concise user-facing categories; detailed architecture audits remain in
+`_arch_registry.py` and its tests.
+
+<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->
+
+{blocks["architectures"]}
+
+<!-- END GGUF SUPPORT MATRIX -->
+
+## Stored quantization types
+
+<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->
+
+{blocks["qtypes"]}
+
+<!-- END GGUF QUANTIZATION MATRIX -->
+
+## Multimodal projector sidecars
+
+{_projector_evidence_table()}
+
+<!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->
+
+{blocks["projectors"]}
+
+<!-- END GGUF MMPROJ SUPPORT MATRIX -->
+
+## Tokenizer pre-types
+
+The pre-type is never sufficient evidence by itself. Each row defaults to deferred; only an
+embedded exact JSON or a complete artifact-scoped evidence record can materialize a tokenizer.
+
+<!-- BEGIN GGUF TOKENIZER PRE SUPPORT MATRIX -->
+
+{blocks["tokenizers"]}
+
+<!-- END GGUF TOKENIZER PRE SUPPORT MATRIX -->
+
+## Validation boundary
+
+Normal tests are deterministic and network-free; committed registry records contain compact
+immutable identities and semantic hashes. Real-artifact qualification is performed serially
+with pinned revisions, full SHA-256 verification, at least twice the artifact size free, and
+independent runtime evidence where runtime support is claimed.
+"""
 
 
 def update_document(path: Path = DOC_PATH) -> str:
-    """Return the documentation with every generated block refreshed."""
+    """Return the complete generated document after rejecting stale upstream pins."""
     text = path.read_text(encoding="utf-8")
-    for name, body in render_blocks().items():
-        text = _replace(text, *_MARKERS[name], body)
     pins = set(
         re.findall(
             r"llama\.cpp(?: commit)?(?:@|\s|`)*([0-9a-f]{40})",
@@ -242,7 +495,7 @@ def update_document(path: Path = DOC_PATH) -> str:
     )
     if pins - {UPSTREAM_COMMIT}:
         raise ValueError(f"Stale llama.cpp pins outside generated blocks: {sorted(pins)}")
-    return text
+    return render_document()
 
 
 def check_document(path: Path = DOC_PATH) -> bool:

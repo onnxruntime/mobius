@@ -5,12 +5,19 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
 
 from mobius.integrations.gguf._arch_registry import iter_arch_specs
-from mobius.integrations.gguf._docs import check_document, render_blocks, update_document
+from mobius.integrations.gguf._docs import (
+    _architecture_reason,
+    check_document,
+    render_blocks,
+    render_document,
+    update_document,
+)
 from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_PINS,
     iter_projector_specs,
@@ -23,6 +30,53 @@ from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT, UPSTREAM_DATE
 
 def test_document_is_exact_generator_output() -> None:
     assert check_document()
+
+
+def test_document_is_concise_and_reason_coded() -> None:
+    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    assert len(document.splitlines()) < 500
+    assert "RUNTIME_EVIDENCE_PENDING" in document
+    assert "qwen3.5-0.8b-q4-tokenizer" in document
+    assert "IDs 0-248069" in document
+    assert "Qwen3.5 full model runtime remains **deferred**" in document
+
+
+def test_tokenizer_evidence_row_has_exactly_four_markdown_columns() -> None:
+    row = next(
+        line
+        for line in render_document().splitlines()
+        if line.startswith("| `qwen3.5-0.8b-q4-tokenizer`")
+    )
+    parts = re.split(r"(?<!\\)\|", row)
+    assert parts[0] == parts[-1] == ""
+    cells = [part.strip() for part in parts[1:-1]]
+    assert len(cells) == 4
+    assert r"<\|im_start\|>" in cells[3]
+    assert r"<\|audio_start\|>" in cells[3]
+
+
+def test_architecture_restrictions_are_concise_and_fully_registry_derived() -> None:
+    rows = {
+        line.split("`", 2)[1]: line
+        for line in render_blocks()["architectures"].splitlines()
+        if line.startswith("| `")
+    }
+    for spec in iter_arch_specs():
+        reason = _architecture_reason(spec)
+        assert rows[spec.gguf_arch].endswith(f"| {reason} |")
+        assert len(reason) <= 320
+        restriction = reason.partition(" — ")[2]
+        assert restriction
+        assert len(restriction.split(". ")) == 1
+
+
+def test_ernie45_row_preserves_exact_admitted_subset_boundary() -> None:
+    ernie = next(spec for spec in iter_arch_specs() if spec.gguf_arch == "ernie4_5")
+    assert _architecture_reason(ernie) == (
+        "RUNTIME_EVIDENCE_PENDING / FLOAT_IMPORT_ONLY — Import is narrowed to the dense "
+        "split-Q/K/V, split-SwiGLU, full-RoPE variant and rejects all expert, fused, "
+        "sectioned-position, and bias alternatives."
+    )
 
 
 def test_manual_real_artifact_table_covers_every_registry_pin() -> None:

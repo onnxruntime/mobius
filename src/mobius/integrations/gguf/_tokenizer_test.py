@@ -462,6 +462,7 @@ def test_tokenizer_evidence_metadata_mismatch_rejects_before_download(
     tmp_path: Path, monkeypatch
 ) -> None:
     metadata = _metadata(pre="smollm")
+    metadata.pop("tokenizer.ggml.scores")
     payloads = _pinned_payloads(metadata)
     source = _pinned_source(metadata, payloads)
     source = GGUFTokenizerSource(
@@ -495,6 +496,46 @@ def test_semantic_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch)
     output = tmp_path / "output"
 
     with pytest.raises(ValueError, match="bos_token id differs"):
+        materialize_gguf_tokenizer(
+            tmp_path / "model.gguf",
+            output,
+            source=source,
+            metadata=metadata,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("materialized_sha256", "encodings", "message"),
+    [
+        ("b" * 64, (), "digest differs"),
+        (None, (("hello", (999,)),), "representative encoding differs"),
+    ],
+)
+def test_compact_evidence_mismatch_leaves_no_partial_output(
+    tmp_path: Path,
+    monkeypatch,
+    materialized_sha256: str | None,
+    encodings: tuple[tuple[str, tuple[int, ...]], ...],
+    message: str,
+) -> None:
+    metadata = _metadata(pre="smollm")
+    metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(metadata)
+    source = _pinned_source(metadata, payloads)
+    source = GGUFTokenizerSource(
+        source.repository,
+        source.revision,
+        source.assets,
+        source.metadata_sha256,
+        materialized_sha256,
+        encodings,
+    )
+    monkeypatch.setattr(_tokenizer, "_download_tokenizer_assets", lambda *_a, **_k: payloads)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match=message):
         materialize_gguf_tokenizer(
             tmp_path / "model.gguf",
             output,
@@ -539,7 +580,7 @@ def test_non_smollm_pipeline_is_bound_by_exact_asset_hashes() -> None:
     assert hashlib.sha256(materialized).hexdigest() == tokenizer_sha256
 
 
-def test_deterministic_unused_padding_is_materialized_as_added_tokens() -> None:
+def test_deterministic_unused_padding_extends_bpe_vocab_without_matching_input() -> None:
     source_metadata = _metadata(pre="qwen2")
     source_metadata.pop("tokenizer.ggml.scores")
     payloads = _pinned_payloads(source_metadata)
@@ -557,27 +598,223 @@ def test_deterministic_unused_padding_is_materialized_as_added_tokens() -> None:
 
     _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
-    tokenizer = json.loads(materialized)
-    assert tokenizer["added_tokens"][-2:] == [
-        {
-            "id": 7,
-            "content": "[PAD7]",
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": False,
-        },
-        {
-            "id": 8,
-            "content": "[PAD8]",
-            "single_word": False,
-            "lstrip": False,
-            "rstrip": False,
-            "normalized": False,
-            "special": False,
-        },
+    from tokenizers import Tokenizer
+
+    tokenizer_json = json.loads(materialized)
+    tokenizer = Tokenizer.from_str(materialized.decode())
+    assert tokenizer_json["model"]["vocab"]["[PAD7]"] == 7
+    assert tokenizer_json["model"]["vocab"]["[PAD8]"] == 8
+    assert all(
+        token["content"] not in {"[PAD7]", "[PAD8]"}
+        for token in tokenizer_json["added_tokens"]
+    )
+    assert [tokenizer.id_to_token(index) for index in range(9)] == metadata[
+        "tokenizer.ggml.tokens"
     ]
+    for text in ("[PAD7]", "prefix[PAD7]suffix", "[PAD8]", "prefix[PAD8]suffix"):
+        assert not ({7, 8} & set(tokenizer.encode(text, add_special_tokens=False).ids))
+
+
+def test_matchable_unused_padding_reconstruction_fails_closed() -> None:
+    source_metadata = _metadata(pre="qwen2")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    tokenizer_json = json.loads(payloads["tokenizer.json"])
+    tokenizer_json["model"]["ignore_merges"] = True
+    tokenizer_json["pre_tokenizer"] = {"type": "WhitespaceSplit"}
+    payloads["tokenizer.json"] = json.dumps(tokenizer_json).encode()
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "[PAD7]",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        5,
+    ]
+
+    with pytest.raises(ValueError, match="unused padding token 7 is matchable"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
+def test_source_config_and_unused_padding_reconstruct_exact_ordered_vocabulary() -> None:
+    source_metadata = _metadata(pre="qwen35")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "<|audio_start|>",
+        "[PAD8]",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        3,
+        5,
+    ]
+    config = json.loads(payloads["tokenizer_config.json"])
+    config["added_tokens_decoder"] = {
+        "7": {
+            "content": "<|audio_start|>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    }
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    _, materialized = _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+    from tokenizers import Tokenizer
+
+    tokenizer_json = json.loads(materialized)
+    tokenizer = Tokenizer.from_str(materialized.decode())
+    assert tokenizer_json["model"]["vocab"]["<|audio_start|>"] == 7
+    assert tokenizer_json["model"]["vocab"]["[PAD8]"] == 8
+    assert tokenizer_json["added_tokens"][-1] == {
+        "id": 7,
+        "content": "<|audio_start|>",
+        "single_word": False,
+        "lstrip": False,
+        "rstrip": False,
+        "normalized": False,
+        "special": True,
+    }
+    assert [tokenizer.id_to_token(index) for index in range(9)] == metadata[
+        "tokenizer.ggml.tokens"
+    ]
+    assert tokenizer.encode("<|audio_start|>", add_special_tokens=False).ids == [7]
+    for text in ("[PAD8]", "prefix[PAD8]suffix"):
+        assert 8 not in tokenizer.encode(text, add_special_tokens=False).ids
+
+
+def test_source_config_added_token_must_match_exact_gguf_id() -> None:
+    source_metadata = _metadata(pre="qwen35")
+    source_metadata.pop("tokenizer.ggml.scores")
+    payloads = _pinned_payloads(source_metadata)
+    metadata = dict(source_metadata)
+    metadata["tokenizer.ggml.tokens"] = [
+        *source_metadata["tokenizer.ggml.tokens"],
+        "<|audio_start|>",
+    ]
+    metadata["tokenizer.ggml.token_type"] = [
+        *source_metadata["tokenizer.ggml.token_type"],
+        3,
+    ]
+    config = json.loads(payloads["tokenizer_config.json"])
+    config["added_tokens_decoder"] = {
+        "7": {
+            "content": "<|wrong|>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    }
+    payloads["tokenizer_config.json"] = json.dumps(config).encode()
+
+    with pytest.raises(ValueError, match="added token 7 differs from GGUF"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
+def test_evidenced_materializer_rejects_existing_destination_before_source_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    read_source = mock.Mock()
+    monkeypatch.setattr("mobius.integrations.gguf._reader.GGUFModel", read_source)
+
+    with pytest.raises(FileExistsError, match="non-atomic directory replacement"):
+        _tokenizer.materialize_evidenced_gguf_tokenizer(tmp_path / "model.gguf", output)
+
+    read_source.assert_not_called()
+
+
+def test_evidenced_materializer_rejects_replaced_source_before_publication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = SimpleNamespace(
+        metadata={},
+        source_matches_path=mock.Mock(side_effect=(True, False)),
+    )
+    evidence = SimpleNamespace(
+        source=object(),
+        repository="owner/model",
+        revision="a" * 40,
+        filename="model.gguf",
+        lfs_sha256="b" * 64,
+    )
+    monkeypatch.setattr("mobius.integrations.gguf._reader.GGUFModel", lambda _path: model)
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
+        lambda *_a, **_k: SimpleNamespace(metadata_sha256="c" * 64),
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_evidence",
+        lambda *_a, **_k: evidence,
+    )
+
+    def materialize(_gguf_path, stage, **_kwargs):
+        path = Path(stage) / "tokenizer.json"
+        path.write_text("{}", encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(_tokenizer, "materialize_gguf_tokenizer", materialize)
+    output = tmp_path / "output"
+
+    with pytest.raises(ValueError, match="changed while tokenizer assets"):
+        _tokenizer.materialize_evidenced_gguf_tokenizer(tmp_path / "model.gguf", output)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".output.*.tmp"))
+
+
+def test_evidenced_materializer_atomically_publishes_complete_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model = SimpleNamespace(
+        metadata={},
+        source_matches_path=mock.Mock(return_value=True),
+    )
+    evidence = SimpleNamespace(
+        source=object(),
+        repository="owner/model",
+        revision="a" * 40,
+        filename="model.gguf",
+        lfs_sha256="b" * 64,
+    )
+    monkeypatch.setattr("mobius.integrations.gguf._reader.GGUFModel", lambda _path: model)
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer.inspect_gguf_tokenizer",
+        lambda *_a, **_k: SimpleNamespace(metadata_sha256="c" * 64),
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_evidence",
+        lambda *_a, **_k: evidence,
+    )
+
+    def materialize(_gguf_path, stage, **_kwargs):
+        path = Path(stage) / "tokenizer.json"
+        path.write_text("{}", encoding="utf-8")
+        (Path(stage) / "gguf_tokenizer_manifest.json").write_text("{}", encoding="utf-8")
+        return str(path)
+
+    monkeypatch.setattr(_tokenizer, "materialize_gguf_tokenizer", materialize)
+    output = tmp_path / "output"
+
+    result = _tokenizer.materialize_evidenced_gguf_tokenizer(tmp_path / "model.gguf", output)
+
+    assert result == str(output / "tokenizer.json")
+    assert sorted(path.name for path in output.iterdir()) == [
+        "gguf_tokenizer_manifest.json",
+        "tokenizer.json",
+    ]
+    assert model.source_matches_path.call_count == 2
+    assert not list(tmp_path.glob(".output.*.tmp"))
 
 
 @pytest.mark.parametrize(
