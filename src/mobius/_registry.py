@@ -1276,8 +1276,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "qwen3_5_vl": "Qwen/Qwen3.5-2B",
     "qwen3_5_vl_text": "Qwen/Qwen3.5-2B",
     "qwen3_vl_single": "Qwen/Qwen3-VL-2B-Instruct",
-    "qwen4_exp": "Qwen/Qwen3.8-Flash-Next",
-    "qwen4_exp_text": "Qwen/Qwen3.8-Flash-Next",
     "sam2": "facebook/sam2-hiera-base-plus",
     "smolvlm": "HuggingFaceTB/SmolVLM-256M-Instruct",
     "video_llava": "LanguageBind/Video-LLaVA-7B-hf",

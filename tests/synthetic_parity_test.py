@@ -389,8 +389,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "nemotron": {"norm_eps": 1e-5},
     # Qwen3.5 has head_dim as an explicit config param (default 256)
     "qwen3_5_text": {"head_dim": TINY_HEAD_DIM},
-    # Qwen4-Exp also defaults head_dim=256; keep its QSA rotary width tiny.
-    "qwen4_exp_text": {"head_dim": TINY_HEAD_DIM},
     # Qwen3.5-MoE uses the same doubled-Q attention as qwen3_5; head_dim defaults to 256 in HF
     "qwen3_5_moe": {"head_dim": TINY_HEAD_DIM},
     # Qwen4-Exp validates partial RoPE against the QSA index head during
@@ -696,7 +694,6 @@ def _create_hf_config(model_type: str, config_overrides: dict):
         "qwen3_moe": {"num_local_experts": "num_experts"},
         "qwen3_5_moe_text": {"num_local_experts": "num_experts"},
         "qwen3_next": {"num_local_experts": "num_experts"},
-        "qwen4_exp_text": {"num_local_experts": "num_experts"},
         # Ernie4.5 MoE uses moe_num_experts / moe_k
         "ernie4_5_moe": {
             "num_local_experts": "moe_num_experts",
