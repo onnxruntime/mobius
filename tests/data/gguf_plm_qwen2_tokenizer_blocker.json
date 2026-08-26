@@ -1,0 +1,61 @@
+{
+  "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+  "artifact_sha256": "b38570ee56ebec82a1e9ef45ab408c0d8230ececef1d7f1b267c49cff35638b8",
+  "tokenizer_revision": "62d188c7d58843d7013d5b3ffe198db448787860",
+  "modes": [
+    "no-add/no-parse-special",
+    "no-add/parse-special",
+    "add-special/parse-special"
+  ],
+  "fixed_inputs": [
+    "",
+    " ",
+    "  ",
+    "\n",
+    "\r\n",
+    "\t",
+    "  spaced  text\n",
+    "I'm we'd they'll can't I'M",
+    "0 1 12 123 1234 12345 000001234567890",
+    "!?. ,;:—/\\[]{}()\n",
+    "你好，世界！",
+    "漢字かなカナ 한글",
+    "Café — κόσμος 🚀",
+    "é é",
+    "🙂🚀👩‍💻🇺🇳",
+    "\u0000\u0001\u007f",
+    "A/B\r\nC",
+    "<|im_start|>user\nHello<|im_end|>\n",
+    "<|endoftext|>",
+    "x<|im_start|>y<|im_end|>z",
+    "<|im_start|><|im_end|><|endoftext|>",
+    "<|im_start|>assistant\n",
+    " leading NBSP​zero-width ",
+    "Ｆｕｌｌｗｉｄｔｈ ﬃ"
+  ],
+  "case_count": 72,
+  "ordered_results_sha256": "66513168812575ccac974ecb454e916def5f4492d558c1866b8811d4f587a41d",
+  "mode_results_sha256": {
+    "no-add/no-parse-special": "e9a8359648d0e0a93503babd854ee11cfddbef07bf43d07f1f1c7e9b37011062",
+    "no-add/parse-special": "1a8c815b42d031e3ed9674bb02b6d88f5f2e4827aa3fd204e658364d86cc8827",
+    "add-special/parse-special": "53bf2a76cf18ac7b85d7e154533b89c21d823537deaa2a7dca8d5d0717e62932"
+  },
+  "chat_template_sha256": "af9c0233881b083b52ff773580215222b5440ac3d0beeeca99b76329b048f8db",
+  "source_pipeline_sha256": "97c53ee89fb584b10798f44b02c60c9a8b746165a32dc34737d178fc20618a69",
+  "source_normalizer": "NFC",
+  "scores_present": false,
+  "bos_id": 151643,
+  "source_bos_token": null,
+  "default_add_bos_matches_no_add": true,
+  "mismatch_count": 3,
+  "mismatch": {
+    "text": "é é",
+    "llamacpp_ids": [68, 53839, 3958],
+    "official_source_ids": [963, 3958],
+    "modes": [
+      "no-add/no-parse-special",
+      "no-add/parse-special",
+      "add-special/parse-special"
+    ]
+  }
+}

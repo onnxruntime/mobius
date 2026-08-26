@@ -22,8 +22,10 @@ from mobius.integrations.gguf._tokenizer_alias_evidence import (
 )
 from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_evidence import (
+    iter_tokenizer_blocker_evidence,
     iter_tokenizer_evidence,
     matching_tokenizer_evidence,
+    tokenizer_blocker_evidence,
     tokenizer_evidence,
 )
 
@@ -73,6 +75,57 @@ def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> Non
         if record.pre_identifier in {"jina-v2-code", "roberta-bpe"}
     )
     assert all(record.source_config_asset[0] == "config.json" for record in records)
+
+
+def test_plm_tokenizer_blocker_is_exact_and_architecture_scoped() -> None:
+    blockers = iter_tokenizer_blocker_evidence()
+    assert [record.evidence_id for record in blockers] == [
+        "plm-1.8b-instruct-q4-k-m-tokenizer-blocker"
+    ]
+    blocker = blockers[0]
+    assert blocker.architecture == "plm"
+    assert blocker.pre_identifier == "qwen2"
+    assert blocker.revision == "7bec6546983bcf0d99526c943580bd49e2237445"
+    assert blocker.lfs_sha256 == (
+        "b38570ee56ebec82a1e9ef45ab408c0d8230ececef1d7f1b267c49cff35638b8"
+    )
+    assert blocker.tokenizer_revision == "62d188c7d58843d7013d5b3ffe198db448787860"
+    assert blocker.token_count == blocker.embedding_vocabulary_size == 151_936
+    assert blocker.source_token_count == 151_646
+    assert blocker.deterministic_padding_range == (151_646, 151_935)
+    assert blocker.merge_count == 151_387
+    assert blocker.score_count == 0
+    assert blocker.ordered_scores_sha256 is None
+    assert blocker.source_normalizer == "NFC"
+    assert blocker.mismatch == ("é é", (68, 53839, 3958), (963, 3958))
+    assert "NFC normalization" in blocker.disposition
+
+
+def test_plm_llamacpp_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_plm_qwen2_tokenizer_blocker.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    blocker = tokenizer_blocker_evidence("plm-1.8b-instruct-q4-k-m-tokenizer-blocker")
+    assert blocker is not None
+    assert blocker.llamacpp_oracle == (
+        oracle["llamacpp_commit"],
+        oracle["case_count"],
+        oracle["ordered_results_sha256"],
+    )
+    assert blocker.lfs_sha256 == oracle["artifact_sha256"]
+    assert blocker.tokenizer_revision == oracle["tokenizer_revision"]
+    assert oracle["case_count"] == len(oracle["modes"]) * len(oracle["fixed_inputs"])
+    assert oracle["mismatch_count"] == len(oracle["mismatch"]["modes"])
+    assert blocker.source_pipeline_sha256 == oracle["source_pipeline_sha256"]
+    assert blocker.chat_template_sha256 == oracle["chat_template_sha256"]
+    assert blocker.source_normalizer == oracle["source_normalizer"]
+    assert blocker.mismatch == (
+        oracle["mismatch"]["text"],
+        tuple(oracle["mismatch"]["llamacpp_ids"]),
+        tuple(oracle["mismatch"]["official_source_ids"]),
+    )
+    assert oracle["source_normalizer"] == "NFC"
+    assert oracle["default_add_bos_matches_no_add"]
+    assert not oracle["scores_present"]
 
 
 def test_evidence_schema_accepts_scores_instead_of_bpe_merges() -> None:
@@ -419,4 +472,64 @@ def test_matching_evidence_fails_closed_on_compact_identity_mismatch(
             tmp_path / "tiny.gguf",
             model,
             metadata_sha256=metadata_sha256,
+        )
+
+
+def test_matching_plm_blocker_reports_exact_normalizer_mismatch(tmp_path, monkeypatch) -> None:
+    blocker = tokenizer_blocker_evidence("plm-1.8b-instruct-q4-k-m-tokenizer-blocker")
+    assert blocker is not None
+    tiny = dataclasses.replace(
+        blocker,
+        filename="tiny.gguf",
+        size=4,
+        lfs_sha256="a" * 64,
+        tensor_count=1,
+        tensor_qtypes=(("F32", 1),),
+        token_count=2,
+        source_token_count=2,
+        embedding_vocabulary_size=2,
+        deterministic_padding_range=(2, 1),
+        ordered_vocabulary_sha256=_digest(["a", "<special>"]),
+        source_vocabulary_sha256=_digest(["a", "<special>"]),
+        merge_count=1,
+        ordered_merges_sha256=_digest(["a <special>"]),
+        source_merges_sha256=_digest([["a", "<special>"]]),
+        ordered_token_types_sha256=_digest([1, 3]),
+        special_token_ids=(("<special>", 1),),
+        mismatch=("é", (0,), (1,)),
+    )
+    monkeypatch.setattr(_tokenizer_evidence, "_TOKENIZER_EVIDENCE", MappingProxyType({}))
+    monkeypatch.setattr(
+        _tokenizer_evidence,
+        "_TOKENIZER_BLOCKER_EVIDENCE",
+        MappingProxyType({tiny.evidence_id: tiny}),
+    )
+    monkeypatch.setattr(
+        _tokenizer_evidence,
+        "gguf_artifact_identity",
+        lambda *_a, **_k: GGUFArtifactIdentity(
+            "plm",
+            "tiny.gguf",
+            4,
+            "a" * 64,
+            1,
+            (("F32", 1),),
+        ),
+    )
+    model = SimpleNamespace(
+        architecture="plm",
+        metadata={
+            "tokenizer.ggml.pre": "qwen2",
+            "tokenizer.ggml.tokens": ["a", "<special>"],
+            "tokenizer.ggml.merges": ["a <special>"],
+            "tokenizer.ggml.token_type": [1, 3],
+        },
+        get_tensor_shape=lambda _name: (2, 4),
+    )
+
+    with pytest.raises(ValueError, match=r"explicitly blocked.*NFC normalization"):
+        matching_tokenizer_evidence(
+            tmp_path / "tiny.gguf",
+            model,
+            metadata_sha256=tiny.tokenizer_metadata_sha256,
         )

@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 __all__ = [
+    "GGUFTokenizerBlockerEvidence",
     "GGUFTokenizerEvidence",
+    "iter_tokenizer_blocker_evidence",
     "iter_tokenizer_evidence",
     "matching_tokenizer_evidence",
+    "tokenizer_blocker_evidence",
     "tokenizer_evidence",
 ]
 
@@ -218,6 +221,132 @@ class GGUFTokenizerEvidence:
             self.representative_special_encodings,
             self.reconstruct_gpt4o_from_gguf,
         )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GGUFTokenizerBlockerEvidence:
+    """Immutable evidence that a pinned artifact cannot use its official tokenizer."""
+
+    evidence_id: str
+    architecture: str
+    pre_identifier: str
+    repository: str
+    revision: str
+    filename: str
+    size: int
+    lfs_sha256: str
+    tensor_count: int
+    tensor_qtypes: tuple[tuple[str, int], ...]
+    tokenizer_repository: str
+    tokenizer_revision: str
+    source_config_asset: tuple[str, int, str]
+    tokenizer_assets: tuple[tuple[str, int, str], ...]
+    tokenizer_metadata_sha256: str
+    token_count: int
+    source_token_count: int
+    embedding_vocabulary_size: int
+    deterministic_padding_range: tuple[int, int]
+    ordered_vocabulary_sha256: str
+    source_vocabulary_sha256: str
+    merge_count: int
+    ordered_merges_sha256: str
+    source_merges_sha256: str
+    score_count: int
+    ordered_scores_sha256: str | None
+    ordered_token_types_sha256: str
+    source_added_tokens_sha256: str
+    source_pipeline_sha256: str
+    chat_template_sha256: str
+    source_normalizer: str
+    special_token_ids: tuple[tuple[str, int], ...]
+    llamacpp_oracle: tuple[str, int, str]
+    mismatch: tuple[str, tuple[int, ...], tuple[int, ...]]
+    disposition: str
+
+    def __post_init__(self) -> None:
+        digests = (
+            self.lfs_sha256,
+            self.tokenizer_metadata_sha256,
+            self.ordered_vocabulary_sha256,
+            self.source_vocabulary_sha256,
+            self.ordered_merges_sha256,
+            self.source_merges_sha256,
+            self.ordered_token_types_sha256,
+            self.source_added_tokens_sha256,
+            self.source_pipeline_sha256,
+            self.chat_template_sha256,
+            self.llamacpp_oracle[2],
+        )
+        if any(
+            re.fullmatch(r"[0-9a-f]{40}", revision) is None
+            for revision in (self.revision, self.tokenizer_revision, self.llamacpp_oracle[0])
+        ):
+            raise ValueError("Tokenizer blocker revisions must be immutable 40-hex commits")
+        if any(re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in digests):
+            raise ValueError("Tokenizer blocker digests must be lowercase SHA-256")
+        if self.score_count < 0 or (
+            (self.score_count == 0) != (self.ordered_scores_sha256 is None)
+        ):
+            raise ValueError("Tokenizer blocker score count and digest disagree")
+        if (
+            self.ordered_scores_sha256 is not None
+            and re.fullmatch(r"[0-9a-f]{64}", self.ordered_scores_sha256) is None
+        ):
+            raise ValueError("Tokenizer blocker score digest must be lowercase SHA-256")
+        if (
+            min(
+                self.size,
+                self.tensor_count,
+                self.token_count,
+                self.source_token_count,
+                self.embedding_vocabulary_size,
+                self.merge_count,
+                self.llamacpp_oracle[1],
+            )
+            <= 0
+        ):
+            raise ValueError("Tokenizer blocker counts and artifact size must be positive")
+        if (
+            self.source_token_count > self.token_count
+            or self.embedding_vocabulary_size != self.token_count
+            or self.deterministic_padding_range
+            != (self.source_token_count, self.token_count - 1)
+        ):
+            raise ValueError(
+                "Tokenizer blocker vocabulary, padding, and embedding sizes disagree"
+            )
+        if tuple(sorted(self.tokenizer_assets)) != self.tokenizer_assets:
+            raise ValueError("Tokenizer blocker assets must be sorted")
+        assets = (self.source_config_asset, *self.tokenizer_assets)
+        if self.source_config_asset[0] != "config.json" or any(
+            not name or size <= 0 or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for name, size, digest in assets
+        ):
+            raise ValueError("Tokenizer blocker requires exact source asset identities")
+        if tuple(sorted(self.special_token_ids)) != self.special_token_ids:
+            raise ValueError("Tokenizer blocker special token IDs must be sorted")
+        if any(
+            token_id < 0 or token_id >= self.token_count
+            for _, token_id in self.special_token_ids
+        ):
+            raise ValueError("Tokenizer blocker special token IDs must be in the vocabulary")
+        if self.pre_identifier not in tokenizer_pre_policies():
+            raise ValueError("Tokenizer blocker contains an unknown pre identifier")
+        if not self.source_normalizer:
+            raise ValueError("Tokenizer blocker requires explicit source normalizer semantics")
+        dispatch = tokenizer_alias_evidence().get(self.pre_identifier)
+        if dispatch is None or dispatch.source_commit != self.llamacpp_oracle[0]:
+            raise ValueError("Tokenizer blocker oracle is not pinned to dispatch evidence")
+        text, llamacpp_ids, source_ids = self.mismatch
+        if not text or not llamacpp_ids or not source_ids or llamacpp_ids == source_ids:
+            raise ValueError("Tokenizer blocker requires an exact non-empty mismatch witness")
+        if any(
+            token_id < 0 or token_id >= self.token_count
+            for token_id in (*llamacpp_ids, *source_ids)
+        ):
+            raise ValueError("Tokenizer blocker mismatch IDs must be in the vocabulary")
+        if not self.disposition:
+            raise ValueError("Tokenizer blocker requires a fail-closed disposition")
 
 
 _QWEN35_08B_Q4_TOKENIZER = GGUFTokenizerEvidence(
@@ -986,6 +1115,89 @@ _QWEN25_05B_Q8_TOKENIZER = GGUFTokenizerEvidence(
     ),
 )
 
+_PLM_18B_Q4_K_M_TOKENIZER_BLOCKER = GGUFTokenizerBlockerEvidence(
+    evidence_id="plm-1.8b-instruct-q4-k-m-tokenizer-blocker",
+    architecture="plm",
+    pre_identifier="qwen2",
+    repository="PLM-Team/PLM-1.8B-Instruct-gguf",
+    revision="7bec6546983bcf0d99526c943580bd49e2237445",
+    filename="PLM-1.8B-Instruct-Q4_K_M.gguf",
+    size=1_182_708_992,
+    lfs_sha256="b38570ee56ebec82a1e9ef45ab408c0d8230ececef1d7f1b267c49cff35638b8",
+    tensor_count=290,
+    tensor_qtypes=(("F32", 97), ("Q4_K", 176), ("Q6_K", 17)),
+    tokenizer_repository="PLM-Team/PLM-1.8B-Instruct",
+    tokenizer_revision="62d188c7d58843d7013d5b3ffe198db448787860",
+    source_config_asset=(
+        "config.json",
+        934,
+        "91e6e13695a6de82556438667e64b60d9910269f300cd97f8c667d19e75f115e",
+    ),
+    tokenizer_assets=(
+        (
+            "merges.txt",
+            1_671_853,
+            "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+        ),
+        (
+            "special_tokens_map.json",
+            410,
+            "c83747485fba9ef20c42793b4b02b05001f214250f0d787f573df216c91047a3",
+        ),
+        (
+            "tokenizer.json",
+            11_418_266,
+            "bcfe42da0a4497e8b2b172c1f9f4ec423a46dc12907f4349c55025f670422ba9",
+        ),
+        (
+            "tokenizer_config.json",
+            1_327,
+            "1becffcfa09c98935043f1724d988887c618c5f6e7a249087d3ae29eb70e2a6f",
+        ),
+        (
+            "vocab.json",
+            2_776_833,
+            "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+        ),
+    ),
+    tokenizer_metadata_sha256="698bfa31cd069292437bc3509fea7be2445324a536d95a6e813d947c283bd989",
+    token_count=151_936,
+    source_token_count=151_646,
+    embedding_vocabulary_size=151_936,
+    deterministic_padding_range=(151_646, 151_935),
+    ordered_vocabulary_sha256="f3ea8e8cf45bd58a8d5ad420306a3ccd925894cdb61a89062fd9e3a6de255a0e",
+    source_vocabulary_sha256="696f26322524de87f49427fd1be6d1afce910574d9656c5d3f4f64064bdb83c1",
+    merge_count=151_387,
+    ordered_merges_sha256="24fa2ae2a398e50784a1fff678482094af4f63e6783d35686726abacda8dc371",
+    source_merges_sha256="cc098baa4a74ce5156487605aa048a34e54f0eee6a704691a738c8fb22dafdd5",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "0286431feb975d95a59a3f39957f8183d929295635fb627b6940627c63918bf1"
+    ),
+    source_added_tokens_sha256=(
+        "e7b5f7013431aa26739424d92f40423f175a46f6d1fdc8453edf6005c99412f7"
+    ),
+    source_pipeline_sha256="97c53ee89fb584b10798f44b02c60c9a8b746165a32dc34737d178fc20618a69",
+    chat_template_sha256="af9c0233881b083b52ff773580215222b5440ac3d0beeeca99b76329b048f8db",
+    source_normalizer="NFC",
+    special_token_ids=(
+        ("<|endoftext|>", 151643),
+        ("<|im_end|>", 151645),
+        ("<|im_start|>", 151644),
+    ),
+    llamacpp_oracle=(
+        "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+        72,
+        "66513168812575ccac974ecb454e916def5f4492d558c1866b8811d4f587a41d",
+    ),
+    mismatch=("é é", (68, 53839, 3958), (963, 3958)),
+    disposition=(
+        "official tokenizer.json applies NFC normalization, but pinned llama.cpp qwen2 "
+        "preserves decomposed Unicode; exact materialization is blocked"
+    ),
+)
+
 _LFM2_350M_F16_TOKENIZER = GGUFTokenizerEvidence(
     evidence_id="lfm2-350m-f16-tokenizer",
     architecture="lfm2",
@@ -1083,6 +1295,10 @@ _TOKENIZER_EVIDENCE = MappingProxyType(
     }
 )
 
+_TOKENIZER_BLOCKER_EVIDENCE = MappingProxyType(
+    {_PLM_18B_Q4_K_M_TOKENIZER_BLOCKER.evidence_id: (_PLM_18B_Q4_K_M_TOKENIZER_BLOCKER)}
+)
+
 
 def tokenizer_evidence(evidence_id: str) -> GGUFTokenizerEvidence | None:
     """Return exact tokenizer evidence by stable ID."""
@@ -1092,6 +1308,18 @@ def tokenizer_evidence(evidence_id: str) -> GGUFTokenizerEvidence | None:
 def iter_tokenizer_evidence() -> tuple[GGUFTokenizerEvidence, ...]:
     """Return every tokenizer evidence record in stable evidence-ID order."""
     return tuple(_TOKENIZER_EVIDENCE[key] for key in sorted(_TOKENIZER_EVIDENCE))
+
+
+def tokenizer_blocker_evidence(evidence_id: str) -> GGUFTokenizerBlockerEvidence | None:
+    """Return exact fail-closed tokenizer evidence by stable ID."""
+    return _TOKENIZER_BLOCKER_EVIDENCE.get(evidence_id)
+
+
+def iter_tokenizer_blocker_evidence() -> tuple[GGUFTokenizerBlockerEvidence, ...]:
+    """Return every fail-closed tokenizer record in stable evidence-ID order."""
+    return tuple(
+        _TOKENIZER_BLOCKER_EVIDENCE[key] for key in sorted(_TOKENIZER_BLOCKER_EVIDENCE)
+    )
 
 
 def matching_tokenizer_evidence(
@@ -1150,6 +1378,36 @@ def matching_tokenizer_evidence(
             for token, token_id in evidence.special_token_ids
         )
     ]
+    blockers = [
+        evidence
+        for evidence in _TOKENIZER_BLOCKER_EVIDENCE.values()
+        if evidence.architecture == architecture
+        and evidence.pre_identifier == metadata.get("tokenizer.ggml.pre")
+        and evidence.filename == identity.filename
+        and evidence.size == identity.size
+        and evidence.lfs_sha256 == identity.sha256
+        and evidence.tensor_count == identity.tensor_count
+        and evidence.tensor_qtypes == identity.tensor_qtypes
+        and evidence.tokenizer_metadata_sha256 == metadata_sha256
+        and evidence.token_count == token_count
+        and evidence.ordered_vocabulary_sha256 == vocabulary_sha256
+        and evidence.merge_count == merge_count
+        and evidence.ordered_merges_sha256 == merges_sha256
+        and evidence.score_count == score_count
+        and evidence.ordered_scores_sha256 == (scores_sha256 or None)
+        and evidence.token_count == token_type_count
+        and evidence.ordered_token_types_sha256 == token_types_sha256
+        and gguf_model.get_tensor_shape("token_embd.weight")[0]
+        == evidence.embedding_vocabulary_size
+    ]
+    if len(blockers) == 1:
+        blocker = blockers[0]
+        raise ValueError(
+            f"Tokenizer materialization is explicitly blocked by {blocker.evidence_id!r}: "
+            f"{blocker.disposition}"
+        )
+    if blockers:
+        raise RuntimeError("Tokenizer blocker evidence contains duplicate artifact identities")
     if len(matches) != 1:
         raise ValueError(
             "No unique exact tokenizer evidence matches "

@@ -38,7 +38,10 @@ from mobius.integrations.gguf._runtime_evidence import runtime_evidence
 from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
 from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
 from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
-from mobius.integrations.gguf._tokenizer_evidence import iter_tokenizer_evidence
+from mobius.integrations.gguf._tokenizer_evidence import (
+    iter_tokenizer_blocker_evidence,
+    iter_tokenizer_evidence,
+)
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 from mobius.integrations.gguf._upstream import (
     UPSTREAM_COMMIT,
@@ -383,6 +386,55 @@ def _tokenizer_evidence_table() -> str:
     return "\n".join(rows)
 
 
+def _tokenizer_blocker_evidence_table() -> str:
+    rows = [
+        "| Blocker ID | GGUF / official source | Exact closure | Fail-closed witness |",
+        "|---|---|---|---|",
+    ]
+    for evidence in iter_tokenizer_blocker_evidence():
+        assets = ", ".join(
+            f"`{name}` {size:,} B `{sha256}`"
+            for name, size, sha256 in evidence.tokenizer_assets
+        )
+        text, llamacpp_ids, source_ids = evidence.mismatch
+        identity = (
+            f"`{evidence.repository}@{evidence.revision}`<br>"
+            f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`<br>"
+            f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>{assets}"
+            f"<br>`{evidence.source_config_asset[0]}` "
+            f"{evidence.source_config_asset[1]:,} B `{evidence.source_config_asset[2]}`"
+        )
+        closure = (
+            f"architecture `{evidence.architecture}`; pre `{evidence.pre_identifier}`<br>"
+            f"metadata `{evidence.tokenizer_metadata_sha256}`<br>"
+            f"tokens {evidence.token_count:,} `{evidence.ordered_vocabulary_sha256}`; "
+            f"source {evidence.source_token_count:,} `{evidence.source_vocabulary_sha256}`<br>"
+            f"merges {evidence.merge_count:,} `{evidence.ordered_merges_sha256}`; "
+            f"source `{evidence.source_merges_sha256}`<br>"
+            f"scores={evidence.score_count}; types `{evidence.ordered_token_types_sha256}`<br>"
+            f"added tokens `{evidence.source_added_tokens_sha256}`; "
+            f"chat `{evidence.chat_template_sha256}`<br>"
+            f"normalizer `{evidence.source_normalizer}`; "
+            f"pipeline `{evidence.source_pipeline_sha256}`"
+        )
+        witness = (
+            f"{evidence.disposition}<br>"
+            f"`{text.encode('unicode_escape').decode()}`: llama.cpp `{list(llamacpp_ids)}` "
+            f"vs source `{list(source_ids)}`<br>"
+            f"llama.cpp oracle `{evidence.llamacpp_oracle[0]}`: "
+            f"{evidence.llamacpp_oracle[1]} cases `{evidence.llamacpp_oracle[2]}`"
+        )
+        rows.append(
+            "| "
+            + " | ".join(
+                _cell(value)
+                for value in (f"`{evidence.evidence_id}`", identity, closure, witness)
+            )
+            + " |"
+        )
+    return "\n".join(rows)
+
+
 def _projector_evidence_table() -> str:
     rows = [
         "| Artifact ID | Immutable sidecar | Bytes | SHA-256 | Projector types |",
@@ -506,6 +558,14 @@ alignment, any non-matchable padding extension, and the final materialized hash.
 additionally require every exact identifier to select the same implementation and flag overrides
 in pinned `llama-vocab.cpp`; the tokenizer matrix links each promoted route to its dispatch line.
 This does not claim graph or runtime support.
+
+### Fail-closed tokenizer evidence
+
+{_tokenizer_blocker_evidence_table()}
+
+These candidates have complete artifact and source closure but are not materializable because
+their pinned llama.cpp behavior differs from the official tokenizer. A shared `pre` identifier
+does not override an architecture-scoped blocker.
 
 ## Supported GGUF architectures
 
