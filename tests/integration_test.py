@@ -1202,7 +1202,10 @@ class TestQwen3VL3Model:
 
         # Run ONNX: first embedding, then decoder
         embed_sess = _make_session(pkg["embedding"])
-        image_features = np.zeros((0, config.hidden_size), dtype=np.float32)
+        num_deepstack = len(config.deepstack_visual_indexes or [])
+        image_features = np.zeros(
+            (0, (num_deepstack + 1) * config.hidden_size), dtype=np.float32
+        )
         embed_out = embed_sess.run(
             {
                 "input_ids": input_ids.numpy(),
@@ -1210,6 +1213,7 @@ class TestQwen3VL3Model:
             }
         )
         inputs_embeds = embed_out["inputs_embeds"]
+        per_layer_inputs = embed_out["per_layer_inputs"]
 
         decoder_sess = _make_session(pkg["decoder"])
         past_kv = {}
@@ -1226,6 +1230,7 @@ class TestQwen3VL3Model:
                 "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask.numpy(),
                 "position_ids": position_ids.numpy(),
+                "per_layer_inputs": per_layer_inputs,
                 **past_kv,
             }
         )
@@ -1297,6 +1302,7 @@ class TestQwen3VL3Model:
         )
         embedding_session.close()
         inputs_embeds = embed_out["inputs_embeds"]
+        per_layer_inputs = embed_out["per_layer_inputs"]
 
         # Step 3: Decoder with MRoPE position_ids from HF
         with torch.no_grad():
@@ -1319,6 +1325,7 @@ class TestQwen3VL3Model:
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
+            "per_layer_inputs": per_layer_inputs,
         }
         for i in range(config.num_hidden_layers):
             kv_shape = (1, config.num_key_value_heads, 0, config.head_dim)
@@ -3345,6 +3352,7 @@ def test_qwen35_vl_3model_builds_and_runs():
         linear_num_value_heads=4,
         linear_value_head_dim=8,
         linear_conv_kernel_dim=4,
+        deepstack_visual_indexes=[0],
         # Vision config (Qwen VL uses packed-attention ViT)
         vision=VisionConfig(
             hidden_size=32,
@@ -3357,7 +3365,6 @@ def test_qwen35_vl_3model_builds_and_runs():
             out_hidden_size=64,
             spatial_merge_size=2,
             num_position_embeddings=16,
-            deepstack_visual_indexes=[0],
             mrope_section=[8, 12, 12],
         ),
         image_token_id=248056,
@@ -3387,6 +3394,7 @@ def test_qwen35_vl_3model_builds_and_runs():
     assert "inputs_embeds" in decoder_inputs
     assert "attention_mask" in decoder_inputs
     assert "position_ids" in decoder_inputs
+    assert "per_layer_inputs" in decoder_inputs
 
     # Verify vision model I/O
     vision_inputs = {i.name for i in pkg["vision_encoder"].graph.inputs}
@@ -3396,6 +3404,10 @@ def test_qwen35_vl_3model_builds_and_runs():
     embed_inputs = {i.name for i in pkg["embedding"].graph.inputs}
     assert "input_ids" in embed_inputs
     assert "image_features" in embed_inputs
+    assert {o.name for o in pkg["embedding"].graph.outputs} == {
+        "inputs_embeds",
+        "per_layer_inputs",
+    }
 
     # Run through ORT: fill initializers with random weights
     rng = np.random.default_rng(42)
@@ -3408,7 +3420,13 @@ def test_qwen35_vl_3model_builds_and_runs():
     # Run embedding model with a single token (DeltaNet = decode-only)
     embed_sess = _make_session(pkg["embedding"])
     input_ids = np.array([[1]], dtype=np.int64)
-    image_features = np.zeros((0, config.hidden_size), dtype=np.float32)
+    image_features = np.zeros(
+        (
+            0,
+            (len(config.deepstack_visual_indexes) + 1) * config.hidden_size,
+        ),
+        dtype=np.float32,
+    )
     embed_out = embed_sess.run({"input_ids": input_ids, "image_features": image_features})
     embed_sess.close()
     assert "inputs_embeds" in embed_out
@@ -3418,6 +3436,7 @@ def test_qwen35_vl_3model_builds_and_runs():
     decoder_sess = _make_session(pkg["decoder"])
     feeds: dict[str, np.ndarray] = {
         "inputs_embeds": embed_out["inputs_embeds"],
+        "per_layer_inputs": embed_out["per_layer_inputs"],
         "attention_mask": np.ones((1, 1), dtype=np.int64),
         # MRoPE: 3D position IDs (3, batch, seq)
         "position_ids": np.zeros((3, 1, 1), dtype=np.int64),

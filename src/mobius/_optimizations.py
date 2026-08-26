@@ -704,6 +704,9 @@ def optimize_model(
                     "so the decoder fuses to GroupQueryAttention."
                 )
 
+    # Rewrites may insert producers after existing consumers.
+    model.graph.sort()
+
 
 def fold_initializers_after_weights(model: ir.Model) -> None:
     """Fold weight ``Transpose`` and ``Concat`` nodes after weights are loaded.

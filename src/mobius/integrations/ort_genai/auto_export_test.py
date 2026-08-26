@@ -21,12 +21,15 @@ from mobius.integrations.ort_genai.auto_export import (
     _count_cache_layer_slots,
     _fix_chat_template,
     _fix_tokenizer_config,
+    _get_static_graph_input_dim,
     _graph_input_names,
     _inspect_decoder_abi,
     _introspect_outputs,
     _is_single_model_decoder_package,
+    _make_trt_rtx_embedding_provider_options,
     _resolve_ort_genai_model_type,
     _select_ort_model_type,
+    _uses_compact_sliding_kv_cache,
     _write_audio_processor_config,
     _write_genai_config,
     _write_vision_processor_config,
@@ -57,6 +60,24 @@ def _mock_model_with_inputs(names: list[str]) -> ir.Model:
 def _mock_model_with_outputs(names: list[str]) -> ir.Model:
     """Create a minimal ir.Model whose graph outputs have the given names."""
     return _mock_model(outputs=names)
+
+
+def test_compact_sliding_kv_cache_requires_matching_graph_contract():
+    model = _mock_model()
+    gqa = ir.Node(
+        op_type="GroupQueryAttention",
+        domain="com.microsoft",
+        inputs=[],
+        num_outputs=1,
+    )
+    model.graph.append(gqa)
+
+    assert not _uses_compact_sliding_kv_cache(model, "cpu")
+    gqa.attributes["sliding_window_cache"] = ir.AttrInt64("sliding_window_cache", 1)
+    assert _uses_compact_sliding_kv_cache(model, "cpu")
+    assert _uses_compact_sliding_kv_cache(model, "cuda")
+    assert not _uses_compact_sliding_kv_cache(model, "dml")
+    assert _uses_compact_sliding_kv_cache(None, "trt-rtx")
 
 
 def _mock_decoder_model(
@@ -148,6 +169,9 @@ class TestResolveOrtGenaiModelType:
         # (not the dense "qwen3" -> "qwen2" alias) so ORT GenAI's tokenizer tag
         # fallback still supplies the Qwen3 reasoning-token IDs.
         assert _resolve_ort_genai_model_type("qwen3_moe") == "qwen3"
+
+    def test_qwen25_text_subconfig_maps_to_multimodal_runtime(self):
+        assert _resolve_ort_genai_model_type("qwen2_5_vl_text") == "qwen2_5_vl"
 
     def test_gemma4_unified_model_types(self):
         # The gemma-4-12B unified checkpoint (model_type "gemma4_unified")
@@ -307,6 +331,43 @@ class TestWriteProcessorConfig:
         norm_attrs = transforms[3]["operation"]["attrs"]
         assert len(norm_attrs["mean"]) == 3
         assert len(norm_attrs["std"]) == 3
+
+    def test_qwen25_text_config_writes_packed_patch_processor(self, tmp_path):
+        vision = types.SimpleNamespace(
+            image_size=448,
+            patch_size=14,
+            spatial_merge_size=2,
+            model_type="qwen2_5_vl",
+        )
+        config = types.SimpleNamespace(
+            vision=vision,
+            model_type="qwen2_5_vl_text",
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+        )
+
+        path = _write_vision_processor_config(config, str(tmp_path))
+
+        assert path is not None
+        with open(path) as f:
+            data = json.load(f)
+        assert data["processor"]["name"] == "qwen2_5_image_processor"
+        transforms = data["processor"]["transforms"]
+        assert transforms[-1]["operation"] == {
+            "name": "patch_image",
+            "type": "PatchImage",
+            "attrs": {
+                "patch_size": 14,
+                "temporal_patch_size": 2,
+                "merge_size": 2,
+            },
+        }
+        normalize = next(
+            transform["operation"]
+            for transform in transforms
+            if transform["operation"]["type"] == "Normalize"
+        )
+        assert normalize["attrs"]["qwen2_5_vl"] == 1
 
     def test_mage_vl_writes_packed_patch_processor(self, tmp_path):
         vision = types.SimpleNamespace(
@@ -1333,9 +1394,22 @@ class TestExportForOrtGenai:
 
         pkg = ModelPackage(
             {
-                "decoder": _mock_model(),
-                "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
+                "decoder": _mock_model(
+                    inputs=[
+                        "inputs_embeds",
+                        "attention_mask",
+                        "position_ids",
+                        "per_layer_inputs",
+                    ]
+                ),
+                "vision_encoder": _mock_model(
+                    inputs=["pixel_values", "image_grid_thw"],
+                    outputs=["image_features"],
+                ),
+                "embedding": _mock_model(
+                    inputs=["input_ids", "image_features"],
+                    outputs=["inputs_embeds", "per_layer_inputs"],
+                ),
             },
             config=FakeConfig(),
         )
@@ -1351,6 +1425,10 @@ class TestExportForOrtGenai:
         assert model["vision"]["tokens_per_second"] == pytest.approx(2.0)
         assert model["vision"]["patch_size"] == 16
         assert model["vision"]["window_size"] == 64
+        assert model["decoder"]["inputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert model["embedding"]["outputs"]["per_layer_inputs"] == "per_layer_inputs"
+        assert model["vision"]["outputs"] == {"image_features": "image_features"}
+        assert "deepstack" not in json.dumps(data)
 
     def test_qwen35_vl_uses_native_qwen35_runtime_type(self, tmp_path):
         import dataclasses
@@ -1381,11 +1459,16 @@ class TestExportForOrtGenai:
             temporal_patch_size: int = 2
             vision: FakeVision = dataclasses.field(default_factory=FakeVision)
 
+        embedding = _mock_model(
+            inputs=["input_ids", "image_features"],
+            outputs=["inputs_embeds", "per_layer_inputs"],
+        )
+        embedding.graph.inputs[1].shape = ir.Shape(["num_tokens", 4096])
         pkg = ModelPackage(
             {
                 "decoder": _mock_model(),
                 "vision_encoder": _mock_model(),
-                "embedding": _mock_model(),
+                "embedding": embedding,
             },
             config=FakeConfig(),
         )
@@ -1424,19 +1507,19 @@ class TestExportForOrtGenai:
             model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "nv_profile_min_shapes"
             ]
-            == "input_ids:1x1,image_features:0x1024"
+            == "input_ids:1x1,image_features:0x4096"
         )
         assert (
             model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "nv_profile_opt_shapes"
             ]
-            == "input_ids:1x226,image_features:192x1024"
+            == "input_ids:1x226,image_features:192x4096"
         )
         assert (
             model["embedding"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "nv_profile_max_shapes"
             ]
-            == "input_ids:1x1024,image_features:2520x1024"
+            == "input_ids:1x1024,image_features:2520x4096"
         )
         assert (
             model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
@@ -3334,26 +3417,54 @@ class TestGraphInputNames:
         ]
 
 
-class TestIntrospectVisionOutputs:
-    """_introspect_outputs surfaces extra vision outputs (DeepStack)."""
+class TestTrtRtxProfileHelpers:
+    def test_static_graph_input_dimension_is_component_agnostic(self):
+        from mobius._model_package import ModelPackage
 
-    def test_vision_deepstack_output_is_surfaced(self):
-        """A Qwen3-VL vision encoder's deepstack_features output is mapped."""
+        encoder = _mock_model(inputs=["features"])
+        encoder.graph.inputs[0].shape = ir.Shape(["tokens", 3072])
+        pkg = ModelPackage({"encoder": encoder}, config=mock.MagicMock())
+
+        assert _get_static_graph_input_dim(pkg, "encoder", "features", -1) == 3072
+
+    def test_symbolic_graph_input_dimension_is_rejected(self):
+        from mobius._model_package import ModelPackage
+
+        encoder = _mock_model(inputs=["features"])
+        encoder.graph.inputs[0].shape = ir.Shape(["tokens", "width"])
+        pkg = ModelPackage({"encoder": encoder}, config=mock.MagicMock())
+
+        with pytest.raises(TypeError, match="must be static"):
+            _get_static_graph_input_dim(pkg, "encoder", "features", -1)
+
+    def test_embedding_profiles_use_supplied_bounds(self):
+        options = _make_trt_rtx_embedding_provider_options(
+            image_feature_width=4096,
+            input_id_lengths=(1, 128, 512),
+            image_feature_lengths=(0, 64, 1024),
+        )
+
+        assert options == {
+            "nv_profile_min_shapes": "input_ids:1x1,image_features:0x4096",
+            "nv_profile_opt_shapes": "input_ids:1x128,image_features:64x4096",
+            "nv_profile_max_shapes": "input_ids:1x512,image_features:1024x4096",
+        }
+
+
+class TestIntrospectVisionOutputs:
+    """_introspect_outputs surfaces graph outputs."""
+
+    def test_vision_image_output_is_surfaced(self):
         from mobius._model_package import ModelPackage
 
         pkg = ModelPackage(
             {
-                "vision_encoder": _mock_model_with_outputs(
-                    ["image_features", "deepstack_features"]
-                ),
+                "vision_encoder": _mock_model_with_outputs(["image_features"]),
             },
             config=mock.MagicMock(),
         )
         mapping = _introspect_outputs(pkg, "vision_encoder")
-        assert mapping == {
-            "image_features": "image_features",
-            "deepstack_features": "deepstack_features",
-        }
+        assert mapping == {"image_features": "image_features"}
 
     def test_missing_key_returns_none(self):
         from mobius._model_package import ModelPackage
@@ -3800,12 +3911,7 @@ class TestGemma4RealModel:
         assert "vision" not in data["model"]
         assert "audio" not in data["model"]
         assert "input_ids" in data["model"]["decoder"]["inputs"]
-        assert data["model"]["decoder"]["sliding_window"] == {
-            "window_size": 8,
-            "slide_key_value_cache": False,
-            "slide_inputs": False,
-            "layers": [0],
-        }
+        assert "sliding_window" not in data["model"]["decoder"]
         # No multimodal processor artifacts.
         assert "processor_config" not in result
         assert "audio_processor" not in result

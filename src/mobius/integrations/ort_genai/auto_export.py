@@ -115,6 +115,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "plamo2": "decoder",
     # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
+    "qwen2_vl_text": "qwen2_5_vl",
+    "qwen2_5_vl_text": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
     # Preserve Qwen3.5 / Qwen3.6 source architecture identities here so package
@@ -217,7 +219,9 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "muse_glimmer",
         "muse_glimmer_text",
         "qwen2_vl",
+        "qwen2_vl_text",
         "qwen2_5_vl",
+        "qwen2_5_vl_text",
         "qwen3_vl",
         "mage_vl",
         "glm_ocr",
@@ -242,11 +246,6 @@ _QWEN35_VL_MODEL_TYPES = frozenset(
         "qwen3_5_moe_vl",
     }
 )
-_QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS = {
-    "nv_profile_min_shapes": "input_ids:1x1,image_features:0x1024",
-    "nv_profile_opt_shapes": "input_ids:1x226,image_features:192x1024",
-    "nv_profile_max_shapes": "input_ids:1x1024,image_features:2520x1024",
-}
 _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS = {
     "nv_profile_min_shapes": "pixel_values:600x1536",
     "nv_profile_opt_shapes": "pixel_values:600x1536",
@@ -573,6 +572,56 @@ def _introspect_outputs(pkg: ModelPackage, key: str) -> dict[str, str] | None:
     if model is None:
         return None
     return {out.name: out.name for out in model.graph.outputs if out.name is not None}
+
+
+def _get_static_graph_input_dim(
+    pkg: ModelPackage,
+    component_name: str,
+    input_name: str,
+    axis: int,
+) -> int:
+    component = pkg.get(component_name)
+    if component is None:
+        raise ValueError(f"Component {component_name!r} is required.")
+    value = next(
+        (value for value in component.graph.inputs if value.name == input_name),
+        None,
+    )
+    if value is None or value.shape is None:
+        raise ValueError(
+            f"Component {component_name!r} requires input {input_name!r} with a known rank."
+        )
+    normalized_axis = axis if axis >= 0 else len(value.shape) + axis
+    if not 0 <= normalized_axis < len(value.shape):
+        raise ValueError(
+            f"Axis {axis} is out of range for {component_name!r} input "
+            f"{input_name!r} with rank {len(value.shape)}."
+        )
+    dimension = value.shape[normalized_axis]
+    if not isinstance(dimension, int):
+        raise TypeError(
+            f"Component {component_name!r} input {input_name!r} axis {axis} must be static."
+        )
+    return dimension
+
+
+def _make_trt_rtx_embedding_provider_options(
+    *,
+    image_feature_width: int,
+    input_id_lengths: tuple[int, int, int],
+    image_feature_lengths: tuple[int, int, int],
+) -> dict[str, str]:
+    return {
+        f"nv_profile_{profile}_shapes": (
+            f"input_ids:1x{input_length},image_features:{feature_length}x{image_feature_width}"
+        )
+        for profile, input_length, feature_length in zip(
+            ("min", "opt", "max"),
+            input_id_lengths,
+            image_feature_lengths,
+            strict=True,
+        )
+    }
 
 
 def _copy_tokenizer_files(
@@ -1418,6 +1467,21 @@ def _write_audio_processor_config(
     return path
 
 
+def _uses_compact_sliding_kv_cache(decoder_model: ir.Model | None, ep: str) -> bool:
+    """Whether the graph and EP can keep sliding layers in a compact KV cache."""
+    if ep == "trt-rtx":
+        return True
+    if decoder_model is None or ep not in {"cpu", "cuda"}:
+        return False
+    return any(
+        node.op_type == "GroupQueryAttention"
+        and node.domain == "com.microsoft"
+        and (attribute := node.attributes.get("sliding_window_cache")) is not None
+        and attribute.as_int() == 1
+        for node in decoder_model.graph
+    )
+
+
 def _write_genai_config(
     config: Any,
     output_dir: str,
@@ -1527,7 +1591,13 @@ def _write_genai_config(
 
     sliding_window = None
     window_size = getattr(config, "sliding_window", None)
-    if isinstance(window_size, int) and window_size > 0:
+    # ORT GenAI uses this block to allocate a compact present cache. A
+    # local_window_size mask alone does not compact GQA outputs.
+    if (
+        isinstance(window_size, int)
+        and window_size > 0
+        and _uses_compact_sliding_kv_cache(decoder_model, ep)
+    ):
         layer_types = getattr(config, "layer_types", None)
         local_types = {"local", "sliding_attention", "window_attention"}
         layers = (
@@ -1646,8 +1716,18 @@ def _write_genai_config(
                         getattr(config, "tokens_per_second", 2.0)
                     )
                 if ep == "trt-rtx" and model_type in _QWEN35_VL_MODEL_TYPES:
+                    image_feature_width = _get_static_graph_input_dim(
+                        pkg,
+                        "embedding",
+                        "image_features",
+                        -1,
+                    )
                     vision_kwargs["embedding_provider_options"] = (
-                        _QWEN35_TRT_RTX_EMBEDDING_PROVIDER_OPTIONS
+                        _make_trt_rtx_embedding_provider_options(
+                            image_feature_width=image_feature_width,
+                            input_id_lengths=(1, 226, 1024),
+                            image_feature_lengths=(0, 192, 2520),
+                        )
                     )
                     vision_kwargs["vision_provider_options"] = (
                         _QWEN35_TRT_RTX_VISION_PROVIDER_OPTIONS
@@ -1655,10 +1735,9 @@ def _write_genai_config(
 
             if vision_input_mapping is not None:
                 vision_kwargs["input_names"] = vision_input_mapping
-            # Introspect vision outputs so extra maps (e.g. Qwen3-VL
-            # ``deepstack_features``) are forwarded to the embedding model
-            # via genai_config.json; defaulting to ``image_features`` alone
-            # would silently drop DeepStack at runtime.
+            # Introspect runtime-semantic vision outputs from the ONNX graph.
+            # Model-specific auxiliary features must be packed into a supported
+            # output by the task rather than emitted as arbitrary config keys.
             vision_output_mapping = _introspect_outputs(pkg, "vision_encoder")
             if vision_output_mapping is not None:
                 vision_kwargs["output_names"] = vision_output_mapping

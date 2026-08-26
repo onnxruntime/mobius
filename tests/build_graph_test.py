@@ -1294,8 +1294,7 @@ class TestBuildGraphVisionLanguage:
         model_cls = registry.get("qwen3_vl")
         module = model_cls(config)
         task_name = _default_task_for_model("qwen3_vl")
-        task = get_task(task_name)
-        pkg = task.build(module, config)
+        pkg = build_from_module(module, config, task=task_name, execution_provider="cpu")
 
         # 3-model split produces decoder, vision, embedding
         assert "decoder" in pkg
@@ -1306,6 +1305,40 @@ class TestBuildGraphVisionLanguage:
         decoder = pkg["decoder"]
         assert "logits" in {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in {inp.name for inp in decoder.graph.inputs}
+        assert "per_layer_inputs" in {inp.name for inp in decoder.graph.inputs}
+        assert "deepstack_embeds" not in {inp.name for inp in decoder.graph.inputs}
+        num_deepstack = len(config.deepstack_visual_indexes)
+        per_layer_input = next(
+            inp for inp in decoder.graph.inputs if inp.name == "per_layer_inputs"
+        )
+        assert per_layer_input.shape[-1] == num_deepstack * config.hidden_size
+
+        vision_outputs = {out.name for out in pkg["vision_encoder"].graph.outputs}
+        assert vision_outputs == {"image_features"}
+        assert (
+            pkg["vision_encoder"].graph.outputs[0].shape[-1]
+            == (num_deepstack + 1) * config.hidden_size
+        )
+        embedding_inputs = {inp.name for inp in pkg["embedding"].graph.inputs}
+        embedding_outputs = {out.name for out in pkg["embedding"].graph.outputs}
+        assert embedding_inputs == {"input_ids", "image_features"}
+        assert embedding_outputs == {"inputs_embeds", "per_layer_inputs"}
+        image_features = next(
+            inp for inp in pkg["embedding"].graph.inputs if inp.name == "image_features"
+        )
+        per_layer_output = next(
+            out for out in pkg["embedding"].graph.outputs if out.name == "per_layer_inputs"
+        )
+        assert image_features.shape[-1] == (num_deepstack + 1) * config.hidden_size
+        assert per_layer_output.shape[-1] == num_deepstack * config.hidden_size
+
+        vision_encoder = pkg["vision_encoder"]
+        node_order = {id(node): index for index, node in enumerate(vision_encoder.graph)}
+        for index, node in enumerate(vision_encoder.graph):
+            for input_value in node.inputs:
+                producer = input_value.producer() if input_value is not None else None
+                if producer is not None and producer.graph is vision_encoder.graph:
+                    assert node_order[id(producer)] < index
 
     def test_qwen35_vl_graph(self):
         """Build Qwen3.5-VL with its auto-detected 3-model task."""
@@ -1349,6 +1382,12 @@ class TestBuildGraphVisionLanguage:
         decoder = pkg["decoder"]
         assert "logits" in {out.name for out in decoder.graph.outputs}
         assert "inputs_embeds" in {inp.name for inp in decoder.graph.inputs}
+        assert "per_layer_inputs" in {inp.name for inp in decoder.graph.inputs}
+        assert {out.name for out in pkg["vision_encoder"].graph.outputs} == {"image_features"}
+        assert {out.name for out in pkg["embedding"].graph.outputs} == {
+            "inputs_embeds",
+            "per_layer_inputs",
+        }
 
         # Verify hybrid cache: linear_attention layer gets conv_state/recurrent_state,
         # full_attention layer gets key/value

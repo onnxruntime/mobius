@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import onnx_ir as ir
 import pytest
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config
+from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -76,6 +78,24 @@ class TestGemma4CausalLMPreprocessWeights:
         expected = 2.0 * (64**-0.5)  # hidden_size=64
         assert abs(result["model.layers.0.router.scale"].item() - expected) < 1e-6
 
+    def test_quantized_moe_experts_fail_closed(self):
+        config = _tiny_gemma4_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            )
+        )
+        state_dict = {
+            "model.layers.0.experts.gate_up_proj_qweight": torch.zeros(
+                4, 64, 32, dtype=torch.uint8
+            )
+        }
+
+        with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
+            Gemma4CausalLMModel(config).preprocess_weights(state_dict)
+
 
 class TestGemma4ModelPreprocessWeights:
     """Test Gemma4Model.preprocess_weights (multimodal path)."""
@@ -106,6 +126,157 @@ class TestGemma4ModelPreprocessWeights:
         assert key in result
         assert abs(result[key].item() - expected) < 1e-6
 
+    def test_quantized_moe_experts_fail_closed(self):
+        config = _tiny_gemma4_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            )
+        )
+        state_dict = {
+            "model.language_model.layers.0.experts.down_proj.weight_scales": torch.ones(
+                4, 64, 2
+            )
+        }
+
+        with pytest.raises(NotImplementedError, match="Quantized Gemma4 MoE experts"):
+            Gemma4Model(config).preprocess_weights(state_dict)
+
+    def test_olive_quantized_decoder_sidecars_are_preprocessed(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            ),
+        )
+        model = Gemma4Model(config)
+        fake_sd = {
+            "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.0.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+        }
+
+        result = model.preprocess_weights(fake_sd)
+
+        weight_key = "decoder.model.layers.0.self_attn.q_proj.weight"
+        scales_key = "decoder.model.layers.0.self_attn.q_proj.scales"
+        assert result[weight_key].shape == (64, 4, 8)
+        assert result[weight_key].dtype == torch.uint8
+        assert (
+            result[scales_key]
+            is fake_sd["model.language_model.layers.0.self_attn.q_proj.weight_scales"]
+        )
+
+    def test_olive_quantized_vision_sidecars_are_preprocessed(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_vision=True,
+            ),
+        )
+        model = Gemma4Model(config)
+        fake_sd = {
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                32, 16, dtype=torch.uint8
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                32, 2
+            ),
+            "model.embed_vision.embedding_projection.weight_qweight": torch.zeros(
+                64, 16, dtype=torch.uint8
+            ),
+            "model.embed_vision.embedding_projection.weight_scales": torch.ones(64, 2),
+        }
+
+        result = model.preprocess_weights(fake_sd)
+
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            2,
+            8,
+        )
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.scales"].shape == (
+            32,
+            2,
+        )
+        assert result["vision_encoder.projector.weight"].shape == (64, 2, 8)
+        assert result["vision_encoder.projector.scales"].shape == (64, 2)
+
+    def test_top_level_lm_head_routes_to_decoder(self):
+        model = Gemma4Model(_tiny_gemma4_config(tie_word_embeddings=False))
+        weight = torch.randn(256, 64)
+
+        result = model.preprocess_weights({"lm_head.weight": weight})
+
+        assert result["decoder.lm_head.weight"] is weight
+
+    @pytest.mark.parametrize(
+        ("quantize_embeddings", "quantize_lm_head", "state_dict"),
+        [
+            (
+                True,
+                False,
+                {
+                    "model.language_model.embed_tokens.weight_qweight": torch.zeros(
+                        256, 32, dtype=torch.uint8
+                    )
+                },
+            ),
+            (
+                False,
+                True,
+                {"lm_head.weight_qweight": torch.zeros(256, 32, dtype=torch.uint8)},
+            ),
+        ],
+    )
+    def test_quantized_embedding_or_lm_head_fails_closed(
+        self,
+        quantize_embeddings,
+        quantize_lm_head,
+        state_dict,
+    ):
+        config = _tiny_gemma4_config(
+            tie_word_embeddings=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_embeddings=quantize_embeddings,
+                quantize_lm_head=quantize_lm_head,
+            ),
+        )
+
+        with pytest.raises(
+            NotImplementedError,
+            match="Quantized embeddings and LM heads are not yet supported",
+        ):
+            Gemma4Model(config).preprocess_weights(state_dict)
+
+    def test_gguf_quantized_tables_keep_canonical_weight_path(self):
+        config = _tiny_gemma4_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="gguf",
+                sym=True,
+                quantize_embeddings=True,
+                quantize_lm_head=True,
+            ),
+        )
+
+        assert Gemma4Model(config).preprocess_weights({}) == {}
+
     def test_per_expert_scale_not_folded(self):
         """router.per_expert_scale should NOT be multiplied by scale_factor."""
         config = _tiny_gemma4_config()
@@ -133,6 +304,49 @@ class TestGemma4EmbeddingModel:
         assert model.audio_token_id == 200011
         assert not hasattr(model, "_image_token_id_mask")
         assert not hasattr(model, "_audio_token_id_mask")
+
+
+class TestGemma4VisionQuantization:
+    def test_quantize_vision_emits_matmulnbits_and_keeps_activation_clipping(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            vision=dataclasses.replace(
+                _tiny_gemma4_config().vision,
+                use_clipped_linears=True,
+            ),
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_vision=True,
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+        op_types = [node.op_type for node in graph]
+
+        assert op_types.count("MatMulNBits") == 9
+        assert op_types.count("Clip") >= 16
+
+    def test_quantized_decoder_does_not_quantize_vision_by_default(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+
+        assert not any(node.op_type == "MatMulNBits" for node in graph)
 
 
 class TestScaleFreeRMSNormOverflow:

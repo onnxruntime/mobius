@@ -196,6 +196,51 @@ class TestBudget:
 
 
 class TestRunPreflight:
+    def test_available_ram_bytes_forwards_probe_value(self, monkeypatch):
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (123, "test"))
+
+        assert preflight._available_ram_bytes() == 123
+
+    def test_ram_probe_reports_windows_source(self, monkeypatch):
+        monkeypatch.setattr(preflight.os, "name", "nt")
+        monkeypatch.setattr(preflight, "_windows_available_ram_bytes", lambda: 123)
+
+        assert preflight._probe_available_ram() == (123, "GlobalMemoryStatusEx:ullAvailPhys")
+
+    def test_ram_probe_reports_darwin_source(self, monkeypatch):
+        monkeypatch.setattr(preflight.os, "name", "posix")
+        monkeypatch.setattr(preflight.sys, "platform", "darwin")
+        monkeypatch.setattr(preflight, "_darwin_available_ram_bytes", lambda: 456)
+
+        assert preflight._probe_available_ram() == (456, "vm_stat:available pages")
+
+    def test_vm_stat_parser_does_not_double_count_purgeable_pages(self):
+        output = """\
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+  Pages free:                             1,000.
+Pages inactive:                              20.
+Pages speculative:                            3.
+Pages purgeable:                            100.
+"""
+
+        assert preflight._parse_vm_stat_available_bytes(output) == 1023 * 4096
+
+    def test_vm_stat_parser_returns_none_without_available_fields(self):
+        output = """\
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages wired down:                           100.
+"""
+
+        assert preflight._parse_vm_stat_available_bytes(output) is None
+
+    def test_ram_probe_reports_sysconf_fallback_source(self, monkeypatch):
+        monkeypatch.setattr(preflight.os, "name", "posix")
+        monkeypatch.setattr(preflight.sys, "platform", "linux")
+        monkeypatch.setattr(preflight, "_proc_available_ram_bytes", lambda: None)
+        monkeypatch.setattr(preflight, "_sysconf_available_ram_bytes", lambda: 789)
+
+        assert preflight._probe_available_ram() == (789, "os.sysconf:SC_AVPHYS_PAGES")
+
     def test_metadata_unavailable_is_a_blocker_not_a_pass(self, tmp_path):
         # A local dir with no safetensors -> resolve fails -> refused.
         result = run_preflight(str(tmp_path), output_dir=str(tmp_path / "out"))
@@ -216,7 +261,7 @@ class TestRunPreflight:
     def test_ready_when_space_sufficient(self, tmp_path, monkeypatch):
         _write_sharded(tmp_path, n_shards=2)
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (10**15, "test"))
         result = run_preflight(
             str(tmp_path), output_dir=str(tmp_path / "out"), loader=LoaderMode.STREAM
         )
@@ -227,7 +272,7 @@ class TestRunPreflight:
     def test_refuses_when_disk_insufficient(self, tmp_path, monkeypatch):
         _write_sharded(tmp_path, n_shards=2)
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 1)  # ~no disk
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (10**15, "test"))
         result = run_preflight(str(tmp_path), output_dir=str(tmp_path / "out"))
         assert result.ok is False
         assert any("disk" in b for b in result.blockers)
@@ -235,7 +280,7 @@ class TestRunPreflight:
     def test_refuses_when_ram_insufficient_eager(self, tmp_path, monkeypatch):
         _write_sharded(tmp_path, n_shards=2)
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 1)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (1, "test"))
         result = run_preflight(
             str(tmp_path), output_dir=str(tmp_path / "out"), loader=LoaderMode.EAGER
         )
@@ -245,7 +290,7 @@ class TestRunPreflight:
     def test_vram_single_device_refusal(self, tmp_path, monkeypatch):
         _write_sharded(tmp_path, n_shards=2)
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (10**15, "test"))
         result = run_preflight(
             str(tmp_path),
             output_dir=str(tmp_path / "out"),
@@ -269,7 +314,7 @@ class TestRunPreflight:
             ],
             safetensors=types.SimpleNamespace(parameters={"BF16": 100}, total=100),
         )
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (10**15, "test"))
         # Free space (240) fits the 200B download or the 200B output alone, but
         # not both (400B combined) on one filesystem. Independent checks would
         # each pass; the combined check must refuse.
@@ -288,7 +333,7 @@ class TestRunPreflight:
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
         # MemAvailable can't be read -> the RAM budget is unverifiable and must
         # not produce a success-shaped pass.
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: None)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (None, "unavailable"))
         result = run_preflight(str(tmp_path), output_dir=str(tmp_path / "out"))
         assert result.ok is False
         assert any("RAM budget could not be verified" in b for b in result.blockers)
@@ -303,7 +348,7 @@ class TestResumability:
     def test_state_written_and_reused(self, tmp_path, monkeypatch):
         _write_sharded(tmp_path, n_shards=2)
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (10**15, "test"))
         state_file = tmp_path / "state.json"
 
         r1 = run_preflight(
@@ -325,7 +370,7 @@ class TestResumability:
         weight_map = {"w0": "model-00001-of-00001.safetensors"}
         _fake_hub(tmp_path, monkeypatch, weight_map)
         monkeypatch.setattr(preflight, "_free_bytes", lambda p: 10**15)
-        monkeypatch.setattr(preflight, "_available_ram_bytes", lambda: 10**15)
+        monkeypatch.setattr(preflight, "_probe_available_ram", lambda: (10**15, "test"))
         state_file = tmp_path / "state.json"
         state_file.write_text(
             json.dumps(
