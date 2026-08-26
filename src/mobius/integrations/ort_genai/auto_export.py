@@ -115,6 +115,8 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
     "plamo2": "decoder",
     # Qwen VL model families have separate ORT GenAI model types.
     "qwen2_vl": "qwen2_5_vl",
+    "qwen2_vl_text": "qwen2_5_vl",
+    "qwen2_5_vl_text": "qwen2_5_vl",
     "qwen3_vl": "qwen3_vl",
     "qwen3_vl_text": "qwen3_vl",
     # Preserve Qwen3.5 / Qwen3.6 source architecture identities here so package
@@ -217,7 +219,9 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "muse_glimmer",
         "muse_glimmer_text",
         "qwen2_vl",
+        "qwen2_vl_text",
         "qwen2_5_vl",
+        "qwen2_5_vl_text",
         "qwen3_vl",
         "mage_vl",
         "glm_ocr",
