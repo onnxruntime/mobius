@@ -17,7 +17,9 @@ schedule, full-kernel Gated-DeltaNet convolution state, recurrent delta-rule
 state, four-stream gated residual hyper-connections, exact softmax-first
 top-k routed MoE plus the sigmoid-gated shared expert, QSA block pooling and
 token selection, and PLE hashed n-gram embeddings with their dilated
-convolution and token-context states.
+convolution and token-context states. The pinned BF16 checkpoint keeps
+DeltaNet recurrent math and recurrent cache state in float32, while convolution
+state, projections, sparse-attention caches, and logits remain in model dtype.
 
 The flattened cache ABI is:
 

@@ -26,6 +26,7 @@ from mobius.components import (
     Linear,
     SoftmaxTopKGate,
     create_attention_bias,
+    get_activation,
     initialize_rope,
 )
 from mobius.components._attention import Qwen35Attention
@@ -188,11 +189,12 @@ class Qwen4ExpGatedResidual(nn.Module):
 class _Qwen4ExpDepthwiseConv1d(nn.Module):
     """Causal depthwise convolution with the upstream full-kernel cache ABI."""
 
-    def __init__(self, channels: int, kernel_size: int):
+    def __init__(self, channels: int, kernel_size: int, activation: str):
         super().__init__()
         self.weight = nn.Parameter([channels, 1, kernel_size])
         self._channels = channels
         self._kernel_size = kernel_size
+        self._activation = get_activation(activation)
 
     def forward(
         self, op: OpBuilder, input_val: ir.Value, conv_state: ir.Value
@@ -208,7 +210,7 @@ class _Qwen4ExpDepthwiseConv1d(nn.Module):
             kernel_shape=[self._kernel_size],
         )
         present_state = op.Slice(history, [-self._kernel_size], [_INT64_MAX], [2])
-        return op.Swish(output), present_state
+        return self._activation(op, output), present_state
 
 
 class _Qwen4ExpPostGatedRMSNorm(nn.Module):
@@ -222,18 +224,21 @@ class _Qwen4ExpPostGatedRMSNorm(nn.Module):
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value, gate: ir.Value) -> ir.Value:
         hidden_f32 = op.Cast(hidden_states, to=ir.DataType.FLOAT)
-        normalized = op.RMSNormalization(
+        variance = op.ReduceMean(op.Mul(hidden_f32, hidden_f32), [-1], keepdims=True)
+        normalized_f32 = op.Mul(
             hidden_f32,
-            op.Cast(self.weight, to=ir.DataType.FLOAT),
-            epsilon=self._eps,
-            stash_type=1,
-            axis=-1,
+            op.Reciprocal(op.Sqrt(op.Add(variance, self._eps))),
         )
+        normalized = op.CastLike(normalized_f32, hidden_states)
+        weighted = op.Mul(normalized, self.weight)
         gate_f32 = op.Cast(gate, to=ir.DataType.FLOAT)
         activated = (
             op.Sigmoid(gate_f32) if self._activation == "sigmoid" else op.Swish(gate_f32)
         )
-        return op.CastLike(op.Mul(normalized, activated), hidden_states)
+        return op.CastLike(
+            op.Mul(op.Cast(weighted, to=ir.DataType.FLOAT), activated),
+            hidden_states,
+        )
 
 
 class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
@@ -241,7 +246,9 @@ class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
 
     def __init__(self, config: Qwen4ExpConfig):
         super().__init__(config)
-        self.conv1d = _Qwen4ExpDepthwiseConv1d(self.conv_dim, self.conv_kernel_size)
+        self.conv1d = _Qwen4ExpDepthwiseConv1d(
+            self.conv_dim, self.conv_kernel_size, config.hidden_act or "silu"
+        )
         self.norm = _Qwen4ExpPostGatedRMSNorm(
             self.head_v_dim,
             config.rms_norm_eps,
@@ -578,15 +585,11 @@ class Qwen4ExpQSAIndexer(nn.Module):
         visible_count = op.ReduceSum(
             op.Cast(all_visible, to=ir.DataType.INT64), [2], keepdims=True
         )
-        visible_start = op.ArgMax(
-            op.Cast(all_visible, to=ir.DataType.INT64),
-            axis=2,
-            keepdims=1,
-            select_last_index=0,
-        )
         query_num_blocks = op.Div(visible_count, self._ratio)
 
         total_length = op.Shape(present_index_key, start=1, end=2)
+        batch = op.Shape(present_index_key, start=0, end=1)
+        query_length = op.Shape(hidden_states, start=1, end=2)
         max_blocks = op.Div(op.Add(total_length, self._ratio - 1), self._ratio)
         block_ids = op.Range(
             op.Constant(value_int=0),
@@ -598,14 +601,51 @@ class Qwen4ExpQSAIndexer(nn.Module):
             op.Constant(value_int=self._ratio),
             op.Constant(value_int=1),
         )
-        candidate_indices = op.Add(
-            op.Unsqueeze(visible_start, [-1]),
-            op.Add(
-                op.Unsqueeze(op.Mul(block_ids, self._ratio), [0, 1, 3]),
-                op.Unsqueeze(block_offsets, [0, 1, 2]),
+        token_ids = op.Range(
+            op.Constant(value_int=0),
+            op.Squeeze(total_length, [0]),
+            op.Constant(value_int=1),
+        )
+        # Sort visible token positions into chronological order. This preserves
+        # exact upstream block construction for left padding and arbitrary holes.
+        position_scores = op.Where(
+            all_visible,
+            op.Cast(
+                op.Sub(op.Squeeze(total_length, [0]), token_ids),
+                to=ir.DataType.FLOAT,
+            ),
+            op.Expand(op.Constant(value_float=-1.0), op.Shape(all_visible)),
+        )
+        _, ordered_visible_indices = op.TopK(
+            position_scores,
+            total_length,
+            axis=-1,
+            largest=1,
+            sorted=1,
+            _outputs=2,
+        )
+        candidate_ordinals = op.Add(
+            op.Unsqueeze(op.Mul(block_ids, self._ratio), [1]),
+            op.Unsqueeze(block_offsets, [0]),
+        )
+        candidate_ordinals = op.Min(candidate_ordinals, op.Sub(total_length, 1))
+        candidate_ordinals = op.Expand(
+            op.Unsqueeze(candidate_ordinals, [0, 1]),
+            op.Concat(
+                batch,
+                query_length,
+                max_blocks,
+                op.Constant(value_ints=[self._ratio]),
+                axis=0,
             ),
         )
-        candidate_indices = op.Min(candidate_indices, op.Sub(total_length, 1))
+        ordered_visible_indices = op.Expand(
+            op.Unsqueeze(ordered_visible_indices, [2]),
+            op.Concat(batch, query_length, max_blocks, total_length, axis=0),
+        )
+        candidate_indices = op.GatherElements(
+            ordered_visible_indices, candidate_ordinals, axis=3
+        )
         block_valid = op.Less(op.Unsqueeze(block_ids, [0, 1]), query_num_blocks)
         key_blocks = self._gather_per_query(
             op, present_index_key, candidate_indices, self._head_dim
@@ -613,8 +653,6 @@ class Qwen4ExpQSAIndexer(nn.Module):
         pooled = op.ReduceMean(op.Cast(key_blocks, to=ir.DataType.FLOAT), [3], keepdims=False)
         pooled = self.k_layernorm(op, op.CastLike(pooled, present_index_key))
 
-        batch = op.Shape(present_index_key, start=0, end=1)
-        query_length = op.Shape(hidden_states, start=1, end=2)
         block_starts = op.Squeeze(op.Gather(candidate_indices, [0], axis=3), [3])
         block_positions = (
             self._gather_per_query(
@@ -699,23 +737,23 @@ class Qwen4ExpQSAIndexer(nn.Module):
         selected = op.Cast(selected, to=ir.DataType.BOOL)
         selected = op.And(selected, block_valid)
 
-        token_ids = op.Range(
-            op.Constant(value_int=0),
-            op.Squeeze(total_length, [0]),
-            op.Constant(value_int=1),
+        visible_ordinal = op.Sub(
+            op.CumSum(
+                op.Cast(all_visible, to=ir.DataType.INT64),
+                op.Constant(value_int=2),
+            ),
+            1,
         )
-        relative_token = op.Sub(op.Unsqueeze(token_ids, [0, 1]), visible_start)
-        nonnegative = op.GreaterOrEqual(relative_token, 0)
-        token_block = op.Div(op.Max(relative_token, 0), self._ratio)
+        token_block = op.Div(op.Max(visible_ordinal, 0), self._ratio)
         token_block = op.Min(token_block, op.Sub(max_blocks, 1))
         selected_for_token = op.GatherElements(selected, token_block, axis=2)
         query_complete_length = op.Mul(query_num_blocks, self._ratio)
-        complete_token = op.Less(relative_token, query_complete_length)
-        selected_complete = op.And(selected_for_token, op.And(nonnegative, complete_token))
-        query_tail = op.GreaterOrEqual(relative_token, query_complete_length)
-        query_tail = op.And(query_tail, nonnegative)
-        selected_complete = op.And(selected_complete, all_visible)
-        query_tail = op.And(query_tail, all_visible)
+        complete_token = op.Less(visible_ordinal, query_complete_length)
+        selected_complete = op.And(selected_for_token, op.And(all_visible, complete_token))
+        query_tail = op.And(
+            all_visible,
+            op.GreaterOrEqual(visible_ordinal, query_complete_length),
+        )
         selected_tokens = op.Or(selected_complete, query_tail)
         sparse_bias = op.Where(
             selected_tokens,
@@ -1005,6 +1043,7 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
         """Map official packed experts and sharded PLE tables to ONNX parameters."""
         cleaned: dict[str, torch.Tensor] = {}
         ple_shards: dict[str, dict[int, torch.Tensor]] = defaultdict(dict)
+        parameter_map = dict(self.named_parameters())
         skipped_mtp = 0
         for original_key, value in state_dict.items():
             key = original_key
@@ -1026,8 +1065,15 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
                     ".ple_embedding.ngram_heads_offsets",
                 )
             ):
-                # These deterministic upstream buffers are materialized as
-                # onnx-ir constants and folded into the hash subgraph.
+                parameter = parameter_map.get(key)
+                if parameter is None or parameter._const_value is None:
+                    raise ValueError(f"Unexpected Qwen4-Exp deterministic buffer: {key}")
+                expected = torch.from_numpy(parameter._const_value.numpy())
+                if not torch.equal(value.cpu(), expected):
+                    raise ValueError(
+                        f"Qwen4-Exp deterministic buffer {key} does not match "
+                        "the pinned hash construction"
+                    )
                 continue
 
             marker = ".ple.ple_embedding.ngram_embedding.shard_"
@@ -1040,6 +1086,16 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
                 continue
 
             if key.endswith(".mlp.experts.gate_up_proj"):
+                expected_shape = (
+                    self.config.num_local_experts,
+                    2 * self.config.moe_intermediate_size,
+                    self.config.hidden_size,
+                )
+                if tuple(value.shape) != expected_shape:
+                    raise ValueError(
+                        f"Qwen4-Exp packed gate_up_proj has shape {tuple(value.shape)}, "
+                        f"expected {expected_shape}"
+                    )
                 prefix = key[: -len("experts.gate_up_proj")]
                 half = value.shape[1] // 2
                 for expert_index in range(value.shape[0]):
@@ -1051,6 +1107,16 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
                     ]
                 continue
             if key.endswith(".mlp.experts.down_proj"):
+                expected_shape = (
+                    self.config.num_local_experts,
+                    self.config.hidden_size,
+                    self.config.moe_intermediate_size,
+                )
+                if tuple(value.shape) != expected_shape:
+                    raise ValueError(
+                        f"Qwen4-Exp packed down_proj has shape {tuple(value.shape)}, "
+                        f"expected {expected_shape}"
+                    )
                 prefix = key[: -len("experts.down_proj")]
                 for expert_index in range(value.shape[0]):
                     cleaned[f"{prefix}experts.{expert_index}.down_proj.weight"] = value[
@@ -1063,13 +1129,25 @@ class Qwen4ExpCausalLMModel(CausalLMModel):
             expected = set(range(self.config.split_ngram_parts))
             if set(shards) != expected:
                 missing = sorted(expected - set(shards))
+                unexpected = sorted(set(shards) - expected)
                 raise ValueError(
-                    f"Qwen4-Exp PLE table {target} is missing shard indices {missing}"
+                    f"Qwen4-Exp PLE table {target} has missing shard indices {missing} "
+                    f"and unexpected shard indices {unexpected}"
                 )
-            cleaned[target] = torch.cat(
+            parameter = parameter_map.get(target)
+            if parameter is None:
+                raise ValueError(f"Unexpected Qwen4-Exp PLE table: {target}")
+            combined = torch.cat(
                 [shards[index] for index in range(self.config.split_ngram_parts)],
                 dim=0,
             )
+            expected_shape = tuple(int(dim) for dim in parameter.shape)
+            if tuple(combined.shape) != expected_shape:
+                raise ValueError(
+                    f"Qwen4-Exp PLE table {target} has shape {tuple(combined.shape)}, "
+                    f"expected {expected_shape}"
+                )
+            cleaned[target] = combined
         if skipped_mtp:
             logger.warning(
                 "Skipped %d Qwen4-Exp MTP tensors. The pinned official "

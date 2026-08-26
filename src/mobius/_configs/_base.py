@@ -29,19 +29,19 @@ if TYPE_CHECKING:
 DEFAULT_INT = -42
 
 
-def _resolve_dtype(config) -> ir.DataType | None:
-    """Extract model dtype from a HuggingFace config.
-
-    Handles string dtypes (e.g. "float16"), torch.dtype objects,
-    and the "auto" sentinel (returns None).
-    """
-    torch_dtype = getattr(config, "dtype", None)
+def _resolve_dtype_value(torch_dtype) -> ir.DataType | None:
+    """Convert a HuggingFace dtype value to an ONNX IR dtype."""
     if torch_dtype is not None and torch_dtype != "auto":
         if isinstance(torch_dtype, str):
             torch_dtype = getattr(torch, torch_dtype, None)
         if torch_dtype is not None:
             return tensor_adapters.from_torch_dtype(torch_dtype)
     return None
+
+
+def _resolve_dtype(config) -> ir.DataType | None:
+    """Extract model dtype from a HuggingFace config."""
+    return _resolve_dtype_value(getattr(config, "dtype", None))
 
 
 def _resolve_hidden_act(config, model_type: str) -> str | None:
@@ -1552,6 +1552,7 @@ class Qwen4ExpConfig(CausalLMConfig):
     indexer_budget: int | None = None
     indexer_compress_ratio: int | None = None
     output_gate_type: str | None = None
+    mamba_ssm_dtype: ir.DataType = ir.DataType.FLOAT
     mtp_num_hidden_layers: int = 0
     mtp_use_dedicated_embeddings: bool = False
 
@@ -1591,6 +1592,11 @@ class Qwen4ExpConfig(CausalLMConfig):
             raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {self.hc_count}")
         if self.hc_lowrank <= 0:
             raise ValueError(f"Qwen4-Exp requires hc_lowrank > 0, got {self.hc_lowrank}")
+        if self.mamba_ssm_dtype != ir.DataType.FLOAT:
+            raise ValueError(
+                "Qwen4-Exp requires mamba_ssm_dtype=float32 for the pinned "
+                "Gated-DeltaNet recurrence"
+            )
         if not self.num_local_experts or self.num_local_experts <= 0:
             raise ValueError("Qwen4-Exp num_experts must be > 0")
         if not self.num_experts_per_tok or not (
@@ -1604,6 +1610,25 @@ class Qwen4ExpConfig(CausalLMConfig):
             or self.shared_expert_intermediate_size <= 0
         ):
             raise ValueError("Qwen4-Exp shared_expert_intermediate_size must be > 0")
+        if "linear_attention" in layer_types:
+            linear_fields = {
+                "linear_num_key_heads": self.linear_num_key_heads,
+                "linear_num_value_heads": self.linear_num_value_heads,
+                "linear_key_head_dim": self.linear_key_head_dim,
+                "linear_value_head_dim": self.linear_value_head_dim,
+                "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+            }
+            if any(value is None or value <= 0 for value in linear_fields.values()):
+                raise ValueError(
+                    f"Qwen4-Exp linear-attention config values must be positive: {linear_fields}"
+                )
+            assert self.linear_num_key_heads is not None
+            assert self.linear_num_value_heads is not None
+            if self.linear_num_value_heads % self.linear_num_key_heads:
+                raise ValueError(
+                    "Qwen4-Exp linear_num_value_heads must be divisible by "
+                    "linear_num_key_heads"
+                )
 
         qsa_fields = {
             "indexer_n_heads": self.indexer_n_heads,
@@ -1668,6 +1693,14 @@ class Qwen4ExpConfig(CausalLMConfig):
                 isinstance(self.eos_token_id, list) and not self.eos_token_id
             ):
                 raise ValueError("Qwen4-Exp eos_token_id must be set when PLE is enabled")
+            if self.ple_conv_kernel_size <= 0:
+                raise ValueError("Qwen4-Exp ple_conv_kernel_size must be > 0")
+            if self.ngram_vocab_size_base < 2:
+                raise ValueError("Qwen4-Exp ngram_vocab_size_base must be >= 2")
+            if self.make_ngram_vocab_size_divisible_by <= 0:
+                raise ValueError("Qwen4-Exp make_ngram_vocab_size_divisible_by must be > 0")
+            if self.split_ngram_parts <= 0:
+                raise ValueError("Qwen4-Exp split_ngram_parts must be > 0")
 
         if self.mtp_use_dedicated_embeddings:
             raise ValueError(
@@ -1681,6 +1714,11 @@ class Qwen4ExpConfig(CausalLMConfig):
         parent = parent_config or (config if text is not config else None)
         base = ArchitectureConfig.from_transformers(text, parent)
         fields = _shallow_fields(base)
+        mamba_ssm_dtype = _resolve_dtype_value(getattr(text, "mamba_ssm_dtype", "float32"))
+        if mamba_ssm_dtype is None:
+            raise ValueError(
+                "Qwen4-Exp mamba_ssm_dtype must be a recognized floating-point dtype"
+            )
         layer_types = getattr(text, "layer_types", None)
         if layer_types is not None:
             layer_types = [
@@ -1709,6 +1747,7 @@ class Qwen4ExpConfig(CausalLMConfig):
             indexer_budget=getattr(text, "indexer_budget", None),
             indexer_compress_ratio=getattr(text, "indexer_compress_ratio", None),
             output_gate_type=getattr(text, "output_gate_type", None),
+            mamba_ssm_dtype=mamba_ssm_dtype,
             mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0),
             mtp_use_dedicated_embeddings=getattr(text, "mtp_use_dedicated_embeddings", False),
         )

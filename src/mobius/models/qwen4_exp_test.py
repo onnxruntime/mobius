@@ -90,7 +90,10 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
             "rope_type": "default",
             "rope_theta": 10_000_000,
             "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "mrope_section": [11, 11, 10],
         },
+        dtype="bfloat16",
         layer_types=[
             "linear_attention",
             "linear_attention",
@@ -122,6 +125,7 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
         indexer_budget=2048,
         indexer_compress_ratio=4,
         output_gate_type="sigmoid",
+        mamba_ssm_dtype="float32",
         eos_token_id=248044,
         mtp_num_hidden_layers=0,
     )
@@ -146,6 +150,10 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert config.hc_count == 4
     assert config.ple_layer_ids == [2]
     assert config.indexer_budget == 2048
+    assert config.dtype == ir.DataType.BFLOAT16
+    assert config.mrope_interleaved
+    assert config.mrope_section == [11, 11, 10]
+    assert config.mamba_ssm_dtype == ir.DataType.FLOAT
 
 
 def test_mtp_metadata_is_preserved_but_dedicated_embeddings_fail_closed():
@@ -161,6 +169,13 @@ def test_mtp_metadata_is_preserved_but_dedicated_embeddings_fail_closed():
         ({"indexer_kv_heads": 2}, "indexer_kv_heads=1"),
         ({"indexer_budget": 3}, "divisible"),
         ({"ple_layer_ids": [2]}, "only supported on linear_attention"),
+        (
+            {"linear_num_key_heads": 2, "linear_num_value_heads": 3},
+            "must be divisible",
+        ),
+        ({"linear_conv_kernel_dim": 0}, "must be positive"),
+        ({"make_ngram_vocab_size_divisible_by": 0}, "must be > 0"),
+        ({"mamba_ssm_dtype": ir.DataType.BFLOAT16}, "mamba_ssm_dtype=float32"),
     ],
 )
 def test_exact_config_guards(override, message):
@@ -196,6 +211,7 @@ def test_graph_exposes_exact_heterogeneous_state_abi():
         8,
         8,
     )
+    assert inputs["past_key_values.0.recurrent_state"].dtype == ir.DataType.FLOAT
     assert inputs["past_key_values.0.ple_conv_state"].shape[-2:] == (
         config.hc_count * config.hidden_size,
         3,
@@ -213,6 +229,18 @@ def test_graph_exposes_exact_heterogeneous_state_abi():
         "present.1.index_key",
     } <= outputs
     assert model.metadata_props["mobius.cache_abi"].startswith("qwen4-exp:position_ids")
+
+
+def test_bfloat16_graph_keeps_only_recurrent_math_and_state_in_float32():
+    config, _module, model = _build(_config(dtype=ir.DataType.BFLOAT16))
+    inputs = {value.name: value for value in model.graph.inputs}
+    assert inputs["past_key_values.0.conv_state"].dtype == ir.DataType.BFLOAT16
+    assert inputs["past_key_values.0.recurrent_state"].dtype == ir.DataType.FLOAT
+    assert inputs["past_key_values.1.key"].dtype == ir.DataType.BFLOAT16
+
+    linear_attention = next(node for node in model.graph if node.op_type == "LinearAttention")
+    assert all(value.dtype == ir.DataType.FLOAT for value in linear_attention.inputs)
+    assert linear_attention.outputs[1].dtype == config.mamba_ssm_dtype
 
 
 def test_parameter_names_match_upstream_modules():
@@ -261,6 +289,37 @@ def test_preprocess_unpacks_experts_and_joins_ple_shards():
     assert ple.shape == (embedding_rows, 2)
     assert torch.all(ple[embedding_rows // 2 :] == 1)
     assert not any(key.startswith("mtp.") for key in result)
+
+
+def test_preprocess_fails_closed_on_noncanonical_packed_or_deterministic_weights():
+    config = _config()
+    module = Qwen4ExpCausalLMModel(config)
+    parameters = dict(module.named_parameters())
+    buffer_key = "model.layers.0.ple.ple_embedding.layer_multipliers"
+    canonical = torch.from_numpy(parameters[buffer_key]._const_value.numpy().copy())
+
+    with pytest.raises(ValueError, match="does not match the pinned hash construction"):
+        module.preprocess_weights({buffer_key: canonical + 2})
+    with pytest.raises(ValueError, match="packed gate_up_proj has shape"):
+        module.preprocess_weights(
+            {"model.layers.0.mlp.experts.gate_up_proj": torch.zeros(2, 15, 16)}
+        )
+
+
+def test_preprocess_fails_closed_on_missing_or_unexpected_ple_shards():
+    config = _config(split_ngram_parts=2)
+    module = Qwen4ExpCausalLMModel(config)
+    target = "model.layers.0.ple.ple_embedding.ngram_embedding"
+    with pytest.raises(ValueError, match=r"missing shard indices \[1\]"):
+        module.preprocess_weights({f"{target}.shard_0.weight": torch.zeros(1, 2)})
+    with pytest.raises(ValueError, match=r"unexpected shard indices \[2\]"):
+        module.preprocess_weights(
+            {
+                f"{target}.shard_0.weight": torch.zeros(1, 2),
+                f"{target}.shard_1.weight": torch.zeros(1, 2),
+                f"{target}.shard_2.weight": torch.zeros(1, 2),
+            }
+        )
 
 
 def _initial_states() -> dict[str, np.ndarray]:
@@ -480,6 +539,15 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
             ],
             axis=1,
         )
+        masked_input_ids = np.array([[2, 7, 3, 4]], dtype=np.int64)
+        masked_attention = np.array([[1, 0, 1, 1]], dtype=np.int64)
+        masked_position_ids = np.array([[0, 0, 1, 2]], dtype=np.int64)
+        hf_masked = hf_model(
+            torch.from_numpy(masked_input_ids),
+            attention_mask=torch.from_numpy(masked_attention),
+            position_ids=torch.from_numpy(masked_position_ids),
+            use_cache=False,
+        ).logits.numpy()
 
     session = OnnxModelSession(model)
     try:
@@ -491,8 +559,17 @@ def test_reduced_random_weight_huggingface_prefill_and_decode_parity():
                 "position_ids": np.arange(4, dtype=np.int64)[None],
             }
         )["logits"]
+        onnx_masked = session.run(
+            _initial_states()
+            | {
+                "input_ids": masked_input_ids,
+                "attention_mask": masked_attention,
+                "position_ids": masked_position_ids,
+            }
+        )["logits"]
     finally:
         session.close()
 
     np.testing.assert_allclose(onnx_full, hf_full, rtol=1e-3, atol=1e-3)
     np.testing.assert_allclose(onnx_full, hf_decode, rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(onnx_masked, hf_masked, rtol=1e-3, atol=1e-3)

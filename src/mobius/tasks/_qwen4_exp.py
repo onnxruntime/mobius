@@ -70,7 +70,7 @@ class Qwen4ExpCausalLMTask(ModelTask):
                 )
                 recurrent_state = builder.input(
                     f"past_key_values.{layer_idx}.recurrent_state",
-                    dtype=config.dtype,
+                    dtype=config.mamba_ssm_dtype,
                     shape=[
                         batch,
                         config.linear_num_value_heads,
