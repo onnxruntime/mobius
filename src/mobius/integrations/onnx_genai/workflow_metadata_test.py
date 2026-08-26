@@ -255,7 +255,8 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
     assert "&id" not in serialized
     assert "*id" not in serialized
     with open(path, encoding="utf-8") as handle:
-        workflow = yaml.safe_load(handle)["pipeline"]["workflow"]
+        metadata = yaml.safe_load(handle)
+    workflow = metadata["pipeline"]["workflow"]
     decoder_invokes = []
     policy_invokes = {}
 
@@ -285,7 +286,8 @@ def test_vlm_writer_derives_real_decoder_contract_from_artifact(tmp_path):
         == 104
     )
     assert workflow["inputs"]["package.max_context"]["default"] == 131072
-    assert workflow["inputs"]["package.eos_ids"]["default"] == 200001
+    assert "package.eos_ids" not in workflow["inputs"]
+    assert metadata["package"]["tokenizer"]["special_tokens"]["eos_token_id"] == [200001]
     assert workflow["state"]["cache_103"]["contract"] == {
         "dtype": "bfloat16",
         "rank": 4,

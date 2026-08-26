@@ -23,6 +23,7 @@ import yaml
 
 from mobius._configs import MMSConfig
 from mobius._model_package import ModelPackage
+from mobius.integrations.onnx_genai import SpecialTokenFact
 from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
 from mobius.integrations.onnx_genai.auto_export_test import _vlm_package, _VlmCfg
 from mobius.integrations.onnx_genai.inference_metadata_test import (
@@ -81,6 +82,7 @@ class _MediaCfg(_VlmCfg):
     """A vision config that can also declare a video placeholder."""
 
     video_token_id: int | None = None
+    audio_token_id: int | None = None
 
 
 def _write_tokenizer(
@@ -165,6 +167,12 @@ class TestTokenizerDefinition:
 class TestDecoderPackageFacts:
     """A text package states the vocabulary the ids it emits belong to."""
 
+    def test_legacy_special_token_fact_remains_importable(self):
+        assert SpecialTokenFact(7, "<legacy>").to_metadata() == {
+            "id": 7,
+            "content": "<legacy>",
+        }
+
     def test_facts_survive_into_package_metadata(self, tmp_path):
         _write_tokenizer(tmp_path)
         metadata = build_decoder_workflow_metadata(
@@ -175,10 +183,11 @@ class TestDecoderPackageFacts:
         assert tokenizer["vocab_size"] == _TEXT_VOCAB_SIZE
         assert tokenizer["byte_level"] is True
         assert tokenizer["special_tokens"] == {
-            "bos": {"id": _BOS_ID, "content": "<s>"},
-            "eos": {"id": _EOS_ID, "content": "</s>"},
-            "pad": {"id": _PAD_ID, "content": "<pad>"},
+            "pad_token_id": _PAD_ID,
+            "bos_token_id": _BOS_ID,
+            "eos_token_id": [_EOS_ID],
         }
+        assert metadata["schema_version"] == "v1.2"
         _validate(metadata)
 
     def test_the_stated_width_is_the_vocabulary_not_the_logits_row(self, tmp_path):
@@ -205,8 +214,8 @@ class TestDecoderPackageFacts:
     def test_the_stated_stop_token_is_the_one_the_loop_terminates_on(self, tmp_path):
         # A repackaged checkpoint may be retuned without its config being
         # rewritten, so genai_config.json outranks the config. Both the
-        # termination policy and the published role must follow it, or one
-        # document names two different stop tokens.
+        # package facts must follow it, while the workflow only exposes the
+        # request override consumed by termination.
         _write_tokenizer(tmp_path, added={_IMAGE_ID: "<|endoftext|>"})
         (tmp_path / "genai_config.json").write_text(
             json.dumps({"model": {"eos_token_id": _IMAGE_ID}}), encoding="utf-8"
@@ -215,29 +224,49 @@ class TestDecoderPackageFacts:
             _decoder_package(_TextCfg()), _TextCfg(), source=str(tmp_path)
         )
         workflow = metadata["pipeline"]["workflow"]
-        assert metadata["package"]["tokenizer"]["special_tokens"]["eos"] == {
-            "id": _IMAGE_ID,
-            "content": "<|endoftext|>",
-        }
-        assert workflow["inputs"]["package.eos_ids"]["default"] == _IMAGE_ID
+        assert metadata["package"]["tokenizer"]["special_tokens"]["eos_token_id"] == [
+            _IMAGE_ID
+        ]
+        assert "package.eos_ids" not in workflow["inputs"]
+        assert workflow["inputs"]["request.eos_ids"]["role"]["role"] == "eos_token_ids"
+        assert "default" not in workflow["inputs"]["request.eos_ids"]
 
-    def test_a_role_the_vocabulary_cannot_render_is_omitted(self, tmp_path):
-        # A config field pointing outside the shipped vocabulary is stale. A
-        # front end that spliced that id would emit a token the tokenizer
-        # cannot render, so the role is dropped rather than half-stated.
+    def test_multi_eos_order_is_preserved_without_a_workflow_literal(self, tmp_path):
+        _write_tokenizer(tmp_path, added={_IMAGE_ID: "<|im_end|>"})
+        (tmp_path / "genai_config.json").write_text(
+            json.dumps({"model": {"eos_token_id": [_EOS_ID, _IMAGE_ID]}}),
+            encoding="utf-8",
+        )
+
+        metadata = build_decoder_workflow_metadata(
+            _decoder_package(_TextCfg()), _TextCfg(), source=str(tmp_path)
+        )
+
+        assert metadata["package"]["tokenizer"]["special_tokens"]["eos_token_id"] == [
+            _EOS_ID,
+            _IMAGE_ID,
+        ]
+        assert "package.eos_ids" not in metadata["pipeline"]["workflow"]["inputs"]
+
+    def test_numeric_facts_do_not_duplicate_tokenizer_surface_forms(self, tmp_path):
+        # Token spellings belong to tokenizer assets. The package still states
+        # its execution-relevant numeric fact without copying vocabulary text.
         _write_tokenizer(tmp_path)
         metadata = build_decoder_workflow_metadata(
             _decoder_package(_TextCfg()),
             _TextCfg(bos_token_id=9_999),
             source=str(tmp_path),
         )
-        assert "bos" not in metadata["package"]["tokenizer"]["special_tokens"]
+        assert metadata["package"]["tokenizer"]["special_tokens"]["bos_token_id"] == 9_999
 
-    def test_a_package_without_a_readable_tokenizer_states_no_facts(self, tmp_path):
+    def test_a_package_without_a_readable_tokenizer_still_states_numeric_facts(self, tmp_path):
         metadata = build_decoder_workflow_metadata(
             _decoder_package(_TextCfg()), _TextCfg(), source=str(tmp_path)
         )
-        assert "package" not in metadata
+        tokenizer = metadata["package"]["tokenizer"]
+        assert "algorithm" not in tokenizer
+        assert "vocab_size" not in tokenizer
+        assert tokenizer["special_tokens"]["eos_token_id"] == [_EOS_ID]
 
     def test_artifacts_name_only_files_the_package_contains(self, tmp_path):
         source = tmp_path / "source"
@@ -311,13 +340,10 @@ class TestDecoderPackageFacts:
         metadata = yaml.safe_load(Path(artifacts["inference_metadata"]).read_text())
         tokenizer = metadata["package"]["tokenizer"]
         assert tokenizer["vocab_size"] == _IMAGE_ID + 1
-        assert tokenizer["special_tokens"]["eos"] == {
-            "id": _IMAGE_ID,
-            "content": "<|endoftext|>",
-        }
+        assert tokenizer["special_tokens"]["eos_token_id"] == [_IMAGE_ID]
         assert tokenizer["artifacts"] == [{"location": "tokenizer.json"}]
         workflow = metadata["pipeline"]["workflow"]
-        assert workflow["inputs"]["package.eos_ids"]["default"] == _IMAGE_ID
+        assert "package.eos_ids" not in workflow["inputs"]
 
 
 class TestMultimodalPackageFacts:
@@ -338,11 +364,8 @@ class TestMultimodalPackageFacts:
 
     def test_image_placeholder_role_is_published(self, source):
         tokenizer = self._metadata(source)["package"]["tokenizer"]
-        assert tokenizer["special_tokens"][IMAGE_PLACEHOLDER_ROLE] == {
-            "id": _IMAGE_ID,
-            "content": "<image>",
-        }
-        assert tokenizer["special_tokens"]["eos"] == {"id": _EOS_ID, "content": "</s>"}
+        assert tokenizer["special_tokens"][IMAGE_PLACEHOLDER_ROLE] == _IMAGE_ID
+        assert tokenizer["special_tokens"]["eos_token_id"] == [_EOS_ID]
 
     def test_image_input_routing_survives_alongside_the_facts(self, source):
         metadata = self._metadata(source)
@@ -374,15 +397,15 @@ class TestMultimodalPackageFacts:
 
     def test_a_declared_video_placeholder_is_published_too(self, source):
         tokenizer = self._metadata(source, video_token_id=_VIDEO_ID)["package"]["tokenizer"]
-        assert tokenizer["special_tokens"]["video_placeholder"] == {
-            "id": _VIDEO_ID,
-            "content": "<video>",
-        }
+        assert tokenizer["special_tokens"]["video_token_id"] == _VIDEO_ID
+
+    def test_a_declared_audio_placeholder_is_published_too(self, source):
+        tokenizer = self._metadata(source, audio_token_id=_VIDEO_ID)["package"]["tokenizer"]
+        assert tokenizer["special_tokens"]["audio_token_id"] == _VIDEO_ID
 
     def test_an_undeclared_modality_role_is_absent(self, source):
         tokenizer = self._metadata(source)["package"]["tokenizer"]
-        assert "video_placeholder" not in tokenizer["special_tokens"]
-        assert "audio_placeholder" not in tokenizer["special_tokens"]
+        assert "video_token_id" not in tokenizer["special_tokens"]
 
 
 class TestScatteredAddedTokens:
@@ -446,10 +469,10 @@ class TestScatteredAddedTokens:
         )
         config = _MediaCfg(image_token_id=_IMAGE_ID, eos_token_id=_EOS_ID)
         metadata = build_vlm_workflow_metadata(_vlm_package(), config, source=str(tmp_path))
-        assert metadata["package"]["tokenizer"]["special_tokens"][IMAGE_PLACEHOLDER_ROLE] == {
-            "id": _IMAGE_ID,
-            "content": "<|image_pad|>",
-        }
+        assert (
+            metadata["package"]["tokenizer"]["special_tokens"][IMAGE_PLACEHOLDER_ROLE]
+            == _IMAGE_ID
+        )
 
 
 class TestAlgorithmIsReadNotDefaulted:
@@ -625,7 +648,8 @@ class TestCtcPackageFacts:
         assert tokenizer["algorithm"] == "word_level"
         assert tokenizer["vocab_size"] == config.vocab_size
         blank_id = metadata["profiles"]["transcription"]["decoding"]["blank_id"]
-        assert tokenizer["special_tokens"]["pad"] == {"id": blank_id, "content": "<pad>"}
+        assert tokenizer["special_tokens"]["pad_token_id"] == blank_id
+        assert set(tokenizer["special_tokens"]) == {"pad_token_id"}
         _validate(metadata)
 
     def test_a_package_that_ships_no_vocabulary_still_states_its_facts(self, tmp_path):
@@ -677,7 +701,7 @@ class TestSpeculativePackageFacts:
         )
         tokenizer = metadata["package"]["tokenizer"]
         assert tokenizer["vocab_size"] == _TEXT_VOCAB_SIZE
-        assert tokenizer["special_tokens"]["eos"] == {"id": _EOS_ID, "content": "</s>"}
+        assert tokenizer["special_tokens"]["eos_token_id"] == [_EOS_ID]
         # Nothing was shipped next to the document, so it claims no artifacts.
         assert "artifacts" not in tokenizer
         assert set(metadata["pipeline"]) == {"workflow"}

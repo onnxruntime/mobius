@@ -244,11 +244,11 @@ def test_dispatch_decoder(tmp_path):
     }
     assert application_inputs == {
         "request.prompt_lengths",
-        "request.eos_ids",
-        "request.eos_lengths",
         "request.row_max_iterations",
         "request.rng_counter",
     }
+    assert workflow["inputs"]["request.eos_ids"]["role"]["role"] == "eos_token_ids"
+    assert workflow["inputs"]["request.eos_lengths"]["role"]["role"] == "eos_token_lengths"
     assert workflow["inputs"]["request.prompt_lengths"]["default"] == -1
     assert [node["component"] for node in workflow["steps"][0]["setup"]] == [
         "decoder_state_initializer",

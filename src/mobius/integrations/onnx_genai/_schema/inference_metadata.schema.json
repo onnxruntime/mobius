@@ -2234,7 +2234,7 @@
               "type": "null"
             }
           ],
-          "description": "Exact tokenizer, vocabulary, and special-token facts."
+          "description": "Exact tokenizer and vocabulary facts."
         }
       },
       "type": "object"
@@ -2621,7 +2621,12 @@
         },
         {
           "const": "eos_token_ids",
-          "description": "Token ids that end generation.\n\nA set, not a single id: a model may end a turn with one token and a\nmessage with another, and both must stop. Declaring it here is what lets\nthe runtime's stop policy read a package's EOS from the package instead\nof rediscovering it from tokenizer side-files it may not ship.",
+          "description": "Token ids that end generation.\n\nThe request value overrides\n`package.tokenizer.special_tokens.eos_token_id`. It never carries an\nauthored package default.",
+          "type": "string"
+        },
+        {
+          "const": "eos_token_lengths",
+          "description": "Number of valid entries in each row of a padded EOS-id tensor.",
           "type": "string"
         },
         {
@@ -2974,28 +2979,6 @@
           "type": "object"
         }
       },
-      "type": "object"
-    },
-    "SpecialTokenFact": {
-      "additionalProperties": false,
-      "description": "One special token, pinned by id and exact surface bytes.",
-      "properties": {
-        "content": {
-          "description": "Exact UTF-8 surface form of the token.",
-          "minLength": 1,
-          "type": "string"
-        },
-        "id": {
-          "description": "Vocabulary id of the token.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "id",
-        "content"
-      ],
       "type": "object"
     },
     "SpeculationSafety": {
@@ -3993,6 +3976,94 @@
       ],
       "type": "object"
     },
+    "TokenFacts": {
+      "additionalProperties": false,
+      "description": "Numeric model and control-token facts.\n\nThese ids are model/package facts. Token spellings, added-token maps, and\nchat templates remain in tokenizer assets and are not repeated here.",
+      "properties": {
+        "audio_token_id": {
+          "description": "Prompt placeholder replaced by audio features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "bos_token_id": {
+          "description": "Beginning-of-sequence token.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "decoder_start_token_id": {
+          "description": "First token fed to an encoder-decoder's autoregressive decoder.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "eos_token_id": {
+          "description": "Every token id that terminates package-default autoregressive generation.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "image_token_id": {
+          "description": "Prompt placeholder replaced by image features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pad_token_id": {
+          "description": "Padding token used by package-authored tensor contracts.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sep_token_id": {
+          "description": "Separator token used by sequence-pair models.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "video_token_id": {
+          "description": "Prompt placeholder replaced by video features.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "vision_start_token_id": {
+          "description": "Token that opens a vision segment in a multimodal prompt.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "TokenizerArtifact": {
       "additionalProperties": false,
       "description": "One package-relative tokenizer artifact.",
@@ -4015,7 +4086,10 @@
         "algorithm": {
           "description": "Tokenizer algorithm identifier, e.g. `bpe`, `unigram`, `wordpiece`.",
           "minLength": 1,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "artifacts": {
           "description": "Package-relative tokenizer artifacts.",
@@ -4031,23 +4105,26 @@
           "type": "boolean"
         },
         "special_tokens": {
-          "additionalProperties": {
-            "$ref": "#/$defs/SpecialTokenFact"
-          },
-          "description": "Special tokens by semantic role, e.g. `bos`, `eos`, `pad`.",
-          "type": "object"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenFacts"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Numeric model and control-token facts for this tokenizer vocabulary.\n\nToken strings, added-token mappings, and chat templates remain in the\ntokenizer assets. Request EOS inputs may override these defaults, but\nworkflow literals and termination components do not own another copy."
         },
         "vocab_size": {
           "description": "Number of entries in the vocabulary, including added tokens.",
           "format": "uint",
           "minimum": 1,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
-      "required": [
-        "algorithm",
-        "vocab_size"
-      ],
       "type": "object"
     },
     "VisionOutputBinding": {
