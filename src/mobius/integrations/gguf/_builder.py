@@ -23,6 +23,7 @@ import re
 import shutil
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -50,7 +51,12 @@ from mobius.integrations.gguf._errors import (
     ShardedGGUFNotSupportedError,
     UnsupportedGGUFArchitectureError,
 )
-from mobius.integrations.gguf._header import _gguf_architecture_from_header
+from mobius.integrations.gguf._header import (
+    GGUFHeaderInfo,
+    GGUFHeaderTruncatedError,
+    _gguf_architecture_from_header,
+    _gguf_header_info_from_header,
+)
 from mobius.integrations.gguf._spec import Support, TensorRole
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
@@ -72,6 +78,54 @@ _GGUF_SHARD_FILENAME_RE = re.compile(
 )
 _NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
 _GGUF_HEADER_RANGE_BYTES = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _GGUFPreflightRevision:
+    """Immutable Hub revision carrying the selected file's bounded header."""
+
+    revision: str
+    header_info: GGUFHeaderInfo
+
+    def __str__(self) -> str:
+        return self.revision
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _GGUFPreflightRevision):
+            return self.revision == other.revision and self.header_info == other.header_info
+        return isinstance(other, str) and self.revision == other
+
+    def __hash__(self) -> int:
+        return hash((self.revision, self.header_info))
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class _ResolvedGGUFPath:
+    """Downloaded shard path carrying the trusted Hub manifest to the reader."""
+
+    path: str
+    expected_sha256: dict[str, str]
+    expected_sizes: dict[str, int]
+    shard_paths: list[str]
+
+    def __fspath__(self) -> str:
+        return self.path
+
+    def __str__(self) -> str:
+        return self.path
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _ResolvedGGUFPath):
+            return (
+                self.path == other.path
+                and self.expected_sha256 == other.expected_sha256
+                and self.expected_sizes == other.expected_sizes
+                and self.shard_paths == other.shard_paths
+            )
+        return isinstance(other, str) and self.path == other
+
+    def __hash__(self) -> int:
+        return hash(self.path)
 
 
 def _summarize_nemotron_h_moe_layout(
@@ -113,6 +167,7 @@ def _raise_for_unsupported_gguf_architecture(
     source: str,
     tensor_names: Iterable[str] | None = None,
     allow_mmproj_companion: bool = False,
+    allow_preflight_only: bool = False,
 ) -> None:
     """Reject known architectures whose config, tensor map, or graph is unavailable.
 
@@ -131,6 +186,8 @@ def _raise_for_unsupported_gguf_architecture(
     if spec.gguf_arch == MMPROJ_ARCHITECTURE and allow_mmproj_companion:
         # mmproj sidecars are opened deliberately by the multimodal path, which
         # pairs them with a text backbone and applies role-specific validation.
+        return
+    if spec.preflight_only and allow_preflight_only:
         return
     import_verdicts = {
         name: verdict
@@ -393,6 +450,54 @@ def _gguf_architecture_from_header_prefix(data: bytes, *, source: str) -> str:
     return architecture
 
 
+def _gguf_header_info_from_header_prefix(
+    data: bytes,
+    *,
+    source: str,
+) -> GGUFHeaderInfo:
+    """Read architecture and split bookkeeping from a bounded GGUF header."""
+    return _gguf_header_info_from_header(
+        data,
+        source=source,
+        require_architecture=False,
+    )
+
+
+def _requires_strict_hub_header_preflight(repo_id: str) -> bool:
+    """Return whether this route must never fall back to payload download."""
+    from mobius.integrations.gguf._qwen4_exp import QWEN4EXP_GGUF_REPO
+
+    return repo_id == QWEN4EXP_GGUF_REPO
+
+
+def _validate_preflight_split_header(info: GGUFHeaderInfo, *, source: str) -> None:
+    """Require complete, internally consistent split bookkeeping when present."""
+    split_values = (info.split_no, info.split_count, info.split_tensors_count)
+    if all(value is None for value in split_values):
+        return
+    if any(value is None for value in split_values):
+        raise ValueError(
+            f"GGUF header {source!r} has incomplete split bookkeeping "
+            f"(no={info.split_no}, count={info.split_count}, "
+            f"tensors.count={info.split_tensors_count}). No payload was downloaded."
+        )
+    assert info.split_no is not None
+    assert info.split_count is not None
+    assert info.split_tensors_count is not None
+    if info.split_count <= 0 or not 0 <= info.split_no < info.split_count:
+        raise ValueError(
+            f"GGUF header {source!r} has invalid split bookkeeping "
+            f"(no={info.split_no}, count={info.split_count}). "
+            "No payload was downloaded."
+        )
+    if info.split_tensors_count < info.tensor_count:
+        raise ValueError(
+            f"GGUF header {source!r} declares split.tensors.count="
+            f"{info.split_tensors_count}, smaller than its local tensor count "
+            f"{info.tensor_count}. No payload was downloaded."
+        )
+
+
 def _preflight_hf_gguf_file(
     repo_id: str,
     filename: str,
@@ -400,7 +505,7 @@ def _preflight_hf_gguf_file(
     revision: str = "main",
     allow_mmproj_companion: bool = False,
     expected_architecture: str | None = None,
-) -> str:
+) -> str | _GGUFPreflightRevision:
     """Validate the exact selected Hub file header and return its immutable revision."""
     source = f"{repo_id}@{revision}:{filename}"
     url = hf_hub_url(repo_id, filename, revision=revision)
@@ -454,39 +559,67 @@ def _preflight_hf_gguf_file(
             with session.get(metadata.location, headers=headers, stream=True) as response:
                 chunks = read_response(response)
     except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
-        raise RuntimeError(
-            f"Cannot read the bounded GGUF header for {source!r}; refusing payload "
-            "download because architecture and route policy cannot be established. "
-            "No payload was downloaded."
-        ) from error
+        if _requires_strict_hub_header_preflight(repo_id):
+            raise RuntimeError(
+                f"Cannot read the bounded GGUF header for {source!r}; refusing payload "
+                "download because Qwen4Exp route policy cannot be established. "
+                "No payload was downloaded."
+            ) from error
+        logger.warning(
+            "Bounded GGUF header range read failed for %s (%s); downloading the "
+            "same immutable revision and validating its local header before dispatch.",
+            source,
+            error,
+        )
+        return commit_hash
     try:
-        architecture = _gguf_architecture_from_header_prefix(
+        header_info = _gguf_header_info_from_header_prefix(
             b"".join(chunks),
             source=source,
         )
-    except ValueError as error:
-        if "truncated GGUF metadata" not in str(error):
-            raise
-        raise RuntimeError(
-            f"The selected GGUF metadata header for {source!r} exceeds the bounded "
-            "range; refusing payload download because architecture and route policy "
-            "cannot be established. No payload was downloaded."
-        ) from error
+    except GGUFHeaderTruncatedError as error:
+        if _requires_strict_hub_header_preflight(repo_id):
+            raise RuntimeError(
+                f"The selected GGUF metadata header for {source!r} exceeds the bounded "
+                "range; refusing payload download because Qwen4Exp route policy cannot "
+                "be established. No payload was downloaded."
+            ) from error
+        logger.warning(
+            "The selected GGUF metadata header for %s exceeds the bounded range; "
+            "downloading the same immutable revision for full local validation.",
+            source,
+        )
+        return commit_hash
+    _validate_preflight_split_header(header_info, source=source)
+    architecture = header_info.architecture
     if expected_architecture is not None and architecture != expected_architecture:
         raise ValueError(
             f"Expected a {expected_architecture!r} mmproj GGUF for {source!r}, "
             f"got architecture {architecture!r}. No payload was downloaded."
         )
-    _raise_for_unsupported_gguf_architecture(
-        architecture,
-        source=source,
-        allow_mmproj_companion=allow_mmproj_companion,
-    )
+    if architecture is None:
+        if (
+            header_info.split_count is None
+            or header_info.split_count <= 1
+            or header_info.split_no in {None, 0}
+        ):
+            raise ValueError(
+                f"Selected GGUF header {source!r} has no general.architecture and "
+                "is not a continuation shard in a complete split set. "
+                "No payload was downloaded."
+            )
+    else:
+        _raise_for_unsupported_gguf_architecture(
+            architecture,
+            source=source,
+            allow_mmproj_companion=allow_mmproj_companion,
+            allow_preflight_only=True,
+        )
     if architecture == "qwen4exp":
         from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_hub_source
 
         validate_qwen4exp_hub_source(repo_id=repo_id, revision=commit_hash)
-    return commit_hash
+    return _GGUFPreflightRevision(commit_hash, header_info)
 
 
 def _preflight_hf_mmproj_companion_file(
@@ -494,7 +627,7 @@ def _preflight_hf_mmproj_companion_file(
     filename: str,
     *,
     revision: str = "main",
-) -> str:
+) -> str | _GGUFPreflightRevision:
     """Validate one exact Hub mmproj file and pin its immutable revision."""
     return _preflight_hf_gguf_file(
         repo_id,
@@ -521,18 +654,18 @@ def _validate_gguf_model(
     if not isinstance(gguf_model, GgufShardSet):
         split_count = int(gguf_model.get_metadata("split.count", 1))
         _raise_for_sharded_gguf(source=source, split_count=split_count)
-    _raise_for_unsupported_gguf_architecture(
-        gguf_model.architecture,
-        source=source,
-        tensor_names=gguf_model.tensor_names,
-        allow_mmproj_companion=allow_mmproj_companion,
-    )
     from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_tensor_contract
 
     validate_qwen4exp_tensor_contract(
         gguf_model,
         source=source,
         keep_quantized=keep_quantized,
+    )
+    _raise_for_unsupported_gguf_architecture(
+        gguf_model.architecture,
+        source=source,
+        tensor_names=gguf_model.tensor_names,
+        allow_mmproj_companion=allow_mmproj_companion,
     )
     _raise_for_invalid_bitnet_tensor_contract(gguf_model)
     _raise_for_invalid_talkie_tensor_contract(gguf_model)
@@ -4747,6 +4880,105 @@ def _select_complete_hf_gguf_set(
     return filename, [by_index[index] for index in range(1, count + 1)]
 
 
+def _select_hf_gguf_set_from_split_headers(
+    repo_files: Collection[str],
+    *,
+    repo_id: str,
+    selected_filename: str,
+    revision: str,
+    selected_preflight: _GGUFPreflightRevision,
+) -> list[str]:
+    """Enumerate renamed split siblings from authoritative bounded headers."""
+    selected_info = selected_preflight.header_info
+    _validate_preflight_split_header(
+        selected_info,
+        source=f"{repo_id}@{revision}:{selected_filename}",
+    )
+    if selected_info.split_count is None or selected_info.split_count <= 1:
+        return [selected_filename]
+    assert selected_info.split_tensors_count is not None
+
+    selected_path = PurePosixPath(selected_filename)
+    candidates = sorted(
+        name
+        for name in repo_files
+        if PurePosixPath(name).parent == selected_path.parent
+        and name.lower().endswith(".gguf")
+    )
+    preflights: dict[str, _GGUFPreflightRevision] = {selected_filename: selected_preflight}
+    by_split_no: dict[int, str] = {}
+    primary_architecture: str | None = None
+    declared_architectures: dict[str, str] = {}
+    for name in candidates:
+        preflight = preflights.get(name)
+        if preflight is None:
+            candidate_preflight = _preflight_hf_gguf_file(
+                repo_id,
+                name,
+                revision=revision,
+            )
+            if not isinstance(candidate_preflight, _GGUFPreflightRevision):
+                raise ValueError(
+                    f"Cannot enumerate renamed GGUF split sibling {name!r} without "
+                    "bounded split metadata. No payload was downloaded."
+                )
+            preflight = candidate_preflight
+            preflights[name] = preflight
+        if str(preflight) != revision:
+            raise ValueError(
+                f"GGUF sibling {name!r} resolved to {str(preflight)!r}, expected "
+                f"the pinned revision {revision!r}. No payload was downloaded."
+            )
+        info = preflight.header_info
+        if (
+            info.split_count != selected_info.split_count
+            or info.split_tensors_count != selected_info.split_tensors_count
+        ):
+            continue
+        assert info.split_no is not None
+        if info.split_no in by_split_no:
+            raise ValueError(
+                "Ambiguous GGUF split set discovered from bounded headers: "
+                f"{by_split_no[info.split_no]!r} and {name!r} both declare "
+                f"split.no={info.split_no}. No payload was downloaded."
+            )
+        by_split_no[info.split_no] = name
+        if info.split_no == 0:
+            if info.architecture is None:
+                raise ValueError(
+                    f"Primary GGUF shard {name!r} has no general.architecture. "
+                    "No payload was downloaded."
+                )
+            primary_architecture = info.architecture
+        if info.architecture is not None:
+            declared_architectures[name] = info.architecture
+
+    expected_nos = set(range(selected_info.split_count))
+    if set(by_split_no) != expected_nos:
+        raise ValueError(
+            "Incomplete GGUF split set discovered from bounded headers: "
+            f"expected split.no values {sorted(expected_nos)}, got "
+            f"{sorted(by_split_no)}. No payload was downloaded."
+        )
+    if primary_architecture is None:
+        raise ValueError(
+            "GGUF split set has no authoritative primary architecture. "
+            "No payload was downloaded."
+        )
+    mismatched_architectures = {
+        name: architecture
+        for name, architecture in declared_architectures.items()
+        if architecture != primary_architecture
+    }
+    if mismatched_architectures:
+        raise ValueError(
+            f"GGUF split siblings disagree with primary architecture "
+            f"{primary_architecture!r}: {mismatched_architectures}. "
+            "No payload was downloaded."
+        )
+    return [by_split_no[index] for index in range(selected_info.split_count)]
+
+
 def _existing_disk_usage_path(path: Path) -> Path:
     """Return the nearest existing ancestor accepted by ``disk_usage``."""
     candidate = path.expanduser().absolute()
@@ -4780,7 +5012,7 @@ def _download_hf_gguf_shards(
     selected_filename: str,
     shard_filenames: list[str],
     revision: str,
-) -> str:
+) -> _ResolvedGGUFPath:
     """Preflight and download one complete shard set at an immutable revision."""
     from huggingface_hub.constants import HF_HUB_CACHE
 
@@ -4792,6 +5024,7 @@ def _download_hf_gguf_shards(
     )
     info_by_path = {getattr(info, "path", None): info for info in paths_info}
     sizes: dict[str, int] = {}
+    sha256_by_remote: dict[str, str] = {}
     required_bytes = 0
     for name in shard_filenames:
         info = info_by_path.get(name)
@@ -4801,7 +5034,21 @@ def _download_hf_gguf_shards(
                 f"Hugging Face metadata omitted a positive size for GGUF shard "
                 f"{name!r} at {repo_id}@{revision}; no payload was downloaded."
             )
+        lfs = getattr(info, "lfs", None)
+        sha256 = (
+            lfs.get("sha256") or lfs.get("oid")
+            if isinstance(lfs, Mapping)
+            else getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
+        )
+        if isinstance(sha256, str) and sha256.startswith("sha256:"):
+            sha256 = sha256.removeprefix("sha256:")
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None:
+            raise ValueError(
+                f"Hugging Face metadata omitted a valid LFS SHA-256 for GGUF shard "
+                f"{name!r} at {repo_id}@{revision}; no payload was downloaded."
+            )
         sizes[name] = size
+        sha256_by_remote[name] = sha256.lower()
         cached = try_to_load_from_cache(
             repo_id,
             name,
@@ -4841,7 +5088,24 @@ def _download_hf_gguf_shards(
                 f"expected {sizes[name]:,}; remove the corrupt cache entry and retry."
             )
         downloaded[name] = local_path
-    return downloaded[selected_filename]
+
+    expected_sizes: dict[str, int] = {}
+    expected_sha256: dict[str, str] = {}
+    for name in shard_filenames:
+        basename = PurePosixPath(name).name
+        if basename in expected_sizes:
+            raise ValueError(
+                f"GGUF shard manifest contains duplicate basename {basename!r}; "
+                "the local reader cannot bind identities unambiguously."
+            )
+        expected_sizes[basename] = sizes[name]
+        expected_sha256[basename] = sha256_by_remote[name]
+    return _ResolvedGGUFPath(
+        downloaded[selected_filename],
+        expected_sha256=expected_sha256,
+        expected_sizes=expected_sizes,
+        shard_paths=[downloaded[name] for name in shard_filenames],
+    )
 
 
 def _resolve_gguf_path_impl(
@@ -4849,7 +5113,7 @@ def _resolve_gguf_path_impl(
     *,
     allow_mmproj_companion: bool,
     keep_quantized: bool = True,
-) -> str:
+) -> str | _ResolvedGGUFPath:
     """Resolve a GGUF reference with an internal primary/companion context.
 
     Accepts:
@@ -4883,28 +5147,43 @@ def _resolve_gguf_path_impl(
         filename, selected_files = _select_complete_hf_gguf_set(repo_files, filename or None)
     primary_filename = selected_files[0]
 
-    resolved_revision: str | None
+    preflight_revision: str | _GGUFPreflightRevision
     if allow_mmproj_companion:
         if len(selected_files) != 1:
             raise ValueError("Sharded mmproj companion GGUF files are not supported.")
-        resolved_revision = _preflight_hf_mmproj_companion_file(
+        preflight_revision = _preflight_hf_mmproj_companion_file(
             repo_id,
             primary_filename,
             revision=revision,
         )
     else:
-        resolved_revision = _preflight_hf_gguf_file(
+        preflight_revision = _preflight_hf_gguf_file(
             repo_id,
             primary_filename,
             revision=revision,
         )
-    if resolved_revision is None:
-        raise RuntimeError(
-            f"Hub did not resolve an immutable revision for {repo_id}:{filename}"
+    resolved_revision = str(preflight_revision)
+    selected_header = getattr(preflight_revision, "header_info", None)
+    if (
+        len(selected_files) == 1
+        and selected_header is not None
+        and selected_header.split_count is not None
+        and selected_header.split_count > 1
+    ):
+        assert isinstance(preflight_revision, _GGUFPreflightRevision)
+        pinned_files = api.list_repo_files(repo_id, revision=resolved_revision)
+        selected_files = _select_hf_gguf_set_from_split_headers(
+            pinned_files,
+            repo_id=repo_id,
+            selected_filename=filename,
+            revision=resolved_revision,
+            selected_preflight=preflight_revision,
         )
-    if len(selected_files) > 1:
+    elif len(selected_files) > 1:
         pinned_files = api.list_repo_files(repo_id, revision=resolved_revision)
         filename, selected_files = _select_complete_hf_gguf_set(pinned_files, filename)
+
+    if len(selected_files) > 1:
         from mobius.integrations.gguf._qwen4_exp import (
             QWEN4EXP_GGUF_REPO,
             validate_qwen4exp_hub_artifact,
@@ -4937,7 +5216,7 @@ def _resolve_gguf_path_impl(
 def _resolve_gguf_path(
     gguf_path: str | Path,
     keep_quantized: bool = True,
-) -> str:
+) -> str | _ResolvedGGUFPath:
     """Resolve a primary GGUF reference without allowing mmproj sidecars."""
     return _resolve_gguf_path_impl(
         gguf_path,
@@ -4946,7 +5225,9 @@ def _resolve_gguf_path(
     )
 
 
-def _resolve_mmproj_companion_path(gguf_path: str | Path) -> str:
+def _resolve_mmproj_companion_path(
+    gguf_path: str | Path,
+) -> str | _ResolvedGGUFPath:
     """Resolve an internal mmproj companion, allowing only ``clip`` Hub metadata."""
     return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
 
@@ -5151,7 +5432,11 @@ def build_from_gguf(
     #    A ``-000i-of-000N.gguf`` split set is assembled directly from its shards
     #    (never merged into a second on-disk GGUF); a plain file opens as before.
     source_reference = str(gguf_path)
-    gguf_path = _resolve_gguf_path(gguf_path, keep_quantized)
+    resolved_gguf_path = _resolve_gguf_path(gguf_path, keep_quantized)
+    expected_sha256 = getattr(resolved_gguf_path, "expected_sha256", None)
+    expected_sizes = getattr(resolved_gguf_path, "expected_sizes", None)
+    resolved_shard_paths = getattr(resolved_gguf_path, "shard_paths", None)
+    gguf_path = str(resolved_gguf_path)
     logical_source_filename = _logical_source_filename(source_reference, gguf_path)
     source_path = Path(gguf_path)
     if source_path.is_symlink() and _GGUF_SHARD_FILENAME_RE.search(source_path.name) is None:
@@ -5165,7 +5450,17 @@ def build_from_gguf(
             # Snapshot links point into the immutable content-addressed blob store.
             source_path = source_path.resolve(strict=True)
             gguf_path = str(source_path)
-    gguf_model = _gguf_model if _gguf_model is not None else open_gguf_model(gguf_path)
+    if _gguf_model is not None:
+        gguf_model = _gguf_model
+    else:
+        shard_open_kwargs: dict[str, Any] = {}
+        if resolved_shard_paths is not None:
+            shard_open_kwargs["shard_paths"] = resolved_shard_paths
+        if expected_sha256 is not None:
+            shard_open_kwargs["expected_sha256"] = expected_sha256
+        if expected_sizes is not None:
+            shard_open_kwargs["expected_sizes"] = expected_sizes
+        gguf_model = open_gguf_model(gguf_path, **shard_open_kwargs)
     if isinstance(gguf_model, GgufShardSet):
         identity_paths = _hub_cache_identity_paths(gguf_model.shard_paths)
         if identity_paths is not None:

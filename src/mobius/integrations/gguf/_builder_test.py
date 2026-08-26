@@ -8342,6 +8342,52 @@ class TestGGUFPreflightGuards:
                 == commit_hash
             )
 
+    def test_truncated_split_value_falls_back_to_pinned_download(self) -> None:
+        from mobius.integrations.gguf._builder import _preflight_hf_gguf_file
+
+        key = b"split.count"
+        truncated = b"".join(
+            [
+                b"GGUF",
+                struct.pack("<I", 3),
+                struct.pack("<Q", 0),
+                struct.pack("<Q", 1),
+                struct.pack("<Q", len(key)),
+                key,
+                struct.pack("<I", 4),
+                # UINT32 value deliberately omitted at the bounded range edge.
+            ]
+        )
+        response = mock.MagicMock()
+        response.iter_bytes.return_value = [truncated]
+        response_context = mock.MagicMock()
+        response_context.__enter__.return_value = response
+        session = mock.MagicMock()
+        session.stream.return_value = response_context
+        commit_hash = "1" * 40
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash=commit_hash,
+                    location="https://cdn.example/model.gguf",
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+        ):
+            assert (
+                _preflight_hf_gguf_file(
+                    "example/generic",
+                    "model.gguf",
+                    revision="main",
+                )
+                == commit_hash
+            )
+
     @pytest.mark.parametrize(
         "preflight_error",
         [

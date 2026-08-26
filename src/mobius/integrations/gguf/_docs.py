@@ -182,11 +182,13 @@ def _architectures() -> str:
     for spec in sorted(iter_arch_specs(), key=lambda item: item.gguf_arch):
         aliases = ", ".join(f"`{alias}`" for alias in sorted(spec.aliases)) or "—"
         route_parts = []
-        if spec.is_importable and spec.model_type:
+        if spec.preflight_only:
+            route_parts.append("header/config/tensor preflight only")
+        if (spec.is_importable or spec.preflight_only) and spec.model_type:
             route_parts.append(f"model=`{spec.model_type}`")
         if spec.is_importable and spec.module_type:
             route_parts.append(f"module=`{spec.module_type}`")
-        if spec.is_importable and spec.tensor_map_recipe:
+        if (spec.is_importable or spec.preflight_only) and spec.tensor_map_recipe:
             route_parts.append(
                 "tensor=" + "+".join(f"`{name}`" for name in spec.tensor_map_recipe)
             )

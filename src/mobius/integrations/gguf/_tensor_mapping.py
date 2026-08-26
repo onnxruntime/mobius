@@ -1278,14 +1278,14 @@ def _build_mapping(
             :func:`get_arch_spec` uses.
     """
     spec = try_get_arch_spec(architecture.lower())
-    if spec is None or not spec.is_importable:
+    if spec is None or not (spec.is_importable or spec.preflight_only):
         try:
             get_arch_spec(architecture.lower())
         except DisabledGGUFArchitectureError as error:
             raise UnsupportedGGUFArchitectureError(str(error)) from None
         except UnsupportedGGUFArchitectureError:
             raise
-        raise AssertionError("unreachable: spec is importable after all")
+        raise AssertionError("unreachable: spec has a tensor mapping after all")
     result: dict[str, str] = {}
     for table_name in spec.tensor_map_recipe:
         table = _MAPPING_TABLES.get(table_name)

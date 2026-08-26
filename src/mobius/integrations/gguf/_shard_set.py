@@ -341,7 +341,13 @@ class GgufShardSet:
         self._infos = [self._infos[i] for i in order]
         self._primary = self._shards[0]
         self._identity_paths = [Path(shard._path) for shard in self._shards]
-        self._metadata: dict[str, Any] | None = None
+        # Validate primary authority before exposing any tensor access. Delaying
+        # this until ``metadata`` is first read would let callers consume a
+        # malformed continuation-only semantic override.
+        self._metadata: dict[str, Any] | None = _merge_metadata(
+            self._infos,
+            self._shards,
+        )
 
         # Combined, order-preserving tensor index: name -> owning shard.
         self._owner: dict[str, GGUFModel] = {}
@@ -540,11 +546,17 @@ def _build_shard_infos(
     infos: list[ShardInfo] = []
     for path, shard in zip(paths, shards):
         parsed = parse_shard_filename(path.name)
+        split_no = _int_or_none(shard.get_metadata(_SPLIT_NO))
+        split_count = _int_or_none(shard.get_metadata(_SPLIT_COUNT))
         if parsed is None:
-            raise GgufShardError(
-                f"{path.name!r} is not a ``-000i-of-000N.gguf`` shard filename"
-            )
-        _prefix, index, count = parsed
+            if split_no is None or split_count is None:
+                raise GgufShardError(
+                    f"{path.name!r} is not a ``-000i-of-000N.gguf`` shard filename "
+                    "and lacks authoritative split.no/split.count metadata."
+                )
+            index, count = split_no + 1, split_count
+        else:
+            _prefix, index, count = parsed
         size_bytes = path.stat().st_size
 
         expected_size = (expected_sizes or {}).get(path.name)
@@ -570,8 +582,8 @@ def _build_shard_infos(
                 path=path,
                 filename_index=index,
                 filename_count=count,
-                split_no=_int_or_none(shard.get_metadata(_SPLIT_NO)),
-                split_count=_int_or_none(shard.get_metadata(_SPLIT_COUNT)),
+                split_no=split_no,
+                split_count=split_count,
                 split_tensors_count=_int_or_none(shard.get_metadata(_SPLIT_TENSORS_COUNT)),
                 size_bytes=size_bytes,
                 tensor_count=shard.num_tensors,
@@ -599,7 +611,7 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
         for info in infos
         if (parsed := parse_shard_filename(info.path.name)) is not None
     }
-    if len(prefixes) != 1:
+    if len(prefixes) > 1:
         raise GgufShardError(
             f"Shard filenames have inconsistent basenames {sorted(prefixes)}; "
             "the files belong to different split sets."
@@ -719,30 +731,39 @@ def _validate_identity(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
 
 
 def _merge_metadata(infos: list[ShardInfo], shards: list[GGUFModel]) -> dict[str, Any]:
-    """Merge shard metadata in split order and reject incompatible repeats."""
+    """Use primary semantics and reject continuation-only metadata injection."""
+    if not shards:
+        raise GgufShardError("Cannot merge metadata from an empty GGUF shard set.")
     merged: dict[str, Any] = {}
     owners: dict[str, str] = {}
-    for info, shard in zip(infos, shards):
+    primary_info = infos[0]
+    primary_metadata = shards[0].metadata
+    for key, value in primary_metadata.items():
+        if key == _SPLIT_NO:
+            continue
+        merged[key] = value
+        owners[key] = primary_info.path.name
+
+    for info, shard in zip(infos[1:], shards[1:]):
         for key, value in shard.metadata.items():
-            if key == _SPLIT_NO:
+            if key in {_SPLIT_NO, _SPLIT_COUNT, _SPLIT_TENSORS_COUNT}:
                 continue
             # gguf-py exposes container-local pseudo fields alongside serialized
-            # metadata. Keep the primary values, then canonicalize tensor_count
-            # below for the logical model.
+            # metadata. Only primary pseudo fields describe the logical model.
             if key.startswith("GGUF."):
-                if key not in merged:
-                    merged[key] = value
-                    owners[key] = info.path.name
                 continue
-            if key in merged and not _metadata_values_equal(merged[key], value):
+            if key not in primary_metadata:
+                raise GgufShardError(
+                    f"Continuation shard {info.path.name} declares semantic metadata "
+                    f"key {key!r} that is absent from authoritative primary shard "
+                    f"{primary_info.path.name}; refusing continuation-only metadata."
+                )
+            if not _metadata_values_equal(primary_metadata[key], value):
                 raise GgufShardError(
                     f"Shards disagree on metadata key {key!r}: "
                     f"{merged[key]!r} in {owners[key]} versus {value!r} "
                     f"in {info.path.name}."
                 )
-            if key not in merged:
-                merged[key] = value
-                owners[key] = info.path.name
     merged[_SPLIT_NO] = 0
     merged[_SPLIT_COUNT] = len(shards)
     merged[_SPLIT_TENSORS_COUNT] = sum(info.tensor_count for info in infos)
@@ -781,6 +802,7 @@ def _validate_offsets(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
 def open_gguf_model(
     path: str | Path,
     *,
+    shard_paths: list[str | Path] | None = None,
     verify_checksums: bool = False,
     expected_sha256: dict[str, str] | None = None,
     expected_sizes: dict[str, int] | None = None,
@@ -791,8 +813,12 @@ def open_gguf_model(
     (or a directory holding a single split set); otherwise a plain
     :class:`GGUFModel`. Callers get the same interface either way.
     """
-    shards = discover_gguf_shards(path)
-    if len(shards) == 1:
+    shards = (
+        [Path(shard_path) for shard_path in shard_paths]
+        if shard_paths is not None
+        else discover_gguf_shards(path)
+    )
+    if len(shards) == 1 and shard_paths is None:
         single = shards[0]
         # A lone ``-00001-of-00001`` file is a degenerate single-shard set;
         # treat it as a plain file. GGUFModel still validates it.

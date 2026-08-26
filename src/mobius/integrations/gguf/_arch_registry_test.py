@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 90
+_EXPECTED_SUPPORTED_COUNT = 89
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -247,6 +247,9 @@ class TestCapabilityClosure:
             f"{spec.gguf_arch}: tensor mapping is supported but config extraction "
             f"is {spec.config.value}"
         )
+        if spec.preflight_only:
+            assert spec.graph is not Support.SUPPORTED
+            return
         assert spec.graph is Support.SUPPORTED, (
             f"{spec.gguf_arch}: tensor mapping is supported but graph construction "
             f"is {spec.graph.value}"
@@ -331,7 +334,6 @@ class TestCapabilityClosure:
             "openelm",
             "orion",
             "qwen",
-            "qwen4exp",
             "refact",
             "starcoder",
             "talkie",

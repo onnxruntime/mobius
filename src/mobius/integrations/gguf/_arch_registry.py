@@ -883,6 +883,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("qwen4exp",),
         config_key_map="qwen4exp",
         config_postprocessor="qwen4exp",
+        graph=Support.DEFERRED,
+        preflight_only=True,
         offset_norm=True,
         v_head_reorder=True,
         required_metadata=(
@@ -918,7 +920,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         quantized_import=Support.REJECTED,
         runtime=Support.DEFERRED,
         reason=(
-            "Exact header/float mapping is implemented. The published UD-IQ1_S "
+            "Exact header/config/tensor preflight is implemented, but no executable "
+            "graph import route is claimed. The published UD-IQ1_S "
             "payload is rejected: its IQ4_NL PLE table has no native gather ABI, "
             "mixed IQ1_S/IQ4_NL rank-3 experts have no released mixed sparse-MoE "
             "ABI/runtime evidence, and float dequantization exceeds bounded memory."
