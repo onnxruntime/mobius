@@ -127,6 +127,11 @@ _COMMAND_R_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
 }
 
+_APERTUS_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 _DFLASH_MAPPING: dict[str, str] = {
     "fc": "fc",
     "enc.output_norm": "hidden_norm",
@@ -193,6 +198,21 @@ _ARCEE_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
     "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
     "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+}
+
+_PLM_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_kv_b": "model.layers.{bid}.self_attn.kv_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
 }
 
 # OLMo 2/3 apply RMSNorm after each branch, not before it.
@@ -976,6 +996,24 @@ _KIMI_K3_MAPPING: dict[str, str] = {
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_a"]
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_b"]
 
+_MINICPM3_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_kv_b": "model.layers.{bid}.self_attn.kv_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
 # Architectures sharing the llama HF naming convention are declared in
 # ``_arch_registry`` via ``tensor_map_recipe=("llama", ...)`` rather than by a
 # frozenset here, so the "which architectures does this cover?" question has one
@@ -1031,12 +1069,14 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "starcoder": _STARCODER_MAPPING,
         "qwen1_extras": _QWEN1_EXTRAS,
         "command_r_extras": _COMMAND_R_EXTRAS,
+        "apertus_extras": _APERTUS_EXTRAS,
         "lfm2": _LFM2_MAPPING,
         "lfm2_moe_extras": _LFM2_MOE_EXTRAS,
         "dflash": _DFLASH_MAPPING,
         "eagle3": _EAGLE3_MAPPING,
         "olmo": _OLMO_MAPPING,
         "arcee": _ARCEE_MAPPING,
+        "plm": _PLM_MAPPING,
         "olmo2_extras": _OLMO2_EXTRAS,
         "phi3": _PHI3_MAPPING,
         "chatglm": _CHATGLM_MAPPING,
@@ -1073,6 +1113,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minimax": _MINIMAX_MAPPING,
         "kimi_linear": _KIMI_LINEAR_MAPPING,
         "kimi_k3": _KIMI_K3_MAPPING,
+        "minicpm3": _MINICPM3_MAPPING,
     }
 )
 

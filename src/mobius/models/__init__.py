@@ -103,6 +103,8 @@ __all__ = [
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
     "MiniMaxCausalLMModel",
+    "MiniCPM3CausalLMModel",
+    "MiniCPMCausalLMModel",
     "MiniCPMV46ForConditionalGeneration",
     "MoonshineForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
@@ -197,6 +199,7 @@ __all__ = [
     "moshi_depformer_config",
     "moshi_temporal_config",
     "Plamo2ForCausalLM",
+    "PLMCausalLMModel",
 ]
 
 from mobius.models.adapters import IPAdapterModel, T2IAdapterModel
@@ -294,6 +297,7 @@ from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.mimi import MimiModel, mimi_default_config
+from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.minimax_music3 import (
@@ -342,6 +346,7 @@ from mobius.models.phi3 import Phi3CausalLMModel
 from mobius.models.phi3_v import Phi3VModel
 from mobius.models.phi4_siglip import Phi4SigLIPModel
 from mobius.models.plamo2 import Plamo2ForCausalLM
+from mobius.models.plm import PLMCausalLMModel
 from mobius.models.qwen import (
     Qwen3CausalLMModel,
     QwenCausalLMModel,

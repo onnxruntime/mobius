@@ -116,6 +116,7 @@ from mobius.models import (
     PhiCausalLMModel,
     PhiMoEGGUFCausalLMModel,
     Plamo2ForCausalLM,
+    PLMCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
     Qwen3CausalLMModel,
@@ -176,6 +177,7 @@ from mobius.models.layoutlmv3 import LayoutLMv3Model
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
+from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
 from mobius.models.mllama import MllamaCausalLMModel
@@ -445,6 +447,8 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "llama": ModelRegistration(CausalLMModel),
     "minicpm": ModelRegistration(CausalLMModel),
     "minicpm3": ModelRegistration(CausalLMModel),
+    "minicpm_gguf": ModelRegistration(MiniCPMCausalLMModel),
+    "minicpm3_gguf": ModelRegistration(MiniCPM3CausalLMModel),
     "ministral": ModelRegistration(CausalLMModel),
     "ministral3": ModelRegistration(CausalLMModel),
     "mistral": ModelRegistration(CausalLMModel),
@@ -491,6 +495,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_model_id="pfnet/plamo-2-1b",
         family="plamo2",
     ),
+    "plm": ModelRegistration(
+        PLMCausalLMModel,
+        test_model_id="PLM-Team/PLM-1.8B-Instruct",
+        test_revision="62d188c7d58843d7013d5b3ffe198db448787860",
+        family="plm",
+    ),
+    "pangu_embedded": ModelRegistration(CausalLMModel, family="pangu-embedded"),
     "gemma": ModelRegistration(GemmaCausalLMModel),
     "gemma2": ModelRegistration(Gemma2CausalLMModel),
     "gemma3": ModelRegistration(Gemma3MultiModalModel, task="gemma3-vision-language"),

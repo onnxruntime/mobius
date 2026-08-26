@@ -51,13 +51,16 @@ from mobius.integrations.gguf._tensor_mapping import (
     is_known_skip,
     map_gguf_to_hf_names,
 )
-from mobius.integrations.gguf._tensor_processors import _PROCESSOR_IMPLS
+from mobius.integrations.gguf._tensor_processors import (
+    _PROCESSOR_IMPLS,
+    PACKED_SAFE_PROCESSORS,
+)
 from mobius.integrations.gguf._upstream import upstream_architectures
 
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 80
+_EXPECTED_SUPPORTED_COUNT = 85
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "codeshell",
@@ -66,9 +69,12 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "gptneox",
         "jais",
         "jais2",
+        "minicpm",
         "mpt",
         "openelm",
         "orion",
+        "pangu-embedded",
+        "plm",
         "qwen",
         "refact",
         "starcoder",
@@ -158,6 +164,7 @@ _FINAL_CENSUS_SUFFIXLESS_TENSORS = frozenset(
 # modules before joining this set.
 _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
     {
+        "apertus",
         "arcee",
         "baichuan",
         "bailingmoe",
@@ -176,7 +183,6 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "gemma2",
         "gemma3",
         "gemma4",
-        "gpt2",
         "granitemoe",
         "hunyuan-dense",
         "jamba",
@@ -187,6 +193,8 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "llada",
         "llada-moe",
         "llama",
+        "minicpm",
+        "minicpm3",
         "minimax-01",
         "modern-bert",
         "muse-glimmer",
@@ -194,9 +202,11 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "olmo",
         "olmo2",
         "olmoe",
+        "pangu-embedded",
         "phi3",
         "phimoe",
         "plamo2",
+        "plm",
         "qwen2",
         "qwen2vl",
         "qwen2moe",
@@ -307,6 +317,7 @@ class TestCapabilityClosure:
             "nomic-bert",
             "phi2",
             "bloom",
+            "gpt2",
             "codeshell",
             "gptneox",
             "jais",
@@ -369,6 +380,20 @@ class TestNameResolutionClosure:
         assert not orphans, (
             f"{field} implementations {sorted(orphans)} are registered but no "
             "architecture uses them, so they are dead code"
+        )
+
+    def test_quantized_import_never_skips_required_tensor_processor(self) -> None:
+        unsafe = {
+            spec.gguf_arch: spec.tensor_processor
+            for spec in iter_arch_specs()
+            if spec.quantized_import is Support.SUPPORTED
+            and spec.tensor_processor is not None
+            and spec.tensor_processor not in PACKED_SAFE_PROCESSORS
+        }
+        assert unsafe == {}, (
+            "keep_quantized=True bypasses float tensor processors. Mark these "
+            "architectures quantized_import=REJECTED or implement an exact packed-domain "
+            f"transform for weight/scales/zero-points: {unsafe}"
         )
 
 

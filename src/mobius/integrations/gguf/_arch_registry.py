@@ -235,12 +235,6 @@ _MPT_GRAPH_REASON = (
     "whole closure safely, and the current MPT preprocessing overwrites norm biases."
 )
 
-_APERTUS_GRAPH_REASON = (
-    "The pinned Apertus converter emits a serialized Llama-3 rope_freqs tensor that "
-    "the pinned loader consumes as per-dimension RoPE factors. The current Mobius "
-    "Apertus graph computes RoPE frequencies from scalar config and cannot represent "
-    "that tensor without changing attention semantics."
-)
 
 _RECURRENT_RUNTIME_VALIDATION_PENDING = (
     "Config extraction, exact pinned tensor-name closure, GGUF value transforms, and "
@@ -449,8 +443,9 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
     ),
     "plamo3": (
         "PLaMo3 requires fused QKV and fused SwiGLU, four norm sites with architecture-"
-        "specific offset transforms, Q/K norm before RoPE, and alternating full/sliding "
-        "attention state. Mobius has no exact iSWA schedule or value transform."
+        "specific offset transforms, Q/K norm before RoPE, and a periodic full/sliding "
+        "attention state (seven sliding layers then one full layer by default). Mobius has "
+        "no exact iSWA cache ABI or value transform."
     ),
     "plm": (
         "PLM uses latent KV projections and normalization with shared RoPE keys, expanded "
@@ -913,6 +908,23 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
+        gguf_arch="plm",
+        model_type="plm",
+        tensor_map_recipe=("plm",),
+        config_key_map="plm",
+        config_postprocessor="plm",
+        required_metadata=(
+            "attention.key_length",
+            "attention.value_length",
+            "attention.kv_lora_rank",
+            "rope.dimension_count",
+            "attention.layer_norm_rms_epsilon",
+        ),
+        rope_interleave=True,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="baichuan",
         model_type="baichuan",
         tensor_map_recipe=("llama",),
@@ -974,7 +986,14 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("gpt2",),
         tensor_processor="gpt2",
         runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        quantized_import=Support.REJECTED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Quantization preservation is rejected because canonical GPT-2 GGUF "
+            "projections must be transposed into graph order, and the current packed "
+            "route cannot transpose values together with their scales and zero-points. "
+            "Use keep_quantized=False for explicit float import."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="mamba",
@@ -1793,19 +1812,62 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="apertus",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="apertus",
+        tensor_map_recipe=("llama", "apertus_extras"),
+        config_postprocessor="apertus",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "xielu.alpha_n",
+            "xielu.alpha_p",
+            "xielu.beta",
+            "xielu.eps",
+        ),
         runtime=Support.DEFERRED,
-        reason=_APERTUS_GRAPH_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="minicpm",
+        model_type="minicpm",
+        module_type="minicpm_gguf",
+        config_key_map="minicpm",
+        config_postprocessor="minicpm",
+        tensor_map_recipe=("llama",),
+        tensor_processor="llama",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "embedding_scale",
+            "residual_scale",
+            "logit_scale",
+        ),
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Exact dense graph import, tensor closure, scaling, LongRoPE factors, "
+            "Q/K transforms, and expanded dynamic K/V cache are covered. Runtime "
+            "packaging remains deferred pending pinned real-weight generation parity; "
+            "routed-expert MiniCPM files are rejected by the dense-only boundary."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="minicpm3",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="minicpm3",
+        module_type="minicpm3_gguf",
+        config_key_map="minicpm3",
+        config_postprocessor="minicpm3",
+        tensor_map_recipe=("minicpm3",),
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "attention.key_length",
+            "rope.dimension_count",
+        ),
         runtime=Support.DEFERRED,
-        reason=_MINICPM3_GRAPH_REASON,
+        reason=(
+            "Exact Q/KV-LoRA MLA graph import with expanded K/V cache is covered. "
+            "Runtime packaging remains deferred pending pinned real-weight generation "
+            "parity; latent cache/state sidecars remain unsupported."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="openelm",
@@ -2021,6 +2083,20 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="pangu-embedded",
+        model_type="pangu_embedded",
+        tensor_map_recipe=("llama",),
+        config_postprocessor="pangu_embedded",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.DEFERRED,
+        reason=(
+            _RUNTIME_VALIDATION_PENDING
+            + " Import is intentionally restricted to split Q/K/V tensors and ordinary "
+            "full-head RoPE. Fused QKV and tensor-backed LongRoPE remain fail-closed until "
+            "their packed row and factor-value contracts can be preserved exactly."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="t5",
         model_type="t5",
         tensor_map_recipe=("t5",),
@@ -2113,7 +2189,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "gptneox",
             "jais",
             "jais2",
+            "minicpm",
+            "plm",
             "orion",
+            "pangu-embedded",
             "qwen",
             "refact",
             "starcoder",
