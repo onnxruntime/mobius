@@ -83,6 +83,9 @@ _CHECKER_SKIP_MODELS: set[str] = {
     "qwen3_5_moe",
     "qwen3_5_moe_text",
     "qwen3_next",
+    "qwen4_exp",
+    "qwen4_exp_text",
+    "Qwen4ExpForConditionalGeneration",
     # Models using LinearAttention / CausalConvWithState custom ops
     # prevent full shape/type propagation through com.microsoft domain.
     "bamba",

@@ -1532,6 +1532,190 @@ class CausalLMConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class Qwen4ExpConfig(CausalLMConfig):
+    """Exact text-core configuration for experimental Qwen4/Qwen3.8 Flash-Next."""
+
+    hc_count: int = 4
+    hc_lowrank: int = 320
+    ple_layer_ids: list[int] | None = None
+    ple_embed_dim: int | None = None
+    ple_conv_kernel_size: int = 4
+    ngram_size: int = 3
+    heads_per_ngram: int = 8
+    ngram_vocab_size_base: int = 20_000_000
+    make_ngram_vocab_size_divisible_by: int = 128
+    seed: int = 1234
+    split_ngram_parts: int = 512
+    indexer_n_heads: int | None = None
+    indexer_kv_heads: int | None = None
+    indexer_head_dim: int | None = None
+    indexer_budget: int | None = None
+    indexer_compress_ratio: int | None = None
+    output_gate_type: str | None = None
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
+
+    def __post_init__(self) -> None:
+        self.ple_layer_ids = sorted(set(self.ple_layer_ids or []))
+        if self.ple_embed_dim is None:
+            self.ple_embed_dim = self.hidden_size
+        if self.layer_types is None:
+            interval = self.full_attention_interval or 4
+            self.layer_types = [
+                "linear_attention" if (index + 1) % interval else "qwen_sparse_attention"
+                for index in range(self.num_hidden_layers)
+            ]
+        else:
+            self.layer_types = [
+                "qwen_sparse_attention" if layer_type == "full_attention" else layer_type
+                for layer_type in self.layer_types
+            ]
+        self._validate_architecture()
+
+    def _validate_architecture(self) -> None:
+        layer_types = self.layer_types or []
+        if len(layer_types) != self.num_hidden_layers:
+            raise ValueError(
+                "Qwen4-Exp layer_types must contain exactly num_hidden_layers entries "
+                f"(expected {self.num_hidden_layers}, got {len(layer_types)})"
+            )
+        unsupported = sorted(set(layer_types) - {"linear_attention", "qwen_sparse_attention"})
+        if unsupported:
+            raise ValueError(f"Unsupported Qwen4-Exp layer types: {unsupported}")
+        output_gate_type = self.output_gate_type or self.hidden_act
+        if output_gate_type not in {"sigmoid", "silu"}:
+            raise ValueError(
+                f"Unsupported Qwen4-Exp output gate activation: {output_gate_type}"
+            )
+        if self.hc_count <= 1:
+            raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {self.hc_count}")
+        if self.hc_lowrank <= 0:
+            raise ValueError(f"Qwen4-Exp requires hc_lowrank > 0, got {self.hc_lowrank}")
+        if not self.num_local_experts or self.num_local_experts <= 0:
+            raise ValueError("Qwen4-Exp num_experts must be > 0")
+        if not self.num_experts_per_tok or not (
+            0 < self.num_experts_per_tok <= self.num_local_experts
+        ):
+            raise ValueError("Qwen4-Exp num_experts_per_tok must be in [1, num_experts]")
+        if not self.moe_intermediate_size or self.moe_intermediate_size <= 0:
+            raise ValueError("Qwen4-Exp moe_intermediate_size must be > 0")
+        if (
+            not self.shared_expert_intermediate_size
+            or self.shared_expert_intermediate_size <= 0
+        ):
+            raise ValueError("Qwen4-Exp shared_expert_intermediate_size must be > 0")
+
+        qsa_fields = {
+            "indexer_n_heads": self.indexer_n_heads,
+            "indexer_kv_heads": self.indexer_kv_heads,
+            "indexer_head_dim": self.indexer_head_dim,
+            "indexer_budget": self.indexer_budget,
+            "indexer_compress_ratio": self.indexer_compress_ratio,
+        }
+        if any(value is not None for value in qsa_fields.values()):
+            missing = [name for name, value in qsa_fields.items() if value is None]
+            if missing:
+                raise ValueError(f"Qwen4-Exp QSA config is missing required fields: {missing}")
+            if any(value is not None and value <= 0 for value in qsa_fields.values()):
+                raise ValueError(f"Qwen4-Exp QSA config values must be positive: {qsa_fields}")
+            if self.indexer_kv_heads != 1:
+                raise ValueError("Qwen4-Exp QSA requires indexer_kv_heads=1")
+            assert self.indexer_budget is not None
+            assert self.indexer_compress_ratio is not None
+            if self.indexer_budget % self.indexer_compress_ratio:
+                raise ValueError(
+                    "Qwen4-Exp indexer_budget must be divisible by indexer_compress_ratio"
+                )
+            rotary_dim = int(self.head_dim * (self.partial_rotary_factor or 1.0))
+            assert self.indexer_head_dim is not None
+            if rotary_dim > self.indexer_head_dim:
+                raise ValueError(
+                    "Qwen4-Exp attention RoPE dimensions must fit the QSA index head: "
+                    f"rotary_dim={rotary_dim}, indexer_head_dim={self.indexer_head_dim}"
+                )
+        elif "qwen_sparse_attention" in layer_types:
+            raise ValueError("Qwen4-Exp sparse-attention layers require a complete QSA config")
+
+        if self.ple_layer_ids:
+            ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+            assert self.ple_embed_dim is not None
+            if ngram_heads <= 0 or self.ple_embed_dim <= 0 or self.ple_embed_dim % ngram_heads:
+                raise ValueError(
+                    "Qwen4-Exp ple_embed_dim must be positive and divisible by the "
+                    f"number of n-gram heads ({ngram_heads})"
+                )
+            invalid = [
+                layer_id
+                for layer_id in self.ple_layer_ids
+                if layer_id < 1 or layer_id > self.num_hidden_layers
+            ]
+            if invalid:
+                raise ValueError(
+                    "Qwen4-Exp ple_layer_ids must be one-indexed decoder layer ids; "
+                    f"invalid ids: {invalid}"
+                )
+            non_linear = [
+                layer_id
+                for layer_id in self.ple_layer_ids
+                if layer_types[layer_id - 1] != "linear_attention"
+            ]
+            if non_linear:
+                raise ValueError(
+                    "Qwen4-Exp PLE is only supported on linear_attention layers; "
+                    f"got PLE on layers {non_linear}"
+                )
+            if self.eos_token_id is None or (
+                isinstance(self.eos_token_id, list) and not self.eos_token_id
+            ):
+                raise ValueError("Qwen4-Exp eos_token_id must be set when PLE is enabled")
+
+        if self.mtp_use_dedicated_embeddings:
+            raise ValueError(
+                "Qwen4-Exp dedicated MTP embeddings are unsupported: the pinned "
+                "official runtime defines no MTP execution or NextN cache ABI"
+            )
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Qwen4ExpConfig:
+        text = _as_attribute_config(getattr(config, "text_config", None)) or config
+        parent = parent_config or (config if text is not config else None)
+        base = ArchitectureConfig.from_transformers(text, parent)
+        fields = _shallow_fields(base)
+        layer_types = getattr(text, "layer_types", None)
+        if layer_types is not None:
+            layer_types = [
+                "qwen_sparse_attention" if value == "full_attention" else value
+                for value in layer_types
+            ]
+        fields.update(
+            model_type="qwen4_exp_text",
+            layer_types=layer_types,
+            hc_count=getattr(text, "hc_count", 4),
+            hc_lowrank=getattr(text, "hc_lowrank", 320),
+            ple_layer_ids=list(getattr(text, "ple_layer_ids", None) or []),
+            ple_embed_dim=getattr(text, "ple_embed_dim", None),
+            ple_conv_kernel_size=getattr(text, "ple_conv_kernel_size", 4),
+            ngram_size=getattr(text, "ngram_size", 3),
+            heads_per_ngram=getattr(text, "heads_per_ngram", 8),
+            ngram_vocab_size_base=getattr(text, "ngram_vocab_size_base", 20_000_000),
+            make_ngram_vocab_size_divisible_by=getattr(
+                text, "make_ngram_vocab_size_divisible_by", 128
+            ),
+            seed=getattr(text, "seed", 1234),
+            split_ngram_parts=getattr(text, "split_ngram_parts", 512),
+            indexer_n_heads=getattr(text, "indexer_n_heads", None),
+            indexer_kv_heads=getattr(text, "indexer_kv_heads", None),
+            indexer_head_dim=getattr(text, "indexer_head_dim", None),
+            indexer_budget=getattr(text, "indexer_budget", None),
+            indexer_compress_ratio=getattr(text, "indexer_compress_ratio", None),
+            output_gate_type=getattr(text, "output_gate_type", None),
+            mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0),
+            mtp_use_dedicated_embeddings=getattr(text, "mtp_use_dedicated_embeddings", False),
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
 class Jais2Config(CausalLMConfig):
     """Normalize the published Jais2 projection and LayerNorm configuration."""
 

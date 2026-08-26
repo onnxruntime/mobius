@@ -162,6 +162,7 @@ class GatedDeltaNet(nn.Module):
         hidden_states: ir.Value,
         conv_state: ir.Value,
         recurrent_state: ir.Value,
+        token_mask: ir.Value | None = None,
     ):
         """Forward pass for the Gated DeltaNet layer.
 
@@ -224,13 +225,19 @@ class GatedDeltaNet(nn.Module):
         # TODO: Use op.LpNormalization directly once ORT >=1.25 supports it.
         q_4d = op.Reshape(query, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
         q_l2 = op.Sqrt(
-            op.ReduceSumSquare(q_4d, [-1], keepdims=1)
+            op.Max(
+                op.ReduceSumSquare(q_4d, [-1], keepdims=1),
+                op.CastLike(1e-12, q_4d),
+            )
         )  # (B, T, num_k_heads, 1) — L2 norm per head
         query = op.Reshape(op.Div(q_4d, q_l2), qk_3d_shape)  # (B, T, key_dim)
 
         k_4d = op.Reshape(key, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
         k_l2 = op.Sqrt(
-            op.ReduceSumSquare(k_4d, [-1], keepdims=1)
+            op.Max(
+                op.ReduceSumSquare(k_4d, [-1], keepdims=1),
+                op.CastLike(1e-12, k_4d),
+            )
         )  # (B, T, num_k_heads, 1) — L2 norm per head
         key = op.Reshape(op.Div(k_4d, k_l2), qk_3d_shape)  # (B, T, key_dim)
 
@@ -255,6 +262,15 @@ class GatedDeltaNet(nn.Module):
             neg_a = op.Neg(op.Exp(self.A_log))
             g = op.Mul(neg_a, softplus_val)
         # g: (B, T, num_v_heads)
+        if token_mask is not None:
+            state_mask = op.Unsqueeze(
+                op.CastLike(token_mask, beta),
+                [-1],
+            )
+            # A masked token must preserve the recurrent state: beta=0 skips
+            # the delta update and g=0 makes exp(g)=1.
+            beta = op.Mul(beta, state_mask)
+            g = op.Mul(g, state_mask)
 
         # === LinearAttention ===
         # beta: (B, T, num_v_heads) — already 3D, matches (B, T, kv_num_heads)
