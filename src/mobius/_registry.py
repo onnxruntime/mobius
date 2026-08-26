@@ -163,6 +163,7 @@ from mobius.models.gguf_encoders import (
     NeoBertGGUFModel,
     NomicBertGGUFModel,
 )
+from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.gpt2 import GPT2CausalLMModel, ScaledEmbeddingGPT2CausalLMModel
 from mobius.models.gpt_neox import GPTNeoXCausalLMModel, GPTNeoXJapaneseCausalLMModel
@@ -533,6 +534,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm": ModelRegistration(GlmCausalLMModel),
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
+    "gguf_legacy": ModelRegistration(ExactLegacyGGUFCausalLMModel),
     "gpt_neox_japanese": ModelRegistration(GPTNeoXJapaneseCausalLMModel),
     "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
     "gptj": ModelRegistration(GPTJCausalLMModel),

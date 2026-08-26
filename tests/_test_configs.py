@@ -3378,7 +3378,10 @@ _EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
 # Internal aliases removed from test configs — they are still registered in
 # the registry but should not appear in any test parametrization.  Their real
 # HF model_type counterpart (or the underlying model class) is already tested.
-_EXCLUDED_ALIASES: set[str] = set()
+_EXCLUDED_ALIASES: set[str] = {
+    # Internal graph selected only after strict GGUF metadata validation.
+    "gguf_legacy",
+}
 
 
 # ---------------------------------------------------------------------------

@@ -94,6 +94,7 @@ def _make_kv_cache_inputs(
     prefix: str = "past_key_values",
     key_head_dim: int | None = None,
     value_head_dim: int | None = None,
+    cache_specs: list[tuple[int, int]] | None = None,
 ) -> list[tuple[ir.Value, ir.Value]]:
     """Create KV cache input values for ``num_layers`` layers.
 
@@ -111,17 +112,23 @@ def _make_kv_cache_inputs(
     """
     k_dim = key_head_dim if key_head_dim is not None else head_dim
     v_dim = value_head_dim if value_head_dim is not None else head_dim
+    if cache_specs is not None and len(cache_specs) != num_layers:
+        raise ValueError("cache_specs must contain exactly num_layers entries")
     pairs: list[tuple[ir.Value, ir.Value]] = []
     for i in range(num_layers):
+        layer_heads, layer_head_dim = (
+            cache_specs[i] if cache_specs is not None else (num_kv_heads, k_dim)
+        )
+        layer_value_dim = layer_head_dim if cache_specs is not None else v_dim
         past_key = builder.input(
             f"{prefix}.{i}.key",
             dtype=dtype,
-            shape=[batch, num_kv_heads, past_seq_len, k_dim],
+            shape=[batch, layer_heads, past_seq_len, layer_head_dim],
         )
         past_value = builder.input(
             f"{prefix}.{i}.value",
             dtype=dtype,
-            shape=[batch, num_kv_heads, past_seq_len, v_dim],
+            shape=[batch, layer_heads, past_seq_len, layer_value_dim],
         )
         pairs.append((past_key, past_value))
     return pairs
@@ -138,6 +145,7 @@ def _register_kv_cache_outputs(
     value_head_dim: int | None = None,
     total_seq_len: ir.SymbolicDim | str | int | None = None,
     dtype: ir.DataType | None = None,
+    cache_specs: list[tuple[int, int]] | None = None,
 ) -> None:
     """Name and register KV cache outputs on the graph.
 
@@ -189,10 +197,14 @@ def _register_kv_cache_outputs(
         )
     for i, (present_key, present_value) in enumerate(present_key_values):
         if stamp:
-            present_key.shape = ir.Shape([batch, num_kv_heads, total_seq_len, key_head_dim])
+            layer_heads, layer_head_dim = (
+                cache_specs[i] if cache_specs is not None else (num_kv_heads, key_head_dim)
+            )
+            layer_value_dim = layer_head_dim if cache_specs is not None else value_head_dim
+            present_key.shape = ir.Shape([batch, layer_heads, total_seq_len, layer_head_dim])
             present_key.type = ir.TensorType(dtype)
             present_value.shape = ir.Shape(
-                [batch, num_kv_heads, total_seq_len, value_head_dim]
+                [batch, layer_heads, total_seq_len, layer_value_dim]
             )
             present_value.type = ir.TensorType(dtype)
         builder.add_output(present_key, f"{prefix}.{i}.key")

@@ -458,6 +458,12 @@ class ArchitectureConfig(BaseModelConfig):
     attn_qk_norm: bool = False
     attn_qk_norm_full: bool = False
     mlp_bias: bool = False
+    attention_scale: float | None = None
+    alibi_max_bias: float | None = None
+    use_parallel_residual: bool = False
+    layer_intermediate_sizes: tuple[int, ...] = ()
+    layer_attention_head_counts: tuple[int, ...] = ()
+    layer_attention_kv_head_counts: tuple[int, ...] = ()
 
     # Encoder-specific config
     type_vocab_size: int = 0

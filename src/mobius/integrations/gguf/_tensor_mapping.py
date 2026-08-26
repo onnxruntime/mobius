@@ -87,6 +87,11 @@ _LEGACY_LAYERNORM_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
 }
 
+_EXACT_LEGACY_GGUF_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+}
+
 _BLOOM_MAPPING: dict[str, str] = {
     "token_embd": "transformer.word_embeddings",
     "token_embd_norm": "transformer.word_embeddings_layernorm",
@@ -1021,6 +1026,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
         "legacy_layernorm": _LEGACY_LAYERNORM_MAPPING,
+        "exact_legacy_gguf_extras": _EXACT_LEGACY_GGUF_EXTRAS,
         "bloom": _BLOOM_MAPPING,
         "starcoder": _STARCODER_MAPPING,
         "qwen1_extras": _QWEN1_EXTRAS,

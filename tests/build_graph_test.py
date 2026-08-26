@@ -6027,6 +6027,8 @@ class TestBuildJambaGraph:
 # Model types exercised by non-parametrized test classes above (VLM,
 # whisper, audio, TTS, diffusion, etc.).  Keep sorted for readability.
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
+    # Internal GGUF-only graph covered by _exact_legacy_decoder_test.py.
+    "gguf_legacy",
     # T5 encoder-only hidden-state contract (co-located models/t5_test.py).
     "t5encoder",
     # LLaDA masked-diffusion LM (co-located src/mobius/models/llada_test.py):
