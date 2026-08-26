@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import onnx_ir as ir
 import pytest
 import torch
@@ -135,6 +137,45 @@ class TestGemma4ModelPreprocessWeights:
             is fake_sd["model.language_model.layers.0.self_attn.q_proj.weight_scales"]
         )
 
+    def test_olive_quantized_vision_sidecars_are_preprocessed(self):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_vision=True,
+            ),
+        )
+        model = Gemma4Model(config)
+        fake_sd = {
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                32, 16, dtype=torch.uint8
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                32, 2
+            ),
+            "model.embed_vision.embedding_projection.weight_qweight": torch.zeros(
+                64, 16, dtype=torch.uint8
+            ),
+            "model.embed_vision.embedding_projection.weight_scales": torch.ones(64, 2),
+        }
+
+        result = model.preprocess_weights(fake_sd)
+
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            2,
+            8,
+        )
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.scales"].shape == (
+            32,
+            2,
+        )
+        assert result["vision_encoder.projector.weight"].shape == (64, 2, 8)
+        assert result["vision_encoder.projector.scales"].shape == (64, 2)
+
     def test_top_level_lm_head_routes_to_decoder(self):
         model = Gemma4Model(_tiny_gemma4_config(tie_word_embeddings=False))
         weight = torch.randn(256, 64)
@@ -227,6 +268,49 @@ class TestGemma4EmbeddingModel:
         assert model.audio_token_id == 200011
         assert not hasattr(model, "_image_token_id_mask")
         assert not hasattr(model, "_audio_token_id_mask")
+
+
+class TestGemma4VisionQuantization:
+    def test_quantize_vision_emits_matmulnbits_and_keeps_activation_clipping(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            vision=dataclasses.replace(
+                _tiny_gemma4_config().vision,
+                use_clipped_linears=True,
+            ),
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_vision=True,
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+        op_types = [node.op_type for node in graph]
+
+        assert op_types.count("MatMulNBits") == 9
+        assert op_types.count("Clip") >= 16
+
+    def test_quantized_decoder_does_not_quantize_vision_by_default(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+
+        assert not any(node.op_type == "MatMulNBits" for node in graph)
 
 
 class TestScaleFreeRMSNormOverflow:

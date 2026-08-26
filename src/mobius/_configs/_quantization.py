@@ -33,6 +33,9 @@ class QuantizationConfig:
     # When True, the LM head projection is block-wise quantized (MatMulNBits).
     # Used by Olive RTN exports and quantized GGUF imports.
     quantize_lm_head: bool = False
+    # When True, multimodal vision projections are block-wise quantized.
+    # Olive RTN records this when ``quantize_vision`` is enabled.
+    quantize_vision: bool = False
     # When True, the input embedding and LM head share one weight table. Olive
     # RTN records this in its own config (``tie_word_embeddings``) and may clear
     # the model's top-level flag, so it is tracked here independently.
@@ -120,5 +123,6 @@ class QuantizationConfig:
             sym=qc.get("sym", qc.get("symmetric", True)),
             quantize_embeddings=bool(qc.get("embeds", False)),
             quantize_lm_head=bool(qc.get("lm_head", False)),
+            quantize_vision=bool(qc.get("quantize_vision", False)),
             tie_word_embeddings=bool(qc.get("tie_word_embeddings", False)),
         )
