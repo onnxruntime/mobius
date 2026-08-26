@@ -1395,16 +1395,19 @@ def validate_executable_closure(pkg: Any, metadata: dict[str, Any]) -> None:
                 )
 
 
-#: Symbolic leading dimension Mobius emits for every batched ONNX port. A port
-#: that opens with it holds exactly one entry per in-flight request, which is
-#: the structural fact a runtime needs to permute or drop rows.
+#: Symbolic dimension Mobius emits for every request-aligned ONNX port.
 REQUEST_AXIS_SYMBOL = "batch"
 
 
 def request_batch_layout(shape: list[Any] | None) -> dict[str, Any] | None:
     """Return the request-aligned batch layout implied by a port's shape."""
-    if shape and shape[0] == REQUEST_AXIS_SYMBOL:
-        return {"kind": "request_aligned", "axis": 0}
+    axes = [
+        axis
+        for axis, dimension in enumerate(shape or [])
+        if str(dimension) in _BATCH_DIMENSION_NAMES
+    ]
+    if len(axes) == 1:
+        return {"kind": "request_aligned", "axis": axes[0]}
     return None
 
 
@@ -1519,11 +1522,11 @@ _BATCH_DIMENSION_NAMES = frozenset({"batch", "batch_size", "batch_dim", "b"})
 
 
 def declare_request_alignment(workflow: dict[str, Any]) -> None:
-    """Stamp the request-aligned row axis onto every batch-leading contract.
+    """Stamp the request axis named by exactly one batch symbol.
 
     The runtime compacts finished rows out of a batch by applying one row
-    permutation to every request-aligned tensor. A contract whose leading axis
-    is the batch symbol but that does not say so is unpermutable, so state,
+    permutation to every request-aligned tensor. A contract whose batch axis
+    does not say so is unpermutable, so state,
     component ports, and outputs would silently drift apart after the first
     eviction. Deriving the declaration from the admitted graph's own batch
     symbol keeps alignment a property of the model interface rather than an
@@ -1534,8 +1537,8 @@ def declare_request_alignment(workflow: dict[str, Any]) -> None:
         if not isinstance(contract, dict) or "batch_layout" in contract:
             return
         shape = contract.get("shape") or []
-        if shape and str(shape[0]) in _BATCH_DIMENSION_NAMES:
-            contract["batch_layout"] = {"kind": "request_aligned", "axis": 0}
+        if layout := request_batch_layout(shape):
+            contract["batch_layout"] = layout
 
     for section in ("inputs", "outputs", "state"):
         for declaration in (workflow.get(section) or {}).values():

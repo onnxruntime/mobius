@@ -384,8 +384,9 @@ pipeline:
               - batch
               - prompt_sequence
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
           outputs:
             attention_mask:
               dtype: int64
@@ -394,8 +395,9 @@ pipeline:
               - batch
               - past_sequence_length + sequence_length
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             position_ids:
               dtype: int64
               rank: 2
@@ -403,8 +405,9 @@ pipeline:
               - batch
               - prompt_sequence
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             body_attention_mask:
               dtype: int64
               rank: 2
@@ -412,8 +415,9 @@ pipeline:
               - batch
               - prompt_sequence + 1
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             body_position_ids:
               dtype: int64
               rank: 2
@@ -421,8 +425,9 @@ pipeline:
               - batch
               - 1
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             token_slot:
               dtype: int64
               rank: 2
@@ -430,8 +435,9 @@ pipeline:
               - batch
               - 1
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             past_key_values.0.key:
               dtype: float32
               rank: 4
@@ -441,8 +447,9 @@ pipeline:
               - past_sequence_length
               - 4
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             past_key_values.0.value:
               dtype: float32
               rank: 4
@@ -452,8 +459,9 @@ pipeline:
               - past_sequence_length
               - 4
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
       global_step_update:
         implementation:
           kind: onnx
@@ -467,8 +475,9 @@ pipeline:
               - batch
               - context
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             position_ids:
               dtype: int64
               rank: 2
@@ -476,8 +485,9 @@ pipeline:
               - batch
               - 1
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
           outputs:
             next_attention_mask:
               dtype: int64
@@ -486,8 +496,9 @@ pipeline:
               - batch
               - context + 1
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
             next_position_ids:
               dtype: int64
               rank: 2
@@ -495,8 +506,9 @@ pipeline:
               - batch
               - 1
               batch_layout:
-                kind: request_aligned
+                kind: request_expanded
                 axis: 0
+                factor: 2
       ar_initializer:
         implementation:
           kind: onnx

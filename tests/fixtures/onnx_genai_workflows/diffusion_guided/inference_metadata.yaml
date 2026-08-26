@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -214,6 +214,7 @@ pipeline:
           roles:
             input_ids: token_ids
             encoder_hidden_states: encoder_hidden_states
+        batch_capacity: {}
       denoiser:
         implementation:
           kind: onnx
@@ -221,10 +222,12 @@ pipeline:
         ports:
           roles:
             encoder_hidden_states: encoder_hidden_states
+        batch_capacity: {}
       vae_decoder:
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx
+        batch_capacity: {}
       solver_step:
         implementation:
           kind: onnx
@@ -311,6 +314,12 @@ pipeline:
             schedule: schedule
             next_state: next_state
             next_history: next_history
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
+          - schedule_length
       continue_predicate:
         implementation:
           kind: onnx
@@ -331,6 +340,7 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity: {}
       diffusion_schedule:
         implementation:
           kind: onnx
@@ -343,6 +353,7 @@ pipeline:
               rank: 1
               shape:
               - 4
+        batch_capacity: {}
       diffusion_timesteps:
         implementation:
           kind: onnx
@@ -355,6 +366,7 @@ pipeline:
               rank: 1
               shape:
               - 3
+        batch_capacity: {}
       schedule_lookup:
         implementation:
           kind: onnx
@@ -383,6 +395,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - schedule_length
       tensor_scale:
         implementation:
           kind: onnx
@@ -417,6 +432,11 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
       decoder_input_scale:
         implementation:
           kind: onnx
@@ -429,6 +449,7 @@ pipeline:
               rank: 1
               shape:
               - 1
+        batch_capacity: {}
       history_initializer:
         implementation:
           kind: onnx
@@ -458,6 +479,11 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
       guidance_combine:
         implementation:
           kind: onnx
@@ -514,6 +540,11 @@ pipeline:
             conditional: conditional
             scale: scale
             estimate: estimate
+        batch_capacity:
+          uniform_dimensions:
+          - channels
+          - height
+          - width
       image_output_clamp:
         implementation:
           kind: onnx
@@ -543,6 +574,11 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - axis_1
+          - axis_2
+          - axis_3
       latent_row_shape:
         implementation:
           kind: onnx
@@ -555,6 +591,7 @@ pipeline:
               rank: 1
               shape:
               - 3
+        batch_capacity: {}
       latent_noise:
         implementation:
           kind: onnx
@@ -611,6 +648,7 @@ pipeline:
             row_shape: row_shape
             noise: noise
             next_offset: next_offset
+        batch_capacity: {}
     state:
       latent_state:
         contract:
@@ -757,10 +795,12 @@ pipeline:
         value: denoiser.estimate
         output: noise_estimate
         mode: append
+        axis: 3
       - kind: emit
         value: latent.body
         output: latent_trajectory
         mode: append
+        axis: 3
       - kind: invoke
         component: continue_predicate
         inputs:

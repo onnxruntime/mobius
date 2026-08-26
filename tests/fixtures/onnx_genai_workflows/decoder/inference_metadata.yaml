@@ -1,4 +1,4 @@
-schema_version: '1.0'
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -343,6 +343,7 @@ pipeline:
             attention_mask: attention_mask
             position_ids: position_ids
             logits: logits
+        batch_capacity: {}
       token_sampler:
         implementation:
           kind: onnx
@@ -459,6 +460,9 @@ pipeline:
             batching: per_row
             inactive_rows: preserve
         application_overridable: true
+        batch_capacity:
+          uniform_dimensions:
+          - vocabulary
       termination:
         implementation:
           kind: onnx
@@ -549,6 +553,9 @@ pipeline:
           parameters:
             batching: per_row
             inactive_rows: preserve
+        batch_capacity:
+          uniform_dimensions:
+          - num_eos
       token_state_update:
         implementation:
           kind: onnx
@@ -611,6 +618,7 @@ pipeline:
           parameters:
             batching: per_row
             inactive_rows: preserve
+        batch_capacity: {}
       last_token_logits:
         implementation:
           kind: onnx
@@ -637,6 +645,10 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - sequence
+          - vocabulary
       decoder_state_initializer:
         implementation:
           kind: onnx
@@ -736,6 +748,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - prompt_sequence
       decoder_step_update:
         implementation:
           kind: onnx
@@ -779,6 +794,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - context
       cache_length_update:
         implementation:
           kind: onnx
@@ -826,6 +844,7 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity: {}
       termination_batch_initializer:
         implementation:
           kind: onnx
@@ -896,6 +915,9 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity:
+          uniform_dimensions:
+          - num_eos
       token_to_slot:
         implementation:
           kind: onnx
@@ -920,6 +942,7 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity: {}
       generated_length_update:
         implementation:
           kind: onnx
@@ -967,6 +990,7 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+        batch_capacity: {}
     state:
       token:
         contract:

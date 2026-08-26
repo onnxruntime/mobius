@@ -831,6 +831,114 @@ def _fixture_packages() -> list[str]:
     )
 
 
+_MULTI_REQUEST_COMPONENTS = {
+    "adapter": {"overlay"},
+    "decoder": {
+        "model",
+        "token_sampler",
+        "termination",
+        "token_state_update",
+        "last_token_logits",
+        "decoder_state_initializer",
+        "decoder_step_update",
+        "cache_length_update",
+        "termination_batch_initializer",
+        "token_to_slot",
+        "generated_length_update",
+    },
+    "diffusion": {
+        "text_encoder",
+        "denoiser",
+        "vae_decoder",
+        "image_output_clamp",
+        "solver_step",
+        "continue_predicate",
+        "model_input_scale",
+        "diffusion_schedule",
+        "diffusion_timesteps",
+        "schedule_lookup",
+        "tensor_scale",
+        "initial_state_scale",
+    },
+    "diffusion_guided": {
+        "text_encoder",
+        "denoiser",
+        "vae_decoder",
+        "image_output_clamp",
+        "solver_step",
+        "continue_predicate",
+        "diffusion_schedule",
+        "diffusion_timesteps",
+        "schedule_lookup",
+        "tensor_scale",
+        "decoder_input_scale",
+        "history_initializer",
+        "guidance_combine",
+        "latent_row_shape",
+        "latent_noise",
+    },
+    "static_cache": {
+        "model",
+        "token_sampler",
+        "termination",
+        "token_state_update",
+        "last_token_logits",
+        "decoder_state_initializer",
+        "decoder_step_update",
+        "cache_length_update",
+        "termination_batch_initializer",
+        "token_to_slot",
+        "generated_length_update",
+    },
+    "tts": {
+        "talker",
+        "code_predictor",
+        "embedding",
+        "talker_step_embedder",
+        "talker_prefill_embedder",
+        "code_predictor_prefill",
+        "code_predictor_step_embedder",
+        "code_predictor_indices",
+        "talker_text_step",
+        "codec",
+        "last_token_logits",
+        "setup_talker_sampler",
+        "setup_predictor_sampler",
+        "talker_sampler",
+        "predictor_prefill_sampler",
+        "predictor_body_sampler",
+        "continue_predicate",
+        "tts_state_initializer",
+        "token_to_slot",
+        "code_frame_update",
+        "code_history_append",
+        "cache_length_update",
+        "talker_state_initializer",
+        "predictor_state_initializer",
+        "talker_step_update",
+        "predictor_step_update",
+        "codec_layout",
+    },
+    "video": {
+        "transformer",
+        "vae_decoder",
+        "model_input",
+        "solver_step",
+        "continue_predicate",
+        "video_latent_init",
+        "schedule_history_append",
+        "video_latent_permute",
+        "video_latent_unscale",
+        "video_decode_chunks",
+        "video_decode_chunk",
+        "video_conv_cache_init",
+        "diffusion_schedule",
+        "diffusion_timesteps",
+        "schedule_lookup",
+    },
+}
+
+
 @pytest.mark.parametrize(
     "directory", _fixture_packages(), ids=lambda path: os.path.basename(path)
 )
@@ -858,6 +966,46 @@ class TestCheckedInPackagesShareTheShape:
 
     def test_fixture_validates_against_current_onnx_genai_schema(self, directory):
         jsonschema.validate(self._metadata(directory), ONNX_GENAI_SCHEMA)
+
+    def test_fixture_round_trips_through_yaml_and_schema(self, directory):
+        metadata = self._metadata(directory)
+        round_tripped = yaml.safe_load(yaml.safe_dump(metadata, sort_keys=False))
+        assert round_tripped == metadata
+        jsonschema.validate(round_tripped, ONNX_GENAI_SCHEMA)
+
+    def test_multi_request_components_declare_capacity(self, directory):
+        package = os.path.basename(directory)
+        expected = _MULTI_REQUEST_COMPONENTS.get(package)
+        if expected is None:
+            return
+        components = self._metadata(directory)["pipeline"]["workflow"]["components"]
+        assert {
+            name for name, component in components.items() if "batch_capacity" in component
+        } == expected
+
+    def test_unproven_encoder_capacity_remains_absent(self, directory):
+        if os.path.basename(directory) not in {
+            "esm2_protein_embeddings",
+            "protbert_protein_embeddings",
+        }:
+            return
+        encoder = self._metadata(directory)["pipeline"]["workflow"]["components"]["encoder"]
+        assert "batch_capacity" not in encoder
+
+    def test_hierarchical_audio_preserves_its_internal_row_expansion(self, directory):
+        if os.path.basename(directory) != "hierarchical_audio":
+            return
+        components = self._metadata(directory)["pipeline"]["workflow"]["components"]
+        for name in ("global_initializer", "global_step_update"):
+            contracts = components[name]["ports"]
+            for contract in (*contracts["inputs"].values(), *contracts["outputs"].values()):
+                shape = contract.get("shape") or []
+                if shape and shape[0] == "batch":
+                    assert contract["batch_layout"] == {
+                        "kind": "request_expanded",
+                        "axis": 0,
+                        "factor": 2,
+                    }
 
     def test_fixture_matches_regenerated_metadata(
         self, directory, materialized_workflow_packages

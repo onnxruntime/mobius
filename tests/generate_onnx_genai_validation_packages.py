@@ -1326,7 +1326,7 @@ def _adapter_package(source_root: Path) -> ModelPackage:
 
 def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
     metadata = {
-        "schema_version": "v1",
+        "schema_version": "v1.1",
         "pipeline": {
             "workflow": {
                 "manifest": {
@@ -1392,6 +1392,7 @@ def _write_adapter_metadata(package: ModelPackage, directory: Path) -> None:
                             "abi": "onnx-genai.parameter-overlay",
                             "version": "1",
                         },
+                        "batch_capacity": {},
                         "ports": {
                             "inputs": {
                                 "input": {

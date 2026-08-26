@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -115,6 +115,7 @@ pipeline:
           kind: adapter
           abi: onnx-genai.parameter-overlay
           version: '1'
+        batch_capacity: {}
         ports:
           inputs:
             input:

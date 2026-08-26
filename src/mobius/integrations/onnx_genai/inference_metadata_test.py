@@ -39,6 +39,7 @@ from mobius.integrations.onnx_genai.inference_metadata import (
     load_diffusers_scheduler_config,
     load_diffusers_vae_scaling_factor,
     published_value_references,
+    request_batch_layout,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_mtp_speculator_metadata,
@@ -47,6 +48,19 @@ from mobius.integrations.onnx_genai.inference_metadata import (
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_vlm_workflow_metadata,
 )
+
+
+def test_request_batch_layout_follows_the_unique_batch_symbol():
+    assert request_batch_layout(["batch", "sequence"]) == {
+        "kind": "request_aligned",
+        "axis": 0,
+    }
+    assert request_batch_layout([3, "batch", "sequence"]) == {
+        "kind": "request_aligned",
+        "axis": 1,
+    }
+    assert request_batch_layout(["batch", "batch"]) is None
+    assert request_batch_layout([3, "sequence"]) is None
 
 
 def test_ort_extensions_processor_config_supplies_structural_values(tmp_path):

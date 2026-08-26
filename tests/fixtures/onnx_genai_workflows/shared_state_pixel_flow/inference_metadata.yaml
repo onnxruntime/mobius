@@ -458,6 +458,9 @@ pipeline:
               - 3
               - batch
               - prompt_sequence
+              batch_layout:
+                kind: request_aligned
+                axis: 1
             body_attention_mask:
               dtype: int64
               rank: 2
@@ -474,6 +477,9 @@ pipeline:
               - 3
               - batch
               - 1
+              batch_layout:
+                kind: request_aligned
+                axis: 1
             token_slot:
               dtype: int64
               rank: 2
@@ -553,6 +559,9 @@ pipeline:
               - 3
               - batch
               - image_tokens
+              batch_layout:
+                kind: request_aligned
+                axis: 1
             token_grid:
               dtype: int64
               rank: 1
