@@ -52,8 +52,8 @@ from mobius.integrations.gguf._tensor_mapping import (
     map_gguf_to_hf_names,
 )
 from mobius.integrations.gguf._tensor_processors import (
-    PACKED_SAFE_PROCESSORS,
     _PROCESSOR_IMPLS,
+    PACKED_SAFE_PROCESSORS,
 )
 from mobius.integrations.gguf._upstream import upstream_architectures
 
