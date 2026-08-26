@@ -391,6 +391,9 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "qwen3_5_text": {"head_dim": TINY_HEAD_DIM},
     # Qwen3.5-MoE uses the same doubled-Q attention as qwen3_5; head_dim defaults to 256 in HF
     "qwen3_5_moe": {"head_dim": TINY_HEAD_DIM},
+    # Qwen4-Exp validates partial RoPE against the QSA index head during
+    # construction, so its explicit head_dim must match the tiny ONNX config.
+    "qwen4_exp_text": {"head_dim": TINY_HEAD_DIM},
     # GPT-NeoX/Pythia use layer_norm_eps (not rms_norm_eps) for their LayerNorms
     "gpt_neox": {"layer_norm_eps": 1e-6},
     # GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; test config matches via rms_norm_eps=1e-5
@@ -708,6 +711,7 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "moe_intermediate_size": "expert_ffn_hidden_size",
         },
         "nemotron_h": {"num_local_experts": "n_routed_experts"},
+        "qwen4_exp_text": {"num_local_experts": "num_experts"},
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():
@@ -1217,6 +1221,8 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
         for onnx_model in pkg.values():
             apply_weights(onnx_model, preprocessed)
     except Exception as e:
+        if model_type == "qwen4_exp_text":
+            raise
         pytest.skip(f"Weight transfer failed for {model_type}: {type(e).__name__}: {e}")
 
     # Fill any remaining unset initializers (ONNX constants, etc.)
@@ -1279,13 +1285,14 @@ def test_synthetic_parity(model_type: str, config_overrides: dict):
                 shape.append(1)
             else:
                 shape.append(0)
-        dtype = np.int64 if inp.dtype == ir.DataType.INT64 else np.float32
-        feeds[name] = np.zeros(shape, dtype=dtype)
+        feeds[name] = np.zeros(shape, dtype=inp.dtype.numpy())
 
     try:
         onnx_out = session.run(feeds)
     except Exception as e:
         session.close()
+        if model_type == "qwen4_exp_text":
+            raise
         pytest.skip(f"ONNX inference failed for {model_type}: {type(e).__name__}: {e}")
     onnx_logits = onnx_out["logits"]
     session.close()

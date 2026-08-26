@@ -183,9 +183,19 @@ def test_exact_config_guards(override, message):
         _config(**override)
 
 
-def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache():
-    config = _config(partial_rotary_factor=0.5)
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache(interleaved):
+    config = _config(partial_rotary_factor=0.5, rope_interleave=interleaved)
     _config_value, _module, model = _build(config)
+    rotary_nodes = [
+        node
+        for node in model.graph
+        if node.op_type == "RotaryEmbedding" and "/indexer/" in node.name
+    ]
+    assert len(rotary_nodes) == 2
+    assert all(node.attributes["rotary_embedding_dim"].value == 4 for node in rotary_nodes)
+    assert all(node.attributes["interleaved"].value == interleaved for node in rotary_nodes)
+
     rng = np.random.default_rng(5)
     for value in model.graph.initializers.values():
         if value.const_value is None:
@@ -193,7 +203,18 @@ def test_qsa_rope_uses_full_rotary_width_from_half_width_frequency_cache():
                 rng.normal(0.0, 0.02, [int(dim) for dim in value.shape]).astype(np.float32)
             )
     session = OnnxModelSession(model)
-    session.close()
+    try:
+        outputs = session.run(
+            _initial_states()
+            | {
+                "input_ids": np.array([[2, 3, 4, 5]], dtype=np.int64),
+                "attention_mask": np.ones((1, 4), dtype=np.int64),
+                "position_ids": np.arange(4, dtype=np.int64)[None],
+            }
+        )
+    finally:
+        session.close()
+    assert np.isfinite(outputs["logits"]).all()
 
 
 def test_registry_routes_composite_and_text_model_types():

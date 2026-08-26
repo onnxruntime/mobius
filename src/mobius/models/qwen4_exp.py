@@ -28,6 +28,7 @@ from mobius.components import (
     Linear,
     Qwen35Attention,
     SoftmaxTopKGate,
+    apply_rotary_pos_emb,
     create_attention_bias,
     get_activation,
     initialize_rope,
@@ -462,6 +463,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         self._block_topk = self._budget // self._ratio
         self._rotary_dim = int(config.head_dim * (config.partial_rotary_factor or 1.0))
         self._frequency_dim = self._rotary_dim // 2
+        self._interleaved = config.rope_interleave
         self.index_qk_proj = Linear(
             config.hidden_size,
             (self._n_heads + 1) * self._head_dim,
@@ -477,32 +479,21 @@ class Qwen4ExpQSAIndexer(nn.Module):
         position_embeddings: tuple[ir.Value, ir.Value],
         num_heads: int,
     ) -> ir.Value:
-        value = op.Reshape(value, [0, 0, num_heads, self._head_dim])
-        rotary, passthrough = op.Split(
+        # The shared RoPE cache follows ONNX RotaryEmbedding and stores one
+        # cos/sin value per rotation pair. The op expands those values across
+        # split halves or adjacent pairs according to ``interleaved``.
+        value = op.Reshape(value, [0, 0, num_heads * self._head_dim])
+        value = apply_rotary_pos_emb(
+            op,
             value,
-            [self._rotary_dim, self._head_dim - self._rotary_dim],
-            axis=-1,
-            _outputs=2,
+            position_embeddings,
+            num_heads,
+            rotary_embedding_dim=(
+                self._rotary_dim if self._rotary_dim < self._head_dim else 0
+            ),
+            interleaved=self._interleaved,
         )
-        first, second = op.Split(
-            rotary,
-            [self._rotary_dim // 2, self._rotary_dim // 2],
-            axis=-1,
-            _outputs=2,
-        )
-        rotated_half = op.Concat(op.Neg(second), first, axis=-1)
-        # Mobius RoPE caches one value per frequency. Upstream expands those
-        # frequencies across both rotary halves with torch.cat((freqs, freqs)).
-        cos = op.Unsqueeze(
-            op.Concat(position_embeddings[0], position_embeddings[0], axis=-1),
-            [2],
-        )
-        sin = op.Unsqueeze(
-            op.Concat(position_embeddings[1], position_embeddings[1], axis=-1),
-            [2],
-        )
-        rotary = op.Add(op.Mul(rotary, cos), op.Mul(rotated_half, sin))
-        return op.Concat(rotary, passthrough, axis=-1)
+        return op.Reshape(value, [0, 0, num_heads, self._head_dim])
 
     @staticmethod
     def _gather_per_query(
