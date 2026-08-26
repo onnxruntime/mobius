@@ -1010,6 +1010,9 @@ class Qwen4ExpExperts(nn.Module):
         super().__init__()
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
+        self._hidden_size = config.hidden_size
+        self._num_experts = config.num_local_experts
+        self._top_k = config.num_experts_per_tok
         self._intermediate_size = config.moe_intermediate_size
         self.gate_up_proj = nn.Parameter(
             [
@@ -1033,27 +1036,61 @@ class Qwen4ExpExperts(nn.Module):
         selected_experts: ir.Value,
         routing_weights: ir.Value,
     ) -> ir.Value:
-        # Gather only top-k expert matrices for each token:
-        # gate_up: (B, S, K, 2I, H), hidden: (B, S, 1, H, 1).
-        gate_up = op.Gather(self.gate_up_proj, selected_experts, axis=0)
-        hidden_column = op.Unsqueeze(hidden_states, [2, 4])
-        projected = op.Squeeze(op.MatMul(gate_up, hidden_column), [-1])
-        gate, up = op.Split(
-            projected,
-            [self._intermediate_size, self._intermediate_size],
-            axis=-1,
-            _outputs=2,
+        # Dispatch only the tokens routed to each expert. Dynamic Gather on the
+        # expert bank would replicate full matrices into (B,S,K,...), which is
+        # prohibitive at production prefill lengths.
+        original_shape = op.Shape(hidden_states)
+        flat_hidden = op.Reshape(hidden_states, [-1, self._hidden_size])
+        assert self._top_k is not None
+        flat_indices = op.Reshape(selected_experts, [-1, self._top_k])
+        flat_weights = op.Reshape(routing_weights, [-1, self._top_k])
+        output = op.CastLike(
+            op.ConstantOfShape(op.Shape(flat_hidden)),
+            flat_hidden,
         )
-        activated = op.Mul(op.Swish(gate), up)
 
-        # down: (B, S, K, H, I) @ (B, S, K, I, 1) -> (B, S, K, H).
-        down = op.Gather(self.down_proj, selected_experts, axis=0)
-        expert_output = op.Squeeze(
-            op.MatMul(down, op.Unsqueeze(activated, [-1])),
-            [-1],
-        )
-        weighted = op.Mul(expert_output, op.Unsqueeze(routing_weights, [-1]))
-        return op.ReduceSum(weighted, [-2], keepdims=False)
+        for expert_index in range(self._num_experts):
+            matches = op.Equal(flat_indices, expert_index)
+            coordinates = op.Transpose(op.NonZero(matches), perm=[1, 0])
+            token_indices = op.Squeeze(op.Gather(coordinates, [0], axis=1), [1])
+            expert_hidden = op.Gather(flat_hidden, token_indices, axis=0)
+
+            gate_up = op.Squeeze(
+                op.Gather(self.gate_up_proj, [expert_index], axis=0),
+                [0],
+            )
+            projected = op.MatMul(
+                expert_hidden,
+                op.Transpose(gate_up, perm=[1, 0]),
+            )
+            gate, up = op.Split(
+                projected,
+                [self._intermediate_size, self._intermediate_size],
+                axis=-1,
+                _outputs=2,
+            )
+            activated = op.Mul(op.Swish(gate), up)
+
+            down = op.Squeeze(
+                op.Gather(self.down_proj, [expert_index], axis=0),
+                [0],
+            )
+            expert_output = op.MatMul(
+                activated,
+                op.Transpose(down, perm=[1, 0]),
+            )
+            route_weight = op.GatherND(flat_weights, coordinates)
+            weighted = op.Mul(expert_output, op.Unsqueeze(route_weight, [-1]))
+            scattered = op.ScatterND(
+                op.CastLike(
+                    op.ConstantOfShape(op.Shape(flat_hidden)),
+                    flat_hidden,
+                ),
+                op.Unsqueeze(token_indices, [-1]),
+                weighted,
+            )
+            output = op.Add(output, scattered)
+        return op.Reshape(output, original_shape)
 
 
 class Qwen4ExpTopKGate(SoftmaxTopKGate):

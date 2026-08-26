@@ -946,8 +946,19 @@ def test_moe_executes_only_packed_topk_experts():
         for node in model.graph
         if node.outputs[0].name is not None and ".mlp.experts." in node.outputs[0].name
     ]
-    assert sum(node.op_type == "Gather" for node in expert_nodes) == 4
-    assert sum(node.op_type == "MatMul" for node in expert_nodes) == 4
+    weight_gathers = [
+        node
+        for node in expert_nodes
+        if node.op_type == "Gather"
+        and node.inputs[0].name is not None
+        and node.inputs[0].name.endswith(
+            (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+        )
+    ]
+    assert len(weight_gathers) == 8
+    assert all(node.inputs[1].const_value is not None for node in weight_gathers)
+    assert sum(node.op_type == "NonZero" for node in expert_nodes) == 4
+    assert sum(node.op_type == "MatMul" for node in expert_nodes) == 8
     assert not any(".mlp.experts.0." in name for name in model.graph.initializers)
 
 
