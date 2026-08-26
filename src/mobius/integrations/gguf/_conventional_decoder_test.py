@@ -333,14 +333,17 @@ def test_pangu_embedded_rejects_partial_qkv_bias() -> None:
         _raise_for_invalid_conventional_decoder_tensor_contract(model)
 
 
-@pytest.mark.parametrize("factor", ["rope_factors_long.weight", "rope_factors_short.weight"])
-def test_pangu_embedded_longrope_factors_fail_closed(factor: str) -> None:
+@pytest.mark.parametrize(
+    "factor",
+    ["rope_freqs.weight", "rope_factors_long.weight", "rope_factors_short.weight"],
+)
+def test_pangu_embedded_tensor_rope_factors_fail_closed(factor: str) -> None:
     model = _fixture("pangu-embedded")
     model._tensors[factor] = (4,)
     model.tensor_names = list(model._tensors)
     model.metadata["pangu-embedded.rope.scaling.type"] = "longrope"
 
-    with pytest.raises(ValueError, match="rope_factors"):
+    with pytest.raises(ValueError, match=r"rope_(freqs|factors)"):
         _raise_for_invalid_conventional_decoder_tensor_contract(model)
 
 

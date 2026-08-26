@@ -2201,6 +2201,7 @@ def _pangu_embedded_postprocess(
     arch = "pangu-embedded"
     tensor_names = set(getattr(model, "tensor_names", ()) or ())
     factor_tensors = tensor_names & {
+        "rope_freqs.weight",
         "rope_factors_long.weight",
         "rope_factors_short.weight",
     }
@@ -2250,6 +2251,14 @@ def _minicpm_longrope(
         )
     if model is None or not hasattr(model, "get_tensor"):
         raise ValueError("MiniCPM LongRoPE factors could not be read from the GGUF model")
+
+    raw_types = {
+        name: getattr(qtype, "value", qtype)
+        for name, _raw, qtype, _shape in model.tensor_items_raw()
+        if name in present
+    }
+    if any(type_id not in {0, 1, 30} for type_id in raw_types.values()):
+        raise ValueError("MiniCPM LongRoPE factors must use F32/F16/BF16 storage")
 
     long_factor = np.asarray(model.get_tensor(long_name), dtype=np.float32).reshape(-1)
     short_factor = np.asarray(model.get_tensor(short_name), dtype=np.float32).reshape(-1)

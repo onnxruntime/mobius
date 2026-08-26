@@ -2038,10 +2038,6 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
             required[prefix + "ffn_up.bias"] = (intermediate,)
             required[prefix + "ffn_down.bias"] = (hidden,)
 
-    if architecture == "pangu-embedded":
-        rope_dim = int(metadata.get(f"{architecture}.rope.dimension_count", head_dim))
-        optional["rope_freqs.weight"] = (rope_dim // 2,)
-
     allowed = set(required) | set(optional)
     missing = sorted(set(required) - set(actual))
     if architecture == "codeshell" and not {

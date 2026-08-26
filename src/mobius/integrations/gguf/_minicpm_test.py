@@ -36,10 +36,12 @@ class _FakeGGUF:
         architecture: str,
         metadata: dict[str, object],
         tensors: dict[str, np.ndarray],
+        qtypes: dict[str, int] | None = None,
     ):
         self.architecture = architecture
         self.metadata = metadata
         self._tensors = tensors
+        self._qtypes = qtypes or {}
         self.tensor_names = tuple(tensors)
 
     def get_tensor(self, name: str) -> np.ndarray:
@@ -47,7 +49,7 @@ class _FakeGGUF:
 
     def tensor_items_raw(self):
         for name, value in self._tensors.items():
-            yield name, memoryview(value), 0, value.shape
+            yield name, memoryview(value), self._qtypes.get(name, 0), value.shape
 
 
 def _base_config(**overrides: object) -> ArchitectureConfig:
@@ -238,6 +240,31 @@ def test_minicpm_scales_and_longrope_are_exact() -> None:
         "long_factor": [2.0, 3.0],
         "short_factor": [1.0, 1.5],
     }
+
+
+def test_minicpm_quantized_longrope_factors_fail_closed() -> None:
+    metadata = _metadata("minicpm")
+    metadata.update(
+        {
+            "minicpm.embedding_scale": 12.0,
+            "minicpm.residual_scale": 0.7,
+            "minicpm.logit_scale": 10.0,
+            "minicpm.rope.dimension_count": 4,
+            "minicpm.rope.scaling.original_context_length": 8,
+        }
+    )
+    tensors = _dense_tensors("minicpm")
+    tensors["rope_factors_long.weight"] = np.array([2.0, 3.0], dtype=np.float32)
+    tensors["rope_factors_short.weight"] = np.array([1.0, 1.5], dtype=np.float32)
+    model = _FakeGGUF(
+        "minicpm",
+        metadata,
+        tensors,
+        qtypes={"rope_factors_long.weight": 2},
+    )
+
+    with pytest.raises(ValueError, match="F32/F16/BF16"):
+        _minicpm_postprocess(_base_config(), metadata, model)
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), float("nan")])
