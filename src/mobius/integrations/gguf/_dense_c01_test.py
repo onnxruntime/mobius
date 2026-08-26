@@ -18,7 +18,6 @@ from mobius.integrations.gguf._builder import (
     build_from_gguf,
 )
 from mobius.integrations.gguf._config_mapping import gguf_to_config
-from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
 from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 from mobius.integrations.gguf._tensor_processors import process_tensors
 from mobius.models.chatglm import ChatGLMCausalLMModel
@@ -198,9 +197,9 @@ def test_dense_cohort_registry_runtime_is_deferred(
 
 
 @pytest.mark.parametrize("architecture", ["apertus", "openelm", "mpt"])
-def test_dense_graph_mismatches_fail_before_config(architecture) -> None:
+def test_dense_missing_metadata_fails_before_config(architecture) -> None:
     model = _FakeGGUF(architecture, {}, {})
-    with pytest.raises(UnsupportedGGUFArchitectureError, match="before config extraction"):
+    with pytest.raises(ValueError, match="missing required"):
         _validate_gguf_model(model, source="synthetic.gguf")
 
 
