@@ -200,6 +200,21 @@ _ARCEE_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
 }
 
+_PLM_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_kv_b": "model.layers.{bid}.self_attn.kv_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
 # OLMo 2/3 apply RMSNorm after each branch, not before it.
 _OLMO2_EXTRAS: dict[str, str] = {
     "blk.{bid}.post_attention_norm": ("model.layers.{bid}.post_attention_layernorm"),
@@ -1043,6 +1058,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "eagle3": _EAGLE3_MAPPING,
         "olmo": _OLMO_MAPPING,
         "arcee": _ARCEE_MAPPING,
+        "plm": _PLM_MAPPING,
         "olmo2_extras": _OLMO2_EXTRAS,
         "phi3": _PHI3_MAPPING,
         "chatglm": _CHATGLM_MAPPING,

@@ -179,6 +179,13 @@ _PLAMO2_KEY_MAP = {
     "ssm.time_step_rank": "mamba_num_heads",
 }
 
+_PLM_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "attention.value_length": "v_head_dim",
+    "attention.kv_lora_rank": "kv_lora_rank",
+    "rope.dimension_count": "qk_rope_head_dim",
+}
+
 _JAMBA_KEY_MAP = {
     "attention.head_count": "num_attention_heads",
     "attention.head_count_kv": "num_key_value_heads",
@@ -263,6 +270,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "mamba": _MAMBA_KEY_MAP,
         "falcon_h1": _FALCON_H1_KEY_MAP,
         "plamo2": _PLAMO2_KEY_MAP,
+        "plm": _PLM_KEY_MAP,
         "jamba": _JAMBA_KEY_MAP,
         "nemotron_h": _NEMOTRON_H_KEY_MAP,
         "granitehybrid": _GRANITEHYBRID_KEY_MAP,
@@ -3463,6 +3471,100 @@ def _exact_legacy_gguf_postprocess(
     return dataclasses.replace(config, **fields)
 
 
+def _plm_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    """Validate and materialize the exact pinned PLM GGUF contract."""
+    arch = model.architecture
+    key_dim = int(metadata[f"{arch}.attention.key_length"])
+    value_dim = int(metadata[f"{arch}.attention.value_length"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    kv_rank = int(metadata[f"{arch}.attention.kv_lora_rank"])
+    nope_dim = key_dim - rope_dim
+    heads = config.num_attention_heads
+
+    if min(nope_dim, rope_dim, value_dim, kv_rank) <= 0:
+        raise ValueError("PLM requires positive NoPE, RoPE, value, and KV-LoRA dimensions")
+    if rope_dim % 2:
+        raise ValueError("PLM rope.dimension_count must be even")
+    if "output.weight" in model.tensor_names:
+        raise ValueError(
+            "PLM uses token_embd.weight as the sole tied output owner; "
+            "standalone output.weight is not accepted"
+        )
+
+    expected: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (config.vocab_size, config.hidden_size),
+        "output_norm.weight": (config.hidden_size,),
+    }
+    for layer in range(config.num_hidden_layers):
+        prefix = f"blk.{layer}."
+        expected.update(
+            {
+                prefix + "attn_norm.weight": (config.hidden_size,),
+                prefix + "attn_q.weight": (heads * key_dim, config.hidden_size),
+                prefix + "attn_kv_a_mqa.weight": (
+                    kv_rank + rope_dim,
+                    config.hidden_size,
+                ),
+                prefix + "attn_kv_a_norm.weight": (kv_rank,),
+                prefix + "attn_kv_b.weight": (
+                    heads * (nope_dim + value_dim),
+                    kv_rank,
+                ),
+                prefix + "attn_output.weight": (
+                    config.hidden_size,
+                    heads * value_dim,
+                ),
+                prefix + "ffn_norm.weight": (config.hidden_size,),
+                prefix + "ffn_up.weight": (
+                    config.intermediate_size,
+                    config.hidden_size,
+                ),
+                prefix + "ffn_down.weight": (
+                    config.hidden_size,
+                    config.intermediate_size,
+                ),
+            }
+        )
+
+    raw_shapes = {
+        name: tuple(int(dim) for dim in shape)
+        for name, _raw, _qtype, shape in model.tensor_items_raw()
+    }
+    missing = sorted(set(expected) - set(raw_shapes))
+    mismatched = sorted(
+        f"{name}: expected {shape}, got {raw_shapes[name]}"
+        for name, shape in expected.items()
+        if name in raw_shapes and raw_shapes[name] != shape
+    )
+    if missing or mismatched:
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if mismatched:
+            details.append(f"shape_mismatches={mismatched}")
+        raise ValueError("Invalid PLM tensor contract: " + "; ".join(details))
+
+    return dataclasses.replace(
+        config,
+        head_dim=key_dim,
+        num_key_value_heads=heads,
+        q_lora_rank=None,
+        kv_lora_rank=kv_rank,
+        qk_nope_head_dim=nope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=value_dim,
+        hidden_act="relu2",
+        tie_word_embeddings=True,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        rope_interleave=True,
+        partial_rotary_factor=1.0,
+    )
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -3498,6 +3600,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "mamba2": _mamba2_postprocess,
     "falcon_h1": _falcon_h1_postprocess,
     "plamo2": _plamo2_postprocess,
+    "plm": _plm_postprocess,
     "jamba": _jamba_postprocess,
     "lfm2moe": _lfm2moe_postprocess,
     "nemotron_h": _nemotron_h_postprocess,

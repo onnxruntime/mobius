@@ -706,6 +706,22 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         False,
     ),
     ("xverse", {}, False),
+    (
+        "plm",
+        {
+            "num_key_value_heads": TINY_HEADS,
+            "head_dim": 24,
+            "q_lora_rank": None,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "hidden_act": "relu2",
+            "tie_word_embeddings": True,
+            "rope_interleave": True,
+        },
+        True,
+    ),
     # === DeepSeek (MLA + MoE) ===
     (
         "deepseek",
