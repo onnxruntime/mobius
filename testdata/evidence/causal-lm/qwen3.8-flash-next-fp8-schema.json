@@ -121,7 +121,7 @@
     "mode": "streaming dense dequantized fallback",
     "native_fp8": false,
     "native_fp8_reason": "No available ONNX Runtime MatMul/MoE ABI consumes F8_E4M3 weights with BF16 128x128 inverse-scale grids exactly.",
-    "peak_host_working_set": "bounded by one target tensor plus its small scale grid; PLE remains 128 graph initializers and is never concatenated during export",
+    "peak_host_working_set": "bounded by one output shard plus the largest reconstructed tensor and serializer overhead; dense streaming defaults to 1 GiB shards and rejects limits above 5 GB; PLE remains 128 graph initializers and is never concatenated",
     "multimodal_package_complete": false,
     "multimodal_dependency": "the separate stacked Qwen4-Exp multimodal PR must be incorporated before claiming a complete image-text package",
     "mtp_exported": false

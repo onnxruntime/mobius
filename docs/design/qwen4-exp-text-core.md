@@ -143,12 +143,16 @@ The checkpoint uses three text-weight paths:
   `modules_to_not_convert` list resolves completely against the pinned header.
 
 Mobius emits a **dense fallback**, not a native-FP8 package. Each target tensor
-is read and reconstructed independently, bounding host memory by one dense
-target plus its small scale grid. `weight-loading-report.json` states
-`native_fp8: false` and records the exact reason: no available ONNX Runtime
-MatMul/MoE ABI consumes this FP8/BF16 128x128 layout exactly. Missing scales,
-wrong grids, changed deterministic PLE buffers, orphan scales, unknown source
-tensors, and missing graph targets all fail closed.
+is read and reconstructed independently. Because ONNX IR buffers one external
+data shard before flushing it, dense streaming packages default to 1 GiB
+output shards and reject shard limits above 5 GB. The reported host-memory
+bound is therefore one output shard plus the largest reconstructed tensor and
+serializer overhead, rather than the whole checkpoint.
+`weight-loading-report.json` states `native_fp8: false`, records the effective
+shard limit and largest tensor, and gives the exact reason: no available ONNX
+Runtime MatMul/MoE ABI consumes this FP8/BF16 128x128 layout exactly. Missing
+scales, wrong grids, changed deterministic PLE buffers, orphan scales, unknown
+source tensors, and missing graph targets all fail closed.
 
 ```bash
 mobius build \

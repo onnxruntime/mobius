@@ -106,7 +106,24 @@ class TestWeightLoadingReport:
         loaded = ModelPackage.load(str(tmp_path))
 
         assert loaded.weight_loading_report == pkg.weight_loading_report
+        assert loaded.weight_loading_report["external_data_shard_limit_bytes"] == 1 << 30
+        assert loaded.weight_loading_report["largest_dense_tensor_bytes"] == 0
         assert (tmp_path / "weight-loading-report.json").is_file()
+
+    def test_rejects_unbounded_dense_streaming_shard(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        with pytest.raises(ValueError, match="serializer buffers one output shard"):
+            pkg.save(
+                str(tmp_path),
+                max_shard_size_bytes=5_000_000_001,
+                progress_bar=False,
+            )
 
     def test_ordinary_resave_removes_stale_report(self, tmp_path):
         pkg = ModelPackage({"model": _make_simple_model()})

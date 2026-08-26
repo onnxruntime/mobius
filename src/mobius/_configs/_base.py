@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 import onnx_ir as ir
 import torch
@@ -407,8 +407,6 @@ class BaseModelConfig:
 @dataclasses.dataclass
 class ArchitectureConfig(BaseModelConfig):
     """Configuration for decoder-only model architectures."""
-
-    supports_block_fp8_dense_fallback: ClassVar[bool] = False
 
     max_position_embeddings: int = DEFAULT_INT
 
@@ -1373,9 +1371,7 @@ class ArchitectureConfig(BaseModelConfig):
                 return QuantizationConfig.from_transformers(source)
             except BlockQuantExportError:
                 if not (
-                    getattr(source, "native_csa", False)
-                    or cls.supports_block_fp8_dense_fallback
-                    or allow_block_fp8_dense_fallback
+                    getattr(source, "native_csa", False) or allow_block_fp8_dense_fallback
                 ):
                     raise
                 scheme = BlockQuantScheme.from_hf_config(source)
@@ -1552,8 +1548,6 @@ class CausalLMConfig(ArchitectureConfig):
 @dataclasses.dataclass
 class Qwen4ExpConfig(CausalLMConfig):
     """Exact configuration for experimental Qwen4/Qwen3.8 Flash-Next."""
-
-    supports_block_fp8_dense_fallback: ClassVar[bool] = True
 
     hc_count: int = 4
     hc_lowrank: int = 320

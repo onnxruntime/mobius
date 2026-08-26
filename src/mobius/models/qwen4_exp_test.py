@@ -21,7 +21,6 @@ from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations._weight_loading import (
-    _dequantize_fp8_tensor,
     apply_weights,
     stream_preprocessed_safetensors_to_model,
 )
@@ -1047,6 +1046,31 @@ def test_preprocess_ignores_nonexecuted_mtp_sidecar(caplog):
     assert "does not expose an unsupported NextN task" in caplog.text
 
 
+def test_preprocess_splits_upstream_combined_ple_table():
+    config = _config(split_ngram_parts=2)
+    module = Qwen4ExpCausalLMModel(config)
+    embedding = module.model.layers[0].ple.ple_embedding.ngram_embedding
+    shard_shape = tuple(embedding.shard_0.weight.shape)
+    combined = torch.arange(2 * shard_shape[0] * shard_shape[1], dtype=torch.float32).reshape(
+        2 * shard_shape[0], shard_shape[1]
+    )
+
+    result = module.preprocess_weights(
+        {
+            "model.layers.0.ple.ple_embedding.ngram_embedding.weight": combined,
+        }
+    )
+
+    assert torch.equal(
+        result["model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"],
+        combined[: shard_shape[0]],
+    )
+    assert torch.equal(
+        result["model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight"],
+        combined[shard_shape[0] :],
+    )
+
+
 def test_preprocess_fails_closed_on_noncanonical_packed_or_deterministic_weights():
     config = _config()
     module = Qwen4ExpCausalLMModel(config)
@@ -1117,6 +1141,22 @@ def _quantize_blocks(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return quantized, scales
 
 
+def _independent_dequantize_blocks(weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Reference reconstruction intentionally independent of production code."""
+    result = torch.empty(weight.shape, dtype=torch.float32)
+    for block_row in range(scales.shape[0]):
+        row_slice = slice(block_row * 128, min((block_row + 1) * 128, weight.shape[0]))
+        for block_col in range(scales.shape[1]):
+            col_slice = slice(
+                block_col * 128,
+                min((block_col + 1) * 128, weight.shape[1]),
+            )
+            result[row_slice, col_slice] = weight[row_slice, col_slice].to(
+                torch.float32
+            ) * scales[block_row, block_col].to(torch.float32)
+    return result
+
+
 def _reduced_fp8_checkpoint(
     module: Qwen4ExpCausalLMModel,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -1134,9 +1174,7 @@ def _reduced_fp8_checkpoint(
             quantized, scale = _quantize_blocks(value)
             source[source_name] = quantized
             source[source_name[: -len(".weight")] + ".weight_scale_inv"] = scale
-            dense_targets[target_name] = _dequantize_fp8_tensor(
-                quantized, scale, name=source_name, target_dtype=torch.float32
-            )
+            dense_targets[target_name] = _independent_dequantize_blocks(quantized, scale)
         elif ".ple.ple_embedding.ngram_embedding.shard_" in target_name:
             stored = value.to(torch.float8_e4m3fn)
             source[source_name] = stored

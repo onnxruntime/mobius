@@ -1453,6 +1453,33 @@ class Qwen4ExpCausalLMModel(nn.Module):
                     )
                 continue
 
+            combined_marker = ".ple.ple_embedding.ngram_embedding.weight"
+            if key.endswith(combined_marker):
+                base = key[: -len(".weight")]
+                first_target = f"{base}.shard_0.weight"
+                first_parameter = parameter_map.get(first_target)
+                if first_parameter is None:
+                    raise ValueError(f"Unexpected Qwen4-Exp PLE table: {key}")
+                shard_rows, embedding_width = (
+                    int(first_parameter.shape[0]),
+                    int(first_parameter.shape[1]),
+                )
+                expected_shape = (
+                    shard_rows * self.config.split_ngram_parts,
+                    embedding_width,
+                )
+                if tuple(value.shape) != expected_shape:
+                    raise ValueError(
+                        f"Qwen4-Exp combined PLE table {key} has shape "
+                        f"{tuple(value.shape)}, expected {expected_shape}"
+                    )
+                for shard_index in range(self.config.split_ngram_parts):
+                    target = f"{base}.shard_{shard_index}.weight"
+                    row_start = shard_index * shard_rows
+                    cleaned[target] = value[row_start : row_start + shard_rows]
+                ple_shards[base] = set(range(self.config.split_ngram_parts))
+                continue
+
             marker = ".ple.ple_embedding.ngram_embedding.shard_"
             if marker in key and key.endswith(".weight"):
                 prefix, suffix = key.split(marker, 1)

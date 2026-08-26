@@ -23,6 +23,7 @@ __all__ = ["ModelPackage"]
 import inspect
 import json
 import logging
+import math
 import os
 import shutil
 import threading
@@ -55,6 +56,8 @@ _PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
 _MTP_SIDECAR_BASENAME = ".mobius-mtp"
 _QUANTIZATION_REPORT = "quantization_report.json"
 _WEIGHT_LOADING_REPORT = "weight-loading-report.json"
+_DEFAULT_STREAMING_DENSE_SHARD_BYTES = 1 << 30
+_MAX_STREAMING_DENSE_SHARD_BYTES = 5_000_000_000
 
 
 def _read_mtp_sidecar_name(directory: str) -> str | None:
@@ -453,6 +456,37 @@ class ModelPackage(UserDict[str, ir.Model]):
             for name, model in self.data.items()
             if components is None or components(name)
         }
+        if (
+            self.weight_loading_report is not None
+            and self.weight_loading_report.get("output_weight_format") == "dense"
+            and self.weight_loading_report.get("native_fp8") is False
+        ):
+            if max_shard_size_bytes is None:
+                max_shard_size_bytes = _DEFAULT_STREAMING_DENSE_SHARD_BYTES
+            if max_shard_size_bytes > _MAX_STREAMING_DENSE_SHARD_BYTES:
+                raise ValueError(
+                    "Streaming dense fallback packages require "
+                    f"max_shard_size_bytes <= {_MAX_STREAMING_DENSE_SHARD_BYTES}; "
+                    f"got {max_shard_size_bytes}. The serializer buffers one output "
+                    "shard before flushing it."
+                )
+            largest_tensor_bytes = 0
+            for model in selected.values():
+                for initializer in model.graph.initializers.values():
+                    if initializer.shape is None or initializer.dtype is None:
+                        continue
+                    num_elements = math.prod(int(dim) for dim in initializer.shape)
+                    tensor_bytes = (num_elements * initializer.dtype.bitwidth + 7) // 8
+                    largest_tensor_bytes = max(largest_tensor_bytes, tensor_bytes)
+            self.weight_loading_report = {
+                **self.weight_loading_report,
+                "external_data_shard_limit_bytes": max_shard_size_bytes,
+                "largest_dense_tensor_bytes": largest_tensor_bytes,
+                "serialization_memory_bound": (
+                    "one output shard plus the largest reconstructed tensor and "
+                    "serializer overhead"
+                ),
+            }
         use_subfolders = len(selected) > 1
         if reuse_plan is not None and (len(selected) != 1 or use_subfolders):
             raise ValueError("GGUF weight reuse currently supports one flat ONNX model only.")
