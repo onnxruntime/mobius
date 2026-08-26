@@ -34,7 +34,11 @@ from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
 from mobius._configs import ArchitectureConfig, Gemma4Config
-from mobius._weight_utils import vlm_decoder_weights, vlm_embedding_weights
+from mobius._weight_utils import (
+    preprocess_quantized_weights,
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+)
 from mobius.components import (
     MLP,
     ClippableLinear,
@@ -3320,6 +3324,9 @@ class Gemma4Model(nn.Module):
                         # embeddings route correctly.
                         renamed["embedding." + suffix] = value
 
+            elif key.startswith("lm_head."):
+                renamed["decoder." + key] = value
+
             elif key.startswith("vision_tower."):
                 new_key = "vision_encoder.encoder." + key[len("vision_tower.") :]
                 # HF wraps encoder layers under an extra "encoder." sub-module; strip it
@@ -3380,6 +3387,30 @@ class Gemma4Model(nn.Module):
 
         # Map HF expert weight names and fold router scale
         _remap_moe_expert_weights(renamed, self.config)
+
+        quantization = self.config.quantization
+        if quantization is not None and quantization.quant_method in {
+            "olive",
+            "gptq",
+            "awq",
+        }:
+            tie = self.config.tie_word_embeddings
+            apply_tie = tie and any(
+                key in renamed
+                for key in (
+                    "embedding.embed_tokens.weight",
+                    "decoder.lm_head.weight",
+                )
+            )
+            renamed = preprocess_quantized_weights(
+                renamed,
+                quantization,
+                tie_embeddings=apply_tie,
+                embed_key="embedding.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=None,
+                reject_quantized_embeddings_lm_head=True,
+            )
 
         # For WebGPU: the fused [V, L*D] embed_tokens_per_layer exceeds the 256 MiB
         # per-buffer limit.  Split it into L separate [V, D] tables in the decoder.

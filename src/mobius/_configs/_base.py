@@ -753,17 +753,64 @@ class ArchitectureConfig(BaseModelConfig):
         if rope_config is not None:
             rope_config = dataclasses.replace(rope_config, rope_interleave=rope_interleave)
 
+        per_layer_config = getattr(config, "per_layer_config", None)
+        layer_configs = []
+        layer_types = getattr(config, "layer_types", None)
+        if per_layer_config:
+            layer_configs = list(
+                per_layer_config.values()
+                if isinstance(per_layer_config, dict)
+                else per_layer_config
+            )
+
+        def _per_layer_value(attribute: str) -> int | None:
+            values = set()
+            values_by_layer_type: dict[str, set[int]] = {}
+            for index, layer_config in enumerate(layer_configs):
+                value = (
+                    layer_config.get(attribute)
+                    if isinstance(layer_config, dict)
+                    else getattr(layer_config, attribute, None)
+                )
+                if value is None:
+                    continue
+                values.add(value)
+                if layer_types and len(layer_types) == len(layer_configs):
+                    values_by_layer_type.setdefault(layer_types[index], set()).add(value)
+            if not values:
+                return None
+            if len(values) == 1:
+                return next(iter(values))
+            supported_layer_types = {"sliding_attention", "full_attention"}
+            if (
+                model_type not in {"gemma4_text", "gemma4_unified_text"}
+                or set(values_by_layer_type) != supported_layer_types
+                or any(len(type_values) != 1 for type_values in values_by_layer_type.values())
+            ):
+                raise ValueError(
+                    f"Mobius does not support these heterogeneous per-layer {attribute} "
+                    f"values: {sorted(values)}."
+                )
+            return next(iter(values_by_layer_type["sliding_attention"]))
+
+        head_dim = _per_layer_value("head_dim")
+        if head_dim is None:
+            head_dim = getattr(config, "head_dim", None)
+        num_key_value_heads = _per_layer_value("num_key_value_heads")
+        if num_key_value_heads is None:
+            num_key_value_heads = getattr(config, "num_key_value_heads", None)
+
         options = dict(
             head_dim=(
-                config.head_dim
-                if (hasattr(config, "head_dim") and config.head_dim is not None)
+                head_dim
+                if head_dim is not None
                 else getattr(config, "d_kv", None)
                 or getattr(config, "kv_channels", None)
                 or _as_int(hidden_size) // _as_int(num_attention_heads)
             ),
             num_attention_heads=_as_int(num_attention_heads),
             num_key_value_heads=_as_int(
-                getattr(config, "num_key_value_heads", None)
+                num_key_value_heads
                 or getattr(config, "n_kv_heads", None)
                 or (
                     getattr(config, "multi_query_group_num", None)
@@ -2437,15 +2484,50 @@ class Gemma4Config(VisionLanguageConfig):
             # Override with the correct sliding-attention theta (e.g. 10_000 for E2B/E4B).
             base = dataclasses.replace(base, rope_theta=float(sliding_rope["rope_theta"]))
 
-        # num_global_key_value_heads: only set when attention_k_eq_v is True
-        # (full-attention layers use fewer KV heads than sliding layers).
-        num_global_kv = None
-        if getattr(config, "attention_k_eq_v", False):
-            num_global_kv = getattr(config, "num_global_key_value_heads", None)
+        num_global_kv = getattr(config, "num_global_key_value_heads", None)
+        global_head_dim = getattr(config, "global_head_dim", None)
+        if global_head_dim is None or num_global_kv is None:
+            per_layer_config = getattr(config, "per_layer_config", None)
+            layer_types = getattr(config, "layer_types", None)
+            if per_layer_config and layer_types:
+                layer_configs = list(
+                    per_layer_config.values()
+                    if isinstance(per_layer_config, dict)
+                    else per_layer_config
+                )
+                if len(layer_types) == len(layer_configs):
+                    full_head_dims = {
+                        (
+                            layer_config.get("head_dim")
+                            if isinstance(layer_config, dict)
+                            else getattr(layer_config, "head_dim", None)
+                        )
+                        for layer_type, layer_config in zip(
+                            layer_types, layer_configs, strict=True
+                        )
+                        if layer_type == "full_attention"
+                    }
+                    full_head_dims.discard(None)
+                    if global_head_dim is None and len(full_head_dims) == 1:
+                        global_head_dim = next(iter(full_head_dims))
+                    full_kv_heads = {
+                        (
+                            layer_config.get("num_key_value_heads")
+                            if isinstance(layer_config, dict)
+                            else getattr(layer_config, "num_key_value_heads", None)
+                        )
+                        for layer_type, layer_config in zip(
+                            layer_types, layer_configs, strict=True
+                        )
+                        if layer_type == "full_attention"
+                    }
+                    full_kv_heads.discard(None)
+                    if num_global_kv is None and len(full_kv_heads) == 1:
+                        num_global_kv = next(iter(full_kv_heads))
 
         return cls(
             **_shallow_fields(base),
-            global_head_dim=getattr(config, "global_head_dim", None),
+            global_head_dim=global_head_dim,
             global_rope_theta=float(full_rope.get("rope_theta", 1_000_000.0)),
             global_partial_rotary_factor=float(full_rope.get("partial_rotary_factor", 0.25)),
             num_global_key_value_heads=num_global_kv,

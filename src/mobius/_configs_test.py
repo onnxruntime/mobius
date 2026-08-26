@@ -1182,6 +1182,93 @@ class TestArchitectureConfigValidate:
 class TestGemma4Config:
     """Tests for Gemma4Config.from_transformers."""
 
+    @staticmethod
+    def _heterogeneous_config(*head_dims, layer_types=None, kv_heads=None):
+        class FakeConfig:
+            model_type = "gemma4_text"
+            num_attention_heads = 8
+            num_hidden_layers = len(head_dims)
+            vocab_size = 262144
+            hidden_size = 1536
+            intermediate_size = 6144
+            hidden_act = "silu"
+            max_position_embeddings = 131072
+            rms_norm_eps = 1e-6
+            rope_theta = 10_000.0
+
+            def __init__(self):
+                layer_kv_heads = kv_heads or [1] * len(head_dims)
+                self.per_layer_config = [
+                    type(
+                        "LayerConfig",
+                        (),
+                        {
+                            "head_dim": head_dim,
+                            "num_key_value_heads": num_kv_heads,
+                        },
+                    )()
+                    for head_dim, num_kv_heads in zip(head_dims, layer_kv_heads, strict=True)
+                ]
+                self.layer_types = layer_types
+
+            @property
+            def head_dim(self):
+                raise RuntimeError("global per-layer attribute access is ambiguous")
+
+            @property
+            def num_key_value_heads(self):
+                raise RuntimeError("global per-layer attribute access is ambiguous")
+
+        return FakeConfig()
+
+    def test_uniform_per_layer_head_dim_avoids_ambiguous_global_access(self):
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config.from_transformers(self._heterogeneous_config(256, 256))
+
+        assert config.head_dim == 256
+
+    def test_heterogeneous_per_layer_head_dim_fails_loudly(self):
+        from mobius._configs import Gemma4Config
+
+        with pytest.raises(ValueError, match="heterogeneous per-layer head_dim"):
+            Gemma4Config.from_transformers(self._heterogeneous_config(128, 256))
+
+    def test_dual_head_dim_maps_sliding_and_full_attention(self):
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config.from_transformers(
+            self._heterogeneous_config(
+                256,
+                512,
+                layer_types=["sliding_attention", "full_attention"],
+                kv_heads=[8, 2],
+            )
+        )
+
+        assert config.head_dim == 256
+        assert config.global_head_dim == 512
+        assert config.num_key_value_heads == 8
+        assert config.num_global_key_value_heads == 2
+
+    def test_unsupported_third_heterogeneous_layer_type_fails(self):
+        from mobius._configs import Gemma4Config
+
+        with pytest.raises(ValueError, match="heterogeneous per-layer head_dim"):
+            Gemma4Config.from_transformers(
+                self._heterogeneous_config(
+                    256,
+                    512,
+                    128,
+                    layer_types=[
+                        "sliding_attention",
+                        "full_attention",
+                        "window_attention",
+                    ],
+                    kv_heads=[8, 2, 4],
+                )
+            )
+
     def test_boa_token_id_extracted_from_parent(self):
         """boa_token_id lives on the parent HF config, not text_config."""
         from mobius._configs import Gemma4Config
