@@ -669,8 +669,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="qwen2",
         model_type="qwen2",
         tensor_map_recipe=("llama",),
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the official Qwen2.5-0.5B-Instruct Q8_0 "
+            "artifact, pinned CPU import route, exact tokenizer revision, and ORT GenAI "
+            "0.15.2 evidence."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen3",
@@ -808,8 +813,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "attention.layer_norm_rms_epsilon",
             "shortconv.l_cache",
         ),
-        runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("lfm2-350m-f16-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to LiquidAI's official LFM2-350M F16 artifact, "
+            "pinned CPU import route, exact tokenizer revision, hybrid convolution/KV state "
+            "evidence, and ORT GenAI 0.15.2."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen35",

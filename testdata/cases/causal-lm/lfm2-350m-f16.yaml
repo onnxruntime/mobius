@@ -1,0 +1,64 @@
+model_id: "LiquidAI/LFM2-350M"
+model_type: "lfm2"
+revision: "f37d3f5c8c5484bc01dad379a595cf4c68c4e70e"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "LiquidAI/LFM2-350M-GGUF"
+  revision: "8fdc9d526b7ed346b19257551b05816c7912ecc2"
+  filename: "LFM2-350M-F16.gguf"
+  size: 711482304
+  lfs_sha256: "379ffdcbf08147c0313f6f1ce7ff558a2bc935eda633f4b46c52347032419c42"
+  tensor_count: 148
+  tensor_qtypes:
+    F16: 93
+    F32: 55
+  execution_provider: "cpu"
+  config_sha256: "69e63a13b046ca5658e4fbf1fac41b76e021ef768b16428cd2baa7c990bef21a"
+  preserve_quantization: false
+  keep_quantized: true
+  tokenizer:
+    repository: "LiquidAI/LFM2-350M"
+    revision: "73e3c253078a3b97c2e14b4c4665679f4d9b6d56"
+    metadata_sha256: "e5626d605bb50bc53fdb0fbfcf374fb33dfbaa0cc698d9746ba1e9b0b7e6d07d"
+    identity_status: "exact"
+    assets:
+      - filename: "chat_template.jinja"
+        size: 209
+        sha256: "a805e50fed68938a076b07e2e602639611b50b1ced0e50f11eb92f1ba25be4dc"
+      - filename: "special_tokens_map.json"
+        size: 434
+        sha256: "742aefe2b7dec496e8caffdba03a75d0c1a9925d53bd3f3e0d388c96b591b6f4"
+      - filename: "tokenizer.json"
+        size: 4732426
+        sha256: "98cff83b4f6d7e9d8929bebc62b07e92cf1b3f99c80d16bafe8b84a75448f40b"
+      - filename: "tokenizer_config.json"
+        size: 91509
+        sha256: "36f511115e9d8952cbc9d15d9a20dfa7ce7d1444940e5c1dc42a762020c99bf5"
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "lfm2-350m-f16-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 725000000
+  released_capabilities:
+    "0.15.2":
+      specialized_lfm2: true
+      hybrid_conv_kv_state: true
+      state_groups: false
+
+inputs:
+  prompts:
+    - "Hello"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Official F16 GGUF; complete logits and 20-step hybrid convolution/KV decode are compared to Transformers loading this exact artifact."

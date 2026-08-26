@@ -269,10 +269,126 @@ _SMOLLM_F16_ORT_GENAI = dataclasses.replace(
     runtime_version="0.15.2",
 )
 
+_QWEN25_Q8_ORT_GENAI = GGUFRuntimeEvidence(
+    evidence_id="qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
+    architecture="qwen2",
+    repository="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    revision="9217f5db79a29953eb74d5343926648285ec7e67",
+    filename="qwen2.5-0.5b-instruct-q8_0.gguf",
+    size=675_710_816,
+    lfs_sha256="ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    config_repository="Qwen/Qwen2.5-0.5B-Instruct",
+    config_revision="7ae557604adf67be50417f59c2c2f167def9a775",
+    tokenizer_repository="Qwen/Qwen2.5-0.5B-Instruct",
+    tokenizer_revision="a338b55dd21219a5f4da42bc11a9313d1a27d4cc",
+    tokenizer_metadata_sha256="8fc8ef848104e931f14ae03d9581699d54813a2ff952fb7caac0654e8aa27ee3",
+    tokenizer_assets=(
+        (
+            "tokenizer.json",
+            7_031_645,
+            "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+        ),
+        (
+            "tokenizer_config.json",
+            7_308,
+            "5214600ee45ca2f887ce2eede8910378a0111ea99d657428bcbce94778e65a92",
+        ),
+    ),
+    tensor_count=291,
+    tensor_qtypes=(("F32", 121), ("Q8_0", 170)),
+    import_route='{"architecture":"qwen2","config_sha256":"4002821420e74a522abaf921e064f23217eac71284d71d6d288171cf7802d068","execution_provider":"cpu","model_type":"qwen2","module_type":"qwen2","preserve_quantization":true,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":[],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"text-generation"},"tensor_map_recipe":["llama"]}',
+    graph_files=("model.onnx", "model.onnx.data"),
+    graph_sha256="b0d1814ea69dddd405e30541e9009ba6fb73930f98538921d5c2eaa4a14f5d2c",
+    runtime_package_files=(
+        "genai_config.json",
+        "gguf_tokenizer_manifest.json",
+        "model.onnx",
+        "model.onnx.data",
+        "runtime_compatibility.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
+    runtime_package_sha256="cb43c76e1bc3db07a6a3631c7a99e7c47b6891807fecffdb3b70fddd9c108173",
+    parity_test="test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
+    parity_kind="full-logit",
+    deterministic_test="test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
+    stateful_semantics="dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps",
+    runtime="ort-genai",
+    runtime_version="0.15.2",
+)
+
+_LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
+    evidence_id="lfm2-350m-f16-ort-genai-0.15.2",
+    architecture="lfm2",
+    repository="LiquidAI/LFM2-350M-GGUF",
+    revision="8fdc9d526b7ed346b19257551b05816c7912ecc2",
+    filename="LFM2-350M-F16.gguf",
+    size=711_482_304,
+    lfs_sha256="379ffdcbf08147c0313f6f1ce7ff558a2bc935eda633f4b46c52347032419c42",
+    config_repository="LiquidAI/LFM2-350M",
+    config_revision="f37d3f5c8c5484bc01dad379a595cf4c68c4e70e",
+    tokenizer_repository="LiquidAI/LFM2-350M",
+    tokenizer_revision="73e3c253078a3b97c2e14b4c4665679f4d9b6d56",
+    tokenizer_metadata_sha256="e5626d605bb50bc53fdb0fbfcf374fb33dfbaa0cc698d9746ba1e9b0b7e6d07d",
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            209,
+            "a805e50fed68938a076b07e2e602639611b50b1ced0e50f11eb92f1ba25be4dc",
+        ),
+        (
+            "special_tokens_map.json",
+            434,
+            "742aefe2b7dec496e8caffdba03a75d0c1a9925d53bd3f3e0d388c96b591b6f4",
+        ),
+        (
+            "tokenizer.json",
+            4_732_426,
+            "98cff83b4f6d7e9d8929bebc62b07e92cf1b3f99c80d16bafe8b84a75448f40b",
+        ),
+        (
+            "tokenizer_config.json",
+            91_509,
+            "36f511115e9d8952cbc9d15d9a20dfa7ce7d1444940e5c1dc42a762020c99bf5",
+        ),
+    ),
+    tensor_count=148,
+    tensor_qtypes=(("F16", 93), ("F32", 55)),
+    import_route='{"architecture":"lfm2","config_sha256":"69e63a13b046ca5658e4fbf1fac41b76e021ef768b16428cd2baa7c990bef21a","execution_provider":"cpu","model_type":"lfm2","module_type":"lfm2","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":["attention.head_count_kv","attention.layer_norm_rms_epsilon","shortconv.l_cache"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"hybrid-text-generation"},"tensor_map_recipe":["lfm2"]}',
+    graph_files=("model.onnx", "model.onnx.data"),
+    graph_sha256="2a15694cd5ff9f5c9f798feeca91cc41174842065ada80a18b288478725b3342",
+    runtime_package_files=(
+        "chat_template.jinja",
+        "genai_config.json",
+        "gguf_tokenizer_manifest.json",
+        "model.onnx",
+        "model.onnx.data",
+        "runtime_compatibility.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
+    runtime_package_sha256="87b8cdd1edc8c5be948716df3efe551f5fc8f96762d7ea3f99b27688ca9f24af",
+    parity_test="test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
+    parity_kind="full-logit",
+    deterministic_test="test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
+    stateful_semantics=(
+        "hybrid convolution and KV state prefill, replay, rollback, reorder, "
+        "and 20 decode steps"
+    ),
+    runtime="ort-genai",
+    runtime_version="0.15.2",
+)
+
 _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType(
     {
         record.evidence_id: record
-        for record in (_SMOLLM_F16_ONNX_RUNTIME, _SMOLLM_F16_ORT_GENAI)
+        for record in (
+            _LFM2_350M_F16_ORT_GENAI,
+            _QWEN25_Q8_ORT_GENAI,
+            _SMOLLM_F16_ONNX_RUNTIME,
+            _SMOLLM_F16_ORT_GENAI,
+        )
     }
 )
 

@@ -13,6 +13,7 @@ same-weight provenance.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -41,6 +42,10 @@ from mobius.integrations.gguf import (
     write_gguf_runtime_package,
 )
 from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._runtime_evidence import (
+    gguf_graph_package_identity,
+    runtime_evidence,
+)
 from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
 
 
@@ -223,6 +228,81 @@ _Q4_K_M_CASE = _RuntimeCase(
 )
 
 
+@dataclass(frozen=True)
+class _PromotedRuntimeCase:
+    name: str
+    evidence_id: str
+    reference_repository: str
+    reference_revision: str
+    prompt: str
+    generated_tokens: tuple[int, ...]
+    atol: float
+
+
+_PROMOTED_RUNTIME_CASES = (
+    _PromotedRuntimeCase(
+        name="qwen2.5-0.5b-instruct-q8",
+        evidence_id="qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
+        reference_repository="Qwen/Qwen2.5-0.5B-Instruct",
+        reference_revision="7ae557604adf67be50417f59c2c2f167def9a775",
+        prompt="Hello",
+        generated_tokens=(
+            271,
+            40,
+            1079,
+            4460,
+            311,
+            1855,
+            264,
+            2025,
+            429,
+            646,
+            1477,
+            279,
+            7192,
+            897,
+            304,
+            264,
+            2661,
+            1140,
+            315,
+            5109,
+        ),
+        atol=4e-4,
+    ),
+    _PromotedRuntimeCase(
+        name="lfm2-350m-f16",
+        evidence_id="lfm2-350m-f16-ort-genai-0.15.2",
+        reference_repository="LiquidAI/LFM2-350M",
+        reference_revision="f37d3f5c8c5484bc01dad379a595cf4c68c4e70e",
+        prompt="Hello",
+        generated_tokens=(
+            8227,
+            24771,
+            938,
+            31707,
+            8587,
+            4427,
+            896,
+            938,
+            7306,
+            18414,
+            1399,
+            4903,
+            8227,
+            24771,
+            810,
+            2492,
+            5992,
+            768,
+            3680,
+            4600,
+        ),
+        atol=3e-4,
+    ),
+)
+
+
 @pytest.fixture
 def isolated_hf_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Keep each real-artifact test's Hub/Xet state isolated and disposable."""
@@ -309,6 +389,95 @@ def _next_cache(outputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         for name, value in outputs.items()
         if name.startswith("present.")
     }
+
+
+def _empty_promoted_state(
+    session: ort.InferenceSession, *, batch_size: int
+) -> dict[str, np.ndarray]:
+    state: dict[str, np.ndarray] = {}
+    for value in session.get_inputs():
+        if value.name.endswith((".key", ".value")):
+            state[value.name] = np.empty(
+                [batch_size, value.shape[1], 0, value.shape[3]], dtype=np.float32
+            )
+        elif value.name.endswith(".conv_state"):
+            state[value.name] = np.zeros(
+                [batch_size, value.shape[1], value.shape[2]], dtype=np.float32
+            )
+    return state
+
+
+def _run_promoted_ort(
+    session: ort.InferenceSession,
+    input_ids: np.ndarray,
+    state: dict[str, np.ndarray],
+    past_length: int,
+) -> dict[str, np.ndarray]:
+    sequence_length = input_ids.shape[1]
+    candidates = {
+        "input_ids": input_ids,
+        "attention_mask": np.ones(
+            (input_ids.shape[0], past_length + sequence_length), dtype=np.int64
+        ),
+        "position_ids": np.broadcast_to(
+            np.arange(past_length, past_length + sequence_length, dtype=np.int64),
+            input_ids.shape,
+        ),
+        **state,
+    }
+    input_names = {value.name for value in session.get_inputs()}
+    output_names = [value.name for value in session.get_outputs()]
+    feeds = {name: value for name, value in candidates.items() if name in input_names}
+    return dict(zip(output_names, session.run(output_names, feeds), strict=True))
+
+
+def _assert_replay_rollback_and_reorder(
+    session: ort.InferenceSession,
+    prompt_ids: np.ndarray,
+) -> None:
+    prefill = _run_promoted_ort(
+        session,
+        prompt_ids,
+        _empty_promoted_state(session, batch_size=1),
+        0,
+    )
+    snapshot = {name: value.copy() for name, value in _next_cache(prefill).items()}
+    token = np.asarray([[int(prefill["logits"][0, -1].argmax())]], dtype=np.int64)
+    first = _run_promoted_ort(session, token, snapshot, prompt_ids.shape[1])
+    second = _run_promoted_ort(session, token, snapshot, prompt_ids.shape[1])
+    for name in first:
+        np.testing.assert_array_equal(first[name], second[name])
+
+    next_token = np.asarray([[int(first["logits"][0, -1].argmax())]], dtype=np.int64)
+    _run_promoted_ort(
+        session, next_token, _next_cache(first), prompt_ids.shape[1] + 1
+    )
+    rolled_back = _run_promoted_ort(session, token, snapshot, prompt_ids.shape[1])
+    for name in first:
+        np.testing.assert_array_equal(first[name], rolled_back[name])
+
+    alternate_ids = prompt_ids.copy()
+    alternate_ids[0, -1] += 1
+    batched_ids = np.concatenate([prompt_ids, alternate_ids], axis=0)
+    batched = _run_promoted_ort(
+        session,
+        batched_ids,
+        _empty_promoted_state(session, batch_size=2),
+        0,
+    )
+    batched_state = _next_cache(batched)
+    batched_tokens = batched["logits"][:, -1].argmax(axis=-1).astype(np.int64)[:, None]
+    original = _run_promoted_ort(
+        session, batched_tokens, batched_state, prompt_ids.shape[1]
+    )
+    reordered = _run_promoted_ort(
+        session,
+        batched_tokens[::-1].copy(),
+        {name: value[::-1].copy() for name, value in batched_state.items()},
+        prompt_ids.shape[1],
+    )
+    for name in original:
+        np.testing.assert_array_equal(original[name][::-1], reordered[name])
 
 
 @pytest.mark.integration
@@ -743,3 +912,210 @@ def test_smollm_generic_ort_genai_generation(
 
     assert len(generated) == len(case.generated_tokens)
     assert generated == list(case.generated_tokens)
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+@pytest.mark.ort_genai_real
+@pytest.mark.parametrize("case", _PROMOTED_RUNTIME_CASES, ids=lambda case: case.name)
+def test_promoted_gguf_full_runtime_evidence(
+    case: _PromotedRuntimeCase,
+    tmp_path: Path,
+    isolated_hf_cache: Path,
+) -> None:
+    """Exact GGUF weights prove logits, state semantics, publication, and OGA decode."""
+    import onnxruntime_genai as ort_genai
+
+    evidence = runtime_evidence(case.evidence_id)
+    case_yaml = Path(f"testdata/cases/causal-lm/{case.name}.yaml")
+    enrollment = yaml.safe_load(case_yaml.read_text(encoding="utf-8"))["ort_genai"]
+    installed_version = _installed_ort_genai_version()
+    assert installed_version == evidence.runtime_version == "0.15.2"
+    assert enrollment["runtime_evidence_id"] == case.evidence_id
+    assert enrollment["runtime_versions"] == [installed_version]
+
+    download_specs = [
+        (
+            evidence.repository,
+            evidence.revision,
+            evidence.filename,
+            evidence.size,
+        ),
+        *(
+            (
+                evidence.tokenizer_repository,
+                evidence.tokenizer_revision,
+                filename,
+                size,
+            )
+            for filename, size, _ in evidence.tokenizer_assets
+        ),
+    ]
+    remote_download_bytes = 0
+    for repository, revision, filename, expected_size in download_specs:
+        remote = get_hf_file_metadata(
+            hf_hub_url(repository, filename, revision=revision),
+            timeout=30,
+        )
+        assert remote.commit_hash == revision
+        assert remote.size == expected_size
+        remote_download_bytes += remote.size
+    assert evidence.size <= 2**30
+    assert remote_download_bytes <= enrollment["max_download_bytes"]
+    assert isolated_hf_cache.exists()
+
+    cached_gguf = Path(
+        hf_hub_download(
+            repo_id=evidence.repository,
+            revision=evidence.revision,
+            filename=evidence.filename,
+        )
+    )
+    assert cached_gguf.stat().st_size == evidence.size
+    assert _sha256(cached_gguf) == evidence.lfs_sha256
+    gguf_path = tmp_path / evidence.filename
+    shutil.copyfile(cached_gguf, gguf_path)
+    gguf_model = GGUFModel(gguf_path)
+    qtypes = Counter(qtype.name for _, _, qtype, _ in gguf_model.tensor_items_raw())
+    assert len(gguf_model.reader_tensors()) == evidence.tensor_count
+    assert tuple(sorted(qtypes.items())) == evidence.tensor_qtypes
+    for filename, size, sha256 in evidence.tokenizer_assets:
+        asset_path = Path(
+            hf_hub_download(
+                repo_id=evidence.tokenizer_repository,
+                revision=evidence.tokenizer_revision,
+                filename=filename,
+            )
+        )
+        assert asset_path.stat().st_size == size
+        assert _sha256(asset_path) == sha256
+
+    output_dir = tmp_path / "runtime-package"
+    captured: list[ModelPackage] = []
+    original_save = ModelPackage.save
+
+    def capture_save(package: ModelPackage, *args: object, **kwargs: object) -> None:
+        captured.append(package)
+        original_save(package, *args, **kwargs)
+
+    with mock.patch.object(ModelPackage, "save", capture_save):
+        main(
+            [
+                "build-gguf",
+                str(gguf_path),
+                "--output",
+                str(output_dir),
+                "--dtype",
+                "f32",
+                "--execution-provider",
+                "cpu",
+                "--runtime",
+                "ort-genai",
+                "--runtime-version",
+                installed_version,
+                "--tokenizer-repository",
+                evidence.tokenizer_repository,
+                "--tokenizer-revision",
+                evidence.tokenizer_revision,
+                "--local-files-only",
+            ]
+        )
+    assert len(captured) == 1
+    assert captured[0].gguf_import_route == evidence.import_route
+    package = ModelPackage.load(output_dir)
+    assert tuple(package) == ("model",)
+    runtime_identity = gguf_graph_package_identity(output_dir)
+    assert runtime_identity.files == evidence.runtime_package_files
+    assert runtime_identity.sha256 == evidence.runtime_package_sha256
+    graph_dir = tmp_path / "graph-identity"
+    graph_dir.mkdir()
+    for filename in evidence.graph_files:
+        os.link(output_dir / filename, graph_dir / filename)
+    graph_identity = gguf_graph_package_identity(graph_dir)
+    assert graph_identity.files == evidence.graph_files
+    assert graph_identity.sha256 == evidence.graph_sha256
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        evidence.tokenizer_repository,
+        revision=evidence.tokenizer_revision,
+    )
+    packaged_tokenizer = AutoTokenizer.from_pretrained(output_dir, local_files_only=True)
+    prompt_ids = tokenizer(case.prompt, return_tensors="pt").input_ids
+    assert packaged_tokenizer(case.prompt).input_ids == prompt_ids.tolist()[0]
+    reference = AutoModelForCausalLM.from_pretrained(
+        evidence.repository,
+        revision=evidence.revision,
+        gguf_file=evidence.filename,
+        dtype=torch.float32,
+    ).eval()
+    session = ort.InferenceSession(
+        str(output_dir / "model.onnx"), providers=["CPUExecutionProvider"]
+    )
+    input_ids = prompt_ids.numpy()
+    with torch.no_grad():
+        reference_output = reference(prompt_ids, use_cache=True)
+    ort_output = _run_promoted_ort(
+        session,
+        input_ids,
+        _empty_promoted_state(session, batch_size=1),
+        0,
+    )
+    np.testing.assert_allclose(
+        ort_output["logits"],
+        reference_output.logits.numpy(),
+        rtol=1e-4,
+        atol=case.atol,
+    )
+
+    state = _next_cache(ort_output)
+    reference_state = reference_output.past_key_values
+    generated: list[int] = []
+    for step in range(len(case.generated_tokens)):
+        token = int(ort_output["logits"][0, -1].argmax())
+        generated.append(token)
+        token_ids = np.asarray([[token]], dtype=np.int64)
+        ort_output = _run_promoted_ort(
+            session, token_ids, state, input_ids.shape[1] + step
+        )
+        state = _next_cache(ort_output)
+        with torch.no_grad():
+            reference_output = reference(
+                torch.from_numpy(token_ids),
+                past_key_values=reference_state,
+                use_cache=True,
+            )
+        reference_state = reference_output.past_key_values
+        np.testing.assert_allclose(
+            ort_output["logits"],
+            reference_output.logits.numpy(),
+            rtol=1e-4,
+            atol=case.atol,
+        )
+    assert len(generated) == len(case.generated_tokens)
+    assert generated == list(case.generated_tokens)
+    _assert_replay_rollback_and_reorder(session, input_ids)
+
+    compatibility = json.loads(
+        (output_dir / "runtime_compatibility.json").read_text(encoding="utf-8")
+    )
+    assert installed_version in compatibility["tested_versions"]
+    model = ort_genai.Model(str(output_dir))
+    oga_tokens = prompt_ids.tolist()[0]
+    params = ort_genai.GeneratorParams(model)
+    params.set_search_options(
+        max_length=len(oga_tokens) + len(case.generated_tokens),
+        do_sample=False,
+    )
+    generator = ort_genai.Generator(model, params)
+    generator.append_tokens(oga_tokens)
+    oga_generated: list[int] = []
+    for _ in case.generated_tokens:
+        generator.generate_next_token()
+        oga_generated.append(int(generator.get_next_tokens()[0]))
+    assert len(oga_generated) == len(case.generated_tokens)
+    assert oga_generated == list(case.generated_tokens)
+    del generator, params, model
+    gc.collect()
+
+    shutil.rmtree(output_dir)
+    gguf_path.unlink()

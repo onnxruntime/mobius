@@ -15,7 +15,7 @@ from mobius import build_from_gguf
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 55, 'rejected': 2, 'supported': 90}; importable: 89; quantized import: {'rejected': 31, 'supported': 116}; runtime: {'deferred': 144, 'rejected': 2, 'supported': 1} |
+| Architectures | 147 | graph verdicts: {'deferred': 55, 'rejected': 2, 'supported': 90}; importable: 89; quantized import: {'rejected': 31, 'supported': 116}; runtime: {'deferred': 142, 'rejected': 2, 'supported': 3} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 5, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; all default to deferred and become materializable only from a validated embedded `tokenizer.huggingface.json` or an exact pinned source in runtime evidence |
@@ -23,6 +23,59 @@ from mobius import build_from_gguf
 `SUPPORTED` means the named capability is implemented and mechanically tested. `DEFERRED` means it is intentionally unavailable pending the stated work. `REJECTED` means the input or route is invalid by policy. Graph support proves construction/execution only; runtime support additionally requires a pinned real artifact, independent parity, and deterministic generation or stateful semantics. Tokenizer `copy` delegates algorithm semantics to an embedded, vocabulary-identical tokenizer JSON. A `pinned-source` route additionally binds an immutable Hub revision, exact asset hashes, and all reconstructible GGUF tokenizer semantics.
 
 <!-- END GGUF CLOSURE SUMMARY -->
+
+## Runtime artifact census (90 graph-supported routes)
+
+The runtime-evidence pass based on Mobius
+`fcd5b3bb42dbc2ca7ca4bc62e9ee502e8446085a` screened every architecture that
+was graph-supported but runtime-deferred at that revision. The complete set was:
+`bitnet`, `deci`, `qwen3`, `dflash`, `eagle3`, `qwen2`, `qwen2moe`, `qwen3moe`, `dream`,
+`llada`, `llada-moe`, `rnd1`, `qwen35`, `qwen35moe`, `qwen3next`, `gemma`,
+`gemma2`, `gemma3`, `gemma4`, `phi3`, `plm`, `baichuan`, `chatglm`, `phi2`,
+`seed_oss`, `falcon`, `gpt2`, `mamba`, `mamba2`, `jamba`, `nemotron_h`,
+`nemotron_h_moe`, `granitehybrid`, `kimi-k3`, `kimi-linear`, `lfm2`,
+`lfm2moe`, `minimax-01`, `plamo2`, `falcon-h1`, `bert`, `modern-bert`,
+`eurobert`, `neo-bert`, `nomic-bert`, `jina-bert-v2`, `gemma-embedding`,
+`llama-embed`, `starcoder2`, `stablelm`,
+`internlm2`, `olmo`, `olmo2`, `olmoe`, `phimoe`, `granitemoe`, `bailingmoe`,
+`deepseek`, `dots1`, `qwen2vl`, `cohere2`, `arcee`, `smollm3`, `exaone`,
+`nemotron`, `hunyuan-dense`, `muse-glimmer`, `glm-dsa`, `apertus`, `minicpm`,
+`minicpm3`, `openelm`, `mpt`,
+`gptneox`, `jais`, `refact`, `ernie4_5`, `bloom`, `codeshell`, `command-r`,
+`jais2`, `orion`, `qwen`, `starcoder`, `xverse`, `pangu-embedded`, `t5`,
+`t5encoder`, and `talkie`.
+
+The initial pass admitted immutable canonical artifacts no larger than 1 GiB.
+The final census raised that ceiling to 16 GiB, with a mandatory free-space
+gate of at least twice the artifact size and one artifact/model/process at a
+time. Two diverse routes completed the full evidence contract:
+
+| Route | Immutable GGUF | Bytes | SHA-256 | Tensor census | Runtime proof |
+|---|---|---:|---|---|---|
+| `qwen2` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF@9217f5db79a29953eb74d5343926648285ec7e67` / `qwen2.5-0.5b-instruct-q8_0.gguf` | 675,710,816 | `ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e` | 291: F32=121, Q8_0=170 | Exact-artifact full logits, dynamic-KV replay/rollback/reorder, 20 decode steps, deterministic ORT GenAI 0.15.2 generation |
+| `lfm2` | `LiquidAI/LFM2-350M-GGUF@8fdc9d526b7ed346b19257551b05816c7912ecc2` / `LFM2-350M-F16.gguf` | 711,482,304 | `379ffdcbf08147c0313f6f1ce7ff558a2bc935eda633f4b46c52347032419c42` | 148: F16=93, F32=55 | Exact-artifact full logits, mixed convolution/KV replay/rollback/reorder, 20 decode steps, deterministic ORT GenAI 0.15.2 generation |
+
+Attempted families that remain deferred:
+
+| Candidate/family | Result |
+|---|---|
+| `gpt2` | Small canonical artifacts exist, but released ORT GenAI requires one rank-5 combined KV tensor per layer while Mobius exposes separate key/value caches. This is a downstream ABI limitation, not a graph failure. |
+| `mamba`, `mamba2` | Small artifacts were inspected, but released runtime state publication cannot satisfy the registry's required replay/rollback/reorder evidence contract. |
+| `bert`, `modern-bert`, `eurobert`, `neo-bert`, `nomic-bert`, `jina-bert-v2` | Small encoder artifacts exist; the released ORT GenAI registry has no evidenced encoder semantic-output contract. No generation claim is made. |
+| `t5`, `t5encoder` | Small canonical seq2seq artifacts exist; the released registry cannot publish the required encoder/decoder semantic contract. No generation claim is made. |
+| `bailingmoe`, `deepseek`, `dots1` | Newly graph-supported routes were included in the census; raising the ceiling to 16 GiB still did not establish an exact canonical artifact within the bound for these architecture routes. |
+| `gptneox`, `jais`, `mpt`, `refact`, `ernie4_5`, `openelm` | Legacy dense routes added by #639 were retained through the final rebase; no qualifying exact canonical artifact within the 16 GiB bound was established for promotion in this pass. |
+| `bitnet`, `plm`, `gemma-embedding`, `llama-embed`, `apertus`, `minicpm`, `minicpm3`, `pangu-embedded`, `talkie` | Routes added through #640/#641 were included after rebasing onto `fcd5b3bb42dbc2ca7ca4bc62e9ee502e8446085a`; none completed both immutable-artifact qualification and the released runtime's architecture-appropriate evidence contract in this bounded pass. |
+| Remaining decoder, MoE, hybrid, and multimodal rows above | The expanded 16 GiB census did not establish a qualifying exact canonical artifact plus a released-runtime evidence route in this bounded pass, so these remain runtime-deferred without a weaker proxy claim. |
+
+The official Qwen F16 artifact (1,266,425,696 bytes) became size-eligible after
+the ceiling changed, but was not downloaded because the smaller official Q8_0
+artifact already proves the identical `qwen2` route with exact-artifact
+full-logit/runtime evidence; duplicating that route would add disk and memory
+cost without increasing architecture coverage.
+Tokenizer revisions are independently pinned to the historical commits whose
+ordered vocabulary and embedded chat template exactly match each GGUF; current
+upstream tokenizer heads are not substituted.
 
 ## Tokenizer truthfulness
 
@@ -417,7 +470,7 @@ before graph construction or durable output.
 | `kimi-k3` | — | model=`kimi_k3`; tensor=`kimi_k3` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The exact KDA/NoPE gated-MLA schedule, four-state recurrent ABI, attention-residual banks, Stable LatentMoE routing, SiTU activation, strict metadata/tensor closure, and compatible projection quantization are supported. Released generic ORT GenAI cache schemas cannot represent the heterogeneous KV plus convolution/matrix state ABI; tracked by onnxruntime/mobius#605. |
 | `kimi-linear` | — | model=`kimi_linear`; tensor=`kimi_linear` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | The exact KDA/NoPE-MLA schedule, four-state recurrent ABI, dense/MoE topology, correction-bias routing, pinned metadata, tensor closure, and compatible MatMul/expert quantization are supported. Released generic ORT GenAI cache schemas cannot represent heterogeneous KV plus three convolution histories and a matrix state, and representative real-weight GGUF evidence is pending; package runtime remains tracked by onnxruntime/mobius#605. |
 | `laguna` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | Laguna combines per-head-or-element softplus attention gates, dual-RoPE interleaved sliding-window attention, a dense prefix, and sigmoid correction-biased routed/shared experts. Mobius has no exact graph or iSWA cache contract. |
-| `lfm2` | — | model=`lfm2`; tensor=`lfm2` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. |
+| `lfm2` | — | model=`lfm2`; tensor=`lfm2` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=supported; quantized_import=supported | Runtime support is restricted to LiquidAI's official LFM2-350M F16 artifact, pinned CPU import route, exact tokenizer revision, hybrid convolution/KV state evidence, and ORT GenAI 0.15.2. |
 | `lfm2moe` | — | model=`lfm2_moe`; tensor=`lfm2`+`lfm2_moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact pinned tensor-name closure, GGUF value transforms, and synthetic recurrent-state execution are covered, but no representative real-weight GGUF has yet passed independent full-logit parity and deterministic multi-token stateful ORT generation. Runtime packaging remains deferred until that evidence exists. The mobius graph uses floating Linear modules for this architecture, so no MatMulNBits or BlockQuantizedMatMul target can consume preserved GGUF projection weights. Use keep_quantized=False for explicit float import. |
 | `llada` | — | model=`llada`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, suffix-exact tensor closure, masked-diffusion task dispatch, and synthetic full-sequence execution are covered, but no pinned real GGUF has passed independent Hugging Face/llama.cpp masked-step logit parity and deterministic multi-step generation parity. Runtime packaging remains deferred until both exist. |
 | `llada-moe` | — | model=`llada`; module=`llada_moe`; tensor=`llama`+`diffusion_fused_qkv`+`moe_qk_norm_extras`+`moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, suffix-exact tensor closure, masked-diffusion task dispatch, and synthetic full-sequence execution are covered, but no pinned real GGUF has passed independent Hugging Face/llama.cpp masked-step logit parity and deterministic multi-step generation parity. Runtime packaging remains deferred until both exist. |
@@ -462,7 +515,7 @@ before graph construction or durable output.
 | `plm` | — | model=`plm`; tensor=`plm` | audited-direct-loader-conditional-union | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `pockettts` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | The primary GGUF is only PocketTTS's transformed causal CALM backbone: its embedding table contains folded learned conditioning rows and its duplicated embedding output is not a semantic LM head. Voice encoding, continuous 32-D flow generation, EOS scoring, and the stateful 24-kHz Mimi decoder live in a required pockettts_spkenc/pockettts_gen mmproj bundle that Mobius cannot import. Registering the backbone as text generation or TTS would expose the wrong I/O contract, so standalone conversion is refused before graph construction. |
 | `qwen` | — | model=`qwen`; tensor=`llama`+`qwen1_extras` | audited-direct-loader-conditional-union | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. Quantization preservation is rejected because Qwen v1 stores fused QKV weights that must be split into separate graph projections. |
-| `qwen2` | — | model=`qwen2`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
+| `qwen2` | — | model=`qwen2`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=supported; quantized_import=supported | Runtime support is restricted to the official Qwen2.5-0.5B-Instruct Q8_0 artifact, pinned CPU import route, exact tokenizer revision, and ORT GenAI 0.15.2 evidence. |
 | `qwen2moe` | `qwen2_moe` | model=`qwen2_moe`; tensor=`llama`+`moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |
 | `qwen2vl` | — | model=`qwen2_vl_text`; tensor=`llama`; mmproj=`qwen_vl` | exact-direct-loader-conditional-union | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Text and paired Qwen2/Qwen2.5-VL projector graph import are supported for the exact split-QKV llama.cpp artifacts, but downstream multimodal runtime execution has not been evidenced. |
 | `qwen3` | — | model=`qwen3`; tensor=`llama` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | Config extraction, exact tensor-name closure, and a full synthetic GGUF graph build are covered, but no representative real-weight GGUF has yet passed ORT parity or generation validation. Runtime packaging remains deferred until that evidence exists. |

@@ -308,7 +308,7 @@
         "max_download_bytes": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 536870912,
+          "maximum": 1073741824,
           "description": "Hard per-case aggregate artifact download budget."
         },
         "released_capabilities": {
@@ -519,18 +519,35 @@
     "ortGenaiCapabilities": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "generic_decoder",
-        "state_groups"
-      ],
       "properties": {
         "generic_decoder": {
+          "const": true
+        },
+        "specialized_lfm2": {
+          "const": true
+        },
+        "hybrid_conv_kv_state": {
           "const": true
         },
         "state_groups": {
           "const": false
         }
-      }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "generic_decoder",
+            "state_groups"
+          ]
+        },
+        {
+          "required": [
+            "specialized_lfm2",
+            "hybrid_conv_kv_state",
+            "state_groups"
+          ]
+        }
+      ]
     }
   }
 }
