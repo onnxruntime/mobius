@@ -273,7 +273,7 @@ def _declare_batch_capacities(
             capacity["uniform_dimensions"] = uniform_dimensions
         component["batch_capacity"] = capacity
         declared = True
-    if declared:
+    if declared and metadata.get("schema_version") == "v1":
         metadata["schema_version"] = "v1.1"
 
 

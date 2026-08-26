@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-schema_version: v1.1
-=======
 schema_version: v1.2
->>>>>>> 031ee3b2 (test(onnx-genai): refresh token authority fixtures)
 pipeline:
   workflow:
     manifest:
