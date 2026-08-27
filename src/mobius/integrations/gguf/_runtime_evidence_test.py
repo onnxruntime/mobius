@@ -240,6 +240,30 @@ def test_quantized_runtime_evidence_requires_preserved_full_stateful_route(
         validate_quant_runtime_evidence_ids("Q4_K", (lossy.evidence_id,))
 
 
+@pytest.mark.parametrize(
+    "import_route",
+    [
+        '{"preserve_quantization":"true"}',
+        '{"preserve_quantization":1}',
+        '{"preserve_quantization":true,"preserve_quantization":true}',
+        '{"preserve_quantization":true',
+        "[]",
+    ],
+)
+def test_quantized_runtime_evidence_rejects_noncanonical_route_json(
+    import_route: str,
+    monkeypatch,
+) -> None:
+    record = replace(_record(b"pinned-gguf"), import_route=import_route)
+    monkeypatch.setattr(
+        _runtime_evidence,
+        "_RUNTIME_EVIDENCE",
+        MappingProxyType({record.evidence_id: record}),
+    )
+    with pytest.raises(ValueError, match="does not prove preserved Q4_K"):
+        validate_quant_runtime_evidence_ids("Q4_K", (record.evidence_id,))
+
+
 def test_graph_package_identity_frames_files_and_rejects_symlinks(tmp_path) -> None:
     package = tmp_path / "package"
     package.mkdir()

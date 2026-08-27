@@ -49,7 +49,9 @@ def test_every_stored_qtype_and_tensor_role_is_explicit() -> None:
             assert {
                 "route",
                 "exactness",
-                "preserves_source_values",
+                "source_fidelity",
+                "target_storage",
+                "target_storage_supported",
                 "keep_quantized_supported",
                 "transform",
                 "operator_abi",
@@ -59,7 +61,7 @@ def test_every_stored_qtype_and_tensor_role_is_explicit() -> None:
             } == set(route)
 
 
-def test_float_mediated_routes_are_never_marked_preserved() -> None:
+def test_lossy_affine_routes_keep_target_storage_without_claiming_fidelity() -> None:
     qtypes = _qtypes(quantization_capability_matrix())
     for name in ("Q4_K", "Q6_K"):
         record = qtypes[name]
@@ -67,11 +69,13 @@ def test_float_mediated_routes_are_never_marked_preserved() -> None:
         assert isinstance(roles, dict)
         projection = roles["projection"]
         assert isinstance(projection, dict)
-        assert projection["route"] == "dequantize/requantize"
+        assert projection["route"] == "affine repack"
         assert projection["exactness"] == "lossy"
-        assert projection["preserves_source_values"] is False
-        assert projection["keep_quantized_supported"] is False
-        assert "dequantize_raw_tensor" in str(projection["transform"])
+        assert projection["source_fidelity"] is False
+        assert projection["target_storage"] == "affine integer blocks"
+        assert projection["target_storage_supported"] is True
+        assert projection["keep_quantized_supported"] is True
+        assert f"_repack_{name.lower()}" in str(projection["transform"])
 
 
 def test_only_q8_has_qtype_level_runtime_execution_evidence() -> None:
@@ -128,17 +132,18 @@ def test_selected_real_artifacts_stay_within_global_budget() -> None:
     matrix = quantization_capability_matrix()
     policy = matrix["policy"]
     artifacts = matrix["selected_artifacts"]
-    rejected = matrix["rejected_artifacts"]
+    lossy = matrix["lossy_target_artifacts"]
     assert isinstance(policy, dict)
     assert isinstance(artifacts, list)
-    assert isinstance(rejected, list)
+    assert isinstance(lossy, list)
     assert len(artifacts) == 3
-    assert len(rejected) == 1
-    selected = sum(int(record["size"]) for record in [*artifacts, *rejected])
+    assert len(lossy) == 1
+    selected = sum(int(record["size"]) for record in [*artifacts, *lossy])
     assert selected == 1_763_532_768
     assert selected == policy["selected_artifact_bytes"]
     assert selected <= policy["max_selected_artifact_bytes"]
-    assert rejected[0]["lfs_sha256"] == (
+    assert lossy[0]["lfs_sha256"] == (
         "ed5fa30c487b282ec156c29062f1222e5c20875a944ac98289dbd242e947f747"
     )
-    assert "keep-quantized rejected" in rejected[0]["disposition"]
+    assert "source_fidelity=false" in lossy[0]["disposition"]
+    assert "runtime support deferred" in lossy[0]["runtime_disposition"]

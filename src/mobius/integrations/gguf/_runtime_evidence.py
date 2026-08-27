@@ -20,6 +20,7 @@ __all__ = [
 
 import dataclasses
 import hashlib
+import json
 import os
 import stat
 from collections import Counter
@@ -439,10 +440,15 @@ def validate_quant_runtime_evidence_ids(qtype: str, evidence_ids: tuple[str, ...
     for evidence_id in evidence_ids:
         evidence = _RUNTIME_EVIDENCE[evidence_id]
         qtypes = dict(evidence.tensor_qtypes)
+        try:
+            import_route = _strict_json_object(evidence.import_route)
+        except (TypeError, ValueError):
+            invalid.append(evidence_id)
+            continue
         if (
             qtypes.get(qtype, 0) <= 0
             or evidence.parity_kind != "full-logit"
-            or '"preserve_quantization":true' not in evidence.import_route
+            or import_route.get("preserve_quantization") is not True
             or evidence.execution_provider != "CPUExecutionProvider"
             or any(
                 term not in evidence.stateful_semantics for term in required_state_semantics
@@ -454,6 +460,23 @@ def validate_quant_runtime_evidence_ids(qtype: str, evidence_ids: tuple[str, ...
             f"GGUF quantized runtime evidence does not prove preserved {qtype} full-logit "
             f"CPU prefill/decode/replay/rollback/reorder semantics: {sorted(invalid)}"
         )
+
+
+def _strict_json_object(payload: str) -> dict[str, object]:
+    """Parse a JSON object while rejecting duplicate keys at every depth."""
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    parsed = json.loads(payload, object_pairs_hook=reject_duplicates)
+    if not isinstance(parsed, dict):
+        raise TypeError("GGUF import route must be a JSON object")
+    return parsed
 
 
 def validate_runtime_evidence_ids(architecture: str, evidence_ids: tuple[str, ...]) -> None:

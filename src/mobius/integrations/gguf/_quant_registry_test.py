@@ -115,9 +115,9 @@ _PINNED_STORED_ROUTES = {
     "Q8_0": ("affine repack", "exact"),
     "Q2_K": ("dequantize/requantize", None),
     "Q3_K": ("dequantize/requantize", None),
-    "Q4_K": ("dequantize/requantize", "lossy"),
+    "Q4_K": ("affine repack", "lossy"),
     "Q5_K": ("dequantize/requantize", None),
-    "Q6_K": ("dequantize/requantize", "lossy"),
+    "Q6_K": ("affine repack", "lossy"),
     "TQ1_0": ("dequantize/requantize", None),
     "TQ2_0": ("dequantize/requantize", None),
     "IQ4_NL": ("native byte-preserved", None),
@@ -406,12 +406,10 @@ class TestStorageInvariants:
         assert spec.repack_exactness is RepackExactness.EXACT
 
     @pytest.mark.parametrize("name", ["Q4_K", "Q6_K"])
-    def test_float_mediated_requantization_is_never_affine_preservation(
-        self, name: str
-    ) -> None:
+    def test_lossy_affine_target_storage_is_never_source_preservation(self, name: str) -> None:
         spec = quant_spec_by_name(name)
         assert spec is not None
-        assert spec.import_route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        assert spec.import_route is QuantImportRoute.AFFINE_REPACK
         assert spec.repack_exactness is RepackExactness.LOSSY
         assert not spec.preserves_values
 

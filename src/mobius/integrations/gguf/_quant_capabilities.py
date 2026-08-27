@@ -41,7 +41,13 @@ _RUNTIME_EVIDENCED_ROLES: dict[str, frozenset[TensorRole]] = {
         }
     ),
 }
-_REJECTED_ARTIFACTS: tuple[dict[str, object], ...] = (
+
+
+def _test_ref(path: str, test: str) -> str:
+    return f"{path}::{test}"
+
+
+_LOSSY_TARGET_ARTIFACTS: tuple[dict[str, object], ...] = (
     {
         "repository": "unsloth/SmolLM2-135M-Instruct-GGUF",
         "revision": "9e6855bc4be717fca1ef21360a1db4b29d5c559a",
@@ -56,67 +62,118 @@ _REJECTED_ARTIFACTS: tuple[dict[str, object], ...] = (
             "Q8_0": 15,
         },
         "disposition": (
-            "keep-quantized rejected because the mixed source requires lossy "
-            "dequantize/requantize; explicit float import passed same-artifact full-logit "
-            "prefill/decode and deterministic generation"
+            "keep_quantized produces INT4 affine block-32 target storage with "
+            "source_fidelity=false; the output must not be labeled Q4_K_M"
         ),
-        "test": (
-            "tests/gguf_small_model_runtime_integration_test.py::"
-            "test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized"
+        "runtime_disposition": (
+            "runtime support deferred pending full-logit heterogeneous-state "
+            "prefill/decode/replay/reorder and deterministic generation evidence"
+        ),
+        "test": _test_ref(
+            "tests/gguf_small_model_runtime_integration_test.py",
+            "test_smollm_q4_k_m_target_storage_and_explicit_float_fidelity",
         ),
     },
 )
 
 _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
     "codes-scales-zero-points-and-block-tails": (
-        "src/mobius/integrations/gguf/_repacker_test.py"
-        "::TestRepackQ40::test_nibble_ordering_reordered",
-        "src/mobius/integrations/gguf/_repacker_test.py"
-        "::TestRepackQ41::test_zp_clamped_to_15",
-        "src/mobius/integrations/gguf/_repacker_test.py"
-        "::TestRepackQ80::test_int8_to_uint8_conversion",
-        "src/mobius/integrations/gguf/_repacker_test.py"
-        "::TestRepackQ4K::test_requantized_values_stay_within_half_scale",
-        "src/mobius/integrations/gguf/_repacker_test.py"
-        "::TestRepackQ6K::test_dequantization_matches_gguf_reference_exactly",
-        "src/mobius/integrations/gguf/_repacker_test.py"
-        "::TestRepackQ10::test_round_trip_dequantize",
+        _test_ref(
+            "src/mobius/integrations/gguf/_repacker_test.py",
+            "TestRepackQ40::test_nibble_ordering_reordered",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_repacker_test.py",
+            "TestRepackQ41::test_zp_clamped_to_15",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_repacker_test.py",
+            "TestRepackQ80::test_int8_to_uint8_conversion",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_repacker_test.py",
+            "TestRepackQ4K::test_requantized_values_stay_within_half_scale",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_repacker_test.py",
+            "TestRepackQ6K::test_dequantization_matches_gguf_reference_exactly",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_repacker_test.py",
+            "TestRepackQ10::test_round_trip_dequantize",
+        ),
     ),
     "qkv-split-and-row-permutation": (
-        "src/mobius/integrations/gguf/_builder_test.py"
-        "::test_phimoe_fused_qkv_is_split_without_loss",
-        "src/mobius/integrations/gguf/_minicpm_test.py"
-        "::test_quantized_minicpm_loader_permutes_packed_rows_scales_and_zero_points",
-        "src/mobius/integrations/gguf/_kimi_k3_test.py"
-        "::test_fused_kv_b_float_values_and_quantized_import",
+        _test_ref(
+            "src/mobius/integrations/gguf/_builder_test.py",
+            "test_phimoe_fused_qkv_is_split_without_loss",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_minicpm_test.py",
+            "test_quantized_minicpm_loader_permutes_packed_rows_scales_and_zero_points",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_kimi_k3_test.py",
+            "test_fused_kv_b_float_values_and_quantized_import",
+        ),
     ),
     "transpose-and-concat": (
-        "src/mobius/integrations/gguf/_tensor_processors_test.py"
-        "::test_attn_weights_transposed",
-        "src/mobius/integrations/gguf/_tensor_processors_test.py"
-        "::test_granitehybrid_expert_gate_up_fusion_preserves_expert_order",
+        _test_ref(
+            "src/mobius/integrations/gguf/_tensor_processors_test.py",
+            "test_attn_weights_transposed",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_tensor_processors_test.py",
+            "test_granitehybrid_expert_gate_up_fusion_preserves_expert_order",
+        ),
     ),
     "embedding-and-output-aliases": (
-        "src/mobius/integrations/gguf/_builder_test.py"
-        "::test_tied_quantized_embedding_is_shared_with_output_head",
-        "src/mobius/integrations/gguf/_builder_test.py"
-        "::test_quantized_untied_output_head_is_preserved",
+        _test_ref(
+            "src/mobius/integrations/gguf/_builder_test.py",
+            "test_tied_quantized_embedding_is_shared_with_output_head",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_builder_test.py",
+            "test_quantized_untied_output_head_is_preserved",
+        ),
     ),
     "expert-stacking-and-3d-experts": (
-        "src/mobius/integrations/gguf/_builder_test.py"
-        "::test_fused_experts_are_split_without_tensor_loss",
-        "src/mobius/integrations/gguf/_block_quantized_moe_builder_test.py"
-        "::test_e2e_uniform_native_moe_fuses_through_builder",
-        "src/mobius/integrations/_block_quant_test.py"
-        "::test_stack_is_byte_exact_and_recoverable",
+        _test_ref(
+            "src/mobius/integrations/gguf/_builder_test.py",
+            "test_fused_experts_are_split_without_tensor_loss",
+        ),
+        _test_ref(
+            "src/mobius/integrations/gguf/_block_quantized_moe_builder_test.py",
+            "test_e2e_uniform_native_moe_fuses_through_builder",
+        ),
+        _test_ref(
+            "src/mobius/integrations/_block_quant_test.py",
+            "test_stack_is_byte_exact_and_recoverable",
+        ),
     ),
 }
 
 
-def _transform(route: QuantImportRoute) -> str | None:
+def _transform(
+    qtype_name: str,
+    route: QuantImportRoute,
+    exactness: RepackExactness | None,
+) -> str | None:
     if route is QuantImportRoute.NATIVE_BYTES:
         return "mobius.integrations.gguf._repacker.preserve_native_blocks"
     if route is QuantImportRoute.AFFINE_REPACK:
+        if qtype_name == "Q4_1":
+            return (
+                "mobius.integrations.gguf._repacker.repack_gguf_tensor -> "
+                "_repack_q4_1 (rounded integer zero point)"
+            )
+        if qtype_name in {"Q4_K", "Q6_K"}:
+            return (
+                "mobius.integrations.gguf._repacker.repack_gguf_tensor -> "
+                f"_repack_{qtype_name.lower()} -> repack_dequantized_tensor"
+            )
+        if exactness is RepackExactness.LOSSY:
+            raise ValueError(f"{qtype_name} has no declared lossy affine transform")
         return "mobius.integrations.gguf._repacker.repack_gguf_tensor"
     if route is QuantImportRoute.DEQUANTIZE_REQUANTIZE:
         return (
@@ -147,15 +204,27 @@ def _route_record(
     runtime_evidence_ids: tuple[str, ...],
 ) -> dict[str, object]:
     route, exactness, reason = quant_import_decision(ggml_type_id, role)
-    preserves_source_values = route is QuantImportRoute.NATIVE_BYTES or (
+    source_fidelity = route is QuantImportRoute.NATIVE_BYTES or (
         route is QuantImportRoute.AFFINE_REPACK and exactness is RepackExactness.EXACT
     )
+    target_storage = (
+        "native GGUF blocks"
+        if route is QuantImportRoute.NATIVE_BYTES
+        else "affine integer blocks"
+        if route in {QuantImportRoute.AFFINE_REPACK, QuantImportRoute.DEQUANTIZE_REQUANTIZE}
+        else "float"
+        if route is QuantImportRoute.DEQUANTIZE_FLOAT
+        else None
+    )
+    target_storage_supported = route is not QuantImportRoute.REJECTED
     return {
         "route": route.value,
         "exactness": None if exactness is None else exactness.value,
-        "preserves_source_values": preserves_source_values,
-        "keep_quantized_supported": preserves_source_values,
-        "transform": _transform(route),
+        "source_fidelity": source_fidelity,
+        "target_storage": target_storage,
+        "target_storage_supported": target_storage_supported,
+        "keep_quantized_supported": target_storage_supported,
+        "transform": _transform(qtype_name, route, exactness),
         "operator_abi": _operator_abi(route, role),
         "runtime_support": (
             "supported"
@@ -214,10 +283,8 @@ def _artifact_records() -> tuple[list[dict[str, object]], int]:
 def quantization_capability_matrix() -> dict[str, object]:
     """Return the complete JSON-serializable stored-qtype capability matrix."""
     artifacts, selected_bytes = _artifact_records()
-    rejected_artifact_bytes = sum(
-        cast(int, record["size"]) for record in _REJECTED_ARTIFACTS
-    )
-    selected_bytes += rejected_artifact_bytes
+    lossy_artifact_bytes = sum(cast(int, record["size"]) for record in _LOSSY_TARGET_ARTIFACTS)
+    selected_bytes += lossy_artifact_bytes
     if selected_bytes > _ARTIFACT_BUDGET_BYTES:
         raise ValueError(
             f"Pinned GGUF evidence totals {selected_bytes} bytes, exceeding "
@@ -286,6 +353,10 @@ def quantization_capability_matrix() -> dict[str, object]:
                 "Only byte-identical native blocks or exact affine repacks preserve "
                 "source represented values. Dequantize/requantize is never preserved."
             ),
+            "target_storage_definition": (
+                "Lossy affine normalization may still produce supported packed target "
+                "storage while source_fidelity is false."
+            ),
             "runtime_definition": (
                 "Runtime support requires immutable same-artifact full-logit parity plus "
                 "deterministic prefill/decode/replay/rollback/reorder evidence."
@@ -302,7 +373,7 @@ def quantization_capability_matrix() -> dict[str, object]:
             key: list(value) for key, value in sorted(_TRANSFORM_EVIDENCE.items())
         },
         "selected_artifacts": artifacts,
-        "rejected_artifacts": list(_REJECTED_ARTIFACTS),
+        "lossy_target_artifacts": list(_LOSSY_TARGET_ARTIFACTS),
         "qtypes": qtypes,
     }
 

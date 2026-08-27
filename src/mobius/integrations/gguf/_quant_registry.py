@@ -119,9 +119,9 @@ _STORED_ROUTE_POLICY: MappingProxyType[
         "Q8_0": (QuantImportRoute.AFFINE_REPACK, RepackExactness.EXACT),
         "Q2_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
         "Q3_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "Q4_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, RepackExactness.LOSSY),
+        "Q4_K": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
         "Q5_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
-        "Q6_K": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, RepackExactness.LOSSY),
+        "Q6_K": (QuantImportRoute.AFFINE_REPACK, RepackExactness.LOSSY),
         "TQ1_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
         "TQ2_0": (QuantImportRoute.DEQUANTIZE_REQUANTIZE, None),
         "IQ4_NL": (QuantImportRoute.NATIVE_BYTES, None),
@@ -538,10 +538,10 @@ def render_quant_support_matrix() -> str:
     rows = [
         (
             "| Stored qtype | ID | Parse | Exact dequantization | Projection/output route | "
-            "Direct exactness | Embedding route | Expert-major route | Keep-quantized | "
-            "Native operator ABI | Runtime evidence |"
+            "Direct exactness | Embedding route | Expert-major route | Target storage | "
+            "Source fidelity | Native operator ABI | Runtime evidence |"
         ),
-        "|---|---:|---|---|---|---|---|---|---|---|---|",
+        "|---|---:|---|---|---|---|---|---|---|---|---|---|",
     ]
     for spec in iter_quant_specs():
         if not spec.is_quantized_storage:
@@ -550,14 +550,19 @@ def render_quant_support_matrix() -> str:
         embedding = quant_import_decision(spec.ggml_type_id, TensorRole.EMBEDDING)[0]
         expert = quant_import_decision(spec.ggml_type_id, TensorRole.EXPERT)[0]
         exactness = "—" if spec.repack_exactness is None else spec.repack_exactness.value
-        keep_quantized = (
-            "projection/output/expert"
+        target_storage = (
+            "quantized target supported"
+            if projection is not QuantImportRoute.REJECTED
+            else "rejected"
+        )
+        source_fidelity = (
+            "true"
             if projection is QuantImportRoute.NATIVE_BYTES
             or (
                 projection is QuantImportRoute.AFFINE_REPACK
                 and spec.repack_exactness is RepackExactness.EXACT
             )
-            else "no (conversion or explicit float import only)"
+            else "false"
         )
         native_abi = (
             f"`pkg.nxrt::BlockQuantizedMatMul/v1` (`{spec.native_preserve.format}`)"
@@ -572,8 +577,8 @@ def render_quant_support_matrix() -> str:
         rows.append(
             f"| `{spec.name}` | {spec.ggml_type_id} | supported | "
             f"{spec.dequantize.value} | {projection.value} | {exactness} | "
-            f"{embedding.value} | {expert.value} | {keep_quantized} | {native_abi} | "
-            f"{evidence} |"
+            f"{embedding.value} | {expert.value} | {target_storage} | "
+            f"{source_fidelity} | {native_abi} | {evidence} |"
         )
     return "\n".join(rows)
 
