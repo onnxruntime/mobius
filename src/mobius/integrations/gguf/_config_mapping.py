@@ -2359,11 +2359,27 @@ def _granite_postprocess(
     embedding_scale = finite_scale("embedding_scale", 0.0) or 1.0
     residual_scale = finite_scale("residual_scale", 0.0) or 1.0
     attention_scale = finite_scale("attention.scale", 0.0) or None
-    expert_width = int(
-        metadata.get(f"{arch}.expert_feed_forward_length", config.intermediate_size)
-    )
-    if num_experts and expert_width <= 0:
-        raise ValueError("granite expert feed-forward width must be positive")
+    raw_expert_width = metadata.get(f"{arch}.expert_feed_forward_length")
+    if raw_expert_width is not None:
+        if isinstance(raw_expert_width, (bool, np.bool_)):
+            serialized_expert_width = None
+        elif isinstance(raw_expert_width, (int, np.integer)):
+            serialized_expert_width = int(raw_expert_width)
+        elif isinstance(raw_expert_width, (float, np.floating)):
+            numeric_expert_width = float(raw_expert_width)
+            serialized_expert_width = (
+                int(numeric_expert_width)
+                if math.isfinite(numeric_expert_width) and numeric_expert_width.is_integer()
+                else None
+            )
+        else:
+            serialized_expert_width = None
+        if serialized_expert_width != config.intermediate_size:
+            raise ValueError(
+                "granite.expert_feed_forward_length must equal feed_forward_length "
+                "because the pinned loader sizes routed experts from feed_forward_length"
+            )
+    expert_width = config.intermediate_size
 
     return dataclasses.replace(
         config,

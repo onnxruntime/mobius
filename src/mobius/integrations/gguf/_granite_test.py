@@ -303,6 +303,35 @@ def test_granite_moe_config_selects_shared_expert_graph() -> None:
     assert config.norm_topk_prob
 
 
+@pytest.mark.parametrize(
+    ("feed_forward_length", "expert_feed_forward_length"),
+    [
+        (_INTERMEDIATE, _INTERMEDIATE // 2),
+        (2**53, 2**53 + 1),
+    ],
+)
+def test_granite_rejects_distinct_expert_width_before_tensor_closure(
+    feed_forward_length: int, expert_feed_forward_length: int
+) -> None:
+    metadata = _metadata(moe=True)
+    metadata["granite.feed_forward_length"] = feed_forward_length
+    metadata["granite.expert_feed_forward_length"] = expert_feed_forward_length
+    tensors = _tensors(moe=True)
+    if expert_feed_forward_length < 1000:
+        for suffix, shape in {
+            "ffn_gate_exps.weight": (_EXPERTS, expert_feed_forward_length, _HIDDEN),
+            "ffn_up_exps.weight": (_EXPERTS, expert_feed_forward_length, _HIDDEN),
+            "ffn_down_exps.weight": (_EXPERTS, _HIDDEN, expert_feed_forward_length),
+        }.items():
+            tensors[f"blk.0.{suffix}"] = np.empty(shape, np.float32)
+    model = _FakeGGUF(metadata, tensors)
+
+    with pytest.raises(ValueError, match="sizes routed experts from feed_forward_length"):
+        gguf_to_config(model)
+    with pytest.raises(ValueError, match="sizes routed experts from feed_forward_length"):
+        _raise_for_invalid_granite_tensor_contract(model)
+
+
 @pytest.mark.parametrize("attention_factor", [None, 1.1])
 def test_granite_longrope_factors_fail_closed(attention_factor: float | None) -> None:
     metadata = _metadata()

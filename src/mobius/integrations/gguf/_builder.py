@@ -3645,7 +3645,28 @@ def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
     )
     experts = int(metadata.get(f"{arch}.expert_count", 0))
     top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
-    expert_intermediate = int(metadata.get(f"{arch}.expert_feed_forward_length", intermediate))
+    raw_expert_intermediate = metadata.get(f"{arch}.expert_feed_forward_length")
+    if raw_expert_intermediate is not None:
+        if isinstance(raw_expert_intermediate, (bool, np.bool_)):
+            serialized_expert_intermediate = None
+        elif isinstance(raw_expert_intermediate, (int, np.integer)):
+            serialized_expert_intermediate = int(raw_expert_intermediate)
+        elif isinstance(raw_expert_intermediate, (float, np.floating)):
+            numeric_expert_intermediate = float(raw_expert_intermediate)
+            serialized_expert_intermediate = (
+                int(numeric_expert_intermediate)
+                if math.isfinite(numeric_expert_intermediate)
+                and numeric_expert_intermediate.is_integer()
+                else None
+            )
+        else:
+            serialized_expert_intermediate = None
+        if serialized_expert_intermediate != intermediate:
+            raise ValueError(
+                "granite.expert_feed_forward_length must equal feed_forward_length "
+                "because the pinned loader sizes routed experts from feed_forward_length"
+            )
+    expert_intermediate = intermediate
     shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
     if (
         min(hidden, intermediate, layers, heads, kv_heads, context, vocab) <= 0
