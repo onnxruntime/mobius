@@ -281,6 +281,21 @@ class TestConfig:
 
 
 class TestReconstruction:
+    def test_torch_dtype_resolution_tolerates_missing_optional_fnuz(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.delattr(torch, "float8_e4m3fnuz")
+        monkeypatch.delattr(torch, "float8_e5m2fnuz")
+
+        assert compressed_tensors_loader._torch_dtype("BF16") == torch.bfloat16
+        assert compressed_tensors_loader._torch_dtype("F8_E4M3") == torch.float8_e4m3fn
+        with pytest.raises(
+            CompressedTensorsError,
+            match="Unsupported safetensors dtype 'F8_E4M3FNUZ'",
+        ):
+            compressed_tensors_loader._torch_dtype("F8_E4M3FNUZ")
+
     def test_nvfp4_reads_one_shard_handle_per_logical_tensor(self, tmp_path, monkeypatch):
         tensors = {
             "nvfp4.weight_packed": torch.zeros(2, 8, dtype=torch.uint8),

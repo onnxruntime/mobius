@@ -533,15 +533,20 @@ def _torch_dtype(dtype: str) -> torch.dtype:
         "F32": torch.float32,
         "F64": torch.float64,
         "F8_E4M3": torch.float8_e4m3fn,
-        "F8_E4M3FNUZ": torch.float8_e4m3fnuz,
         "F8_E5M2": torch.float8_e5m2,
-        "F8_E5M2FNUZ": torch.float8_e5m2fnuz,
         "I8": torch.int8,
         "I16": torch.int16,
         "I32": torch.int32,
         "I64": torch.int64,
         "U8": torch.uint8,
     }
+    for safetensors_dtype, torch_attribute in (
+        ("F8_E4M3FNUZ", "float8_e4m3fnuz"),
+        ("F8_E5M2FNUZ", "float8_e5m2fnuz"),
+    ):
+        optional_dtype = getattr(torch, torch_attribute, None)
+        if optional_dtype is not None:
+            mapping[safetensors_dtype] = optional_dtype
     try:
         return mapping[dtype]
     except KeyError as error:
