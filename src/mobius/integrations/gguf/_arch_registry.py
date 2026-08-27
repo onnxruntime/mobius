@@ -856,8 +856,14 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "ssm.state_size",
             "ssm.time_step_rank",
         ),
-        runtime=Support.DEFERRED,
-        reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the pinned Q2_K reduced checkpoint's "
+            "explicit-float CPU route, exact tokenizer revision, hybrid KV/convolution/"
+            "recurrent-state evidence, and ORT GenAI 0.15.2. Quantization preservation "
+            "and sparse MoE throughput are not claimed."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="qwen3next",

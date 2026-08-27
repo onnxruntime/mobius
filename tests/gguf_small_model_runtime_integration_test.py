@@ -31,7 +31,7 @@ import pytest
 import torch
 import yaml
 from huggingface_hub import get_hf_file_metadata, hf_hub_download, hf_hub_url
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from mobius import ModelPackage, build_from_gguf
 from mobius.__main__ import main
@@ -236,19 +236,19 @@ _Q4_K_M_CASE = _RuntimeCase(
 class _PromotedRuntimeCase:
     name: str
     evidence_id: str
-    reference_repository: str
-    reference_revision: str
     prompt: str
     generated_tokens: tuple[int, ...]
     atol: float
+    dequantize: bool = False
+    release: bool = False
+    allow_dense_moe: bool = False
+    required_free_bytes: int = 0
 
 
 _PROMOTED_RUNTIME_CASES = (
     _PromotedRuntimeCase(
         name="qwen2.5-0.5b-instruct-q8",
         evidence_id="qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
-        reference_repository="Qwen/Qwen2.5-0.5B-Instruct",
-        reference_revision="7ae557604adf67be50417f59c2c2f167def9a775",
         prompt="Hello",
         generated_tokens=(
             271,
@@ -277,8 +277,6 @@ _PROMOTED_RUNTIME_CASES = (
     _PromotedRuntimeCase(
         name="lfm2-350m-f16",
         evidence_id="lfm2-350m-f16-ort-genai-0.15.2",
-        reference_repository="LiquidAI/LFM2-350M",
-        reference_revision="f37d3f5c8c5484bc01dad379a595cf4c68c4e70e",
         prompt="Hello",
         generated_tokens=(
             8227,
@@ -303,6 +301,38 @@ _PROMOTED_RUNTIME_CASES = (
             4600,
         ),
         atol=3e-4,
+    ),
+    _PromotedRuntimeCase(
+        name="qwen3.5-moe-0.87b-q2-k",
+        evidence_id="qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            198,
+            198,
+            198,
+            321,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+            198,
+        ),
+        atol=0.35,
+        dequantize=True,
+        release=True,
+        allow_dense_moe=True,
+        required_free_bytes=5_000_000_000,
     ),
 )
 
@@ -408,7 +438,68 @@ def _empty_promoted_state(
             state[value.name] = np.zeros(
                 [batch_size, value.shape[1], value.shape[2]], dtype=np.float32
             )
+        elif value.name.endswith(".recurrent_state"):
+            state[value.name] = np.zeros(
+                [batch_size, value.shape[1], value.shape[2], value.shape[3]],
+                dtype=np.float32,
+            )
     return state
+
+
+def _load_qwen35moe_same_value_reference(
+    gguf_path: Path,
+    *,
+    repository: str,
+    revision: str,
+) -> torch.nn.Module:
+    """Build the HF Qwen3.5-MoE architecture from the exact dequantized GGUF values."""
+    from mobius.integrations.gguf._builder import (
+        _load_dequantized_state_dict,
+        _normalize_gguf_weights,
+    )
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+    from mobius.integrations.gguf._tensor_processors import process_tensors
+
+    gguf_model = GGUFModel(gguf_path)
+    config = gguf_to_config(gguf_model)
+    state_dict = _normalize_gguf_weights(
+        process_tensors(
+            _load_dequantized_state_dict(gguf_model, "qwen35moe"),
+            config,
+        ),
+        "qwen35moe",
+        config,
+    )
+    num_experts = int(config.num_local_experts)
+    for layer_idx in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer_idx}.mlp.experts"
+        gate = [
+            state_dict.pop(f"{prefix}.{expert}.gate_proj.weight")
+            for expert in range(num_experts)
+        ]
+        up = [
+            state_dict.pop(f"{prefix}.{expert}.up_proj.weight")
+            for expert in range(num_experts)
+        ]
+        down = [
+            state_dict.pop(f"{prefix}.{expert}.down_proj.weight")
+            for expert in range(num_experts)
+        ]
+        state_dict[f"{prefix}.gate_up_proj"] = torch.stack(
+            [
+                torch.cat([gate_weight, up_weight], dim=0)
+                for gate_weight, up_weight in zip(gate, up, strict=True)
+            ]
+        )
+        state_dict[f"{prefix}.down_proj"] = torch.stack(down)
+    state_dict = {name: value.float() for name, value in state_dict.items()}
+
+    hf_config = AutoConfig.from_pretrained(repository, revision=revision)
+    reference = AutoModelForCausalLM.from_config(hf_config)
+    missing, unexpected = reference.load_state_dict(state_dict, assign=True)
+    assert not missing
+    assert not unexpected
+    return reference.to(dtype=torch.float32).eval()
 
 
 def _run_promoted_ort(
@@ -981,6 +1072,7 @@ def test_promoted_gguf_full_runtime_evidence(
     case: _PromotedRuntimeCase,
     tmp_path: Path,
     isolated_hf_cache: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exact GGUF weights prove logits, state semantics, publication, and OGA decode."""
     import onnxruntime_genai as ort_genai
@@ -1023,7 +1115,9 @@ def test_promoted_gguf_full_runtime_evidence(
     assert evidence.size <= 16 * 2**30
     assert remote_download_bytes <= enrollment["max_download_bytes"]
     assert isolated_hf_cache.exists()
-    assert shutil.disk_usage(isolated_hf_cache).free >= 2 * evidence.size
+    assert shutil.disk_usage(isolated_hf_cache).free >= max(
+        2 * evidence.size, case.required_free_bytes
+    )
 
     cached_gguf = Path(
         hf_hub_download(
@@ -1054,7 +1148,7 @@ def test_promoted_gguf_full_runtime_evidence(
         assert _sha256(asset_path) == sha256
 
     output_dir = tmp_path / "runtime-package"
-    assert shutil.disk_usage(tmp_path).free >= 2 * evidence.size
+    assert shutil.disk_usage(tmp_path).free >= max(2 * evidence.size, case.required_free_bytes)
     captured: list[ModelPackage] = []
     original_save = ModelPackage.save
 
@@ -1062,35 +1156,42 @@ def test_promoted_gguf_full_runtime_evidence(
         captured.append(package)
         original_save(package, *args, **kwargs)
 
+    cli_args = [
+        "build-gguf",
+        str(gguf_path),
+        "--output",
+        str(output_dir),
+        "--dtype",
+        "f32",
+        "--execution-provider",
+        "cpu",
+        "--runtime",
+        "ort-genai",
+        "--runtime-version",
+        installed_version,
+        "--tokenizer-repository",
+        evidence.tokenizer_repository,
+        "--tokenizer-revision",
+        evidence.tokenizer_revision,
+        "--local-files-only",
+    ]
+    if case.dequantize:
+        cli_args.append("--dequantize")
+    if case.release:
+        cli_args.append("--release")
+    if case.allow_dense_moe:
+        monkeypatch.setenv("MOBIUS_ALLOW_DENSE_MOE_EXPERTS", "1")
     with mock.patch.object(ModelPackage, "save", capture_save):
-        main(
-            [
-                "build-gguf",
-                str(gguf_path),
-                "--output",
-                str(output_dir),
-                "--dtype",
-                "f32",
-                "--execution-provider",
-                "cpu",
-                "--runtime",
-                "ort-genai",
-                "--runtime-version",
-                installed_version,
-                "--tokenizer-repository",
-                evidence.tokenizer_repository,
-                "--tokenizer-revision",
-                evidence.tokenizer_revision,
-                "--local-files-only",
-            ]
-        )
+        main(cli_args)
     assert len(captured) == 1
     assert captured[0].gguf_import_route == evidence.import_route
     source_report = captured[0].gguf_quantization_report
     assert source_report is not None
-    if dict(evidence.tensor_qtypes).get("Q8_0", 0):
-        assert source_report.storage_quantized is True
-        assert source_report.source_fidelity is True
+    assert source_report.storage_quantized is evidence.storage_quantized
+    assert source_report.source_fidelity is evidence.source_fidelity
+    assert source_report.target_storage_format == evidence.target_storage_format
+    assert source_report.compute_mode == evidence.compute_mode
+    if source_report.storage_quantized:
         graph = captured[0]["model"].graph
         op_types = Counter(node.op_type for node in graph)
         assert op_types["MatMulNBits"] > 0
@@ -1127,12 +1228,19 @@ def test_promoted_gguf_full_runtime_evidence(
     packaged_tokenizer = AutoTokenizer.from_pretrained(output_dir, local_files_only=True)
     prompt_ids = tokenizer(case.prompt, return_tensors="pt").input_ids
     assert packaged_tokenizer(case.prompt).input_ids == prompt_ids.tolist()[0]
-    reference = AutoModelForCausalLM.from_pretrained(
-        evidence.repository,
-        revision=evidence.revision,
-        gguf_file=evidence.filename,
-        dtype=torch.float32,
-    ).eval()
+    if evidence.architecture == "qwen35moe":
+        reference = _load_qwen35moe_same_value_reference(
+            gguf_path,
+            repository=evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+    else:
+        reference = AutoModelForCausalLM.from_pretrained(
+            evidence.repository,
+            revision=evidence.revision,
+            gguf_file=evidence.filename,
+            dtype=torch.float32,
+        ).eval()
     input_ids = prompt_ids.numpy()
     reference_logits: list[np.ndarray] = []
     with torch.no_grad():

@@ -277,7 +277,9 @@ _COVERAGE_SKIP: dict[str, str] = {
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
     "covered, but no small public artifact exists for bounded L4/L5 validation.",
-    "qwen3_5_moe": "Large MoE (22B) — no small public checkpoint",
+    "qwen3_5_moe": "The bounded reduced GGUF runtime fixture proves the explicit-float "
+    "hybrid state route, but the registered upstream checkpoint remains too large for "
+    "ordinary L4/L5 golden generation.",
     "xverse": "Xverse's smallest public checkpoint is 7B; L1 graph, config, "
     "weight-alignment, and value-based GGUF permutation coverage are present, "
     "but real-weight L4/L5 goldens exceed the CPU CI budget.",

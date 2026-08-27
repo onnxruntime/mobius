@@ -28,7 +28,7 @@
     "max_selected_artifact_bytes": 17179869184,
     "preserved_definition": "Only byte-identical native blocks or exact affine repacks preserve source represented values. Dequantize/requantize is never preserved.",
     "runtime_definition": "Runtime support requires immutable same-artifact full-logit parity plus deterministic prefill/decode/replay/rollback/reorder evidence.",
-    "selected_artifact_bytes": 1763532768,
+    "selected_artifact_bytes": 2390132320,
     "target_storage_definition": "Lossy affine normalization may still produce supported packed target storage while source_fidelity is false."
   },
   "qtypes": [
@@ -2485,6 +2485,46 @@
   "selected_artifacts": [
     {
       "evidence_ids": [
+        "qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "qwen3.5-moe-0.87B-d0.8B.Q2_K.gguf",
+      "lfs_sha256": "e8a84df1a50ce65cf80c2b55bba8c6e80f913679fdf9e9439f2c3b52ef3145d5",
+      "repository": "Flexan/kshitijthakkar-qwen3.5-moe-0.87B-d0.8B-GGUF",
+      "revision": "a9b8adbec2cc87479c772dac1944f313b4036c26",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[qwen3.5-moe-0.87b-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "8c1aa1075cee03ffd5ce5bbd283ee88b2466e6c1d645f0a41e542230951d6f09",
+          "import_route": "{\"architecture\":\"qwen35moe\",\"config_sha256\":\"f61aa39910c1b2ef27b9f8c707ef17dc7d16eff6fd97fae33d3a2eb367bf76f9\",\"execution_provider\":\"cpu\",\"model_type\":\"qwen3_5_moe\",\"module_type\":\"qwen3_5_moe\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":true,\"required_metadata\":[\"attention.layer_norm_rms_epsilon\",\"expert_count\",\"expert_used_count\",\"rope.dimension_sections\",\"ssm.conv_kernel\",\"ssm.group_count\",\"ssm.inner_size\",\"ssm.state_size\",\"ssm.time_step_rank\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":true,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"hybrid-text-generation\"},\"tensor_map_recipe\":[\"llama\",\"moe_extras\",\"qwen35_hybrid_extras\"]}",
+          "limitations": "Explicit-float correctness route only: source quantization is dequantized, dense MoE execution is opt-in, and the selected publisher marks this reduced checkpoint as low quality. Same-value full-logit comparison uses atol=0.35 because small backend differences can cross a routed-expert boundary; all greedy tokens match.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[qwen3.5-moe-0.87b-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "bd69cf72acffd393a706bb012c23990acfdaf3a43e25ad919ef1148afac42a15",
+          "source_fidelity": false,
+          "stateful_semantics": "hybrid convolution, recurrent, and KV state prefill, replay, rollback, reorder, and 20 cache-threaded decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 626599552,
+      "tensor_qtypes": {
+        "F16": 48,
+        "F32": 181,
+        "Q2_K": 193,
+        "Q5_K": 6,
+        "Q6_K": 1,
+        "Q8_0": 12
+      }
+    },
+    {
+      "evidence_ids": [
         "lfm2-350m-f16-ort-genai-0.15.2"
       ],
       "filename": "LFM2-350M-F16.gguf",
@@ -2493,18 +2533,24 @@
       "revision": "8fdc9d526b7ed346b19257551b05816c7912ecc2",
       "runtime_results": [
         {
+          "compute_mode": "float operators",
           "deterministic_test": "test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
           "downstream_runtime": "ort-genai",
           "downstream_runtime_version": "0.15.2",
           "evidence_id": "lfm2-350m-f16-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "27e4ebb4c0c8b6c01ee57fa7825f34c5ddadc8ca5dc0c75d989e4507d4dcdfdb",
+          "import_route": "{\"architecture\":\"lfm2\",\"config_sha256\":\"c961bba579ea33a2472a7c5d3f469c76f1f8c7aae8440a7eaa86bc6e878a42f4\",\"execution_provider\":\"cpu\",\"model_type\":\"lfm2\",\"module_type\":\"lfm2\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.head_count_kv\",\"attention.layer_norm_rms_epsilon\",\"shortconv.l_cache\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"hybrid-text-generation\"},\"tensor_map_recipe\":[\"lfm2\"]}",
+          "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
           "result": "passed",
           "runtime_package_sha256": "ef3816d4f93c7061fd4653248629f0439d6ad1c623bdd0f27d31fe0349cb3505",
-          "stateful_semantics": "hybrid convolution and KV state prefill, replay, rollback, reorder, and 20 decode steps"
+          "source_fidelity": true,
+          "stateful_semantics": "hybrid convolution and KV state prefill, replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
         }
       ],
       "size": 711482304,
@@ -2523,18 +2569,24 @@
       "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
       "runtime_results": [
         {
+          "compute_mode": "runtime-dependent native custom op or inline standard-ONNX fallback",
           "deterministic_test": "test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
           "downstream_runtime": "ort-genai",
           "downstream_runtime_version": "0.15.2",
           "evidence_id": "qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "240e5e374803c94efdb17eee39c09b0d3e9aed10b6d8b4e1c92e39918ea2155e",
+          "import_route": "{\"architecture\":\"qwen2\",\"config_sha256\":\"f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500\",\"execution_provider\":\"cpu\",\"model_type\":\"qwen2\",\"module_type\":\"qwen2\",\"preserve_quantization\":true,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
           "result": "passed",
           "runtime_package_sha256": "5029bbfcdd8d1ae1d2b0ed9587cc288a68cb38bb7f92b9e10f9bf64a436b1762",
-          "stateful_semantics": "dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps"
+          "source_fidelity": true,
+          "stateful_semantics": "dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": true,
+          "target_storage_format": "native GGUF block storage"
         }
       ],
       "size": 675710816,
@@ -2554,32 +2606,44 @@
       "revision": "22cca988936eafe92908e7558907c3964e10bba7",
       "runtime_results": [
         {
+          "compute_mode": "float operators",
           "deterministic_test": "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
           "downstream_runtime": "onnx-genai",
           "downstream_runtime_version": "1.29.0",
           "evidence_id": "smollm-135m-f16-onnxruntime-1.29.0",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
+          "import_route": "{\"architecture\":\"llama\",\"config_sha256\":\"d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886\",\"execution_provider\":\"cpu\",\"model_type\":\"llama\",\"module_type\":\"llama\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
           "result": "passed",
           "runtime_package_sha256": "57038e28e83a2b4251e334b6098f59b4344c7e526746e29d9fa42eeaebfcbddc",
-          "stateful_semantics": "dynamic KV cache prefill plus 20 cache-threaded decode steps"
+          "source_fidelity": true,
+          "stateful_semantics": "dynamic KV cache prefill plus 20 cache-threaded decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
         },
         {
+          "compute_mode": "float operators",
           "deterministic_test": "test_smollm_generic_ort_genai_generation",
           "downstream_runtime": "ort-genai",
           "downstream_runtime_version": "0.15.2",
           "evidence_id": "smollm-135m-f16-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
+          "import_route": "{\"architecture\":\"llama\",\"config_sha256\":\"d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886\",\"execution_provider\":\"cpu\",\"model_type\":\"llama\",\"module_type\":\"llama\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
           "result": "passed",
           "runtime_package_sha256": "15d0218a4b326648d514a98c4f073251c674312b1faa83bec9022cc91daa0a53",
-          "stateful_semantics": "ORT GenAI prefill plus 20 cache-threaded decode steps"
+          "source_fidelity": true,
+          "stateful_semantics": "ORT GenAI prefill plus 20 cache-threaded decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
         }
       ],
       "size": 270885504,

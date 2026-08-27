@@ -317,7 +317,8 @@ def _runtime_evidence_table() -> str:
             f"ONNX Runtime {evidence.onnxruntime_version} "
             f"`{evidence.execution_provider}`; {evidence.runtime} "
             f"{evidence.runtime_version}; result={evidence.result}; "
-            f"{evidence.parity_kind}; {evidence.stateful_semantics} |"
+            f"{evidence.parity_kind}; {evidence.stateful_semantics}"
+            f"{'; ' + evidence.limitations if evidence.limitations else ''} |"
         )
     return "\n".join(rows)
 

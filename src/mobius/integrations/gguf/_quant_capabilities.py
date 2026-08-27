@@ -268,12 +268,18 @@ def _artifact_records() -> tuple[list[dict[str, object]], int]:
                 "downstream_runtime": evidence.runtime,
                 "downstream_runtime_version": evidence.runtime_version,
                 "result": evidence.result,
+                "import_route": evidence.import_route,
+                "source_fidelity": evidence.source_fidelity,
+                "storage_quantized": evidence.storage_quantized,
+                "target_storage_format": evidence.target_storage_format,
+                "compute_mode": evidence.compute_mode,
                 "parity_kind": evidence.parity_kind,
                 "stateful_semantics": evidence.stateful_semantics,
                 "parity_test": evidence.parity_test,
                 "deterministic_test": evidence.deterministic_test,
                 "graph_sha256": evidence.graph_sha256,
                 "runtime_package_sha256": evidence.runtime_package_sha256,
+                "limitations": evidence.limitations,
             }
         )
     artifacts = [grouped[key] for key in sorted(grouped)]

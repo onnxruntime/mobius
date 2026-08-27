@@ -1,0 +1,64 @@
+model_id: "kshitijthakkar/qwen3.5-moe-0.87B-d0.8B"
+model_type: "qwen3_5_moe"
+revision: "e5b5b3d7c3cc5593196902fd3c23964e891a6ea6"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "Flexan/kshitijthakkar-qwen3.5-moe-0.87B-d0.8B-GGUF"
+  revision: "a9b8adbec2cc87479c772dac1944f313b4036c26"
+  filename: "qwen3.5-moe-0.87B-d0.8B.Q2_K.gguf"
+  size: 626599552
+  lfs_sha256: "e8a84df1a50ce65cf80c2b55bba8c6e80f913679fdf9e9439f2c3b52ef3145d5"
+  tensor_count: 441
+  tensor_qtypes:
+    F16: 48
+    F32: 181
+    Q2_K: 193
+    Q5_K: 6
+    Q6_K: 1
+    Q8_0: 12
+  execution_provider: "cpu"
+  config_sha256: "f61aa39910c1b2ef27b9f8c707ef17dc7d16eff6fd97fae33d3a2eb367bf76f9"
+  preserve_quantization: false
+  keep_quantized: false
+  tokenizer:
+    repository: "kshitijthakkar/qwen3.5-moe-0.87B-d0.8B"
+    revision: "e5b5b3d7c3cc5593196902fd3c23964e891a6ea6"
+    metadata_sha256: "45302b58b2086a666a874652d0e9e1d5b4b26e786ffbaf9362a4f902eba0b10d"
+    identity_status: "exact"
+    assets:
+      - filename: "chat_template.jinja"
+        size: 7755
+        sha256: "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+      - filename: "tokenizer.json"
+        size: 12807982
+        sha256: "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+      - filename: "tokenizer_config.json"
+        size: 16709
+        sha256: "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 650000000
+  released_capabilities:
+    "0.15.2":
+      generic_decoder: true
+      state_groups: false
+
+inputs:
+  prompts:
+    - "The capital of France is"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Pinned reduced Qwen3.5-MoE Q2_K artifact. Runtime evidence is restricted to explicit float storage and dense MoE correctness; it does not claim source fidelity, quantized target storage, sparse execution, throughput, or checkpoint quality."

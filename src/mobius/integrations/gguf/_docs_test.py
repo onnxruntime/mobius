@@ -142,6 +142,7 @@ def test_runtime_support_requires_structured_evidence() -> None:
         ),
         ("qwen2", ("qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",)),
         ("lfm2", ("lfm2-350m-f16-ort-genai-0.15.2",)),
+        ("qwen35moe", ("qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",)),
     ]
 
     pins = {pin.artifact_id for pin in MMPROJ_ARTIFACT_PINS}
