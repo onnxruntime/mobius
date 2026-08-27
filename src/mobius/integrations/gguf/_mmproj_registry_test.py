@@ -13,6 +13,7 @@ import pytest
 from mobius.integrations.gguf._mmproj_registry import (
     CLIP_METADATA_SCHEMA,
     LLAMA_CPP_MMPROJ_SHA,
+    MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
     MMProjModality,
     get_projector_spec,
@@ -126,6 +127,50 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         assert spec.real_artifact_ids
         assert all(artifact_id in pins for artifact_id in spec.real_artifact_ids)
         assert all(pins[artifact_id].parity_test for artifact_id in spec.real_artifact_ids)
+
+
+def test_deferred_lfm2_and_pixtral_artifacts_are_immutably_available() -> None:
+    pins = {
+        (pin.projector_type, pin.filename): pin for pin in MMPROJ_ARTIFACT_AVAILABILITY_PINS
+    }
+    assert set(pins) == {
+        ("lfm2", "mmproj-LFM2-VL-1.6B-F16.gguf"),
+        ("lfm2", "mmproj-LFM2-VL-1.6B-Q8_0.gguf"),
+        ("pixtral", "mmproj-pixtral-12b-f16.gguf"),
+        ("pixtral", "mmproj-pixtral-12b-Q8_0.gguf"),
+    }
+    assert {
+        (pin.repository, pin.revision, pin.size, pin.lfs_sha256) for pin in pins.values()
+    } == {
+        (
+            "LiquidAI/LFM2-VL-1.6B-GGUF",
+            "6121de267003bb4d4f325fe10abdc735aee06747",
+            830_339_008,
+            "b637bfa6060be2bc7503ec23ba48b407843d08c2ca83f52be206ea8563ccbae2",
+        ),
+        (
+            "LiquidAI/LFM2-VL-1.6B-GGUF",
+            "6121de267003bb4d4f325fe10abdc735aee06747",
+            564_115_648,
+            "65ec437db88d65fff93f472d00c145e09880769ac67fedff5cd1c0f8d8301d87",
+        ),
+        (
+            "ggml-org/pixtral-12b-GGUF",
+            "cba1ea4420bc2b4f15f50fdec59e30769880a63c",
+            870_070_176,
+            "b4819558d6524a2e5623a06104ee085253a6dfd2b51470c60771ec33976f81bb",
+        ),
+        (
+            "ggml-org/pixtral-12b-GGUF",
+            "cba1ea4420bc2b4f15f50fdec59e30769880a63c",
+            463_091_616,
+            "5504fe00067629053e6f99abac05f628c653a50394f4929bcc185bc80a10daf4",
+        ),
+    }
+    for projector_type in ("lfm2", "pixtral"):
+        spec = get_projector_spec(projector_type)
+        assert not spec.is_importable
+        assert "mapping" in spec.reason or "parity" in spec.reason
 
 
 def test_gemma3_real_artifact_pin_matches_huggingface_api_metadata() -> None:

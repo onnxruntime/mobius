@@ -22,6 +22,7 @@ from mobius.integrations.gguf._arch_registry import (
     iter_arch_specs,
 )
 from mobius.integrations.gguf._mmproj_registry import (
+    MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
     iter_projector_specs,
 )
@@ -396,6 +397,19 @@ def _projector_evidence_table() -> str:
     return "\n".join(rows)
 
 
+def _projector_availability_table() -> str:
+    rows = [
+        "| Candidate route | Immutable available sidecar | Bytes | SHA-256 |",
+        "|---|---|---:|---|",
+    ]
+    for pin in MMPROJ_ARTIFACT_AVAILABILITY_PINS:
+        rows.append(
+            f"| `{pin.projector_type}` | `{pin.repository}@{pin.revision}`<br>"
+            f"`{pin.filename}` | {pin.size:,} | `{pin.lfs_sha256}` |"
+        )
+    return "\n".join(rows)
+
+
 def render_document() -> str:
     """Render the complete concise API document from live registries and evidence."""
     blocks = render_blocks()
@@ -515,6 +529,11 @@ Reason codes are concise user-facing categories; detailed architecture audits re
 ## Multimodal projector sidecars
 
 {_projector_evidence_table()}
+
+These additional immutable files prove artifact availability only. Their routes remain
+implementation work until tensor mapping and component parity are independently established.
+
+{_projector_availability_table()}
 
 <!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->
 

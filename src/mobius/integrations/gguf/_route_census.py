@@ -138,7 +138,7 @@ _ARCHITECTURE_RUNTIME_SCHEMA_BLOCKED = frozenset(
 _ARCHITECTURE_INTENTIONAL_REJECTIONS = frozenset(
     {"bailingmoe2", "dots3note", "exaone-moe", "exaone4", "glm4", "glm4moe"}
 )
-_PROJECTOR_ARTIFACT_UNAVAILABLE = frozenset({"lfm2", "phi4", "pixtral"})
+_PROJECTOR_ARTIFACT_UNAVAILABLE = frozenset({"phi4"})
 
 
 def _architecture_dependencies(spec) -> tuple[str, ...]:

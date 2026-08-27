@@ -65,9 +65,9 @@ def test_every_route_has_one_actionable_classification() -> None:
     assert Counter(item.category for item in items) == {
         "dependency-or-runtime-abi-blocked": 100,
         "evidence-only": 95,
-        "immediately-implementable": 65,
+        "immediately-implementable": 67,
         "intentionally-rejected": 19,
-        "artifact-unavailable": 6,
+        "artifact-unavailable": 4,
     }
 
 
@@ -101,6 +101,8 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
     assert by_id["architecture:plamo2"].category == "dependency-or-runtime-abi-blocked"
     assert "issue #605" in by_id["architecture:plamo2"].dependencies[0]
     assert by_id["projector:qwen2vl_merger"].category == "evidence-only"
+    assert by_id["projector:lfm2"].category == "immediately-implementable"
+    assert by_id["projector:pixtral"].category == "immediately-implementable"
     assert by_id["projector:qwen3tts_gen"].category == "intentionally-rejected"
     assert by_id["tokenizer:llama4"].category == "artifact-unavailable"
     assert "PR #652" in by_id["tokenizer:llama4"].dependencies
