@@ -241,6 +241,8 @@ class GGUFArchitectureSpec:
         v_head_reorder: Whether the converter tiles Gated-DeltaNet V-heads.
         rope_interleave: Whether the architecture rotates adjacent pairs
             (GPT-J style) rather than split-half (NEOX style).
+        preflight_only: Whether exact header/config/tensor evidence exists while
+            graph import is intentionally unavailable.
     """
 
     gguf_arch: str
@@ -264,6 +266,7 @@ class GGUFArchitectureSpec:
     offset_norm: bool = False
     v_head_reorder: bool = False
     rope_interleave: bool = False
+    preflight_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.gguf_arch:
@@ -300,6 +303,15 @@ class GGUFArchitectureSpec:
             raise ValueError(
                 f"{self.gguf_arch!r}: config is {self.config.value} but required "
                 "metadata was declared, which would imply config extraction works"
+            )
+        if self.preflight_only and (
+            self.config is not Support.SUPPORTED
+            or self.tensor_map is not Support.SUPPORTED
+            or self.graph is Support.SUPPORTED
+        ):
+            raise ValueError(
+                f"{self.gguf_arch!r}: preflight_only requires supported config/tensor "
+                "evidence and an unavailable graph route"
             )
 
     @property

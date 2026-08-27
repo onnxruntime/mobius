@@ -877,6 +877,56 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_RECURRENT_RUNTIME_VALIDATION_PENDING,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="qwen4exp",
+        model_type="qwen4_exp_text",
+        tensor_map_recipe=("qwen4exp",),
+        config_key_map="qwen4exp",
+        config_postprocessor="qwen4exp",
+        graph=Support.DEFERRED,
+        preflight_only=True,
+        offset_norm=True,
+        v_head_reorder=True,
+        required_metadata=(
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.layer_norm_rms_epsilon",
+            "attention.compress_ratios",
+            "attention.indexer.head_count",
+            "attention.indexer.key_length",
+            "attention.indexer.top_k",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_feed_forward_length",
+            "hyper_connection.count",
+            "hyper_connection.low_rank",
+            "ple.layers",
+            "ple.ngram_size",
+            "ple.heads_per_ngram",
+            "ple.conv_kernel",
+            "ple.eos_token_id",
+            "ple.layer_multipliers",
+            "ple.head_offsets",
+            "ple.head_vocab_sizes",
+            "embedding_length_per_layer_input",
+            "rope.dimension_sections",
+            "ssm.conv_kernel",
+            "ssm.group_count",
+            "ssm.inner_size",
+            "ssm.state_size",
+            "ssm.time_step_rank",
+        ),
+        quantized_import=Support.REJECTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Exact header/config/tensor preflight is implemented, but no executable "
+            "graph import route is claimed. The published UD-IQ1_S "
+            "payload is rejected: its IQ4_NL PLE table has no native gather ABI, "
+            "mixed IQ1_S/IQ4_NL rank-3 experts have no released mixed sparse-MoE "
+            "ABI/runtime evidence, and float dequantization exceeds bounded memory."
+        ),
+    ),
     # ---------------------------------------------------------------- Gemma
     GGUFArchitectureSpec(
         gguf_arch="gemma",
@@ -2400,9 +2450,10 @@ def _unknown_architecture_message(architecture: str) -> str:
     prefix = f"Unsupported GGUF architecture: {architecture!r}."
     if upstream is None:
         return (
-            f"{prefix} It is not among the {len(upstream_architectures())} "
-            "architectures llama.cpp defines at the pinned commit, so the file is "
-            "either newer than this build of mobius or not a llama.cpp GGUF. "
+            f"{prefix} It is not among the {len(upstream_architectures())} pinned "
+            "GGUF architecture formats (147 from the llama.cpp census plus explicit "
+            "post-census artifact pins), so the file is either newer than this build "
+            "of mobius or not a recognized pinned GGUF. "
             f"Supported: {', '.join(supported_architectures())}."
         )
     if not upstream.cpp_loader:

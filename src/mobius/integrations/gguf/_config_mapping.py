@@ -48,6 +48,7 @@ from mobius._configs import (
     MuseGlimmerConfig,
     NemotronHConfig,
     Plamo2Config,
+    Qwen4ExpConfig,
     _shallow_fields,
 )
 from mobius.integrations.gguf._arch_registry import iter_arch_specs, try_get_arch_spec
@@ -265,6 +266,23 @@ _CONVENTIONAL_SHARED_MOE_KEY_MAP = {
     "leading_dense_block_count": "first_k_dense_replace",
 }
 
+_QWEN4EXP_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "expert_count": "num_local_experts",
+    "expert_used_count": "num_experts_per_tok",
+    "expert_feed_forward_length": "moe_intermediate_size",
+    "expert_shared_feed_forward_length": "shared_expert_intermediate_size",
+    "hyper_connection.count": "hc_count",
+    "hyper_connection.low_rank": "hc_lowrank",
+    "attention.indexer.head_count": "indexer_n_heads",
+    "attention.indexer.key_length": "indexer_head_dim",
+    "attention.indexer.top_k": "indexer_budget",
+    "ple.ngram_size": "ngram_size",
+    "ple.heads_per_ngram": "heads_per_ngram",
+    "ple.conv_kernel": "ple_conv_kernel_size",
+    "ple.eos_token_id": "eos_token_id",
+}
+
 _T5_KEY_MAP = {
     "attention.key_length": "head_dim",
     "attention.relative_buckets_count": "relative_attention_num_buckets",
@@ -294,6 +312,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minicpm": _MINICPM_KEY_MAP,
         "minicpm3": _MINICPM3_KEY_MAP,
         "conventional_shared_moe": _CONVENTIONAL_SHARED_MOE_KEY_MAP,
+        "qwen4exp": _QWEN4EXP_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
 )
@@ -399,7 +418,7 @@ def _extract_config_fields(
     return hf_fields
 
 
-_DELTA_NET_ARCHITECTURES = frozenset({"qwen35", "qwen35moe", "qwen3next"})
+_DELTA_NET_ARCHITECTURES = frozenset({"qwen35", "qwen35moe", "qwen3next", "qwen4exp"})
 
 
 def _nextn_predict_layers(gguf_arch: str, metadata: dict[str, Any]) -> int:
@@ -914,11 +933,16 @@ def gguf_to_config(
             "beta_slow": metadata.get(f"{gguf_arch}.rope.scaling.yarn_beta_slow", 1.0),
         }
 
-    if canonical_arch in {"qwen2vl", "qwen35", "qwen35moe"}:
+    if canonical_arch in {"qwen2vl", "qwen35", "qwen35moe", "qwen4exp"}:
         mrope_section = metadata[f"{gguf_arch}.rope.dimension_sections"]
-        if not isinstance(mrope_section, (list, tuple, np.ndarray)) or len(mrope_section) != 4:
+        expected_sections = 3 if canonical_arch == "qwen4exp" else 4
+        if (
+            not isinstance(mrope_section, (list, tuple, np.ndarray))
+            or len(mrope_section) != expected_sections
+        ):
             raise ValueError(
-                f"{gguf_arch}.rope.dimension_sections must contain exactly four entries"
+                f"{gguf_arch}.rope.dimension_sections must contain exactly "
+                f"{expected_sections} entries"
             )
         mrope_section = [int(value) for value in mrope_section]
         if canonical_arch == "qwen2vl":
@@ -3852,6 +3876,74 @@ def _plm_postprocess(
     )
 
 
+def _qwen4exp_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> Qwen4ExpConfig:
+    """Construct the exact Qwen3.8 Flash-Next text config from GGUF metadata."""
+    arch = model.architecture
+    prefix = f"{arch}."
+    ratios_raw = metadata[f"{prefix}attention.compress_ratios"]
+    if not isinstance(ratios_raw, (list, tuple, np.ndarray)):
+        raise TypeError(f"{prefix}attention.compress_ratios must be an integer array")
+    ratios = [int(value) for value in ratios_raw]
+    if len(ratios) != config.num_hidden_layers:
+        raise ValueError(
+            f"{prefix}attention.compress_ratios must contain exactly "
+            f"{config.num_hidden_layers} entries, got {len(ratios)}"
+        )
+    nonzero_ratios = {value for value in ratios if value > 0}
+    if any(value < 0 for value in ratios) or len(nonzero_ratios) != 1:
+        raise ValueError(
+            f"{prefix}attention.compress_ratios must contain zero for DeltaNet "
+            "layers and one consistent positive QSA ratio"
+        )
+    compress_ratio = nonzero_ratios.pop()
+    layer_types = [
+        "linear_attention" if ratio == 0 else "qwen_sparse_attention" for ratio in ratios
+    ]
+
+    ple_layers_raw = metadata[f"{prefix}ple.layers"]
+    if not isinstance(ple_layers_raw, (list, tuple, np.ndarray)):
+        raise TypeError(f"{prefix}ple.layers must be an integer array")
+    ple_layer_ids = [int(layer) + 1 for layer in ple_layers_raw]
+    if len(set(ple_layer_ids)) != len(ple_layer_ids):
+        raise ValueError(f"{prefix}ple.layers contains duplicate layer indices")
+
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="qwen4_exp_text",
+        layer_types=layer_types,
+        hc_count=int(metadata[f"{prefix}hyper_connection.count"]),
+        hc_lowrank=int(metadata[f"{prefix}hyper_connection.low_rank"]),
+        ple_layer_ids=ple_layer_ids,
+        ple_embed_dim=config.hidden_size,
+        ple_conv_kernel_size=int(metadata[f"{prefix}ple.conv_kernel"]),
+        ngram_size=int(metadata[f"{prefix}ple.ngram_size"]),
+        heads_per_ngram=int(metadata[f"{prefix}ple.heads_per_ngram"]),
+        # These source-owned values are absent from GGUF because its concrete
+        # hash arrays and combined PLE table already embody them.
+        ngram_vocab_size_base=20_000_000,
+        make_ngram_vocab_size_divisible_by=128,
+        seed=1234,
+        split_ngram_parts=128,
+        indexer_n_heads=int(metadata[f"{prefix}attention.indexer.head_count"]),
+        indexer_kv_heads=1,
+        indexer_head_dim=int(metadata[f"{prefix}attention.indexer.key_length"]),
+        indexer_budget=int(metadata[f"{prefix}attention.indexer.top_k"]),
+        indexer_compress_ratio=compress_ratio,
+        output_gate_type="sigmoid",
+        eos_token_id=int(metadata[f"{prefix}ple.eos_token_id"]),
+        mrope_section=[int(value) for value in metadata[f"{prefix}rope.dimension_sections"]],
+        mrope_interleaved=True,
+        norm_topk_prob=True,
+        mtp_num_hidden_layers=0,
+        mtp_use_dedicated_embeddings=False,
+    )
+    return Qwen4ExpConfig(**fields)
+
+
 # Architecture-specific config postprocessors, keyed by the name a
 # :class:`GGUFArchitectureSpec` refers to. Each takes a base ArchitectureConfig
 # + raw metadata and returns an architecture-specific config subclass.
@@ -3905,6 +3997,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "kimi_k3": _kimi_k3_postprocess,
     "minicpm": _minicpm_postprocess,
     "minicpm3": _minicpm3_postprocess,
+    "qwen4exp": _qwen4exp_postprocess,
 }
 
 

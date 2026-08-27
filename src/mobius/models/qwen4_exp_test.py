@@ -360,6 +360,52 @@ def test_preprocess_validates_packed_experts_and_joins_ple_shards():
     assert not any(key.startswith("mtp.") for key in result)
 
 
+def test_preprocess_fuses_exact_gguf_indexer_query_and_key_rows():
+    config = _config()
+    module = Qwen4ExpCausalLMModel(config)
+    prefix = "model.layers.1.self_attn.indexer"
+    query = torch.arange(16 * 16, dtype=torch.float32).reshape(16, 16)
+    key = torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16) + 1000
+
+    result = module.preprocess_weights(
+        {
+            f"{prefix}.index_q_proj.weight": query,
+            f"{prefix}.index_k_proj.weight": key,
+        }
+    )
+
+    fused = result[f"{prefix}.index_qk_proj.weight"]
+    assert fused.shape == (24, 16)
+    torch.testing.assert_close(fused[:16], query)
+    torch.testing.assert_close(fused[16:], key)
+
+
+def test_preprocess_preserves_official_fused_hf_indexer_projection():
+    module = Qwen4ExpCausalLMModel(_config())
+    name = "model.layers.1.self_attn.indexer.index_qk_proj.weight"
+    fused = torch.arange(24 * 16, dtype=torch.float32).reshape(24, 16)
+
+    result = module.preprocess_weights({name: fused})
+
+    assert result[name] is fused
+
+
+def test_preprocess_fails_closed_on_incomplete_or_malformed_gguf_indexer_split():
+    config = _config()
+    module = Qwen4ExpCausalLMModel(config)
+    prefix = "model.layers.1.self_attn.indexer"
+
+    with pytest.raises(ValueError, match=r"missing parts \['k'\]"):
+        module.preprocess_weights({f"{prefix}.index_q_proj.weight": torch.zeros(16, 16)})
+    with pytest.raises(ValueError, match=r"query projection.*expected"):
+        module.preprocess_weights(
+            {
+                f"{prefix}.index_q_proj.weight": torch.zeros(15, 16),
+                f"{prefix}.index_k_proj.weight": torch.zeros(8, 16),
+            }
+        )
+
+
 def test_preprocess_fails_closed_on_noncanonical_packed_or_deterministic_weights():
     config = _config()
     module = Qwen4ExpCausalLMModel(config)

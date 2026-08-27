@@ -182,11 +182,13 @@ def _architectures() -> str:
     for spec in sorted(iter_arch_specs(), key=lambda item: item.gguf_arch):
         aliases = ", ".join(f"`{alias}`" for alias in sorted(spec.aliases)) or "—"
         route_parts = []
-        if spec.is_importable and spec.model_type:
+        if spec.preflight_only:
+            route_parts.append("header/config/tensor preflight only")
+        if (spec.is_importable or spec.preflight_only) and spec.model_type:
             route_parts.append(f"model=`{spec.model_type}`")
         if spec.is_importable and spec.module_type:
             route_parts.append(f"module=`{spec.module_type}`")
-        if spec.is_importable and spec.tensor_map_recipe:
+        if (spec.is_importable or spec.preflight_only) and spec.tensor_map_recipe:
             route_parts.append(
                 "tensor=" + "+".join(f"`{name}`" for name in spec.tensor_map_recipe)
             )
@@ -491,12 +493,10 @@ payload conversion, emits one aggregate warning for lossy requantization, and
 saves the typed result as `quantization_report.json`. Use
 `keep_quantized=False` for explicit float import.
 
-Storage and compute are separate: packed MatMulNBits initializers may use a
-native custom op or a portable inline fallback with nibble unpack,
-`DequantizeLinear`, and float `MatMul`. The fallback does not replace packed
-initializers with dense float storage or promise a particular ORT kernel. Pass
-`mmproj=` only for an evidenced multimodal sidecar. The CLI equivalent is
-`mobius build model.gguf -o output`.
+Packed MatMulNBits storage may use a native op or portable nibble unpack,
+`DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
+Use `mmproj=` only for evidenced sidecars; CLI: `mobius build model.gguf -o output`.
+Split shards validate siblings and ownership; Hub references reject partial downloads.
 
 ## API
 

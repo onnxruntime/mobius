@@ -9,7 +9,7 @@ Support is capability-specific: graph import does not imply runtime packaging.
 
 | Census | Total | Closure |
 |---|---:|---|
-| Architectures | 147 | graph verdicts: {'deferred': 55, 'rejected': 2, 'supported': 90}; importable: 89; quantized import: {'rejected': 31, 'supported': 116}; runtime: {'deferred': 142, 'rejected': 2, 'supported': 3} |
+| Architectures | 148 | graph verdicts: {'deferred': 56, 'rejected': 2, 'supported': 90}; importable: 89; quantized import: {'rejected': 32, 'supported': 116}; runtime: {'deferred': 143, 'rejected': 2, 'supported': 3} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
 | Serialized projector strings | 60 | {'graph-importable': 5, 'runtime-supported': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; route dispositions: {'deferred-compiled-semantics': 45, 'deferred-pinned-artifact-evidence': 12, 'validated-pinned-source': 30} |
@@ -33,12 +33,10 @@ payload conversion, emits one aggregate warning for lossy requantization, and
 saves the typed result as `quantization_report.json`. Use
 `keep_quantized=False` for explicit float import.
 
-Storage and compute are separate: packed MatMulNBits initializers may use a
-native custom op or a portable inline fallback with nibble unpack,
-`DequantizeLinear`, and float `MatMul`. The fallback does not replace packed
-initializers with dense float storage or promise a particular ORT kernel. Pass
-`mmproj=` only for an evidenced multimodal sidecar. The CLI equivalent is
-`mobius build model.gguf -o output`.
+Packed MatMulNBits storage may use a native op or portable nibble unpack,
+`DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
+Use `mmproj=` only for evidenced sidecars; CLI: `mobius build model.gguf -o output`.
+Split shards validate siblings and ownership; Hub references reject partial downloads.
 
 ## API
 
@@ -87,6 +85,7 @@ remain machine-readable in `_route_census.py`; this table groups only shared nex
 | `artifact-unavailable` | `tokenizer-artifact-replacement` | `tokenizer:gpt-4o`, `tokenizer:jina-v1-en` | replacement complete artifact; matching official tokenizer source |
 | `artifact-unavailable` | `tokenizer-artifact-replacement` | `tokenizer:llama4` | replacement complete artifact; matching official tokenizer source; PR #652 |
 | `dependency-or-runtime-abi-blocked` | `architecture-abi-dependencies` | `architecture:falcon-h1`, `architecture:granitehybrid`, `architecture:jamba`, `architecture:kimi-k3`, `architecture:kimi-linear`, `architecture:minimax-01`, `architecture:nemotron_h_moe`, `architecture:plamo2` | ORT GenAI heterogeneous-state schema (issue #605); stateful runtime package parity |
+| `dependency-or-runtime-abi-blocked` | `architecture-abi-dependencies` | `architecture:qwen4exp` | dedicated graph topology; cache/state contract; synthetic parity |
 | `dependency-or-runtime-abi-blocked` | `architecture-abi-dependencies` | `architecture:afmoe`, `architecture:arwkv7`, `architecture:bailingmoe3`, `architecture:chameleon`, `architecture:cogvlm`, `architecture:cohere2moe`, `architecture:deepseek2`, `architecture:deepseek2-ocr`, `architecture:deepseek32`, `architecture:deepseek4`, `architecture:gemma3n`, `architecture:gemma4-assistant`, `architecture:gpt-oss`, `architecture:granite_swa`, `architecture:graniteswitch`, `architecture:hunyuan_vl`, `architecture:hy_v3`, `architecture:laguna`, `architecture:llama4`, `architecture:mellum`, `architecture:mimo2`, `architecture:minimax-m3`, `architecture:mistral3`, `architecture:nanbeige`, `architecture:paddleocr`, `architecture:plamo3`, `architecture:pockettts`, `architecture:qwen3tts`, `architecture:qwen3vl`, `architecture:qwen3vlmoe`, `architecture:rwkv6`, `architecture:rwkv6qwen2`, `architecture:rwkv7`, `architecture:step35`, `architecture:wavtokenizer-dec` | exact metadata extraction; tensor closure; dedicated graph and parity |
 | `dependency-or-runtime-abi-blocked` | `mtp-specialized-abi` | `mtp:bailingmoe3`, `mtp:cohere2moe`, `mtp:deepseek2`, `mtp:deepseek32`, `mtp:deepseek4`, `mtp:glm-dsa`, `mtp:hy_v3`, `mtp:mimo2`, `mtp:nemotron_h_moe`, `mtp:qwen35moe`, `mtp:qwen3next`, `mtp:step35` | specialized sidecar graph; routed/cache state ABI |
 | `dependency-or-runtime-abi-blocked` | `tokenizer-compiled-semantics` | `tokenizer:afmoe`, `tokenizer:bloom`, `tokenizer:chameleon`, `tokenizer:codeshell`, `tokenizer:command-r`, `tokenizer:dbrx`, `tokenizer:deepseek-coder`, `tokenizer:deepseek-llm`, `tokenizer:deepseek-v3`, `tokenizer:default`, `tokenizer:exaone`, `tokenizer:exaone-moe`, `tokenizer:falcon`, `tokenizer:gpt3-finnish`, `tokenizer:granite-docling`, `tokenizer:granite-embed-multi-97m`, `tokenizer:grok-2`, `tokenizer:hunyuan`, `tokenizer:hunyuan-dense`, `tokenizer:jais`, `tokenizer:jais-2`, `tokenizer:joyai-llm`, `tokenizer:kimi-k2`, `tokenizer:laguna`, `tokenizer:megrez`, `tokenizer:mellum2`, `tokenizer:minerva-7b`, `tokenizer:minicpm5`, `tokenizer:minimax-m2`, `tokenizer:mpt`, `tokenizer:olmo`, `tokenizer:poro-chat`, `tokenizer:refact`, `tokenizer:sarvam-moe`, `tokenizer:seed-coder`, `tokenizer:smaug-bpe`, `tokenizer:solar-open`, `tokenizer:stablelm2`, `tokenizer:starcoder`, `tokenizer:superbpe`, `tokenizer:tekken`, `tokenizer:trillion`, `tokenizer:viking`, `tokenizer:whitespace`, `tokenizer:youtu` | compiled pinned llama.cpp oracle; dispatch-equivalence fixture |
@@ -275,6 +274,7 @@ Reason codes are concise user-facing categories; detailed architecture audits re
 | `qwen3tts` | — | none (fails before config extraction) | not claimed | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | CONFIG_DEFERRED — The primary GGUF is only a transformed Qwen3-TTS talker backbone, not the existing Mobius Qwen3TTS conditional-generation or codec model. |
 | `qwen3vl` | — | none (fails before config extraction) | exact-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | CONFIG_DEFERRED — Qwen3-VL text GGUF requires multimodal position IDs and an exact qwen3vl_merger clip companion, including deep-stack vision features and architecture-specific token placement. |
 | `qwen3vlmoe` | — | none (fails before config extraction) | exact-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | CONFIG_DEFERRED — Qwen3-VL-MoE combines the Qwen3-VL multimodal position/token contract and merger sidecar with routed experts in the text backbone. |
+| `qwen4exp` | — | header/config/tensor preflight only; model=`qwen4_exp_text`; tensor=`qwen4exp` | exact pinned 3-shard artifact header closure | config=supported; tensor_map=supported; graph=deferred; runtime=deferred; quantized_import=rejected | GRAPH_DEFERRED — Exact header/config/tensor preflight is implemented, but no executable graph import route is claimed. |
 | `refact` | — | model=`refact`; module=`gguf_legacy`; tensor=`legacy_layernorm` | audited-direct-loader-conditional-union | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=rejected | RUNTIME_EVIDENCE_PENDING / FLOAT_IMPORT_ONLY — Import is narrowed to split, bias-free dense tensors with one KV head; loaded-but-unexecuted expert, RoPE-factor, and bias families are rejected. |
 | `rnd1` | — | model=`llada`; module=`rnd1`; tensor=`llama`+`diffusion_fused_qkv`+`moe_qk_norm_extras`+`moe_extras` | not claimed | config=supported; tensor_map=supported; graph=supported; runtime=deferred; quantized_import=supported | RUNTIME_EVIDENCE_PENDING — Config extraction, suffix-exact tensor closure, masked-diffusion task dispatch, and synthetic full-sequence execution are covered, but no pinned real GGUF has passed independent Hugging Face/llama.cpp masked-step logit parity and deterministic multi-step generation parity. |
 | `rwkv6` | — | none (fails before config extraction) | audited-direct-loader-conditional-union | config=deferred; tensor_map=deferred; graph=deferred; runtime=deferred; quantized_import=supported | CONFIG_DEFERRED — RWKV6 carries two F32 states per layer (two token-shift vectors and a per-head WKV matrix) and applies token-dependent exp(-exp(decay)), a time_first read-before-update term, per-head group norm, and cumulative rescale transforms. |

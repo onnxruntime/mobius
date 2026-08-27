@@ -40,6 +40,7 @@ __all__ = [
     "GgufShardSet",
     "ShardInfo",
     "GgufShardManifest",
+    "MAX_GGUF_SHARD_COUNT",
     "discover_gguf_shards",
     "parse_shard_filename",
     "open_gguf_model",
@@ -59,6 +60,8 @@ import numpy as np
 from mobius.integrations.gguf._reader import GGUFModel
 
 logger = logging.getLogger(__name__)
+
+MAX_GGUF_SHARD_COUNT = 1024
 
 #: ``<name>-<index>-of-<count>.gguf`` where index/count are five-digit,
 #: one-based. Matches the llama.cpp ``SHARD_NAME_FORMAT`` and the reader's
@@ -152,7 +155,7 @@ def discover_gguf_shards(path: str | Path) -> list[Path]:
 def _discover_in_directory(directory: Path) -> list[Path]:
     groups: dict[tuple[str, int], list[Path]] = {}
     single_files: list[Path] = []
-    for candidate in sorted(directory.glob("*.gguf")):
+    for candidate in _gguf_files(directory):
         parsed = parse_shard_filename(candidate.name)
         if parsed is None:
             single_files.append(candidate)
@@ -169,6 +172,11 @@ def _discover_in_directory(directory: Path) -> list[Path]:
             f"{directory} contains multiple non-sharded .gguf files "
             f"{[f.name for f in single_files]}; specify one explicitly."
         )
+    if single_files:
+        raise GgufShardError(
+            f"{directory} contains both GGUF split sets and standalone files "
+            f"{[f.name for f in single_files]}; specify one file explicitly."
+        )
     if len(groups) > 1:
         summaries = ", ".join(f"{prefix}-*-of-{count:05d}" for prefix, count in sorted(groups))
         raise GgufShardError(
@@ -181,11 +189,11 @@ def _discover_in_directory(directory: Path) -> list[Path]:
 
 def _collect_shard_group(directory: Path, prefix: str, count: int) -> list[Path]:
     """Collect and order the ``count`` shards named ``<prefix>-i-of-count``."""
-    if count < 1:
+    if count < 1 or count > MAX_GGUF_SHARD_COUNT:
         raise GgufShardError(f"Invalid shard count {count} in split filename")
 
     by_index: dict[int, Path] = {}
-    for candidate in directory.glob(f"{glob_escape(prefix)}-*-of-{count:05d}.gguf"):
+    for candidate in _gguf_files(directory):
         parsed = parse_shard_filename(candidate.name)
         if parsed is None:
             continue
@@ -215,11 +223,13 @@ def _collect_shard_group(directory: Path, prefix: str, count: int) -> list[Path]
     return [by_index[i] for i in range(1, count + 1)]
 
 
-def glob_escape(value: str) -> str:
-    """Escape glob metacharacters in a literal filename prefix."""
-    # ``pathlib.Path.glob`` uses fnmatch semantics; escape the wildcard set so a
-    # prefix containing ``[`` / ``*`` / ``?`` is matched literally.
-    return re.sub(r"([\[\]\*\?])", r"[\1]", value)
+def _gguf_files(directory: Path) -> list[Path]:
+    """List GGUF files with suffix matching independent of filesystem casing."""
+    return sorted(
+        candidate
+        for candidate in directory.iterdir()
+        if candidate.is_file() and candidate.suffix.lower() == ".gguf"
+    )
 
 
 @dataclass(frozen=True)
@@ -340,6 +350,14 @@ class GgufShardSet:
         self._shards = [shards[i] for i in order]
         self._infos = [self._infos[i] for i in order]
         self._primary = self._shards[0]
+        self._identity_paths = [Path(shard._path) for shard in self._shards]
+        # Validate primary authority before exposing any tensor access. Delaying
+        # this until ``metadata`` is first read would let callers consume a
+        # malformed continuation-only semantic override.
+        self._metadata: dict[str, Any] | None = _merge_metadata(
+            self._infos,
+            self._shards,
+        )
 
         # Combined, order-preserving tensor index: name -> owning shard.
         self._owner: dict[str, GGUFModel] = {}
@@ -380,11 +398,23 @@ class GgufShardSet:
 
     @property
     def metadata(self) -> dict[str, Any]:
-        """Model key-value metadata (from the primary shard)."""
-        return self._primary.metadata
+        """Deterministically merged metadata from every shard.
+
+        Split bookkeeping is canonicalized to the logical set: ``split.no``
+        remains zero while ``split.count`` and ``split.tensors.count`` describe
+        the complete model. All other repeated keys must have identical values.
+        """
+        if self._metadata is None:
+            self._metadata = _merge_metadata(self._infos, self._shards)
+        return self._metadata
 
     def get_metadata(self, key: str, default: Any = None) -> Any:
-        return self._primary.get_metadata(key, default)
+        return self.metadata.get(key, default)
+
+    @property
+    def format_version(self) -> int:
+        """GGUF container version shared by all shards."""
+        return self._primary.format_version
 
     @property
     def tensor_names(self) -> list[str]:
@@ -400,6 +430,11 @@ class GgufShardSet:
         for shard in self._shards:
             records.extend(shard.reader_tensors())
         return records
+
+    @property
+    def is_little_endian(self) -> bool:
+        """Whether every shard stores tensor payloads in little-endian order."""
+        return all(shard.is_little_endian for shard in self._shards)
 
     def tensor_items(self) -> Iterator[tuple[str, np.ndarray]]:
         for shard in self._shards:
@@ -423,6 +458,27 @@ class GgufShardSet:
             raise KeyError(f"Tensor {name!r} not found in split set.")
         return shard.get_tensor_type(name)
 
+    def get_tensor_shape(self, name: str) -> tuple[int, ...]:
+        """Get a tensor's logical numpy shape from its owning shard."""
+        shard = self._owner.get(name)
+        if shard is None:
+            raise KeyError(f"Tensor {name!r} not found in split set.")
+        return shard.get_tensor_shape(name)
+
+    def tensor_storage_range(self, name: str) -> tuple[int, int, str]:
+        """Get a tensor's byte range within its owning shard."""
+        shard = self._owner.get(name)
+        if shard is None:
+            raise KeyError(f"Tensor {name!r} not found in split set.")
+        return shard.tensor_storage_range(name)
+
+    def _tensor_source(self, name: str) -> tuple[Path, int, Any]:
+        """Return the owning path, data-section offset, and reader record."""
+        shard = self._owner.get(name)
+        if shard is None:
+            raise KeyError(f"Tensor {name!r} not found in split set.")
+        return shard._tensor_source(name)
+
     def dequantize_raw_tensor(
         self,
         raw_data: np.ndarray,
@@ -441,6 +497,27 @@ class GgufShardSet:
     @property
     def shard_paths(self) -> list[Path]:
         return [Path(shard._path) for shard in self._shards]
+
+    @property
+    def identity_paths(self) -> list[Path]:
+        """Regular files used for immutable identity hashing, in shard order."""
+        return list(self._identity_paths)
+
+    def _set_identity_paths(self, paths: list[Path]) -> None:
+        """Bind trusted regular-file aliases of the opened shard sources."""
+        if len(paths) != len(self._paths):
+            raise ValueError(
+                f"Expected {len(self._paths)} shard identity paths, got {len(paths)}."
+            )
+        ordered: list[Path] = []
+        for shard, candidate in zip(self._shards, paths):
+            original = Path(shard._path)
+            if not original.samefile(candidate):
+                raise ValueError(
+                    f"Identity path does not name the opened shard {original.name!r}."
+                )
+            ordered.append(candidate)
+        self._identity_paths = ordered
 
     def source_matches_path(self) -> bool:
         """Return whether every shard still names the exact file that was opened."""
@@ -479,11 +556,17 @@ def _build_shard_infos(
     infos: list[ShardInfo] = []
     for path, shard in zip(paths, shards):
         parsed = parse_shard_filename(path.name)
+        split_no = _int_or_none(shard.get_metadata(_SPLIT_NO))
+        split_count = _int_or_none(shard.get_metadata(_SPLIT_COUNT))
         if parsed is None:
-            raise GgufShardError(
-                f"{path.name!r} is not a ``-000i-of-000N.gguf`` shard filename"
-            )
-        _prefix, index, count = parsed
+            if split_no is None or split_count is None:
+                raise GgufShardError(
+                    f"{path.name!r} is not a ``-000i-of-000N.gguf`` shard filename "
+                    "and lacks authoritative split.no/split.count metadata."
+                )
+            index, count = split_no + 1, split_count
+        else:
+            _prefix, index, count = parsed
         size_bytes = path.stat().st_size
 
         expected_size = (expected_sizes or {}).get(path.name)
@@ -509,8 +592,8 @@ def _build_shard_infos(
                 path=path,
                 filename_index=index,
                 filename_count=count,
-                split_no=_int_or_none(shard.get_metadata(_SPLIT_NO)),
-                split_count=_int_or_none(shard.get_metadata(_SPLIT_COUNT)),
+                split_no=split_no,
+                split_count=split_count,
                 split_tensors_count=_int_or_none(shard.get_metadata(_SPLIT_TENSORS_COUNT)),
                 size_bytes=size_bytes,
                 tensor_count=shard.num_tensors,
@@ -533,6 +616,16 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
     """Fail closed on any structural inconsistency in the split set."""
     n = len(infos)
     filename_count = infos[0].filename_count
+    prefixes = {
+        parsed[0]
+        for info in infos
+        if (parsed := parse_shard_filename(info.path.name)) is not None
+    }
+    if len(prefixes) > 1:
+        raise GgufShardError(
+            f"Shard filenames have inconsistent basenames {sorted(prefixes)}; "
+            "the files belong to different split sets."
+        )
     if any(info.filename_count != filename_count for info in infos):
         counts = sorted({info.filename_count for info in infos})
         raise GgufShardError(
@@ -545,35 +638,49 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
         )
 
     # Authoritative split.count metadata must agree with the filename count.
-    declared_counts = {info.split_count for info in infos if info.split_count is not None}
-    if declared_counts and declared_counts != {filename_count}:
+    missing_counts = [info.path.name for info in infos if info.split_count is None]
+    if missing_counts:
+        raise GgufShardError(
+            f"Every shard must declare split.count; missing from {missing_counts}."
+        )
+    declared_counts = {info.split_count for info in infos}
+    if declared_counts != {filename_count}:
         raise GgufShardError(
             f"GGUF split.count metadata {sorted(declared_counts)} disagrees with the "
             f"{filename_count}-shard filenames; mixed or corrupt split set."
         )
 
     # split.no must be a contiguous 0..count-1 permutation when present.
+    missing_nos = [info.path.name for info in infos if info.split_no is None]
+    if missing_nos:
+        raise GgufShardError(f"Every shard must declare split.no; missing from {missing_nos}.")
     split_nos = [info.split_no for info in infos]
-    if all(s is not None for s in split_nos):
-        if sorted(split_nos) != list(range(n)):
-            raise GgufShardError(
-                f"GGUF split.no values {sorted(split_nos)} are not the contiguous "
-                f"set 0..{n - 1} (missing, duplicate, or mixed shards)."
-            )
-    else:
-        # Fall back to filename indices, which must be the contiguous 1..count.
-        indices = sorted(info.filename_index for info in infos)
-        if indices != list(range(1, n + 1)):
-            raise GgufShardError(
-                f"Shard filename indices {indices} are not the contiguous set "
-                f"1..{n} and no split.no metadata is present to recover order."
-            )
+    if sorted(split_nos) != list(range(n)):
+        raise GgufShardError(
+            f"GGUF split.no values {sorted(split_nos)} are not the contiguous "
+            f"set 0..{n - 1} (missing, duplicate, or mixed shards)."
+        )
+    mismatched_nos = [
+        (info.path.name, info.filename_index, info.split_no)
+        for info in infos
+        if info.split_no != info.filename_index - 1
+    ]
+    if mismatched_nos:
+        raise GgufShardError(
+            f"Shard filename indices do not match their split.no metadata: {mismatched_nos}."
+        )
 
     # split.tensors.count (total across the set) must agree everywhere and equal
     # the observed tensor total.
-    declared_tensor_totals = {
-        info.split_tensors_count for info in infos if info.split_tensors_count is not None
-    }
+    missing_tensor_totals = [
+        info.path.name for info in infos if info.split_tensors_count is None
+    ]
+    if missing_tensor_totals:
+        raise GgufShardError(
+            "Every shard must declare split.tensors.count; missing from "
+            f"{missing_tensor_totals}."
+        )
+    declared_tensor_totals = {info.split_tensors_count for info in infos}
     observed_total = sum(info.tensor_count for info in infos)
     if len(declared_tensor_totals) > 1:
         raise GgufShardError(
@@ -588,7 +695,21 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
         )
 
     _validate_identity(infos, shards)
+    _validate_container_compatibility(infos, shards)
     _validate_offsets(infos, shards)
+
+
+def _validate_container_compatibility(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
+    """Require one GGUF version and byte order across the complete set."""
+    versions = {shard.format_version for shard in shards}
+    if len(versions) != 1:
+        raise GgufShardError(
+            f"Shards use incompatible GGUF container versions {sorted(versions)}."
+        )
+    endian_values = {shard.is_little_endian for shard in shards}
+    if len(endian_values) != 1:
+        names = [info.path.name for info in infos]
+        raise GgufShardError(f"Shards use mixed byte order across {names}.")
 
 
 def _validate_identity(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
@@ -619,6 +740,54 @@ def _validate_identity(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
                 )
 
 
+def _merge_metadata(infos: list[ShardInfo], shards: list[GGUFModel]) -> dict[str, Any]:
+    """Use primary semantics and reject continuation-only metadata injection."""
+    if not shards:
+        raise GgufShardError("Cannot merge metadata from an empty GGUF shard set.")
+    merged: dict[str, Any] = {}
+    owners: dict[str, str] = {}
+    primary_info = infos[0]
+    primary_metadata = shards[0].metadata
+    for key, value in primary_metadata.items():
+        if key == _SPLIT_NO:
+            continue
+        merged[key] = value
+        owners[key] = primary_info.path.name
+
+    for info, shard in zip(infos[1:], shards[1:]):
+        for key, value in shard.metadata.items():
+            if key in {_SPLIT_NO, _SPLIT_COUNT, _SPLIT_TENSORS_COUNT}:
+                continue
+            # gguf-py exposes container-local pseudo fields alongside serialized
+            # metadata. Only primary pseudo fields describe the logical model.
+            if key.startswith("GGUF."):
+                continue
+            if key not in primary_metadata:
+                raise GgufShardError(
+                    f"Continuation shard {info.path.name} declares semantic metadata "
+                    f"key {key!r} that is absent from authoritative primary shard "
+                    f"{primary_info.path.name}; refusing continuation-only metadata."
+                )
+            if not _metadata_values_equal(primary_metadata[key], value):
+                raise GgufShardError(
+                    f"Shards disagree on metadata key {key!r}: "
+                    f"{merged[key]!r} in {owners[key]} versus {value!r} "
+                    f"in {info.path.name}."
+                )
+    merged[_SPLIT_NO] = 0
+    merged[_SPLIT_COUNT] = len(shards)
+    merged[_SPLIT_TENSORS_COUNT] = sum(info.tensor_count for info in infos)
+    merged["GGUF.tensor_count"] = sum(info.tensor_count for info in infos)
+    return merged
+
+
+def _metadata_values_equal(left: Any, right: Any) -> bool:
+    """Compare parsed metadata values, including numpy-backed unknown fields."""
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return bool(np.array_equal(left, right))
+    return bool(left == right)
+
+
 def _validate_offsets(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
     """Reject shards whose tensor table points outside the file (corruption)."""
     for info, shard in zip(infos, shards):
@@ -643,6 +812,7 @@ def _validate_offsets(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
 def open_gguf_model(
     path: str | Path,
     *,
+    shard_paths: list[str | Path] | None = None,
     verify_checksums: bool = False,
     expected_sha256: dict[str, str] | None = None,
     expected_sizes: dict[str, int] | None = None,
@@ -653,8 +823,18 @@ def open_gguf_model(
     (or a directory holding a single split set); otherwise a plain
     :class:`GGUFModel`. Callers get the same interface either way.
     """
-    shards = discover_gguf_shards(path)
-    if len(shards) == 1:
+    if shard_paths is None:
+        shard_paths = getattr(path, "shard_paths", None)
+    if expected_sha256 is None:
+        expected_sha256 = getattr(path, "expected_sha256", None)
+    if expected_sizes is None:
+        expected_sizes = getattr(path, "expected_sizes", None)
+    shards = (
+        [Path(shard_path) for shard_path in shard_paths]
+        if shard_paths is not None
+        else discover_gguf_shards(path)
+    )
+    if len(shards) == 1 and shard_paths is None:
         single = shards[0]
         # A lone ``-00001-of-00001`` file is a degenerate single-shard set;
         # treat it as a plain file. GGUFModel still validates it.

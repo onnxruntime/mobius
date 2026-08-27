@@ -170,8 +170,10 @@ def _architecture_items() -> list[GGUFRouteWorkItem]:
             category: RouteCategory = "intentionally-rejected"
             batch = "policy-rejections"
             dependencies = ("policy change plus independent correctness proof",)
-        elif spec.gguf_arch in (
-            _ARCHITECTURE_ABI_BLOCKED | _ARCHITECTURE_RUNTIME_SCHEMA_BLOCKED
+        elif (
+            spec.gguf_arch
+            in (_ARCHITECTURE_ABI_BLOCKED | _ARCHITECTURE_RUNTIME_SCHEMA_BLOCKED)
+            or spec.preflight_only
         ):
             category = "dependency-or-runtime-abi-blocked"
             batch = "architecture-abi-dependencies"

@@ -127,6 +127,8 @@ def _write_quantized_gguf(
     float_type: str = "f32",
     fused_qkv: bool = False,
     fused_qkv_float: bool = False,
+    split_max_tensors: int = 0,
+    small_first_shard: bool = False,
 ) -> None:
     """Write a GGUF file with quantized projection weights.
 
@@ -136,7 +138,13 @@ def _write_quantized_gguf(
     """
     from gguf import GGMLQuantizationType, GGUFWriter
 
-    writer = GGUFWriter(str(path), architecture)
+    writer_path = path.with_suffix("") if split_max_tensors else path
+    writer = GGUFWriter(
+        str(writer_path),
+        architecture,
+        split_max_tensors=split_max_tensors,
+        small_first_shard=small_first_shard,
+    )
     writer.add_context_length(512)
     writer.add_embedding_length(hidden_size)
     writer.add_feed_forward_length(intermediate_size)
@@ -3155,6 +3163,24 @@ class TestBuildQuantizedGguf:
             f"Expected MatMulNBits in ops, got: {sorted(op_types)}"
         )
 
+    def test_sharded_quantized_build_preserves_matmulnbits(self, tmp_path: Path):
+        """A metadata-only primary and split Q4 payloads use the normal packed path."""
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        stem = tmp_path / "split-q4.gguf"
+        _write_quantized_gguf(
+            stem,
+            split_max_tensors=4,
+            small_first_shard=True,
+        )
+        shards = sorted(tmp_path.glob("split-q4-*.gguf"))
+        assert len(shards) > 1
+        assert GGUFModel(shards[0]).num_tensors == 0
+
+        model = build_from_gguf(shards[-1], keep_quantized=True)["model"]
+        assert any(node.op_type == "MatMulNBits" for node in model.graph)
+
     def test_default_quantized_package_save_reload(self, q4_0_gguf: Path, tmp_path: Path):
         """Default quantized ops and weights survive ModelPackage persistence."""
         from mobius._model_package import ModelPackage
@@ -4917,7 +4943,7 @@ class TestLanguageDiffusionDispatch:
         import mobius.integrations.gguf._builder as builder
         import mobius.integrations.gguf._shard_set as shard_set
 
-        monkeypatch.setattr(builder, "_resolve_gguf_path", lambda path: path)
+        monkeypatch.setattr(builder, "_resolve_gguf_path", lambda path, *_args: path)
         monkeypatch.setattr(builder, "_validate_gguf_model", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(builder, "_has_quantized_weights", lambda *_args: False)
         monkeypatch.setattr(shard_set, "open_gguf_model", _DreamGGUF)
@@ -8316,6 +8342,52 @@ class TestGGUFPreflightGuards:
                 == commit_hash
             )
 
+    def test_truncated_split_value_falls_back_to_pinned_download(self) -> None:
+        from mobius.integrations.gguf._builder import _preflight_hf_gguf_file
+
+        key = b"split.count"
+        truncated = b"".join(
+            [
+                b"GGUF",
+                struct.pack("<I", 3),
+                struct.pack("<Q", 0),
+                struct.pack("<Q", 1),
+                struct.pack("<Q", len(key)),
+                key,
+                struct.pack("<I", 4),
+                # UINT32 value deliberately omitted at the bounded range edge.
+            ]
+        )
+        response = mock.MagicMock()
+        response.iter_bytes.return_value = [truncated]
+        response_context = mock.MagicMock()
+        response_context.__enter__.return_value = response
+        session = mock.MagicMock()
+        session.stream.return_value = response_context
+        commit_hash = "1" * 40
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_hf_file_metadata",
+                return_value=SimpleNamespace(
+                    commit_hash=commit_hash,
+                    location="https://cdn.example/model.gguf",
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._builder.get_session",
+                return_value=session,
+            ),
+        ):
+            assert (
+                _preflight_hf_gguf_file(
+                    "example/generic",
+                    "model.gguf",
+                    revision="main",
+                )
+                == commit_hash
+            )
+
     @pytest.mark.parametrize(
         "preflight_error",
         [
@@ -8341,18 +8413,22 @@ class TestGGUFPreflightGuards:
 
         download.assert_not_called()
 
-    def test_remote_shard_fails_before_hub_calls(self):
+    def test_remote_incomplete_shard_fails_before_preflight_or_download(self):
         from mobius.integrations.gguf._builder import _resolve_gguf_path
 
         filename = "BF16/model-00001-of-00002.gguf"
         with (
             mock.patch("mobius.integrations.gguf._builder.HfApi") as api_type,
             mock.patch("mobius.integrations.gguf._builder.hf_hub_download") as download,
-            pytest.raises(NotImplementedError, match="shard 1 of 2"),
+            mock.patch(
+                "mobius.integrations.gguf._builder._preflight_hf_gguf_file"
+            ) as preflight,
+            pytest.raises(ValueError, match=r"Incomplete.*00002"),
         ):
+            api_type.return_value.list_repo_files.return_value = [filename]
             _resolve_gguf_path(f"owner/repo:{filename}")
 
-        api_type.return_value.model_info.assert_not_called()
+        preflight.assert_not_called()
         download.assert_not_called()
 
     def test_local_split_metadata_is_rejected(self):

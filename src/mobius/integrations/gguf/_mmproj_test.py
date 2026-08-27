@@ -27,6 +27,23 @@ _PATCH_SIZE = 4
 _POS_EMB_SIZE = 8
 _TEXT_HIDDEN = 32
 
+
+def test_text_gguf_opener_preserves_resolved_shard_manifest(monkeypatch):
+    from mobius.integrations.gguf import _mmproj, _shard_set
+
+    resolved = SimpleNamespace(
+        shard_paths=["a.gguf", "b.gguf"],
+        expected_sha256={"a.gguf": "a" * 64, "b.gguf": "b" * 64},
+        expected_sizes={"a.gguf": 1, "b.gguf": 2},
+    )
+    opened = object()
+    open_model = mock.Mock(return_value=opened)
+    monkeypatch.setattr(_shard_set, "open_gguf_model", open_model)
+
+    assert _mmproj._open_text_gguf(resolved) is opened
+    open_model.assert_called_once_with(resolved)
+
+
 # Small synthetic audio encoder dimensions.
 _AUDIO_HIDDEN = 16
 _AUDIO_FFN = 32

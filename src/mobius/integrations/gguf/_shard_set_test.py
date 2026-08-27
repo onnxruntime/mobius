@@ -10,8 +10,11 @@ metadata only on the primary shard). No real weights are downloaded.
 
 from __future__ import annotations
 
+import hashlib
 import tracemalloc
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -21,10 +24,15 @@ from mobius.integrations.gguf._shard_set import (
     GgufShardError,
     GgufShardManifest,
     GgufShardSet,
+    _merge_metadata,
     discover_gguf_shards,
     open_gguf_model,
     parse_shard_filename,
 )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _tensor_names(num_layers: int) -> list[str]:
@@ -48,6 +56,7 @@ def _write_sharded_gguf(
     cols: int = 16,
     name_override: str | None = None,
     seed: int = 0,
+    small_first_shard: bool = False,
 ) -> list[Path]:
     """Write a synthetic split GGUF set and return its shard paths in order.
 
@@ -58,7 +67,10 @@ def _write_sharded_gguf(
 
     directory.mkdir(parents=True, exist_ok=True)
     writer = GGUFWriter(
-        str(directory / stem), architecture, split_max_tensors=split_max_tensors
+        str(directory / stem),
+        architecture,
+        split_max_tensors=split_max_tensors,
+        small_first_shard=small_first_shard,
     )
     writer.add_context_length(128)
     writer.add_embedding_length(cols)
@@ -156,6 +168,26 @@ def test_happy_path_reads_all_tensors(tmp_path, split_max_tensors):
             single_reads[name] = gm.get_tensor(name)
     for name in model.tensor_names:
         np.testing.assert_array_equal(model.get_tensor(name), single_reads[name])
+    assert [name for name, _ in model.tensor_items()] == model.tensor_names
+
+
+def test_metadata_only_first_shard_is_assembled(tmp_path):
+    shards = _write_sharded_gguf(
+        tmp_path,
+        split_max_tensors=3,
+        small_first_shard=True,
+    )
+    assert GGUFModel(shards[0]).num_tensors == 0
+
+    model = open_gguf_model(shards[0])
+    assert isinstance(model, GgufShardSet)
+    assert model.num_tensors == len(_tensor_names(3))
+    assert model.metadata["split.no"] == 0
+    assert model.metadata["split.count"] == len(shards)
+    assert model.metadata["split.tensors.count"] == len(_tensor_names(3))
+    assert model.format_version == 3
+    assert model.is_little_endian
+    assert model.get_tensor_shape("token_embd.weight") == (8, 16)
 
 
 def test_tensors_split_across_files(tmp_path):
@@ -180,11 +212,46 @@ def test_order_independence(tmp_path):
         assert other.manifest.split_count == ref.manifest.split_count
 
 
+def test_uppercase_gguf_suffix_discovers_complete_set_on_case_sensitive_filesystems(
+    tmp_path,
+):
+    shards = _write_sharded_gguf(tmp_path, split_max_tensors=3)
+    uppercase = []
+    for shard in shards:
+        renamed = shard.with_suffix(".GGUF")
+        shard.rename(renamed)
+        uppercase.append(renamed)
+
+    model = open_gguf_model(uppercase[1])
+
+    assert isinstance(model, GgufShardSet)
+    assert model.num_tensors == len(_tensor_names(3))
+
+
+def test_local_shard_count_is_bounded_before_sibling_allocation(tmp_path):
+    path = tmp_path / "model-00001-of-01025.gguf"
+    path.write_bytes(b"")
+
+    with pytest.raises(GgufShardError, match=r"Invalid shard count 1025"):
+        discover_gguf_shards(path)
+
+
 def test_open_directory(tmp_path):
     _write_sharded_gguf(tmp_path, split_max_tensors=3)
     model = open_gguf_model(tmp_path)  # a directory holding one split set
     assert isinstance(model, GgufShardSet)
     assert model.num_tensors == len(_tensor_names(3))
+
+
+def test_open_directory_rejects_split_set_mixed_with_standalone_file(tmp_path):
+    _write_sharded_gguf(tmp_path, split_max_tensors=3)
+    _write_single_gguf(tmp_path, stem="standalone")
+
+    with pytest.raises(
+        GgufShardError,
+        match=r"both GGUF split sets and standalone files",
+    ):
+        open_gguf_model(tmp_path)
 
 
 def test_discover_confined_to_directory(tmp_path):
@@ -250,6 +317,45 @@ def test_duplicate_tensor_across_shards_rejected(tmp_path):
     shards[2].write_bytes(shards[1].read_bytes())
     with pytest.raises(GgufShardError):
         open_gguf_model(shards[0])
+
+
+def _write_manual_split(
+    directory: Path,
+    *,
+    split_counts: tuple[int, int] = (2, 2),
+    tensor_names: tuple[str, str] = ("left", "right"),
+) -> list[Path]:
+    from gguf import GGUFWriter
+
+    paths: list[Path] = []
+    for split_no in range(2):
+        path = directory / f"manual-{split_no + 1:05d}-of-00002.gguf"
+        writer = GGUFWriter(str(path), "llama")
+        writer.add_uint16("split.no", split_no)
+        writer.add_uint16("split.count", split_counts[split_no])
+        writer.add_uint64("split.tensors.count", 2)
+        writer.add_tensor(
+            tensor_names[split_no],
+            np.full((2, 2), split_no + 1, dtype=np.float32),
+        )
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+        paths.append(path)
+    return paths
+
+
+def test_split_count_metadata_mismatch_rejected(tmp_path):
+    paths = _write_manual_split(tmp_path, split_counts=(2, 3))
+    with pytest.raises(GgufShardError, match=r"split\.count"):
+        open_gguf_model(paths[0])
+
+
+def test_actual_duplicate_tensor_names_rejected(tmp_path):
+    paths = _write_manual_split(tmp_path, tensor_names=("duplicate", "duplicate"))
+    with pytest.raises(GgufShardError, match="Duplicate tensor"):
+        open_gguf_model(paths[0])
 
 
 def test_corrupt_truncated_shard_rejected(tmp_path):
@@ -318,6 +424,87 @@ def test_manifest_rejects_swapped_continuation_shard(tmp_path):
             expected_sha256=expected_sha256,
             expected_sizes=expected_sizes,
         )
+
+
+def test_primary_shard_is_authoritative_for_semantic_metadata(tmp_path):
+    infos = [
+        SimpleNamespace(path=tmp_path / "primary.gguf", tensor_count=0),
+        SimpleNamespace(path=tmp_path / "continuation.gguf", tensor_count=1),
+    ]
+    primary = SimpleNamespace(
+        metadata={
+            "general.architecture": "llama",
+            "llama.context_length": 2048,
+            "split.no": 0,
+            "split.count": 2,
+            "split.tensors.count": 1,
+        }
+    )
+    continuation = SimpleNamespace(
+        metadata={
+            "split.no": 1,
+            "split.count": 2,
+            "split.tensors.count": 1,
+            "llama.rope.freq_base": 500000.0,
+        }
+    )
+
+    with pytest.raises(
+        GgufShardError,
+        match=r"continuation.*rope\.freq_base.*absent.*primary",
+    ):
+        _merge_metadata(infos, [primary, continuation])
+
+
+def test_continuation_may_repeat_primary_semantics_but_cannot_override_them(tmp_path):
+    infos = [
+        SimpleNamespace(path=tmp_path / "primary.gguf", tensor_count=0),
+        SimpleNamespace(path=tmp_path / "continuation.gguf", tensor_count=1),
+    ]
+    primary_metadata = {
+        "general.architecture": "llama",
+        "llama.context_length": 2048,
+        "split.no": 0,
+        "split.count": 2,
+        "split.tensors.count": 1,
+    }
+    repeated = SimpleNamespace(
+        metadata={
+            **primary_metadata,
+            "split.no": 1,
+        }
+    )
+    merged = _merge_metadata(
+        infos,
+        [SimpleNamespace(metadata=primary_metadata), repeated],
+    )
+    assert merged["llama.context_length"] == 2048
+    assert merged["split.no"] == 0
+
+    repeated.metadata["llama.context_length"] = 4096
+    with pytest.raises(GgufShardError, match=r"disagree.*context_length"):
+        _merge_metadata(
+            infos,
+            [SimpleNamespace(metadata=primary_metadata), repeated],
+        )
+
+
+def test_open_validates_primary_metadata_authority_eagerly(tmp_path):
+    from mobius.integrations.gguf import _shard_set
+
+    shards = _write_sharded_gguf(
+        tmp_path,
+        split_max_tensors=3,
+        small_first_shard=True,
+    )
+    with mock.patch.object(
+        _shard_set,
+        "_merge_metadata",
+        wraps=_shard_set._merge_metadata,
+    ) as merge:
+        open_gguf_model(shards[0])
+
+    merge.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #
@@ -506,6 +693,423 @@ def test_iq1_type_matches_single_file(tmp_path):
     from gguf import GGMLQuantizationType
 
     assert int(model.get_tensor_type("blk.0.attn_q.weight")) == int(GGMLQuantizationType.IQ1_M)
+
+
+# --------------------------------------------------------------------------- #
+# Hugging Face resolution (metadata/download boundary only)
+# --------------------------------------------------------------------------- #
+
+
+def test_hub_shard_resolution_pins_and_downloads_complete_set(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    shards = _write_sharded_gguf(
+        tmp_path,
+        split_max_tensors=3,
+        small_first_shard=True,
+    )
+    remote_files = [f"weights/{path.name}" for path in shards]
+    local_by_remote = dict(zip(remote_files, shards))
+    api = mock.Mock()
+    api.list_repo_files.side_effect = [remote_files, remote_files]
+    api.get_paths_info.return_value = [
+        SimpleNamespace(
+            path=name,
+            size=local_by_remote[name].stat().st_size,
+            lfs=SimpleNamespace(sha256=_sha256(local_by_remote[name])),
+        )
+        for name in remote_files
+    ]
+    commit = "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249"
+    events: list[str] = []
+
+    def disk_usage(_path):
+        events.append("space")
+        return SimpleNamespace(free=1 << 40)
+
+    def download(*, repo_id, filename, revision):
+        assert repo_id == "unsloth/tiny-sharded"
+        assert revision == commit
+        assert events == ["space"] or events[-1] == "download"
+        events.append("download")
+        return str(local_by_remote[filename])
+
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(
+            builder,
+            "_preflight_hf_gguf_file",
+            return_value=commit,
+        ) as preflight,
+        mock.patch.object(builder.shutil, "disk_usage", side_effect=disk_usage),
+        mock.patch.object(builder, "hf_hub_download", side_effect=download) as hub_download,
+    ):
+        resolved = builder._resolve_gguf_path(f"unsloth/tiny-sharded:{remote_files[1]}")
+
+    assert resolved == str(shards[1])
+    preflight.assert_called_once_with(
+        "unsloth/tiny-sharded",
+        remote_files[0],
+        revision="main",
+    )
+    assert api.list_repo_files.call_args_list == [
+        mock.call("unsloth/tiny-sharded", revision="main"),
+        mock.call("unsloth/tiny-sharded", revision=commit),
+    ]
+    api.get_paths_info.assert_called_once_with(
+        "unsloth/tiny-sharded",
+        remote_files,
+        revision=commit,
+        expand=True,
+    )
+    assert hub_download.call_count == len(shards)
+    assert resolved.expected_sizes == {path.name: path.stat().st_size for path in shards}
+    assert resolved.expected_sha256 == {path.name: _sha256(path) for path in shards}
+    assert open_gguf_model(resolved).num_tensors == len(_tensor_names(3))
+    victim = shards[1].name
+    resolved.expected_sha256[victim] = "0" * 64
+    with pytest.raises(GgufShardError, match=r"SHA-256 mismatch"):
+        open_gguf_model(resolved)
+
+
+def test_build_rejects_same_size_corrupt_hub_shard_from_lfs_manifest(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    good = _write_sharded_gguf(
+        tmp_path / "good",
+        stem="tiny",
+        split_max_tensors=3,
+        seed=1,
+    )
+    other = _write_sharded_gguf(
+        tmp_path / "other",
+        stem="tiny",
+        split_max_tensors=3,
+        seed=2,
+    )
+    assert [path.stat().st_size for path in good] == [path.stat().st_size for path in other]
+
+    work = tmp_path / "work"
+    work.mkdir()
+    for path in good:
+        (work / path.name).write_bytes(path.read_bytes())
+    victim_index = 1
+    (work / good[victim_index].name).write_bytes(other[victim_index].read_bytes())
+    assert (work / good[victim_index].name).stat().st_size == good[victim_index].stat().st_size
+    assert _sha256(work / good[victim_index].name) != _sha256(good[victim_index])
+
+    remote_files = [f"weights/{path.name}" for path in good]
+    work_by_remote = {name: work / path.name for name, path in zip(remote_files, good)}
+    api = mock.Mock()
+    api.list_repo_files.side_effect = [remote_files, remote_files]
+    api.get_paths_info.return_value = [
+        SimpleNamespace(
+            path=name,
+            size=path.stat().st_size,
+            lfs=SimpleNamespace(sha256=_sha256(path)),
+        )
+        for name, path in zip(remote_files, good)
+    ]
+    commit = "c" * 40
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(
+            builder,
+            "_preflight_hf_gguf_file",
+            return_value=commit,
+        ),
+        mock.patch.object(
+            builder.shutil,
+            "disk_usage",
+            return_value=SimpleNamespace(free=1 << 40),
+        ),
+        mock.patch.object(builder, "try_to_load_from_cache", return_value=None),
+        mock.patch.object(
+            builder,
+            "hf_hub_download",
+            side_effect=lambda *, repo_id, filename, revision: str(work_by_remote[filename]),
+        ),
+        pytest.raises(GgufShardError, match=r"SHA-256 mismatch.*corrupt shard"),
+    ):
+        builder.build_from_gguf(f"owner/repo:{remote_files[0]}")
+
+
+def test_hub_incomplete_shard_set_rejected_before_preflight_or_download():
+    from mobius.integrations.gguf import _builder as builder
+
+    filename = "weights/model-00002-of-00003.gguf"
+    api = mock.Mock()
+    api.list_repo_files.return_value = [
+        "weights/model-00001-of-00003.gguf",
+        filename,
+    ]
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(builder, "_preflight_hf_gguf_file") as preflight,
+        mock.patch.object(builder, "hf_hub_download") as download,
+        pytest.raises(ValueError, match=r"Incomplete.*missing indices.*00003"),
+    ):
+        builder._resolve_gguf_path(f"owner/repo:{filename}")
+
+    preflight.assert_not_called()
+    download.assert_not_called()
+
+
+def test_hub_renamed_shard_headers_enumerate_complete_set_before_download(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    source_shards = _write_sharded_gguf(
+        tmp_path / "source",
+        split_max_tensors=3,
+        small_first_shard=True,
+    )
+    remote_files = [
+        f"weights/{chr(ord('a') + index)}.gguf" for index in range(len(source_shards))
+    ]
+    mmproj_name = "weights/mmproj.gguf"
+    local_dir = tmp_path / "downloaded"
+    local_dir.mkdir()
+    local_by_remote: dict[str, Path] = {}
+    for remote_name, source in zip(remote_files, source_shards):
+        target = local_dir / PurePosixPath(remote_name).name
+        target.write_bytes(source.read_bytes())
+        local_by_remote[remote_name] = target
+
+    commit = "a" * 40
+    api = mock.Mock()
+    api.list_repo_files.return_value = [*remote_files, mmproj_name]
+    api.get_paths_info.return_value = [
+        SimpleNamespace(
+            path=name,
+            size=path.stat().st_size,
+            lfs=SimpleNamespace(sha256=_sha256(path)),
+        )
+        for name, path in local_by_remote.items()
+    ]
+
+    def preflight(_repo_id, filename, *, revision, dispatch_architecture=True):
+        if filename == mmproj_name:
+            assert not dispatch_architecture
+            return builder._GGUFPreflightRevision(
+                commit,
+                builder.GGUFHeaderInfo(
+                    architecture="clip",
+                    tensor_count=1,
+                    split_no=None,
+                    split_count=None,
+                    split_tensors_count=None,
+                ),
+            )
+        path = local_by_remote[filename]
+        info = builder._gguf_header_info_from_header_prefix(
+            path.read_bytes(),
+            source=filename,
+        )
+        return builder._GGUFPreflightRevision(commit, info)
+
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(builder, "_preflight_hf_gguf_file", side_effect=preflight),
+        mock.patch.object(
+            builder.shutil,
+            "disk_usage",
+            return_value=SimpleNamespace(free=1 << 40),
+        ),
+        mock.patch.object(builder, "try_to_load_from_cache", return_value=None),
+        mock.patch.object(
+            builder,
+            "hf_hub_download",
+            side_effect=lambda *, repo_id, filename, revision: str(local_by_remote[filename]),
+        ) as download,
+    ):
+        resolved = builder._resolve_gguf_path(f"owner/renamed:{remote_files[1]}")
+
+    assert download.call_count == len(source_shards)
+    assert resolved == str(local_by_remote[remote_files[1]])
+    assert resolved.shard_paths == [str(local_by_remote[name]) for name in remote_files]
+    model = open_gguf_model(resolved)
+    assert model.num_tensors == len(_tensor_names(3))
+
+
+def test_hub_renamed_discovery_caps_header_candidates_before_probing():
+    from mobius.integrations.gguf import _builder as builder
+
+    selected = builder._GGUFPreflightRevision(
+        "a" * 40,
+        builder.GGUFHeaderInfo(
+            architecture=None,
+            tensor_count=1,
+            split_no=1,
+            split_count=2,
+            split_tensors_count=2,
+        ),
+    )
+    candidates = [f"weights/candidate-{index}.gguf" for index in range(9)]
+    candidates[0] = "weights/selected.gguf"
+    with (
+        mock.patch.object(builder, "_preflight_hf_gguf_file") as preflight,
+        pytest.raises(ValueError, match=r"bounded limit 8.*No additional headers"),
+    ):
+        builder._select_hf_gguf_set_from_split_headers(
+            candidates,
+            repo_id="owner/repo",
+            selected_filename="weights/selected.gguf",
+            revision="a" * 40,
+            selected_preflight=selected,
+        )
+
+    preflight.assert_not_called()
+
+
+def test_hub_split_count_is_bounded_before_candidate_allocation():
+    from mobius.integrations.gguf import _builder as builder
+
+    info = builder.GGUFHeaderInfo(
+        architecture="llama",
+        tensor_count=0,
+        split_no=0,
+        split_count=1025,
+        split_tensors_count=1,
+    )
+    with pytest.raises(ValueError, match=r"count=1025, maximum=1024"):
+        builder._validate_preflight_split_header(info, source="oversized.gguf")
+
+
+def test_hub_renamed_incomplete_set_rejected_before_download(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    source_shards = _write_sharded_gguf(
+        tmp_path / "source",
+        split_max_tensors=3,
+        small_first_shard=True,
+    )
+    complete_remote_files = [
+        f"weights/{chr(ord('a') + index)}.gguf" for index in range(len(source_shards))
+    ]
+    remote_files = complete_remote_files[:-1]
+    local_by_remote = dict(zip(remote_files, source_shards[:-1]))
+    commit = "b" * 40
+    api = mock.Mock()
+    api.list_repo_files.return_value = remote_files
+
+    def preflight(_repo_id, filename, *, revision, dispatch_architecture=True):
+        path = local_by_remote[filename]
+        info = builder._gguf_header_info_from_header_prefix(
+            path.read_bytes(),
+            source=filename,
+        )
+        return builder._GGUFPreflightRevision(commit, info)
+
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(builder, "_preflight_hf_gguf_file", side_effect=preflight),
+        mock.patch.object(builder, "hf_hub_download") as download,
+        pytest.raises(ValueError, match=r"Incomplete.*split\.no"),
+    ):
+        builder._resolve_gguf_path(f"owner/renamed:{remote_files[1]}")
+
+    api.get_paths_info.assert_not_called()
+    download.assert_not_called()
+
+
+def test_hub_renamed_header_fallback_rejects_potential_partial_download():
+    from mobius.integrations.gguf import _builder as builder
+
+    filename = "weights/selected.gguf"
+    api = mock.Mock()
+    api.list_repo_files.return_value = [filename, "weights/possible-sibling.gguf"]
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(
+            builder,
+            "_preflight_hf_gguf_file",
+            return_value=builder._GGUFPreflightFallbackRevision("a" * 40),
+        ),
+        mock.patch.object(builder, "hf_hub_download") as download,
+        pytest.raises(ValueError, match=r"potentially partial download"),
+    ):
+        builder._resolve_gguf_path(f"owner/repo:{filename}")
+
+    download.assert_not_called()
+
+
+def test_hub_free_space_preflight_is_actionable(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    with (
+        mock.patch.object(
+            builder.shutil,
+            "disk_usage",
+            return_value=SimpleNamespace(free=100),
+        ),
+        pytest.raises(OSError, match=r"requires 1,000 bytes.*only 100 bytes.*HF_HOME"),
+    ):
+        builder._preflight_hf_download_space(1000, cache_path=tmp_path)
+
+
+def test_hub_download_space_counts_only_uncached_shards(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    cached = tmp_path / "cached.gguf"
+    missing = tmp_path / "missing.gguf"
+    cached.write_bytes(b"cached")
+    missing.write_bytes(b"new")
+    names = ["model-00001-of-00002.gguf", "model-00002-of-00002.gguf"]
+    api = mock.Mock()
+    api.get_paths_info.return_value = [
+        SimpleNamespace(
+            path=names[0],
+            size=cached.stat().st_size,
+            lfs=SimpleNamespace(sha256=_sha256(cached)),
+        ),
+        SimpleNamespace(
+            path=names[1],
+            size=missing.stat().st_size,
+            lfs=SimpleNamespace(sha256=_sha256(missing)),
+        ),
+    ]
+    with (
+        mock.patch.object(
+            builder,
+            "try_to_load_from_cache",
+            side_effect=[str(cached), None],
+        ),
+        mock.patch.object(builder, "_preflight_hf_download_space") as preflight,
+        mock.patch.object(
+            builder,
+            "hf_hub_download",
+            side_effect=[str(cached), str(missing)],
+        ),
+    ):
+        resolved = builder._download_hf_gguf_shards(
+            api,
+            repo_id="owner/repo",
+            selected_filename=names[0],
+            shard_filenames=names,
+            revision="a" * 40,
+        )
+
+    assert resolved == str(cached)
+    preflight.assert_called_once()
+    assert preflight.call_args.args == (missing.stat().st_size,)
+
+
+def test_hub_cache_identity_paths_resolve_only_inside_cache(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+
+    cache = tmp_path / "hub"
+    blobs = cache / "blobs"
+    snapshot = cache / "snapshots" / ("a" * 40)
+    blobs.mkdir(parents=True)
+    snapshot.mkdir(parents=True)
+    blob = blobs / "abc"
+    blob.write_bytes(b"GGUF")
+    shard = snapshot / "model-00001-of-00002.gguf"
+    shard.symlink_to(blob)
+
+    with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(cache)):
+        assert builder._hub_cache_identity_paths([shard]) == [blob]
+        assert builder._hub_cache_identity_paths([tmp_path / "outside.gguf"]) is None
 
 
 # --------------------------------------------------------------------------- #

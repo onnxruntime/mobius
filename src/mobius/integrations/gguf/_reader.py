@@ -274,6 +274,16 @@ class GGUFModel:
         """
         return list(self._reader.tensors)
 
+    def _tensor_source(self, name: str) -> tuple[Path, int, Any]:
+        """Return the owning path, data-section offset, and reader record."""
+        if name not in self._tensor_index:
+            raise KeyError(f"Tensor '{name}' not found in GGUF file.")
+        return (
+            self._path,
+            int(self._reader.data_offset),
+            self._reader.get_tensor(self._tensor_index[name]),
+        )
+
     @property
     def is_little_endian(self) -> bool:
         """Whether raw tensor payloads use ONNX-compatible little-endian bytes."""

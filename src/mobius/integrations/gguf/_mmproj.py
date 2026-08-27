@@ -375,10 +375,16 @@ def read_mmproj_audio_config(gguf_model: Any):
     )
 
 
-def _resolve_local_path(path: str | Path) -> str:
+def _resolve_local_path(path: str | Path) -> Any:
     from mobius.integrations.gguf._builder import _resolve_gguf_path
 
     return _resolve_gguf_path(path)
+
+
+def _open_text_gguf(path: Any) -> Any:
+    from mobius.integrations.gguf._shard_set import open_gguf_model
+
+    return open_gguf_model(path)
 
 
 def _resolve_mmproj_companion_path(path: str | Path) -> str:
@@ -1393,7 +1399,9 @@ def build_qwen_vlm_from_gguf(
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
-        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+        _text_gguf_model
+        if _text_gguf_model is not None
+        else _open_text_gguf(resolved_text_path)
     )
     if text_gguf.architecture != "qwen2vl":
         raise ValueError(
@@ -1589,7 +1597,9 @@ def build_gemma3_vlm_from_gguf(
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
-        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+        _text_gguf_model
+        if _text_gguf_model is not None
+        else _open_text_gguf(resolved_text_path)
     )
     if text_gguf.architecture != "gemma3":
         raise ValueError(
@@ -1935,7 +1945,9 @@ def build_gemma4_vlm_from_gguf(
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
-        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+        _text_gguf_model
+        if _text_gguf_model is not None
+        else _open_text_gguf(resolved_text_path)
     )
     if text_gguf.architecture != "gemma4":
         raise ValueError(
@@ -2211,7 +2223,9 @@ def build_muse_glimmer_vlm_from_gguf(
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
-        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+        _text_gguf_model
+        if _text_gguf_model is not None
+        else _open_text_gguf(resolved_text_path)
     )
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
     text_arch = text_gguf.architecture
@@ -2359,7 +2373,9 @@ def build_vlm_from_gguf(
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
-        _text_gguf_model if _text_gguf_model is not None else GGUFModel(resolved_text_path)
+        _text_gguf_model
+        if _text_gguf_model is not None
+        else _open_text_gguf(resolved_text_path)
     )
     _validate_gguf_model(text_gguf, source=str(text_gguf_path))
     resolved_mmproj_path = _resolve_mmproj_companion_path(mmproj_gguf_path)

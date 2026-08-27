@@ -6,9 +6,15 @@
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 from typing import Any
 
 _GGUF_ARCHITECTURE_KEY = b"general.architecture"
+_GGUF_SPLIT_KEYS = {
+    b"split.no": "split_no",
+    b"split.count": "split_count",
+    b"split.tensors.count": "split_tensors_count",
+}
 _GGUF_MAX_METADATA_ARRAY_DEPTH = 8
 _GGUF_MAX_METADATA_ARRAY_ELEMENTS = 1_000_000
 _GGUF_MAX_METADATA_ENTRIES = 1_000_000
@@ -27,15 +33,40 @@ _GGUF_SCALAR_WIDTHS = {
 }
 _GGUF_STRING = 8
 _GGUF_ARRAY = 9
+_GGUF_INTEGER_FORMATS = {
+    0: "B",
+    1: "b",
+    2: "H",
+    3: "h",
+    4: "I",
+    5: "i",
+    10: "Q",
+    11: "q",
+}
 
 
-def _gguf_architecture_from_header(
+class GGUFHeaderTruncatedError(ValueError):
+    """A bounded GGUF header prefix ended before required metadata."""
+
+
+@dataclass(frozen=True, slots=True)
+class GGUFHeaderInfo:
+    """Payload-free identity and split bookkeeping from one GGUF header."""
+
+    architecture: str | None
+    tensor_count: int
+    split_no: int | None
+    split_count: int | None
+    split_tensors_count: int | None
+
+
+def _gguf_header_info_from_header(
     data: Any,
     *,
     source: str,
     require_architecture: bool = True,
-) -> str | None:
-    """Validate a GGUF metadata table and return its architecture when present."""
+) -> GGUFHeaderInfo:
+    """Validate a GGUF metadata table and return bounded preflight fields."""
     size = len(data)
     if size < 24 or data[0:4] != b"GGUF":
         raise ValueError(f"{source!r} does not begin with a valid GGUF header.")
@@ -55,24 +86,39 @@ def _gguf_architecture_from_header(
     def read_uint32(offset: int) -> tuple[int, int]:
         end = offset + 4
         if end > size:
-            raise ValueError(f"{source!r} has a truncated GGUF metadata header.")
+            raise GGUFHeaderTruncatedError(f"{source!r} has a truncated GGUF metadata header.")
         return struct.unpack_from(f"{byte_order}I", data, offset)[0], end
 
     def read_uint64(offset: int) -> tuple[int, int]:
         end = offset + 8
         if end > size:
-            raise ValueError(f"{source!r} has a truncated GGUF metadata header.")
+            raise GGUFHeaderTruncatedError(f"{source!r} has a truncated GGUF metadata header.")
         return struct.unpack_from(f"{byte_order}Q", data, offset)[0], end
 
     def read_string_span(offset: int) -> tuple[int, int, int]:
         length, offset = read_uint64(offset)
         end = offset + length
         if end > size:
-            raise ValueError(
+            raise GGUFHeaderTruncatedError(
                 f"{source!r} has a truncated GGUF metadata string: "
                 f"declares {length} bytes with only {size - offset} remaining."
             )
         return offset, end, end
+
+    def read_integer(value_type: int, offset: int) -> tuple[int, int]:
+        format_char = _GGUF_INTEGER_FORMATS.get(value_type)
+        if format_char is None:
+            raise ValueError(
+                f"{source!r} encodes split bookkeeping with non-integer GGUF "
+                f"type {value_type}."
+            )
+        width = _GGUF_SCALAR_WIDTHS[value_type]
+        end = offset + width
+        if end > size:
+            raise GGUFHeaderTruncatedError(
+                f"{source!r} has a truncated GGUF split metadata value."
+            )
+        return int(struct.unpack_from(f"{byte_order}{format_char}", data, offset)[0]), end
 
     def minimum_value_width(value_type: int) -> int:
         width = _GGUF_SCALAR_WIDTHS.get(value_type)
@@ -89,7 +135,9 @@ def _gguf_architecture_from_header(
         if width is not None:
             end = offset + width
             if end > size:
-                raise ValueError(f"{source!r} has a truncated GGUF metadata value.")
+                raise GGUFHeaderTruncatedError(
+                    f"{source!r} has a truncated GGUF metadata value."
+                )
             return end
         if value_type == _GGUF_STRING:
             _, _, offset = read_string_span(offset)
@@ -104,7 +152,7 @@ def _gguf_architecture_from_header(
         element_width = minimum_value_width(element_type)
         remaining = size - offset
         if count > remaining // element_width:
-            raise ValueError(
+            raise GGUFHeaderTruncatedError(
                 f"{source!r} has a truncated GGUF metadata array: declares {count} "
                 f"elements requiring at least {count * element_width} bytes with only "
                 f"{remaining} remaining."
@@ -121,6 +169,7 @@ def _gguf_architecture_from_header(
             offset = skip_value(element_type, offset, depth=depth + 1)
         return offset
 
+    tensor_count = struct.unpack_from(f"{byte_order}Q", data, 8)[0]
     kv_count = struct.unpack_from(f"{byte_order}Q", data, 16)[0]
     if kv_count > _GGUF_MAX_METADATA_ENTRIES:
         raise ValueError(
@@ -130,18 +179,22 @@ def _gguf_architecture_from_header(
     # Every entry needs an 8-byte key length, a 4-byte type, and at least
     # one value byte. Reject impossible counts before entering the loop.
     if kv_count > (size - 24) // 13:
-        raise ValueError(
+        raise GGUFHeaderTruncatedError(
             f"{source!r} has a truncated GGUF metadata table for {kv_count} entries."
         )
 
     offset = 24
     architecture_values: list[bytes] = []
+    split_values: dict[str, list[int]] = {
+        field_name: [] for field_name in _GGUF_SPLIT_KEYS.values()
+    }
     for _ in range(kv_count):
         key_start, key_end, offset = read_string_span(offset)
         value_type, offset = read_uint32(offset)
+        key = bytes(data[key_start:key_end])
         is_architecture = (
             key_end - key_start == len(_GGUF_ARCHITECTURE_KEY)
-            and data[key_start:key_end] == _GGUF_ARCHITECTURE_KEY
+            and key == _GGUF_ARCHITECTURE_KEY
         )
         if is_architecture:
             if value_type != _GGUF_STRING:
@@ -151,17 +204,52 @@ def _gguf_architecture_from_header(
                 )
             value_start, value_end, offset = read_string_span(offset)
             architecture_values.append(bytes(data[value_start:value_end]))
+        elif (field_name := _GGUF_SPLIT_KEYS.get(key)) is not None:
+            value, offset = read_integer(value_type, offset)
+            split_values[field_name].append(value)
         else:
             offset = skip_value(value_type, offset)
 
     if not architecture_values and not require_architecture:
-        return None
-    if len(architecture_values) != 1:
+        architecture = None
+    elif len(architecture_values) != 1:
         raise ValueError(
             f"{source!r} must contain exactly one general.architecture metadata entry, "
             f"found {len(architecture_values)}."
         )
-    try:
-        return architecture_values[0].decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"{source!r} has a non-UTF-8 general.architecture value.") from error
+    else:
+        try:
+            architecture = architecture_values[0].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                f"{source!r} has a non-UTF-8 general.architecture value."
+            ) from error
+
+    split_fields: dict[str, int | None] = {}
+    for field_name, values in split_values.items():
+        if len(values) > 1:
+            raise ValueError(
+                f"{source!r} contains duplicate {field_name.replace('_', '.')} metadata."
+            )
+        split_fields[field_name] = values[0] if values else None
+    return GGUFHeaderInfo(
+        architecture=architecture,
+        tensor_count=tensor_count,
+        split_no=split_fields["split_no"],
+        split_count=split_fields["split_count"],
+        split_tensors_count=split_fields["split_tensors_count"],
+    )
+
+
+def _gguf_architecture_from_header(
+    data: Any,
+    *,
+    source: str,
+    require_architecture: bool = True,
+) -> str | None:
+    """Validate a GGUF metadata table and return its architecture when present."""
+    return _gguf_header_info_from_header(
+        data,
+        source=source,
+        require_architecture=require_architecture,
+    ).architecture
