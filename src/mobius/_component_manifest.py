@@ -34,12 +34,15 @@ class ComponentDescriptor:
             or ``glue``.
         source_paths: Runtime HuggingFace ``named_modules()`` paths whose
             weights belong to this component.
+        source_path_aliases: Pairs of ``(local_prefix, source_prefix)`` for
+            component paths that cannot be aligned by a shared anchor segment.
     """
 
     name: str
     module_path: str
     role: str
     source_paths: tuple[str, ...] = ()
+    source_path_aliases: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -49,6 +52,11 @@ class ComponentDescriptor:
         if any(not path for path in self.source_paths):
             raise ValueError(
                 f"component {self.name!r} source_paths must not contain empty paths"
+            )
+        if any(not local or not source for local, source in self.source_path_aliases):
+            raise ValueError(
+                f"component {self.name!r} source_path_aliases must contain "
+                "non-empty local/source prefixes"
             )
 
     def source_module_names(self, local_module_path: str) -> tuple[str, ...]:
@@ -65,6 +73,12 @@ class ComponentDescriptor:
 
         local_parts = local_module_path.split(".")
         candidates = [local_module_path]
+        for local_prefix, source_prefix in self.source_path_aliases:
+            if local_module_path == local_prefix:
+                candidates.append(source_prefix)
+            elif local_module_path.startswith(f"{local_prefix}."):
+                suffix = local_module_path[len(local_prefix) + 1 :]
+                candidates.append(f"{source_prefix}.{suffix}")
         for source_path in self.source_paths:
             source_parts = source_path.split(".")
             anchor = source_parts[-1]
@@ -141,12 +155,17 @@ def resolve_component_manifest(
     module_paths = dict(component_spec.items()) if component_spec is not None else {}
 
     component_sources: dict[str, tuple[str, ...]] = {}
+    component_aliases: dict[str, tuple[tuple[str, str], ...]] = {}
     if module_class is not None and model_type is not None and hf_config is not None:
         component_sources = get_hf_component_sources(
             module_class,
             model_type,
             hf_config,
         )
+        raw_aliases = getattr(module_class, "HF_COMPONENT_MODULE_ALIASES", {})
+        component_aliases = {
+            name: tuple(aliases.items()) for name, aliases in raw_aliases.items()
+        }
 
     ordered_names = tuple(dict.fromkeys((*roles, *module_paths)))
     descriptors = tuple(
@@ -155,6 +174,7 @@ def resolve_component_manifest(
             module_path=module_paths.get(name, "" if name == "model" else name),
             role=roles.get(name, "decoder"),
             source_paths=component_sources.get(name, ()),
+            source_path_aliases=component_aliases.get(name, ()),
         )
         for name in ordered_names
     )
