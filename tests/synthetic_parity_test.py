@@ -391,9 +391,6 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     "qwen3_5_text": {"head_dim": TINY_HEAD_DIM},
     # Qwen3.5-MoE uses the same doubled-Q attention as qwen3_5; head_dim defaults to 256 in HF
     "qwen3_5_moe": {"head_dim": TINY_HEAD_DIM},
-    # Qwen4-Exp validates partial RoPE against the QSA index head during
-    # construction, so its explicit head_dim must match the tiny ONNX config.
-    "qwen4_exp_text": {"head_dim": TINY_HEAD_DIM},
     # GPT-NeoX/Pythia use layer_norm_eps (not rms_norm_eps) for their LayerNorms
     "gpt_neox": {"layer_norm_eps": 1e-6},
     # GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; test config matches via rms_norm_eps=1e-5
@@ -502,6 +499,7 @@ def _adapt_muse_glimmer_text_config(hf_kwargs: dict) -> None:
 
 
 def _adapt_qwen4_exp_text_config(hf_kwargs: dict) -> None:
+    """Translate flat Mobius RoPE/expert fields to the strict HF config."""
     hf_kwargs["head_dim"] = hf_kwargs["hidden_size"] // hf_kwargs["num_attention_heads"]
     hf_kwargs["num_experts"] = hf_kwargs.pop("num_local_experts")
     hf_kwargs["rope_parameters"] = {
@@ -711,7 +709,6 @@ def _create_hf_config(model_type: str, config_overrides: dict):
             "moe_intermediate_size": "expert_ffn_hidden_size",
         },
         "nemotron_h": {"num_local_experts": "n_routed_experts"},
-        "qwen4_exp_text": {"num_local_experts": "num_experts"},
     }
     if hf_model_type in expert_field_aliases:
         for src_field, dst_field in expert_field_aliases[hf_model_type].items():

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest import mock
 
 import onnx_ir as ir
@@ -13,6 +14,7 @@ from onnxscript import nn
 
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
+from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations.diffusers import _builder as diffusers_builder
 from mobius.integrations.transformers import _builder as transformers_builder
 from mobius.integrations.transformers import _config_resolver
@@ -22,6 +24,212 @@ class _DummyModule(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+
+
+class _DummyFp8Module(_DummyModule):
+    def build_fp8_streaming_plan(self, *_args):
+        raise AssertionError("mock streaming function should own planning")
+
+
+@pytest.mark.parametrize(
+    ("keep_quantized", "expected_loader"),
+    [(True, "qdq"), (False, "dense")],
+)
+def test_qwen38_fp8_selects_storage_or_dense_loader(
+    monkeypatch,
+    keep_quantized,
+    expected_loader,
+) -> None:
+    text_config = SimpleNamespace(model_type="qwen4_exp_text")
+    expected_parent = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config=text_config,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+            "activation_scheme": "dynamic",
+        },
+        vision_config=object(),
+        image_token_id=248056,
+        video_token_id=248057,
+        vision_start_token_id=248053,
+        vision_end_token_id=248054,
+    )
+    model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
+    package = ModelPackage({"model": model})
+    calls = []
+    built_configs = []
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (expected_parent, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            _DummyFp8Module,
+            "qwen4-exp-text-generation",
+            "qwen4_exp_text",
+        ),
+    )
+
+    def resolve_config(primary, *, parent_config, module_class):
+        assert primary is text_config
+        assert parent_config is expected_parent
+        assert not hasattr(primary, "quantization_config")
+        scheme = BlockQuantScheme.from_quantization_config(parent_config.quantization_config)
+        assert scheme is not None
+        return make_config(
+            model_type="qwen4_exp",
+            block_quant_scheme=scheme,
+            vision=object(),
+            image_token_id=parent_config.image_token_id,
+            video_token_id=parent_config.video_token_id,
+            vision_start_token_id=parent_config.vision_start_token_id,
+            vision_end_token_id=parent_config.vision_end_token_id,
+            deepstack_visual_indexes=[],
+        )
+
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", resolve_config)
+
+    def build_module(_module, config, *args, **kwargs):
+        built_configs.append(config)
+        package.config = config
+        return package
+
+    monkeypatch.setattr(transformers_builder, "build_from_module", build_module)
+
+    def qdq(*args, **kwargs):
+        calls.append("qdq")
+        return {"format": "mobius.weight-loading-report.v1"}
+
+    def dense(*args, **kwargs):
+        calls.append("dense")
+        return {"format": "mobius.weight-loading-report.v1"}
+
+    monkeypatch.setattr(transformers_builder, "stream_qdq_safetensors_to_model", qdq)
+    monkeypatch.setattr(
+        transformers_builder,
+        "stream_preprocessed_safetensors_to_model",
+        dense,
+    )
+
+    result = transformers_builder.build_transformers_model(
+        "unsloth/Qwen3.8-Flash-Next-FP8",
+        keep_quantized=keep_quantized,
+        text_only=True,
+    )
+
+    assert result is package
+    assert calls == [expected_loader]
+    assert built_configs[0].block_quant_scheme is not None
+    assert built_configs[0].model_type == "qwen4_exp_text"
+    assert built_configs[0].vision is None
+    assert built_configs[0].image_token_id is None
+    assert built_configs[0].video_token_id is None
+    assert built_configs[0].vision_start_token_id is None
+    assert built_configs[0].vision_end_token_id is None
+    assert getattr(built_configs[0], "unsupported_video_token_id", None) is None
+    assert built_configs[0].deepstack_visual_indexes is None
+
+
+def test_qwen38_multimodal_config_keeps_parent_fields(monkeypatch) -> None:
+    text_config = SimpleNamespace(model_type="qwen4_exp_text")
+    vision = object()
+    parent = SimpleNamespace(
+        model_type="qwen4_exp",
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config=text_config,
+        quantization_config={
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+        vision_config=vision,
+        image_token_id=248056,
+    )
+    built_configs = []
+    package = ModelPackage(
+        {"decoder": ir.Model(ir.Graph([], [], nodes=[], name="decoder"), ir_version=11)}
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "qwen4-exp-vision-language", "qwen4_exp"),
+    )
+
+    def resolve_config(primary, *, parent_config, module_class):
+        assert primary is text_config
+        assert parent_config is parent
+        return make_config(
+            model_type="qwen4_exp",
+            vision=vision,
+            image_token_id=parent.image_token_id,
+        )
+
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", resolve_config)
+
+    def build_module(_module, config, *args, **kwargs):
+        built_configs.append(config)
+        return package
+
+    monkeypatch.setattr(transformers_builder, "build_from_module", build_module)
+
+    transformers_builder.build_transformers_model(
+        "fake/qwen4-exp",
+        load_weights=False,
+        text_only=False,
+    )
+
+    assert built_configs[0].model_type == "qwen4_exp"
+    assert built_configs[0].vision is vision
+    assert built_configs[0].image_token_id == 248056
+
+
+def test_qwen38_fp8_defaults_to_immutable_integrated_revision(monkeypatch) -> None:
+    calls = []
+
+    def stop_after_config(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        stop_after_config,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            load_weights=False,
+        )
+
+    assert calls == [
+        (
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            {
+                "revision": "41cc25fe32cc20053a59c89716196897580cddf6",
+                "trust_remote_code": False,
+            },
+        )
+    ]
+
+
+def test_qwen38_fp8_rejects_other_revision() -> None:
+    with pytest.raises(ValueError, match="integrated only at immutable revision"):
+        transformers_builder.build_transformers_model(
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            revision="main",
+            load_weights=False,
+        )
 
 
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
@@ -78,7 +286,9 @@ def test_text_only_resolution_ignores_multimodal_parent_architecture() -> None:
     assert model_type == "qwen4_exp_text"
 
 
-def test_qwen4_text_only_build_excludes_composite_config(monkeypatch) -> None:
+def test_qwen4_text_only_build_inherits_parent_metadata_then_strips_multimodal(
+    monkeypatch,
+) -> None:
     text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
     parent_config = type(
         "Qwen4ExpParent",
@@ -88,9 +298,20 @@ def test_qwen4_text_only_build_excludes_composite_config(monkeypatch) -> None:
             "architectures": ["Qwen4ExpForConditionalGeneration"],
             "text_config": text_config,
             "vision_config": object(),
+            "quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
         },
     )()
-    config = make_config(model_type="qwen4_exp", vision=object())
+    config = make_config(
+        model_type="qwen4_exp",
+        vision=object(),
+        image_token_id=248056,
+        block_quant_scheme=BlockQuantScheme.from_quantization_config(
+            parent_config.quantization_config
+        ),
+    )
     model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
 
     monkeypatch.setattr(
@@ -110,10 +331,11 @@ def test_qwen4_text_only_build_excludes_composite_config(monkeypatch) -> None:
     )
 
     def config_from_hf(_config, *, parent_config, module_class):
-        assert parent_config is None
+        assert parent_config is globals_parent
         assert module_class is _DummyModule
         return config
 
+    globals_parent = parent_config
     monkeypatch.setattr(_config_resolver, "_config_from_hf", config_from_hf)
     monkeypatch.setattr(
         transformers_builder,
@@ -130,7 +352,9 @@ def test_qwen4_text_only_build_excludes_composite_config(monkeypatch) -> None:
         load_weights=False,
     )
     assert package.config.model_type == "qwen4_exp_text"
+    assert package.config.block_quant_scheme is not None
     assert package.config.vision is None
+    assert package.config.image_token_id is None
 
 
 def test_qwen4_multimodal_build_streams_entire_package_without_eager_loader(

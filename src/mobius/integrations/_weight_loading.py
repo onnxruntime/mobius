@@ -15,16 +15,25 @@ checkpoints that only publish ``pytorch_model.bin`` are loaded with
 from __future__ import annotations
 
 __all__ = [
+    "StreamingExpertBankSource",
+    "StreamingWeightPlan",
+    "StreamingWeightSource",
     "apply_weights",
+    "stream_qdq_safetensors_to_model",
+    "stream_preprocessed_safetensors_to_model",
     "stream_safetensors_to_model",
     "external_data_checksums",
 ]
 
 import concurrent.futures
+import dataclasses
 import hashlib
 import json
 import logging
+import math
 import pathlib
+from collections.abc import Callable, Mapping
+from typing import Literal
 
 import onnx_ir as ir
 import safetensors.torch
@@ -43,6 +52,48 @@ _WEIGHT_INDEX_NAME = "model.safetensors.index.json"
 _SINGLE_WEIGHT_NAME = "model.safetensors"
 _PYTORCH_WEIGHT_INDEX_NAME = "pytorch_model.bin.index.json"
 _SINGLE_PYTORCH_WEIGHT_NAME = "pytorch_model.bin"
+_SAFETENSORS_DTYPE_BYTES = {
+    "BF16": 2,
+    "F16": 2,
+    "F32": 4,
+    "F64": 8,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I64": 8,
+}
+_SAFETENSORS_TO_IR_DTYPE = {
+    "BF16": ir.DataType.BFLOAT16,
+    "F16": ir.DataType.FLOAT16,
+    "F32": ir.DataType.FLOAT,
+    "F8_E4M3": ir.DataType.FLOAT8E4M3FN,
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamingWeightSource:
+    """One checkpoint tensor bound to one dense ONNX initializer."""
+
+    source_name: str
+    mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
+    scale_name: str | None = None
+    expected_scale: float | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamingExpertBankSource:
+    """Per-expert source matrices packed into one dense rank-3 initializer."""
+
+    experts: tuple[tuple[StreamingWeightSource, ...], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamingWeightPlan:
+    """Complete fail-closed source classification for a streaming export."""
+
+    targets: Mapping[str, StreamingWeightSource | StreamingExpertBankSource]
+    ignored: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    constants: Mapping[str, torch.Tensor] = dataclasses.field(default_factory=dict)
+    report: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 def _assign_weight(
@@ -261,12 +312,59 @@ def _local_weight_paths(model_dir: pathlib.Path) -> tuple[list[str], str] | None
     return paths, weight_format
 
 
+def _dequantize_fp8_tensor(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    name: str,
+    target_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Reconstruct one scalar- or 128x128-block-scaled FP8 tensor."""
+    if weight.dtype not in {torch.float8_e4m3fn, torch.float8_e5m2}:
+        raise ValueError(f"Weight '{name}' is not an FP8 tensor: {weight.dtype}")
+    scale = scale.to(target_dtype)
+    if scale.ndim == 0:
+        return weight.to(target_dtype) * scale
+    if scale.ndim != 2:
+        raise ValueError(
+            f"FP8 weight '{name}' has scale with shape {tuple(scale.shape)}; "
+            "expected a scalar or 2-D block scale grid"
+        )
+    if weight.ndim != 2:
+        raise ValueError(
+            f"FP8 weight '{name}' has a 2-D scale grid but is "
+            f"{weight.ndim}-D; block scaling requires a 2-D weight"
+        )
+
+    rows, cols = weight.shape
+    expected_grid_shape = ((rows + 127) // 128, (cols + 127) // 128)
+    if tuple(scale.shape) != expected_grid_shape:
+        raise ValueError(
+            f"FP8 weight '{name}' has scale grid shape {tuple(scale.shape)}; "
+            f"expected {expected_grid_shape} for weight shape {tuple(weight.shape)}"
+        )
+
+    # Mutate one dense target tensor tile-by-tile instead of materializing an
+    # expanded scale grid the size of the weight.
+    dequantized = weight.to(target_dtype)
+    for block_row in range(expected_grid_shape[0]):
+        row_start = block_row * 128
+        row_end = min(row_start + 128, rows)
+        for block_col in range(expected_grid_shape[1]):
+            col_start = block_col * 128
+            col_end = min(col_start + 128, cols)
+            dequantized[row_start:row_end, col_start:col_end].mul_(scale[block_row, block_col])
+    return dequantized
+
+
 def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Dequantize FP8 weights and return a new dict with float tensors.
 
     Some HuggingFace checkpoints (e.g. Ministral-3-3B) store linear layer
     weights as float8_e4m3fn with a scalar ``weight_scale_inv`` tensor.
-    The real weight value is ``fp8_weight.to(bfloat16) * weight_scale_inv``.
+    Others use a two-dimensional grid of inverse scales, with each element
+    applying to a 128-by-128 weight block. The real weight value is
+    ``fp8_weight.to(bfloat16) * weight_scale_inv``.
 
     Dequantization targets bfloat16 because that is the native training
     dtype for FP8-quantized checkpoints — the FP8 values represent
@@ -299,14 +397,13 @@ def _dequantize_fp8_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, to
         else:
             scale_key = key + "_scale_inv"
 
-        if scale_key in result:
-            # Cast scale to bfloat16 to guarantee the output dtype is bfloat16,
-            # even when weight_scale_inv is stored as FP32 in the checkpoint.
-            scale = result[scale_key].to(torch.bfloat16)
-            result[key] = result[key].to(torch.bfloat16) * scale
-        else:
-            logger.warning("FP8 weight '%s' has no scale_inv — casting without scaling", key)
-            result[key] = result[key].to(torch.bfloat16)
+        if scale_key not in result:
+            raise ValueError(
+                f"FP8 weight '{key}' has no '{scale_key}' tensor. Refusing to "
+                "guess an implicit scale; an architecture-specific loader must "
+                "explicitly classify any direct-cast FP8 storage."
+            )
+        result[key] = _dequantize_fp8_tensor(result[key], result[scale_key], name=key)
 
     # Remove auxiliary FP8 tensors (not needed in the ONNX graph)
     aux_suffixes = (".weight_scale_inv", ".activation_scale", ".input_scale")
@@ -421,16 +518,19 @@ def _shard_key_index(paths: list[str]) -> dict[str, tuple[str, list[int], str]]:
     """Map each tensor key -> (shard_path, shape, dtype) by reading headers only.
 
     ``safe_open(...).keys()`` and ``get_slice(...).get_shape()`` read only the
-    safetensors header, so this never materializes weight data. When a key
-    appears in more than one shard the first shard wins and a warning is logged.
+    safetensors header, so this never materializes weight data. Duplicate keys
+    are rejected because choosing a shard by traversal order is ambiguous.
     """
     key_index: dict[str, tuple[str, list[int], str]] = {}
     for path in paths:
         with safe_open(path, framework="pt") as handle:
             for key in handle.keys():  # noqa: SIM118 - safe_open handle is not directly iterable
                 if key in key_index:
-                    logger.warning("Duplicate tensor key %r across shards; keeping first", key)
-                    continue
+                    first_path = key_index[key][0]
+                    raise ValueError(
+                        f"Duplicate tensor key {key!r} across safetensors shards "
+                        f"{first_path!r} and {path!r}"
+                    )
                 sliced = handle.get_slice(key)
                 key_index[key] = (path, list(sliced.get_shape()), sliced.get_dtype())
     return key_index
@@ -464,6 +564,1163 @@ def _assign_lazy_from_shard(
         shape=ir.Shape(initializer.shape),
         name=name,
     )
+
+
+def _materialize_preprocessed_source(
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Read and reconstruct one classified source tensor."""
+    source_path, source_shape, source_dtype = key_index[source.source_name]
+    del source_shape
+    with safe_open(source_path, framework="pt") as handle:
+        tensor = handle.get_tensor(source.source_name)
+    if source.mode == "fp8_block_128":
+        assert source.scale_name is not None
+        scale_path = key_index[source.scale_name][0]
+        with safe_open(scale_path, framework="pt") as handle:
+            scale = handle.get_tensor(source.scale_name)
+        tensor = _dequantize_fp8_tensor(
+            tensor,
+            scale,
+            name=source.source_name,
+            target_dtype=torch.bfloat16,
+        )
+        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
+    if source.mode == "fp8_scalar":
+        if not source_dtype.startswith("F8"):
+            raise ValueError(
+                f"Streaming source '{source.source_name}' was classified fp8_scalar "
+                f"but has dtype {source_dtype}"
+            )
+        assert source.scale_name is not None
+        scale_path = key_index[source.scale_name][0]
+        with safe_open(scale_path, framework="pt") as handle:
+            scale = handle.get_tensor(source.scale_name)
+        actual_scale = float(scale.to(torch.float32).item())
+        if source.expected_scale is None or actual_scale != source.expected_scale:
+            raise ValueError(
+                f"FP8 scalar source '{source.source_name}' has scale {actual_scale}; "
+                f"expected pinned value {source.expected_scale}"
+            )
+        tensor = tensor.to(torch.bfloat16)
+        tensor.mul_(scale.to(torch.bfloat16))
+        return tensor if target_dtype == torch.bfloat16 else tensor.to(target_dtype)
+    if source.mode == "direct":
+        if source_dtype.startswith("F8"):
+            raise ValueError(
+                f"Streaming source '{source.source_name}' is FP8 but was not explicitly "
+                "classified as scaled FP8"
+            )
+        return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+    raise AssertionError(f"Unknown streaming weight mode: {source.mode}")
+
+
+def _assign_lazy_preprocessed(
+    initializer: ir.Value,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_name: str,
+) -> None:
+    """Bind a direct or dense-dequantized source with one-tensor working memory."""
+    onnx_dtype = initializer.dtype
+    assert onnx_dtype is not None
+    target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+
+    def tensor_func(
+        source_spec: StreamingWeightSource = source,
+        dt: torch.dtype = target_dtype,
+        n: str = target_name,
+    ) -> tensor_adapters.TorchTensor:
+        tensor = _materialize_preprocessed_source(source_spec, key_index, dt)
+        return tensor_adapters.TorchTensor(tensor, name=n)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=onnx_dtype,
+        shape=ir.Shape(initializer.shape),
+        name=target_name,
+    )
+
+
+def _assign_lazy_expert_bank(
+    initializer: ir.Value,
+    source: StreamingExpertBankSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_name: str,
+) -> None:
+    """Pack independently scaled expert matrices into one dense rank-3 bank."""
+    onnx_dtype = initializer.dtype
+    assert onnx_dtype is not None
+    target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+    target_shape = tuple(int(dim) for dim in initializer.shape)
+
+    def tensor_func(
+        source_spec: StreamingExpertBankSource = source,
+        dt: torch.dtype = target_dtype,
+        n: str = target_name,
+    ) -> tensor_adapters.TorchTensor:
+        output = torch.empty(target_shape, dtype=dt)
+        for expert_index, projections in enumerate(source_spec.experts):
+            row = 0
+            for projection in projections:
+                tensor = _materialize_preprocessed_source(projection, key_index, dt)
+                next_row = row + tensor.shape[0]
+                output[expert_index, row:next_row].copy_(tensor)
+                row = next_row
+            if row != target_shape[1]:
+                raise ValueError(
+                    f"Expert {expert_index} for '{n}' populated {row} rows; "
+                    f"expected {target_shape[1]}"
+                )
+        return tensor_adapters.TorchTensor(output, name=n)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=onnx_dtype,
+        shape=ir.Shape(target_shape),
+        name=target_name,
+    )
+
+
+def stream_preprocessed_safetensors_to_model(
+    model: ir.Model,
+    model_id: str,
+    planner: Callable[
+        [Mapping[str, tuple[str, list[int], str]], Mapping[str, ir.Value]],
+        StreamingWeightPlan,
+    ],
+    *,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Stream a fully classified transformed checkpoint into a dense ONNX graph.
+
+    The planner must classify every source tensor as a target, a consumed scale,
+    a validated deterministic constant, or an explicitly ignored sidecar tensor.
+    Any unclassified key, missing target, malformed FP8 grid, or changed constant
+    fails before serialization. The resulting package is dense; this path never
+    claims native FP8 preservation.
+    """
+    paths = _resolve_shard_paths(model_id, revision)
+    key_index = _shard_key_index(paths)
+    plan = planner(key_index, model.graph.initializers)
+
+    consumed = set(plan.ignored) | set(plan.constants)
+    assigned: set[str] = set()
+    bindings: list[
+        tuple[
+            ir.Value,
+            StreamingWeightSource | StreamingExpertBankSource,
+            str,
+        ]
+    ] = []
+    validated_scalar_scales: dict[str, float] = {}
+    largest_source_tensor_bytes = 0
+    largest_reconstruction_working_set_bytes = 0
+
+    def validate_source(
+        source: StreamingWeightSource,
+    ) -> tuple[list[int], int, int]:
+        if source.source_name not in key_index:
+            raise ValueError(f"Streaming source '{source.source_name}' does not exist")
+        _source_path, source_shape, source_dtype = key_index[source.source_name]
+        if source.mode in {"fp8_block_128", "fp8_scalar"}:
+            if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
+                raise ValueError(
+                    f"Scaled FP8 source '{source.source_name}' has dtype {source_dtype}"
+                )
+            if source.scale_name is None or source.scale_name not in key_index:
+                raise ValueError(
+                    f"Scaled FP8 source '{source.source_name}' has no scale tensor"
+                )
+            scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+            if source.mode == "fp8_block_128":
+                expected_grid = [
+                    (source_shape[0] + 127) // 128,
+                    (source_shape[1] + 127) // 128,
+                ]
+                if len(source_shape) != 2 or scale_shape != expected_grid:
+                    raise ValueError(
+                        f"FP8 source '{source.source_name}' has scale grid {scale_shape}; "
+                        f"expected {expected_grid} for strict 128x128 blocks"
+                    )
+                if scale_dtype not in {"BF16", "F32"}:
+                    raise ValueError(
+                        f"FP8 source '{source.source_name}' has unsupported scale dtype "
+                        f"{scale_dtype}; expected BF16 or F32"
+                    )
+            else:
+                if scale_shape != [1] or scale_dtype != "BF16":
+                    raise ValueError(
+                        f"FP8 scalar source '{source.source_name}' has scale "
+                        f"dtype/shape {scale_dtype}/{scale_shape}; expected BF16/[1]"
+                    )
+                if source.expected_scale is None:
+                    raise ValueError(
+                        f"FP8 scalar source '{source.source_name}' has no pinned "
+                        "expected scale value"
+                    )
+                actual_scale = validated_scalar_scales.get(source.scale_name)
+                if actual_scale is None:
+                    with safe_open(scale_path, framework="pt") as handle:
+                        scale = handle.get_tensor(source.scale_name)
+                    actual_scale = float(scale.to(torch.float32).item())
+                    validated_scalar_scales[source.scale_name] = actual_scale
+                if actual_scale != source.expected_scale:
+                    raise ValueError(
+                        f"FP8 scalar source '{source.source_name}' has scale "
+                        f"{actual_scale}; expected pinned value {source.expected_scale}"
+                    )
+            consumed.add(source.scale_name)
+        source_element_bytes = _SAFETENSORS_DTYPE_BYTES.get(source_dtype)
+        if source_element_bytes is None:
+            raise ValueError(
+                f"Streaming source '{source.source_name}' has unsupported byte-size "
+                f"dtype {source_dtype}"
+            )
+        source_bytes = math.prod(source_shape) * source_element_bytes
+        scale_bytes = 0
+        if source.scale_name is not None:
+            _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+            scale_element_bytes = _SAFETENSORS_DTYPE_BYTES.get(scale_dtype)
+            if scale_element_bytes is None:
+                raise ValueError(
+                    f"Streaming scale '{source.scale_name}' has unsupported "
+                    f"byte-size dtype {scale_dtype}"
+                )
+            scale_bytes = math.prod(scale_shape) * scale_element_bytes
+        consumed.add(source.source_name)
+        return source_shape, source_bytes, scale_bytes
+
+    for target_name, source in plan.targets.items():
+        initializer = model.graph.initializers.get(target_name)
+        if initializer is None:
+            raise ValueError(f"Streaming plan targets unknown initializer '{target_name}'")
+        if initializer.const_value is not None:
+            raise ValueError(f"Streaming plan targets constant initializer '{target_name}'")
+        assert initializer.dtype is not None
+        expected_shape = [int(dim) for dim in initializer.shape]
+        target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
+        if isinstance(source, StreamingWeightSource):
+            source_shape, source_bytes, scale_bytes = validate_source(source)
+            if expected_shape != source_shape:
+                raise ValueError(
+                    f"Weight shape mismatch for '{target_name}': model expects "
+                    f"{expected_shape}, checkpoint source '{source.source_name}' has "
+                    f"{source_shape}"
+                )
+            bf16_bytes = math.prod(source_shape) * 2
+            cast_bytes = target_bytes if initializer.dtype != ir.DataType.BFLOAT16 else 0
+            largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+            largest_reconstruction_working_set_bytes = max(
+                largest_reconstruction_working_set_bytes,
+                source_bytes + bf16_bytes + cast_bytes + scale_bytes,
+            )
+        else:
+            if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
+                raise ValueError(
+                    f"Expert bank '{target_name}' expects shape {expected_shape}, "
+                    f"but the plan has {len(source.experts)} experts"
+                )
+            max_transient_bytes = 0
+            for expert_index, projections in enumerate(source.experts):
+                rows = 0
+                for projection in projections:
+                    source_shape, source_bytes, scale_bytes = validate_source(projection)
+                    if len(source_shape) != 2 or source_shape[1] != expected_shape[2]:
+                        raise ValueError(
+                            f"Expert source '{projection.source_name}' has shape "
+                            f"{source_shape}; expected [rows, {expected_shape[2]}]"
+                        )
+                    rows += source_shape[0]
+                    dense_projection_bytes = (
+                        math.prod(source_shape) * initializer.dtype.bitwidth + 7
+                    ) // 8
+                    bf16_projection_bytes = math.prod(source_shape) * 2
+                    cast_projection_bytes = (
+                        dense_projection_bytes
+                        if initializer.dtype != ir.DataType.BFLOAT16
+                        else 0
+                    )
+                    largest_source_tensor_bytes = max(
+                        largest_source_tensor_bytes,
+                        source_bytes,
+                    )
+                    max_transient_bytes = max(
+                        max_transient_bytes,
+                        source_bytes
+                        + bf16_projection_bytes
+                        + cast_projection_bytes
+                        + scale_bytes,
+                    )
+                if rows != expected_shape[1]:
+                    raise ValueError(
+                        f"Expert {expert_index} for '{target_name}' has {rows} rows; "
+                        f"expected {expected_shape[1]}"
+                    )
+            largest_reconstruction_working_set_bytes = max(
+                largest_reconstruction_working_set_bytes,
+                target_bytes + max_transient_bytes,
+            )
+        bindings.append((initializer, source, target_name))
+        assigned.add(target_name)
+
+    for source_name, expected in plan.constants.items():
+        path, shape, _dtype = key_index[source_name]
+        if list(expected.shape) != shape:
+            raise ValueError(
+                f"Deterministic source '{source_name}' has shape {shape}; "
+                f"expected {list(expected.shape)}"
+            )
+        with safe_open(path, framework="pt") as handle:
+            actual = handle.get_tensor(source_name)
+        if not torch.equal(actual.cpu(), expected.cpu()):
+            raise ValueError(
+                f"Deterministic source '{source_name}' does not match the graph constant"
+            )
+
+    missing_targets = sorted(
+        name
+        for name, initializer in model.graph.initializers.items()
+        if initializer.const_value is None and name not in assigned
+    )
+    if missing_targets:
+        raise ValueError(
+            f"{len(missing_targets)} graph initializer(s) are missing from the "
+            f"streaming plan (e.g. {missing_targets[:5]})"
+        )
+    unclassified = sorted(set(key_index) - consumed)
+    if unclassified:
+        raise ValueError(
+            f"{len(unclassified)} checkpoint tensor(s) are unclassified by the "
+            f"streaming plan (e.g. {unclassified[:5]})"
+        )
+
+    for initializer, source, target_name in bindings:
+        if isinstance(source, StreamingWeightSource):
+            _assign_lazy_preprocessed(initializer, source, key_index, target_name)
+        else:
+            _assign_lazy_expert_bank(initializer, source, key_index, target_name)
+
+    report = {
+        "format": "mobius.weight-loading-report.v1",
+        "source": model_id,
+        "revision": revision,
+        "output_weight_format": "dense",
+        "native_fp8": False,
+        "assigned_tensors": len(assigned),
+        "validated_constants": len(plan.constants),
+        "ignored_tensors": len(plan.ignored),
+        "largest_source_tensor_bytes": largest_source_tensor_bytes,
+        "largest_reconstruction_working_set_bytes": (largest_reconstruction_working_set_bytes),
+        **dict(plan.report),
+    }
+    model.metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
+    return report
+
+
+def _graph_constant(
+    graph: ir.Graph,
+    name: str,
+    values: list[int],
+    *,
+    shape: tuple[int, ...] | None = None,
+) -> ir.Value:
+    array = torch.tensor(values, dtype=torch.int64)
+    if shape is not None:
+        array = array.reshape(shape)
+    value = ir.Value(
+        name=name,
+        type=ir.TensorType(ir.DataType.INT64),
+        shape=ir.Shape(array.shape),
+        const_value=tensor_adapters.TorchTensor(array, name),
+    )
+    graph.register_initializer(value)
+    return value
+
+
+def _append_standard_node(
+    graph: ir.Graph,
+    op_type: str,
+    inputs: list[ir.Value | None],
+    *,
+    name: str,
+    dtype: ir.DataType,
+    shape: list[int],
+    attributes: dict[str, object] | None = None,
+) -> ir.Value:
+    output = ir.Value(
+        name=f"{name}.output",
+        type=ir.TensorType(dtype),
+        shape=ir.Shape(shape),
+    )
+    graph.append(
+        ir.Node(
+            "",
+            op_type,
+            inputs,
+            outputs=[output],
+            attributes=ir.convenience.convert_attributes(attributes or {}),
+            name=name,
+        )
+    )
+    return output
+
+
+def _qdq_source_initializer(
+    graph: ir.Graph,
+    source_name: str,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+) -> ir.Value:
+    existing = graph.initializers.get(source_name)
+    if existing is not None:
+        return existing
+    path, shape, safetensors_dtype = key_index[source_name]
+    dtype = _SAFETENSORS_TO_IR_DTYPE.get(safetensors_dtype)
+    if dtype is None:
+        raise ValueError(
+            f"QDQ source '{source_name}' has unsupported storage dtype {safetensors_dtype}"
+        )
+    value = ir.Value(
+        name=source_name,
+        type=ir.TensorType(dtype),
+        shape=ir.Shape(shape),
+    )
+    _assign_lazy_from_shard(value, path, source_name, source_name)
+    graph.register_initializer(value)
+    return value
+
+
+def _cast_qdq_output(
+    graph: ir.Graph,
+    value: ir.Value,
+    target_dtype: ir.DataType,
+    target_shape: list[int],
+    *,
+    prefix: str,
+) -> ir.Value:
+    if value.dtype == target_dtype:
+        return value
+    return _append_standard_node(
+        graph,
+        "Cast",
+        [value],
+        name=f"{prefix}.cast",
+        dtype=target_dtype,
+        shape=target_shape,
+        attributes={"to": int(target_dtype.value)},
+    )
+
+
+def _build_scalar_fp8_qdq(
+    graph: ir.Graph,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    *,
+    target_dtype: ir.DataType,
+    prefix: str,
+    dependency: ir.Value | None = None,
+) -> ir.Value:
+    assert source.scale_name is not None
+    codes = _qdq_source_initializer(graph, source.source_name, key_index)
+    scale = _qdq_source_initializer(graph, source.scale_name, key_index)
+    source_shape = [int(dim) for dim in codes.shape]
+    scalar_shape = _graph_constant(graph, f"{prefix}.scalar_shape", [], shape=(0,))
+    scalar = _append_standard_node(
+        graph,
+        "Reshape",
+        [scale, scalar_shape],
+        name=f"{prefix}.scale_scalar",
+        dtype=ir.DataType.BFLOAT16,
+        shape=[],
+    )
+    if dependency is not None:
+        # Force PLE shards to execute sequentially. Equal reads the previous
+        # token-sized Gather result; its finite count multiplied by zero adds an
+        # exact dependency without changing the next shard's scale.
+        self_equal = _append_standard_node(
+            graph,
+            "Equal",
+            [dependency, dependency],
+            name=f"{prefix}.dependency_equal",
+            dtype=ir.DataType.BOOL,
+            shape=list(dependency.shape),
+        )
+        counted = _append_standard_node(
+            graph,
+            "Cast",
+            [self_equal],
+            name=f"{prefix}.dependency_cast",
+            dtype=ir.DataType.INT64,
+            shape=list(dependency.shape),
+            attributes={"to": int(ir.DataType.INT64.value)},
+        )
+        count = _append_standard_node(
+            graph,
+            "ReduceSum",
+            [counted],
+            name=f"{prefix}.dependency_sum",
+            dtype=ir.DataType.INT64,
+            shape=[],
+            attributes={"keepdims": 0},
+        )
+        count_bf16 = _append_standard_node(
+            graph,
+            "Cast",
+            [count],
+            name=f"{prefix}.dependency_sum_bf16",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+            attributes={"to": int(ir.DataType.BFLOAT16.value)},
+        )
+        zero_bf16 = _append_standard_node(
+            graph,
+            "Cast",
+            [_graph_constant(graph, f"{prefix}.dependency_zero", [0], shape=())],
+            name=f"{prefix}.dependency_zero_bf16",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+            attributes={"to": int(ir.DataType.BFLOAT16.value)},
+        )
+        dependency_zero = _append_standard_node(
+            graph,
+            "Mul",
+            [count_bf16, zero_bf16],
+            name=f"{prefix}.dependency_mul",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+        )
+        scalar = _append_standard_node(
+            graph,
+            "Add",
+            [scalar, dependency_zero],
+            name=f"{prefix}.dependent_scale",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+        )
+    dequantized = _append_standard_node(
+        graph,
+        "DequantizeLinear",
+        [codes, scalar],
+        name=f"{prefix}.dequantize",
+        dtype=ir.DataType.BFLOAT16,
+        shape=source_shape,
+    )
+    return _cast_qdq_output(
+        graph,
+        dequantized,
+        target_dtype,
+        source_shape,
+        prefix=prefix,
+    )
+
+
+def _build_block_fp8_qdq(
+    graph: ir.Graph,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    *,
+    target_dtype: ir.DataType,
+    prefix: str,
+) -> ir.Value:
+    assert source.scale_name is not None
+    codes = _qdq_source_initializer(graph, source.source_name, key_index)
+    scale = _qdq_source_initializer(graph, source.scale_name, key_index)
+    rows, cols = (int(dim) for dim in codes.shape)
+    block_rows = (rows + 127) // 128
+    block_cols = (cols + 127) // 128
+    padded_rows = block_rows * 128
+    padded_cols = block_cols * 128
+
+    value = codes
+    if (rows, cols) != (padded_rows, padded_cols):
+        pads = _graph_constant(
+            graph,
+            f"{prefix}.pads",
+            [0, 0, padded_rows - rows, padded_cols - cols],
+        )
+        value = _append_standard_node(
+            graph,
+            "Pad",
+            [value, pads],
+            name=f"{prefix}.pad",
+            dtype=ir.DataType.FLOAT8E4M3FN,
+            shape=[padded_rows, padded_cols],
+            attributes={"mode": "constant"},
+        )
+
+    tiled_shape = _graph_constant(
+        graph,
+        f"{prefix}.tiled_shape",
+        [block_rows, 128, block_cols, 128],
+    )
+    tiled = _append_standard_node(
+        graph,
+        "Reshape",
+        [value, tiled_shape],
+        name=f"{prefix}.tile_reshape",
+        dtype=ir.DataType.FLOAT8E4M3FN,
+        shape=[block_rows, 128, block_cols, 128],
+    )
+    tile_major = _append_standard_node(
+        graph,
+        "Transpose",
+        [tiled],
+        name=f"{prefix}.tile_transpose",
+        dtype=ir.DataType.FLOAT8E4M3FN,
+        shape=[block_rows, block_cols, 128, 128],
+        attributes={"perm": [0, 2, 1, 3]},
+    )
+    flat_tile_shape = _graph_constant(
+        graph,
+        f"{prefix}.flat_tile_shape",
+        [block_rows * block_cols, 128 * 128],
+    )
+    flat_tiles = _append_standard_node(
+        graph,
+        "Reshape",
+        [tile_major, flat_tile_shape],
+        name=f"{prefix}.flat_tiles",
+        dtype=ir.DataType.FLOAT8E4M3FN,
+        shape=[block_rows * block_cols, 128 * 128],
+    )
+    flat_scale_shape = _graph_constant(
+        graph,
+        f"{prefix}.flat_scale_shape",
+        [block_rows * block_cols],
+    )
+    flat_scales = _append_standard_node(
+        graph,
+        "Reshape",
+        [scale, flat_scale_shape],
+        name=f"{prefix}.flat_scales",
+        dtype=ir.DataType.BFLOAT16,
+        shape=[block_rows * block_cols],
+    )
+    dequantized_tiles = _append_standard_node(
+        graph,
+        "DequantizeLinear",
+        [flat_tiles, flat_scales],
+        name=f"{prefix}.dequantize",
+        dtype=ir.DataType.BFLOAT16,
+        shape=[block_rows * block_cols, 128 * 128],
+        attributes={"axis": 0},
+    )
+    tile_major_bf16 = _append_standard_node(
+        graph,
+        "Reshape",
+        [
+            dequantized_tiles,
+            _graph_constant(
+                graph,
+                f"{prefix}.tile_major_shape",
+                [block_rows, block_cols, 128, 128],
+            ),
+        ],
+        name=f"{prefix}.tile_major_bf16",
+        dtype=ir.DataType.BFLOAT16,
+        shape=[block_rows, block_cols, 128, 128],
+    )
+    tiled_bf16 = _append_standard_node(
+        graph,
+        "Transpose",
+        [tile_major_bf16],
+        name=f"{prefix}.inverse_tile_transpose",
+        dtype=ir.DataType.BFLOAT16,
+        shape=[block_rows, 128, block_cols, 128],
+        attributes={"perm": [0, 2, 1, 3]},
+    )
+    padded = _append_standard_node(
+        graph,
+        "Reshape",
+        [
+            tiled_bf16,
+            _graph_constant(
+                graph,
+                f"{prefix}.padded_shape",
+                [padded_rows, padded_cols],
+            ),
+        ],
+        name=f"{prefix}.inverse_tile_reshape",
+        dtype=ir.DataType.BFLOAT16,
+        shape=[padded_rows, padded_cols],
+    )
+    if (rows, cols) != (padded_rows, padded_cols):
+        padded = _append_standard_node(
+            graph,
+            "Slice",
+            [
+                padded,
+                _graph_constant(graph, f"{prefix}.slice_starts", [0, 0]),
+                _graph_constant(graph, f"{prefix}.slice_ends", [rows, cols]),
+                _graph_constant(graph, f"{prefix}.slice_axes", [0, 1]),
+            ],
+            name=f"{prefix}.slice",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[rows, cols],
+        )
+    return _cast_qdq_output(
+        graph,
+        padded,
+        target_dtype,
+        [rows, cols],
+        prefix=prefix,
+    )
+
+
+def _build_fp8_qdq_source(
+    graph: ir.Graph,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    *,
+    target_dtype: ir.DataType,
+    prefix: str,
+) -> ir.Value:
+    if source.mode == "fp8_scalar":
+        return _build_scalar_fp8_qdq(
+            graph,
+            source,
+            key_index,
+            target_dtype=target_dtype,
+            prefix=prefix,
+        )
+    if source.mode == "fp8_block_128":
+        return _build_block_fp8_qdq(
+            graph,
+            source,
+            key_index,
+            target_dtype=target_dtype,
+            prefix=prefix,
+        )
+    raise ValueError(f"QDQ requires an FP8 source, got mode {source.mode!r}")
+
+
+def _replace_ple_gather_with_qdq(
+    graph: ir.Graph,
+    target: ir.Value,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    *,
+    prefix: str,
+    dependency: ir.Value | None,
+) -> ir.Value:
+    """Dequantize one PLE shard and serialize execution before the next shard."""
+    uses = list(target.uses())
+    if len(uses) != 1 or uses[0][0].op_type != "Gather":
+        raise ValueError(
+            f"PLE QDQ target '{target.name}' must have exactly one Gather consumer"
+        )
+    gather = uses[0][0]
+    gathered = gather.outputs[0]
+    if gathered.shape is None or target.dtype is None:
+        raise ValueError(f"PLE QDQ target '{target.name}' has incomplete type information")
+    replacement = _build_scalar_fp8_qdq(
+        graph,
+        source,
+        key_index,
+        target_dtype=target.dtype,
+        prefix=prefix,
+        dependency=dependency,
+    )
+    target.replace_all_uses_with(replacement)
+    return gathered
+
+
+def stream_qdq_safetensors_to_model(
+    model: ir.Model,
+    model_id: str,
+    planner: Callable[
+        [Mapping[str, tuple[str, list[int], str]], Mapping[str, ir.Value]],
+        StreamingWeightPlan,
+    ],
+    *,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Bind exact FP8/scales and reconstruct logical weights with standard QDQ."""
+    paths = _resolve_shard_paths(model_id, revision)
+    key_index = _shard_key_index(paths)
+    plan = planner(key_index, model.graph.initializers)
+    graph = model.graph
+    consumed = set(plan.ignored) | set(plan.constants)
+    assigned: set[str] = set()
+    qdq_targets = 0
+    code_to_target: dict[str, str] = {}
+    scale_to_targets: dict[str, list[str]] = {}
+    validated_scalar_scales: dict[str, float] = {}
+    largest_source_cast_overlap_bytes = 0
+    largest_ple_runtime_working_set_bytes = 0
+
+    def record_qdq_source(source: StreamingWeightSource, target_label: str) -> None:
+        prior = code_to_target.get(source.source_name)
+        if prior is not None:
+            raise ValueError(
+                f"FP8 code tensor '{source.source_name}' maps to both {prior!r} "
+                f"and {target_label!r}; code mapping must be bijective"
+            )
+        code_to_target[source.source_name] = target_label
+        assert source.scale_name is not None
+        _code_path, code_shape, code_dtype = key_index[source.source_name]
+        _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+        if code_dtype != "F8_E4M3" or len(code_shape) != 2:
+            raise ValueError(
+                f"QDQ code '{source.source_name}' must be 2-D F8_E4M3, got "
+                f"{code_dtype}/{code_shape}"
+            )
+        if source.mode == "fp8_block_128":
+            expected_scale_shape = [
+                (code_shape[0] + 127) // 128,
+                (code_shape[1] + 127) // 128,
+            ]
+            if scale_dtype != "BF16" or scale_shape != expected_scale_shape:
+                raise ValueError(
+                    f"QDQ block scale '{source.scale_name}' must be BF16/"
+                    f"{expected_scale_shape}, got {scale_dtype}/{scale_shape}"
+                )
+        elif source.mode == "fp8_scalar":
+            if scale_dtype != "BF16" or scale_shape != [1]:
+                raise ValueError(
+                    f"QDQ scalar scale '{source.scale_name}' must be BF16/[1], "
+                    f"got {scale_dtype}/{scale_shape}"
+                )
+            if source.expected_scale is None:
+                raise ValueError(
+                    f"QDQ scalar source '{source.source_name}' has no expected scale"
+                )
+            actual = validated_scalar_scales.get(source.scale_name)
+            if actual is None:
+                with safe_open(_scale_path, framework="pt") as handle:
+                    actual = float(
+                        handle.get_tensor(source.scale_name).to(torch.float32).item()
+                    )
+                validated_scalar_scales[source.scale_name] = actual
+            if actual != source.expected_scale:
+                raise ValueError(
+                    f"QDQ scalar scale '{source.scale_name}' is {actual}; expected "
+                    f"{source.expected_scale}"
+                )
+        else:
+            raise ValueError(
+                f"QDQ source '{source.source_name}' has unsupported mode {source.mode}"
+            )
+        scale_to_targets.setdefault(source.scale_name, []).append(target_label)
+
+    # Validate the complete plan before registering any source initializer or
+    # appending any QDQ node. A malformed late target must not leave a partially
+    # mutated graph.
+    ple_dependencies: dict[str, ir.Value] = {}
+    for target_name, source in plan.targets.items():
+        target = graph.initializers.get(target_name)
+        if target is None:
+            raise ValueError(f"QDQ plan targets unknown initializer '{target_name}'")
+        if target.const_value is not None:
+            raise ValueError(f"QDQ plan targets constant initializer '{target_name}'")
+        if target.shape is None or target.dtype is None:
+            raise ValueError(
+                f"QDQ target '{target_name}' must have a concrete shape and dtype"
+            )
+        target_shape = [int(dim) for dim in target.shape]
+        if isinstance(source, StreamingWeightSource):
+            located = key_index.get(source.source_name)
+            if located is None:
+                raise ValueError(
+                    f"QDQ target '{target_name}' is missing source '{source.source_name}'"
+                )
+            _path, source_shape, _dtype = located
+            if source_shape != target_shape:
+                raise ValueError(
+                    f"QDQ source '{source.source_name}' has logical shape "
+                    f"{source_shape}; target '{target_name}' expects {target_shape}"
+                )
+            if source.mode != "direct":
+                record_qdq_source(source, target_name)
+                assert source.scale_name is not None
+                consumed.add(source.scale_name)
+                if (
+                    source.mode == "fp8_scalar"
+                    and ".ple.ple_embedding.ngram_embedding.shard_" in target_name
+                ):
+                    _path, code_shape, code_dtype = key_index[source.source_name]
+                    _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+                    code_bytes = math.prod(code_shape) * _SAFETENSORS_DTYPE_BYTES[code_dtype]
+                    bf16_bytes = math.prod(code_shape) * 2
+                    cast_bytes = (
+                        (math.prod(code_shape) * target.dtype.bitwidth + 7) // 8
+                        if target.dtype != ir.DataType.BFLOAT16
+                        else 0
+                    )
+                    scale_bytes = (
+                        math.prod(scale_shape) * _SAFETENSORS_DTYPE_BYTES[scale_dtype]
+                    )
+                    largest_ple_runtime_working_set_bytes = max(
+                        largest_ple_runtime_working_set_bytes,
+                        code_bytes + bf16_bytes + cast_bytes + scale_bytes,
+                    )
+            consumed.add(source.source_name)
+            continue
+
+        if len(target_shape) != 3:
+            raise ValueError(
+                f"QDQ packed expert target '{target_name}' has shape {target_shape}; "
+                "expected rank 3 [experts, rows, input_width]"
+            )
+        if len(source.experts) != target_shape[0]:
+            raise ValueError(
+                f"QDQ packed expert target '{target_name}' expects "
+                f"{target_shape[0]} experts, but the plan provides "
+                f"{len(source.experts)}"
+            )
+        for expert_index, projections in enumerate(source.experts):
+            if not projections:
+                raise ValueError(
+                    f"QDQ packed expert target '{target_name}' expert "
+                    f"{expert_index} has no source projections"
+                )
+            rows = 0
+            for projection_index, projection in enumerate(projections):
+                label = f"{target_name}[{expert_index}][{projection_index}]"
+                record_qdq_source(projection, label)
+                _path, projection_shape, _dtype = key_index[projection.source_name]
+                if len(projection_shape) != 2:
+                    raise ValueError(
+                        f"QDQ expert source '{projection.source_name}' has shape "
+                        f"{projection_shape}; target '{target_name}' requires 2-D "
+                        "projections"
+                    )
+                if projection_shape[1] != target_shape[2]:
+                    raise ValueError(
+                        f"QDQ expert source '{projection.source_name}' has input "
+                        f"width {projection_shape[1]}; target '{target_name}' expects "
+                        f"{target_shape[2]}"
+                    )
+                rows += projection_shape[0]
+                consumed.add(projection.source_name)
+                assert projection.scale_name is not None
+                consumed.add(projection.scale_name)
+            if rows != target_shape[1]:
+                raise ValueError(
+                    f"QDQ packed expert target '{target_name}' expert "
+                    f"{expert_index} source row sum is {rows}; expected "
+                    f"{target_shape[1]}"
+                )
+
+    for source_name, expected in plan.constants.items():
+        path, shape, _dtype = key_index[source_name]
+        if list(expected.shape) != shape:
+            raise ValueError(
+                f"Deterministic source '{source_name}' has shape {shape}; "
+                f"expected {list(expected.shape)}"
+            )
+        with safe_open(path, framework="pt") as handle:
+            actual = handle.get_tensor(source_name)
+        if not torch.equal(actual.cpu(), expected.cpu()):
+            raise ValueError(
+                f"Deterministic source '{source_name}' does not match the graph constant"
+            )
+
+    missing_targets = sorted(
+        name
+        for name, value in graph.initializers.items()
+        if value.const_value is None and name not in plan.targets
+    )
+    if missing_targets:
+        raise ValueError(f"QDQ plan leaves graph target(s) unassigned: {missing_targets[:5]}")
+    unclassified = sorted(set(key_index) - consumed)
+    if unclassified:
+        raise ValueError(
+            f"{len(unclassified)} checkpoint tensor(s) are unclassified by the "
+            f"QDQ plan (e.g. {unclassified[:5]})"
+        )
+
+    for target_name, source in plan.targets.items():
+        target = graph.initializers.get(target_name)
+        if target is None:
+            raise ValueError(f"QDQ plan targets unknown initializer '{target_name}'")
+        if target.const_value is not None:
+            raise ValueError(f"QDQ plan targets constant initializer '{target_name}'")
+        assert target.dtype is not None
+        prefix = f"fp8_qdq.{hashlib.sha256(target_name.encode()).hexdigest()[:16]}"
+
+        if isinstance(source, StreamingWeightSource):
+            if source.mode == "direct":
+                path, shape, source_dtype = key_index[source.source_name]
+                source_ir_dtype = _SAFETENSORS_TO_IR_DTYPE.get(source_dtype)
+                if source_ir_dtype is None:
+                    raise ValueError(
+                        f"QDQ direct source '{source.source_name}' has unsupported "
+                        f"storage dtype {source_dtype}"
+                    )
+                if source_ir_dtype != target.dtype:
+                    source_bytes = math.prod(shape) * _SAFETENSORS_DTYPE_BYTES[source_dtype]
+                    target_bytes = (
+                        math.prod(int(dim) for dim in target.shape) * target.dtype.bitwidth + 7
+                    ) // 8
+                    largest_source_cast_overlap_bytes = max(
+                        largest_source_cast_overlap_bytes,
+                        source_bytes + target_bytes,
+                    )
+                _assign_lazy_from_shard(target, path, source.source_name, target_name)
+                consumed.add(source.source_name)
+                assigned.add(target_name)
+                continue
+            if (
+                source.mode == "fp8_scalar"
+                and ".ple.ple_embedding.ngram_embedding.shard_" in target_name
+            ):
+                assert source.scale_name is not None
+                ple_dependencies[source.scale_name] = _replace_ple_gather_with_qdq(
+                    graph,
+                    target,
+                    source,
+                    key_index,
+                    prefix=prefix,
+                    dependency=ple_dependencies.get(source.scale_name),
+                )
+                del graph.initializers[target_name]
+                assigned.add(target_name)
+                qdq_targets += 1
+                continue
+            replacement = _build_fp8_qdq_source(
+                graph,
+                source,
+                key_index,
+                target_dtype=target.dtype,
+                prefix=prefix,
+            )
+            consumed.add(source.source_name)
+            assert source.scale_name is not None
+            consumed.add(source.scale_name)
+            qdq_targets += 1
+        else:
+            expert_values: list[ir.Value] = []
+            for expert_index, projections in enumerate(source.experts):
+                projection_values = []
+                for projection_index, projection in enumerate(projections):
+                    projection_values.append(
+                        _build_fp8_qdq_source(
+                            graph,
+                            projection,
+                            key_index,
+                            target_dtype=target.dtype,
+                            prefix=f"{prefix}.expert_{expert_index}.{projection_index}",
+                        )
+                    )
+                    consumed.add(projection.source_name)
+                    assert projection.scale_name is not None
+                    consumed.add(projection.scale_name)
+                expert = (
+                    projection_values[0]
+                    if len(projection_values) == 1
+                    else _append_standard_node(
+                        graph,
+                        "Concat",
+                        projection_values,
+                        name=f"{prefix}.expert_{expert_index}.concat",
+                        dtype=target.dtype,
+                        shape=[
+                            sum(int(value.shape[0]) for value in projection_values),
+                            int(projection_values[0].shape[1]),
+                        ],
+                        attributes={"axis": 0},
+                    )
+                )
+                expert_values.append(
+                    _append_standard_node(
+                        graph,
+                        "Unsqueeze",
+                        [
+                            expert,
+                            _graph_constant(
+                                graph,
+                                f"{prefix}.expert_{expert_index}.axis",
+                                [0],
+                            ),
+                        ],
+                        name=f"{prefix}.expert_{expert_index}.unsqueeze",
+                        dtype=target.dtype,
+                        shape=[1, *[int(dim) for dim in expert.shape]],
+                    )
+                )
+            replacement = _append_standard_node(
+                graph,
+                "Concat",
+                expert_values,
+                name=f"{prefix}.expert_bank",
+                dtype=target.dtype,
+                shape=[int(dim) for dim in target.shape],
+                attributes={"axis": 0},
+            )
+            qdq_targets += sum(len(projections) for projections in source.experts)
+
+        target.replace_all_uses_with(replacement, replace_graph_outputs=True)
+        del graph.initializers[target_name]
+        assigned.add(target_name)
+
+    graph.sort()
+    fold_initializers_after_weights(model)
+    canonical_mapping = "\n".join(
+        f"{source}\t{code_to_target[source]}\n" for source in sorted(code_to_target)
+    )
+    stored_code_bytes = sum(
+        math.prod(key_index[name][1]) * _SAFETENSORS_DTYPE_BYTES[key_index[name][2]]
+        for name in code_to_target
+    )
+    stored_scale_bytes = sum(
+        math.prod(key_index[name][1]) * _SAFETENSORS_DTYPE_BYTES[key_index[name][2]]
+        for name in scale_to_targets
+    )
+    dense_equivalent_bytes = sum(math.prod(key_index[name][1]) * 2 for name in code_to_target)
+    recipe = {
+        "format": "mobius.fp8-qdq-recipe.v1",
+        "block_shape": [128, 128],
+        "block_transform": (
+            "[R,C] -> pad -> [Br,128,Bc,128] -> transpose(0,2,1,3) "
+            "-> [Br*Bc,16384] -> DequantizeLinear(axis=0) -> inverse -> slice"
+        ),
+        "ple_transform": (
+            "per-shard DequantizeLinear(float8_codes, reshape(bf16_scale,[ ])) "
+            "-> Gather(dense_shard, local_ids); explicit dependencies serialize "
+            "full-shard DQ and masked outputs accumulate without a full-table destination"
+        ),
+        "source_codes_preserved": True,
+        "source_scales_preserved": True,
+        "ple_shards_execute_sequentially": True,
+        "native_fp8_compute": False,
+        "runtime_execution_proven": False,
+        "qdq_targets": qdq_targets,
+        "source_code_tensors": len(code_to_target),
+        "source_scale_tensors": len(scale_to_targets),
+        "code_mapping": "bijective",
+        "scale_mapping": (
+            "one-to-one for block grids; the pinned PLE scalar is shared by "
+            "all PLE shard code tensors"
+        ),
+        "canonical_code_mapping_sha256": hashlib.sha256(
+            canonical_mapping.encode()
+        ).hexdigest(),
+    }
+    report = {
+        "format": "mobius.weight-loading-report.v1",
+        "source": model_id,
+        "revision": revision,
+        "output_weight_format": "fp8_qdq",
+        "storage_preserving": True,
+        "native_fp8": False,
+        "streaming_external_data": True,
+        "largest_source_cast_overlap_bytes": largest_source_cast_overlap_bytes,
+        "largest_ple_runtime_working_set_bytes": (largest_ple_runtime_working_set_bytes),
+        "stored_fp8_code_bytes": stored_code_bytes,
+        "stored_scale_bytes": stored_scale_bytes,
+        "dense_equivalent_bytes": dense_equivalent_bytes,
+        "assigned_targets": len(assigned),
+        "validated_constants": len(plan.constants),
+        "ignored_tensors": len(plan.ignored),
+        "qdq_recipe": recipe,
+        **dict(plan.report),
+    }
+    model.metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
+    model.metadata_props["mobius.fp8_qdq_recipe"] = json.dumps(recipe, sort_keys=True)
+    return report
 
 
 def stream_safetensors_to_model(

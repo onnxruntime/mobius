@@ -100,6 +100,40 @@ class TestCLIBuild:
 
         assert save_package.call_args.args[2].max_workers == 8
 
+    @pytest.mark.parametrize(
+        ("extra_args", "expected"),
+        [([], True), (["--dequantize"], False)],
+    )
+    def test_transformers_quantization_choice_reaches_build(
+        self,
+        extra_args,
+        expected,
+    ):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch(
+                "mobius.__main__.build",
+                return_value=mock.MagicMock(),
+            ) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "unsloth/Qwen3.8-Flash-Next-FP8",
+                    tmpdir,
+                    "--no-weights",
+                    *extra_args,
+                ]
+            )
+
+        assert mock_build.call_args.kwargs["keep_quantized"] is expected
+
     def test_revision_propagates_to_diffusers_detection_and_build(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,

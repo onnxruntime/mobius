@@ -23,6 +23,7 @@ __all__ = ["ModelPackage"]
 import inspect
 import json
 import logging
+import math
 import os
 import shutil
 import threading
@@ -54,6 +55,9 @@ _PACKAGE_MANIFEST = ".mobius-package.json"
 _PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
 _MTP_SIDECAR_BASENAME = ".mobius-mtp"
 _QUANTIZATION_REPORT = "quantization_report.json"
+_WEIGHT_LOADING_REPORT = "weight-loading-report.json"
+_DEFAULT_STREAMING_DENSE_SHARD_BYTES = 1 << 30
+_MAX_STREAMING_DENSE_SHARD_BYTES = 5_000_000_000
 
 
 def _read_mtp_sidecar_name(directory: str) -> str | None:
@@ -135,6 +139,7 @@ def _validate_mtp_chain(package: ModelPackage) -> None:
             if collision_key in {
                 _PACKAGE_MANIFEST.casefold(),
                 _QUANTIZATION_REPORT.casefold(),
+                _WEIGHT_LOADING_REPORT.casefold(),
             }:
                 raise ValueError(
                     f"ModelPackage component name {name!r} is reserved for package metadata."
@@ -182,6 +187,11 @@ def _validate_mtp_save_paths(
             "package being saved has no GGUF quantization report. Remove or clean the "
             "output directory before saving."
         )
+    weight_report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+    if os.path.lexists(weight_report_path) and (
+        os.path.islink(weight_report_path) or not os.path.isfile(weight_report_path)
+    ):
+        raise ValueError("ModelPackage weight-loading report output must be a real file.")
     previous_sidecar_name = _read_mtp_sidecar_name(directory)
     selected = [name for name in package if components is None or components(name)]
     if len(selected) > 1:
@@ -306,6 +316,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         self.config = config
         self.gguf_quantization_report: GGUFQuantizationReport | None = None
         self.quantization_report: object | None = None
+        self.weight_loading_report: dict[str, object] | None = None
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
         self.mtp_head: ModelPackage | None = None
@@ -450,6 +461,57 @@ class ModelPackage(UserDict[str, ir.Model]):
             for name, model in self.data.items()
             if components is None or components(name)
         }
+        report = self.weight_loading_report
+        dense_stream = (
+            report is not None
+            and report.get("output_weight_format") == "dense"
+            and report.get("native_fp8") is False
+        )
+        preserved_stream = report is not None and report.get("streaming_external_data") is True
+        if dense_stream or preserved_stream:
+            assert report is not None
+            # onnx-ir may materialize external-data shards concurrently. Keep
+            # this fallback serial so the documented bound remains one output
+            # shard plus one reconstructed tensor instead of max_workers shards.
+            max_workers = 1
+            if max_shard_size_bytes is None:
+                max_shard_size_bytes = _DEFAULT_STREAMING_DENSE_SHARD_BYTES
+            if max_shard_size_bytes > _MAX_STREAMING_DENSE_SHARD_BYTES:
+                raise ValueError(
+                    "Streaming dense fallback packages require "
+                    f"max_shard_size_bytes <= {_MAX_STREAMING_DENSE_SHARD_BYTES}; "
+                    f"got {max_shard_size_bytes}. The serializer buffers one output "
+                    "shard before flushing it."
+                )
+            largest_tensor_bytes = 0
+            for model in selected.values():
+                for initializer in model.graph.initializers.values():
+                    if initializer.shape is None or initializer.dtype is None:
+                        continue
+                    num_elements = math.prod(int(dim) for dim in initializer.shape)
+                    tensor_bytes = (num_elements * initializer.dtype.bitwidth + 7) // 8
+                    largest_tensor_bytes = max(largest_tensor_bytes, tensor_bytes)
+            self.weight_loading_report = {
+                **report,
+                "external_data_shard_limit_bytes": max_shard_size_bytes,
+                "largest_dense_tensor_bytes": largest_tensor_bytes,
+                "largest_reconstruction_working_set_bytes": max(
+                    int(
+                        report.get(
+                            "largest_reconstruction_working_set_bytes",
+                            0,
+                        )
+                    ),
+                    int(report.get("largest_source_cast_overlap_bytes", 0)),
+                    largest_tensor_bytes,
+                ),
+                "serializer_max_workers": max_workers,
+                "serialization_memory_bound": (
+                    "one output shard plus the largest source/reconstruction "
+                    "working set and serializer overhead; "
+                    "external-data serialization is forced to one worker"
+                ),
+            }
         use_subfolders = len(selected) > 1
         if reuse_plan is not None and (len(selected) != 1 or use_subfolders):
             raise ValueError("GGUF weight reuse currently supports one flat ONNX model only.")
@@ -498,6 +560,15 @@ class ModelPackage(UserDict[str, ir.Model]):
             stale_reuse_manifest = os.path.join(directory, "gguf-reuse.json")
             if os.path.isfile(stale_reuse_manifest):
                 os.remove(stale_reuse_manifest)
+        report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+        if self.weight_loading_report is not None:
+            if os.path.islink(report_path):
+                raise ValueError("Weight-loading report must not be a symlink.")
+            with open(report_path, "w", encoding="utf-8") as file:
+                json.dump(self.weight_loading_report, file, indent=2, sort_keys=True)
+                file.write("\n")
+        elif os.path.isfile(report_path):
+            os.remove(report_path)
         if include_policy_components:
             self.save_policy_components(directory, check_weights=check_weights)
         if include_adapter_artifacts:
@@ -915,6 +986,18 @@ class ModelPackage(UserDict[str, ir.Model]):
             package.gguf_quantization_report = GGUFQuantizationReport.read_json(
                 quantization_report_path
             )
+        report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+        if os.path.lexists(report_path):
+            if os.path.islink(report_path) or not os.path.isfile(report_path):
+                raise ValueError("Weight-loading report must be a regular file.")
+            with open(report_path, encoding="utf-8") as file:
+                report = json.load(file)
+            if (
+                not isinstance(report, dict)
+                or report.get("format") != "mobius.weight-loading-report.v1"
+            ):
+                raise ValueError("Invalid weight-loading report.")
+            package.weight_loading_report = report
         package._load_policy_components(directory)
         if mtp_dir is not None:
             package.mtp_head = cls._load(mtp_dir, ancestors)

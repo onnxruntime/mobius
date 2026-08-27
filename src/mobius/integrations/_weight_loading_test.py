@@ -900,14 +900,14 @@ class TestDequantizeFP8Weights:
         assert "model.weight_proj.weight" in result
         assert result["model.weight_proj.weight"].dtype == torch.bfloat16
 
-    def test_missing_scale_casts_without_scaling(self):
-        """FP8 weight without scale_inv is cast to bfloat16 without scaling."""
+    def test_missing_scale_fails_closed(self):
+        """Generic FP8 loading must not guess an implicit unit scale."""
         from mobius.integrations._weight_loading import _dequantize_fp8_weights
 
         fp8_weight = torch.tensor([1.0, 2.0], dtype=torch.float32).to(torch.float8_e4m3fn)
         state_dict = {"orphan.weight": fp8_weight}
-        result = _dequantize_fp8_weights(state_dict)
-        assert result["orphan.weight"].dtype == torch.bfloat16
+        with pytest.raises(ValueError, match="Refusing to guess an implicit scale"):
+            _dequantize_fp8_weights(state_dict)
 
     def test_fp32_scale_produces_bf16_output(self):
         """FP32 weight_scale_inv should still produce bfloat16 output."""
@@ -924,6 +924,90 @@ class TestDequantizeFP8Weights:
         assert result["proj.weight"].dtype == torch.bfloat16, (
             f"Expected bfloat16, got {result['proj.weight'].dtype}"
         )
+
+    def test_2d_scale_grid_dequantizes_128_by_128_blocks(self):
+        """A 2-D inverse-scale grid maps to 128-by-128 FP8 weight tiles."""
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
+
+        fp8_weight = torch.full((129, 130), 2.0, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale_grid = torch.tensor([[0.5, 1.0], [1.5, 2.0]], dtype=torch.bfloat16)
+        state_dict = {
+            "expert.down_proj.weight": fp8_weight,
+            "expert.down_proj.weight_scale_inv": scale_grid,
+            "expert.down_proj.activation_scale": torch.tensor(1.0, dtype=torch.bfloat16),
+        }
+
+        result = _dequantize_fp8_weights(state_dict)
+
+        expected = torch.empty((129, 130), dtype=torch.bfloat16)
+        expected[:128, :128] = 1.0
+        expected[:128, 128:] = 2.0
+        expected[128:, :128] = 3.0
+        expected[128:, 128:] = 4.0
+        assert torch.equal(result["expert.down_proj.weight"], expected)
+        assert result["expert.down_proj.weight"].dtype == torch.bfloat16
+        assert "expert.down_proj.weight_scale_inv" not in result
+        assert "expert.down_proj.activation_scale" not in result
+        assert torch.equal(
+            state_dict["expert.down_proj.weight"].to(torch.float32),
+            fp8_weight.to(torch.float32),
+        )
+        assert torch.equal(state_dict["expert.down_proj.weight_scale_inv"], scale_grid)
+        assert "expert.down_proj.activation_scale" in state_dict
+
+    @pytest.mark.parametrize(
+        ("weight_shape", "grid_shape"),
+        [
+            ((128, 128), (1, 2)),
+            ((129, 128), (1, 1)),
+        ],
+    )
+    def test_2d_scale_grid_requires_exact_block_shape(self, weight_shape, grid_shape):
+        """Block-scale grids must cover every full or partial 128-by-128 tile."""
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
+
+        state_dict = {
+            "proj.weight": torch.ones(weight_shape, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            "proj.weight_scale_inv": torch.ones(grid_shape, dtype=torch.bfloat16),
+        }
+
+        with pytest.raises(ValueError, match="scale grid shape"):
+            _dequantize_fp8_weights(state_dict)
+
+    @pytest.mark.parametrize(
+        "scale",
+        [
+            torch.ones(2, dtype=torch.bfloat16),
+            torch.ones((1, 1, 1), dtype=torch.bfloat16),
+        ],
+    )
+    def test_scale_must_be_scalar_or_2d_grid(self, scale):
+        """Non-scalar, non-grid inverse scales fail closed."""
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
+
+        state_dict = {
+            "proj.weight": torch.ones((128, 128), dtype=torch.float32).to(torch.float8_e4m3fn),
+            "proj.weight_scale_inv": scale,
+        }
+
+        with pytest.raises(ValueError, match="scalar or 2-D block scale grid"):
+            _dequantize_fp8_weights(state_dict)
+
+    def test_2d_scale_grid_requires_2d_weight(self):
+        """Block-scale grids cannot silently broadcast over non-matrix FP8 weights."""
+        from mobius.integrations._weight_loading import _dequantize_fp8_weights
+
+        state_dict = {
+            "proj.weight": torch.ones((1, 128, 128), dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            ),
+            "proj.weight_scale_inv": torch.ones((1, 1), dtype=torch.bfloat16),
+        }
+
+        with pytest.raises(ValueError, match="block scaling requires a 2-D weight"):
+            _dequantize_fp8_weights(state_dict)
 
     def test_does_not_mutate_input(self):
         """_dequantize_fp8_weights should not mutate the input dict."""

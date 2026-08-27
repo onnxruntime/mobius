@@ -15,7 +15,11 @@ from onnxscript import nn
 from mobius._builder import build_from_module, resolve_dtype
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
-from mobius.integrations._weight_loading import _download_weights
+from mobius.integrations._weight_loading import (
+    _download_weights,
+    stream_preprocessed_safetensors_to_model,
+    stream_qdq_safetensors_to_model,
+)
 from mobius.integrations.compressed_tensors import (
     CompressedTensorsConfig,
     stream_compressed_tensors_to_package,
@@ -23,6 +27,10 @@ from mobius.integrations.compressed_tensors import (
 from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
+
+_PINNED_CHECKPOINT_REVISIONS = {
+    "unsloth/Qwen3.8-Flash-Next-FP8": "41cc25fe32cc20053a59c89716196897580cddf6",
+}
 
 
 def _is_qwen4_exp_composite(config) -> bool:
@@ -42,6 +50,11 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
     overrides: dict[str, Any] = {"model_type": model_type}
     for name in (
         "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "unsupported_video_token_id",
+        "deepstack_visual_indexes",
         "use_bidirectional_attention",
         "audio_token_id",
         "boa_token_id",
@@ -164,6 +177,7 @@ def build_transformers_model(
     dtype: str | ir.DataType | None = None,
     output_layer_indices: list[int] | None = None,
     load_weights: bool = True,
+    keep_quantized: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "default",
     trace_optimization: bool = False,
@@ -173,7 +187,6 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
-    keep_quantized: bool = True,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -190,6 +203,16 @@ def build_transformers_model(
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
     """
+    pinned_revision = _PINNED_CHECKPOINT_REVISIONS.get(model_id)
+    if pinned_revision is not None:
+        if revision is None:
+            revision = pinned_revision
+        elif revision != pinned_revision:
+            raise ValueError(
+                f"{model_id} is integrated only at immutable revision "
+                f"{pinned_revision}; got {revision}."
+            )
+
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,
@@ -244,10 +267,9 @@ def build_transformers_model(
         task,
         allow_parent_architecture_override=not text_only,
     )
-    config_parent = None if text_only and model_type == "qwen4_exp_text" else parent_config
     config = _config_from_hf(
         hf_config,
-        parent_config=config_parent,
+        parent_config=parent_config,
         module_class=module_class,
     )
     if (
@@ -336,7 +358,39 @@ def build_transformers_model(
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        if config.block_quant_scheme is not None and hasattr(
+            model_module, "build_fp8_streaming_plan"
+        ):
+            if len(package) != 1:
+                raise ValueError(
+                    "Block-FP8 dense streaming currently requires one text-only "
+                    "model component; multimodal Qwen4-Exp remains unsupported."
+                )
+            stream = (
+                stream_qdq_safetensors_to_model
+                if keep_quantized
+                else stream_preprocessed_safetensors_to_model
+            )
+            report = stream(
+                next(iter(package.values())),
+                model_id,
+                model_module.build_fp8_streaming_plan,
+                revision=revision,
+            )
+            package.weight_loading_report = report
+            if keep_quantized:
+                logger.info(
+                    "Preserved %s FP8 storage with standard QDQ. Current ORT "
+                    "execution is not claimed; see weight-loading-report.json.",
+                    model_id,
+                )
+            else:
+                logger.warning(
+                    "Loaded %s as an explicitly requested streaming dense fallback; "
+                    "native FP8 was not preserved. See weight-loading-report.json.",
+                    model_id,
+                )
+        elif model_type in {"qwen4_exp", "qwen4_exp_text"}:
             from mobius.integrations.transformers._qwen4_exp_weights import (
                 stream_qwen4_exp_safetensors_to_package,
             )

@@ -93,6 +93,129 @@ class TestModelPackageDict:
         assert pkg.config is config
 
 
+class TestWeightLoadingReport:
+    def test_roundtrips_with_package(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        pkg.save(str(tmp_path), progress_bar=False)
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.weight_loading_report == pkg.weight_loading_report
+        assert loaded.weight_loading_report["external_data_shard_limit_bytes"] == 1 << 30
+        assert loaded.weight_loading_report["largest_dense_tensor_bytes"] == 0
+        assert loaded.weight_loading_report["serializer_max_workers"] == 1
+        assert (tmp_path / "weight-loading-report.json").is_file()
+
+    def test_dense_streaming_forces_serial_external_data_save(self, tmp_path, monkeypatch):
+        workers = []
+
+        def save(
+            model,
+            path,
+            *,
+            external_data,
+            max_shard_size_bytes,
+            callback,
+            max_workers,
+        ):
+            workers.append(max_workers)
+
+        monkeypatch.setattr(ir, "save", save)
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        pkg.save(
+            str(tmp_path),
+            max_workers=8,
+            progress_bar=False,
+            check_weights=False,
+        )
+
+        assert workers == [1]
+        assert pkg.weight_loading_report["serializer_max_workers"] == 1
+        assert (
+            "forced to one worker" in pkg.weight_loading_report["serialization_memory_bound"]
+        )
+
+    def test_rejects_unbounded_dense_streaming_shard(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "dense",
+        }
+
+        with pytest.raises(ValueError, match="serializer buffers one output shard"):
+            pkg.save(
+                str(tmp_path),
+                max_shard_size_bytes=5_000_000_001,
+                progress_bar=False,
+            )
+
+    def test_qdq_report_includes_source_cast_overlap(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "fp8_qdq",
+            "streaming_external_data": True,
+            "largest_source_cast_overlap_bytes": 4096,
+        }
+
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        assert pkg.weight_loading_report["largest_reconstruction_working_set_bytes"] == 4096
+        assert pkg.weight_loading_report["serializer_max_workers"] == 1
+
+    def test_ordinary_resave_removes_stale_report(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+        }
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        pkg.weight_loading_report = None
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "weight-loading-report.json").exists()
+
+    def test_load_rejects_invalid_report(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.save(str(tmp_path), progress_bar=False)
+        (tmp_path / "weight-loading-report.json").write_text('{"format": "unknown"}')
+
+        with pytest.raises(ValueError, match="Invalid weight-loading report"):
+            ModelPackage.load(str(tmp_path))
+
+    def test_report_path_is_validated_before_model_serialization(self, tmp_path):
+        external = tmp_path / "external-report"
+        external.write_text("unchanged")
+        (tmp_path / "weight-loading-report.json").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "fp8_qdq",
+            "streaming_external_data": True,
+        }
+
+        with pytest.raises(ValueError, match="weight-loading report output"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert external.read_text() == "unchanged"
+        assert not (tmp_path / "model.onnx").exists()
+
+
 class TestOnnxShardedSave:
     def test_onnx_external_data_is_sharded(self, tmp_path):
         graph = ir.Graph([], [], nodes=[], name="m")

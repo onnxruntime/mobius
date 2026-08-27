@@ -23,6 +23,7 @@ from onnx_ir import tensor_adapters
 from mobius._builder import build_from_module
 from mobius._testing import make_config
 from mobius.integrations._weight_loading import (
+    _shard_key_index,
     external_data_checksums,
     stream_safetensors_to_model,
 )
@@ -138,6 +139,15 @@ class TestStreamingCorrectness:
 
 
 class TestStreamingRefusals:
+    def test_duplicate_tensor_across_shards_is_rejected(self, tmp_path):
+        shard_a = tmp_path / "a.safetensors"
+        shard_b = tmp_path / "b.safetensors"
+        safetensors.torch.save_file({"duplicate.weight": torch.ones(2)}, str(shard_a))
+        safetensors.torch.save_file({"duplicate.weight": torch.zeros(2)}, str(shard_b))
+
+        with pytest.raises(ValueError, match=r"Duplicate tensor key 'duplicate\.weight'"):
+            _shard_key_index([str(shard_a), str(shard_b)])
+
     def test_shape_mismatch_raises(self, tmp_path):
         model = _fresh_model()
         state = _make_checkpoint_state(model)

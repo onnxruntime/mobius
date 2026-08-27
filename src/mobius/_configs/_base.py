@@ -732,7 +732,13 @@ class ArchitectureConfig(BaseModelConfig):
     output_final_hidden_state: bool = False
 
     @classmethod
-    def from_transformers(cls, config, parent_config=None) -> ArchitectureConfig:
+    def from_transformers(
+        cls,
+        config,
+        parent_config=None,
+        *,
+        allow_block_fp8_dense_fallback: bool = False,
+    ) -> ArchitectureConfig:
         model_type = config.model_type
         rope_config = _extract_rope_config(config)
         mrope_fields = _extract_mrope_fields(config)
@@ -1360,15 +1366,23 @@ class ArchitectureConfig(BaseModelConfig):
             BlockQuantScheme,
         )
 
-        try:
-            quant = QuantizationConfig.from_transformers(config)
-        except BlockQuantExportError:
-            if not getattr(config, "native_csa", False):
-                raise
-            options["block_quant_scheme"] = BlockQuantScheme.from_hf_config(config)
-            quant = None
+        def parse_quantization(source):
+            try:
+                return QuantizationConfig.from_transformers(source)
+            except BlockQuantExportError:
+                if not (
+                    getattr(source, "native_csa", False) or allow_block_fp8_dense_fallback
+                ):
+                    raise
+                scheme = BlockQuantScheme.from_hf_config(source)
+                if scheme is None:
+                    raise
+                options["block_quant_scheme"] = scheme
+                return None
+
+        quant = parse_quantization(config)
         if quant is None and parent_config is not None:
-            quant = QuantizationConfig.from_transformers(parent_config)
+            quant = parse_quantization(parent_config)
         if quant is not None:
             options["quantization"] = quant
 
@@ -1716,7 +1730,11 @@ class Qwen4ExpConfig(CausalLMConfig):
     def from_transformers(cls, config, parent_config=None) -> Qwen4ExpConfig:
         text = _as_attribute_config(getattr(config, "text_config", None)) or config
         parent = parent_config or (config if text is not config else None)
-        base = ArchitectureConfig.from_transformers(text, parent)
+        base = ArchitectureConfig.from_transformers(
+            text,
+            parent,
+            allow_block_fp8_dense_fallback=True,
+        )
         fields = _shallow_fields(base)
         is_multimodal = (
             getattr(parent, "model_type", None) == "qwen4_exp"
