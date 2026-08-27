@@ -274,7 +274,7 @@ class GlmMoeDsaAttention(DeepSeekMLA):
         indexer_type: str,
         linear_class: type | None = None,
     ):
-        super().__init__(config, linear_class=linear_class)
+        super().__init__(config, linear_class=linear_class, split_kv_b=True)
         self.indexer_type = indexer_type
         self.dtype = config.dtype
         self.main_key_dim = self.num_heads * self.qk_head_dim
@@ -457,10 +457,13 @@ class GlmMoeDsaAttention(DeepSeekMLA):
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], axis=-1, _outputs=2
         )
         kv_latent = self.kv_a_layernorm(op, kv_latent)
-        kv = self.kv_b_proj(op, kv_latent)
-        kv = op.Reshape(kv, [0, 0, self.num_heads, self.qk_nope_head_dim + self.v_head_dim])
-        k_nope, value = op.Split(
-            kv, [self.qk_nope_head_dim, self.v_head_dim], axis=-1, _outputs=2
+        k_nope = op.Reshape(
+            self.k_b_proj(op, kv_latent),
+            [0, 0, self.num_heads, self.qk_nope_head_dim],
+        )
+        value = op.Reshape(
+            self.v_b_proj(op, kv_latent),
+            [0, 0, self.num_heads, self.v_head_dim],
         )
         value = op.Reshape(value, [0, 0, -1])
         k_rope = apply_rotary_pos_emb(
@@ -667,6 +670,41 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        state_dict = dict(state_dict)
+        kv_b_suffix = ".self_attn.kv_b_proj.weight"
+        for key in tuple(state_dict):
+            if not key.endswith(kv_b_suffix):
+                continue
+            tensor = state_dict.pop(key)
+            expected_rows = self.config.num_attention_heads * (
+                self.config.qk_nope_head_dim + self.config.v_head_dim
+            )
+            if tensor.dim() != 2 or tensor.shape != (
+                expected_rows,
+                self.config.kv_lora_rank,
+            ):
+                raise ValueError(
+                    f"GLM-5.2 fused KV-B tensor {key!r} must have shape "
+                    f"({expected_rows}, {self.config.kv_lora_rank}), got "
+                    f"{tuple(tensor.shape)}"
+                )
+            per_head = tensor.reshape(
+                self.config.num_attention_heads,
+                self.config.qk_nope_head_dim + self.config.v_head_dim,
+                self.config.kv_lora_rank,
+            )
+            key_rows, value_rows = per_head.split(
+                [self.config.qk_nope_head_dim, self.config.v_head_dim],
+                dim=1,
+            )
+            prefix = key[: -len("kv_b_proj.weight")]
+            state_dict[f"{prefix}k_b_proj.weight"] = key_rows.reshape(
+                -1, self.config.kv_lora_rank
+            )
+            state_dict[f"{prefix}v_b_proj.weight"] = value_rows.reshape(
+                -1, self.config.kv_lora_rank
+            )
+
         mtp_keys = []
         for key in state_dict:
             match = _LAYER_RE.match(key)

@@ -420,6 +420,33 @@ class TestPreprocessWeights:
         out = model.preprocess_weights(state)
         assert any(".self_attn.indexer." in k for k in out)
 
+    def test_splits_hf_fused_kv_b_projection(self):
+        config = _glm_config(num_hidden_layers=1, indexer_types=["full"])
+        model = GlmMoeDsaCausalLMModel(config)
+        rows = config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim)
+        fused = torch.arange(rows * config.kv_lora_rank, dtype=torch.float32).reshape(
+            rows, config.kv_lora_rank
+        )
+
+        out = model.preprocess_weights({"model.layers.0.self_attn.kv_b_proj.weight": fused})
+
+        per_head = fused.reshape(
+            config.num_attention_heads,
+            config.qk_nope_head_dim + config.v_head_dim,
+            config.kv_lora_rank,
+        )
+        expected_k, expected_v = per_head.split(
+            [config.qk_nope_head_dim, config.v_head_dim], dim=1
+        )
+        torch.testing.assert_close(
+            out["model.layers.0.self_attn.k_b_proj.weight"],
+            expected_k.reshape(-1, config.kv_lora_rank),
+        )
+        torch.testing.assert_close(
+            out["model.layers.0.self_attn.v_b_proj.weight"],
+            expected_v.reshape(-1, config.kv_lora_rank),
+        )
+
 
 # --------------------------------------------------------------------------
 # Numeric parity: GlmMoeDsaIndexer vs the real transformers reference

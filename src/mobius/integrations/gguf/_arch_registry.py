@@ -2079,13 +2079,11 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="glm_moe_dsa",
         aliases=frozenset({"glm_dsa"}),
         config_key_map="glm_dsa",
-        tensor_map=Support.DEFERRED,
-        reason=(
-            "Config extraction and the glm_moe_dsa graph are both available, but "
-            "no GGUF→HuggingFace tensor-name mapping has been written for GLM-5.2's "
-            "MLA + DSA-indexer tensor families yet, so weights cannot be routed "
-            "into the graph. " + _NO_TENSOR_MAP
-        ),
+        config_postprocessor="glm_dsa",
+        tensor_map_recipe=("glm_dsa",),
+        tensor_processor="glm_dsa",
+        rope_interleave=True,
+        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="apertus",

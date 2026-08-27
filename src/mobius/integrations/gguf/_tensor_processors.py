@@ -486,6 +486,33 @@ def _process_kimi_linear(
     return state_dict
 
 
+def _process_glm_dsa(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore GLM-5.2's split MLA K/V-B matrices to Linear row order."""
+    del config
+    for name in tuple(state_dict):
+        tensor = state_dict[name]
+        if name.endswith(".k_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"GLM-5.2 K-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.transpose(1, 2).reshape(
+                tensor.shape[0] * tensor.shape[2], tensor.shape[1]
+            )
+        elif name.endswith(".v_b_proj.weight"):
+            if tensor.dim() != 3:
+                raise ValueError(
+                    f"GLM-5.2 V-B tensor {name!r} must be rank 3, got {tensor.dim()}"
+                )
+            state_dict[name] = tensor.reshape(
+                tensor.shape[0] * tensor.shape[1], tensor.shape[2]
+            )
+    return state_dict
+
+
 def _process_kimi_k3(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -678,6 +705,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "plamo": _process_plamo,
     "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
+    "glm_dsa": _process_glm_dsa,
     "kimi_linear": _process_kimi_linear,
     "kimi_k3": _process_kimi_k3,
     "bloom": _process_bloom,
@@ -693,6 +721,7 @@ PACKED_SAFE_PROCESSORS = frozenset(
     {
         "kimi_k3",
         "kimi_linear",
+        "glm_dsa",
         "llama",
         "mamba",
         "muse_glimmer",
