@@ -175,22 +175,6 @@ _COVERAGE_SKIP: dict[str, str] = {
     "hy_v3": "L1 graph construction, native Transformers L2 config loading, and "
     "payload-free L3 trunk parity are covered; the immutable official checkpoint is "
     "597,578,239,288 bytes, so L4/L5 real-weight goldens exceed the 16 GiB policy.",
-    "arctic_gguf": "GGUF-only Arctic graph variant; L1 coverage and exact metadata, "
-    "tensor, fingerprint, and executable graph paths are covered by "
-    "src/mobius/integrations/gguf/_moe_cohort_test.py, while native HF config loading "
-    "targets the separate arctic registration.",
-    "dbrx_gguf": "GGUF-only DBRX graph variant; L1 coverage and exact metadata, tensor, "
-    "fingerprint, and executable graph paths are covered by "
-    "src/mobius/integrations/gguf/_moe_cohort_test.py, while native HF config loading "
-    "targets the separate dbrx registration.",
-    "ernie4_5_moe_gguf": "GGUF-only Ernie 4.5 MoE graph variant; L1 coverage and exact "
-    "metadata, tensor, fingerprint, and executable graph paths are covered by "
-    "src/mobius/integrations/gguf/_moe_cohort_test.py, while native HF config loading "
-    "targets the separate ernie4_5_moe registration.",
-    "nomic_bert_moe_gguf": "GGUF-only Nomic-BERT MoE encoder variant; L1 coverage and "
-    "exact metadata, tensor, fingerprint, and executable graph paths are covered by "
-    "src/mobius/integrations/gguf/_moe_cohort_test.py; its specialized config is "
-    "derived from GGUF metadata rather than a native HF model type.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
