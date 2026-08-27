@@ -182,6 +182,40 @@ def test_loader_rejects_non_regular_and_incomplete_members(
         load_qualification_inputs(incomplete)
 
 
+def test_loader_rejects_hidden_pax_extension_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_qualification_inputs(_QUALIFICATION_INPUTS)["source/config.json"]
+    archive = io.BytesIO()
+    with tarfile.open(
+        fileobj=archive,
+        mode="w",
+        format=tarfile.PAX_FORMAT,
+        pax_headers={"comment": "hidden extension"},
+    ) as tar:
+        info, payload = _regular_member("source/config.json", config)
+        tar.addfile(info, io.BytesIO(payload))
+    path = tmp_path / "pax.tar.xz"
+    path.write_bytes(lzma.compress(archive.getvalue(), format=lzma.FORMAT_XZ))
+    _trust_test_archive(path, monkeypatch)
+    with pytest.raises(ValueError, match="members must be regular files"):
+        load_qualification_inputs(path)
+
+
+def test_loader_rejects_nonzero_data_after_ustar_terminator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_archive = bytearray(lzma.decompress(_QUALIFICATION_INPUTS.read_bytes()))
+    raw_archive[-1] = 1
+    path = tmp_path / "trailing-data.tar.xz"
+    path.write_bytes(lzma.compress(raw_archive, format=lzma.FORMAT_XZ))
+    _trust_test_archive(path, monkeypatch)
+    with pytest.raises(ValueError, match="trailing data differs"):
+        load_qualification_inputs(path)
+
+
 def test_loader_rejects_oversize_bad_hash_and_decompression_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

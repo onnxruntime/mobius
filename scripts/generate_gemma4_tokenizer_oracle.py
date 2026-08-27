@@ -270,6 +270,18 @@ def render_fixture(payload: object) -> bytes:
     return (rendered + "\n").encode("utf-8")
 
 
+def _qualification_tar_info(name: str, size: int) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.size = size
+    info.mode = 0o644
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    return info
+
+
 def render_qualification_inputs(header: Path, source_dir: Path) -> bytes:
     """Return a deterministic compressed archive of exact Gemma4 replay inputs."""
     route = ROUTES[0]
@@ -282,14 +294,7 @@ def render_qualification_inputs(header: Path, source_dir: Path) -> bytes:
     archive = io.BytesIO()
     with tarfile.open(fileobj=archive, mode="w", format=tarfile.USTAR_FORMAT) as tar:
         for name, payload in sorted(files.items()):
-            info = tarfile.TarInfo(name)
-            info.size = len(payload)
-            info.mode = 0o644
-            info.mtime = 0
-            info.uid = 0
-            info.gid = 0
-            info.uname = ""
-            info.gname = ""
+            info = _qualification_tar_info(name, len(payload))
             tar.addfile(info, io.BytesIO(payload))
     return lzma.compress(
         archive.getvalue(),
@@ -336,8 +341,38 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _read_exact(stream: _BoundedReader, size: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < size:
+        chunk = stream.read(min(1024 * 1024, size - len(payload)))
+        if not chunk:
+            raise ValueError("Gemma4 qualification archive is truncated")
+        payload.extend(chunk)
+    return bytes(payload)
+
+
+def _tar_header_name(header: bytes) -> str:
+    name = header[:100].split(b"\0", 1)[0]
+    prefix = header[345:500].split(b"\0", 1)[0]
+    try:
+        path = b"/".join(part for part in (prefix, name) if part).decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("Gemma4 qualification archive member name is not ASCII") from error
+    if not path:
+        raise ValueError("Gemma4 qualification archive member name is empty")
+    return path
+
+
+def _tar_header_size(header: bytes) -> int:
+    raw_size = header[124:136].rstrip(b"\0 ")
+    try:
+        return int(raw_size or b"0", 8)
+    except ValueError as error:
+        raise ValueError("Gemma4 qualification archive member size is invalid") from error
+
+
 def load_qualification_inputs(path: Path) -> dict[str, bytes]:
-    """Verify and stream the bounded, exact Gemma4 qualification archive."""
+    """Verify and strictly stream the bounded USTAR Gemma4 input archive."""
     if (
         path.stat().st_size != _QUALIFICATION_INPUTS_SIZE
         or _file_sha256(path) != _QUALIFICATION_INPUTS_SHA256
@@ -350,51 +385,48 @@ def load_qualification_inputs(path: Path) -> dict[str, bytes]:
     total_payload_bytes = 0
     with lzma.open(path, "rb") as decompressed:
         bounded = _BoundedReader(decompressed, _QUALIFICATION_MAX_DECOMPRESSED_BYTES)
-        with tarfile.open(fileobj=bounded, mode="r|") as tar:
-            for member in tar:
-                if member.name in result:
-                    raise ValueError(
-                        f"Gemma4 qualification archive duplicates {member.name!r}"
-                    )
-                expected = specs.get(member.name)
-                if expected is None:
-                    raise ValueError(
-                        f"Gemma4 qualification archive contains unexpected {member.name!r}"
-                    )
-                if not member.isfile():
-                    raise ValueError(
-                        "Gemma4 qualification archive members must be regular files"
-                    )
-                expected_size, expected_sha256 = expected
-                if member.size != expected_size:
-                    raise ValueError(
-                        f"Gemma4 qualification archive member {member.name!r} size differs"
-                    )
-                total_payload_bytes += member.size
-                if total_payload_bytes > max_payload_bytes:
-                    raise ValueError(
-                        "Gemma4 qualification archive payload exceeds the approved total"
-                    )
-                stream = tar.extractfile(member)
-                if stream is None:
-                    raise ValueError(
-                        f"Gemma4 qualification archive member {member.name!r} is unreadable"
-                    )
-                payload = bytearray()
-                while chunk := stream.read(min(1024 * 1024, expected_size - len(payload))):
-                    payload.extend(chunk)
-                if len(payload) != expected_size:
-                    raise ValueError(
-                        f"Gemma4 qualification archive member {member.name!r} is truncated"
-                    )
-                raw_payload = bytes(payload)
-                if _sha256(raw_payload) != expected_sha256:
-                    raise ValueError(
-                        f"Gemma4 qualification archive member {member.name!r} hash differs"
-                    )
-                result[member.name] = raw_payload
-        while bounded.read(1024 * 1024):
-            pass
+        while True:
+            header = _read_exact(bounded, 512)
+            if header == b"\0" * 512:
+                if _read_exact(bounded, 512) != b"\0" * 512:
+                    raise ValueError("Gemma4 qualification archive has an invalid terminator")
+                break
+            name = _tar_header_name(header)
+            if name in result:
+                raise ValueError(f"Gemma4 qualification archive duplicates {name!r}")
+            if header[156:157] not in {b"\0", b"0"}:
+                raise ValueError("Gemma4 qualification archive members must be regular files")
+            expected = specs.get(name)
+            if expected is None:
+                raise ValueError(f"Gemma4 qualification archive contains unexpected {name!r}")
+            expected_size, expected_sha256 = expected
+            member_size = _tar_header_size(header)
+            if member_size != expected_size:
+                raise ValueError(f"Gemma4 qualification archive member {name!r} size differs")
+            expected_header = _qualification_tar_info(name, expected_size).tobuf(
+                format=tarfile.USTAR_FORMAT
+            )
+            if header != expected_header:
+                raise ValueError(
+                    f"Gemma4 qualification archive member {name!r} header differs"
+                )
+            total_payload_bytes += member_size
+            if total_payload_bytes > max_payload_bytes:
+                raise ValueError(
+                    "Gemma4 qualification archive payload exceeds the approved total"
+                )
+            raw_payload = _read_exact(bounded, member_size)
+            if _sha256(raw_payload) != expected_sha256:
+                raise ValueError(f"Gemma4 qualification archive member {name!r} hash differs")
+            padding = (-member_size) % 512
+            if padding and _read_exact(bounded, padding) != b"\0" * padding:
+                raise ValueError(
+                    f"Gemma4 qualification archive member {name!r} padding differs"
+                )
+            result[name] = raw_payload
+        while trailing := bounded.read(1024 * 1024):
+            if any(trailing):
+                raise ValueError("Gemma4 qualification archive trailing data differs")
 
     if set(result) != set(specs) or len(result) != len(specs):
         raise ValueError("Gemma4 qualification archive member inventory differs")
