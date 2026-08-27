@@ -2,7 +2,7 @@
   "generator_sources": [
     {
       "path": "scripts/generate_gemma4_tokenizer_oracle.py",
-      "sha256": "2f4d53b82df099a9857400fb9e5548c1a35ea26cf82443075f41c2aceb40f478"
+      "sha256": "eb866f5b044aec0cc5ae9e68d6209f3d0f3bc7d8063daa221809949d0e247e72"
     },
     {
       "path": "scripts/generate_minicpm_tokenizer_oracle.py",

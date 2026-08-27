@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import hashlib
 import io
 import json
 import lzma
@@ -105,6 +106,11 @@ RANDOM_ALPHABET = tuple(
 _GENERATOR_PATH = "scripts/generate_gemma4_tokenizer_oracle.py"
 _SHARED_GENERATOR_PATH = "scripts/generate_minicpm_tokenizer_oracle.py"
 _QUALIFICATION_INPUTS_PATH = "tests/data/gguf_gemma4_qualification_inputs.tar.xz"
+_QUALIFICATION_INPUTS_SIZE = 6_309_288
+_QUALIFICATION_INPUTS_SHA256 = (
+    "37e431b1a73fbbd924771e649f373a30f5f23e021939bf4cd85ee044a80fc98f"
+)
+_QUALIFICATION_MAX_DECOMPRESSED_BYTES = 48_025_600
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -293,21 +299,109 @@ def render_qualification_inputs(header: Path, source_dir: Path) -> bytes:
     )
 
 
+class _BoundedReader(io.RawIOBase):
+    def __init__(self, stream: lzma.LZMAFile, limit: int):
+        super().__init__()
+        self._stream = stream
+        self.limit = limit
+        self.bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self.limit - self.bytes_read
+        request = remaining + 1 if size < 0 else min(size, remaining + 1)
+        data = self._stream.read(request)
+        self.bytes_read += len(data)
+        if self.bytes_read > self.limit:
+            raise ValueError("Gemma4 qualification archive exceeds decompression limit")
+        return data
+
+
+def _qualification_member_specs() -> dict[str, tuple[int, str]]:
+    route = ROUTES[0]
+    _, assets = _route_contract(route)
+    return {
+        "gemma4.header": (route.bounded_header_bytes, route.bounded_header_sha256),
+        **{f"source/{name}": (size, digest) for name, size, digest in assets},
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def load_qualification_inputs(path: Path) -> dict[str, bytes]:
-    """Load regular files from a deterministic Gemma4 qualification archive."""
-    result = {}
-    with tarfile.open(
-        fileobj=io.BytesIO(lzma.decompress(path.read_bytes())), mode="r:"
-    ) as tar:
-        for member in tar.getmembers():
-            if not member.isfile() or member.name in result:
-                raise ValueError(
-                    "Gemma4 qualification archive must contain unique regular files"
-                )
-            stream = tar.extractfile(member)
-            if stream is None:
-                raise ValueError("Gemma4 qualification archive member is unreadable")
-            result[member.name] = stream.read()
+    """Verify and stream the bounded, exact Gemma4 qualification archive."""
+    if (
+        path.stat().st_size != _QUALIFICATION_INPUTS_SIZE
+        or _file_sha256(path) != _QUALIFICATION_INPUTS_SHA256
+    ):
+        raise ValueError("Gemma4 qualification archive compressed identity differs")
+
+    specs = _qualification_member_specs()
+    max_payload_bytes = sum(size for size, _ in specs.values())
+    result: dict[str, bytes] = {}
+    total_payload_bytes = 0
+    with lzma.open(path, "rb") as decompressed:
+        bounded = _BoundedReader(decompressed, _QUALIFICATION_MAX_DECOMPRESSED_BYTES)
+        with tarfile.open(fileobj=bounded, mode="r|") as tar:
+            for member in tar:
+                if member.name in result:
+                    raise ValueError(
+                        f"Gemma4 qualification archive duplicates {member.name!r}"
+                    )
+                expected = specs.get(member.name)
+                if expected is None:
+                    raise ValueError(
+                        f"Gemma4 qualification archive contains unexpected {member.name!r}"
+                    )
+                if not member.isfile():
+                    raise ValueError(
+                        "Gemma4 qualification archive members must be regular files"
+                    )
+                expected_size, expected_sha256 = expected
+                if member.size != expected_size:
+                    raise ValueError(
+                        f"Gemma4 qualification archive member {member.name!r} size differs"
+                    )
+                total_payload_bytes += member.size
+                if total_payload_bytes > max_payload_bytes:
+                    raise ValueError(
+                        "Gemma4 qualification archive payload exceeds the approved total"
+                    )
+                stream = tar.extractfile(member)
+                if stream is None:
+                    raise ValueError(
+                        f"Gemma4 qualification archive member {member.name!r} is unreadable"
+                    )
+                payload = bytearray()
+                while chunk := stream.read(min(1024 * 1024, expected_size - len(payload))):
+                    payload.extend(chunk)
+                if len(payload) != expected_size:
+                    raise ValueError(
+                        f"Gemma4 qualification archive member {member.name!r} is truncated"
+                    )
+                raw_payload = bytes(payload)
+                if _sha256(raw_payload) != expected_sha256:
+                    raise ValueError(
+                        f"Gemma4 qualification archive member {member.name!r} hash differs"
+                    )
+                result[member.name] = raw_payload
+        while bounded.read(1024 * 1024):
+            pass
+
+    if set(result) != set(specs) or len(result) != len(specs):
+        raise ValueError("Gemma4 qualification archive member inventory differs")
+    if total_payload_bytes != max_payload_bytes:
+        raise ValueError("Gemma4 qualification archive payload total differs")
+    if bounded.bytes_read != _QUALIFICATION_MAX_DECOMPRESSED_BYTES:
+        raise ValueError("Gemma4 qualification archive decompressed size differs")
     return result
 
 
