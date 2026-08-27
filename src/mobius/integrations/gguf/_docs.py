@@ -387,10 +387,7 @@ def _tokenizer_evidence_table() -> str:
 
 
 def _tokenizer_blocker_evidence_table() -> str:
-    rows = [
-        "| Blocker ID | GGUF / official source | Exact closure | Fail-closed witness |",
-        "|---|---|---|---|",
-    ]
+    rows = []
     for evidence in iter_tokenizer_blocker_evidence():
         assets = ", ".join(
             f"`{name}` {size:,} B `{sha256}`"
@@ -426,12 +423,8 @@ def _tokenizer_blocker_evidence_table() -> str:
             f"{evidence.llamacpp_oracle[1]} cases `{evidence.llamacpp_oracle[2]}`"
         )
         rows.append(
-            "| "
-            + " | ".join(
-                _cell(value)
-                for value in (f"`{evidence.evidence_id}`", identity, closure, witness)
-            )
-            + " |"
+            f"- `{evidence.evidence_id}` — **GGUF/source:** {_cell(identity)}; "
+            f"**closure:** {_cell(closure)}; **witness:** {_cell(witness)}"
         )
     return "\n".join(rows)
 
@@ -563,10 +556,6 @@ This does not claim graph or runtime support.
 ### Fail-closed tokenizer evidence
 
 {_tokenizer_blocker_evidence_table()}
-
-These candidates have complete artifact and source closure but are not materializable because
-their pinned llama.cpp behavior differs from the official tokenizer. A shared `pre` identifier
-does not override an architecture-scoped blocker.
 
 ## Supported GGUF architectures
 
