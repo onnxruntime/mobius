@@ -28,6 +28,35 @@ _POS_EMB_SIZE = 8
 _TEXT_HIDDEN = 32
 
 
+def test_generic_mlp_norm_variant_fails_closed():
+    from mobius._configs._sub_configs import VisionConfig
+    from mobius.integrations.gguf._mmproj import _generic_projector_dimensions
+
+    shapes = {
+        "mm.0.weight": (16, 8),
+        "mm.2.weight": (16, 16),
+    }
+    sidecar = SimpleNamespace(
+        tensor_names=[*shapes, "mm.3.weight"],
+        get_tensor_shape=shapes.__getitem__,
+    )
+    vision = VisionConfig(image_size=28, patch_size=14, hidden_size=8)
+
+    with pytest.raises(ValueError, match="MLP_NORM"):
+        _generic_projector_dimensions(sidecar, "mlp", vision)
+
+
+def test_generic_projector_unknown_variant_fails_closed():
+    from mobius._configs._sub_configs import VisionConfig
+    from mobius.integrations.gguf._mmproj import _generic_projector_dimensions
+
+    vision = VisionConfig(image_size=28, patch_size=14, hidden_size=8)
+    sidecar = SimpleNamespace(get_tensor_shape=lambda _: ())
+
+    with pytest.raises(ValueError, match="Unknown generic"):
+        _generic_projector_dimensions(sidecar, "future-projector", vision)
+
+
 def test_text_gguf_opener_preserves_resolved_shard_manifest(monkeypatch):
     from mobius.integrations.gguf import _mmproj, _shard_set
 
@@ -2354,7 +2383,12 @@ class TestVlmRouting:
         with mock.patch(
             f"mobius.integrations.gguf._mmproj.{expected}", return_value=package
         ) as builder:
-            actual = build_vlm_from_gguf(text_path, mmproj_path, keep_quantized=False)
+            actual = build_vlm_from_gguf(
+                text_path,
+                mmproj_path,
+                image_token_id=-200,
+                keep_quantized=False,
+            )
 
         assert actual is package
         builder.assert_called_once_with(
@@ -2362,6 +2396,7 @@ class TestVlmRouting:
             str(mmproj_path),
             dtype=None,
             execution_provider="default",
+            image_token_id=-200,
             keep_quantized=False,
             _text_gguf_model=mock.ANY,
             _mmproj_gguf_model=mock.ANY,
@@ -2427,6 +2462,7 @@ class TestVlmRouting:
             str(mmproj_path),
             dtype=None,
             execution_provider="default",
+            image_token_id=None,
             keep_quantized=False,
             _text_gguf_model=mock.ANY,
             _mmproj_gguf_model=mock.ANY,

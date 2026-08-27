@@ -5869,6 +5869,7 @@ def build_from_gguf(
     keep_quantized: bool = True,
     execution_provider: str = "default",
     mmproj: str | Path | None = None,
+    image_token_id: int | None = None,
     static_cache: bool = False,
     max_seq_len: int | None = None,
     allow_dense_moe: bool | None = None,
@@ -5927,6 +5928,9 @@ def build_from_gguf(
             mmproj vision/audio encoder are fused into one multimodal
             :class:`ModelPackage` (delegates to
             :func:`build_gemma4_vlm_from_gguf`).
+        image_token_id: Optional processor-owned image placeholder or sentinel
+            ID for companion mmproj packages. It is forwarded unchanged; GGUF
+            text vocabularies do not always serialize this processor contract.
         static_cache: When ``True``, build with a pre-allocated static KV
             cache (fixed-width buffers written in place via ``TensorScatter``)
             instead of the default dynamic concat-grow cache. Produces a
@@ -5985,9 +5989,12 @@ def build_from_gguf(
             mmproj,
             dtype=dtype,
             execution_provider=execution_provider,
+            image_token_id=image_token_id,
             keep_quantized=keep_quantized,
             **parsed_source,
         )
+    if image_token_id is not None:
+        raise ValueError("image_token_id requires a companion mmproj package.")
 
     from mobius._builder import (
         build_from_module,

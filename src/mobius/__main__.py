@@ -748,6 +748,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     pkg = build_from_gguf(
         gguf_reference,
         mmproj=mmproj_path,
+        image_token_id=args.image_token_id,
         dtype=args.dtype,
         keep_quantized=keep_quantized,
         execution_provider=args.execution_provider,
@@ -1322,8 +1323,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Path to a companion 'clip' mmproj GGUF (vision/audio encoder). "
             "When set, builds a full multimodal package (decoder + "
             "vision_encoder + embedding) instead of a text-only model. "
-            "Currently supports Gemma4 and Muse Glimmer vision; audio is "
-            "experimental."
+            "Supports registry-evidenced vision projectors; audio is experimental."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--image-token-id",
+        type=int,
+        default=None,
+        help=(
+            "Processor-owned image placeholder ID for --mmproj packages. "
+            "Use this for sentinels absent from the text vocabulary (for example -200)."
         ),
     )
     gguf_parser.add_argument(

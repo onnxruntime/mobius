@@ -52,9 +52,14 @@ __all__ = [
     "LayerScale",
     "Linear",
     "LinearMultiModalProjector",
+    "GGUFMLPProjector",
+    "GLMEdgeAdapterProjector",
     "LoRALinear",
     "MLP",
     "MLPMultiModalProjector",
+    "MiniCPMResamplerProjector",
+    "MobileLDPProjector",
+    "MobileLDPV2Projector",
     "MuseGlimmerVisionModel",
     "NVFP4QuantizedLinear",
     "Cosmos3EdgeMultiModalProjector",
@@ -209,9 +214,14 @@ from mobius.components._multimodal import (
     Gemma3MultiModalProjector as Gemma3MultiModalProjector,
 )
 from mobius.components._multimodal import (
+    GGUFMLPProjector,
+    GLMEdgeAdapterProjector,
     InputMixer,
     LinearMultiModalProjector,
+    MiniCPMResamplerProjector,
     MLPMultiModalProjector,
+    MobileLDPProjector,
+    MobileLDPV2Projector,
 )
 from mobius.components._muse_glimmer_vision import MuseGlimmerVisionModel
 from mobius.components._paged_mla import (

@@ -9,10 +9,66 @@ import pytest
 
 from mobius.integrations.gguf._mmproj_mapping import (
     is_mmproj_stat_tensor,
+    map_generic_projector_to_onnx,
+    map_generic_vision_to_onnx,
     map_mmproj_audio_to_hf,
     map_mmproj_gemma3_vision_to_hf,
     map_mmproj_vision_to_hf,
 )
+
+
+class TestGenericProjectorMapping:
+    @pytest.mark.parametrize(
+        ("gguf_name", "expected"),
+        [
+            ("v.class_embd", "vision_tower.embeddings.class_embedding"),
+            (
+                "v.blk.2.ffn_down.weight",
+                "vision_tower.encoder.2.mlp.up_proj.weight",
+            ),
+            (
+                "v.blk.4.attn_out.bias",
+                "vision_tower.encoder.4.self_attn.out_proj.bias",
+            ),
+            ("v.post_ln.weight", "vision_tower.post_layernorm.weight"),
+        ],
+    )
+    def test_vision_names(self, gguf_name: str, expected: str):
+        assert map_generic_vision_to_onnx(gguf_name) == expected
+
+    @pytest.mark.parametrize(
+        ("projector_type", "gguf_name", "expected"),
+        [
+            ("mlp", "mm.0.weight", "projector.linear_0.weight"),
+            (
+                "ldp",
+                "mm.model.mb_block.2.block.1.fc2.bias",
+                "projector.block_2.se_fc2.bias",
+            ),
+            ("ldpv2", "mm.model.peg.0.weight", "projector.peg_0.weight"),
+            (
+                "adapter",
+                "adapter.linear.gate.weight",
+                "projector.gate.weight",
+            ),
+            (
+                "resampler",
+                "resampler.attn.out.weight",
+                "projector.attn_out.weight",
+            ),
+        ],
+    )
+    def test_projector_names(
+        self,
+        projector_type: str,
+        gguf_name: str,
+        expected: str,
+    ):
+        assert map_generic_projector_to_onnx(gguf_name, projector_type) == expected
+
+    def test_unknown_projector_fails_closed(self):
+        with pytest.raises(ValueError, match="Unknown generic"):
+            map_generic_projector_to_onnx("mm.weight", "future-projector")
 
 
 class TestStatTensorDetection:

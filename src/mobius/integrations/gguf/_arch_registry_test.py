@@ -1582,8 +1582,11 @@ class TestPinnedRemainingVLMTextCohort:
             if spec.vlm_builder is not None
         }
         assert exact == {
+            "chatglm": "generic_projector",
             "gemma3": "gemma3",
             "gemma4": "gemma4",
+            "llama": "generic_projector",
+            "minicpm": "generic_projector",
             "muse-glimmer": "muse_glimmer",
             "qwen2vl": "qwen_vl",
         }

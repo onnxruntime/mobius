@@ -506,15 +506,41 @@ def _tokenizer_blocker_evidence_table() -> str:
 
 def _projector_evidence_table() -> str:
     rows = [
-        "| Artifact ID | Immutable sidecar | Bytes | SHA-256 | Projector types |",
-        "|---|---|---:|---|---|",
+        (
+            "| Artifact ID | Immutable sidecar | Bytes | SHA-256 | Projector types | "
+            "Paired text | Processor source |"
+        ),
+        "|---|---|---:|---|---|---|---|",
     ]
     for pin in MMPROJ_ARTIFACT_PINS:
+        paired_text = f"`{pin.paired_text_target}`"
+        if pin.paired_text_repository and pin.paired_text_revision:
+            paired_text = (
+                f"`{pin.paired_text_repository}@{pin.paired_text_revision}`<br>"
+                f"`{pin.paired_text_target}`"
+            )
+            if pin.paired_text_size is not None:
+                paired_text += f"<br>{pin.paired_text_size:,} bytes"
+        processor = "—"
+        if pin.processor_repository and pin.processor_revision:
+            processor = f"`{pin.processor_repository}@{pin.processor_revision}`"
         rows.append(
             f"| `{pin.artifact_id}` | `{pin.repository}@{pin.revision}`<br>"
             f"`{pin.filename}` | {pin.size:,} | `{pin.lfs_sha256}` | "
-            f"{', '.join(f'`{item}`' for item in pin.projector_types)} |"
+            f"{', '.join(f'`{item}`' for item in pin.projector_types)} | "
+            f"{paired_text} | {processor} |"
         )
+    rows.extend(
+        (
+            "",
+            (
+                "The five generic projector evidence pairs total **12,414,806,816 bytes** "
+                "(sidecars plus paired text GGUFs), below the 16 GiB evidence budget. "
+                "Runtime remains deferred; these pins establish immutable schema and "
+                "graph-construction evidence only."
+            ),
+        )
+    )
     return "\n".join(rows)
 
 
@@ -597,6 +623,7 @@ build_from_gguf(
     keep_quantized=True,
     execution_provider="default",
     mmproj=None,
+    image_token_id=None,
     static_cache=False,
     max_seq_len=None,
     allow_dense_moe=None,
@@ -610,6 +637,7 @@ closure, shapes, qtypes, and selected graph route before publication. Source reu
 the original immutable GGUF at runtime. Runtime packages additionally require an exact
 artifact, graph, tokenizer, runtime version, parity proof, and deterministic state/generation
 evidence match.
+Processor-owned `image_token_id` overrides are forwarded unchanged for `mmproj=` packages.
 
 ## Runtime evidence
 

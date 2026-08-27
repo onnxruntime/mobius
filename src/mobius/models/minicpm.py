@@ -55,18 +55,24 @@ class _MiniCPMTextModel(nn.Module):
     def forward(
         self,
         op: OpBuilder,
-        input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value | None,
         position_ids: ir.Value,
         past_key_values: list | None = None,
+        inputs_embeds: ir.Value | None = None,
     ):
-        hidden_states = _scale_like(
-            op, self.embed_tokens(op, input_ids), self._embedding_scale
-        )
+        if inputs_embeds is None:
+            if input_ids is None:
+                raise ValueError("MiniCPM requires input_ids or inputs_embeds")
+            hidden_states = _scale_like(
+                op, self.embed_tokens(op, input_ids), self._embedding_scale
+            )
+        else:
+            hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(op, position_ids)
         attention_bias = create_attention_bias(
             op,
-            input_ids=input_ids,
+            input_ids=input_ids if input_ids is not None else inputs_embeds,
             attention_mask=attention_mask,
             dtype=self._dtype,
         )

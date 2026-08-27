@@ -9,6 +9,10 @@ Projectors (vision → text embedding space):
 - ``Gemma3MultiModalProjector``: AvgPool2d → RMSNorm → MatMul (Gemma3)
 - ``MLPMultiModalProjector``: Linear → Act → Linear (LLaVA, Phi4MM)
 - ``LinearMultiModalProjector``: Single Linear (PaliGemma)
+- ``GGUFMLPProjector``: llama.cpp's one/two-layer LLaVA MLP
+- ``MobileLDPProjector`` / ``MobileLDPV2Projector``: MobileVLM token downsamplers
+- ``GLMEdgeAdapterProjector``: GLM-Edge spatial adapter with BOI/EOI tokens
+- ``MiniCPMResamplerProjector``: MiniCPM-V learned-query cross-attention resampler
 
 Mixer:
 - ``InputMixer``: Merges vision embeddings into text embeddings at
@@ -21,7 +25,8 @@ from typing import TYPE_CHECKING
 
 from onnxscript import OpBuilder, nn
 
-from mobius.components._common import Linear
+from mobius.components._common import LayerNorm, Linear
+from mobius.components._conv import Conv2d, Conv2dNoBias
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._vision import VisionLayerNorm
 
@@ -116,6 +121,373 @@ class MLPMultiModalProjector(nn.Module):
         hidden = op.Gelu(hidden)
         hidden = self.linear_2(op, hidden)
         return hidden
+
+
+class GGUFMLPProjector(nn.Module):
+    """llama.cpp LLaVA MLP projector with an optional second affine layer.
+
+    The serialized ``projector:mlp`` closure is ``mm.0`` followed by GELU and,
+    when present, ``mm.2``. The distinct Yi ``MLP_NORM`` compatibility topology
+    is intentionally not represented by this component.
+    """
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        text_hidden_size: int,
+        *,
+        has_second_layer: bool = True,
+    ):
+        super().__init__()
+        if vision_hidden_size <= 0 or text_hidden_size <= 0:
+            raise ValueError("MLP projector dimensions must be positive")
+        self.linear_0 = Linear(vision_hidden_size, text_hidden_size, bias=True)
+        self.linear_2 = (
+            Linear(text_hidden_size, text_hidden_size, bias=True) if has_second_layer else None
+        )
+
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
+        # [B, patches, vision_hidden] -> [B, patches, text_hidden]
+        hidden = op.Gelu(self.linear_0(op, vision_features), approximate="tanh")
+        if self.linear_2 is not None:
+            hidden = self.linear_2(op, hidden)
+        return hidden
+
+
+class _MobileLDPBlock(nn.Module):
+    """MobileVLM inverted residual block with depthwise SE gating."""
+
+    def __init__(self, hidden_size: int, *, stride: int, eps: float):
+        super().__init__()
+        if stride not in (1, 2):
+            raise ValueError(f"LDP stride must be 1 or 2, got {stride}")
+        self.depthwise = Conv2dNoBias(
+            hidden_size,
+            hidden_size,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=hidden_size,
+        )
+        self.depthwise_norm = LayerNorm(hidden_size, eps=eps)
+        squeeze = hidden_size // 4
+        if squeeze <= 0:
+            raise ValueError(f"LDP hidden size must be at least 4, got {hidden_size}")
+        self.se_fc1 = Linear(hidden_size, squeeze, bias=True)
+        self.se_fc2 = Linear(squeeze, hidden_size, bias=True)
+        self.pointwise = Conv2dNoBias(hidden_size, hidden_size, kernel_size=1)
+        self.pointwise_norm = LayerNorm(hidden_size, eps=eps)
+        self._stride = stride
+
+    @staticmethod
+    def _layer_norm_nchw(op: OpBuilder, norm: LayerNorm, hidden_states: ir.Value) -> ir.Value:
+        # LayerNorm is channel-last: [B, C, H, W] -> [B, H, W, C] -> NCHW.
+        hidden_states = op.Transpose(hidden_states, perm=[0, 2, 3, 1])
+        hidden_states = norm(op, hidden_states)
+        return op.Transpose(hidden_states, perm=[0, 3, 1, 2])
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        residual = hidden_states
+        hidden_states = self.depthwise(op, hidden_states)
+        hidden_states = self._layer_norm_nchw(op, self.depthwise_norm, hidden_states)
+        hidden_states = op.HardSwish(hidden_states)
+
+        # Squeeze-and-excitation: [B, C, H, W] -> [B, C] -> [B, C, 1, 1].
+        gate = op.ReduceMean(hidden_states, [2, 3], keepdims=0)
+        gate = op.Relu(self.se_fc1(op, gate))
+        gate = op.HardSigmoid(self.se_fc2(op, gate), alpha=1.0 / 6.0, beta=0.5)
+        gate = op.Unsqueeze(gate, [2, 3])
+        hidden_states = op.Mul(hidden_states, gate)
+
+        hidden_states = self.pointwise(op, hidden_states)
+        hidden_states = self._layer_norm_nchw(op, self.pointwise_norm, hidden_states)
+        if self._stride == 1:
+            hidden_states = op.Add(residual, hidden_states)
+        return hidden_states
+
+
+class MobileLDPProjector(nn.Module):
+    """MobileVLM LDP projector for a fixed 24x24 CLIP patch grid.
+
+    The two affine layers preserve 576 tokens, then an inverted-residual block
+    keeps the 24x24 grid and a second block downsamples it to 12x12 (144 tokens).
+    """
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        text_hidden_size: int,
+        *,
+        grid_size: int = 24,
+        eps: float = 1e-5,
+    ):
+        super().__init__()
+        if grid_size != 24:
+            raise ValueError(f"LDP requires the pinned 24x24 patch grid, got {grid_size}")
+        self.mlp_1 = Linear(vision_hidden_size, text_hidden_size, bias=True)
+        self.mlp_3 = Linear(text_hidden_size, text_hidden_size, bias=True)
+        self.block_1 = _MobileLDPBlock(text_hidden_size, stride=1, eps=eps)
+        self.block_2 = _MobileLDPBlock(text_hidden_size, stride=2, eps=eps)
+        self._grid = grid_size
+        self._hidden = text_hidden_size
+
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
+        # [B, 576, vision_hidden] -> [B, 576, text_hidden].
+        hidden = op.Gelu(self.mlp_1(op, vision_features), approximate="tanh")
+        hidden = self.mlp_3(op, hidden)
+        batch = op.Shape(hidden, start=0, end=1)
+        hidden = op.Transpose(hidden, perm=[0, 2, 1])
+        hidden = op.Reshape(
+            hidden,
+            op.Concat(batch, [self._hidden, self._grid, self._grid], axis=0),
+        )
+        # [B, text_hidden, 24, 24] -> [B, text_hidden, 12, 12].
+        hidden = self.block_2(op, self.block_1(op, hidden))
+        hidden = op.Reshape(
+            hidden,
+            op.Concat(batch, [self._hidden, (self._grid // 2) ** 2], axis=0),
+        )
+        return op.Transpose(hidden, perm=[0, 2, 1])
+
+
+class MobileLDPV2Projector(nn.Module):
+    """MobileVLM-V2 LDP projector: MLP, 2x2 pool, residual depthwise PEG."""
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        text_hidden_size: int,
+        *,
+        grid_size: int = 24,
+    ):
+        super().__init__()
+        if grid_size != 24:
+            raise ValueError(f"LDPv2 requires the pinned 24x24 patch grid, got {grid_size}")
+        self.mlp_0 = Linear(vision_hidden_size, text_hidden_size, bias=True)
+        self.mlp_2 = Linear(text_hidden_size, text_hidden_size, bias=True)
+        self.peg_0 = Conv2d(
+            text_hidden_size,
+            text_hidden_size,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=text_hidden_size,
+        )
+        self._grid = grid_size
+        self._hidden = text_hidden_size
+
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
+        hidden = self.mlp_2(
+            op,
+            op.Gelu(self.mlp_0(op, vision_features), approximate="tanh"),
+        )
+        batch = op.Shape(hidden, start=0, end=1)
+        hidden = op.Transpose(hidden, perm=[0, 2, 1])
+        hidden = op.Reshape(
+            hidden,
+            op.Concat(batch, [self._hidden, self._grid, self._grid], axis=0),
+        )
+        # [B, C, 24, 24] -> [B, C, 12, 12].
+        hidden = op.AveragePool(hidden, kernel_shape=[2, 2], strides=[2, 2])
+        hidden = op.Add(hidden, self.peg_0(op, hidden))
+        hidden = op.Reshape(
+            hidden,
+            op.Concat(batch, [self._hidden, (self._grid // 2) ** 2], axis=0),
+        )
+        return op.Transpose(hidden, perm=[0, 2, 1])
+
+
+class GLMEdgeAdapterProjector(nn.Module):
+    """GLM-Edge spatial adapter with gated MLP and boundary embeddings."""
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        text_hidden_size: int,
+        intermediate_size: int,
+        *,
+        grid_size: int,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        if grid_size <= 0 or grid_size % 2:
+            raise ValueError(f"GLM-Edge grid size must be positive and even, got {grid_size}")
+        if intermediate_size <= 0:
+            raise ValueError("GLM-Edge intermediate size must be positive")
+        self.conv = Conv2d(
+            vision_hidden_size,
+            text_hidden_size,
+            kernel_size=2,
+            stride=2,
+        )
+        self.linear = Linear(text_hidden_size, text_hidden_size, bias=False)
+        self.norm1 = LayerNorm(text_hidden_size, eps=eps)
+        self.dense_h_to_4h = Linear(text_hidden_size, intermediate_size, bias=False)
+        self.gate = Linear(text_hidden_size, intermediate_size, bias=False)
+        self.dense_4h_to_h = Linear(intermediate_size, text_hidden_size, bias=False)
+        self.boi = nn.Parameter([text_hidden_size])
+        self.eoi = nn.Parameter([text_hidden_size])
+        self._grid = grid_size
+        self._vision_hidden = vision_hidden_size
+        self._text_hidden = text_hidden_size
+
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
+        batch = op.Shape(vision_features, start=0, end=1)
+        hidden = op.Reshape(
+            vision_features,
+            op.Concat(
+                batch,
+                [self._grid, self._grid, self._vision_hidden],
+                axis=0,
+            ),
+        )
+        hidden = self.conv(op, op.Transpose(hidden, perm=[0, 3, 1, 2]))
+        # [B, text_hidden, grid/2, grid/2] -> [B, grid^2/4, text_hidden].
+        hidden = op.Reshape(
+            hidden,
+            op.Concat(batch, [self._text_hidden, -1], axis=0),
+        )
+        hidden = op.Transpose(hidden, perm=[0, 2, 1])
+        hidden = op.Gelu(
+            self.norm1(op, self.linear(op, hidden)),
+            approximate="tanh",
+        )
+
+        gate = self.gate(op, hidden)
+        up = self.dense_h_to_4h(op, hidden)
+        hidden = self.dense_4h_to_h(op, op.Mul(op.Mul(gate, op.Sigmoid(gate)), up))
+
+        boundary_shape = op.Concat(batch, [1, self._text_hidden], axis=0)
+        boi = op.Expand(op.Reshape(self.boi, [1, 1, self._text_hidden]), boundary_shape)
+        eoi = op.Expand(op.Reshape(self.eoi, [1, 1, self._text_hidden]), boundary_shape)
+        return op.Concat(boi, hidden, eoi, axis=1)
+
+
+class MiniCPMResamplerProjector(nn.Module):
+    """MiniCPM-V learned-query resampler with 2D sinusoidal key positions."""
+
+    def __init__(
+        self,
+        vision_hidden_size: int,
+        text_hidden_size: int,
+        *,
+        num_queries: int,
+        grid_size: int,
+        head_dim: int = 128,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        if num_queries <= 0 or grid_size <= 0:
+            raise ValueError("MiniCPM resampler query and grid sizes must be positive")
+        if text_hidden_size % head_dim:
+            raise ValueError(
+                f"MiniCPM resampler width {text_hidden_size} must be divisible by "
+                f"head_dim {head_dim}"
+            )
+        if text_hidden_size % 4:
+            raise ValueError("MiniCPM resampler width must be divisible by four")
+        self.query = nn.Parameter([num_queries, text_hidden_size])
+        self.kv = Linear(vision_hidden_size, text_hidden_size, bias=False)
+        self.ln_q = LayerNorm(text_hidden_size, eps=eps)
+        self.ln_kv = LayerNorm(text_hidden_size, eps=eps)
+        self.attn_q = Linear(text_hidden_size, text_hidden_size, bias=True)
+        self.attn_k = Linear(text_hidden_size, text_hidden_size, bias=True)
+        self.attn_v = Linear(text_hidden_size, text_hidden_size, bias=True)
+        self.attn_out = Linear(text_hidden_size, text_hidden_size, bias=True)
+        self.ln_post = LayerNorm(text_hidden_size, eps=eps)
+        self.proj = Linear(text_hidden_size, text_hidden_size, bias=False)
+        self._num_queries = num_queries
+        self._grid = grid_size
+        self._hidden = text_hidden_size
+        self._head_dim = head_dim
+        self._heads = text_hidden_size // head_dim
+
+    def _position_embedding(self, op: OpBuilder, like: ir.Value) -> ir.Value:
+        num_patches = self._grid * self._grid
+        indices = op.Range(
+            op.Constant(value_int=0),
+            op.Constant(value_int=num_patches),
+            op.Constant(value_int=1),
+        )
+        pos_h = op.Cast(op.Div(indices, op.Constant(value_int=self._grid)), to=1)
+        pos_w = op.Cast(op.Mod(indices, op.Constant(value_int=self._grid)), to=1)
+        omega_indices = op.Cast(
+            op.Range(
+                op.Constant(value_int=0),
+                op.Constant(value_int=self._hidden // 4),
+                op.Constant(value_int=1),
+            ),
+            to=1,
+        )
+        exponent = op.Div(omega_indices, op.Constant(value_float=self._hidden / 4))
+        omega = op.Reciprocal(op.Pow(op.Constant(value_float=10_000.0), exponent))
+        theta_x = op.Mul(op.Unsqueeze(pos_w, [1]), op.Unsqueeze(omega, [0]))
+        theta_y = op.Mul(op.Unsqueeze(pos_h, [1]), op.Unsqueeze(omega, [0]))
+        position = op.Concat(
+            op.Sin(theta_x),
+            op.Cos(theta_x),
+            op.Sin(theta_y),
+            op.Cos(theta_y),
+            axis=1,
+        )
+        return op.CastLike(position, like)
+
+    def forward(self, op: OpBuilder, vision_features: ir.Value):
+        batch = op.Shape(vision_features, start=0, end=1)
+        query = op.Expand(
+            op.Unsqueeze(self.query, [0]),
+            op.Concat(batch, [self._num_queries, self._hidden], axis=0),
+        )
+        query = self.ln_q(op, query)
+        value = self.ln_kv(op, self.kv(op, vision_features))
+        key = op.Add(value, op.Unsqueeze(self._position_embedding(op, value), [0]))
+
+        q = self.attn_q(op, query)
+        k = self.attn_k(op, key)
+        v = self.attn_v(op, value)
+        # [B, tokens, hidden] -> [B, heads, tokens, 128].
+        q = op.Transpose(
+            op.Reshape(
+                q,
+                op.Concat(
+                    batch,
+                    [self._num_queries, self._heads, self._head_dim],
+                    axis=0,
+                ),
+            ),
+            perm=[0, 2, 1, 3],
+        )
+        k = op.Transpose(
+            op.Reshape(
+                k,
+                op.Concat(
+                    batch,
+                    [self._grid**2, self._heads, self._head_dim],
+                    axis=0,
+                ),
+            ),
+            perm=[0, 2, 1, 3],
+        )
+        v = op.Transpose(
+            op.Reshape(
+                v,
+                op.Concat(
+                    batch,
+                    [self._grid**2, self._heads, self._head_dim],
+                    axis=0,
+                ),
+            ),
+            perm=[0, 2, 1, 3],
+        )
+        scores = op.MatMul(q, op.Transpose(k, perm=[0, 1, 3, 2]))
+        scores = op.Mul(scores, op.CastLike(self._head_dim**-0.5, scores))
+        hidden = op.MatMul(op.Softmax(scores, axis=-1), v)
+        hidden = op.Reshape(
+            op.Transpose(hidden, perm=[0, 2, 1, 3]),
+            op.Concat(batch, [self._num_queries, self._hidden], axis=0),
+        )
+        hidden = self.attn_out(op, hidden)
+        return self.proj(op, self.ln_post(op, hidden))
 
 
 class Cosmos3EdgeMultiModalProjector(nn.Module):

@@ -34,6 +34,8 @@ from __future__ import annotations
 
 __all__ = [
     "is_mmproj_stat_tensor",
+    "map_generic_projector_to_onnx",
+    "map_generic_vision_to_onnx",
     "map_mmproj_gemma3_vision_to_hf",
     "map_mmproj_qwen_vision_to_hf",
     "map_mmproj_audio_to_hf",
@@ -126,6 +128,130 @@ def is_mmproj_stat_tensor(name: str) -> bool:
     mapping functions decide whether a specific projector consumes them.
     """
     return name.endswith(_STAT_SUFFIXES)
+
+
+_GENERIC_VISION_BLOCK_STEMS: dict[str, str] = {
+    "ln1.weight": "layer_norm1.weight",
+    "ln1.bias": "layer_norm1.bias",
+    "ln2.weight": "layer_norm2.weight",
+    "ln2.bias": "layer_norm2.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q.bias": "self_attn.q_proj.bias",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k.bias": "self_attn.k_proj.bias",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_v.bias": "self_attn.v_proj.bias",
+    "attn_out.weight": "self_attn.out_proj.weight",
+    "attn_out.bias": "self_attn.out_proj.bias",
+    "ffn_down.weight": "mlp.up_proj.weight",
+    "ffn_down.bias": "mlp.up_proj.bias",
+    "ffn_up.weight": "mlp.down_proj.weight",
+    "ffn_up.bias": "mlp.down_proj.bias",
+}
+
+
+def map_generic_vision_to_onnx(name: str) -> str | None:
+    """Map a legacy CLIP/SigLIP sidecar tower directly to ONNX module names."""
+    blk = _VISION_BLK.match(name)
+    if blk is not None:
+        idx, stem = blk.group(1), blk.group(2)
+        mapped = _GENERIC_VISION_BLOCK_STEMS.get(stem)
+        return None if mapped is None else f"vision_tower.encoder.{idx}.{mapped}"
+
+    top = {
+        "v.class_embd": "vision_tower.embeddings.class_embedding",
+        "v.patch_embd.weight": ("vision_tower.embeddings.patch_embedding.projection.weight"),
+        "v.patch_embd.bias": "vision_tower.embeddings.patch_embedding.projection.bias",
+        "v.position_embd.weight": "vision_tower.embeddings.position_embedding.weight",
+        "v.pre_ln.weight": "vision_tower.pre_layrnorm.weight",
+        "v.pre_ln.bias": "vision_tower.pre_layrnorm.bias",
+        "v.post_ln.weight": "vision_tower.post_layernorm.weight",
+        "v.post_ln.bias": "vision_tower.post_layernorm.bias",
+    }
+    return top.get(name)
+
+
+def _map_ldp_block(name: str) -> str | None:
+    match = re.match(r"^mm\.model\.mb_block\.([12])\.block\.(.+)$", name)
+    if match is None:
+        return None
+    block = f"block_{match.group(1)}"
+    suffix = match.group(2)
+    mapped = {
+        "0.0.weight": "depthwise.weight",
+        "0.1.weight": "depthwise_norm.weight",
+        "0.1.bias": "depthwise_norm.bias",
+        "1.fc1.weight": "se_fc1.weight",
+        "1.fc1.bias": "se_fc1.bias",
+        "1.fc2.weight": "se_fc2.weight",
+        "1.fc2.bias": "se_fc2.bias",
+        "2.0.weight": "pointwise.weight",
+        "2.1.weight": "pointwise_norm.weight",
+        "2.1.bias": "pointwise_norm.bias",
+    }.get(suffix)
+    return None if mapped is None else f"projector.{block}.{mapped}"
+
+
+def map_generic_projector_to_onnx(name: str, projector_type: str) -> str | None:
+    """Map one exact generic projector closure directly to ONNX module names."""
+    if projector_type == "mlp":
+        return {
+            "mm.0.weight": "projector.linear_0.weight",
+            "mm.0.bias": "projector.linear_0.bias",
+            "mm.2.weight": "projector.linear_2.weight",
+            "mm.2.bias": "projector.linear_2.bias",
+        }.get(name)
+    if projector_type == "ldp":
+        top = {
+            "mm.model.mlp.1.weight": "projector.mlp_1.weight",
+            "mm.model.mlp.1.bias": "projector.mlp_1.bias",
+            "mm.model.mlp.3.weight": "projector.mlp_3.weight",
+            "mm.model.mlp.3.bias": "projector.mlp_3.bias",
+        }
+        return top.get(name) or _map_ldp_block(name)
+    if projector_type == "ldpv2":
+        return {
+            "mm.model.mlp.0.weight": "projector.mlp_0.weight",
+            "mm.model.mlp.0.bias": "projector.mlp_0.bias",
+            "mm.model.mlp.2.weight": "projector.mlp_2.weight",
+            "mm.model.mlp.2.bias": "projector.mlp_2.bias",
+            "mm.model.peg.0.weight": "projector.peg_0.weight",
+            "mm.model.peg.0.bias": "projector.peg_0.bias",
+        }.get(name)
+    if projector_type == "adapter":
+        return {
+            "adapter.boi": "projector.boi",
+            "adapter.eoi": "projector.eoi",
+            "adapter.conv.weight": "projector.conv.weight",
+            "adapter.conv.bias": "projector.conv.bias",
+            "adapter.linear.linear.weight": "projector.linear.weight",
+            "adapter.linear.norm1.weight": "projector.norm1.weight",
+            "adapter.linear.norm1.bias": "projector.norm1.bias",
+            "adapter.linear.dense_h_to_4h.weight": "projector.dense_h_to_4h.weight",
+            "adapter.linear.gate.weight": "projector.gate.weight",
+            "adapter.linear.dense_4h_to_h.weight": "projector.dense_4h_to_h.weight",
+        }.get(name)
+    if projector_type == "resampler":
+        return {
+            "resampler.query": "projector.query",
+            "resampler.kv.weight": "projector.kv.weight",
+            "resampler.attn.q.weight": "projector.attn_q.weight",
+            "resampler.attn.q.bias": "projector.attn_q.bias",
+            "resampler.attn.k.weight": "projector.attn_k.weight",
+            "resampler.attn.k.bias": "projector.attn_k.bias",
+            "resampler.attn.v.weight": "projector.attn_v.weight",
+            "resampler.attn.v.bias": "projector.attn_v.bias",
+            "resampler.attn.out.weight": "projector.attn_out.weight",
+            "resampler.attn.out.bias": "projector.attn_out.bias",
+            "resampler.ln_q.weight": "projector.ln_q.weight",
+            "resampler.ln_q.bias": "projector.ln_q.bias",
+            "resampler.ln_kv.weight": "projector.ln_kv.weight",
+            "resampler.ln_kv.bias": "projector.ln_kv.bias",
+            "resampler.ln_post.weight": "projector.ln_post.weight",
+            "resampler.ln_post.bias": "projector.ln_post.bias",
+            "resampler.proj.weight": "projector.proj.weight",
+        }.get(name)
+    raise ValueError(f"Unknown generic GGUF projector type {projector_type!r}")
 
 
 def map_mmproj_vision_to_hf(name: str) -> str | None:
