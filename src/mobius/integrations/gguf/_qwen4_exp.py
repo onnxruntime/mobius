@@ -22,8 +22,6 @@ __all__ = [
 
 QWEN4EXP_GGUF_REPO = "unsloth/Qwen3.8-Flash-Next-GGUF"
 QWEN4EXP_GGUF_REVISION = "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249"
-QWEN4EXP_OFFICIAL_MODEL = "Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c"
-QWEN4EXP_TRANSFORMERS_REVISION = "598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1"
 
 
 @dataclass(frozen=True, slots=True)
