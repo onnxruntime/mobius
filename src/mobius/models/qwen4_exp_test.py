@@ -1603,6 +1603,8 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
     )
     assert report["qdq_recipe"]["code_mapping"] == "bijective"
     assert report["qdq_recipe"]["ple_shards_execute_sequentially"] is True
+    assert report["qdq_recipe"]["ple_transform"].startswith("per-shard DequantizeLinear")
+    assert "-> Gather(dense_shard" in report["qdq_recipe"]["ple_transform"]
     assert report["qdq_recipe"]["source_code_tensors"] == len(fp8_names)
     assert len(report["qdq_recipe"]["canonical_code_mapping_sha256"]) == 64
     ple_source = source[
@@ -1637,7 +1639,49 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
     assert loaded_package.weight_loading_report["serializer_max_workers"] == 1
 
 
+def _ort_supports_bfloat16_fp8_dequantize() -> bool:
+    _builder, op, graph = create_test_builder()
+    codes = ir.Value(
+        name="codes",
+        type=ir.TensorType(ir.DataType.FLOAT8E4M3FN),
+        shape=ir.Shape([2]),
+        const_value=ir.tensor(np.array([1.0, -2.0], dtype=ml_dtypes.float8_e4m3fn)),
+    )
+    scale = ir.Value(
+        name="scale",
+        type=ir.TensorType(ir.DataType.BFLOAT16),
+        shape=ir.Shape([]),
+        const_value=ir.tensor(np.array(0.5, dtype=ml_dtypes.bfloat16)),
+    )
+    graph.register_initializer(codes)
+    graph.register_initializer(scale)
+    output = op.DequantizeLinear(codes, scale)
+    output.name = "output"
+    graph.outputs.append(output)
+    model = ir.Model(graph, ir_version=11)
+
+    try:
+        session = OnnxModelSession(model)
+    except Exception as error:
+        message = str(error)
+        if "NOT_IMPLEMENTED" in message and "DequantizeLinear" in message:
+            return False
+        raise
+    try:
+        actual = session.run({})["output"]
+    finally:
+        session.close()
+    np.testing.assert_array_equal(
+        actual.astype(np.float32),
+        np.array([0.5, -1.0], dtype=np.float32),
+    )
+    return True
+
+
 def test_bfloat16_fp8_qdq_reaches_only_declared_ort_capability_gap(tmp_path):
+    if not _ort_supports_bfloat16_fp8_dequantize():
+        pytest.skip("ORT lacks the independently probed BF16 FLOAT8 DequantizeLinear kernel")
+
     config = _fp8_config(dtype=ir.DataType.BFLOAT16)
     module = Qwen4ExpCausalLMModel(config)
     model = build_from_module(
@@ -1653,14 +1697,7 @@ def test_bfloat16_fp8_qdq_reaches_only_declared_ort_capability_gap(tmp_path):
         module.build_fp8_streaming_plan,
     )
 
-    try:
-        session = OnnxModelSession(model)
-    except Exception as error:
-        message = str(error)
-        assert "Optype (MoE)" not in message
-        assert "MoE" not in message or "Type parameter" not in message
-        return
-
+    session = OnnxModelSession(model)
     states = _initial_states()
     for name, value in states.items():
         if value.dtype == np.float32 and not name.endswith(".recurrent_state"):

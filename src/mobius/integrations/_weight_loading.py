@@ -1678,9 +1678,9 @@ def stream_qdq_safetensors_to_model(
             "-> [Br*Bc,16384] -> DequantizeLinear(axis=0) -> inverse -> slice"
         ),
         "ple_transform": (
-            "per-shard Gather(float8_codes, local_ids) -> "
-            "DequantizeLinear(gathered_rows, reshape(bf16_scale,[ ])); "
-            "masked shard outputs accumulate without a full-table destination"
+            "per-shard DequantizeLinear(float8_codes, reshape(bf16_scale,[ ])) "
+            "-> Gather(dense_shard, local_ids); explicit dependencies serialize "
+            "full-shard DQ and masked outputs accumulate without a full-table destination"
         ),
         "source_codes_preserved": True,
         "source_scales_preserved": True,

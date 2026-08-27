@@ -156,7 +156,7 @@ external-data initializer. Standard ONNX QDQ reconstructs the logical weights:
   shard DQ from running before the previous token-sized Gather completes.
   Masked outputs accumulate without a full-table Concat or a roughly 95 GiB
   destination, so peak runtime storage is one code shard plus one dense shard
-  and any explicit output-dtype cast.
+  plus its BF16 scale and any explicit output-dtype cast.
 
 The transform is invertible for source codes, and the external data keeps their
 exact bytes. `weight-loading-report.json` records
