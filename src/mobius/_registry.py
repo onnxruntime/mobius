@@ -579,7 +579,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gptj": ModelRegistration(GPTJCausalLMModel),
     "granite": ModelRegistration(GraniteCausalLMModel),
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
-    "hy_v3": ModelRegistration(HyV3CausalLMModel, config_class=HyV3Config),
+    "hy_v3": ModelRegistration(
+        HyV3CausalLMModel,
+        config_class=HyV3Config,
+        test_model_id="tencent/Hy3",
+    ),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
     "lfm2": ModelRegistration(Lfm2CausalLMModel, config_class=Lfm2Config),

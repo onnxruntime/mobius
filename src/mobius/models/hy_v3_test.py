@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
+import pytest
 import torch
 
 from mobius._configs import HyV3Config, HyV3MtpConfig
@@ -92,6 +93,37 @@ def test_hy_v3_preprocesses_separate_stacked_experts() -> None:
         result["model.layers.1.mlp.experts.2.gate_proj.weight"], gate[2]
     )
     np.testing.assert_array_equal(result["model.layers.1.mlp.experts.2.up_proj.weight"], up[2])
+
+
+def test_hy_v3_preprocesses_official_raw_weight_names_collision_safely() -> None:
+    router = torch.arange(64, dtype=torch.float32).reshape(4, 16)
+    expert_bias = torch.arange(4, dtype=torch.float32)
+    shared_gate = torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16)
+    shared_up = shared_gate + 1
+    shared_down = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8)
+    result = _preprocess_hy_v3_weights(
+        {
+            "model.layers.1.mlp.router.gate.weight": router,
+            "model.layers.1.mlp.expert_bias": expert_bias,
+            "model.layers.1.mlp.shared_mlp.gate_proj.weight": shared_gate,
+            "model.layers.1.mlp.shared_mlp.up_proj.weight": shared_up,
+            "model.layers.1.mlp.shared_mlp.down_proj.weight": shared_down,
+        }
+    )
+
+    assert result["model.layers.1.mlp.gate.weight"] is router
+    assert result["model.layers.1.mlp.e_score_correction_bias"] is expert_bias
+    assert result["model.layers.1.mlp.shared_experts.gate_proj.weight"] is shared_gate
+    assert result["model.layers.1.mlp.shared_experts.up_proj.weight"] is shared_up
+    assert result["model.layers.1.mlp.shared_experts.down_proj.weight"] is shared_down
+
+    with pytest.raises(ValueError, match="HYV3 weight rename collision"):
+        _preprocess_hy_v3_weights(
+            {
+                "model.layers.1.mlp.router.gate.weight": router,
+                "model.layers.1.mlp.gate.weight": router,
+            }
+        )
 
 
 def test_hy_v3_mtp_uses_exactly_one_independent_cache_layer() -> None:
@@ -189,7 +221,7 @@ def test_hy_v3_official_router_uses_additive_normalization_epsilon() -> None:
     graph.outputs.append(weights)
     model = ir.Model(graph, ir_version=10)
     model.graph.initializers["weight"].const_value = ir.tensor(
-        np.array([[-10.0], [-10.0]], dtype=np.float32)
+        np.array([[-12.0], [-12.0]], dtype=np.float32)
     )
 
     session = OnnxModelSession(model, device="cpu")
@@ -202,3 +234,41 @@ def test_hy_v3_official_router_uses_additive_normalization_epsilon() -> None:
     session.close()
 
     np.testing.assert_allclose(actual, np.array([[[0.5, 0.5]]]), rtol=1e-6, atol=1e-6)
+
+
+def test_hy_v3_llamacpp_router_clamps_tiny_probability_sum() -> None:
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 1, 1])
+    correction = create_test_input(builder, "correction", [2])
+    floor = 6.103515625e-5
+    gate = HyV3TopKGate(
+        1,
+        2,
+        2,
+        normalize=True,
+        normalization_floor=floor,
+        normalization_epsilon=None,
+        routed_scaling_factor=1.0,
+    )
+    weights, _ = gate(op, hidden, correction)
+    weights.name = "weights"
+    graph.outputs.append(weights)
+    model = ir.Model(graph, ir_version=10)
+    model.graph.initializers["weight"].const_value = ir.tensor(
+        np.array([[-12.0], [-12.0]], dtype=np.float32)
+    )
+
+    session = OnnxModelSession(model, device="cpu")
+    actual = session.run(
+        {
+            "hidden": np.ones((1, 1, 1), dtype=np.float32),
+            "correction": np.zeros(2, dtype=np.float32),
+        }
+    )["weights"]
+    session.close()
+
+    probability = 1.0 / (1.0 + np.exp(12.0))
+    expected = np.full((1, 1, 2), probability / floor, dtype=np.float32)
+    # Stock ORT's tail sigmoid approximation is within 1% of the analytic value.
+    np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-8)
+    assert not np.allclose(actual, np.array([[[0.5, 0.5]]], dtype=np.float32))

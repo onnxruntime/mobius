@@ -236,7 +236,26 @@ class HyV3TextModel(TextModel):
 
 
 def _preprocess_hy_v3_weights(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    renamed = _rename_moe_expert_weights(state_dict)
+    source_renames = (
+        (".mlp.router.gate.weight", ".mlp.gate.weight"),
+        (".mlp.expert_bias", ".mlp.e_score_correction_bias"),
+        (".mlp.shared_mlp.", ".mlp.shared_experts."),
+    )
+    normalized: dict[str, torch.Tensor] = {}
+    for source_name, tensor in state_dict.items():
+        target_name = source_name
+        for source, target in source_renames:
+            if source in target_name:
+                target_name = target_name.replace(source, target)
+                break
+        if target_name in normalized:
+            raise ValueError(
+                f"HYV3 weight rename collision: {source_name!r} maps to existing "
+                f"target {target_name!r}"
+            )
+        normalized[target_name] = tensor
+
+    renamed = _rename_moe_expert_weights(normalized)
     unpacked: dict[str, torch.Tensor] = {}
     for name, tensor in renamed.items():
         projection = next(

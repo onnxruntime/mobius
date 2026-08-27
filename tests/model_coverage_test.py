@@ -168,6 +168,13 @@ _COVERAGE_SKIP: dict[str, str] = {
     "real-weight L4/L5 awaits an unquantized or supported checkpoint.",
     "t5encoder": "Encoder-only T5 task — covered by src/mobius/models/t5_test.py "
     "and GGUF integration tests; generic encoder tests require token_type_ids",
+    "HyV3MtpModel": "Internal GGUF-only auxiliary head with target-hidden-state and "
+    "independent-cache inputs that the generic L1/L3 and Hugging Face L2 harnesses "
+    "cannot drive; its graph execution, weight paths, and one-layer cache ABI are "
+    "covered by src/mobius/models/hy_v3_test.py and GGUF MTP integration tests.",
+    "hy_v3": "L1 graph construction, native Transformers L2 config loading, and "
+    "payload-free L3 trunk parity are covered; the immutable official checkpoint is "
+    "597,578,239,288 bytes, so L4/L5 real-weight goldens exceed the 16 GiB policy.",
     # --- Internal / duplicate aliases ---
     "code_llama": "Alias for llama — covered by llama",
     "command_r": "Alias for cohere — covered by cohere",
