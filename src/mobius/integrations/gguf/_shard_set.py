@@ -823,6 +823,12 @@ def open_gguf_model(
     (or a directory holding a single split set); otherwise a plain
     :class:`GGUFModel`. Callers get the same interface either way.
     """
+    if shard_paths is None:
+        shard_paths = getattr(path, "shard_paths", None)
+    if expected_sha256 is None:
+        expected_sha256 = getattr(path, "expected_sha256", None)
+    if expected_sizes is None:
+        expected_sizes = getattr(path, "expected_sizes", None)
     shards = (
         [Path(shard_path) for shard_path in shard_paths]
         if shard_paths is not None

@@ -102,6 +102,24 @@ class _GGUFPreflightRevision:
 
 
 @dataclass(frozen=True, slots=True, eq=False)
+class _GGUFPreflightFallbackRevision:
+    """Immutable revision whose bounded header requires local validation."""
+
+    revision: str
+
+    def __str__(self) -> str:
+        return self.revision
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _GGUFPreflightFallbackRevision):
+            return self.revision == other.revision
+        return isinstance(other, str) and self.revision == other
+
+    def __hash__(self) -> int:
+        return hash(self.revision)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
 class _ResolvedGGUFPath:
     """Downloaded shard path carrying the trusted Hub manifest to the reader."""
 
@@ -513,7 +531,7 @@ def _preflight_hf_gguf_file(
     allow_mmproj_companion: bool = False,
     expected_architecture: str | None = None,
     dispatch_architecture: bool = True,
-) -> str | _GGUFPreflightRevision:
+) -> str | _GGUFPreflightRevision | _GGUFPreflightFallbackRevision:
     """Validate the exact selected Hub file header and return its immutable revision."""
     source = f"{repo_id}@{revision}:{filename}"
     url = hf_hub_url(repo_id, filename, revision=revision)
@@ -579,7 +597,7 @@ def _preflight_hf_gguf_file(
             source,
             error,
         )
-        return commit_hash
+        return _GGUFPreflightFallbackRevision(commit_hash)
     try:
         header_info = _gguf_header_info_from_header_prefix(
             b"".join(chunks),
@@ -597,7 +615,7 @@ def _preflight_hf_gguf_file(
             "downloading the same immutable revision for full local validation.",
             source,
         )
-        return commit_hash
+        return _GGUFPreflightFallbackRevision(commit_hash)
     _validate_preflight_split_header(header_info, source=source)
     architecture = header_info.architecture
     if (
@@ -639,7 +657,7 @@ def _preflight_hf_mmproj_companion_file(
     filename: str,
     *,
     revision: str = "main",
-) -> str | _GGUFPreflightRevision:
+) -> str | _GGUFPreflightRevision | _GGUFPreflightFallbackRevision:
     """Validate one exact Hub mmproj file and pin its immutable revision."""
     return _preflight_hf_gguf_file(
         repo_id,
@@ -5185,7 +5203,9 @@ def _resolve_gguf_path_impl(
         filename, selected_files = _select_complete_hf_gguf_set(repo_files, filename or None)
     primary_filename = selected_files[0]
 
-    preflight_revision: str | _GGUFPreflightRevision
+    preflight_revision: (
+        str | _GGUFPreflightRevision | _GGUFPreflightFallbackRevision
+    )
     if allow_mmproj_companion:
         if len(selected_files) != 1:
             raise ValueError("Sharded mmproj companion GGUF files are not supported.")
@@ -5202,6 +5222,25 @@ def _resolve_gguf_path_impl(
         )
     resolved_revision = str(preflight_revision)
     selected_header = getattr(preflight_revision, "header_info", None)
+    if (
+        len(selected_files) == 1
+        and isinstance(preflight_revision, _GGUFPreflightFallbackRevision)
+        and _GGUF_SHARD_FILENAME_RE.search(PurePosixPath(filename).name) is None
+    ):
+        pinned_files = api.list_repo_files(repo_id, revision=resolved_revision)
+        selected_parent = PurePosixPath(filename).parent
+        same_directory_ggufs = sorted(
+            name
+            for name in pinned_files
+            if PurePosixPath(name).parent == selected_parent
+            and name.lower().endswith(".gguf")
+        )
+        if same_directory_ggufs != [filename]:
+            raise ValueError(
+                f"Bounded header preflight did not establish whether {filename!r} "
+                "is a standalone GGUF, and its directory contains other GGUF files "
+                f"{same_directory_ggufs}. Refusing a potentially partial download."
+            )
     if (
         len(selected_files) == 1
         and selected_header is not None

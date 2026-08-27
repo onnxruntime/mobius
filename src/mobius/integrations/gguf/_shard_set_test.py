@@ -765,11 +765,11 @@ def test_hub_shard_resolution_pins_and_downloads_complete_set(tmp_path):
     assert hub_download.call_count == len(shards)
     assert resolved.expected_sizes == {path.name: path.stat().st_size for path in shards}
     assert resolved.expected_sha256 == {path.name: _sha256(path) for path in shards}
-    assert open_gguf_model(
-        resolved,
-        expected_sha256=resolved.expected_sha256,
-        expected_sizes=resolved.expected_sizes,
-    ).num_tensors == len(_tensor_names(3))
+    assert open_gguf_model(resolved).num_tensors == len(_tensor_names(3))
+    victim = shards[1].name
+    resolved.expected_sha256[victim] = "0" * 64
+    with pytest.raises(GgufShardError, match=r"SHA-256 mismatch"):
+        open_gguf_model(resolved)
 
 
 def test_build_rejects_same_size_corrupt_hub_shard_from_lfs_manifest(tmp_path):
@@ -927,12 +927,7 @@ def test_hub_renamed_shard_headers_enumerate_complete_set_before_download(tmp_pa
     assert download.call_count == len(source_shards)
     assert resolved == str(local_by_remote[remote_files[1]])
     assert resolved.shard_paths == [str(local_by_remote[name]) for name in remote_files]
-    model = open_gguf_model(
-        resolved,
-        shard_paths=resolved.shard_paths,
-        expected_sha256=resolved.expected_sha256,
-        expected_sizes=resolved.expected_sizes,
-    )
+    model = open_gguf_model(resolved)
     assert model.num_tensors == len(_tensor_names(3))
 
 
@@ -1014,6 +1009,27 @@ def test_hub_renamed_incomplete_set_rejected_before_download(tmp_path):
         builder._resolve_gguf_path(f"owner/renamed:{remote_files[1]}")
 
     api.get_paths_info.assert_not_called()
+    download.assert_not_called()
+
+
+def test_hub_renamed_header_fallback_rejects_potential_partial_download():
+    from mobius.integrations.gguf import _builder as builder
+
+    filename = "weights/selected.gguf"
+    api = mock.Mock()
+    api.list_repo_files.return_value = [filename, "weights/possible-sibling.gguf"]
+    with (
+        mock.patch.object(builder, "HfApi", return_value=api),
+        mock.patch.object(
+            builder,
+            "_preflight_hf_gguf_file",
+            return_value=builder._GGUFPreflightFallbackRevision("a" * 40),
+        ),
+        mock.patch.object(builder, "hf_hub_download") as download,
+        pytest.raises(ValueError, match=r"potentially partial download"),
+    ):
+        builder._resolve_gguf_path(f"owner/repo:{filename}")
+
     download.assert_not_called()
 
 
