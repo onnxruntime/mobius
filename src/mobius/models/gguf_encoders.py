@@ -4,8 +4,8 @@
 """Specialized stateless encoder graphs matching llama.cpp GGUF architectures.
 
 The models in this module consume the exact float tensor layouts emitted for
-EuroBERT, NeoBERT, dense NomicBERT, and JinaBERT-v2. They expose token-level
-hidden states through the standard feature-extraction ABI.
+EuroBERT, NeoBERT, dense NomicBERT, JinaBERT-v2, and JinaBERT-v3. They expose
+token-level hidden states through the standard feature-extraction ABI.
 """
 
 from __future__ import annotations
@@ -139,14 +139,17 @@ class _SplitAttention(nn.Module):
 
 
 class _PackedAttention(nn.Module):
-    """Bias-free packed-QKV bidirectional RoPE attention used by NeoBERT."""
+    """Packed-QKV bidirectional RoPE attention."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, *, interleaved: bool = True):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.qkv = Linear(config.hidden_size, 3 * config.hidden_size, bias=False)
-        self.output = Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.interleaved = interleaved
+        self.qkv = Linear(
+            config.hidden_size, 3 * config.hidden_size, bias=config.attn_qkv_bias
+        )
+        self.output = Linear(config.hidden_size, config.hidden_size, bias=config.attn_o_bias)
 
     def forward(self, op, hidden_states, attention_mask, position_embeddings):
         # llama.cpp's fused build_qkv views contiguous full-width Q, K, and V
@@ -159,14 +162,14 @@ class _PackedAttention(nn.Module):
             query,
             position_embeddings,
             num_heads=self.num_heads,
-            interleaved=True,
+            interleaved=self.interleaved,
         )
         key = apply_rotary_pos_emb(
             op,
             key,
             position_embeddings,
             num_heads=self.num_heads,
-            interleaved=True,
+            interleaved=self.interleaved,
         )
         attended = op.Attention(
             query,
@@ -417,6 +420,48 @@ class _PostNormEncoderLayer(nn.Module):
         return self.layer_output_norm(op, op.Add(hidden_states, self.mlp(op, hidden_states)))
 
 
+class _SequentialGeluMLP(nn.Module):
+    """llama.cpp ``LLM_FFN_SEQ``: up projection, GELU, then down projection."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.up = Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=config.encoder_ffn_up_bias,
+        )
+        self.down = Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=config.encoder_ffn_down_bias,
+        )
+
+    def forward(self, op, hidden_states):
+        return self.down(op, ACT2FN["gelu_pytorch_tanh"](op, self.up(op, hidden_states)))
+
+
+class _JinaBertV3Layer(nn.Module):
+    """Pinned llama.cpp JinaBERT-v3 post-norm encoder layer."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.attention = (
+            _PackedAttention(config, interleaved=False)
+            if config.encoder_fused_qkv
+            else _SplitAttention(config, rope=True)
+        )
+        self.attention_output_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = _SequentialGeluMLP(config)
+        self.layer_output_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, op, hidden_states, attention_mask, position_embeddings):
+        attention_output = self.attention(
+            op, hidden_states, attention_mask, position_embeddings
+        )
+        ffn_input = self.attention_output_norm(op, op.Add(hidden_states, attention_output))
+        return self.layer_output_norm(op, op.Add(ffn_input, self.mlp(op, ffn_input)))
+
+
 class _PostNormEncoder(nn.Module):
     """Shared embedding/post-norm body for dense NomicBERT and JinaBERT-v2."""
 
@@ -563,6 +608,46 @@ class JinaBertV2GGUFModel(_PostNormEncoder):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config, jina=True)
+
+
+class JinaBertV3GGUFModel(nn.Module):
+    """JinaBERT-v3 RoPE encoder with the exact dense/routed FFN schedule."""
+
+    default_task = "feature-extraction"
+    category = "encoder"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self._pooling_type = config.pooling_type
+        self.token_embeddings = Embedding(
+            config.vocab_size, config.hidden_size, config.pad_token_id
+        )
+        self._use_token_types = config.encoder_use_token_type_embeddings
+        if self._use_token_types:
+            self.token_type_embeddings = Embedding(config.type_vocab_size, config.hidden_size)
+        self.token_embeddings_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList(
+            [_JinaBertV3Layer(config) for _ in range(config.num_hidden_layers)]
+        )
+        self.rotary_emb = initialize_rope(config)
+
+    def forward(self, op, input_ids, attention_mask, token_type_ids):
+        hidden_states = self.token_embeddings(op, input_ids)
+        if self._use_token_types:
+            # llama.cpp fixes every request to token type zero ("Sentence A").
+            zero_types = op.Mul(token_type_ids, op.Constant(value_int=0))
+            hidden_states = op.Add(hidden_states, self.token_type_embeddings(op, zero_types))
+        hidden_states = self.token_embeddings_norm(op, hidden_states)
+        padding_mask = create_padding_mask(op, input_ids, attention_mask)
+        positions = _position_embeddings(op, input_ids, self.rotary_emb)
+        for layer in self.layers:
+            hidden_states = layer(op, hidden_states, padding_mask, positions)
+        return _pool_encoder_output(
+            op, hidden_states, attention_mask, pooling_type=self._pooling_type
+        )
+
+    def preprocess_weights(self, state_dict: dict[str, torch.Tensor]):
+        return state_dict
 
 
 def _pool_encoder_output(op, hidden_states, attention_mask, *, pooling_type: int):

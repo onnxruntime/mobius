@@ -89,6 +89,7 @@ __all__ = [
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JinaBertV2GGUFModel",
+    "JinaBertV3GGUFModel",
     "Jais2CausalLMModel",
     "JetMoeCausalLMModel",
     "KimiK3CausalLMModel",
@@ -272,6 +273,7 @@ from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGU
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,
+    JinaBertV3GGUFModel,
     NeoBertGGUFModel,
     NomicBertGGUFModel,
     NomicBertMoEGGUFModel,

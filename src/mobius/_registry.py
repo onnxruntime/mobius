@@ -170,6 +170,7 @@ from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGU
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,
+    JinaBertV3GGUFModel,
     NeoBertGGUFModel,
     NomicBertGGUFModel,
     NomicBertMoEGGUFModel,
@@ -883,6 +884,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "jina_bert_v2_gguf": ModelRegistration(
         JinaBertV2GGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "jina_bert_v3_gguf": ModelRegistration(
+        JinaBertV3GGUFModel, task="gguf-encoder-feature-extraction"
     ),
     "neo_bert_gguf": ModelRegistration(
         NeoBertGGUFModel, task="gguf-encoder-feature-extraction"

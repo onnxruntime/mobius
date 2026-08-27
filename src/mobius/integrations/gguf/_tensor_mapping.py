@@ -666,6 +666,11 @@ _JINA_BERT_V2_MAPPING: dict[str, str] = {
     "blk.{bid}.attn_norm_2": "layers.{bid}.extra_attention_norm",
 }
 
+_JINA_BERT_V3_MAPPING: dict[str, str] = {
+    **_NOMIC_BERT_MAPPING,
+    "blk.{bid}.attn_qkv": "layers.{bid}.attention.qkv",
+}
+
 _T5_MAPPING: dict[str, str] = {
     "token_embd": "shared",
     "output": "lm_head",
@@ -1242,6 +1247,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "neo_bert": _NEO_BERT_MAPPING,
         "nomic_bert": _NOMIC_BERT_MAPPING,
         "jina_bert_v2": _JINA_BERT_V2_MAPPING,
+        "jina_bert_v3": _JINA_BERT_V3_MAPPING,
         "t5": _T5_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,

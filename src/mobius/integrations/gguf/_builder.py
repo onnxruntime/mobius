@@ -4014,6 +4014,7 @@ def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
     }:
         return
     head_tensors = [
@@ -4187,7 +4188,13 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
     from mobius.integrations.gguf._tensor_mapping import is_known_skip
 
     arch = gguf_model.architecture
-    if arch not in {"eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"}:
+    if arch not in {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "jina-bert-v2",
+        "jina-bert-v3",
+    }:
         return
     metadata = gguf_model.metadata
     geometry = (
@@ -4219,7 +4226,7 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
     if key_length != head_dim or value_length != head_dim:
         raise ValueError(f"{arch} GGUF requires full-width equal Q/K/V heads")
     if arch != "jina-bert-v2":
-        rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+        rope_dim = int(metadata.get(f"{arch}.rope.dimension_count", head_dim))
         if rope_dim != head_dim:
             raise ValueError(f"{arch} GGUF requires full-head RoPE")
 
@@ -4245,7 +4252,9 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
     else:
         if token_types <= 0:
             raise ValueError(f"{arch} tokenizer.ggml.token_type_count must be positive")
-        token_type_shape = (token_types, hidden)
+        token_type_shape = (
+            (hidden,) if arch == "jina-bert-v3" and token_types == 1 else (token_types, hidden)
+        )
         if arch == "jina-bert-v2":
             required["token_types.weight"] = token_type_shape
         else:
@@ -4258,6 +4267,23 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
         )
 
     optional_families: dict[str, set[str]] = {}
+    moe_interval = int(metadata.get(f"{arch}.moe_every_n_layers", 0))
+    if arch == "jina-bert-v3":
+        expert_metadata = any(
+            f"{arch}.{suffix}" in metadata
+            for suffix in (
+                "expert_count",
+                "expert_used_count",
+                "expert_feed_forward_length",
+                "expert_weights_norm",
+                "expert_weights_scale",
+            )
+        )
+        if moe_interval != 0 or expert_metadata:
+            raise ValueError(
+                f"{arch} MoE metadata is unsupported because the pinned loader never "
+                "loads moe_every_n_layers"
+            )
     for layer in range(layers):
         prefix = f"blk.{layer}."
         if arch in {"eurobert", "neo-bert"}:
@@ -4286,6 +4312,36 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
                         prefix + "ffn_up.weight": (2 * intermediate, hidden),
                     }
                 )
+            continue
+
+        if arch == "jina-bert-v3":
+            required.update(
+                {
+                    prefix + "attn_output.weight": (hidden, hidden),
+                    prefix + "attn_output_norm.weight": (hidden,),
+                    prefix + "attn_output_norm.bias": (hidden,),
+                    prefix + "layer_output_norm.weight": (hidden,),
+                    prefix + "layer_output_norm.bias": (hidden,),
+                }
+            )
+            fused = prefix + "attn_qkv.weight" in actual
+            if fused:
+                required[prefix + "attn_qkv.weight"] = (3 * hidden, hidden)
+                optional[prefix + "attn_qkv.bias"] = (3 * hidden,)
+            else:
+                for projection in ("q", "k", "v"):
+                    required[prefix + f"attn_{projection}.weight"] = (hidden, hidden)
+                    optional[prefix + f"attn_{projection}.bias"] = (hidden,)
+            optional[prefix + "attn_output.bias"] = (hidden,)
+
+            required.update(
+                {
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional[prefix + "ffn_up.bias"] = (intermediate,)
+            optional[prefix + "ffn_down.bias"] = (hidden,)
             continue
 
         required.update(
@@ -6530,6 +6586,7 @@ def build_from_gguf(
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
     }:
         from mobius.tasks import GGUFEncoderFeatureExtractionTask
 
@@ -7152,6 +7209,14 @@ def _normalize_gguf_weights(
     for key, value in state_dict.items():
         if config is not None:
             _validate_moe_weight_shape(key, tuple(value.shape), config, gguf_arch=gguf_arch)
+        if (
+            gguf_arch == "jina-bert-v3"
+            and key == "token_type_embeddings.weight"
+            and value.dim() == 1
+        ):
+            # GGUF elides the unit token-type dimension; ONNX Gather needs [1, hidden].
+            result[key] = value.unsqueeze(0)
+            continue
         if gguf_arch in {"dream", "llada-moe", "rnd1"} and ".self_attn.qkv_proj." in key:
             suffix = key.rsplit(".", 1)[-1]
             q_width = int(config.num_attention_heads) * int(config.head_dim)

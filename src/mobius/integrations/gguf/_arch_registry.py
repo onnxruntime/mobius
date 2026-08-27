@@ -383,6 +383,10 @@ _ENCODER_GRAPH_MISMATCH = {
         "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
         "BertModel has absolute positions and no MoE path."
     ),
+    "nomic-bert-moe": (
+        "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
+        "moe_every_n_layers. Mobius has no encoder MoE graph with that schedule."
+    ),
 }
 
 _FINAL_CENSUS_DEFERRED_REASONS = {
@@ -1420,6 +1424,26 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         runtime=Support.DEFERRED,
         reason=_ENCODER_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jina-bert-v3",
+        model_type="jina-bert-v3",
+        module_type="jina_bert_v3_gguf",
+        tensor_map_recipe=("jina_bert_v3",),
+        config_postprocessor="jina_bert_v3_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+            "rope.freq_base",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "The dedicated graph and float importer preserve the pinned RoPE, post-norm, "
+            "and sequential GELU contracts of the reachable dense loader path. The pinned "
+            "loader does not read moe_every_n_layers, so MoE schedules, quantized packed "
+            "projections, and runtime packaging remain fail-closed pending proof."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="modern-bert",

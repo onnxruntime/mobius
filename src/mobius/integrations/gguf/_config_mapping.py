@@ -3760,6 +3760,93 @@ def _specialized_encoder_postprocess(
     return config
 
 
+def _jina_bert_v3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Resolve JinaBERT-v3's QKV representation and exact dense/MoE schedule."""
+    arch = model.architecture
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(f"{arch} GGUF requires head_count_kv == head_count")
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false for encoder import")
+
+    pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
+    if pooling_type not in {0, 1, 2}:
+        raise ValueError(f"{arch}.pooling_type={pooling_type} is not a known encoder pooling")
+    if metadata.get(f"{arch}.classifier.output_labels"):
+        raise ValueError(f"{arch} classifier heads are not part of feature extraction")
+
+    names = set(model.tensor_names)
+    layer_count = config.num_hidden_layers
+    layers = range(layer_count)
+
+    def _all_or_none(suffix: str, selected_layers=layers) -> bool:
+        expected = {f"blk.{layer}.{suffix}" for layer in selected_layers}
+        present = expected & names
+        if present and present != expected:
+            raise ValueError(
+                f"{arch} optional tensor family {suffix!r} must be all-layers or absent"
+            )
+        return bool(present)
+
+    fused = {f"blk.{layer}.attn_qkv.weight" for layer in layers}
+    split = {
+        f"blk.{layer}.attn_{projection}.weight"
+        for layer in layers
+        for projection in ("q", "k", "v")
+    }
+    if fused <= names and not names & split:
+        config.encoder_fused_qkv = True
+        config.attn_qkv_bias = _all_or_none("attn_qkv.bias")
+        config.encoder_q_bias = False
+        config.encoder_k_bias = False
+        config.encoder_v_bias = False
+    elif split <= names and not names & fused:
+        config.encoder_fused_qkv = False
+        config.attn_qkv_bias = False
+        config.encoder_q_bias = _all_or_none("attn_q.bias")
+        config.encoder_k_bias = _all_or_none("attn_k.bias")
+        config.encoder_v_bias = _all_or_none("attn_v.bias")
+    else:
+        raise ValueError(
+            f"{arch} requires a uniform complete fused-QKV or split-Q/K/V tensor family"
+        )
+
+    config.attn_o_bias = _all_or_none("attn_output.bias")
+    config.pooling_type = pooling_type
+    token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+    if token_types <= 0:
+        raise ValueError(f"{arch} tokenizer.ggml.token_type_count must be positive")
+    config.type_vocab_size = token_types
+    config.encoder_use_token_type_embeddings = "token_types.weight" in names
+    config.hidden_act = "gelu_pytorch_tanh"
+
+    interval = int(metadata.get(f"{arch}.moe_every_n_layers", 0))
+    expert_metadata = tuple(
+        suffix
+        for suffix in (
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_weights_norm",
+            "expert_weights_scale",
+        )
+        if f"{arch}.{suffix}" in metadata
+    )
+    if interval != 0 or expert_metadata:
+        raise ValueError(
+            f"{arch} MoE metadata is unsupported: the pinned loader does not read "
+            "moe_every_n_layers, so only its reachable dense tensor path is importable"
+        )
+
+    config.encoder_ffn_up_bias = _all_or_none("ffn_up.bias")
+    config.encoder_ffn_down_bias = _all_or_none("ffn_down.bias")
+    config.mlp_bias = config.encoder_ffn_up_bias or config.encoder_ffn_down_bias
+    return config
+
+
 def _gguf_embedding_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -4202,6 +4289,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
     "specialized_encoder": _specialized_encoder_postprocess,
+    "jina_bert_v3_encoder": _jina_bert_v3_postprocess,
     "gguf_embedding": _gguf_embedding_postprocess,
     "talkie": _talkie_postprocess,
     "maincoder": _maincoder_postprocess,

@@ -147,6 +147,75 @@ def _tensors(arch: str, *, jina_fused: bool = True) -> dict[str, tuple[int, ...]
     return tensors
 
 
+def _jina_v3_tensors(*, moe: bool = False, fused_qkv: bool = True):
+    hidden = 8
+    intermediate = 16
+    experts = 3
+    tensors: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (32, hidden),
+        "token_types.weight": (2, hidden),
+        "token_embd_norm.weight": (hidden,),
+        "token_embd_norm.bias": (hidden,),
+    }
+    for layer in range(2):
+        prefix = f"blk.{layer}."
+        if fused_qkv:
+            tensors[prefix + "attn_qkv.weight"] = (3 * hidden, hidden)
+            tensors[prefix + "attn_qkv.bias"] = (3 * hidden,)
+        else:
+            for projection in ("q", "k", "v"):
+                tensors[prefix + f"attn_{projection}.weight"] = (hidden, hidden)
+                tensors[prefix + f"attn_{projection}.bias"] = (hidden,)
+        tensors.update(
+            {
+                prefix + "attn_output.weight": (hidden, hidden),
+                prefix + "attn_output.bias": (hidden,),
+                prefix + "attn_output_norm.weight": (hidden,),
+                prefix + "attn_output_norm.bias": (hidden,),
+                prefix + "layer_output_norm.weight": (hidden,),
+                prefix + "layer_output_norm.bias": (hidden,),
+            }
+        )
+        if moe and layer == 1:
+            tensors.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        intermediate,
+                    ),
+                }
+            )
+        else:
+            tensors.update(
+                {
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_up.bias": (intermediate,),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                    prefix + "ffn_down.bias": (hidden,),
+                }
+            )
+    return tensors
+
+
+def _jina_v3_metadata(*, moe: bool = False):
+    metadata = _metadata("jina-bert-v3")
+    metadata.pop("jina-bert-v3.rope.dimension_count")
+    if moe:
+        metadata.update(
+            {
+                "jina-bert-v3.moe_every_n_layers": 2,
+                "jina-bert-v3.expert_count": 3,
+                "jina-bert-v3.expert_used_count": 2,
+                "jina-bert-v3.expert_weights_scale": 0.5,
+                "jina-bert-v3.expert_weights_norm": False,
+            }
+        )
+    return metadata
+
+
 @pytest.mark.parametrize(
     ("arch", "model_type", "module_type"),
     [
@@ -154,6 +223,7 @@ def _tensors(arch: str, *, jina_fused: bool = True) -> dict[str, tuple[int, ...]
         ("neo-bert", "neobert", "neo_bert_gguf"),
         ("nomic-bert", "nomic_bert", "nomic_bert_gguf"),
         ("jina-bert-v2", "bert", "jina_bert_v2_gguf"),
+        ("jina-bert-v3", "jina-bert-v3", "jina_bert_v3_gguf"),
     ],
 )
 def test_promoted_capabilities_are_float_only(arch, model_type, module_type) -> None:
@@ -234,6 +304,106 @@ def test_exact_closure_accepts_and_mutations_fail(arch: str) -> None:
 )
 def test_exact_tensor_mapping(arch: str, gguf_name: str, target: str) -> None:
     assert map_gguf_to_hf_names(gguf_name, arch) == target
+
+
+@pytest.mark.parametrize("fused_qkv", [False, True])
+def test_jina_v3_config_graph_and_tensor_closure(fused_qkv: bool) -> None:
+    arch = "jina-bert-v3"
+    tensors = _jina_v3_tensors(fused_qkv=fused_qkv)
+    model = _FakeGGUF(arch, _jina_v3_metadata(), tensors)
+    _raise_for_invalid_specialized_encoder_tensor_contract(model)
+    config = gguf_to_config(model)
+    assert config.encoder_fused_qkv is fused_qkv
+
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    graph = GGUFEncoderFeatureExtractionTask().build(module, config)["model"].graph
+    mapped = {map_gguf_to_hf_names(name, arch) for name in tensors}
+    owned_initializers = {
+        name for name in graph.initializers if name.startswith(("token_", "layers."))
+    }
+    assert mapped == owned_initializers
+    rotary = [node for node in graph if node.op_type == "RotaryEmbedding"]
+    assert len(rotary) == 2 * config.num_hidden_layers
+    assert all(node.attributes["interleaved"].value == 0 for node in rotary)
+    gelu = [node for node in graph if node.op_type == "Gelu"]
+    assert all(node.attributes["approximate"].value == "tanh" for node in gelu)
+    assert not any(node.op_type in {"TopK", "Softmax"} for node in graph)
+
+
+def test_jina_v3_rejects_malformed_schedule_and_tensor_mix() -> None:
+    arch = "jina-bert-v3"
+    tensors = _jina_v3_tensors(moe=True)
+    metadata = _jina_v3_metadata(moe=True)
+    with pytest.raises(ValueError, match="pinned loader"):
+        _raise_for_invalid_specialized_encoder_tensor_contract(
+            _FakeGGUF(arch, metadata, tensors)
+        )
+
+    with pytest.raises(ValueError, match="pinned loader"):
+        gguf_to_config(_FakeGGUF(arch, metadata, tensors))
+
+
+def test_jina_v3_exact_tensor_mapping_and_singleton_token_type_transform() -> None:
+    from mobius.integrations.gguf._builder import _normalize_gguf_weights
+
+    assert (
+        map_gguf_to_hf_names("blk.1.attn_qkv.weight", "jina-bert-v3")
+        == "layers.1.attention.qkv.weight"
+    )
+    normalized = _normalize_gguf_weights(
+        {"token_type_embeddings.weight": torch.arange(8.0)},
+        "jina-bert-v3",
+        SimpleNamespace(num_local_experts=None),
+    )
+    assert normalized["token_type_embeddings.weight"].shape == (1, 8)
+
+
+@pytest.mark.parametrize("fused_qkv", [False, True])
+def test_jina_v3_synthetic_execution_matches_post_norm_oracle(
+    fused_qkv: bool,
+) -> None:
+    from mobius._testing.ort_inference import OnnxModelSession
+
+    arch = "jina-bert-v3"
+    tensors = _jina_v3_tensors(fused_qkv=fused_qkv)
+    metadata = _jina_v3_metadata()
+    config = gguf_to_config(_FakeGGUF(arch, metadata, tensors))
+    module = registry.get(get_arch_spec(arch).module_type)(config)
+    package = FeatureExtractionTask().build(module, config)
+
+    weights = {
+        map_gguf_to_hf_names(name, arch): torch.zeros(shape) for name, shape in tensors.items()
+    }
+    token = torch.arange(1, 9, dtype=torch.float32)
+    weights["token_embeddings.weight"][1] = token
+    for name in tuple(weights):
+        if name.endswith(
+            (
+                "token_embeddings_norm.weight",
+                "attention_output_norm.weight",
+                "layer_output_norm.weight",
+            )
+        ):
+            weights[name] = torch.ones_like(weights[name])
+    package.apply_weights(weights)
+
+    session = OnnxModelSession(package["model"])
+    try:
+        output = session.run(
+            {
+                "input_ids": np.array([[1, 0]], dtype=np.int64),
+                "attention_mask": np.array([[1, 0]], dtype=np.int64),
+                "token_type_ids": np.array([[1, 1]], dtype=np.int64),
+            }
+        )["last_hidden_state"]
+    finally:
+        session.close()
+
+    expected = token.numpy()
+    for _ in range(1 + 2 * config.num_hidden_layers):
+        expected = (expected - expected.mean()) / np.sqrt(expected.var() + config.rms_norm_eps)
+    np.testing.assert_allclose(output[0, 0], expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(output[0, 1], np.zeros(8), rtol=0, atol=0)
 
 
 def test_jina_separate_and_fused_geglu_are_discriminated_by_shape() -> None:

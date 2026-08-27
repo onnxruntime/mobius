@@ -317,6 +317,7 @@ class TestCapabilityClosure:
             "granitehybrid",
             "internlm2",
             "jina-bert-v2",
+            "jina-bert-v3",
             "llama-embed",
             "lfm2moe",
             "mamba",
