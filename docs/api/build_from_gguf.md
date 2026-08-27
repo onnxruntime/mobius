@@ -75,6 +75,12 @@ evidence match.
 
 Runtime support above is independent from tokenizer materialization support below.
 
+### Fail-closed runtime evidence
+
+| Evidence ID | Pinned candidate | Bounded result | Withheld runtime claims |
+|---|---|---|---|
+| `nemotron-h-moe-30b-iq2-xxs-runtime-blocker` | `bartowski/nvidia_Nemotron-3-Nano-30B-A3B-GGUF@1fc64d5b160654ec892df2708aa893b0e96e6491`<br>`nvidia_Nemotron-3-Nano-30B-A3B-IQ2_XXS.gguf`<br>18,010,755,296 B<br>`f3da710c046ce7cc6ff28a9b5f1a9153ac72e3f60603e51c7bb679d80716b58a` | config/tokenizer `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16@bf77c3174f68ad409e1c2aa60daeb46e32d1c606`; GGUF tokenizer metadata `6089bcaf08b3fe0d49379ca7e85bd3c93e8705bac6130636425c159212971225`; result=blocked; 401 tensors / 31,577,940,288 parameters; ort-genai 0.15.2; The smallest model GGUF in the pinned 29-file repository revision is 18,010,755,296 bytes, above the 16 GiB bounded-artifact policy; explicit float16/float32 weights require 63,155,880,576/126,311,761,152 bytes.<br>Nemotron-H correction-biased sigmoid routing, unbiased sigmoid weights, ReLU2 experts, shared expert, and optional latent projections cannot use com.microsoft.MoE; the truthful production graph retains 40,167 nodes and 6,028 MatMul nodes.<br>ORT GenAI 0.15.2 cannot describe the 58 heterogeneous attention key/value and Mamba2 convolution/recurrent state slots required for package replay and reorder.<br>The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is not serialized; exact ORT tokenizer materialization is unavailable. | cached decode and deterministic generation, full-logit parity, package and report roundtrip, state replay, rollback, and reorder, tensor value closure |
+
 ## Remaining route work
 
 Every unresolved route is classified once from its authoritative registry. Exact reasons

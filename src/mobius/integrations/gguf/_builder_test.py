@@ -7346,6 +7346,10 @@ class TestNemotronHMoEGGUFBuild:
         _write_nemotron_h_moe_gguf(path, quantized=False)
         package = build_from_gguf(path)
         model = package["model"]
+        assert (
+            "heterogeneous attention KV and Mamba convolution/recurrent state"
+            in (model.metadata_props["mobius.runtime_support"])
+        )
         assert [value.name for value in model.graph.outputs] == [
             "logits",
             "present.0.conv_state",
@@ -7380,6 +7384,27 @@ class TestNemotronHMoEGGUFBuild:
         assert outputs["present.0.conv_state"].shape == (2, 72, 3)
         assert outputs["present.0.ssm_state"].shape == (2, 4, 4, 16)
         session.close()
+
+    def test_runtime_package_remains_fail_closed(self, tmp_path: Path) -> None:
+        from mobius.integrations.gguf import build_from_gguf, write_gguf_runtime_package
+
+        path = tmp_path / "nemotron-h-moe-f32.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+
+        with pytest.raises(
+            ValueError,
+            match=r"runtime packaging for 'nemotron_h_moe' is deferred",
+        ):
+            write_gguf_runtime_package(
+                package,
+                path,
+                tmp_path / "runtime-package",
+                tokenizer_repository="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+                tokenizer_revision="bf77c3174f68ad409e1c2aa60daeb46e32d1c606",
+                runtime_version="0.15.2",
+            )
+        assert not (tmp_path / "runtime-package").exists()
 
     def test_latent_projection_imports_and_executes(self, tmp_path: Path) -> None:
         from mobius._testing.ort_inference import OnnxModelSession

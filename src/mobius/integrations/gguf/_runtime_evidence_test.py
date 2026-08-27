@@ -12,6 +12,10 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from mobius.integrations.gguf import _runtime_evidence
+from mobius.integrations.gguf._runtime_blocker_evidence import (
+    iter_runtime_blocker_evidence,
+    runtime_blocker_evidence,
+)
 from mobius.integrations.gguf._runtime_evidence import (
     GGUFRuntimeEvidence,
     gguf_artifact_identity,
@@ -73,6 +77,35 @@ def _model():
 def test_runtime_evidence_rejects_non_hex_tokenizer_metadata_digest() -> None:
     with pytest.raises(ValueError, match="immutable 40-hex revisions and LFS SHA-256"):
         replace(_record(b"pinned-gguf"), tokenizer_metadata_sha256="g" * 64)
+
+
+def test_nemotron_h_runtime_blocker_is_pinned_without_support_claim() -> None:
+    records = iter_runtime_blocker_evidence()
+    assert len(records) == 1
+    record = records[0]
+    assert runtime_blocker_evidence(record.evidence_id) is record
+    assert record.architecture == "nemotron_h_moe"
+    assert record.result == "blocked"
+    assert record.size == 18_010_755_296
+    assert record.size > 16 * 1024**3
+    assert record.tensor_count == 401
+    assert dict(record.tensor_qtypes)["IQ2_XXS"] == 23
+    assert record.state_slots == (
+        ("attention.key", 6),
+        ("attention.value", 6),
+        ("mamba2.conv_state", 23),
+        ("mamba2.ssm_state", 23),
+    )
+    assert record.explicit_float16_bytes == record.logical_parameter_count * 2
+    assert record.explicit_float32_bytes == record.logical_parameter_count * 4
+    assert record.tokenizer_metadata_sha256 == (
+        "6089bcaf08b3fe0d49379ca7e85bd3c93e8705bac6130636425c159212971225"
+    )
+    assert "tokenizer.json" in {name for name, _, _ in record.tokenizer_assets}
+    assert record.runtime_version == "0.15.2"
+    assert record.runtime_schema_issue.endswith("/issues/605")
+    assert _runtime_evidence.runtime_evidence(record.evidence_id) is None
+    assert "full-logit parity" in record.withheld_checks
 
 
 def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(

@@ -27,6 +27,26 @@ def test_committed_quantization_capability_matrix_is_current() -> None:
     assert parsed == quantization_capability_matrix()
 
 
+def test_runtime_blocker_candidate_is_metadata_only_and_not_budgeted_as_support() -> None:
+    matrix = quantization_capability_matrix()
+    records = matrix["runtime_blocker_evidence"]
+    assert isinstance(records, list)
+    assert len(records) == 1
+    record = records[0]
+    policy = matrix["policy"]
+    selected_artifacts = matrix["selected_artifacts"]
+    assert isinstance(policy, dict)
+    assert isinstance(selected_artifacts, list)
+    assert record["evidence_id"] == "nemotron-h-moe-30b-iq2-xxs-runtime-blocker"
+    assert record["result"] == "blocked"
+    assert record["size"] > policy["max_selected_artifact_bytes"]
+    assert record["size"] not in {artifact["size"] for artifact in selected_artifacts}
+    assert record["tokenizer"]["revision"] == "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"
+    assert record["graph"]["state_slots"]["mamba2.ssm_state"] == 23
+    assert record["runtime_schema_issue"].endswith("/issues/605")
+    assert "full-logit parity" in record["withheld_checks"]
+
+
 def test_every_stored_qtype_and_tensor_role_is_explicit() -> None:
     matrix = quantization_capability_matrix()
     qtypes = _qtypes(matrix)

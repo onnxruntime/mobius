@@ -35,7 +35,7 @@ def test_load_torch_model_pins_every_huggingface_resource() -> None:
             "from_pretrained",
             return_value=model,
         ) as load_model,
-        mock.patch.object(torch_reference, "_fix_nemotron_h_init_weights") as fix_weights,
+        mock.patch.object(torch_reference, "_fix_nemotron_h_dt_bias") as fix_weights,
     ):
         loaded_model, loaded_tokenizer = torch_reference.load_torch_model(
             "owner/model",

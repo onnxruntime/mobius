@@ -1174,6 +1174,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "closure are supported. Generic ORT GenAI runtime packaging remains deferred "
             "because its released cache schema cannot represent heterogeneous KV, "
             "convolution, and recurrent state slots; tracked by onnxruntime/mobius#605. "
+            "Pinned blocker evidence: nemotron-h-moe-30b-iq2-xxs-runtime-blocker. "
             "Quantization preservation is unsupported because mixed Mamba2 recurrent "
             "parameters must remain dequantized and correction-biased sigmoid experts "
             "cannot use the fused MoE ABI. Use keep_quantized=False for explicit float import."

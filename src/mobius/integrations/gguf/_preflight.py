@@ -293,6 +293,7 @@ def _is_moe(model_type: str | None, num_experts: int | None) -> bool:
 
 def _assess_sparse_moe(
     *,
+    architecture: str | None = None,
     model_type: str | None,
     num_experts: int | None,
     quantization: str | None,
@@ -306,8 +307,20 @@ def _assess_sparse_moe(
     a native IQ/MXFP4 layout they lower to ``pkg.nxrt::BlockQuantizedMatMul``
     with no fusion, i.e. dense-all-expert compute. Report that as a blocker.
     """
-    if not _is_moe(model_type, num_experts):
+    is_nemotron_h_moe = architecture == "nemotron_h_moe"
+    if not is_nemotron_h_moe and not _is_moe(model_type, num_experts):
         return True, []
+
+    if is_nemotron_h_moe:
+        blocker = (
+            f"sparse-MoE fusion blocker: {source} uses Nemotron-H correction-biased "
+            "sigmoid selection with unbiased sigmoid routing weights, ReLU2 experts, "
+            "and a shared expert. com.microsoft::MoE/QMoE cannot represent those "
+            "semantics, so neither native blocks nor an int4 MatMulNBits repack provide "
+            "a truthful sparse runtime route. build_from_gguf fails closed unless "
+            "keep_quantized=False explicitly selects the loop-over-experts float graph."
+        )
+        return False, [blocker]
 
     native_block = _NATIVE_BLOCK_QUANT_RE.search(quantization or "") is not None
     if not native_block:
@@ -494,6 +507,7 @@ def preflight_local_gguf(
         )
 
     fusion_ok, blockers = _assess_sparse_moe(
+        architecture=architecture,
         model_type=model_type,
         num_experts=num_experts,
         quantization=quantization,
@@ -598,6 +612,7 @@ def preflight_hf_gguf(
     quantization = _detect_quantization(filename, *shard_files)
 
     fusion_ok, blockers = _assess_sparse_moe(
+        architecture=architecture,
         model_type=model_type,
         num_experts=num_experts,
         quantization=quantization,
