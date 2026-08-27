@@ -5203,9 +5203,7 @@ def _resolve_gguf_path_impl(
         filename, selected_files = _select_complete_hf_gguf_set(repo_files, filename or None)
     primary_filename = selected_files[0]
 
-    preflight_revision: (
-        str | _GGUFPreflightRevision | _GGUFPreflightFallbackRevision
-    )
+    preflight_revision: str | _GGUFPreflightRevision | _GGUFPreflightFallbackRevision
     if allow_mmproj_companion:
         if len(selected_files) != 1:
             raise ValueError("Sharded mmproj companion GGUF files are not supported.")
@@ -5232,8 +5230,7 @@ def _resolve_gguf_path_impl(
         same_directory_ggufs = sorted(
             name
             for name in pinned_files
-            if PurePosixPath(name).parent == selected_parent
-            and name.lower().endswith(".gguf")
+            if PurePosixPath(name).parent == selected_parent and name.lower().endswith(".gguf")
         )
         if same_directory_ggufs != [filename]:
             raise ValueError(
