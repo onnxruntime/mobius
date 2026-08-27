@@ -17,6 +17,7 @@ from mobius.integrations.gguf._runtime_evidence import (
     gguf_artifact_identity,
     gguf_graph_package_identity,
     matching_runtime_evidence,
+    validate_quant_runtime_evidence_ids,
     validate_runtime_evidence_ids,
 )
 
@@ -46,7 +47,9 @@ def _record(payload: bytes) -> GGUFRuntimeEvidence:
         parity_test="test_full_logit_parity",
         parity_kind="full-logit",
         deterministic_test="test_cached_generation",
-        stateful_semantics="dynamic KV cache with reorder and rollback",
+        stateful_semantics="dynamic KV cache prefill, replay, rollback, reorder, and decode",
+        execution_provider="CPUExecutionProvider",
+        onnxruntime_version="1.29.0",
         runtime="onnx-genai",
         runtime_version="1.0.0",
     )
@@ -211,6 +214,54 @@ def test_evidence_id_cannot_cross_architectures(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="do not belong to 'qwen2'"):
         validate_runtime_evidence_ids("qwen2", (record.evidence_id,))
+
+
+def test_quantized_runtime_evidence_requires_preserved_full_stateful_route(
+    monkeypatch,
+) -> None:
+    record = replace(
+        _record(b"pinned-gguf"),
+        import_route='{"preserve_quantization":true}',
+    )
+    monkeypatch.setattr(
+        _runtime_evidence,
+        "_RUNTIME_EVIDENCE",
+        MappingProxyType({record.evidence_id: record}),
+    )
+    validate_quant_runtime_evidence_ids("Q4_K", (record.evidence_id,))
+
+    lossy = replace(record, import_route='{"preserve_quantization":false}')
+    monkeypatch.setattr(
+        _runtime_evidence,
+        "_RUNTIME_EVIDENCE",
+        MappingProxyType({lossy.evidence_id: lossy}),
+    )
+    with pytest.raises(ValueError, match="does not prove preserved Q4_K"):
+        validate_quant_runtime_evidence_ids("Q4_K", (lossy.evidence_id,))
+
+
+@pytest.mark.parametrize(
+    "import_route",
+    [
+        '{"preserve_quantization":"true"}',
+        '{"preserve_quantization":1}',
+        '{"preserve_quantization":true,"preserve_quantization":true}',
+        '{"preserve_quantization":true',
+        "[]",
+    ],
+)
+def test_quantized_runtime_evidence_rejects_noncanonical_route_json(
+    import_route: str,
+    monkeypatch,
+) -> None:
+    record = replace(_record(b"pinned-gguf"), import_route=import_route)
+    monkeypatch.setattr(
+        _runtime_evidence,
+        "_RUNTIME_EVIDENCE",
+        MappingProxyType({record.evidence_id: record}),
+    )
+    with pytest.raises(ValueError, match="does not prove preserved Q4_K"):
+        validate_quant_runtime_evidence_ids("Q4_K", (record.evidence_id,))
 
 
 def test_graph_package_identity_frames_files_and_rejects_symlinks(tmp_path) -> None:

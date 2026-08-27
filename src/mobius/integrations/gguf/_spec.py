@@ -65,7 +65,10 @@ __all__ = [
 import dataclasses
 import enum
 
-from mobius.integrations.gguf._runtime_evidence import validate_runtime_evidence_ids
+from mobius.integrations.gguf._runtime_evidence import (
+    validate_quant_runtime_evidence_ids,
+    validate_runtime_evidence_ids,
+)
 
 
 class Support(enum.Enum):
@@ -353,6 +356,8 @@ class GGUFQuantSpec:
         repack_exactness: Whether ``affine_repack`` preserves represented values.
         runtime: Runtime execution verdict. Graph construction or ABI matching
             alone is not runtime evidence.
+        runtime_evidence_ids: Immutable full-logit/stateful evidence records that
+            qualify this exact stored qtype for runtime execution.
         requires_explicit_zero_point: Whether a file containing this type forces
             the shared graph scaffolding to carry explicit ``zero_points``.
         lm_head_preserve: Whether an untied output head stored in this type may
@@ -372,6 +377,7 @@ class GGUFQuantSpec:
     repack_exactness: RepackExactness | None = None
     runtime: Support = Support.DEFERRED
     runtime_reason: str = "No real-weight ONNX Runtime execution evidence is recorded."
+    runtime_evidence_ids: tuple[str, ...] = ()
     requires_explicit_zero_point: bool = False
     lm_head_preserve: bool = False
     reason: str | None = None
@@ -382,6 +388,12 @@ class GGUFQuantSpec:
             raise ValueError(f"GGML type id {self.ggml_type_id} must have a name")
         _require_reason(label, {"dequantize": self.dequantize}, self.reason)
         _require_reason(label, {"runtime": self.runtime}, self.runtime_reason)
+        if self.runtime is Support.SUPPORTED:
+            validate_quant_runtime_evidence_ids(self.name, self.runtime_evidence_ids)
+        if self.runtime is not Support.SUPPORTED and self.runtime_evidence_ids:
+            raise ValueError(
+                f"{label}: runtime evidence cannot accompany runtime={self.runtime.value}"
+            )
         # Upstream rejects a tensor whose type has blck_size == 0 in gguf.cpp
         # before any model logic runs, so readability is not an independent
         # choice — it is a consequence of the pinned block size.

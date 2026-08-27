@@ -181,6 +181,16 @@ _LM_HEAD_PRESERVE: frozenset[str] = frozenset(
     }
 )
 
+# Qtype-level runtime support is narrower than architecture support. Q8_0 is the
+# only stored route with immutable same-artifact full-logit and stateful CPU
+# execution evidence. Native IQ/MXFP4 byte compatibility remains an ABI fact,
+# not an execution claim.
+_RUNTIME_EVIDENCE_IDS: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
+    {
+        "Q8_0": ("qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",),
+    }
+)
+
 #: Upstream ``gguf_role`` strings → :class:`StorageRole`. The census stores the
 #: role as free text, so this is the one place it is interpreted.
 _ROLE_PREFIXES: tuple[tuple[str, StorageRole], ...] = (
@@ -265,6 +275,7 @@ def _specs() -> MappingProxyType[int, GGUFQuantSpec]:
             )
         )
         route, exactness = _STORED_ROUTE_POLICY.get(name, (QuantImportRoute.REJECTED, None))
+        runtime_evidence_ids = _RUNTIME_EVIDENCE_IDS.get(name, ())
         specs[type_id] = GGUFQuantSpec(
             ggml_type_id=type_id,
             name=name,
@@ -276,6 +287,15 @@ def _specs() -> MappingProxyType[int, GGUFQuantSpec]:
             affine_repack=_AFFINE_REPACK_TARGETS.get(name),
             import_route=route,
             repack_exactness=exactness,
+            runtime=Support.SUPPORTED if runtime_evidence_ids else Support.DEFERRED,
+            runtime_reason=(
+                "Pinned Q8_0 same-artifact full-logit CPU execution passed ONNX Runtime "
+                "1.29.0 and deterministic ORT GenAI 0.15.2 prefill, decode, replay, "
+                "rollback, and reorder."
+                if runtime_evidence_ids
+                else "No real-weight ONNX Runtime execution evidence is recorded."
+            ),
+            runtime_evidence_ids=runtime_evidence_ids,
             requires_explicit_zero_point=name in _REQUIRES_EXPLICIT_ZERO_POINT,
             lm_head_preserve=name in _LM_HEAD_PRESERVE,
             reason=reason,
@@ -517,10 +537,11 @@ def render_quant_support_matrix() -> str:
     """Render the active stored-qtype policy table for generated documentation."""
     rows = [
         (
-            "| Stored qtype | ID | Projection/output route | Direct exactness | "
-            "Embedding route | Expert-major route | Non-MatMul route | Runtime |"
+            "| Stored qtype | ID | Parse | Exact dequantization | Projection/output route | "
+            "Direct exactness | Embedding route | Expert-major route | Target storage | "
+            "Source fidelity | Native operator ABI | Runtime evidence |"
         ),
-        "|---|---:|---|---|---|---|---|---|",
+        "|---|---:|---|---|---|---|---|---|---|---|---|---|",
     ]
     for spec in iter_quant_specs():
         if not spec.is_quantized_storage:
@@ -528,12 +549,36 @@ def render_quant_support_matrix() -> str:
         projection = quant_import_decision(spec.ggml_type_id, TensorRole.PROJECTION)[0]
         embedding = quant_import_decision(spec.ggml_type_id, TensorRole.EMBEDDING)[0]
         expert = quant_import_decision(spec.ggml_type_id, TensorRole.EXPERT)[0]
-        other = quant_import_decision(spec.ggml_type_id, TensorRole.NON_MATMUL)[0]
         exactness = "—" if spec.repack_exactness is None else spec.repack_exactness.value
+        target_storage = (
+            "quantized target supported"
+            if projection is not QuantImportRoute.REJECTED
+            else "rejected"
+        )
+        source_fidelity = (
+            "true"
+            if projection is QuantImportRoute.NATIVE_BYTES
+            or (
+                projection is QuantImportRoute.AFFINE_REPACK
+                and spec.repack_exactness is RepackExactness.EXACT
+            )
+            else "false"
+        )
+        native_abi = (
+            f"`pkg.nxrt::BlockQuantizedMatMul/v1` (`{spec.native_preserve.format}`)"
+            if spec.native_preserve is not None
+            else "—"
+        )
+        evidence = (
+            ", ".join(f"`{item}`" for item in spec.runtime_evidence_ids)
+            if spec.runtime_evidence_ids
+            else f"{spec.runtime.value}: {spec.runtime_reason}"
+        )
         rows.append(
-            f"| `{spec.name}` | {spec.ggml_type_id} | {projection.value} | "
-            f"{exactness} | {embedding.value} | {expert.value} | {other.value} | "
-            f"{spec.runtime.value} |"
+            f"| `{spec.name}` | {spec.ggml_type_id} | supported | "
+            f"{spec.dequantize.value} | {projection.value} | {exactness} | "
+            f"{embedding.value} | {expert.value} | {target_storage} | "
+            f"{source_fidelity} | {native_abi} | {evidence} |"
         )
     return "\n".join(rows)
 

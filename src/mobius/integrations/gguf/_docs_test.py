@@ -23,6 +23,9 @@ from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_PINS,
     iter_projector_specs,
 )
+from mobius.integrations.gguf._quant_capabilities import (
+    check_quantization_capability_matrix,
+)
 from mobius.integrations.gguf._quant_registry import iter_quant_specs
 from mobius.integrations.gguf._spec import StorageRole, Support
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
@@ -31,11 +34,12 @@ from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT, UPSTREAM_DATE
 
 def test_document_is_exact_generator_output() -> None:
     assert check_document()
+    assert check_quantization_capability_matrix()
 
 
 def test_document_is_concise_and_reason_coded() -> None:
     document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
-    assert len(document.splitlines()) < 525
+    assert len(document.splitlines()) < 535
     assert "RUNTIME_EVIDENCE_PENDING" in document
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document

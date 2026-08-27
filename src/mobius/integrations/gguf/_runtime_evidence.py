@@ -11,13 +11,16 @@ __all__ = [
     "GGUFRuntimeEvidence",
     "gguf_artifact_identity",
     "gguf_graph_package_identity",
+    "iter_runtime_evidence",
     "matching_runtime_evidence",
     "runtime_evidence",
+    "validate_quant_runtime_evidence_ids",
     "validate_runtime_evidence_ids",
 ]
 
 import dataclasses
 import hashlib
+import json
 import os
 import stat
 from collections import Counter
@@ -74,8 +77,11 @@ class GGUFRuntimeEvidence:
     parity_kind: str
     deterministic_test: str
     stateful_semantics: str
+    execution_provider: str
+    onnxruntime_version: str
     runtime: str
     runtime_version: str
+    result: str = "passed"
 
     def __post_init__(self) -> None:
         text_fields = (
@@ -97,8 +103,11 @@ class GGUFRuntimeEvidence:
             self.parity_kind,
             self.deterministic_test,
             self.stateful_semantics,
+            self.execution_provider,
+            self.onnxruntime_version,
             self.runtime,
             self.runtime_version,
+            self.result,
         )
         if any(not value.strip() for value in text_fields):
             raise ValueError("GGUF runtime evidence fields must be non-empty")
@@ -133,6 +142,10 @@ class GGUFRuntimeEvidence:
         if self.parity_kind not in {"full-logit", "component"}:
             raise ValueError(
                 "GGUF runtime evidence parity_kind must be full-logit or component"
+            )
+        if self.result != "passed":
+            raise ValueError(
+                "GGUF runtime evidence may only support a route after a passed result"
             )
         asset_names = tuple(asset[0] for asset in self.tokenizer_assets)
         if (
@@ -217,8 +230,8 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
     tensor_count=272,
     tensor_qtypes=(("F16", 211), ("F32", 61)),
     import_route=_SMOLLM_F16_ROUTE,
-    graph_files=("model.onnx", "model.onnx.data"),
-    graph_sha256="3d242b09fcb5041d71e5914084cf00780867b3b0e32f669f8733369b19b6ea9b",
+    graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
+    graph_sha256="4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
     runtime_package_files=(
         "gguf_tokenizer_manifest.json",
         "inference_metadata.yaml",
@@ -234,17 +247,20 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
         "policies/token_sampler.onnx",
         "policies/token_state_update.onnx",
         "policies/token_to_slot.onnx",
+        "quantization_report.json",
         "special_tokens_map.json",
         "tokenizer.json",
         "tokenizer_config.json",
     ),
-    runtime_package_sha256="5b6fdbdb1db7f7fb9423f2356820812712556abf783acb6bd63c572920031982",
+    runtime_package_sha256="57038e28e83a2b4251e334b6098f59b4344c7e526746e29d9fa42eeaebfcbddc",
     parity_test="test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
     parity_kind="full-logit",
     deterministic_test=(
         "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]"
     ),
     stateful_semantics="dynamic KV cache prefill plus 20 cache-threaded decode steps",
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="onnx-genai",
     runtime_version="1.29.0",
 )
@@ -257,14 +273,17 @@ _SMOLLM_F16_ORT_GENAI = dataclasses.replace(
         "gguf_tokenizer_manifest.json",
         "model.onnx",
         "model.onnx.data",
+        "quantization_report.json",
         "runtime_compatibility.json",
         "special_tokens_map.json",
         "tokenizer.json",
         "tokenizer_config.json",
     ),
-    runtime_package_sha256="43568320f669d259d5a570ee04bd6378316ab31ce2fcb6383e75b479b4f2b349",
+    runtime_package_sha256="15d0218a4b326648d514a98c4f073251c674312b1faa83bec9022cc91daa0a53",
     deterministic_test="test_smollm_generic_ort_genai_generation",
     stateful_semantics="ORT GenAI prefill plus 20 cache-threaded decode steps",
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="ort-genai",
     runtime_version="0.15.2",
 )
@@ -297,22 +316,25 @@ _QWEN25_Q8_ORT_GENAI = GGUFRuntimeEvidence(
     tensor_count=291,
     tensor_qtypes=(("F32", 121), ("Q8_0", 170)),
     import_route='{"architecture":"qwen2","config_sha256":"f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500","execution_provider":"cpu","model_type":"qwen2","module_type":"qwen2","preserve_quantization":true,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":[],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"text-generation"},"tensor_map_recipe":["llama"]}',
-    graph_files=("model.onnx", "model.onnx.data"),
-    graph_sha256="b0d1814ea69dddd405e30541e9009ba6fb73930f98538921d5c2eaa4a14f5d2c",
+    graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
+    graph_sha256="240e5e374803c94efdb17eee39c09b0d3e9aed10b6d8b4e1c92e39918ea2155e",
     runtime_package_files=(
         "genai_config.json",
         "gguf_tokenizer_manifest.json",
         "model.onnx",
         "model.onnx.data",
+        "quantization_report.json",
         "runtime_compatibility.json",
         "tokenizer.json",
         "tokenizer_config.json",
     ),
-    runtime_package_sha256="cb43c76e1bc3db07a6a3631c7a99e7c47b6891807fecffdb3b70fddd9c108173",
+    runtime_package_sha256="5029bbfcdd8d1ae1d2b0ed9587cc288a68cb38bb7f92b9e10f9bf64a436b1762",
     parity_test="test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
     parity_kind="full-logit",
     deterministic_test="test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
     stateful_semantics="dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps",
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="ort-genai",
     runtime_version="0.15.2",
 )
@@ -355,20 +377,21 @@ _LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
     tensor_count=148,
     tensor_qtypes=(("F16", 93), ("F32", 55)),
     import_route='{"architecture":"lfm2","config_sha256":"c961bba579ea33a2472a7c5d3f469c76f1f8c7aae8440a7eaa86bc6e878a42f4","execution_provider":"cpu","model_type":"lfm2","module_type":"lfm2","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":["attention.head_count_kv","attention.layer_norm_rms_epsilon","shortconv.l_cache"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"hybrid-text-generation"},"tensor_map_recipe":["lfm2"]}',
-    graph_files=("model.onnx", "model.onnx.data"),
-    graph_sha256="2a15694cd5ff9f5c9f798feeca91cc41174842065ada80a18b288478725b3342",
+    graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
+    graph_sha256="27e4ebb4c0c8b6c01ee57fa7825f34c5ddadc8ca5dc0c75d989e4507d4dcdfdb",
     runtime_package_files=(
         "chat_template.jinja",
         "genai_config.json",
         "gguf_tokenizer_manifest.json",
         "model.onnx",
         "model.onnx.data",
+        "quantization_report.json",
         "runtime_compatibility.json",
         "special_tokens_map.json",
         "tokenizer.json",
         "tokenizer_config.json",
     ),
-    runtime_package_sha256="87b8cdd1edc8c5be948716df3efe551f5fc8f96762d7ea3f99b27688ca9f24af",
+    runtime_package_sha256="ef3816d4f93c7061fd4653248629f0439d6ad1c623bdd0f27d31fe0349cb3505",
     parity_test="test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
     parity_kind="full-logit",
     deterministic_test="test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
@@ -376,6 +399,8 @@ _LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
         "hybrid convolution and KV state prefill, replay, rollback, reorder, "
         "and 20 decode steps"
     ),
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
     runtime="ort-genai",
     runtime_version="0.15.2",
 )
@@ -396,6 +421,66 @@ _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType
 def runtime_evidence(evidence_id: str) -> GGUFRuntimeEvidence | None:
     """Return a structured evidence record by stable ID."""
     return _RUNTIME_EVIDENCE.get(evidence_id)
+
+
+def iter_runtime_evidence() -> tuple[GGUFRuntimeEvidence, ...]:
+    """Return every runtime evidence record ordered by stable evidence ID."""
+    return tuple(_RUNTIME_EVIDENCE[key] for key in sorted(_RUNTIME_EVIDENCE))
+
+
+def validate_quant_runtime_evidence_ids(qtype: str, evidence_ids: tuple[str, ...]) -> None:
+    """Require complete preserved-route evidence for a stored quantization type."""
+    if not evidence_ids:
+        raise ValueError("quantized runtime=SUPPORTED requires structured evidence IDs")
+    unknown = sorted(
+        evidence_id
+        for evidence_id in evidence_ids
+        if not evidence_id or runtime_evidence(evidence_id) is None
+    )
+    if unknown:
+        raise ValueError(f"Unknown GGUF quantized runtime evidence IDs: {unknown}")
+    required_state_semantics = ("prefill", "replay", "rollback", "reorder", "decode")
+    invalid = []
+    for evidence_id in evidence_ids:
+        evidence = _RUNTIME_EVIDENCE[evidence_id]
+        qtypes = dict(evidence.tensor_qtypes)
+        try:
+            import_route = _strict_json_object(evidence.import_route)
+        except (TypeError, ValueError):
+            invalid.append(evidence_id)
+            continue
+        if (
+            qtypes.get(qtype, 0) <= 0
+            or evidence.parity_kind != "full-logit"
+            or import_route.get("preserve_quantization") is not True
+            or evidence.execution_provider != "CPUExecutionProvider"
+            or any(
+                term not in evidence.stateful_semantics for term in required_state_semantics
+            )
+        ):
+            invalid.append(evidence_id)
+    if invalid:
+        raise ValueError(
+            f"GGUF quantized runtime evidence does not prove preserved {qtype} full-logit "
+            f"CPU prefill/decode/replay/rollback/reorder semantics: {sorted(invalid)}"
+        )
+
+
+def _strict_json_object(payload: str) -> dict[str, object]:
+    """Parse a JSON object while rejecting duplicate keys at every depth."""
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    parsed = json.loads(payload, object_pairs_hook=reject_duplicates)
+    if not isinstance(parsed, dict):
+        raise TypeError("GGUF import route must be a JSON object")
+    return parsed
 
 
 def validate_runtime_evidence_ids(architecture: str, evidence_ids: tuple[str, ...]) -> None:

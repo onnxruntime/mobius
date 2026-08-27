@@ -36,6 +36,7 @@ jobs:
       - name: Install pinned runtime and test dependencies
         run: |
           python -m pip install --disable-pip-version-check \
+            "onnxruntime==1.29.0" \
             "onnxruntime-genai==0.15.2" \
             "pytest==8.4.2" \
             "pytest-timeout==2.4.0"
@@ -73,6 +74,7 @@ jobs:
       - name: Install pinned runtime and test dependencies
         run: |
           python -m pip install --disable-pip-version-check \
+            "onnxruntime==1.29.0" \
             "onnxruntime-genai==0.15.2" \
             "pytest==8.4.2" \
             "pytest-timeout==2.4.0" \
