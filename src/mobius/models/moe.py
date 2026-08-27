@@ -6,6 +6,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 
 import onnx_ir as ir
 import torch
@@ -15,7 +16,9 @@ from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
 from mobius.components import (
     Attention,
+    FusedQKVAttention,
     LayerNorm,
+    LayerNormNoBias,
     Linear,
     MoELayer,
     RMSNorm,
@@ -28,6 +31,7 @@ from mobius.components._attention import StaticCacheState
 from mobius.components._moe import MLP, SigmoidTopKGate, SoftmaxTopKGate
 from mobius.components._quantized_linear import make_quantized_linear_factory
 from mobius.models.base import CausalLMModel, embedding_for_config
+from mobius.models.deepseek import DeepSeekMoEGate
 from mobius.models.phi3 import split_fused_qkv
 
 
@@ -119,7 +123,7 @@ class MoEDecoderLayer(nn.Module):
         # otherwise builds dense projections that cannot load packed weights.
         linear_class = _quantized_linear_class(config)
         self.self_attn = Attention(config, scale=attention_scale, linear_class=linear_class)
-        self.mlp = MoELayer(config, gate=gate, linear_class=linear_class)
+        self.mlp: nn.Module = MoELayer(config, gate=gate, linear_class=linear_class)
         residual_multiplier = getattr(config, "residual_multiplier", None)
         self._residual_multiplier = 1.0 if residual_multiplier is None else residual_multiplier
         if not self._post_feedforward_norm:
@@ -209,13 +213,17 @@ class MoETextModel(nn.Module):
     def __init__(
         self,
         config: ArchitectureConfig,
-        gate_factory: type[nn.Module] | None = None,
-        norm_class: type = RMSNorm,
-        layer_class: type[MoEDecoderLayer] | None = None,
+        gate_factory: Callable[[int, int, int], nn.Module] | None = None,
+        norm_class: Callable[..., nn.Module] = RMSNorm,
+        layer_class: Callable[..., nn.Module] | None = None,
     ):
         super().__init__()
         self._dtype = config.dtype
         self.embed_tokens = embedding_for_config(config)
+        num_local_experts = config.num_local_experts
+        num_experts_per_tok = config.num_experts_per_tok
+        if num_local_experts is None or num_experts_per_tok is None:
+            raise ValueError("MoE decoder requires num_local_experts and num_experts_per_tok")
 
         def _make_gate() -> nn.Module:
             if gate_factory is None:
@@ -224,16 +232,16 @@ class MoETextModel(nn.Module):
                 # norm_topk_prob=False keeps raw softmax probs (OLMoE, Qwen2-MoE).
                 return SoftmaxTopKGate(
                     config.hidden_size,
-                    config.num_local_experts,
-                    config.num_experts_per_tok,
+                    num_local_experts,
+                    num_experts_per_tok,
                     norm_topk_prob=config.norm_topk_prob,
                     routed_scaling_factor=config.routed_scaling_factor,
                 )
-            return gate_factory(
-                config.hidden_size, config.num_local_experts, config.num_experts_per_tok
-            )
+            return gate_factory(config.hidden_size, num_local_experts, num_experts_per_tok)
 
-        _layer_class = layer_class if layer_class is not None else MoEDecoderLayer
+        _layer_class: Callable[..., nn.Module] = (
+            layer_class if layer_class is not None else MoEDecoderLayer
+        )
         self.layers = nn.ModuleList(
             [
                 _layer_class(config, gate=_make_gate(), norm_class=norm_class)
@@ -280,6 +288,225 @@ class MoETextModel(nn.Module):
 
         hidden_states = self.norm(op, hidden_states)
         return hidden_states, present_key_values
+
+
+class DbrxGGUFDecoderLayer(nn.Module):
+    """DBRX decoder block with fused clamped QKV and weight-only LayerNorm."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        norm_class: type | None = None,
+    ):
+        super().__init__()
+        del norm_class
+        self.self_attn = FusedQKVAttention(config, clamp=config.attention_clamp)
+        self.mlp = MoELayer(config, gate=gate)
+        self.input_layernorm = LayerNormNoBias(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = LayerNormNoBias(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple,
+        past_key_value: tuple | StaticCacheState | None,
+    ):
+        if isinstance(past_key_value, StaticCacheState):
+            static_cache = past_key_value
+            past_key_value = None
+        else:
+            static_cache = None
+
+        # DBRX is pre-norm for both sublayers. The fused QKV projection clips
+        # all Q/K/V activations before splitting and applying RoPE.
+        residual = hidden_states
+        hidden_states = self.input_layernorm(op, hidden_states)
+        attn_output, present_key_value = self.self_attn(
+            op,
+            hidden_states,
+            attention_bias,
+            position_embeddings,
+            past_key_value,
+            static_cache,
+        )
+        hidden_states = op.Add(residual, attn_output)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(op, hidden_states)
+        hidden_states = self.mlp(op, hidden_states)
+        return op.Add(residual, hidden_states), present_key_value
+
+
+class DbrxGGUFCausalLMModel(CausalLMModel):
+    """DBRX causal LM graph matching llama.cpp's GGUF inference semantics.
+
+    Each block uses weight-only LayerNorm, one fused QKV projection clamped
+    before its ``[Q | K | V]`` split, and full-softmax top-k routed SwiGLU
+    experts whose selected weights are renormalized.
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self._replace_text_model(
+            MoETextModel(
+                config,
+                norm_class=LayerNormNoBias,
+                layer_class=DbrxGGUFDecoderLayer,
+            )
+        )
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
+
+
+class ArcticGGUFDecoderLayer(nn.Module):
+    """Arctic block with parallel dense and pre-attention routed branches."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        norm_class: type | None = None,
+    ):
+        super().__init__()
+        del norm_class
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.expert_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        dense_config = dataclasses.replace(config, intermediate_size=config.hidden_size)
+        self.residual_mlp = MLP(dense_config)
+        self.moe = MoELayer(config, gate=gate)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple,
+        past_key_value: tuple | StaticCacheState | None,
+    ):
+        if isinstance(past_key_value, StaticCacheState):
+            static_cache = past_key_value
+            past_key_value = None
+        else:
+            static_cache = None
+
+        # The routed branch consumes the pre-attention residual, while the
+        # square dense branch consumes the post-attention residual.
+        pre_attention = hidden_states
+        attn_output, present_key_value = self.self_attn(
+            op,
+            self.input_layernorm(op, hidden_states),
+            attention_bias,
+            position_embeddings,
+            past_key_value,
+            static_cache,
+        )
+        post_attention = op.Add(pre_attention, attn_output)
+        dense_output = self.residual_mlp(
+            op,
+            self.post_attention_layernorm(op, post_attention),
+        )
+        routed_output = self.moe(
+            op,
+            self.expert_layernorm(op, pre_attention),
+        )
+        return (
+            op.Add(op.Add(post_attention, dense_output), routed_output),
+            present_key_value,
+        )
+
+
+class ArcticGGUFCausalLMModel(CausalLMModel):
+    """Snowflake Arctic graph matching llama.cpp's dual-branch GGUF topology.
+
+    Every block combines a square dense SwiGLU branch from the post-attention
+    residual with a separately normalized routed SwiGLU branch computed from
+    the pre-attention residual.
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self._replace_text_model(MoETextModel(config, layer_class=ArcticGGUFDecoderLayer))
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
+
+
+class Ernie45MoEGGUFDecoderLayer(MoEDecoderLayer):
+    """ERNIE 4.5 layer selected as dense or routed by the GGUF schedule."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        *,
+        routed: bool,
+    ):
+        gate = DeepSeekMoEGate(config) if routed else None
+        super().__init__(config, gate=gate)
+        if not routed:
+            self.mlp = MLP(config)
+        elif config.shared_expert_intermediate_size is not None:
+            self.mlp = UngatedSharedMoELayer(config, gate=gate)
+
+
+class Ernie45MoEGGUFTextModel(MoETextModel):
+    """ERNIE text body with dense-prefix and periodic routed-layer selection."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        frequency = config.moe_layer_frequency
+        if frequency <= 0:
+            raise ValueError("ERNIE 4.5 MoE requires moe_layer_frequency > 0")
+        self.layers = nn.ModuleList(
+            [
+                Ernie45MoEGGUFDecoderLayer(
+                    config,
+                    routed=(
+                        layer >= config.first_k_dense_replace and (layer + 1) % frequency == 0
+                    ),
+                )
+                for layer in range(config.num_hidden_layers)
+            ]
+        )
+
+
+class Ernie45MoEGGUFCausalLMModel(CausalLMModel):
+    """ERNIE 4.5 MoE graph matching llama.cpp's scheduled GGUF semantics.
+
+    Dense prefix and periodic routed layers are selected from GGUF metadata.
+    Routed layers use bias-corrected softmax selection, unbiased normalized
+    weights, and an optional always-active shared SwiGLU expert.
+    """
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self._replace_text_model(Ernie45MoEGGUFTextModel(config))
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
 
 
 class Phi3MoECausalLMModel(CausalLMModel):

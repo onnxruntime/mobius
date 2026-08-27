@@ -25,6 +25,7 @@ __all__ = [
     "DiffusionFFN",
     "DiffusionSelfAttention",
     "Embedding",
+    "FusedQKVAttention",
     "EncoderAttention",
     "EncoderDecoderAttention",
     "EncoderLayer",
@@ -107,6 +108,7 @@ __all__ = [
 from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
+    FusedQKVAttention,
     GQAContext,
     StaticCacheState,
 )

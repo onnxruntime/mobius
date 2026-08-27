@@ -18,7 +18,16 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius.components import Embedding, LayerNorm, Linear, RMSNorm, create_padding_mask
+from mobius.components import (
+    FCMLP,
+    Embedding,
+    LayerNorm,
+    Linear,
+    MoELayer,
+    RMSNorm,
+    SoftmaxTopKGate,
+    create_padding_mask,
+)
 from mobius.components._activations import ACT2FN
 from mobius.components._rotary_embedding import apply_rotary_pos_emb, initialize_rope
 
@@ -171,6 +180,90 @@ class _PackedAttention(nn.Module):
         return self.output(op, attended)
 
 
+class _FusedPostNormAttention(nn.Module):
+    """Fused-QKV bidirectional RoPE attention for NomicBERT-MoE."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.qkv = Linear(
+            config.hidden_size,
+            3 * config.hidden_size,
+            bias=config.encoder_q_bias,
+        )
+        self.output = Linear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=config.attn_o_bias,
+        )
+
+    def forward(self, op, hidden_states, attention_mask, position_embeddings):
+        query, key, value = op.Split(
+            self.qkv(op, hidden_states),
+            axis=-1,
+            num_outputs=3,
+            _outputs=3,
+        )
+        query = apply_rotary_pos_emb(
+            op,
+            query,
+            position_embeddings,
+            num_heads=self.num_heads,
+            interleaved=False,
+        )
+        key = apply_rotary_pos_emb(
+            op,
+            key,
+            position_embeddings,
+            num_heads=self.num_heads,
+            interleaved=False,
+        )
+        attended = op.Attention(
+            query,
+            key,
+            value,
+            attention_mask,
+            q_num_heads=self.num_heads,
+            kv_num_heads=self.num_heads,
+            scale=float(self.head_dim**-0.5),
+        )
+        return self.output(op, attended)
+
+
+class _SequentialMLP(nn.Module):
+    """Plain GELU feed-forward layer with GGUF-aligned parameter names."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__()
+        self.up = Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=config.encoder_ffn_up_bias,
+        )
+        self.down = Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=config.encoder_ffn_down_bias,
+        )
+        self._act = ACT2FN["gelu_pytorch_tanh"]
+
+    def forward(self, op, hidden_states):
+        return self.down(op, self._act(op, self.up(op, hidden_states)))
+
+
+class _TokenTypeVector(nn.Module):
+    """Single GGUF token-type row broadcast across every encoder token."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.weight = nn.Parameter([hidden_size])
+
+    def forward(self, op, token_type_ids):
+        del op, token_type_ids
+        return self.weight
+
+
 class _ParallelGatedMLP(nn.Module):
     """Parallel gate/up MLP with an architecture-selected activation."""
 
@@ -300,6 +393,7 @@ class _PostNormEncoderLayer(nn.Module):
         self._extra_attention_norm = jina and config.encoder_extra_attention_norm
         if self._extra_attention_norm:
             self.extra_attention_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp: nn.Module
         if jina and config.encoder_fused_geglu:
             self.mlp = _FusedGatedMLP(
                 config,
@@ -337,6 +431,7 @@ class _PostNormEncoder(nn.Module):
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self._use_token_types = config.encoder_use_token_type_embeddings
+        self.token_type_embeddings: nn.Module
         if self._use_token_types:
             self.token_type_embeddings = Embedding(config.type_vocab_size, config.hidden_size)
         self.token_embeddings_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -381,6 +476,86 @@ class NomicBertGGUFModel(_PostNormEncoder):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config, jina=False)
+
+
+class _NomicBertMoELayer(nn.Module):
+    """NomicBERT-MoE post-norm layer with scheduled dense or routed GELU FFN."""
+
+    def __init__(self, config: ArchitectureConfig, *, routed: bool):
+        super().__init__()
+        self.attention = _FusedPostNormAttention(config)
+        self.attention_output_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp: nn.Module
+        if routed:
+            num_local_experts = config.num_local_experts
+            num_experts_per_tok = config.num_experts_per_tok
+            if num_local_experts is None or num_experts_per_tok is None:
+                raise ValueError(
+                    "NomicBERT-MoE requires num_local_experts and num_experts_per_tok"
+                )
+            gate = SoftmaxTopKGate(
+                config.hidden_size,
+                num_local_experts,
+                num_experts_per_tok,
+                norm_topk_prob=False,
+            )
+
+            def _expert_factory(expert_config, linear_class):
+                return FCMLP(
+                    expert_config.hidden_size,
+                    expert_config.intermediate_size,
+                    activation="gelu_pytorch_tanh",
+                    bias=False,
+                    linear_class=linear_class,
+                )
+
+            self.mlp = MoELayer(config, gate=gate, expert_factory=_expert_factory)
+        else:
+            self.mlp = _SequentialMLP(config)
+        self.layer_output_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, op, hidden_states, attention_mask, position_embeddings):
+        attended = self.attention(
+            op,
+            hidden_states,
+            attention_mask,
+            position_embeddings,
+        )
+        hidden_states = self.attention_output_norm(op, op.Add(hidden_states, attended))
+        return self.layer_output_norm(op, op.Add(hidden_states, self.mlp(op, hidden_states)))
+
+
+class NomicBertMoEGGUFModel(_PostNormEncoder):
+    """NomicBERT-MoE encoder with periodic routed, non-gated GELU experts.
+
+    Routed layers are selected by ``layer % moe_every_n_layers == 1``.
+    Router probabilities are softmaxed over every expert before top-k
+    selection and are not renormalized after selection.
+    """
+
+    def __init__(self, config: ArchitectureConfig):
+        nn.Module.__init__(self)
+        self._jina = False
+        self._pooling_type = config.pooling_type
+        self.token_embeddings = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            config.pad_token_id,
+        )
+        self._use_token_types = config.encoder_use_token_type_embeddings
+        if self._use_token_types:
+            self.token_type_embeddings = _TokenTypeVector(config.hidden_size)
+        self.token_embeddings_norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        frequency = config.moe_layer_frequency
+        if frequency <= 0:
+            raise ValueError("NomicBERT-MoE requires moe_layer_frequency > 0")
+        self.layers = nn.ModuleList(
+            [
+                _NomicBertMoELayer(config, routed=layer % frequency == 1)
+                for layer in range(config.num_hidden_layers)
+            ]
+        )
+        self.rotary_emb = initialize_rope(config)
 
 
 class JinaBertV2GGUFModel(_PostNormEncoder):

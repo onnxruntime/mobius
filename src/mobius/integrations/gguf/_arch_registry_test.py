@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 89
+_EXPECTED_SUPPORTED_COUNT = 93
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -96,7 +96,6 @@ _FINAL_CENSUS_CLOSURE = frozenset(
         "deepseek32",
         "dots3note",
         "ernie4_5",
-        "ernie4_5-moe",
         "exaone-moe",
         "exaone4",
         "gemma-embedding",
@@ -311,6 +310,7 @@ class TestCapabilityClosure:
             "bitnet",
             "chatglm",
             "ernie4_5",
+            "ernie4_5-moe",
             "eurobert",
             "gemma-embedding",
             "granitehybrid",
@@ -324,6 +324,9 @@ class TestCapabilityClosure:
             "nemotron_h_moe",
             "neo-bert",
             "nomic-bert",
+            "nomic-bert-moe",
+            "arctic",
+            "dbrx",
             "phi2",
             "bloom",
             "gpt2",
@@ -1090,6 +1093,11 @@ class TestPinnedRemainingConventionalMoECohort:
         "grovemoe",
         "smallthinker",
     )
+    _DEFERRED_ARCHITECTURES = tuple(
+        architecture
+        for architecture in _ARCHITECTURES
+        if architecture not in {"arctic", "dbrx"}
+    )
     _EXPECTED_TENSOR_COUNTS: ClassVar[dict[str, int]] = {
         "arctic": 22,
         "dbrx": 11,
@@ -1099,7 +1107,7 @@ class TestPinnedRemainingConventionalMoECohort:
         "smallthinker": 18,
     }
 
-    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    @pytest.mark.parametrize("architecture", _DEFERRED_ARCHITECTURES)
     def test_loader_inventory_and_expert_sidecars_are_suffix_exact(
         self, architecture: str
     ) -> None:
@@ -1210,7 +1218,7 @@ class TestPinnedRemainingConventionalMoECohort:
         assert grove_suffixes["blk.{bid}.ffn_up_chexps"] == ("weight",)
         assert not any("_chexps." in name for name in small)
 
-    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    @pytest.mark.parametrize("architecture", _DEFERRED_ARCHITECTURES)
     def test_no_false_alias_config_or_tensor_claim_is_reachable(
         self, architecture: str
     ) -> None:
@@ -1226,8 +1234,6 @@ class TestPinnedRemainingConventionalMoECohort:
     @pytest.mark.parametrize(
         ("architecture", "reason_terms"),
         [
-            ("arctic", ("dense parallel", "separately normalized", "residual topology")),
-            ("dbrx", ("LayerNorm", "fused QKV", "clamp")),
             ("gpt-oss", ("MXFP4", "expert biases", "attention sinks")),
             ("grok", ("softcaps", "sqrt(2)/2", "dense-plus-routed")),
             ("grovemoe", ("separate selections", "adjugate", "Q/K RMSNorm")),
@@ -1242,7 +1248,7 @@ class TestPinnedRemainingConventionalMoECohort:
         for term in reason_terms:
             assert term in reason
 
-    @pytest.mark.parametrize("architecture", _ARCHITECTURES)
+    @pytest.mark.parametrize("architecture", _DEFERRED_ARCHITECTURES)
     def test_every_architecture_fails_before_graph_construction(
         self, architecture: str
     ) -> None:
@@ -1251,8 +1257,8 @@ class TestPinnedRemainingConventionalMoECohort:
 
     def test_valid_hugging_face_registrations_are_not_reused_as_gguf_aliases(self) -> None:
         assert {"arctic", "dbrx", "gpt_oss"} <= set(_REGISTRATIONS)
-        assert try_get_arch_spec("arctic").model_type is None
-        assert try_get_arch_spec("dbrx").model_type is None
+        assert try_get_arch_spec("arctic").module_type == "arctic_gguf"
+        assert try_get_arch_spec("dbrx").module_type == "dbrx_gguf"
         assert try_get_arch_spec("gpt-oss").model_type is None
 
 

@@ -461,6 +461,7 @@ class ArchitectureConfig(BaseModelConfig):
     attn_k_norm_biases: tuple[bool, ...] | None = None
     mlp_bias: bool = False
     attention_scale: float | None = None
+    attention_clamp: float | None = None
     alibi_max_bias: float | None = None
     use_parallel_residual: bool = False
     layer_intermediate_sizes: tuple[int, ...] = ()
@@ -515,6 +516,7 @@ class ArchitectureConfig(BaseModelConfig):
     scoring_func: str = "softmax"
     topk_method: str = "greedy"
     first_k_dense_replace: int = 0
+    moe_layer_frequency: int = 0
     n_shared_experts: int | None = None
     use_expert_bias: bool | None = None
     disable_qmoe: bool = False

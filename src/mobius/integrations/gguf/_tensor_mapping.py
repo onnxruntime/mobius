@@ -916,6 +916,33 @@ _DIFFUSION_FUSED_QKV: dict[str, str] = {
     "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
 }
 
+_DBRX_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_output_norm": "model.layers.{bid}.post_attention_layernorm",
+}
+
+_NOMIC_BERT_MOE_EXTRAS: dict[str, str] = {
+    "blk.{bid}.attn_qkv": "layers.{bid}.attention.qkv",
+    "blk.{bid}.ffn_gate_inp": "layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_up_exps": "layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "layers.{bid}.mlp.experts.down_proj",
+}
+
+_ARCTIC_EXTRAS: dict[str, str] = {
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.residual_mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.residual_mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.residual_mlp.down_proj",
+    "blk.{bid}.ffn_norm_exps": "model.layers.{bid}.expert_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.moe.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.moe.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.moe.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.moe.experts.down_proj",
+}
+
+_ERNIE45_MOE_EXTRAS: dict[str, str] = {
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias@",
+}
+
 # Qwen3.5 hybrid extensions: DeltaNet (SSM) + full-attention.
 # DeltaNet layers use linear_attn.* naming; full-attention layers add
 # q_norm/k_norm under self_attn; both use post_attention_layernorm.
@@ -1223,6 +1250,10 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
         "deepseek_shared_moe_extras": _DEEPSEEK_SHARED_MOE_EXTRAS,
         "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
+        "dbrx_extras": _DBRX_EXTRAS,
+        "nomic_bert_moe_extras": _NOMIC_BERT_MOE_EXTRAS,
+        "arctic_extras": _ARCTIC_EXTRAS,
+        "ernie45_moe_extras": _ERNIE45_MOE_EXTRAS,
         "qwen35_hybrid_extras": _QWEN35_HYBRID_EXTRAS,
         "qwen3next_hybrid_extras": _QWEN3NEXT_HYBRID_EXTRAS,
         "qwen4exp": _QWEN4EXP_MAPPING,

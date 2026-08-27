@@ -51,6 +51,7 @@ from mobius._configs import (
 from mobius.models import (
     ApertusCausalLMModel,
     ArceeCausalLMModel,
+    ArcticGGUFCausalLMModel,
     BitNetCausalLMModel,
     CausalLMModel,
     ChatGLMCausalLMModel,
@@ -58,6 +59,7 @@ from mobius.models import (
     Cosmos3EdgeTextModel,
     Cosmos3EdgeVLModel,
     Cosmos3OmniReasonerModel,
+    DbrxGGUFCausalLMModel,
     DeepSeekOCR2CausalLMModel,
     DeepSeekV3CausalLMModel,
     DeepSeekV4CausalLMModel,
@@ -68,6 +70,7 @@ from mobius.models import (
     Eagle3DraftModel,
     EncDecRNNTModel,
     Ernie45MoECausalLMModel,
+    Ernie45MoEGGUFCausalLMModel,
     ErnieCausalLMModel,
     ExaOne4CausalLMModel,
     Gemma2CausalLMModel,
@@ -168,6 +171,7 @@ from mobius.models.gguf_encoders import (
     JinaBertV2GGUFModel,
     NeoBertGGUFModel,
     NomicBertGGUFModel,
+    NomicBertMoEGGUFModel,
 )
 from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
@@ -636,8 +640,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "starcoder2": ModelRegistration(StarCoder2CausalLMModel),
     # --- Mixture of Experts ---
     "arctic": ModelRegistration(MoECausalLMModel),
+    "arctic_gguf": ModelRegistration(ArcticGGUFCausalLMModel),
     "dbrx": ModelRegistration(MoECausalLMModel),
+    "dbrx_gguf": ModelRegistration(DbrxGGUFCausalLMModel),
     "ernie4_5_moe": ModelRegistration(Ernie45MoECausalLMModel),
+    "ernie4_5_moe_gguf": ModelRegistration(Ernie45MoEGGUFCausalLMModel),
     "bailing_moe": ModelRegistration(Ernie45MoECausalLMModel),
     "flex_olmo": ModelRegistration(MoECausalLMModel),
     "glm4_moe": ModelRegistration(Glm4MoECausalLMModel),
@@ -880,6 +887,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "nomic_bert_gguf": ModelRegistration(
         NomicBertGGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "nomic_bert_moe_gguf": ModelRegistration(
+        NomicBertMoEGGUFModel, task="gguf-encoder-feature-extraction"
     ),
     "gemma_embedding_gguf": ModelRegistration(
         GemmaEmbeddingGGUFModel, task="gguf-embedding-feature-extraction"
