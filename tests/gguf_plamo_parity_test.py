@@ -123,9 +123,9 @@ def _reference(
         scores = torch.matmul(query.transpose(1, 2), key.transpose(-1, -2))
         scores = scores * config.head_dim**-0.5
         key_positions = torch.arange(key.shape[2], dtype=torch.int64)
-        causal = key_positions[None, :] <= position_ids.reshape(-1, 1)
+        causal = key_positions[None, None, :] <= position_ids[..., None]
         valid = attention_mask.bool().reshape(batch, 1, 1, -1)
-        scores = scores.masked_fill(~(causal[None, None, :, :] & valid), float("-inf"))
+        scores = scores.masked_fill(~(causal[:, None, :, :] & valid), float("-inf"))
         context = torch.matmul(scores.softmax(dim=-1), value)
         attention_output = _linear(
             context.transpose(1, 2).reshape(batch, sequence, config.hidden_size),
@@ -142,9 +142,9 @@ def _reference(
     return _ReferenceResult(_linear(hidden, weights, "lm_head"), presents)
 
 
-def _empty_cache(config: ArchitectureConfig) -> dict[str, np.ndarray]:
+def _empty_cache(config: ArchitectureConfig, *, batch_size: int = 1) -> dict[str, np.ndarray]:
     empty = np.empty(
-        (1, config.num_attention_heads, 0, config.head_dim),
+        (batch_size, config.num_attention_heads, 0, config.head_dim),
         dtype=np.float32,
     )
     return {
@@ -214,6 +214,35 @@ def test_plamo_prefill_and_expanded_cached_decode_match_reference() -> None:
     np.testing.assert_allclose(
         ort_decode["logits"],
         reference_decode.logits.numpy(),
+        rtol=2e-4,
+        atol=2e-5,
+        strict=True,
+    )
+
+
+def test_plamo_prefill_matches_reference_for_multiple_batches() -> None:
+    config = _config()
+    package = PlamoCausalLMTask().build(PlamoGGUFCausalLMModel(config), config)
+    weights = _weights(package)
+    package.apply_weights(weights)
+    session = OnnxModelSession(package)
+
+    input_ids = torch.tensor([[2, 7, 4], [5, 1, 9]], dtype=torch.int64)
+    positions = torch.arange(3, dtype=torch.int64).expand(2, -1)
+    mask = torch.ones((2, 3), dtype=torch.int64)
+    reference = _reference(config, weights, input_ids, positions, mask)
+    actual = session.run(
+        {
+            "input_ids": input_ids.numpy(),
+            "position_ids": positions.numpy(),
+            "attention_mask": mask.numpy(),
+            **_empty_cache(config, batch_size=2),
+        }
+    )
+
+    np.testing.assert_allclose(
+        actual["logits"],
+        reference.logits.numpy(),
         rtol=2e-4,
         atol=2e-5,
         strict=True,
