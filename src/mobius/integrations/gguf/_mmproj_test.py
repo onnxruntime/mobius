@@ -28,6 +28,53 @@ _POS_EMB_SIZE = 8
 _TEXT_HIDDEN = 32
 
 
+def _generic_vision_metadata() -> dict[str, object]:
+    return {
+        "clip.has_vision_encoder": True,
+        "clip.projector_type": "mlp",
+        "clip.vision.image_size": 28,
+        "clip.vision.patch_size": 14,
+        "clip.vision.embedding_length": 8,
+        "clip.vision.feed_forward_length": 16,
+        "clip.vision.attention.head_count": 2,
+        "clip.vision.attention.layer_norm_epsilon": 1e-5,
+        "clip.vision.block_count": 23,
+    }
+
+
+def test_generic_clip_explicit_feature_layer_selects_final_hidden_state():
+    from mobius.integrations.gguf._mmproj import read_mmproj_generic_vision_config
+
+    metadata = _generic_vision_metadata()
+    metadata["clip.vision.feature_layer"] = [23]
+
+    vision = read_mmproj_generic_vision_config(SimpleNamespace(metadata=metadata))
+
+    assert vision is not None
+    assert vision.feature_layer == 23
+
+
+@pytest.mark.parametrize(
+    ("feature_layer", "error"),
+    [
+        (23, ValueError),
+        ([], ValueError),
+        ([True], ValueError),
+        ([-1], ValueError),
+        ([24], ValueError),
+        ([22, 23], NotImplementedError),
+    ],
+)
+def test_generic_clip_invalid_feature_layer_fails_closed(feature_layer, error):
+    from mobius.integrations.gguf._mmproj import read_mmproj_generic_vision_config
+
+    metadata = _generic_vision_metadata()
+    metadata["clip.vision.feature_layer"] = feature_layer
+
+    with pytest.raises(error, match="feature_layer"):
+        read_mmproj_generic_vision_config(SimpleNamespace(metadata=metadata))
+
+
 def test_generic_mlp_norm_variant_fails_closed():
     from mobius._configs._sub_configs import VisionConfig
     from mobius.integrations.gguf._mmproj import _generic_projector_dimensions

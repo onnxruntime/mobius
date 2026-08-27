@@ -115,20 +115,37 @@ class _EmbeddingWithImageFeatures(nn.Module):
 
         image_mask_3d = op.Unsqueeze(image_mask, [-1])
         flat_mask = op.Reshape(image_mask, [-1])
+        placeholder_count = op.ReduceSum(op.Cast(flat_mask, to=7), keepdims=False)
+        feature_count = op.Squeeze(op.Shape(image_features, start=0, end=1), [0])
+        cardinality_mismatch = op.Cast(
+            op.Not(op.Equal(placeholder_count, feature_count)),
+            to=7,
+        )
+        # Gather from a one-row sentinel so any cardinality mismatch raises in ORT.
+        cardinality_guard = op.Gather(
+            op.Constant(value_ints=[0]),
+            cardinality_mismatch,
+            axis=0,
+        )
+        text_embeds = op.Add(text_embeds, op.CastLike(cardinality_guard, text_embeds))
         indices = op.Sub(
             op.CumSum(op.Cast(flat_mask, to=7), op.Constant(value_int=0)),
             op.Constant(value_int=1),
         )
-        indices = op.Clip(indices, op.Constant(value_int=0))
         indices = op.Reshape(indices, op.Shape(input_ids))
 
-        # Keep text-only calls valid even when the feature input has zero rows.
+        # Where evaluates both branches, so non-media positions gather a padded row.
         zero_row = op.Expand(
             op.CastLike(0.0, image_features),
             op.Concat([1], op.Shape(image_features, start=1, end=2), axis=0),
         )
         features = op.Concat(image_features, zero_row, axis=0)
-        return op.Where(image_mask_3d, op.Gather(features, indices, axis=0), text_embeds)
+        safe_indices = op.Where(image_mask, indices, feature_count)
+        return op.Where(
+            image_mask_3d,
+            op.Gather(features, safe_indices, axis=0),
+            text_embeds,
+        )
 
 
 class _ProjectorVisionEncoder(nn.Module):
@@ -165,7 +182,9 @@ class _ProjectorVisionEncoder(nn.Module):
             # when no explicit feature layer is present.
             self.vision_tower = CLIPVisionModel(
                 clip_view,
-                feature_layer=-2,
+                feature_layer=(
+                    int(vision.feature_layer) if vision.feature_layer is not None else -2
+                ),
                 drop_class_token=True,
             )
         elif projector_type in {"adapter", "resampler"}:

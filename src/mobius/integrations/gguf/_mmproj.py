@@ -363,6 +363,32 @@ def read_mmproj_generic_vision_config(mmproj_gguf: Any) -> VisionConfig | None:
         raise ValueError(
             "Generic GGUF projector is missing required vision metadata: " + ", ".join(missing)
         )
+    projector_type = projector_type_for_modality(md, MMProjModality.VISION)
+    feature_layers = md.get("clip.vision.feature_layer")
+    feature_layer: int | None = None
+    if feature_layers is not None:
+        if not isinstance(feature_layers, list) or any(
+            isinstance(layer, bool) or not isinstance(layer, int) for layer in feature_layers
+        ):
+            raise ValueError("clip.vision.feature_layer must be an array of integer indices.")
+        if not feature_layers:
+            raise ValueError("clip.vision.feature_layer must contain exactly one index.")
+        if len(feature_layers) > 1:
+            raise NotImplementedError(
+                "Generic GGUF projectors do not support concatenating multiple "
+                "clip.vision.feature_layer outputs."
+            )
+        if projector_type not in {"mlp", "ldp", "ldpv2"}:
+            raise NotImplementedError(
+                f"{projector_type} does not support explicit clip.vision.feature_layer."
+            )
+        feature_layer = feature_layers[0]
+        block_count = int(md["clip.vision.block_count"])
+        if not 0 <= feature_layer <= block_count:
+            raise ValueError(
+                f"clip.vision.feature_layer index {feature_layer} is outside the "
+                f"valid hidden-state range 0..{block_count}."
+            )
     return VisionConfig(
         image_size=int(md["clip.vision.image_size"]),
         patch_size=int(md["clip.vision.patch_size"]),
@@ -374,6 +400,7 @@ def read_mmproj_generic_vision_config(mmproj_gguf: Any) -> VisionConfig | None:
         hidden_act=(
             "gelu_pytorch_tanh" if bool(md.get("clip.use_gelu", False)) else "quick_gelu"
         ),
+        feature_layer=feature_layer,
     )
 
 
