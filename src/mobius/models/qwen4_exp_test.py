@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+import onnx
 import onnx_ir as ir
 import pytest
 import safetensors.torch
@@ -23,6 +24,7 @@ from mobius.integrations._block_quant import BlockQuantScheme
 from mobius.integrations._weight_loading import (
     apply_weights,
     stream_preprocessed_safetensors_to_model,
+    stream_qdq_safetensors_to_model,
 )
 from mobius.models.qwen4_exp import (
     _PINNED_PLE_WEIGHT_SCALE,
@@ -1170,10 +1172,34 @@ def _independent_dequantize_blocks(weight: torch.Tensor, scales: torch.Tensor) -
                 block_col * 128,
                 min((block_col + 1) * 128, weight.shape[1]),
             )
-            result[row_slice, col_slice] = weight[row_slice, col_slice].to(
-                torch.float32
-            ) * scales[block_row, block_col].to(torch.float32)
+            reconstructed = weight[row_slice, col_slice].to(torch.bfloat16) * scales[
+                block_row, block_col
+            ].to(torch.bfloat16)
+            result[row_slice, col_slice] = reconstructed.to(torch.float32)
     return result
+
+
+def _independent_tile_major_qdq(weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Execute the documented QDQ tile transform without production helpers."""
+    rows, cols = weight.shape
+    block_rows, block_cols = scales.shape
+    padded = torch.zeros(
+        (block_rows * 128, block_cols * 128),
+        dtype=weight.dtype,
+    )
+    padded[:rows, :cols] = weight
+    flat_tiles = (
+        padded.reshape(block_rows, 128, block_cols, 128)
+        .permute(0, 2, 1, 3)
+        .reshape(block_rows * block_cols, 128 * 128)
+    )
+    dequantized = flat_tiles.to(torch.bfloat16) * scales.reshape(-1, 1).to(torch.bfloat16)
+    restored = (
+        dequantized.reshape(block_rows, block_cols, 128, 128)
+        .permute(0, 2, 1, 3)
+        .reshape(block_rows * 128, block_cols * 128)
+    )
+    return restored[:rows, :cols].to(torch.float32)
 
 
 def _reduced_fp8_checkpoint(
@@ -1235,7 +1261,10 @@ def _reduced_fp8_checkpoint(
                 [_PINNED_PLE_WEIGHT_SCALE],
                 dtype=torch.bfloat16,
             )
-            dense_targets[target_name] = stored.to(torch.float32) * _PINNED_PLE_WEIGHT_SCALE
+            dense_targets[target_name] = (
+                stored.to(torch.bfloat16)
+                * torch.tensor(_PINNED_PLE_WEIGHT_SCALE, dtype=torch.bfloat16)
+            ).to(torch.float32)
         else:
             stored = value.to(torch.bfloat16)
             source[source_name] = stored
@@ -1329,6 +1358,193 @@ def test_fp8_streaming_dense_fallback_matches_independent_reconstruction(tmp_pat
         report["largest_reconstruction_working_set_bytes"]
         > report["largest_source_tensor_bytes"]
     )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "torch_dtype"),
+    [
+        (ir.DataType.FLOAT16, torch.float16),
+        (ir.DataType.FLOAT, torch.float32),
+    ],
+)
+def test_fp8_dense_fallback_reconstructs_bf16_before_output_cast(
+    tmp_path,
+    dtype,
+    torch_dtype,
+):
+    config = _fp8_config(dtype=dtype)
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+
+    stream_preprocessed_safetensors_to_model(
+        model,
+        str(tmp_path),
+        module.build_fp8_streaming_plan,
+    )
+
+    target_name = "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    source_name = _source_name(target_name)
+    scale_name = source_name.split(".shard_", 1)[0] + ".weight_scale"
+    expected = (
+        source[source_name].to(torch.bfloat16) * source[scale_name].to(torch.bfloat16)
+    ).to(torch_dtype)
+    actual = torch.from_numpy(model.graph.initializers[target_name].const_value.numpy().copy())
+    assert torch.equal(actual, expected)
+
+
+def test_fp8_qdq_tile_recipe_matches_dense_reconstruction():
+    torch.manual_seed(7)
+    weight = (torch.randn(129, 257) * 0.02).to(torch.float32)
+    quantized, scales = _quantize_blocks(weight)
+
+    np.testing.assert_array_equal(
+        _independent_tile_major_qdq(quantized, scales).numpy(),
+        _independent_dequantize_blocks(quantized, scales).numpy(),
+    )
+
+
+def test_fp8_qdq_source_recipe_matches_all_dense_fallback_targets():
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    source, dense_targets = _reduced_fp8_checkpoint(module)
+
+    for target_name, expected in dense_targets.items():
+        source_name = _source_name(target_name)
+        if target_name.endswith(".mlp.experts.gate_up_proj"):
+            prefix = source_name[: -len("experts.gate_up_proj")]
+            experts = []
+            for expert_index in range(config.num_local_experts or 0):
+                projections = []
+                for projection_name in ("gate_proj", "up_proj"):
+                    weight_name = f"{prefix}experts.{expert_index}.{projection_name}.weight"
+                    scale_name = weight_name[: -len(".weight")] + ".weight_scale_inv"
+                    projections.append(
+                        _independent_tile_major_qdq(
+                            source[weight_name],
+                            source[scale_name],
+                        )
+                    )
+                experts.append(torch.cat(projections, dim=0))
+            actual = torch.stack(experts)
+        elif target_name.endswith(".mlp.experts.down_proj"):
+            prefix = source_name[: -len("experts.down_proj")]
+            experts = []
+            for expert_index in range(config.num_local_experts or 0):
+                weight_name = f"{prefix}experts.{expert_index}.down_proj.weight"
+                scale_name = weight_name[: -len(".weight")] + ".weight_scale_inv"
+                experts.append(
+                    _independent_tile_major_qdq(
+                        source[weight_name],
+                        source[scale_name],
+                    )
+                )
+            actual = torch.stack(experts)
+        elif ".ple.ple_embedding.ngram_embedding.shard_" in target_name:
+            scale_name = source_name.split(".shard_", 1)[0] + ".weight_scale"
+            actual = (
+                source[source_name].to(torch.bfloat16) * source[scale_name].to(torch.bfloat16)
+            ).to(torch.float32)
+        else:
+            continue
+        np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+
+
+def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    package = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    names = sorted(source)
+    weight_map = {}
+    for shard_index, shard_names in enumerate((names[::2], names[1::2]), start=1):
+        filename = f"model-{shard_index:05d}-of-00002.safetensors"
+        safetensors.torch.save_file(
+            {name: source[name] for name in shard_names},
+            str(tmp_path / filename),
+        )
+        weight_map.update((name, filename) for name in shard_names)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": weight_map})
+    )
+
+    model = package["model"]
+    report = stream_qdq_safetensors_to_model(
+        model,
+        str(tmp_path),
+        module.build_fp8_streaming_plan,
+        revision="reduced-multishard-fixture",
+    )
+    package.weight_loading_report = report
+
+    fp8_names = {
+        name for name, tensor in source.items() if tensor.dtype == torch.float8_e4m3fn
+    }
+    scale_names = {
+        name for name in source if name.endswith((".weight_scale", ".weight_scale_inv"))
+    }
+    assert fp8_names <= model.graph.initializers.keys()
+    assert scale_names <= model.graph.initializers.keys()
+    assert all(
+        model.graph.initializers[name].dtype == ir.DataType.FLOAT8E4M3FN for name in fp8_names
+    )
+    assert all(
+        model.graph.initializers[name].dtype == ir.DataType.BFLOAT16 for name in scale_names
+    )
+    assert "model.layers.0.mlp.experts.gate_up_proj" not in model.graph.initializers
+    assert "model.layers.0.mlp.experts.down_proj" not in model.graph.initializers
+    assert not any(
+        name.startswith("model.layers.")
+        and ".ple.ple_embedding.ngram_embedding.shard_" in name
+        for name in model.graph.initializers
+    )
+    assert sum(node.op_type == "DequantizeLinear" for node in model.graph.all_nodes()) == len(
+        fp8_names
+    )
+    assert report["output_weight_format"] == "fp8_qdq"
+    assert report["storage_preserving"] is True
+    assert report["native_fp8"] is False
+    assert (
+        report["stored_fp8_code_bytes"] + report["stored_scale_bytes"]
+        < report["dense_equivalent_bytes"]
+    )
+    assert report["qdq_recipe"]["code_mapping"] == "bijective"
+    assert report["qdq_recipe"]["source_code_tensors"] == len(fp8_names)
+    assert len(report["qdq_recipe"]["canonical_code_mapping_sha256"]) == 64
+    assert model.metadata_props["mobius.fp8_qdq_recipe"]
+
+    output = tmp_path / "qdq"
+    package.save(
+        str(output),
+        external_data="onnx",
+        max_shard_size_bytes=4096,
+        progress_bar=False,
+    )
+    output_shards = [
+        *output.glob("model-*-of-*.onnx.data"),
+        *output.glob("model.onnx-*-of-*.data"),
+    ]
+    assert len(output_shards) > 1
+    onnx.checker.check_model(str(output / "model.onnx"), full_check=False)
+    reloaded = ir.load(output / "model.onnx")
+    for name in fp8_names:
+        expected = source[name].view(torch.uint8).numpy().tobytes()
+        assert reloaded.graph.initializers[name].const_value.tobytes() == expected
+    for name in scale_names:
+        expected = source[name].view(torch.uint16).numpy().tobytes()
+        assert reloaded.graph.initializers[name].const_value.tobytes() == expected
+    loaded_package = type(package).load(str(output))
+    assert loaded_package.weight_loading_report["output_weight_format"] == "fp8_qdq"
+    assert loaded_package.weight_loading_report["serializer_max_workers"] == 1
 
 
 def test_fp8_streaming_plan_rejects_unscaled_projection():
@@ -1439,7 +1655,11 @@ def test_fp8_streaming_plan_rejects_e5m2_ple_storage():
         module.build_fp8_streaming_plan(index, model.graph.initializers)
 
 
-def test_fp8_streaming_rejects_changed_ple_scalar(tmp_path):
+@pytest.mark.parametrize(
+    "stream",
+    [stream_preprocessed_safetensors_to_model, stream_qdq_safetensors_to_model],
+)
+def test_fp8_streaming_rejects_changed_ple_scalar(tmp_path, stream):
     config = _fp8_config()
     module = Qwen4ExpCausalLMModel(config)
     model = build_from_module(module, config, task="qwen4-exp-text-generation")["model"]
@@ -1448,8 +1668,8 @@ def test_fp8_streaming_rejects_changed_ple_scalar(tmp_path):
     source[scale_name] = torch.tensor([0.25], dtype=torch.bfloat16)
     safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
 
-    with pytest.raises(ValueError, match="expected pinned value"):
-        stream_preprocessed_safetensors_to_model(
+    with pytest.raises(ValueError, match="expected"):
+        stream(
             model,
             str(tmp_path),
             module.build_fp8_streaming_plan,

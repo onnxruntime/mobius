@@ -18,6 +18,7 @@ from mobius._registry import registry
 from mobius.integrations._weight_loading import (
     _download_weights,
     stream_preprocessed_safetensors_to_model,
+    stream_qdq_safetensors_to_model,
 )
 from mobius.integrations.compressed_tensors import (
     CompressedTensorsConfig,
@@ -171,6 +172,7 @@ def build_transformers_model(
     dtype: str | ir.DataType | None = None,
     output_layer_indices: list[int] | None = None,
     load_weights: bool = True,
+    keep_quantized: bool = True,
     trust_remote_code: bool = False,
     execution_provider: str = "default",
     trace_optimization: bool = False,
@@ -361,18 +363,30 @@ def build_transformers_model(
                     "Block-FP8 dense streaming currently requires one text-only "
                     "model component; multimodal Qwen4-Exp remains unsupported."
                 )
-            report = stream_preprocessed_safetensors_to_model(
+            stream = (
+                stream_qdq_safetensors_to_model
+                if keep_quantized
+                else stream_preprocessed_safetensors_to_model
+            )
+            report = stream(
                 next(iter(package.values())),
                 model_id,
                 model_module.build_fp8_streaming_plan,
                 revision=revision,
             )
             package.weight_loading_report = report
-            logger.warning(
-                "Loaded %s as a streaming dense fallback; native FP8 was not "
-                "preserved. See weight-loading-report.json.",
-                model_id,
-            )
+            if keep_quantized:
+                logger.info(
+                    "Preserved %s FP8 storage with standard QDQ. Current ORT "
+                    "execution is not claimed; see weight-loading-report.json.",
+                    model_id,
+                )
+            else:
+                logger.warning(
+                    "Loaded %s as an explicitly requested streaming dense fallback; "
+                    "native FP8 was not preserved. See weight-loading-report.json.",
+                    model_id,
+                )
         elif model_type in {"qwen4_exp", "qwen4_exp_text"}:
             from mobius.integrations.transformers._qwen4_exp_weights import (
                 stream_qwen4_exp_safetensors_to_package,

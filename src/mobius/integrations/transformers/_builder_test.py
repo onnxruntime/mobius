@@ -24,6 +24,79 @@ class _DummyModule(nn.Module):
         self.config = config
 
 
+class _DummyFp8Module(_DummyModule):
+    def build_fp8_streaming_plan(self, *_args):
+        raise AssertionError("mock streaming function should own planning")
+
+
+@pytest.mark.parametrize(
+    ("keep_quantized", "expected_loader"),
+    [(True, "qdq"), (False, "dense")],
+)
+def test_qwen38_fp8_selects_storage_or_dense_loader(
+    monkeypatch,
+    keep_quantized,
+    expected_loader,
+) -> None:
+    hf_config = type("HFConfig", (), {"model_type": "qwen4_exp_text"})()
+    config = make_config(
+        model_type="qwen4_exp_text",
+        block_quant_scheme=object(),
+    )
+    model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
+    package = ModelPackage({"model": model}, config=config)
+    calls = []
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "qwen4_exp_text"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            _DummyFp8Module,
+            "qwen4-exp-text-generation",
+            "qwen4_exp_text",
+        ),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda *args, **kwargs: package,
+    )
+
+    def qdq(*args, **kwargs):
+        calls.append("qdq")
+        return {"format": "mobius.weight-loading-report.v1"}
+
+    def dense(*args, **kwargs):
+        calls.append("dense")
+        return {"format": "mobius.weight-loading-report.v1"}
+
+    monkeypatch.setattr(transformers_builder, "stream_qdq_safetensors_to_model", qdq)
+    monkeypatch.setattr(
+        transformers_builder,
+        "stream_preprocessed_safetensors_to_model",
+        dense,
+    )
+
+    result = transformers_builder.build_transformers_model(
+        "unsloth/Qwen3.8-Flash-Next-FP8",
+        keep_quantized=keep_quantized,
+    )
+
+    assert result is package
+    assert calls == [expected_loader]
+
+
 def test_qwen38_fp8_defaults_to_immutable_integrated_revision(monkeypatch) -> None:
     calls = []
 

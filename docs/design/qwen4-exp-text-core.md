@@ -143,19 +143,29 @@ The checkpoint uses three text-weight paths:
 - Remaining text weights are ordinary BF16 tensors. The 943-entry
   `modules_to_not_convert` list resolves completely against the pinned header.
 
-Mobius emits a **dense fallback**, not a native-FP8 package. Each target tensor
-is read and reconstructed independently. Because ONNX IR buffers one external
-data shard before flushing it, dense streaming packages default to 1 GiB
-output shards, reject shard limits above 5 GB, and force external-data
-serialization to one worker. The reported host-memory bound is therefore one
-output shard plus the largest simultaneously live FP8 source, dense target,
-and scale reconstruction working set plus serializer overhead, rather than up
-to eight concurrent shards or the whole checkpoint.
-`weight-loading-report.json` states `native_fp8: false`, records the effective
-shard limit and largest tensor, and gives the exact reason: no available ONNX
-Runtime MatMul/MoE ABI consumes this FP8/BF16 128x128 layout exactly. Missing
-scales, wrong grids, changed deterministic PLE buffers, orphan scales, unknown
-source tensors, and missing graph targets all fail closed.
+By default Mobius preserves every FP8 code tensor and BF16 scale tensor as an
+external-data initializer. Standard ONNX QDQ reconstructs the logical weights:
+
+- a 2-D block weight is padded and transformed
+  `[R,C] -> [Br,128,Bc,128] -> [Br,Bc,128,128] -> [Br*Bc,16384]`;
+- its `[Br,Bc]` scale grid becomes `[Br*Bc]` and feeds
+  `DequantizeLinear(axis=0)`;
+- inverse reshape/transpose plus a final slice restores `[R,C]`;
+- the PLE `[1]` scale is reshaped to a scalar for per-tensor
+  `DequantizeLinear`.
+
+The transform is invertible for source codes, and the external data keeps their
+exact bytes. `weight-loading-report.json` records
+`output_weight_format: fp8_qdq`, `storage_preserving: true`, and
+`native_fp8: false`: QDQ storage is faithful, but no current ORT execution or
+fusion capability is claimed. Stock ORT may reject the float8 DQ kernel while
+the ONNX package remains schema-valid and round-trippable.
+
+Because ONNX IR buffers one output shard before flushing it, streaming packages
+default to 1 GiB output shards, reject shard limits above 5 GB, and force
+external-data serialization to one worker. Missing scales, wrong grids,
+changed deterministic PLE buffers, orphan scales, duplicate source names,
+unknown tensors, and missing graph targets all fail closed.
 
 The report separates excluded checkpoint families instead of hiding them in a
 single aggregate: all 3,101 `mtp.*` tensors are marked
@@ -172,6 +182,9 @@ mobius build \
   --max-shard-size 5GB \
   output/
 ```
+
+Pass `--dequantize` (or API `keep_quantized=False`) only when an explicitly
+dense BF16 reconstruction is required.
 
 The FP8 loader currently targets the text-only component and reports visual
 tensors separately. The branch includes the multimodal graph implementation,

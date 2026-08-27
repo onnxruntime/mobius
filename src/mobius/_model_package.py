@@ -456,11 +456,15 @@ class ModelPackage(UserDict[str, ir.Model]):
             for name, model in self.data.items()
             if components is None or components(name)
         }
-        if (
-            self.weight_loading_report is not None
-            and self.weight_loading_report.get("output_weight_format") == "dense"
-            and self.weight_loading_report.get("native_fp8") is False
-        ):
+        report = self.weight_loading_report
+        dense_stream = (
+            report is not None
+            and report.get("output_weight_format") == "dense"
+            and report.get("native_fp8") is False
+        )
+        preserved_stream = report is not None and report.get("streaming_external_data") is True
+        if dense_stream or preserved_stream:
+            assert report is not None
             # onnx-ir may materialize external-data shards concurrently. Keep
             # this fallback serial so the documented bound remains one output
             # shard plus one reconstructed tensor instead of max_workers shards.
@@ -483,12 +487,12 @@ class ModelPackage(UserDict[str, ir.Model]):
                     tensor_bytes = (num_elements * initializer.dtype.bitwidth + 7) // 8
                     largest_tensor_bytes = max(largest_tensor_bytes, tensor_bytes)
             self.weight_loading_report = {
-                **self.weight_loading_report,
+                **report,
                 "external_data_shard_limit_bytes": max_shard_size_bytes,
                 "largest_dense_tensor_bytes": largest_tensor_bytes,
                 "largest_reconstruction_working_set_bytes": max(
                     int(
-                        self.weight_loading_report.get(
+                        report.get(
                             "largest_reconstruction_working_set_bytes",
                             0,
                         )
@@ -497,8 +501,8 @@ class ModelPackage(UserDict[str, ir.Model]):
                 ),
                 "serializer_max_workers": max_workers,
                 "serialization_memory_bound": (
-                    "one output shard plus the largest source+dense+scale "
-                    "reconstruction working set and serializer overhead; "
+                    "one output shard plus the largest source/reconstruction "
+                    "working set and serializer overhead; "
                     "external-data serialization is forced to one worker"
                 ),
             }

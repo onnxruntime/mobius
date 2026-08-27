@@ -125,10 +125,14 @@
     ]
   },
   "mobius_export": {
-    "mode": "streaming dense dequantized fallback",
+    "mode": "storage-preserving standard ONNX FP8 QDQ",
+    "storage_preserving": true,
     "native_fp8": false,
     "native_fp8_reason": "No available ONNX Runtime MatMul/MoE ABI consumes F8_E4M3 weights with BF16 128x128 inverse-scale grids exactly.",
-    "peak_host_working_set": "bounded by one output shard plus the largest simultaneously live FP8 source, dense target, and scale reconstruction working set plus serializer overhead; dense streaming defaults to 1 GiB shards, rejects limits above 5 GB, and forces external-data serialization to one worker; PLE remains 128 graph initializers and is never concatenated",
+    "qdq_recipe": "tile-major [Br*Bc,16384] DequantizeLinear(axis=0), inverse layout, and slice; PLE uses scalar DequantizeLinear",
+    "runtime_execution_proven": false,
+    "dense_fallback": "explicit --dequantize / keep_quantized=False only",
+    "peak_host_working_set": "bounded by one output shard plus source initializer serialization overhead; defaults to 1 GiB shards, rejects limits above 5 GB, and forces external-data serialization to one worker",
     "multimodal_package_complete": false,
     "multimodal_dependency": "the separate stacked Qwen4-Exp multimodal PR must be incorporated before claiming a complete image-text package",
     "mtp_exported": false,
