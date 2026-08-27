@@ -19,6 +19,7 @@ from mobius.integrations.gguf._docs import (
     update_document,
 )
 from mobius.integrations.gguf._mmproj_registry import (
+    MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
     iter_projector_specs,
 )
@@ -34,7 +35,7 @@ def test_document_is_exact_generator_output() -> None:
 
 def test_document_is_concise_and_reason_coded() -> None:
     document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
-    assert len(document.splitlines()) < 500
+    assert len(document.splitlines()) < 525
     assert "RUNTIME_EVIDENCE_PENDING" in document
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document
@@ -103,6 +104,15 @@ def test_stale_at_style_pin_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match=r"Stale llama\.cpp pins"):
         update_document(document)
+
+
+def test_candidate_projector_artifact_table_covers_every_availability_pin() -> None:
+    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    for pin in MMPROJ_ARTIFACT_AVAILABILITY_PINS:
+        assert f"`{pin.repository}@{pin.revision}`" in document
+        assert f"`{pin.filename}`" in document
+        assert f"`{pin.lfs_sha256}`" in document
+        assert f"{pin.size:,}" in document
 
 
 def test_generated_census_counts_and_pin_are_closed() -> None:

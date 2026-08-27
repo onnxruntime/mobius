@@ -19,9 +19,11 @@ from __future__ import annotations
 __all__ = [
     "CLIP_METADATA_SCHEMA",
     "LLAMA_CPP_MMPROJ_SHA",
+    "MMPROJ_ARTIFACT_AVAILABILITY_PINS",
     "MMPROJ_ARTIFACT_PINS",
     "ClipMetadataField",
     "CompanionTensorSpec",
+    "MMProjArtifactAvailabilityPin",
     "MMProjArtifactPin",
     "MMProjModality",
     "MMProjTensorRole",
@@ -185,6 +187,27 @@ class MMProjArtifactPin:
     processor_files: tuple[str, ...] = ()
     processor_class: str | None = None
     processor_contract: tuple[tuple[str, str], ...] = ()
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MMProjArtifactAvailabilityPin:
+    """Immutable sidecar identity that proves availability, not import parity."""
+
+    artifact_id: str
+    projector_type: str
+    repository: str
+    revision: str
+    filename: str
+    size: int
+    lfs_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.size <= 0:
+            raise ValueError(f"{self.artifact_id}: artifact size must be positive")
+        if len(self.revision) != 40 or len(self.lfs_sha256) != 64:
+            raise ValueError(
+                f"{self.artifact_id}: immutable revision and SHA-256 are required"
+            )
 
 
 _VISION_BASE = frozenset({MMProjModality.VISION})
@@ -1010,6 +1033,45 @@ _SPECS: tuple[ProjectorSpec, ...] = (
 
 _INDEX: Mapping[str, ProjectorSpec] = MappingProxyType(
     {spec.projector_type: spec for spec in _SPECS}
+)
+
+MMPROJ_ARTIFACT_AVAILABILITY_PINS: tuple[MMProjArtifactAvailabilityPin, ...] = (
+    MMProjArtifactAvailabilityPin(
+        artifact_id="lfm2-vl-1.6b-f16",
+        projector_type="lfm2",
+        repository="LiquidAI/LFM2-VL-1.6B-GGUF",
+        revision="6121de267003bb4d4f325fe10abdc735aee06747",
+        filename="mmproj-LFM2-VL-1.6B-F16.gguf",
+        size=830_339_008,
+        lfs_sha256="b637bfa6060be2bc7503ec23ba48b407843d08c2ca83f52be206ea8563ccbae2",
+    ),
+    MMProjArtifactAvailabilityPin(
+        artifact_id="lfm2-vl-1.6b-q8-0",
+        projector_type="lfm2",
+        repository="LiquidAI/LFM2-VL-1.6B-GGUF",
+        revision="6121de267003bb4d4f325fe10abdc735aee06747",
+        filename="mmproj-LFM2-VL-1.6B-Q8_0.gguf",
+        size=564_115_648,
+        lfs_sha256="65ec437db88d65fff93f472d00c145e09880769ac67fedff5cd1c0f8d8301d87",
+    ),
+    MMProjArtifactAvailabilityPin(
+        artifact_id="pixtral-12b-f16",
+        projector_type="pixtral",
+        repository="ggml-org/pixtral-12b-GGUF",
+        revision="cba1ea4420bc2b4f15f50fdec59e30769880a63c",
+        filename="mmproj-pixtral-12b-f16.gguf",
+        size=870_070_176,
+        lfs_sha256="b4819558d6524a2e5623a06104ee085253a6dfd2b51470c60771ec33976f81bb",
+    ),
+    MMProjArtifactAvailabilityPin(
+        artifact_id="pixtral-12b-q8-0",
+        projector_type="pixtral",
+        repository="ggml-org/pixtral-12b-GGUF",
+        revision="cba1ea4420bc2b4f15f50fdec59e30769880a63c",
+        filename="mmproj-pixtral-12b-Q8_0.gguf",
+        size=463_091_616,
+        lfs_sha256="5504fe00067629053e6f99abac05f628c653a50394f4929bcc185bc80a10daf4",
+    ),
 )
 
 MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
