@@ -339,8 +339,7 @@ def configure_component_quantization(
             tuple(
                 other.module_attribute_path
                 for other in manifest.values()
-                if other.name != descriptor.name
-                and other.module_attribute_path
+                if other.name != descriptor.name and other.module_attribute_path
             )
             if not descriptor.module_attribute_path
             else ()
@@ -372,9 +371,7 @@ def _canonical_component_parameter_keys(
 
     keys: set[str] = set()
     prefixes = {
-        prefix
-        for prefix in (descriptor.name, descriptor.module_attribute_path)
-        if prefix
+        prefix for prefix in (descriptor.name, descriptor.module_attribute_path) if prefix
     }
     for local_path, child in component_module.named_modules():
         if not local_path:
@@ -432,9 +429,7 @@ def _route_component_weights(
         ]
         if not matches:
             root_components = [
-                name
-                for name in component_names
-                if not manifest[name].module_attribute_path
+                name for name in component_names if not manifest[name].module_attribute_path
             ]
             return root_components[0] if len(root_components) == 1 else None
         max_length = max(length for length, _ in matches)
