@@ -3365,6 +3365,86 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
             )
         return
 
+    elif architecture == "dbrx":
+        required_suffixes = (
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_epsilon",
+            "attention.clamp_kqv",
+            "expert_count",
+            "expert_used_count",
+        )
+        missing_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in required_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+            )
+        hidden = int(metadata[f"{architecture}.embedding_length"])
+        intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+        layers = int(metadata[f"{architecture}.block_count"])
+        heads = int(metadata[f"{architecture}.attention.head_count"])
+        kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+        experts = int(metadata[f"{architecture}.expert_count"])
+        top_k = int(metadata[f"{architecture}.expert_used_count"])
+        vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+            metadata.get("tokenizer.ggml.tokens", ())
+        )
+        if (
+            min(hidden, intermediate, layers, heads, kv_heads, experts, top_k, vocab) <= 0
+            or hidden % heads
+            or top_k > experts
+        ):
+            raise ValueError(f"{architecture} GGUF has invalid MoE geometry")
+        head_dim = hidden // heads
+        query_width = heads * head_dim
+        kv_width = kv_heads * head_dim
+        qkv_width = query_width + 2 * kv_width
+
+        actual = {
+            name: tuple(int(dimension) for dimension in shape)
+            for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+            if not is_known_skip(name)
+        }
+        required = {
+            "token_embd.weight": (vocab, hidden),
+            "output_norm.weight": (hidden,),
+            "output.weight": (vocab, hidden),
+        }
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            required.update(
+                {
+                    prefix + "attn_qkv.weight": (qkv_width, hidden),
+                    prefix + "attn_output.weight": (hidden, query_width),
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_output_norm.weight": (hidden,),
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
+                    prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                    prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+                }
+            )
+        missing = sorted(set(required) - set(actual))
+        unexpected = sorted(set(actual) - set(required))
+        malformed = {
+            name: (required[name], actual[name])
+            for name in set(required) & set(actual)
+            if actual[name] != required[name]
+        }
+        if missing or unexpected or malformed:
+            raise ValueError(
+                f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+                f"unexpected={unexpected}, malformed={malformed}"
+            )
+        return
+
     elif architecture == "arctic":
         required_suffixes = (
             "context_length",
@@ -3607,6 +3687,7 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
                 f"unexpected={unexpected}, malformed={malformed}"
             )
         return
+
 
 def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
     """Validate Granite's architecture-wide dense-or-MoE tensor union."""
@@ -6581,11 +6662,15 @@ _SPECIALIZED_ENCODER_FINGERPRINT_FIELDS = (
     "pooling_type",
     "embedding_dense_2_out",
     "embedding_dense_3_in",
+    "encoder_fused_qkv",
 )
 _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
     "attention_clamp": frozenset({"dbrx"}),
     "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
+    "routing_weight_normalization_floor": frozenset(
+        {"dots1", "ernie4_5-moe", "smallthinker"}
+    ),
 }
 
 
@@ -6605,6 +6690,8 @@ def _graph_config_fields_for_fingerprint(config, gguf_arch: str) -> dict[str, ob
 
 def _serialize_route_graph_config(config: Any, gguf_arch: str) -> str:
     """Serialize the architecture-isolated graph fields for route fingerprints."""
+    import json
+
     return json.dumps(
         _graph_config_fields_for_fingerprint(config, gguf_arch),
         default=str,

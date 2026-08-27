@@ -79,6 +79,7 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
         *_SPECIALIZED_ENCODER_FINGERPRINT_FIELDS,
         "attention_clamp",
         "moe_layer_frequency",
+        "routing_weight_normalization_floor",
     ):
         legacy_fields.pop(field_name, None)
     legacy_bytes = json.dumps(
@@ -102,18 +103,30 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
     [
         ("arctic", frozenset()),
         ("dbrx", frozenset({"attention_clamp"})),
-        ("ernie4_5-moe", frozenset({"moe_layer_frequency"})),
+        (
+            "ernie4_5-moe",
+            frozenset({"moe_layer_frequency", "routing_weight_normalization_floor"}),
+        ),
         ("nomic-bert-moe", frozenset({"moe_layer_frequency"})),
+        ("smallthinker", frozenset({"routing_weight_normalization_floor"})),
     ],
 )
 def test_cohort_route_fingerprint_includes_only_consumed_new_fields(
     architecture: str,
     included: frozenset[str],
 ) -> None:
-    config = ArchitectureConfig(attention_clamp=8.0, moe_layer_frequency=2)
+    config = ArchitectureConfig(
+        attention_clamp=8.0,
+        moe_layer_frequency=2,
+        routing_weight_normalization_floor=6.103515625e-5,
+    )
     fields = _graph_config_fields_for_fingerprint(config, architecture)
 
-    assert included == {"attention_clamp", "moe_layer_frequency"} & fields.keys()
+    assert included == {
+        "attention_clamp",
+        "moe_layer_frequency",
+        "routing_weight_normalization_floor",
+    } & fields.keys()
 
 
 class _FakeGGUF:

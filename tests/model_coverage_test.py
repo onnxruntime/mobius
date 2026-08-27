@@ -204,6 +204,18 @@ _COVERAGE_SKIP: dict[str, str] = {
     "smallthinker_gguf": "GGUF-only SmallThinker route whose routing and SWA/NoPE schedules "
     "are restored by GGUF metadata postprocessing, not the native HF config path; dedicated "
     "config/graph/synthetic execution tests cover it while real-weight L4/L5 is deferred.",
+    "arctic_gguf": "GGUF-only Arctic route whose residual-MoE tensor layout is reconstructed "
+    "from GGUF metadata; dedicated exact closure, graph, and synthetic execution tests cover "
+    "it while real-weight L2/L4/L5 remains deferred.",
+    "dbrx_gguf": "GGUF-only DBRX route whose fused clamped-QKV and expert layout are restored "
+    "from GGUF metadata; dedicated exact closure, graph, and synthetic execution tests cover "
+    "it while real-weight L2/L4/L5 remains deferred.",
+    "ernie4_5_moe_gguf": "GGUF-only ERNIE MoE route whose dense/MoE schedule and shared "
+    "experts are restored from GGUF metadata; dedicated exact closure, graph, and synthetic "
+    "execution tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "nomic_bert_moe_gguf": "GGUF-only NomicBERT-MoE encoder route whose alternating MoE "
+    "schedule and fused QKV layout are restored from GGUF metadata; dedicated exact closure, "
+    "graph, and synthetic execution tests cover it while real-weight L2/L4/L5 remains deferred.",
     "neo_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
     "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
     "are covered by _specialized_encoders_test.py.",
