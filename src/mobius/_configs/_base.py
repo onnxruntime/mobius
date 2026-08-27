@@ -29,19 +29,19 @@ if TYPE_CHECKING:
 DEFAULT_INT = -42
 
 
-def _resolve_dtype(config) -> ir.DataType | None:
-    """Extract model dtype from a HuggingFace config.
-
-    Handles string dtypes (e.g. "float16"), torch.dtype objects,
-    and the "auto" sentinel (returns None).
-    """
-    torch_dtype = getattr(config, "dtype", None)
+def _resolve_dtype_value(torch_dtype) -> ir.DataType | None:
+    """Convert a HuggingFace dtype value to an ONNX IR dtype."""
     if torch_dtype is not None and torch_dtype != "auto":
         if isinstance(torch_dtype, str):
             torch_dtype = getattr(torch, torch_dtype, None)
         if torch_dtype is not None:
             return tensor_adapters.from_torch_dtype(torch_dtype)
     return None
+
+
+def _resolve_dtype(config) -> ir.DataType | None:
+    """Extract model dtype from a HuggingFace config."""
+    return _resolve_dtype_value(getattr(config, "dtype", None))
 
 
 def _resolve_hidden_act(config, model_type: str) -> str | None:
@@ -1529,6 +1529,232 @@ class CausalLMConfig(ArchitectureConfig):
     Used by Llama, Mistral, Qwen, GPT-2, and similar architectures.
     Inherits all shared transformer fields from :class:`ArchitectureConfig`.
     """
+
+
+@dataclasses.dataclass
+class Qwen4ExpConfig(CausalLMConfig):
+    """Exact text-core configuration for experimental Qwen4/Qwen3.8 Flash-Next."""
+
+    hc_count: int = 4
+    hc_lowrank: int = 320
+    ple_layer_ids: list[int] | None = None
+    ple_embed_dim: int | None = None
+    ple_conv_kernel_size: int = 4
+    ngram_size: int = 3
+    heads_per_ngram: int = 8
+    ngram_vocab_size_base: int = 20_000_000
+    make_ngram_vocab_size_divisible_by: int = 128
+    seed: int = 1234
+    split_ngram_parts: int = 512
+    indexer_n_heads: int | None = None
+    indexer_kv_heads: int | None = None
+    indexer_head_dim: int | None = None
+    indexer_budget: int | None = None
+    indexer_compress_ratio: int | None = None
+    output_gate_type: str | None = None
+    linear_qk_l2norm_eps: float = 1e-6
+    mamba_ssm_dtype: ir.DataType = ir.DataType.FLOAT
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
+
+    def __post_init__(self) -> None:
+        self.ple_layer_ids = sorted(set(self.ple_layer_ids or []))
+        if self.ple_embed_dim is None:
+            self.ple_embed_dim = self.hidden_size
+        if self.layer_types is None:
+            interval = self.full_attention_interval or 4
+            self.layer_types = [
+                "linear_attention" if (index + 1) % interval else "qwen_sparse_attention"
+                for index in range(self.num_hidden_layers)
+            ]
+        else:
+            self.layer_types = [
+                "qwen_sparse_attention" if layer_type == "full_attention" else layer_type
+                for layer_type in self.layer_types
+            ]
+        self._validate_architecture()
+
+    def _validate_architecture(self) -> None:
+        layer_types = self.layer_types or []
+        if len(layer_types) != self.num_hidden_layers:
+            raise ValueError(
+                "Qwen4-Exp layer_types must contain exactly num_hidden_layers entries "
+                f"(expected {self.num_hidden_layers}, got {len(layer_types)})"
+            )
+        unsupported = sorted(set(layer_types) - {"linear_attention", "qwen_sparse_attention"})
+        if unsupported:
+            raise ValueError(f"Unsupported Qwen4-Exp layer types: {unsupported}")
+        output_gate_type = self.output_gate_type or self.hidden_act
+        if output_gate_type not in {"sigmoid", "silu"}:
+            raise ValueError(
+                f"Unsupported Qwen4-Exp output gate activation: {output_gate_type}"
+            )
+        if self.hc_count <= 1:
+            raise ValueError(f"Qwen4-Exp requires hc_count > 1, got {self.hc_count}")
+        if self.hc_lowrank <= 0:
+            raise ValueError(f"Qwen4-Exp requires hc_lowrank > 0, got {self.hc_lowrank}")
+        if self.mamba_ssm_dtype != ir.DataType.FLOAT:
+            raise ValueError(
+                "Qwen4-Exp requires mamba_ssm_dtype=float32 for the pinned "
+                "Gated-DeltaNet recurrence"
+            )
+        if self.rope_interleave:
+            raise ValueError("Qwen4-Exp uses half-split RoPE; rope_interleave must be false")
+        if not self.num_local_experts or self.num_local_experts <= 0:
+            raise ValueError("Qwen4-Exp num_local_experts must be > 0")
+        if not self.num_experts_per_tok or not (
+            0 < self.num_experts_per_tok <= self.num_local_experts
+        ):
+            raise ValueError("Qwen4-Exp num_experts_per_tok must be in [1, num_local_experts]")
+        if not self.moe_intermediate_size or self.moe_intermediate_size <= 0:
+            raise ValueError("Qwen4-Exp moe_intermediate_size must be > 0")
+        if (
+            not self.shared_expert_intermediate_size
+            or self.shared_expert_intermediate_size <= 0
+        ):
+            raise ValueError("Qwen4-Exp shared_expert_intermediate_size must be > 0")
+        if "linear_attention" in layer_types:
+            linear_fields = {
+                "linear_num_key_heads": self.linear_num_key_heads,
+                "linear_num_value_heads": self.linear_num_value_heads,
+                "linear_key_head_dim": self.linear_key_head_dim,
+                "linear_value_head_dim": self.linear_value_head_dim,
+                "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+            }
+            if any(value is None or value <= 0 for value in linear_fields.values()):
+                raise ValueError(
+                    f"Qwen4-Exp linear-attention config values must be positive: {linear_fields}"
+                )
+            assert self.linear_num_key_heads is not None
+            assert self.linear_num_value_heads is not None
+            if self.linear_num_value_heads % self.linear_num_key_heads:
+                raise ValueError(
+                    "Qwen4-Exp linear_num_value_heads must be divisible by "
+                    "linear_num_key_heads"
+                )
+
+        qsa_fields = {
+            "indexer_n_heads": self.indexer_n_heads,
+            "indexer_kv_heads": self.indexer_kv_heads,
+            "indexer_head_dim": self.indexer_head_dim,
+            "indexer_budget": self.indexer_budget,
+            "indexer_compress_ratio": self.indexer_compress_ratio,
+        }
+        if any(value is not None for value in qsa_fields.values()):
+            missing = [name for name, value in qsa_fields.items() if value is None]
+            if missing:
+                raise ValueError(f"Qwen4-Exp QSA config is missing required fields: {missing}")
+            if any(value is not None and value <= 0 for value in qsa_fields.values()):
+                raise ValueError(f"Qwen4-Exp QSA config values must be positive: {qsa_fields}")
+            if self.indexer_kv_heads != 1:
+                raise ValueError("Qwen4-Exp QSA requires indexer_kv_heads=1")
+            assert self.indexer_budget is not None
+            assert self.indexer_compress_ratio is not None
+            if self.indexer_budget % self.indexer_compress_ratio:
+                raise ValueError(
+                    "Qwen4-Exp indexer_budget must be divisible by indexer_compress_ratio"
+                )
+            rotary_dim = int(self.head_dim * (self.partial_rotary_factor or 1.0))
+            assert self.indexer_head_dim is not None
+            if rotary_dim > self.indexer_head_dim:
+                raise ValueError(
+                    "Qwen4-Exp attention RoPE dimensions must fit the QSA index head: "
+                    f"rotary_dim={rotary_dim}, indexer_head_dim={self.indexer_head_dim}"
+                )
+        elif "qwen_sparse_attention" in layer_types:
+            raise ValueError("Qwen4-Exp sparse-attention layers require a complete QSA config")
+
+        if self.ple_layer_ids:
+            ngram_heads = (self.ngram_size - 1) * self.heads_per_ngram
+            assert self.ple_embed_dim is not None
+            if ngram_heads <= 0 or self.ple_embed_dim <= 0 or self.ple_embed_dim % ngram_heads:
+                raise ValueError(
+                    "Qwen4-Exp ple_embed_dim must be positive and divisible by the "
+                    f"number of n-gram heads ({ngram_heads})"
+                )
+            invalid = [
+                layer_id
+                for layer_id in self.ple_layer_ids
+                if layer_id < 1 or layer_id > self.num_hidden_layers
+            ]
+            if invalid:
+                raise ValueError(
+                    "Qwen4-Exp ple_layer_ids must be one-indexed decoder layer ids; "
+                    f"invalid ids: {invalid}"
+                )
+            non_linear = [
+                layer_id
+                for layer_id in self.ple_layer_ids
+                if layer_types[layer_id - 1] != "linear_attention"
+            ]
+            if non_linear:
+                raise ValueError(
+                    "Qwen4-Exp PLE is only supported on linear_attention layers; "
+                    f"got PLE on layers {non_linear}"
+                )
+            if self.eos_token_id is None or (
+                isinstance(self.eos_token_id, list) and not self.eos_token_id
+            ):
+                raise ValueError("Qwen4-Exp eos_token_id must be set when PLE is enabled")
+            if self.ple_conv_kernel_size <= 0:
+                raise ValueError("Qwen4-Exp ple_conv_kernel_size must be > 0")
+            if self.ngram_vocab_size_base < 2:
+                raise ValueError("Qwen4-Exp ngram_vocab_size_base must be >= 2")
+            if self.make_ngram_vocab_size_divisible_by <= 0:
+                raise ValueError("Qwen4-Exp make_ngram_vocab_size_divisible_by must be > 0")
+            if self.split_ngram_parts <= 0:
+                raise ValueError("Qwen4-Exp split_ngram_parts must be > 0")
+
+        if self.mtp_use_dedicated_embeddings:
+            raise ValueError(
+                "Qwen4-Exp dedicated MTP embeddings are unsupported: the pinned "
+                "official runtime defines no MTP execution or NextN cache ABI"
+            )
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Qwen4ExpConfig:
+        text = _as_attribute_config(getattr(config, "text_config", None)) or config
+        parent = parent_config or (config if text is not config else None)
+        base = ArchitectureConfig.from_transformers(text, parent)
+        fields = _shallow_fields(base)
+        mamba_ssm_dtype = _resolve_dtype_value(getattr(text, "mamba_ssm_dtype", "float32"))
+        if mamba_ssm_dtype is None:
+            raise ValueError(
+                "Qwen4-Exp mamba_ssm_dtype must be a recognized floating-point dtype"
+            )
+        layer_types = getattr(text, "layer_types", None)
+        if layer_types is not None:
+            layer_types = [
+                "qwen_sparse_attention" if value == "full_attention" else value
+                for value in layer_types
+            ]
+        fields.update(
+            model_type="qwen4_exp_text",
+            layer_types=layer_types,
+            hc_count=getattr(text, "hc_count", 4),
+            hc_lowrank=getattr(text, "hc_lowrank", 320),
+            ple_layer_ids=list(getattr(text, "ple_layer_ids", None) or []),
+            ple_embed_dim=getattr(text, "ple_embed_dim", None),
+            ple_conv_kernel_size=getattr(text, "ple_conv_kernel_size", 4),
+            ngram_size=getattr(text, "ngram_size", 3),
+            heads_per_ngram=getattr(text, "heads_per_ngram", 8),
+            ngram_vocab_size_base=getattr(text, "ngram_vocab_size_base", 20_000_000),
+            make_ngram_vocab_size_divisible_by=getattr(
+                text, "make_ngram_vocab_size_divisible_by", 128
+            ),
+            seed=getattr(text, "seed", 1234),
+            split_ngram_parts=getattr(text, "split_ngram_parts", 512),
+            indexer_n_heads=getattr(text, "indexer_n_heads", None),
+            indexer_kv_heads=getattr(text, "indexer_kv_heads", None),
+            indexer_head_dim=getattr(text, "indexer_head_dim", None),
+            indexer_budget=getattr(text, "indexer_budget", None),
+            indexer_compress_ratio=getattr(text, "indexer_compress_ratio", None),
+            output_gate_type=getattr(text, "output_gate_type", None),
+            mamba_ssm_dtype=mamba_ssm_dtype,
+            mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0),
+            mtp_use_dedicated_embeddings=getattr(text, "mtp_use_dedicated_embeddings", False),
+        )
+        return cls(**fields)
 
 
 @dataclasses.dataclass

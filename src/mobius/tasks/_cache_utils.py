@@ -457,7 +457,7 @@ def _register_linear_attention_functions(
             kv_num_heads=dims.num_v_heads,
             update_rule="gated_delta",
             scale=1.0 / (dims.head_k_dim**0.5),
-            stash_type=config.dtype,
+            stash_type=getattr(config, "mamba_ssm_dtype", config.dtype),
         )
         model.functions[conv_func.identifier()] = conv_func
         model.functions[attn_func.identifier()] = attn_func

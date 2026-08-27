@@ -43,6 +43,7 @@ from mobius._configs import (
     NemotronParseConfig,
     ParakeetCTCConfig,
     Plamo2Config,
+    Qwen4ExpConfig,
     SenseNovaU1Config,
     WhisperConfig,
     XverseConfig,
@@ -125,6 +126,7 @@ from mobius.models import (
     Qwen3VL3ModelCausalLMModel,
     Qwen3VLCausalLMModel,
     Qwen3VLTextModel,
+    Qwen4ExpCausalLMModel,
     Qwen25VLCausalLMModel,
     Qwen25VLTextModel,
     Qwen35CausalLMModel,
@@ -664,6 +666,30 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_5_moe": ModelRegistration(Qwen35MoECausalLMModel),
     "qwen3_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_next": ModelRegistration(Qwen3NextCausalLMModel),
+    "qwen4_exp": ModelRegistration(
+        Qwen4ExpCausalLMModel,
+        task="qwen4-exp-text-generation",
+        config_class=Qwen4ExpConfig,
+        family="qwen",
+        variant="moe+gdn+qsa+ple",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    ),
+    "qwen4_exp_text": ModelRegistration(
+        Qwen4ExpCausalLMModel,
+        task="qwen4-exp-text-generation",
+        config_class=Qwen4ExpConfig,
+        family="qwen",
+        variant="moe+gdn+qsa+ple",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    ),
+    "Qwen4ExpForConditionalGeneration": ModelRegistration(
+        Qwen4ExpCausalLMModel,
+        task="qwen4-exp-text-generation",
+        config_class=Qwen4ExpConfig,
+        family="qwen",
+        variant="text-core",
+        test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
+    ),
     "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_vl_moe": ModelRegistration(MoECausalLMModel),
     # --- DeepSeek (MLA + MoE) ---
@@ -1020,6 +1046,11 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     # so the text-only override keys off the VL type here.
     "qwen3_5_moe_vl": "qwen3_5_moe_text",
     "qwen3_5_moe_text": "qwen3_5_moe_text",
+    # Qwen3.8 Flash-Next is published as a multimodal qwen4_exp composite.
+    # This PR supports its exact text core only; callers must opt into the
+    # existing text-only extraction path until the wrapper is implemented.
+    "qwen4_exp": "qwen4_exp_text",
+    "qwen4_exp_text": "qwen4_exp_text",
 }
 
 
@@ -1032,6 +1063,9 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "llama": "meta-llama/Llama-3.2-1B",
     "mistral": "mistralai/Mistral-7B-v0.1",
     "qwen2": "Qwen/Qwen2.5-0.5B",
+    "qwen4_exp": "Qwen/Qwen3.8-Flash-Next",
+    "qwen4_exp_text": "Qwen/Qwen3.8-Flash-Next",
+    "Qwen4ExpForConditionalGeneration": "Qwen/Qwen3.8-Flash-Next",
     "plamo2": "pfnet/plamo-2-1b",
     "cohere": "CohereForAI/c4ai-command-r7b-12-2024",
     "cohere2": "CohereForAI/c4ai-command-r7b-12-2024",

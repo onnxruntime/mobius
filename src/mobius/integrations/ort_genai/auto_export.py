@@ -1834,6 +1834,12 @@ def _write_genai_config(
 def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
     """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
     config = getattr(pkg, "config", None)
+    if getattr(config, "model_type", None) == "qwen4_exp_text":
+        raise ValueError(
+            "ORT GenAI released config cannot represent Qwen4-Exp's "
+            "past_position_ids, QSA index-key cache, and PLE context states. "
+            "Export without --runtime ort-genai and run the ONNX model directly."
+        )
     if getattr(config, "model_type", None) == "parakeet_ctc":
         raise ValueError(
             "ORT GenAI does not define a feature-input CTC ASR pipeline; "

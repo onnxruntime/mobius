@@ -51,6 +51,18 @@ def test_single_component_llm_returns_one_component(monkeypatch):
     assert components == [ComponentInfo(name="model", role="decoder")]
 
 
+def test_qwen4_composite_inspection_fails_closed(monkeypatch):
+    _patch_autoconfig(
+        monkeypatch,
+        SimpleNamespace(
+            model_type="qwen4_exp",
+            architectures=["Qwen4ExpForConditionalGeneration"],
+        ),
+    )
+    with pytest.raises(ValueError, match="multimodal component inspection is unavailable"):
+        inspect_components("fake/qwen4")
+
+
 def test_vlm_returns_decoder_vision_embedding(monkeypatch):
     _patch_autoconfig(monkeypatch, SimpleNamespace(model_type="llava"))
     components = inspect_components("fake/llava")

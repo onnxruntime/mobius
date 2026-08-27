@@ -21,6 +21,13 @@ from mobius.tasks import ModelTask
 logger = logging.getLogger(__name__)
 
 
+def _is_qwen4_exp_composite(config) -> bool:
+    """Return whether *config* describes the multimodal Qwen4-Exp wrapper."""
+    return getattr(config, "model_type", None) == "qwen4_exp" or (
+        "Qwen4ExpForConditionalGeneration" in set(getattr(config, "architectures", None) or [])
+    )
+
+
 def _strip_to_text_only(config: Any, model_type: str) -> Any:
     """Return a copy of *config* reduced to a pure text-only decoder."""
     if not dataclasses.is_dataclass(config):
@@ -206,6 +213,12 @@ def build_transformers_model(
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
 
+    if _is_qwen4_exp_composite(parent_config) and not text_only:
+        raise ValueError(
+            "Qwen4-Exp multimodal export is not implemented in this text-core PR. "
+            "Pass text_only=True to export the qwen4_exp_text causal decoder."
+        )
+
     if text_only:
         from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
@@ -273,15 +286,29 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
+        if model_type == "qwen4_exp_text":
+            model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        state_dict = _download_weights(model_id, revision=revision)
-        if hasattr(model_module, "preprocess_weights"):
-            state_dict = model_module.preprocess_weights(state_dict)
-        package.apply_weights(
-            state_dict,
-            prefix_map=getattr(model_module, "weight_prefix_map", None),
-        )
+        if model_type == "qwen4_exp_text":
+            from mobius.integrations.transformers._qwen4_exp_weights import (
+                stream_qwen4_exp_safetensors_to_model,
+            )
+
+            stream_qwen4_exp_safetensors_to_model(
+                package["model"],
+                model_id,
+                config,
+                revision=revision,
+            )
+        else:
+            state_dict = _download_weights(model_id, revision=revision)
+            if hasattr(model_module, "preprocess_weights"):
+                state_dict = model_module.preprocess_weights(state_dict)
+            package.apply_weights(
+                state_dict,
+                prefix_map=getattr(model_module, "weight_prefix_map", None),
+            )
     return package
 
 

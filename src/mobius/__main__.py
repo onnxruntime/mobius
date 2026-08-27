@@ -370,6 +370,15 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 raise
         model_type = hf_config.model_type
         parent_config = hf_config
+        from mobius.integrations.transformers._builder import (
+            _is_qwen4_exp_composite,
+        )
+
+        if _is_qwen4_exp_composite(parent_config):
+            raise SystemExit(
+                "Error: local Qwen4-Exp composite configs cannot be silently "
+                "exported as text-only. Use --model <hf-id> --features text-only."
+            )
         if hasattr(hf_config, "text_config"):
             hf_config = hf_config.text_config
         config = _config_from_hf(hf_config, parent_config=parent_config)

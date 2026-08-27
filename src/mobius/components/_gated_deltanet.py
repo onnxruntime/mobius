@@ -121,6 +121,8 @@ class GatedDeltaNet(nn.Module):
             linear_class = Linear
         self.hidden_size = config.hidden_size
         self._dtype = config.dtype
+        self._stash_type = getattr(config, "mamba_ssm_dtype", config.dtype)
+        self._qk_l2norm_eps = getattr(config, "linear_qk_l2norm_eps", 0.0)
         self.num_v_heads = config.linear_num_value_heads
         self.num_k_heads = config.linear_num_key_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -223,34 +225,39 @@ class GatedDeltaNet(nn.Module):
         # Decomposed form of op.LpNormalization(x, axis=-1, p=2).
         # TODO: Use op.LpNormalization directly once ORT >=1.25 supports it.
         q_4d = op.Reshape(query, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
-        q_l2 = op.Sqrt(
-            op.ReduceSumSquare(q_4d, [-1], keepdims=1)
-        )  # (B, T, num_k_heads, 1) — L2 norm per head
+        q_norm_squared = op.ReduceSumSquare(q_4d, [-1], keepdims=1)
+        if self._qk_l2norm_eps:
+            q_norm_squared = op.Add(
+                q_norm_squared,
+                op.CastLike(self._qk_l2norm_eps, q_4d),
+            )
+        q_l2 = op.Sqrt(q_norm_squared)  # (B, T, num_k_heads, 1) — L2 norm per head
         query = op.Reshape(op.Div(q_4d, q_l2), qk_3d_shape)  # (B, T, key_dim)
 
         k_4d = op.Reshape(key, qk_4d_shape)  # (B, T, num_k_heads, head_k_dim)
-        k_l2 = op.Sqrt(
-            op.ReduceSumSquare(k_4d, [-1], keepdims=1)
-        )  # (B, T, num_k_heads, 1) — L2 norm per head
+        k_norm_squared = op.ReduceSumSquare(k_4d, [-1], keepdims=1)
+        if self._qk_l2norm_eps:
+            k_norm_squared = op.Add(
+                k_norm_squared,
+                op.CastLike(self._qk_l2norm_eps, k_4d),
+            )
+        k_l2 = op.Sqrt(k_norm_squared)  # (B, T, num_k_heads, 1)
         key = op.Reshape(op.Div(k_4d, k_l2), qk_3d_shape)  # (B, T, key_dim)
 
         # === Compute gating parameters ===
         # beta: (B, T, num_v_heads)
         beta = op.Sigmoid(b)
         # Compute decay: g = -exp(A_log) * softplus(a + dt_bias).
-        # fp16 Exp overflows at ~11.09; bf16 has the same exponent range as fp32
-        # (8-bit exponent) so no upcast is needed for bf16 or fp32.
         # Mirrors HF: -A_log.float().exp() * softplus(a.float() + dt_bias).
-        if self._dtype == ir.DataType.FLOAT16:
-            # Upcast to fp32 to avoid fp16 Exp/Softplus overflow.
+        if self._dtype == ir.DataType.FLOAT16 or self._stash_type != self._dtype:
             a_f32 = op.Cast(a, to=ir.DataType.FLOAT)
             dt_bias_f32 = op.Cast(self.dt_bias, to=ir.DataType.FLOAT)
             a_log_f32 = op.Cast(self.A_log, to=ir.DataType.FLOAT)
             softplus_val = op.Softplus(op.Add(a_f32, dt_bias_f32))
             neg_a = op.Neg(op.Exp(a_log_f32))
-            g = op.CastLike(op.Mul(neg_a, softplus_val), a)  # cast back to fp16
+            g_f32 = op.Mul(neg_a, softplus_val)
+            g = g_f32 if self._stash_type != self._dtype else op.CastLike(g_f32, a)
         else:
-            # bf16/fp32: sufficient exponent range, compute natively.
             softplus_val = op.Softplus(op.Add(a, self.dt_bias))
             neg_a = op.Neg(op.Exp(self.A_log))
             g = op.Mul(neg_a, softplus_val)
@@ -261,12 +268,19 @@ class GatedDeltaNet(nn.Module):
         # decay g: (B, T, num_v_heads) — per-head scalar decay (d_k=1),
         #   matches (B, T, kv_num_heads * 1) = (B, T, kv_num_heads)
 
+        if self._stash_type != self._dtype:
+            query = op.Cast(query, to=self._stash_type)
+            key = op.Cast(key, to=self._stash_type)
+            value = op.Cast(value, to=self._stash_type)
+            recurrent_state = op.Cast(recurrent_state, to=self._stash_type)
+            g = op.Cast(g, to=self._stash_type)
+            beta = op.Cast(beta, to=self._stash_type)
         output_3d, new_recurrent_state = op.LinearAttention(
             query,  # (B, T, num_k_heads * head_k_dim)
             key,  # (B, T, num_k_heads * head_k_dim)
             value,  # (B, T, num_v_heads * head_v_dim)
             recurrent_state,  # (B, num_v_heads, d_k, d_v)
-            g,  # (B, T, num_v_heads) — decay in log-space, broadcasts over d_k
+            g,  # (B, T, num_v_heads) — decay in log-space
             beta,  # (B, T, num_v_heads) — update rate
             scale=1.0 / (self.head_k_dim**0.5),
             q_num_heads=self.num_k_heads,
@@ -275,6 +289,8 @@ class GatedDeltaNet(nn.Module):
             _outputs=2,
         )
         # output_3d: (B, T, num_v_heads * d_v) — already 3D
+        if self._stash_type != self._dtype:
+            output_3d = op.CastLike(output_3d, hidden_states)
 
         # === Gated RMSNorm ===
         flat_shape = op.Constant(value_ints=[-1, self.head_v_dim])
