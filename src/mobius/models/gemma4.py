@@ -43,6 +43,7 @@ from mobius.components import (
     Linear,
     QuantizedEmbedding,
     RMSNorm,
+    TiedQuantizedLMHead,
     create_attention_bias,
     initialize_rope,
     make_quantized_linear_factory,
@@ -151,13 +152,37 @@ def _make_scaled_word_embedding(
     )
 
 
+def _tie_quantized_lm_head(config: Gemma4Config, embed_tokens: nn.Module) -> nn.Module | None:
+    """Build a head sharing *embed_tokens*' packed table, or ``None``.
+
+    Only valid in a single-graph (text-only) export where the embedding and the
+    head live in the same ONNX graph. Returns ``None`` whenever the weights are
+    untied or either side is not block-quantized, in which case the caller must
+    fall back to :func:`_make_lm_head`.
+    """
+    quantization_config = _text_quantization_config(config)
+    if quantization_config is None:
+        return None
+    tie = config.tie_word_embeddings or bool(
+        getattr(quantization_config, "tie_word_embeddings", False)
+    )
+    if not (tie and _text_lm_head_quantized(config) and _text_embeddings_quantized(config)):
+        return None
+    if not isinstance(embed_tokens, QuantizedEmbedding):
+        return None
+    if config.hidden_size % quantization_config.group_size != 0:
+        return None
+    return TiedQuantizedLMHead(embed_tokens, config.hidden_size, config.vocab_size)
+
+
 def _make_lm_head(config: Gemma4Config) -> nn.Module:
     """Build the LM head projection, quantized (MatMulNBits) when requested.
 
     The multimodal decoder and embedding live in separate ONNX graphs, so a
     quantized head cannot share the embedding's packed table — it always gets
     its own independent MatMulNBits weight (populated from the same repacked
-    token-embedding data at load time).
+    token-embedding data at load time). Single-graph text-only models should
+    prefer :func:`_tie_quantized_lm_head` when the weights are tied.
     """
     if _text_lm_head_quantized(config):
         linear_cls = _text_linear_class(config)
@@ -2224,7 +2249,9 @@ class Gemma4CausalLMModel(CausalLMModel):
         nn.Module.__init__(self)
         self.config = config
         self.model = Gemma4TextModel(config)
-        self.lm_head = _make_lm_head(config)
+        self.lm_head = _tie_quantized_lm_head(config, self.model.embed_tokens) or _make_lm_head(
+            config
+        )
 
     def forward(
         self,
