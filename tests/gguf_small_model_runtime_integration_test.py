@@ -969,6 +969,8 @@ def test_smollm_generic_ort_genai_generation(
 
     assert len(generated) == len(case.generated_tokens)
     assert generated == list(case.generated_tokens)
+    del generator, params, tokenizer, model
+    gc.collect()
 
 
 @pytest.mark.integration
