@@ -22,7 +22,10 @@ from generate_minicpm_tokenizer_oracle import (  # noqa: E402
     RANDOM_COUNT,
     RANDOM_LENGTH_STOP,
     SEED,
+    _generator_sha256,
     _json_bytes,
+    _render_fixture,
+    _write_or_check_fixture,
     build_corpus,
     summarize_results,
 )
@@ -37,7 +40,7 @@ def test_committed_fixture_binds_exact_generator_and_corpus() -> None:
     corpus = build_corpus()
 
     assert fixture["generator"] == "scripts/generate_minicpm_tokenizer_oracle.py"
-    assert fixture["generator_sha256"] == hashlib.sha256(_GENERATOR.read_bytes()).hexdigest()
+    assert fixture["generator_sha256"] == _generator_sha256(_GENERATOR)
     assert fixture["serialization"] == (
         "UTF-8 compact JSON arrays (ensure_ascii=false; separators=(',',':'))"
     )
@@ -54,6 +57,39 @@ def test_committed_fixture_binds_exact_generator_and_corpus() -> None:
     assert fixture["corpus_sha256"] == hashlib.sha256(_json_bytes(corpus)).hexdigest()
     assert fixture["modes"] == [list(mode) for mode in MODES]
     assert fixture["case_count_per_route"] == len(MODES) * len(corpus)
+
+
+def test_generator_and_fixture_bytes_are_deterministic_across_line_endings(
+    tmp_path: Path,
+) -> None:
+    lf_source = tmp_path / "generator-lf.py"
+    crlf_source = tmp_path / "generator-crlf.py"
+    source = bytes("# UTF-8: café\nprint('MiniCPM')\n", encoding="utf-8")
+    lf_source.write_bytes(source)
+    crlf_source.write_bytes(source.replace(b"\n", b"\r\n"))
+
+    lf_rendered = _render_fixture({"generator_sha256": _generator_sha256(lf_source)})
+    crlf_rendered = _render_fixture({"generator_sha256": _generator_sha256(crlf_source)})
+    lf_output = tmp_path / "oracle-lf.json"
+    crlf_output = tmp_path / "oracle-crlf.json"
+    _write_or_check_fixture(lf_output, lf_rendered, check=False)
+    _write_or_check_fixture(crlf_output, crlf_rendered, check=False)
+
+    assert _generator_sha256(lf_source) == hashlib.sha256(source).hexdigest()
+    assert lf_output.read_bytes() == crlf_output.read_bytes() == lf_rendered
+    assert b"\r\n" not in lf_rendered
+
+
+def test_fixture_check_requires_exact_utf8_lf_bytes(tmp_path: Path) -> None:
+    output = tmp_path / "oracle.json"
+    rendered = _render_fixture({"text": "café", "lines": ["first", "second"]})
+    output.write_bytes(rendered)
+
+    _write_or_check_fixture(output, rendered, check=True)
+
+    output.write_bytes(rendered.replace(b"\n", b"\r\n"))
+    with pytest.raises(SystemExit, match="is stale; regenerate without --check"):
+        _write_or_check_fixture(output, rendered, check=True)
 
 
 def test_result_summary_recomputes_hashes_counts_and_first_witness() -> None:
