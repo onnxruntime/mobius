@@ -332,7 +332,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 revision=revision,
                 dtype=dtype_override,
                 load_weights=load_weights,
-                keep_quantized=not getattr(args, "dequantize", False),
                 components=pipeline_components,
                 execution_provider=execution_provider,
             )
@@ -489,6 +488,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
+            keep_quantized=not getattr(args, "dequantize", False),
             revision=revision,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,

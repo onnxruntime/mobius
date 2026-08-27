@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
+import re
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1144,6 +1146,37 @@ def _source_name(target_name: str) -> str:
     return target_name
 
 
+def _graph_mutation_snapshot(model: ir.Model):
+    nodes = tuple(
+        (
+            node.domain,
+            node.op_type,
+            node.name,
+            tuple(value.name if value is not None else None for value in node.inputs),
+            tuple(value.name for value in node.outputs),
+            tuple(
+                (name, repr(attribute)) for name, attribute in sorted(node.attributes.items())
+            ),
+        )
+        for node in model.graph.all_nodes()
+    )
+    initializers = []
+    for name, value in sorted(model.graph.initializers.items()):
+        const_value = value.const_value
+        initializers.append(
+            (
+                name,
+                value.dtype,
+                tuple(value.shape) if value.shape is not None else None,
+                type(const_value).__name__ if const_value is not None else None,
+                hashlib.sha256(const_value.tobytes()).hexdigest()
+                if const_value is not None and not isinstance(const_value, ir.LazyTensor)
+                else None,
+            )
+        )
+    return nodes, tuple(initializers), tuple(sorted(model.metadata_props.items()))
+
+
 def _quantize_blocks(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     rows, cols = weight.shape
     scales = torch.empty(
@@ -1211,7 +1244,12 @@ def _reduced_fp8_checkpoint(
     for target_name, parameter in module.named_parameters():
         source_name = _source_name(target_name)
         if parameter._const_value is not None:
-            source[source_name] = torch.from_numpy(parameter._const_value.numpy().copy())
+            array = parameter._const_value.numpy().copy()
+            source[source_name] = (
+                torch.from_numpy(array.view(np.uint16)).view(torch.bfloat16)
+                if parameter._const_value.dtype == ir.DataType.BFLOAT16
+                else torch.from_numpy(array)
+            )
             continue
         shape = tuple(int(dim) for dim in parameter.shape)
         value = torch.randn(shape, dtype=torch.float32) * 0.02
@@ -1545,6 +1583,164 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
     loaded_package = type(package).load(str(output))
     assert loaded_package.weight_loading_report["output_weight_format"] == "fp8_qdq"
     assert loaded_package.weight_loading_report["serializer_max_workers"] == 1
+
+
+@pytest.mark.parametrize(
+    ("dtype", "target_bytes"),
+    [
+        (ir.DataType.BFLOAT16, None),
+        (ir.DataType.FLOAT16, 2),
+        (ir.DataType.FLOAT, 4),
+    ],
+)
+def test_fp8_qdq_reports_only_real_source_cast_overlap(
+    tmp_path,
+    dtype,
+    target_bytes,
+):
+    config = _fp8_config(dtype=dtype)
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+
+    report = stream_qdq_safetensors_to_model(
+        model,
+        str(tmp_path),
+        module.build_fp8_streaming_plan,
+    )
+
+    if target_bytes is None:
+        assert report["largest_source_cast_overlap_bytes"] == 0
+    else:
+        lm_head = source["lm_head.weight"]
+        minimum_overlap = lm_head.numel() * (2 + target_bytes)
+        assert report["largest_source_cast_overlap_bytes"] >= minimum_overlap
+    assert report["qdq_recipe"]["source_codes_preserved"] is True
+
+
+def test_fp8_qdq_rejects_logical_shape_before_graph_mutation(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    source_name = (
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    )
+    original = source[source_name]
+    source[source_name] = torch.cat(
+        [original, torch.zeros((1, original.shape[1]), dtype=original.dtype)],
+        dim=0,
+    )
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+    snapshot_before = _graph_mutation_snapshot(model)
+
+    with pytest.raises(
+        ValueError,
+        match=rf"QDQ source '{re.escape(source_name)}'.*target.*expects",
+    ):
+        stream_qdq_safetensors_to_model(
+            model,
+            str(tmp_path),
+            module.build_fp8_streaming_plan,
+        )
+
+    assert _graph_mutation_snapshot(model) == snapshot_before
+
+
+def test_fp8_qdq_rejects_packed_expert_rows_before_graph_mutation(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    source_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+    original = source[source_name]
+    malformed = torch.cat(
+        [original, torch.zeros((1, original.shape[1]), dtype=original.dtype)],
+        dim=0,
+    )
+    source[source_name] = malformed
+    scale_name = source_name[: -len(".weight")] + ".weight_scale_inv"
+    source[scale_name] = torch.ones(
+        (
+            (malformed.shape[0] + 127) // 128,
+            (malformed.shape[1] + 127) // 128,
+        ),
+        dtype=torch.bfloat16,
+    )
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+    snapshot_before = _graph_mutation_snapshot(model)
+
+    with pytest.raises(ValueError, match="source row sum"):
+        stream_qdq_safetensors_to_model(
+            model,
+            str(tmp_path),
+            module.build_fp8_streaming_plan,
+        )
+
+    assert _graph_mutation_snapshot(model) == snapshot_before
+
+
+def test_fp8_qdq_rejects_changed_constant_before_graph_mutation(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    constant_name = "model.language_model.layers.0.ple.ple_embedding.layer_multipliers"
+    source[constant_name] = source[constant_name] + 2
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+    snapshot_before = _graph_mutation_snapshot(model)
+
+    with pytest.raises(ValueError, match="does not match the graph constant"):
+        stream_qdq_safetensors_to_model(
+            model,
+            str(tmp_path),
+            module.build_fp8_streaming_plan,
+        )
+
+    assert _graph_mutation_snapshot(model) == snapshot_before
+
+
+def test_fp8_qdq_rejects_unclassified_source_before_graph_mutation(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    source["model.language_model.unclassified.weight"] = torch.ones(
+        (1, 1),
+        dtype=torch.bfloat16,
+    )
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+    snapshot_before = _graph_mutation_snapshot(model)
+
+    with pytest.raises(ValueError, match="unclassified by the QDQ plan"):
+        stream_qdq_safetensors_to_model(
+            model,
+            str(tmp_path),
+            module.build_fp8_streaming_plan,
+        )
+
+    assert _graph_mutation_snapshot(model) == snapshot_before
 
 
 def test_fp8_streaming_plan_rejects_unscaled_projection():

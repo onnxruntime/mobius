@@ -49,6 +49,13 @@ _PINNED_PLE_WEIGHT_SCALE = 0.00019931793212890625
 logger = logging.getLogger(__name__)
 
 
+def _torch_from_ir_tensor(tensor: ir.TensorProtocol) -> torch.Tensor:
+    array = tensor.numpy().copy()
+    if tensor.dtype == ir.DataType.BFLOAT16:
+        return torch.from_numpy(array.view(np.uint16)).view(torch.bfloat16)
+    return torch.from_numpy(array)
+
+
 def _source_name_for_qwen4_exp_target(target_name: str) -> str:
     if target_name.startswith("model."):
         return f"model.language_model.{target_name[len('model.') :]}"
@@ -1468,9 +1475,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
                         )
 
             if initializer.const_value is not None:
-                constants[source_name] = torch.from_numpy(
-                    initializer.const_value.numpy().copy()
-                )
+                constants[source_name] = _torch_from_ir_tensor(initializer.const_value)
                 continue
 
             targets[target_name] = classify_source(source_name)
@@ -1483,9 +1488,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 continue
             source_name = _source_name_for_qwen4_exp_target(target_name)
             if source_name in key_index and source_name not in constants:
-                constants[source_name] = torch.from_numpy(
-                    parameter._const_value.numpy().copy()
-                )
+                constants[source_name] = _torch_from_ir_tensor(parameter._const_value)
 
         return StreamingWeightPlan(
             targets=targets,
@@ -1563,7 +1566,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
                 parameter = parameter_map.get(key)
                 if parameter is None or parameter._const_value is None:
                     raise ValueError(f"Unexpected Qwen4-Exp deterministic buffer: {key}")
-                expected = torch.from_numpy(parameter._const_value.numpy())
+                expected = _torch_from_ir_tensor(parameter._const_value)
                 if not torch.equal(value.cpu(), expected):
                     raise ValueError(
                         f"Qwen4-Exp deterministic buffer {key} does not match "

@@ -63,6 +63,8 @@ _SAFETENSORS_DTYPE_BYTES = {
 }
 _SAFETENSORS_TO_IR_DTYPE = {
     "BF16": ir.DataType.BFLOAT16,
+    "F16": ir.DataType.FLOAT16,
+    "F32": ir.DataType.FLOAT,
     "F8_E4M3": ir.DataType.FLOAT8E4M3FN,
 }
 
@@ -1238,6 +1240,7 @@ def stream_qdq_safetensors_to_model(
     code_to_target: dict[str, str] = {}
     scale_to_targets: dict[str, list[str]] = {}
     validated_scalar_scales: dict[str, float] = {}
+    largest_source_cast_overlap_bytes = 0
 
     def record_qdq_source(source: StreamingWeightSource, target_label: str) -> None:
         prior = code_to_target.get(source.source_name)
@@ -1293,6 +1296,112 @@ def stream_qdq_safetensors_to_model(
             )
         scale_to_targets.setdefault(source.scale_name, []).append(target_label)
 
+    # Validate the complete plan before registering any source initializer or
+    # appending any QDQ node. A malformed late target must not leave a partially
+    # mutated graph.
+    for target_name, source in plan.targets.items():
+        target = graph.initializers.get(target_name)
+        if target is None:
+            raise ValueError(f"QDQ plan targets unknown initializer '{target_name}'")
+        if target.const_value is not None:
+            raise ValueError(f"QDQ plan targets constant initializer '{target_name}'")
+        if target.shape is None or target.dtype is None:
+            raise ValueError(
+                f"QDQ target '{target_name}' must have a concrete shape and dtype"
+            )
+        target_shape = [int(dim) for dim in target.shape]
+        if isinstance(source, StreamingWeightSource):
+            located = key_index.get(source.source_name)
+            if located is None:
+                raise ValueError(
+                    f"QDQ target '{target_name}' is missing source '{source.source_name}'"
+                )
+            _path, source_shape, _dtype = located
+            if source_shape != target_shape:
+                raise ValueError(
+                    f"QDQ source '{source.source_name}' has logical shape "
+                    f"{source_shape}; target '{target_name}' expects {target_shape}"
+                )
+            if source.mode != "direct":
+                record_qdq_source(source, target_name)
+                assert source.scale_name is not None
+                consumed.add(source.scale_name)
+            consumed.add(source.source_name)
+            continue
+
+        if len(target_shape) != 3:
+            raise ValueError(
+                f"QDQ packed expert target '{target_name}' has shape {target_shape}; "
+                "expected rank 3 [experts, rows, input_width]"
+            )
+        if len(source.experts) != target_shape[0]:
+            raise ValueError(
+                f"QDQ packed expert target '{target_name}' expects "
+                f"{target_shape[0]} experts, but the plan provides "
+                f"{len(source.experts)}"
+            )
+        for expert_index, projections in enumerate(source.experts):
+            if not projections:
+                raise ValueError(
+                    f"QDQ packed expert target '{target_name}' expert "
+                    f"{expert_index} has no source projections"
+                )
+            rows = 0
+            for projection_index, projection in enumerate(projections):
+                label = f"{target_name}[{expert_index}][{projection_index}]"
+                record_qdq_source(projection, label)
+                _path, projection_shape, _dtype = key_index[projection.source_name]
+                if len(projection_shape) != 2:
+                    raise ValueError(
+                        f"QDQ expert source '{projection.source_name}' has shape "
+                        f"{projection_shape}; target '{target_name}' requires 2-D "
+                        "projections"
+                    )
+                if projection_shape[1] != target_shape[2]:
+                    raise ValueError(
+                        f"QDQ expert source '{projection.source_name}' has input "
+                        f"width {projection_shape[1]}; target '{target_name}' expects "
+                        f"{target_shape[2]}"
+                    )
+                rows += projection_shape[0]
+                consumed.add(projection.source_name)
+                assert projection.scale_name is not None
+                consumed.add(projection.scale_name)
+            if rows != target_shape[1]:
+                raise ValueError(
+                    f"QDQ packed expert target '{target_name}' expert "
+                    f"{expert_index} source row sum is {rows}; expected "
+                    f"{target_shape[1]}"
+                )
+
+    for source_name, expected in plan.constants.items():
+        path, shape, _dtype = key_index[source_name]
+        if list(expected.shape) != shape:
+            raise ValueError(
+                f"Deterministic source '{source_name}' has shape {shape}; "
+                f"expected {list(expected.shape)}"
+            )
+        with safe_open(path, framework="pt") as handle:
+            actual = handle.get_tensor(source_name)
+        if not torch.equal(actual.cpu(), expected.cpu()):
+            raise ValueError(
+                f"Deterministic source '{source_name}' does not match the graph constant"
+            )
+
+    missing_targets = sorted(
+        name
+        for name, value in graph.initializers.items()
+        if value.const_value is None and name not in plan.targets
+    )
+    if missing_targets:
+        raise ValueError(f"QDQ plan leaves graph target(s) unassigned: {missing_targets[:5]}")
+    unclassified = sorted(set(key_index) - consumed)
+    if unclassified:
+        raise ValueError(
+            f"{len(unclassified)} checkpoint tensor(s) are unclassified by the "
+            f"QDQ plan (e.g. {unclassified[:5]})"
+        )
+
     for target_name, source in plan.targets.items():
         target = graph.initializers.get(target_name)
         if target is None:
@@ -1304,17 +1413,26 @@ def stream_qdq_safetensors_to_model(
 
         if isinstance(source, StreamingWeightSource):
             if source.mode == "direct":
-                path, shape, _dtype = key_index[source.source_name]
-                if [int(dim) for dim in target.shape] != shape:
+                path, shape, source_dtype = key_index[source.source_name]
+                source_ir_dtype = _SAFETENSORS_TO_IR_DTYPE.get(source_dtype)
+                if source_ir_dtype is None:
                     raise ValueError(
-                        f"QDQ direct source '{source.source_name}' has shape {shape}; "
-                        f"expected {[int(dim) for dim in target.shape]}"
+                        f"QDQ direct source '{source.source_name}' has unsupported "
+                        f"storage dtype {source_dtype}"
+                    )
+                if source_ir_dtype != target.dtype:
+                    source_bytes = math.prod(shape) * _SAFETENSORS_DTYPE_BYTES[source_dtype]
+                    target_bytes = (
+                        math.prod(int(dim) for dim in target.shape) * target.dtype.bitwidth + 7
+                    ) // 8
+                    largest_source_cast_overlap_bytes = max(
+                        largest_source_cast_overlap_bytes,
+                        source_bytes + target_bytes,
                     )
                 _assign_lazy_from_shard(target, path, source.source_name, target_name)
                 consumed.add(source.source_name)
                 assigned.add(target_name)
                 continue
-            record_qdq_source(source, target_name)
             replacement = _build_fp8_qdq_source(
                 graph,
                 source,
@@ -1331,8 +1449,6 @@ def stream_qdq_safetensors_to_model(
             for expert_index, projections in enumerate(source.experts):
                 projection_values = []
                 for projection_index, projection in enumerate(projections):
-                    label = f"{target_name}[{expert_index}][{projection_index}]"
-                    record_qdq_source(projection, label)
                     projection_values.append(
                         _build_fp8_qdq_source(
                             graph,
@@ -1393,36 +1509,6 @@ def stream_qdq_safetensors_to_model(
         del graph.initializers[target_name]
         assigned.add(target_name)
 
-    for source_name, expected in plan.constants.items():
-        path, shape, _dtype = key_index[source_name]
-        if list(expected.shape) != shape:
-            raise ValueError(
-                f"Deterministic source '{source_name}' has shape {shape}; "
-                f"expected {list(expected.shape)}"
-            )
-        with safe_open(path, framework="pt") as handle:
-            actual = handle.get_tensor(source_name)
-        if not torch.equal(actual.cpu(), expected.cpu()):
-            raise ValueError(
-                f"Deterministic source '{source_name}' does not match the graph constant"
-            )
-
-    missing = sorted(
-        name
-        for name, value in graph.initializers.items()
-        if value.const_value is None
-        and name not in consumed
-        and not name.startswith("fp8_qdq.")
-    )
-    if missing:
-        raise ValueError(f"QDQ streaming left initializers unassigned: {missing[:5]}")
-    unclassified = sorted(set(key_index) - consumed)
-    if unclassified:
-        raise ValueError(
-            f"{len(unclassified)} checkpoint tensor(s) are unclassified by the "
-            f"QDQ plan (e.g. {unclassified[:5]})"
-        )
-
     graph.sort()
     fold_initializers_after_weights(model)
     canonical_mapping = "\n".join(
@@ -1469,6 +1555,7 @@ def stream_qdq_safetensors_to_model(
         "storage_preserving": True,
         "native_fp8": False,
         "streaming_external_data": True,
+        "largest_source_cast_overlap_bytes": largest_source_cast_overlap_bytes,
         "stored_fp8_code_bytes": stored_code_bytes,
         "stored_scale_bytes": stored_scale_bytes,
         "dense_equivalent_bytes": dense_equivalent_bytes,

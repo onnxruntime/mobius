@@ -497,6 +497,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                             0,
                         )
                     ),
+                    int(report.get("largest_source_cast_overlap_bytes", 0)),
                     largest_tensor_bytes,
                 ),
                 "serializer_max_workers": max_workers,
