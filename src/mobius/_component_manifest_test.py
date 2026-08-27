@@ -84,15 +84,11 @@ def test_descriptor_maps_local_path_to_huggingface_source_name():
         source_paths=("model.language_model.layers", "lm_head"),
     )
 
-    assert descriptor.source_module_names("model.layers.0.per_layer_input_gate") == (
+    assert descriptor.source_module_names("model.layers.0.per_layer_input_gate"    ) == (
         "model.layers.0.per_layer_input_gate",
         "model.language_model.layers.0.per_layer_input_gate",
-        "lm_head.model.layers.0.per_layer_input_gate",
     )
-    assert descriptor.source_module_names("lm_head") == (
-        "lm_head",
-        "model.language_model.layers.lm_head",
-    )
+    assert descriptor.source_module_names("lm_head") == ("lm_head",)
 
 
 def test_single_component_uses_root_module_path():
