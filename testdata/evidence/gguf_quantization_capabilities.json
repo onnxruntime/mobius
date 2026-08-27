@@ -1022,7 +1022,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1087,7 +1087,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1122,7 +1122,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1187,7 +1187,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1222,7 +1222,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1287,7 +1287,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1322,7 +1322,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1387,7 +1387,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1422,7 +1422,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1487,7 +1487,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1522,7 +1522,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1587,7 +1587,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1622,7 +1622,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1687,7 +1687,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1722,7 +1722,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1787,7 +1787,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -1822,7 +1822,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -1887,7 +1887,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -2110,7 +2110,7 @@
       "parse_support": "supported",
       "roles": {
         "embedding": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::GatherBlockQuantized/v1",
           "reason": "GatherBlockQuantized does not consume BlockQuantizedMatMul's native GGUF byte ABI; the embedding must use the affine Gather ABI.",
@@ -2175,7 +2175,7 @@
           "transform": "mobius.integrations.gguf._repacker.preserve_native_blocks"
         },
         "projection (affine-only graph)": {
-          "exactness": null,
+          "exactness": "lossy",
           "keep_quantized_supported": true,
           "operator_abi": "com.microsoft::MatMulNBits/v1",
           "reason": "This graph exposes only the affine MatMulNBits ABI, not BlockQuantizedMatMul's native GGUF byte ABI.",
@@ -2498,12 +2498,12 @@
           "downstream_runtime_version": "0.15.2",
           "evidence_id": "lfm2-350m-f16-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
-          "graph_sha256": "2a15694cd5ff9f5c9f798feeca91cc41174842065ada80a18b288478725b3342",
+          "graph_sha256": "27e4ebb4c0c8b6c01ee57fa7825f34c5ddadc8ca5dc0c75d989e4507d4dcdfdb",
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_promoted_gguf_full_runtime_evidence[lfm2-350m-f16]",
           "result": "passed",
-          "runtime_package_sha256": "87b8cdd1edc8c5be948716df3efe551f5fc8f96762d7ea3f99b27688ca9f24af",
+          "runtime_package_sha256": "ef3816d4f93c7061fd4653248629f0439d6ad1c623bdd0f27d31fe0349cb3505",
           "stateful_semantics": "hybrid convolution and KV state prefill, replay, rollback, reorder, and 20 decode steps"
         }
       ],
@@ -2528,12 +2528,12 @@
           "downstream_runtime_version": "0.15.2",
           "evidence_id": "qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
-          "graph_sha256": "b0d1814ea69dddd405e30541e9009ba6fb73930f98538921d5c2eaa4a14f5d2c",
+          "graph_sha256": "240e5e374803c94efdb17eee39c09b0d3e9aed10b6d8b4e1c92e39918ea2155e",
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_promoted_gguf_full_runtime_evidence[qwen2.5-0.5b-instruct-q8]",
           "result": "passed",
-          "runtime_package_sha256": "df2211e72f43d3ee0aa31e6ff7b2cc9817f7a76d6169d28f96e71b65fd553d69",
+          "runtime_package_sha256": "5029bbfcdd8d1ae1d2b0ed9587cc288a68cb38bb7f92b9e10f9bf64a436b1762",
           "stateful_semantics": "dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps"
         }
       ],
@@ -2559,12 +2559,12 @@
           "downstream_runtime_version": "1.29.0",
           "evidence_id": "smollm-135m-f16-onnxruntime-1.29.0",
           "execution_provider": "CPUExecutionProvider",
-          "graph_sha256": "3d242b09fcb5041d71e5914084cf00780867b3b0e32f669f8733369b19b6ea9b",
+          "graph_sha256": "4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
           "result": "passed",
-          "runtime_package_sha256": "5b6fdbdb1db7f7fb9423f2356820812712556abf783acb6bd63c572920031982",
+          "runtime_package_sha256": "57038e28e83a2b4251e334b6098f59b4344c7e526746e29d9fa42eeaebfcbddc",
           "stateful_semantics": "dynamic KV cache prefill plus 20 cache-threaded decode steps"
         },
         {
@@ -2573,12 +2573,12 @@
           "downstream_runtime_version": "0.15.2",
           "evidence_id": "smollm-135m-f16-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
-          "graph_sha256": "3d242b09fcb5041d71e5914084cf00780867b3b0e32f669f8733369b19b6ea9b",
+          "graph_sha256": "4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
           "parity_test": "test_small_f16_gguf_cli_full_logit_and_generation_parity[smollm-135m-f16]",
           "result": "passed",
-          "runtime_package_sha256": "43568320f669d259d5a570ee04bd6378316ab31ce2fcb6383e75b479b4f2b349",
+          "runtime_package_sha256": "15d0218a4b326648d514a98c4f073251c674312b1faa83bec9022cc91daa0a53",
           "stateful_semantics": "ORT GenAI prefill plus 20 cache-threaded decode steps"
         }
       ],

@@ -41,6 +41,10 @@ from mobius.integrations.gguf import (
     materialize_gguf_tokenizer,
     write_gguf_runtime_package,
 )
+from mobius.integrations.gguf._quantization_report import (
+    GGUFQuantizationReport,
+    QuantizationDisposition,
+)
 from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import (
     gguf_graph_package_identity,
@@ -544,9 +548,21 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
     assert len(captured) == 1
     route = json.loads(captured[0].gguf_import_route)
     _assert_stable_import_route(route, case)
+    source_report = captured[0].gguf_quantization_report
+    assert source_report is not None
+    assert source_report.source_fidelity is True
+    assert source_report.storage_quantized is False
+    assert source_report.target_storage_format == "float"
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
-    assert {"model.onnx", "model.onnx.data"} <= {path.name for path in output_dir.iterdir()}
+    assert package.gguf_quantization_report == source_report
+    assert (
+        GGUFQuantizationReport.read_json(output_dir / "quantization_report.json")
+        == source_report
+    )
+    assert {"model.onnx", "model.onnx.data", "quantization_report.json"} <= {
+        path.name for path in output_dir.iterdir()
+    }
 
     tokenizer = AutoTokenizer.from_pretrained(
         case.reference_repository, revision=case.reference_revision
@@ -665,10 +681,10 @@ def test_small_f16_gguf_cli_full_logit_and_generation_parity(
 
 @pytest.mark.integration
 @pytest.mark.integration_fast
-def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
+def test_smollm_q4_k_m_target_storage_and_explicit_float_fidelity(
     tmp_path: Path,
 ) -> None:
-    """Q4_K_M preservation is rejected; explicit dequantization retains full parity."""
+    """Lossy INT4 storage is reported honestly; explicit float retains full parity."""
     case = _Q4_K_M_CASE
     gguf_path = Path(
         hf_hub_download(
@@ -693,14 +709,26 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
         assert asset_path.stat().st_size == size
         assert _sha256(asset_path) == sha256
 
-    with pytest.raises(
-        ValueError,
-        match=r"blk\.0\.attn_k\.weight \(Q5_0\).*cannot represent.*losslessly",
-    ):
-        build_from_gguf(gguf_path)
-
-    with pytest.raises(ValueError, match=r"cannot represent.*losslessly"):
-        main(["build-gguf", str(gguf_path), "--output", str(tmp_path / "rejected")])
+    quantized = build_from_gguf(gguf_path)
+    quantized_report = quantized.gguf_quantization_report
+    assert quantized_report is not None
+    assert quantized_report.storage_quantized is True
+    assert quantized_report.source_fidelity is False
+    assert "INT4 affine block-32" in quantized_report.target_storage_format
+    assert {
+        record.qtype
+        for record in quantized_report.tensor_records
+        if record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
+    } >= {"Q4_K", "Q5_0", "Q6_K", "Q8_0"}
+    quantized_dir = tmp_path / f"{case.name}-int4-target"
+    quantized.save(quantized_dir, progress_bar=False)
+    quantized_reloaded = ModelPackage.load(quantized_dir)
+    assert quantized_reloaded.gguf_quantization_report == quantized_report
+    assert (
+        GGUFQuantizationReport.read_json(quantized_dir / "quantization_report.json")
+        == quantized_report
+    )
+    assert any(node.op_type == "MatMulNBits" for node in quantized["model"].graph)
 
     output_dir = tmp_path / case.name
     captured: list[ModelPackage] = []
@@ -730,9 +758,19 @@ def test_smollm_q4_k_m_fails_closed_or_matches_same_artifact_when_dequantized(
     route = json.loads(package.gguf_import_route)
     _assert_stable_import_route(route, case)
     assert all(node.op_type != "MatMulNBits" for node in package["model"].graph)
+    float_report = package.gguf_quantization_report
+    assert float_report is not None
+    assert float_report.source_fidelity is False
+    assert float_report.storage_quantized is False
+    assert float_report.target_storage_format == "float"
 
     reloaded = ModelPackage.load(output_dir)
     assert tuple(reloaded) == ("model",)
+    assert reloaded.gguf_quantization_report == float_report
+    assert (
+        GGUFQuantizationReport.read_json(output_dir / "quantization_report.json")
+        == float_report
+    )
     rejected_package = tmp_path / f"{case.name}-runtime"
     with pytest.raises(ValueError, match="No unique GGUF runtime evidence"):
         write_gguf_runtime_package(
@@ -1046,7 +1084,11 @@ def test_promoted_gguf_full_runtime_evidence(
         )
     assert len(captured) == 1
     assert captured[0].gguf_import_route == evidence.import_route
+    source_report = captured[0].gguf_quantization_report
+    assert source_report is not None
     if dict(evidence.tensor_qtypes).get("Q8_0", 0):
+        assert source_report.storage_quantized is True
+        assert source_report.source_fidelity is True
         graph = captured[0]["model"].graph
         op_types = Counter(node.op_type for node in graph)
         assert op_types["MatMulNBits"] > 0
@@ -1057,6 +1099,11 @@ def test_promoted_gguf_full_runtime_evidence(
         assert "lm_head.scales" in initializer_names
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
+    assert package.gguf_quantization_report == source_report
+    assert (
+        GGUFQuantizationReport.read_json(output_dir / "quantization_report.json")
+        == source_report
+    )
     runtime_identity = gguf_graph_package_identity(output_dir)
     assert runtime_identity.files == evidence.runtime_package_files
     assert runtime_identity.sha256 == evidence.runtime_package_sha256
