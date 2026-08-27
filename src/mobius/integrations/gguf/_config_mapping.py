@@ -1144,7 +1144,7 @@ def _lfm2moe_postprocess(
     raw_gating = metadata[f"{arch}.expert_gating_func"]
     gating_value = float(raw_gating)
     if not math.isfinite(gating_value) or not gating_value.is_integer():
-        raise ValueError("smallthinker.expert_gating_func must be an integer")
+        raise ValueError(f"{arch}.expert_gating_func must be an integer")
     gating = int(gating_value)
     if gating != 2:
         raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")

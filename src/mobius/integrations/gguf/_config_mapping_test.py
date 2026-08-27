@@ -1725,6 +1725,15 @@ class TestLfm2MoePostprocess:
         with pytest.raises(KeyError, match="expert_gating_func"):
             _lfm2moe_postprocess(self._base_config(), metadata)
 
+    def test_non_integer_gating_function_names_lfm2moe(self) -> None:
+        from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
+
+        metadata = self._metadata()
+        metadata["lfm2moe.expert_gating_func"] = 2.5
+
+        with pytest.raises(ValueError, match=r"lfm2moe\.expert_gating_func"):
+            _lfm2moe_postprocess(self._base_config(), metadata)
+
     def test_all_dense_prefix_is_valid(self) -> None:
         from mobius.integrations.gguf._config_mapping import _lfm2moe_postprocess
 
