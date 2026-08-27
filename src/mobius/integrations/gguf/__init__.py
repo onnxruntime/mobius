@@ -12,8 +12,8 @@ Usage::
 
     # Text-only model
     pkg = build_from_gguf("path/to/model.gguf")
-    # Supported quantization is preserved by default; pass
-    # keep_quantized=False for a fully float model.
+    # Quantized target storage is used by default with a fidelity report;
+    # pass keep_quantized=False for explicitly reported float storage.
 
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
@@ -46,6 +46,13 @@ from mobius.integrations.gguf._preflight import (
     preflight_gguf,
     preflight_hf_gguf,
     preflight_local_gguf,
+)
+from mobius.integrations.gguf._quantization_report import (
+    GGUFQuantizationReport,
+    QuantizationDisposition,
+    QuantizationDispositionStat,
+    QuantizationTensorRecord,
+    QuantizationTypeStat,
 )
 from mobius.integrations.gguf._reuse import verify_gguf_reuse_manifest
 from mobius.integrations.gguf._runtime_package import write_gguf_runtime_package
@@ -99,4 +106,9 @@ __all__ = [
     "preflight_hf_gguf",
     "GgufPreflightReport",
     "GgufTypeStat",
+    "GGUFQuantizationReport",
+    "QuantizationDisposition",
+    "QuantizationDispositionStat",
+    "QuantizationTensorRecord",
+    "QuantizationTypeStat",
 ]

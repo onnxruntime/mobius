@@ -67,8 +67,10 @@ def _sha256(path: Path) -> str:
 
 @pytest.mark.integration
 @pytest.mark.parametrize("artifact", _ARTIFACTS, ids=lambda artifact: artifact.architecture)
-def test_real_dense_gguf_artifact_fails_closed(artifact: _Artifact) -> None:
-    """Pinned Q4_K_M artifacts do not silently requantize incompatible projections."""
+def test_real_dense_gguf_artifact_reports_lossy_requantization(
+    artifact: _Artifact, caplog
+) -> None:
+    """Pinned Q4_K_M artifacts remain packed without a source-fidelity claim."""
     path = Path(
         hf_hub_download(
             repo_id=artifact.repo_id,
@@ -83,8 +85,11 @@ def test_real_dense_gguf_artifact_fails_closed(artifact: _Artifact) -> None:
     qtypes = Counter(qtype.name for _, _, qtype, _ in gguf_model.tensor_items_raw())
     assert dict(sorted(qtypes.items())) == artifact.qtypes
 
-    with pytest.raises(
-        ValueError,
-        match=r"Quantization-preserving GGUF import would change the dequantized values",
-    ):
-        build_from_gguf(path)
+    with caplog.at_level("WARNING"):
+        package = build_from_gguf(path)
+    report = package.gguf_quantization_report
+    assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
+    assert report.storage_quantized is True
+    assert report.source_fidelity is False
+    assert report.converted_from == "Q4_K_M-like mixed GGUF"
+    assert {stat.qtype for stat in report.source_qtype_census} == set(artifact.qtypes)

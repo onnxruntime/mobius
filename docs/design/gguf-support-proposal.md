@@ -858,11 +858,11 @@ Neither QDQ nor MatMulNBits can natively represent:
 
 ### 8.7 Implemented Direct-Import Policy
 
-Direct GGUF import preserves supported quantization by default, with an
-explicit fully float path:
+Direct GGUF import uses quantized target storage by default, with an explicit
+fully float path and a persistent fidelity report:
 
 ```python
-# Default: preserve supported quantization
+# Default: quantized target storage where supported
 pkg = build_from_gguf("model.gguf")
 
 # Explicitly dequantize all weights
@@ -872,9 +872,11 @@ pkg = build_from_gguf("model.gguf", keep_quantized=False)
 The quantized path is classified per tensor: supported affine blocks are
 repacked for `MatMulNBits`; in text-only builds, supported native IQ/MXFP4
 projection blocks retain their bytes for `BlockQuantizedMatMul`; and multimodal
-or mixed source qtypes may require dequantization/requantization or produce a
-clear unsupported-layout error. F32-, F16-, and BF16-only files use the float
-path automatically because there is no quantization to preserve.
+or mixed source qtypes may require lossy dequantization/requantization or produce
+a clear unsupported-layout error. One deterministic warning summarizes lossy
+qtypes, counts, and bytes, while `quantization_report.json` records storage and
+compute semantics separately. F32-, F16-, and BF16-only files use the float path
+automatically because there is no quantized storage to convert.
 
 ### 8.8 Historical Alternative: QDQLinear (Not Implemented)
 

@@ -511,7 +511,7 @@ class TestCLIBuildGGUF:
         ],
     )
     def test_quantization_flag_parsing(self, tmp_path, extra_args, expected):
-        """Quantization is preserved by default; ``--dequantize`` opts out.
+        """Quantized target storage is default; ``--dequantize`` requests float.
 
         The ``--keep-quantized`` alias that used to be covered here was removed:
         it was never read (``keep_quantized = not args.dequantize``), so the case

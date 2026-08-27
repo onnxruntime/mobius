@@ -62,6 +62,8 @@ __all__ = [
     "TENCENT_Q1_0_NATIVE_ZERO_POINT",
     "is_tencent_q1_0_layout",
     "parse_tencent_q1_0_tensor",
+    "tencent_q1_0_source_nbytes",
+    "tencent_q1_0_target_bits",
 ]
 
 import math
@@ -134,6 +136,25 @@ def _tensor_data_offset(tensor) -> int:
     # Each tensor's metadata ends with the data offset (relative to the
     # data section start). It is the last part in the field record.
     return int(tensor.field.parts[tensor.field.data[-1]][0])
+
+
+def tencent_q1_0_source_nbytes(tensor) -> int:
+    """Return the exact payload bytes for one Tencent-layout Q1_0 tensor."""
+    if len(tensor.shape) != 2:
+        raise ValueError(f"Tensor {tensor.name!r} must be rank 2 for Tencent Q1_0")
+    ne0 = int(tensor.shape[0])
+    ne1 = int(tensor.shape[1])
+    if ne0 % TENCENT_Q1_0_NATIVE_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"Tensor {tensor.name!r} has K={ne0} not divisible by "
+            f"Tencent Q1_0 native block size {TENCENT_Q1_0_NATIVE_BLOCK_SIZE}"
+        )
+    return ne1 * (ne0 // TENCENT_Q1_0_NATIVE_BLOCK_SIZE) * _TENCENT_Q1_0_BLOCK_BYTES
+
+
+def tencent_q1_0_target_bits() -> int:
+    """Return the selected exact MatMulNBits representation width."""
+    return 2 if flags.tencent_q1_0_use_native_2bit else 4
 
 
 def parse_tencent_q1_0_tensor(

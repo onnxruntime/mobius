@@ -1506,6 +1506,13 @@ class TestKeepQuantizedMixedPrecision:
         ]
         assert float_embedding.const_value is not None
         assert list(float_embedding.shape) == [64, 32]
+        assert package.gguf_quantization_report.storage_quantized is True
+        # The float mmproj vision encoder is merged into the package-level
+        # report alongside the quantized text backbone (issue 4): the target
+        # storage format spans both.
+        assert package.gguf_quantization_report.target_storage_format == (
+            "INT4 affine block-32 + float"
+        )
 
         missing = [
             f"{component}:{name}"
@@ -1518,6 +1525,7 @@ class TestKeepQuantizedMixedPrecision:
         output_dir = tmp_path / "saved"
         package.save(str(output_dir), progress_bar=False)
         reloaded = ModelPackage.load(str(output_dir))
+        assert reloaded.gguf_quantization_report == package.gguf_quantization_report
         assert set(reloaded) == {"decoder", "vision_encoder", "embedding"}
         assert all(
             initializer.const_value is not None
@@ -1533,7 +1541,7 @@ class TestKeepQuantizedMixedPrecision:
         text_gguf = tmp_path / "gemma4-q4-f32-projection.gguf"
         _write_quantized_gemma4_text_gguf(text_gguf, float_projection=True)
 
-        with pytest.raises(ValueError, match=r"would quantize float projection"):
+        with pytest.raises(ValueError, match=r"would quantize a source-float tensor"):
             build_gemma4_vlm_from_gguf(text_gguf, clip_mmproj_gguf, image_token_id=63)
 
         package = build_gemma4_vlm_from_gguf(
@@ -1662,6 +1670,373 @@ class TestKeepQuantizedMixedPrecision:
         session = ort.InferenceSession(str(decoder_path), providers=["CPUExecutionProvider"])
         input_names = {graph_input.name for graph_input in session.get_inputs()}
         assert "inputs_embeds" in input_names
+
+
+class TestMmprojQuantizationReportPreflight:
+    """Unit tests for the mmproj vision/(audio) preflight (follow-up issue 4).
+
+    ``build_gemma4_vlm_from_gguf`` previously computed
+    ``pkg.gguf_quantization_report`` from the text GGUF alone, silently
+    excluding every mmproj vision/(audio) source tensor from the census and
+    tensor records. These tests exercise
+    ``_preflight_mmproj_quantization_report`` directly against a synthetic
+    ``clip`` mmproj GGUF.
+    """
+
+    def test_vision_only_census_covers_whole_file_and_records_are_mapped_vision(
+        self, tmp_path: Path
+    ):
+        from mobius.integrations.gguf._mmproj import (
+            _preflight_mmproj_quantization_report,
+        )
+        from mobius.integrations.gguf._mmproj_mapping import map_mmproj_vision_to_hf
+        from mobius.integrations.gguf._quantization_report import QuantizationDisposition
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "mmproj.gguf"
+        _write_clip_mmproj_gguf(path, with_audio=True)
+        mmproj_gguf = GGUFModel(str(path))
+
+        report = _preflight_mmproj_quantization_report(mmproj_gguf, include_audio=False)
+
+        # The source qtype census covers *every* tensor in the file (vision +
+        # audio + projector), independent of whether audio is mapped below.
+        assert sum(stat.tensor_count for stat in report.source_qtype_census) == (
+            mmproj_gguf.num_tensors
+        )
+        assert sum(stat.source_bytes for stat in report.source_qtype_census) == sum(
+            int(tensor.n_bytes) for tensor in mmproj_gguf.reader_tensors()
+        )
+        # This fixture is entirely float32.
+        assert [stat.qtype for stat in report.source_qtype_census] == ["F32"]
+
+        # Only vision (+ shared projector) tensors are *mapped* into records
+        # when include_audio=False, even though audio tensors are present in
+        # the file and already counted in the census above.
+        expected_names = {
+            f"mmproj:{name}"
+            for name in mmproj_gguf.tensor_names
+            if (name.startswith("v.") or name == "mm.input_projection.weight")
+            and map_mmproj_vision_to_hf(name) is not None
+        }
+        assert expected_names  # sanity: the fixture does map some tensors
+        assert {record.name for record in report.tensor_records} == expected_names
+        assert not any(record.name.startswith("mmproj:a.") for record in report.tensor_records)
+        assert all(
+            record.disposition is QuantizationDisposition.SOURCE_FLOAT
+            for record in report.tensor_records
+        )
+        assert report.explicit_float_tensors == report.tensor_records
+        assert report.source_fidelity is True
+        assert report.storage_quantized is False
+        assert report.target_storage_format == "float"
+
+    def test_include_audio_adds_audio_records_without_changing_the_file_census(
+        self, tmp_path: Path
+    ):
+        from mobius.integrations.gguf._mmproj import (
+            _preflight_mmproj_quantization_report,
+        )
+        from mobius.integrations.gguf._mmproj_mapping import (
+            map_mmproj_audio_to_hf,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "mmproj.gguf"
+        _write_clip_mmproj_gguf(path, with_audio=True)
+        mmproj_gguf = GGUFModel(str(path))
+
+        vision_only = _preflight_mmproj_quantization_report(mmproj_gguf, include_audio=False)
+        vision_and_audio = _preflight_mmproj_quantization_report(
+            mmproj_gguf, include_audio=True
+        )
+
+        # Enabling audio only adds mapped records; the raw file census (every
+        # tensor's qtype/bytes) is a property of the file, not of what gets
+        # mapped, so it must be unaffected by include_audio.
+        assert vision_and_audio.source_qtype_census == vision_only.source_qtype_census
+        assert len(vision_and_audio.tensor_records) > len(vision_only.tensor_records)
+
+        expected_audio_names = {
+            f"mmproj:{name}"
+            for name in mmproj_gguf.tensor_names
+            if (name.startswith("a.") or name == "mm.a.input_projection.weight")
+            and map_mmproj_audio_to_hf(name) is not None
+        }
+        assert expected_audio_names  # the with_audio fixture maps audio tensors
+        record_names = {record.name for record in vision_and_audio.tensor_records}
+        assert expected_audio_names <= record_names
+        vision_names = {record.name for record in vision_only.tensor_records}
+        assert expected_audio_names.isdisjoint(vision_names)
+        assert vision_names <= record_names
+
+    def test_quantized_mmproj_tensor_dequantizes_to_float_and_breaks_fidelity(
+        self, tmp_path: Path
+    ):
+        """Report atypical quantized mmproj tensors as dequantized float.
+
+        The encoder always builds a float parameter, so the report must show
+        dequantization rather than silently claiming perfect source fidelity.
+        """
+        from gguf import GGMLQuantizationType, GGUFWriter
+
+        from mobius.integrations.gguf._mmproj import (
+            _preflight_mmproj_quantization_report,
+        )
+        from mobius.integrations.gguf._quantization_report import QuantizationDisposition
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        path = tmp_path / "mmproj-quantized-patch.gguf"
+        writer = GGUFWriter(str(path), "clip")
+        writer.add_string("clip.vision.projector_type", "gemma4v")
+        writer.add_bool("clip.has_vision_encoder", True)
+        # A Q8_0 block is 32 elements: a 2-byte f16 scale + 32 int8 values.
+        out_features, in_features = 8, 32
+        block_bytes = 34
+        raw = np.zeros((out_features, in_features // 32 * block_bytes), dtype=np.uint8)
+        writer.add_tensor("v.patch_embd.weight", raw, raw_dtype=GGMLQuantizationType.Q8_0)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+        mmproj_gguf = GGUFModel(str(path))
+        report = _preflight_mmproj_quantization_report(mmproj_gguf, include_audio=False)
+
+        assert len(report.tensor_records) == 1
+        record = report.tensor_records[0]
+        assert record.name == "mmproj:v.patch_embd.weight"
+        assert record.qtype == "Q8_0"
+        assert record.disposition is QuantizationDisposition.DEQUANTIZED_FLOAT
+        assert record.target_storage == "float"
+        assert report.source_fidelity is False
+        assert report.storage_quantized is False
+
+    def test_unknown_mapped_mmproj_qtype_fails_preflight(self) -> None:
+        from mobius.integrations.gguf._mmproj import (
+            _preflight_mmproj_quantization_report,
+        )
+
+        tensor = SimpleNamespace(
+            name="v.patch_embd.weight",
+            tensor_type=SimpleNamespace(name="UNKNOWN", value=99_999),
+            shape=(8, 32),
+            n_bytes=256,
+        )
+        source = SimpleNamespace(reader_tensors=lambda: iter([tensor]))
+
+        with pytest.raises(ValueError, match=r"no safe disposition|pinned llama.cpp census"):
+            _preflight_mmproj_quantization_report(source, include_audio=False)
+
+
+class TestGemma4MultimodalQuantizationReportMerge:
+    """The package-level report must combine text + mmproj without collisions.
+
+    Covers the follow-up (issue 4): the Gemma4 multimodal builder previously
+    preflighted only the text GGUF, so the persisted
+    ``quantization_report.json`` silently excluded every mmproj vision/audio
+    source tensor. These synthetic text+vision and text+vision/audio tests
+    assert the merged package-level report's counts/bytes, tensor records,
+    and JSON persistence.
+    """
+
+    def test_text_plus_vision_report_counts_bytes_records_and_persists(self, tmp_path: Path):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_gemma4_vlm_from_gguf
+        from mobius.integrations.gguf._quantization_report import QuantizationDisposition
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
+        text_path = tmp_path / "gemma4-q4.gguf"
+        _write_quantized_gemma4_text_gguf(text_path)
+
+        text_gguf = GGUFModel(str(text_path))
+        mmproj_gguf = GGUFModel(str(mmproj_path))
+
+        package = build_gemma4_vlm_from_gguf(text_path, mmproj_path, image_token_id=63)
+        report = package.gguf_quantization_report
+
+        # The census covers every tensor from BOTH source files (including
+        # the mmproj's audio tensors, which are present but unmapped since
+        # include_audio defaults to False).
+        assert sum(stat.tensor_count for stat in report.source_qtype_census) == (
+            text_gguf.num_tensors + mmproj_gguf.num_tensors
+        )
+        expected_bytes = sum(
+            int(tensor.n_bytes) for tensor in text_gguf.reader_tensors()
+        ) + sum(int(tensor.n_bytes) for tensor in mmproj_gguf.reader_tensors())
+        assert sum(stat.source_bytes for stat in report.source_qtype_census) == expected_bytes
+
+        # Mapped tensor records include both the text decoder's mapped
+        # weights and the mmproj vision tower's, disambiguated by the
+        # "mmproj:" prefix so the two components cannot collide.
+        mmproj_records = [
+            record for record in report.tensor_records if record.name.startswith("mmproj:")
+        ]
+        text_records = [
+            record for record in report.tensor_records if not record.name.startswith("mmproj:")
+        ]
+        assert mmproj_records and text_records
+        assert not any(record.name.startswith("mmproj:a.") for record in mmproj_records)
+        assert all(
+            record.disposition is QuantizationDisposition.SOURCE_FLOAT
+            for record in mmproj_records
+        )
+        assert report.storage_quantized is True
+        assert report.target_storage_format == "INT4 affine block-32 + float"
+
+        # Persistence: the merged report round-trips through the package
+        # save/load path exactly like the pre-existing single-source case.
+        output_dir = tmp_path / "saved"
+        package.save(str(output_dir), progress_bar=False)
+        reloaded = ModelPackage.load(str(output_dir))
+        assert reloaded.gguf_quantization_report == report
+
+    def test_text_plus_vision_and_audio_reports_merge_counts_bytes_and_persist(
+        self, tmp_path: Path
+    ):
+        """Exercises the include_audio=True mmproj preflight + merge.
+
+        ``build_gemma4_vlm_from_gguf(..., include_audio=True)`` currently
+        fails closed before reaching the quantization preflight step (the
+        ``gemma4a`` audio projector is deferred/rejected -- see
+        ``_preflight_mmproj_pair`` and the module docstring's audio caveat),
+        so this drives the same mmproj preflight + merge helpers the builder
+        itself uses at the level below that guard, covering the combined
+        vision+audio report shape end to end. The "text" side is a minimal
+        synthetic stand-in report (this test targets the mmproj preflight and
+        the merge, which is the code changed for issue 4).
+        """
+        from mobius.integrations.gguf._mmproj import (
+            _merge_component_quantization_reports,
+            _preflight_mmproj_quantization_report,
+        )
+        from mobius.integrations.gguf._quantization_report import (
+            GGUFQuantizationReport,
+            QuantizationDisposition,
+            QuantizationTensorRecord,
+            disposition_for_import_route,
+        )
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._spec import QuantImportRoute, RepackExactness
+
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
+        mmproj_gguf = GGUFModel(str(mmproj_path))
+        mmproj_report = _preflight_mmproj_quantization_report(mmproj_gguf, include_audio=True)
+
+        # A minimal stand-in text-backbone component report (one lossless
+        # native tensor, one float tensor) shaped like what
+        # _builder._preflight_quantization_report produces for a real text
+        # GGUF, so the merge is exercised against a genuinely quantized
+        # component without needing to build a full Gemma4Model here.
+        text_report = GGUFQuantizationReport.create(
+            source_qtypes=[("Q4_0", 4608), ("F32", 256)],
+            tensor_records=[
+                QuantizationTensorRecord(
+                    name="blk.0.attn_q.weight",
+                    qtype="Q4_0",
+                    source_bytes=4608,
+                    disposition=disposition_for_import_route(
+                        QuantImportRoute.NATIVE_BYTES, RepackExactness.EXACT
+                    ),
+                    target_storage="native GGUF block storage",
+                    reason="synthetic stand-in for the text component",
+                ),
+                QuantizationTensorRecord(
+                    name="token_embd.weight",
+                    qtype="F32",
+                    source_bytes=256,
+                    disposition=QuantizationDisposition.SOURCE_FLOAT,
+                    target_storage="float",
+                    reason="synthetic stand-in for the text component",
+                ),
+            ],
+            target_storage_format="native GGUF block storage",
+            compute_mode="runtime-dependent native custom op or inline standard-ONNX fallback",
+            compute_capability="synthetic stand-in capability",
+        )
+
+        merged = _merge_component_quantization_reports(text_report, mmproj_report)
+
+        assert sum(stat.tensor_count for stat in merged.source_qtype_census) == sum(
+            stat.tensor_count for stat in text_report.source_qtype_census
+        ) + sum(stat.tensor_count for stat in mmproj_report.source_qtype_census)
+        assert sum(stat.source_bytes for stat in merged.source_qtype_census) == sum(
+            stat.source_bytes for stat in text_report.source_qtype_census
+        ) + sum(stat.source_bytes for stat in mmproj_report.source_qtype_census)
+        assert len(merged.tensor_records) == len(text_report.tensor_records) + len(
+            mmproj_report.tensor_records
+        )
+
+        audio_records = [
+            record
+            for record in merged.tensor_records
+            if record.name.startswith("mmproj:a.")
+            or record.name == "mmproj:mm.a.input_projection.weight"
+        ]
+        vision_records = [
+            record
+            for record in merged.tensor_records
+            if record.name.startswith("mmproj:v.")
+            or record.name == "mmproj:mm.input_projection.weight"
+        ]
+        assert audio_records and vision_records
+        assert {"blk.0.attn_q.weight", "token_embd.weight"} <= {
+            record.name for record in merged.tensor_records
+        }
+        assert all(
+            record.disposition is QuantizationDisposition.SOURCE_FLOAT
+            for record in audio_records + vision_records
+        )
+        assert merged.storage_quantized is True
+        assert merged.target_storage_format == "float + native GGUF block storage"
+
+        # Persistence: the merged report round-trips through JSON exactly
+        # like the package-level report does via ModelPackage.save/load.
+        report_path = tmp_path / "quantization_report.json"
+        merged.write_json(report_path)
+        reloaded = GGUFQuantizationReport.read_json(report_path)
+        assert reloaded == merged
+
+    def test_merge_rejects_conflicting_duplicate_tensor_names(self):
+        """Guard the source-name collision contract.
+
+        If two component reports disagree about the same unqualified tensor
+        name, the merge must fail loudly rather than silently pick one.
+        """
+        from mobius.integrations.gguf._mmproj import (
+            _merge_component_quantization_reports,
+        )
+        from mobius.integrations.gguf._quantization_report import (
+            GGUFQuantizationReport,
+            QuantizationDisposition,
+            QuantizationTensorRecord,
+        )
+
+        def make_report(disposition: QuantizationDisposition) -> GGUFQuantizationReport:
+            return GGUFQuantizationReport.create(
+                source_qtypes=[("F32", 4)],
+                tensor_records=[
+                    QuantizationTensorRecord(
+                        name="shared.weight",
+                        qtype="F32",
+                        source_bytes=4,
+                        disposition=disposition,
+                        target_storage="float",
+                        reason="conflict fixture",
+                    )
+                ],
+                target_storage_format="float",
+                compute_mode="float operators",
+                compute_capability="test",
+            )
+
+        first = make_report(QuantizationDisposition.SOURCE_FLOAT)
+        second = make_report(QuantizationDisposition.DEQUANTIZED_FLOAT)
+        with pytest.raises(ValueError, match="Conflicting GGUF quantization dispositions"):
+            _merge_component_quantization_reports(first, second)
 
 
 # Small synthetic Muse Glimmer vision tower dimensions.

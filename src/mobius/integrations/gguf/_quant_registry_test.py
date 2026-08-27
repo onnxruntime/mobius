@@ -372,6 +372,27 @@ class TestStorageInvariants:
         assert route is QuantImportRoute.REJECTED
         assert "no trusted decoder" in reason
 
+    def test_requantization_rejects_an_unsupported_affine_target(self) -> None:
+        route, exactness, reason = quant_import_decision(
+            2,
+            TensorRole.PROJECTION,
+            target_bits=8,
+            target_block_size=32,
+        )
+        assert route is QuantImportRoute.REJECTED
+        assert exactness is None
+        assert "only the affine (4, 32) target" in reason
+
+    def test_native_to_affine_conversion_is_explicitly_lossy(self) -> None:
+        route, exactness, _ = quant_import_decision(
+            20,
+            TensorRole.EMBEDDING,
+            target_bits=4,
+            target_block_size=32,
+        )
+        assert route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+        assert exactness is RepackExactness.LOSSY
+
     @pytest.mark.parametrize("name", ["Q4_0", "Q8_0", "Q1_0"])
     def test_exact_affine_routes_are_declared(self, name: str) -> None:
         spec = quant_spec_by_name(name)

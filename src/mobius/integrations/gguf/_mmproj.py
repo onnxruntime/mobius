@@ -49,7 +49,7 @@ import logging
 import math
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
@@ -64,6 +64,12 @@ from mobius.integrations.gguf._mmproj_registry import (
     projector_type_for_modality,
 )
 from mobius.integrations.gguf._spec import Support
+
+if TYPE_CHECKING:
+    from mobius.integrations.gguf._quantization_report import (
+        GGUFQuantizationReport,
+        QuantizationTensorRecord,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1693,6 +1699,174 @@ def build_gemma3_vlm_from_gguf(
     return pkg
 
 
+def _preflight_mmproj_quantization_report(
+    mmproj_gguf: Any,
+    *,
+    include_audio: bool,
+) -> GGUFQuantizationReport:
+    """Classify every mapped mmproj vision/(audio) tensor before conversion.
+
+    The Gemma4 vision (and optional audio) encoder always builds float
+    parameters regardless of the mmproj source qtype -- see
+    ``build_gemma4_vlm_from_gguf``'s "Mixed precision" note -- so every mapped
+    tensor here lands on an explicit float disposition: a tensor already
+    stored as float (F32/F16/BF16) is ``SOURCE_FLOAT``; anything else is
+    unconditionally dequantized on load (:meth:`GGUFModel.get_tensor` always
+    dequantizes) and is ``DEQUANTIZED_FLOAT``. There is no lossy-requantize
+    path for mmproj tensors, so this never contributes to the fidelity
+    warning.
+
+    Record names are qualified with an ``"mmproj:"`` prefix so they cannot
+    collide with the text GGUF's own tensor names when the two component
+    reports are merged (see :func:`_merge_component_quantization_reports`)
+    into the package-level report.
+    """
+    from mobius.integrations.gguf._mmproj_mapping import (
+        map_mmproj_audio_to_hf,
+        map_mmproj_vision_to_hf,
+    )
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+    )
+    from mobius.integrations.gguf._quantization_report import (
+        GGUFQuantizationReport,
+        QuantizationDisposition,
+        QuantizationTensorRecord,
+    )
+    from mobius.integrations.gguf._spec import Support
+
+    float_type_ids = float_storage_type_ids()
+    source_qtypes: list[tuple[str, int]] = []
+    records: list[QuantizationTensorRecord] = []
+    rejected: list[QuantizationTensorRecord] = []
+    for tensor in mmproj_gguf.reader_tensors():
+        qtype = tensor.tensor_type
+        qtype_id = getattr(qtype, "value", qtype)
+        quant_spec = get_quant_spec(qtype)
+        qtype_name = (
+            quant_spec.name if quant_spec is not None else str(getattr(qtype, "name", qtype))
+        )
+        source_bytes = int(tensor.n_bytes)
+        source_qtypes.append((qtype_name, source_bytes))
+
+        hf_name = None
+        if tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
+            hf_name = map_mmproj_vision_to_hf(tensor.name)
+        elif include_audio and (
+            tensor.name.startswith("a.") or tensor.name == "mm.a.input_projection.weight"
+        ):
+            hf_name = map_mmproj_audio_to_hf(tensor.name)
+        if hf_name is None:
+            # Unmapped tensor (e.g. a different modality, or an unused
+            # metadata tensor): still counted in the source qtype census
+            # above, but not a mapped-weight record.
+            continue
+
+        if qtype_id in float_type_ids:
+            disposition = QuantizationDisposition.SOURCE_FLOAT
+            reason = (
+                "The mmproj vision/audio tensor is already stored as float and "
+                "the encoder always builds float parameters."
+            )
+        elif quant_spec is None:
+            disposition = QuantizationDisposition.REJECTED
+            reason = "The qtype is outside the pinned llama.cpp census."
+        elif quant_spec.dequantize is not Support.SUPPORTED:
+            disposition = QuantizationDisposition.REJECTED
+            reason = "The mapped mmproj tensor has no trusted float dequantizer."
+        else:
+            disposition = QuantizationDisposition.DEQUANTIZED_FLOAT
+            reason = (
+                "The mmproj vision/audio encoder always builds float parameters; "
+                "the quantized source tensor is unconditionally dequantized on load."
+            )
+        record = QuantizationTensorRecord(
+            name=f"mmproj:{tensor.name}",
+            qtype=qtype_name,
+            source_bytes=source_bytes,
+            disposition=disposition,
+            target_storage=(
+                "rejected" if disposition is QuantizationDisposition.REJECTED else "float"
+            ),
+            reason=reason,
+        )
+        records.append(record)
+        if disposition is QuantizationDisposition.REJECTED:
+            rejected.append(record)
+
+    if rejected:
+        details = "; ".join(
+            f"{record.name} ({record.qtype}): {record.reason}" for record in rejected[:5]
+        )
+        suffix = "" if len(rejected) <= 5 else f"; and {len(rejected) - 5} more"
+        raise ValueError(
+            "GGUF quantization preflight could not determine a safe disposition for "
+            f"{len(rejected)} mapped mmproj tensor(s): {details}{suffix}"
+        )
+
+    return GGUFQuantizationReport.create(
+        source_qtypes=source_qtypes,
+        tensor_records=records,
+        target_storage_format="float",
+        compute_mode="float operators",
+        compute_capability="Storage is float and executes through float operators.",
+    )
+
+
+def _merge_component_quantization_reports(
+    *reports: GGUFQuantizationReport,
+) -> GGUFQuantizationReport:
+    """Merge independently-preflighted reports from *different* GGUF sources.
+
+    :meth:`GGUFQuantizationReport.combine` requires every component to share
+    one GGUF source qtype census -- it's designed to reassemble one file's
+    main graph plus its MTP-head sidecar. The Gemma4 multimodal package
+    instead draws from two independent files (the text backbone GGUF and the
+    companion mmproj GGUF), each with its own census, so this recomputes the
+    merged census/dispositions directly from every component's raw per-tensor
+    statistics via :meth:`GGUFQuantizationReport.create` rather than asserting
+    the censuses match.
+
+    Tensor records must already use source-qualified names where collisions
+    are possible (see :func:`_preflight_mmproj_quantization_report`'s
+    ``"mmproj:"`` prefix); a name collision with conflicting dispositions
+    raises, mirroring :meth:`GGUFQuantizationReport.combine`.
+    """
+    from mobius.integrations.gguf._quantization_report import (
+        GGUFQuantizationReport,
+    )
+
+    if not reports:
+        raise ValueError("At least one GGUF quantization report is required")
+    records_by_name: dict[str, QuantizationTensorRecord] = {}
+    for report in reports:
+        for record in report.tensor_records:
+            previous = records_by_name.setdefault(record.name, record)
+            if previous != record:
+                raise ValueError(
+                    f"Conflicting GGUF quantization dispositions for {record.name!r}"
+                )
+    source_qtypes = [
+        (stat.qtype, stat.source_bytes if index == 0 else 0)
+        for report in reports
+        for stat in report.source_qtype_census
+        for index in range(stat.tensor_count)
+    ]
+    target_formats = {
+        target for report in reports for target in report.target_storage_format.split(" + ")
+    }
+    compute_modes = {report.compute_mode for report in reports}
+    compute_capabilities = {report.compute_capability for report in reports}
+    return GGUFQuantizationReport.create(
+        source_qtypes=source_qtypes,
+        tensor_records=records_by_name.values(),
+        target_storage_format=" + ".join(sorted(target_formats)),
+        compute_mode=" + ".join(sorted(compute_modes)),
+        compute_capability=" ".join(sorted(compute_capabilities)),
+    )
+
+
 def build_gemma4_vlm_from_gguf(
     text_gguf_path: str | Path,
     mmproj_gguf_path: str | Path,
@@ -1718,15 +1892,19 @@ def build_gemma4_vlm_from_gguf(
         include_audio: When ``True``, also build the (experimental) audio
             encoder. Off by default — see the module docstring.
         keep_quantized: Preserve the text backbone's GGUF quantization when
-            present. This is the default: decoder projections become
+            present as quantized target storage. This is the default: decoder projections become
             MatMulNBits and compatible token-embedding tables become
             GatherBlockQuantized. Incompatible embedding qtypes or shapes stay
             float. Quantized projection source types, including native
             IQ/MXFP4 blocks, are normalized to the common affine layout rather
-            than retained byte-for-byte. Set to ``False`` to dequantize all
+            than retained byte-for-byte. Lossy normalization emits one warning
+            and is recorded in ``quantization_report.json``. Set to ``False`` to dequantize all
             text weights. The vision (and audio) encoder always stays float
             because its weights come from the mmproj as F16 — see the "Mixed
-            precision" note below.
+            precision" note below. ``quantization_report.json`` also censuses
+            the mmproj vision/(audio) source tensors and records their
+            (always-float) dispositions alongside the text backbone's, under
+            source-qualified ``"mmproj:"``-prefixed tensor names.
 
     Returns:
         A :class:`ModelPackage` with ``decoder`` + ``vision_encoder`` +
@@ -1746,6 +1924,7 @@ def build_gemma4_vlm_from_gguf(
     from mobius._builder import resolve_dtype
     from mobius.integrations.gguf._builder import (
         _has_quantized_weights,
+        _preflight_quantization_report,
         _reject_unsupported_quantization_preservation,
         _validate_gguf_model,
     )
@@ -1883,9 +2062,44 @@ def build_gemma4_vlm_from_gguf(
     from mobius._builder import build_from_module
 
     module = Gemma4Model(config)
+
+    def target_name(hf_name: str) -> str:
+        if hf_name.startswith("language_model.lm_head."):
+            return "decoder.lm_head." + hf_name.removeprefix("language_model.lm_head.")
+        if hf_name.startswith("language_model.embed_tokens"):
+            return "embedding." + hf_name.removeprefix("language_model.")
+        if hf_name.startswith("language_model."):
+            return "decoder.model." + hf_name.removeprefix("language_model.")
+        return hf_name
+
+    # The text-only preflight below already emits the single deterministic
+    # fidelity warning (via its default emit_warning=True) when the text
+    # backbone has lossy tensors. The mmproj vision/(audio) report merged in
+    # afterwards can never introduce a lossy-requantize tensor (mmproj
+    # weights always stay float — see _preflight_mmproj_quantization_report),
+    # so it cannot change that warning; the merge below must not re-emit it.
+    quantization_report = _preflight_quantization_report(
+        text_gguf,
+        "gemma4",
+        module,
+        config,
+        preserve_quantization=preserve_quantization,
+        target_bits=(config.quantization.bits if preserve_quantization else None),
+        target_block_size=(config.quantization.group_size if preserve_quantization else None),
+        execution_provider=execution_provider,
+        name_mapper=lambda name, _architecture: _text_gguf_name_to_hf_multimodal(name),
+        target_name_mapper=target_name,
+    )
+    mmproj_quantization_report = _preflight_mmproj_quantization_report(
+        mmproj_gguf, include_audio=include_audio
+    )
+    quantization_report = _merge_component_quantization_reports(
+        quantization_report, mmproj_quantization_report
+    )
     pkg = build_from_module(
         module, config, task=Gemma4Task(), execution_provider=execution_provider
     )
+    pkg.gguf_quantization_report = quantization_report
     logger.info("Built Gemma4 VLM graph (%d components: %s)", len(pkg), list(pkg))
 
     # 3. Assemble the combined HF-multimodal state dict from both GGUFs. The

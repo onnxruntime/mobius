@@ -656,6 +656,7 @@ class TestRepackQ4K:
         ort_deq = _dequantize_repacked_q4(result, 256).ravel()
         max_abs_diff = float(np.max(np.abs(ort_deq - gguf_deq)))
         tolerance = float(result.scales.max()) * 0.51 + 1e-6
+        assert max_abs_diff > 0
         assert max_abs_diff <= tolerance
 
     def test_super_blocks_may_cross_logical_rows(self):
@@ -783,7 +784,9 @@ class TestRepackQ6K:
 
         assert result.weight.shape[0] == n_out
         max_scale = float(result.scales.max())
-        assert np.max(np.abs(got - reference)) <= max_scale * 0.51 + 1e-6
+        error = np.abs(got - reference)
+        assert np.any(error > 0)
+        assert np.max(error) <= max_scale * 0.51 + 1e-6
 
     def test_super_block_byte_and_element_counts(self):
         """Q6_K is 210 bytes per 256 elements; a wrong size mis-slices silently."""

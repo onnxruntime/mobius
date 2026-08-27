@@ -73,6 +73,15 @@ class _FakeEmbeddingGGUF:
         for name, value in self.tensors.items():
             yield name, None, SimpleNamespace(value=0, name="F32"), value.shape
 
+    def reader_tensors(self):
+        for name, value in self.tensors.items():
+            yield SimpleNamespace(
+                name=name,
+                tensor_type=SimpleNamespace(value=0, name="F32"),
+                shape=tuple(reversed(value.shape)),
+                n_bytes=value.nbytes,
+            )
+
     def tensor_items(self):
         return self.tensors.items()
 
