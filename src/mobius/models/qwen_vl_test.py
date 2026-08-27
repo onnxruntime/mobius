@@ -9,7 +9,8 @@ import dataclasses
 
 import torch
 
-from mobius._configs import ArchitectureConfig, VisionConfig
+from mobius._builder import build_from_module
+from mobius._configs import ArchitectureConfig, QuantizationConfig, VisionConfig
 from mobius.models.qwen_vl import (
     Qwen3VL3ModelCausalLMModel,
     Qwen3VLDecoderModel,
@@ -92,6 +93,67 @@ class TestQwen25VLCausalLMModelTiedWeights:
         head = result["decoder.lm_head.weight"]
         assert embed.data_ptr() == head.data_ptr(), (
             "Tied weights must share the same data_ptr() for ONNX dedup"
+        )
+
+    def test_builds_different_decoder_vision_and_embedding_layouts(self):
+        decoder = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            sym=True,
+        )
+        config = dataclasses.replace(
+            _BASE_CONFIG,
+            tie_word_embeddings=False,
+            quantization=decoder,
+            component_quantization={
+                "decoder": decoder,
+                "vision_encoder": QuantizationConfig(
+                    bits=8,
+                    group_size=32,
+                    quant_method="olive",
+                    sym=True,
+                ),
+                "embedding": QuantizationConfig(
+                    bits=2,
+                    group_size=16,
+                    quant_method="olive",
+                    sym=True,
+                    quantize_embeddings=True,
+                ),
+            },
+        )
+
+        package = build_from_module(
+            Qwen25VLCausalLMModel(config),
+            config,
+            task="qwen-vl",
+        )
+
+        decoder_layouts = {
+            (
+                node.attributes["bits"].as_int(),
+                node.attributes["block_size"].as_int(),
+            )
+            for node in package["decoder"].graph
+            if node.op_type == "MatMulNBits"
+        }
+        vision_layouts = {
+            (
+                node.attributes["bits"].as_int(),
+                node.attributes["block_size"].as_int(),
+            )
+            for node in package["vision_encoder"].graph
+            if node.op_type == "MatMulNBits"
+        }
+
+        assert decoder_layouts == {(4, 16)}
+        assert vision_layouts == {(8, 32)}
+        assert any(
+            node.op_type == "GatherBlockQuantized"
+            and node.attributes["bits"].as_int() == 2
+            and node.attributes["block_size"].as_int() == 16
+            for node in package["embedding"].graph
         )
 
 

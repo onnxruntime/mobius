@@ -661,15 +661,33 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             key in renamed
             for key in ("decoder.model.embed_tokens.weight", "decoder.lm_head.weight")
         )
-        result = preprocess_quantized_weights(
-            renamed,
-            quantization,
-            tie_embeddings=apply_tie,
-            embed_key="decoder.model.embed_tokens.weight",
-            head_key="decoder.lm_head.weight",
-            qmoe_target_path=None,
-            reject_quantized_embeddings_lm_head=True,
-        )
+        if self.config.component_quantization is not None:
+            decoder_weights = {
+                key: value for key, value in renamed.items() if key.startswith("decoder.")
+            }
+            other_weights = {
+                key: value for key, value in renamed.items() if not key.startswith("decoder.")
+            }
+            result = preprocess_quantized_weights(
+                decoder_weights,
+                self.config.quantization_for("decoder"),
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=None,
+                reject_quantized_embeddings_lm_head=True,
+            )
+            result.update(other_weights)
+        else:
+            result = preprocess_quantized_weights(
+                renamed,
+                quantization,
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=None,
+                reject_quantized_embeddings_lm_head=True,
+            )
         if tie:
             if (
                 "decoder.model.embed_tokens.weight" not in result
@@ -906,16 +924,36 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
             key in renamed
             for key in ("decoder.model.embed_tokens.weight", "decoder.lm_head.weight")
         )
-        result = preprocess_quantized_weights(
-            renamed,
-            quantization,
-            tie_embeddings=apply_tie,
-            embed_key="decoder.model.embed_tokens.weight",
-            head_key="decoder.lm_head.weight",
-            qmoe_target_path=".mlp",
-            qmoe_quant_methods=("olive",),
-            reject_quantized_embeddings_lm_head=True,
-        )
+        if self.config.component_quantization is not None:
+            decoder_weights = {
+                key: value for key, value in renamed.items() if key.startswith("decoder.")
+            }
+            other_weights = {
+                key: value for key, value in renamed.items() if not key.startswith("decoder.")
+            }
+            decoder_quantization = self.config.quantization_for("decoder")
+            result = preprocess_quantized_weights(
+                decoder_weights,
+                decoder_quantization,
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+                reject_quantized_embeddings_lm_head=True,
+            )
+            result.update(other_weights)
+        else:
+            result = preprocess_quantized_weights(
+                renamed,
+                quantization,
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+                reject_quantized_embeddings_lm_head=True,
+            )
         if tie:
             if (
                 "decoder.model.embed_tokens.weight" not in result

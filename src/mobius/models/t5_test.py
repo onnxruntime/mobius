@@ -45,6 +45,62 @@ def test_standard_t5_graph_contract_is_stable():
     )
 
 
+def test_t5_encoder_and_decoder_use_independent_quantization():
+    from mobius._builder import build_from_module
+    from mobius._configs import ArchitectureConfig, QuantizationConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+    )
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_decoder_layers=1,
+        vocab_size=256,
+        max_position_embeddings=64,
+        hidden_act="gelu",
+        rms_norm_eps=1e-6,
+        pad_token_id=0,
+        quantization=decoder,
+        component_quantization={
+            "encoder": QuantizationConfig(
+                bits=8,
+                group_size=32,
+                quant_method="olive",
+                sym=True,
+            ),
+            "decoder": decoder,
+        },
+    )
+
+    package = build_from_module(
+        T5ForConditionalGeneration(config),
+        config,
+        task="seq2seq",
+    )
+
+    def layouts(component: str) -> set[tuple[int, int]]:
+        return {
+            (
+                node.attributes["bits"].as_int(),
+                node.attributes["block_size"].as_int(),
+            )
+            for node in package[component].graph
+            if node.op_type == "MatMulNBits"
+        }
+
+    assert layouts("encoder") == {(8, 32)}
+    assert layouts("decoder") == {(4, 16)}
+
+
 def test_t5_encoder_is_public_and_consumes_attention_mask():
     from mobius._configs import ArchitectureConfig
     from mobius.models import T5EncoderModel

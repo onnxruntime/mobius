@@ -464,6 +464,17 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = _load_weights_from_dir(config_path)
                 if hasattr(model_module, "preprocess_weights"):
                     state_dict = model_module.preprocess_weights(state_dict)
+                from mobius._component_quantization import (
+                    preprocess_component_quantized_state_dict,
+                )
+
+                state_dict = preprocess_component_quantized_state_dict(
+                    state_dict,
+                    model_module,
+                    config,
+                    task,
+                    pkg.keys(),
+                )
                 pkg.apply_weights(state_dict)
     else:
         model_id_or_path = args.model

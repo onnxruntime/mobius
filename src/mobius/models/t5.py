@@ -554,6 +554,11 @@ class T5ForConditionalGeneration(nn.Module):
             embed = new_state_dict.get("encoder.embed_tokens.weight")
             if embed is not None:
                 new_state_dict["decoder.lm_head.weight"] = embed
+        if self.config.component_quantization is not None:
+            # The Transformers builder preprocesses each package component
+            # after this architecture-specific rename, using that component's
+            # own packing layout.
+            return new_state_dict
         return preprocess_quantized_weights(
             new_state_dict,
             self.config.quantization,

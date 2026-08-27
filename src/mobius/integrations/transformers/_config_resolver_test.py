@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from mobius._configs import (
@@ -83,6 +85,46 @@ class TestConfigFromHfLlama:
 
     def test_default_task_is_text_generation(self):
         assert _default_task_for_model("llama") == "text-generation"
+
+
+class TestComponentQuantizationResolution:
+    class _CompositeModule:
+        config_class = ArchitectureConfig
+        HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+            "decoder": ("model.layers", "lm_head"),
+            "vision_encoder": ("model.visual",),
+            "audio_encoder": ("model.audio",),
+            "embedding": ("model.embed_tokens",),
+        }
+
+    def test_derives_components_from_olive_module_plan(self):
+        hf = _fake_hf_config(
+            "composite",
+            quantization_config={
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+                "modules_to_not_convert": [
+                    "model.visual",
+                    "model.embed_tokens",
+                    "lm_head",
+                ],
+                "overrides": {
+                    "model.audio": {
+                        "bits": 8,
+                        "group_size": 64,
+                    }
+                },
+            },
+        )
+
+        result = _config_from_hf(hf, module_class=self._CompositeModule)
+
+        assert result.component_quantization is not None
+        assert result.quantization_for("decoder").bits == 4
+        assert result.quantization_for("audio_encoder").bits == 8
+        assert result.quantization_for("vision_encoder") is None
+        assert result.quantization_for("embedding") is None
 
 
 class TestConfigFromHfQwen:

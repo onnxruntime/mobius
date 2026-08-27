@@ -13,6 +13,7 @@ import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._builder import build_from_module, resolve_dtype
+from mobius._component_quantization import preprocess_component_quantized_state_dict
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
@@ -56,6 +57,7 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
         "boa_token_id",
         "vision",
         "audio",
+        "component_quantization",
     ):
         if name in field_names:
             overrides[name] = None
@@ -401,6 +403,13 @@ def build_transformers_model(
             state_dict = _download_weights(model_id, revision=revision)
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
+            state_dict = preprocess_component_quantized_state_dict(
+                state_dict,
+                model_module,
+                config,
+                task,
+                package.keys(),
+            )
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
