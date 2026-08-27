@@ -22,6 +22,12 @@ from mobius.tasks._cache_utils import _register_linear_attention_functions
 from mobius.tasks._vision_language_3model import QwenVLTask
 
 
+def _require_layer_types(config: Qwen4ExpConfig) -> list[str]:
+    if config.layer_types is None:
+        raise ValueError("Qwen4-Exp requires explicit layer_types")
+    return config.layer_types
+
+
 def _make_qwen4_state_inputs(
     builder,
     config: Qwen4ExpConfig,
@@ -30,7 +36,7 @@ def _make_qwen4_state_inputs(
     past_position_ids: ir.Value,
 ) -> list[tuple[ir.Value, ...]]:
     """Create every Qwen4-Exp recurrent, PLE, QSA, and KV state input."""
-    assert config.layer_types is not None
+    layer_types = _require_layer_types(config)
     linear_key_dim = (
         config.linear_num_key_heads * config.linear_key_head_dim
         if config.linear_num_key_heads is not None and config.linear_key_head_dim is not None
@@ -44,7 +50,7 @@ def _make_qwen4_state_inputs(
     )
     linear_conv_dim = 2 * linear_key_dim + linear_value_dim
     states = []
-    for layer_idx, layer_type in enumerate(config.layer_types):
+    for layer_idx, layer_type in enumerate(layer_types):
         if layer_type == "linear_attention":
             if not linear_key_dim or not linear_value_dim:
                 raise ValueError("Qwen4-Exp linear-attention dimensions must be configured")
@@ -145,10 +151,10 @@ def _register_qwen4_outputs(
     present_position_ids: ir.Value,
 ) -> None:
     """Register the complete heterogeneous state ABI without dropping roles."""
-    assert config.layer_types is not None
+    layer_types = _require_layer_types(config)
     builder.add_output(logits, "logits")
     builder.add_output(present_position_ids, "present_position_ids")
-    for layer_idx, (layer_type, present) in enumerate(zip(config.layer_types, presents)):
+    for layer_idx, (layer_type, present) in enumerate(zip(layer_types, presents)):
         if layer_type == "linear_attention":
             builder.add_output(present[0], f"present.{layer_idx}.conv_state")
             builder.add_output(present[1], f"present.{layer_idx}.recurrent_state")
@@ -178,9 +184,9 @@ def _finalize_qwen4_decoder(
         "Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c;"
         "transformers@598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1"
     )
-    assert config.layer_types is not None
+    layer_types = _require_layer_types(config)
     layers = []
-    for layer_index, layer_type in enumerate(config.layer_types):
+    for layer_index, layer_type in enumerate(layer_types):
         if layer_type == "linear_attention":
             roles = ["conv_state", "recurrent_state"]
             if layer_index + 1 in (config.ple_layer_ids or []):
@@ -315,6 +321,7 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
 
         logits, presents, present_position_ids = decoder(
             builder.op,
+            input_ids=None,
             inputs_embeds=inputs_embeds,
             ple_input_ids=ple_input_ids,
             attention_mask=attention_mask,

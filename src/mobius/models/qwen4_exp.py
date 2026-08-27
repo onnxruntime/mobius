@@ -1324,18 +1324,27 @@ class Qwen4ExpVLDecoderModel(Qwen4ExpCausalLMModel):
     def forward(
         self,
         op: OpBuilder,
-        inputs_embeds: ir.Value,
-        ple_input_ids: ir.Value,
+        input_ids: ir.Value | None,
         attention_mask: ir.Value,
         position_ids: ir.Value,
         past_position_ids: ir.Value,
         past_key_values: list[tuple[ir.Value, ...]],
+        *,
+        inputs_embeds: ir.Value | None = None,
+        ple_input_ids: ir.Value | None = None,
     ):
+        if ple_input_ids is None:
+            if input_ids is None:
+                raise ValueError(
+                    "Qwen4-Exp VL decoding requires explicit ple_input_ids "
+                    "when input_ids is absent"
+                )
+            ple_input_ids = input_ids
         mrope_position_ids = op.Slice(position_ids, [1], [4], [0])
         past_mrope_position_ids = op.Slice(past_position_ids, [1], [4], [0])
         hidden_states, presents, present_position_ids = self.model(
             op,
-            None,
+            input_ids,
             attention_mask,
             mrope_position_ids,
             past_mrope_position_ids,

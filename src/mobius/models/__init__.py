@@ -377,9 +377,7 @@ from mobius.models.qwen3_tts_tokenizer import (
 )
 from mobius.models.qwen4_exp import (
     Qwen4ExpCausalLMModel,
-)
-from mobius.models.qwen4_exp import (
-    Qwen4ExpForConditionalGeneration as Qwen4ExpForConditionalGeneration,
+    Qwen4ExpForConditionalGeneration,
 )
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
