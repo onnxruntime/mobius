@@ -36,6 +36,12 @@ class _Model:
         "vision_encoder": ("model.vision_tower", "model.projector"),
         "embedding": ("model.language_model.embed_tokens",),
     }
+    HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
+        "vision_encoder": {
+            "encoder": "model.vision_tower",
+            "projector": "model.projector",
+        }
+    }
 
 
 def test_manifest_combines_task_and_model_metadata():
@@ -55,6 +61,10 @@ def test_manifest_combines_task_and_model_metadata():
     )
     assert manifest["vision_encoder"].module_path == "vision.tower"
     assert manifest["vision_encoder"].role == "encoder"
+    assert manifest["vision_encoder"].source_module_names("encoder.layers.0.q_proj") == (
+        "encoder.layers.0.q_proj",
+        "model.vision_tower.layers.0.q_proj",
+    )
 
 
 def test_dynamic_source_resolver_is_authoritative():
@@ -84,7 +94,7 @@ def test_descriptor_maps_local_path_to_huggingface_source_name():
         source_paths=("model.language_model.layers", "lm_head"),
     )
 
-    assert descriptor.source_module_names("model.layers.0.per_layer_input_gate"    ) == (
+    assert descriptor.source_module_names("model.layers.0.per_layer_input_gate") == (
         "model.layers.0.per_layer_input_gate",
         "model.language_model.layers.0.per_layer_input_gate",
     )
