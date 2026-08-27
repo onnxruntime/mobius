@@ -528,6 +528,7 @@ class MageVLEmbeddingModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        self.hidden_size = config.hidden_size
         self.embed_tokens = Embedding(
             config.vocab_size,
             config.hidden_size,
@@ -557,7 +558,7 @@ class MageVLEmbeddingModel(nn.Module):
         indices = op.Reshape(flat_indices, op.Shape(input_ids))
         flat_text = op.Reshape(
             text_embeddings,
-            op.Constant(value_ints=[-1, self.embed_tokens.weight.shape[1]]),
+            op.Constant(value_ints=[-1, self.hidden_size]),
         )
         zero_feature = op.Mul(
             op.Slice(flat_text, starts=[0], ends=[1], axes=[0]),

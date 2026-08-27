@@ -253,6 +253,51 @@ class NVFP4QuantizedLinear(nn.Module):
         return result
 
 
+class ClippableQuantizedLinear(QuantizedLinear):
+    """Weight-quantized linear with learned input/output activation bounds."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bits: int = 4,
+        block_size: int = 32,
+        has_zero_point: bool = False,
+        zero_point_dtype: ir.DataType = ir.DataType.UINT8,
+        bias: bool = False,
+    ):
+        super().__init__(
+            in_features,
+            out_features,
+            bits,
+            block_size,
+            has_zero_point,
+            zero_point_dtype,
+            bias,
+        )
+        self.input_min = nn.Parameter([])
+        self.input_max = nn.Parameter([])
+        self.output_min = nn.Parameter([])
+        self.output_max = nn.Parameter([])
+
+    @staticmethod
+    def _clip(
+        op: OpBuilder,
+        x: ir.Value,
+        minimum: ir.Value,
+        maximum: ir.Value,
+    ) -> ir.Value:
+        x_f32 = op.Cast(x, to=ir.DataType.FLOAT)
+        minimum_f32 = op.Cast(minimum, to=ir.DataType.FLOAT)
+        maximum_f32 = op.Cast(maximum, to=ir.DataType.FLOAT)
+        return op.CastLike(op.Clip(x_f32, minimum_f32, maximum_f32), x)
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        x = self._clip(op, x, self.input_min, self.input_max)
+        result = super().forward(op, x)
+        return self._clip(op, result, self.output_min, self.output_max)
+
+
 class BlockQuantizedLinear(nn.Module):
     """Linear layer backed by native GGUF block quantization.
 
@@ -546,4 +591,34 @@ def make_quantized_linear_factory(
 
     _Factory.__name__ = "QuantizedLinear"
     _Factory.__qualname__ = "QuantizedLinear"
+    return _Factory
+
+
+def make_clippable_quantized_linear_factory(
+    bits: int = 4,
+    block_size: int = 32,
+    has_zero_point: bool = False,
+    zero_point_dtype: ir.DataType = ir.DataType.UINT8,
+) -> type[ClippableQuantizedLinear]:
+    """Create a Linear-compatible clipped MatMulNBits factory."""
+
+    class _Factory(ClippableQuantizedLinear):
+        def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            bias: bool = True,
+        ):
+            super().__init__(
+                in_features=in_features,
+                out_features=out_features,
+                bias=bias,
+                bits=bits,
+                block_size=block_size,
+                has_zero_point=has_zero_point,
+                zero_point_dtype=zero_point_dtype,
+            )
+
+    _Factory.__name__ = "ClippableQuantizedLinear"
+    _Factory.__qualname__ = "ClippableQuantizedLinear"
     return _Factory

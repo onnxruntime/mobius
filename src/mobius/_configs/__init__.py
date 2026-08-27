@@ -90,7 +90,7 @@ from mobius._configs._base import (
     _shallow_fields,
     _shared_expert_size,
 )
-from mobius._configs._quantization import QuantizationConfig
+from mobius._configs._quantization import QuantizationConfig, QuantizationOverride
 from mobius._configs._sub_configs import (
     AudioConfig,
     CodecDecoderConfig,
@@ -153,6 +153,7 @@ __all__ = [
     "Plamo2Config",
     "QuantizationConfig",
     "Qwen4ExpConfig",
+    "QuantizationOverride",
     "Qwen35MtpConfig",
     "RoPEConfig",
     "Sam2Config",
