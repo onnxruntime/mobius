@@ -161,6 +161,21 @@ class TestWeightLoadingReport:
                 progress_bar=False,
             )
 
+    def test_qdq_report_includes_source_cast_overlap(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "fp8_qdq",
+            "streaming_external_data": True,
+            "largest_source_cast_overlap_bytes": 4096,
+        }
+
+        pkg.save(str(tmp_path), progress_bar=False)
+
+        assert pkg.weight_loading_report["largest_reconstruction_working_set_bytes"] == 4096
+        assert pkg.weight_loading_report["serializer_max_workers"] == 1
+
     def test_ordinary_resave_removes_stale_report(self, tmp_path):
         pkg = ModelPackage({"model": _make_simple_model()})
         pkg.weight_loading_report = {
