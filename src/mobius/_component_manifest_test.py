@@ -55,11 +55,11 @@ def test_manifest_combines_task_and_model_metadata():
     assert manifest.names == ("decoder", "vision_encoder", "embedding")
     assert manifest["decoder"] == ComponentDescriptor(
         name="decoder",
-        module_path="language",
+        module_attribute_path="language",
         role="decoder",
         source_paths=("model.language_model.layers", "lm_head"),
     )
-    assert manifest["vision_encoder"].module_path == "vision.tower"
+    assert manifest["vision_encoder"].module_attribute_path == "vision.tower"
     assert manifest["vision_encoder"].role == "encoder"
     assert manifest["vision_encoder"].source_module_names("encoder.layers.0.q_proj") == (
         "encoder.layers.0.q_proj",
@@ -89,7 +89,7 @@ def test_dynamic_source_resolver_is_authoritative():
 def test_descriptor_maps_local_path_to_huggingface_source_name():
     descriptor = ComponentDescriptor(
         name="decoder",
-        module_path="decoder",
+        module_attribute_path="decoder",
         role="decoder",
         source_paths=("model.language_model.layers", "lm_head"),
     )
@@ -108,7 +108,7 @@ def test_single_component_uses_root_module_path():
 
     manifest = resolve_component_manifest(_SingleTask())
 
-    assert manifest["model"].module_path == ""
+    assert manifest["model"].module_attribute_path == ""
     assert manifest["model"].role == "encoder"
 
 

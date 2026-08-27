@@ -27,11 +27,13 @@ class ComponentDescriptor:
 
     Attributes:
         name: Key used by :class:`~mobius.ModelPackage`.
-        module_path: Dotted path from the top-level Mobius module to the
+        module_attribute_path: Dotted Python attribute path from the root
+            :class:`onnxscript.nn.Module` passed to ``task.build()`` to the
             sub-module that constructs this component. The empty string means
-            the top-level module itself.
-        role: Optimization role such as ``decoder``, ``encoder``, ``embedding``
-            or ``glue``.
+            the root module itself. This is not a package key or checkpoint
+            prefix.
+        role: Task-defined optimization category. Current roles include
+            ``decoder``, ``encoder``, ``vision``, ``embedding``, and ``glue``.
         source_paths: Runtime HuggingFace ``named_modules()`` paths whose
             weights belong to this component.
         source_path_aliases: Pairs of ``(local_prefix, source_prefix)`` for
@@ -39,7 +41,7 @@ class ComponentDescriptor:
     """
 
     name: str
-    module_path: str
+    module_attribute_path: str
     role: str
     source_paths: tuple[str, ...] = ()
     source_path_aliases: tuple[tuple[str, str], ...] = ()
@@ -171,7 +173,10 @@ def resolve_component_manifest(
     descriptors = tuple(
         ComponentDescriptor(
             name=name,
-            module_path=module_paths.get(name, "" if name == "model" else name),
+            module_attribute_path=module_paths.get(
+                name,
+                "" if name == "model" else name,
+            ),
             role=roles.get(name, "decoder"),
             source_paths=component_sources.get(name, ()),
             source_path_aliases=component_aliases.get(name, ()),
