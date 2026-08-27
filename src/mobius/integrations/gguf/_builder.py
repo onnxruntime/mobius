@@ -685,6 +685,10 @@ def _validate_gguf_model(
     validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
+    _raise_for_invalid_plamo_tensor_contract(
+        gguf_model,
+        keep_quantized=keep_quantized,
+    )
     _raise_for_invalid_plamo2_tensor_contract(gguf_model)
     _raise_for_invalid_minimax_tensor_contract(gguf_model)
     _raise_for_invalid_kimi_k3_tensor_contract(gguf_model)
@@ -2012,6 +2016,121 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
         raise ValueError(
             f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
             f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_plamo_tensor_contract(
+    gguf_model,
+    *,
+    keep_quantized: bool | None,
+) -> None:
+    """Validate the fixed converter-emitted PLaMo-13B tensor/value contract."""
+    if gguf_model.architecture != "plamo":
+        return
+
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+    )
+
+    metadata = gguf_model.metadata
+    expected_metadata = {
+        "plamo.context_length": 4096,
+        "plamo.embedding_length": 5120,
+        "plamo.block_count": 40,
+        "plamo.feed_forward_length": 16640,
+        "plamo.attention.head_count": 40,
+        "plamo.attention.head_count_kv": 5,
+    }
+    missing_metadata = sorted(set(expected_metadata) - set(metadata))
+    if missing_metadata:
+        raise ValueError(
+            f"PLaMo GGUF is missing required architecture metadata: {missing_metadata}"
+        )
+    invalid_metadata = {
+        key: (expected, metadata[key])
+        for key, expected in expected_metadata.items()
+        if int(metadata[key]) != expected
+    }
+    if invalid_metadata:
+        raise ValueError(f"PLaMo GGUF has unsupported fixed geometry: {invalid_metadata}")
+    if int(metadata.get("plamo.rope.dimension_count", 128)) != 128:
+        raise ValueError("PLaMo GGUF requires full-head rope.dimension_count=128")
+    if not math.isclose(
+        float(metadata.get("plamo.rope.freq_base", 10000.0)),
+        10000.0,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError("PLaMo GGUF requires rope.freq_base=10000")
+
+    items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in items
+    }
+    if "token_embd.weight" not in actual or len(actual["token_embd.weight"]) != 2:
+        raise ValueError("PLaMo GGUF requires a rank-2 token_embd.weight tensor")
+    vocab, hidden = actual["token_embd.weight"]
+    if hidden != 5120 or vocab <= 0:
+        raise ValueError(
+            "PLaMo token_embd.weight must have shape [positive_vocab, 5120], "
+            f"got {actual['token_embd.weight']}"
+        )
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, 5120),
+        "output_norm.weight": (5120,),
+        "output.weight": (vocab, 5120),
+    }
+    for layer in range(40):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (5120,),
+                prefix + "attn_q.weight": (5120, 5120),
+                prefix + "attn_k.weight": (640, 5120),
+                prefix + "attn_v.weight": (640, 5120),
+                prefix + "attn_output.weight": (5120, 5120),
+                prefix + "ffn_gate.weight": (16640, 5120),
+                prefix + "ffn_up.weight": (16640, 5120),
+                prefix + "ffn_down.weight": (5120, 16640),
+            }
+        )
+
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required))
+    malformed = {
+        name: (required[name], actual[name])
+        for name in set(required) & set(actual)
+        if required[name] != actual[name]
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid PLaMo exact GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+    float_types = float_storage_type_ids()
+    unsupported_qtypes: dict[str, str] = {}
+    packed_shuffle_tensors: list[str] = []
+    for name, _raw, qtype, _shape in items:
+        qtype_id = getattr(qtype, "value", qtype)
+        quant_spec = get_quant_spec(qtype)
+        if quant_spec is None or quant_spec.dequantize is not Support.SUPPORTED:
+            unsupported_qtypes[name] = str(getattr(qtype, "name", qtype))
+        if (
+            keep_quantized
+            and qtype_id not in float_types
+            and name.endswith(("attn_q.weight", "attn_output.weight"))
+        ):
+            packed_shuffle_tensors.append(name)
+    if unsupported_qtypes:
+        raise ValueError(f"PLaMo GGUF contains unsupported qtypes: {unsupported_qtypes}")
+    if packed_shuffle_tensors:
+        raise ValueError(
+            "PLaMo keep_quantized=True cannot preserve packed Q/output tensors that "
+            "require value shuffles: " + ", ".join(sorted(packed_shuffle_tensors))
         )
 
 
@@ -6289,6 +6408,16 @@ def build_from_gguf(
 
     tokenizer_verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
+    if gguf_arch == "plamo" and reuse_gguf_weights:
+        raise ValueError(
+            "reuse_gguf_weights=True is not supported for PLaMo because its Q/output "
+            "projection shuffles require materialized value transforms"
+        )
+    if gguf_arch == "plamo" and static_cache:
+        raise ValueError(
+            "static_cache=True is not supported for PLaMo; the exact source contract "
+            "stores cyclically expanded 40-head dynamic K/V state"
+        )
     if static_cache and gguf_arch in {
         "gptneox",
         "jais",
@@ -6417,6 +6546,17 @@ def build_from_gguf(
         ):
             raise ValueError(
                 "plamo2 GGUF only supports the dedicated 'plamo2-text-generation' task"
+            )
+    if gguf_arch == "plamo":
+        from mobius.tasks import PlamoCausalLMTask
+
+        if (
+            task is not None
+            and task != "plamo-text-generation"
+            and not isinstance(task, PlamoCausalLMTask)
+        ):
+            raise ValueError(
+                "plamo GGUF only supports the dedicated 'plamo-text-generation' task"
             )
     if gguf_arch == "qwen4exp":
         from mobius.tasks import Qwen4ExpCausalLMTask

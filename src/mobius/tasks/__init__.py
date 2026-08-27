@@ -75,6 +75,7 @@ __all__ = [
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
+    "PlamoCausalLMTask",
     "Plamo2CausalLMTask",
     "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
@@ -156,6 +157,7 @@ from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
+from mobius.tasks._plamo import PlamoCausalLMTask
 from mobius.tasks._plamo2 import Plamo2CausalLMTask
 from mobius.tasks._qwen4_exp import (
     Qwen4ExpCausalLMTask,
@@ -230,6 +232,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,
     "falcon-h1-text-generation": FalconH1CausalLMTask,
+    "plamo-text-generation": PlamoCausalLMTask,
     "plamo2-text-generation": Plamo2CausalLMTask,
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,

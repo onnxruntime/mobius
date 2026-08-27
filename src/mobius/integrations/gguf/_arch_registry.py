@@ -442,11 +442,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "attention-output bias plus conditional LongRoPE factor tensors. Mobius has no "
         "exact graph or suffix closure for this misleadingly named architecture."
     ),
-    "plamo": (
-        "PLaMo uses one RMSNorm feeding attention and FFN in parallel, fixed grouped-query "
-        "geometry, and converter-specific Q/output projection shuffles. Sequential Llama "
-        "topology and direct external tensor reuse would both be incorrect."
-    ),
     "plamo3": (
         "PLaMo3 requires fused QKV and fused SwiGLU, four norm sites with architecture-"
         "specific offset transforms, Q/K norm before RoPE, and a periodic full/sliding "
@@ -1347,6 +1342,30 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "Graph import is exact, but released ORT GenAI packaging cannot represent "
             "the heterogeneous KV/recurrent state slots or bounded rollback snapshots; "
             "runtime packaging remains tracked by #605."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="plamo",
+        model_type="plamo",
+        module_type="gguf_plamo",
+        config_postprocessor="plamo",
+        tensor_map_recipe=("plamo",),
+        tensor_processor="plamo",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact graph/config/tensor import is implemented for the pinned PLaMo-13B "
+            "converter contract. Runtime remains deferred pending representative real-weight "
+            "prefill and expanded-cache decode parity."
         ),
     ),
     GGUFArchitectureSpec(

@@ -122,6 +122,7 @@ from mobius.models import (
     PhiCausalLMModel,
     PhiMoEGGUFCausalLMModel,
     Plamo2ForCausalLM,
+    PlamoGGUFCausalLMModel,
     PLMCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
@@ -561,6 +562,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
     "gguf_legacy": ModelRegistration(ExactLegacyGGUFCausalLMModel),
+    "gguf_plamo": ModelRegistration(
+        PlamoGGUFCausalLMModel,
+        task="plamo-text-generation",
+    ),
     "gpt_neox_japanese": ModelRegistration(GPTNeoXJapaneseCausalLMModel),
     "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
     "gptj": ModelRegistration(GPTJCausalLMModel),

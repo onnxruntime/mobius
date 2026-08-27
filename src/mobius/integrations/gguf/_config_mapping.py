@@ -4079,6 +4079,72 @@ def _exact_legacy_gguf_postprocess(
     return dataclasses.replace(config, **fields)
 
 
+def _plamo_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    """Validate and materialize the fixed PLaMo-13B converter contract."""
+    prefix = "plamo."
+    expected_ints = {
+        "context_length": 4096,
+        "embedding_length": 5120,
+        "block_count": 40,
+        "feed_forward_length": 16640,
+        "attention.head_count": 40,
+        "attention.head_count_kv": 5,
+    }
+    for suffix, expected in expected_ints.items():
+        actual = int(metadata[f"{prefix}{suffix}"])
+        if actual != expected:
+            raise ValueError(f"PLaMo requires {prefix}{suffix}={expected}, got {actual}")
+
+    epsilon = float(metadata[f"{prefix}attention.layer_norm_rms_epsilon"])
+    if not math.isclose(epsilon, 1e-6, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"PLaMo requires RMSNorm epsilon 1e-6, got {epsilon}")
+    rope_theta = float(metadata.get(f"{prefix}rope.freq_base", 10000.0))
+    if not math.isclose(rope_theta, 10000.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"PLaMo requires rope.freq_base=10000, got {rope_theta}")
+    rope_dim = int(metadata.get(f"{prefix}rope.dimension_count", 128))
+    if rope_dim != 128:
+        raise ValueError(f"PLaMo requires full-head rope.dimension_count=128, got {rope_dim}")
+    unsupported_rope = sorted(
+        key
+        for key in metadata
+        if key.startswith(
+            (
+                f"{prefix}rope.scaling",
+                f"{prefix}rope.factor",
+                f"{prefix}rope.original_context",
+            )
+        )
+    )
+    if unsupported_rope:
+        raise ValueError(
+            "PLaMo does not support scaled-RoPE metadata: " + ", ".join(unsupported_rope)
+        )
+
+    return dataclasses.replace(
+        config,
+        model_type="plamo",
+        hidden_size=5120,
+        intermediate_size=16640,
+        num_hidden_layers=40,
+        num_attention_heads=40,
+        num_key_value_heads=5,
+        head_dim=128,
+        max_position_embeddings=4096,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        rope_interleave=False,
+        hidden_act="silu",
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        tie_word_embeddings=False,
+    )
+
+
 def _plm_postprocess(
     config: ArchitectureConfig, metadata: dict[str, Any], model: Any
 ) -> ArchitectureConfig:
@@ -4279,6 +4345,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
     "falcon_h1": _falcon_h1_postprocess,
+    "plamo": _plamo_postprocess,
     "plamo2": _plamo2_postprocess,
     "plm": _plm_postprocess,
     "jamba": _jamba_postprocess,

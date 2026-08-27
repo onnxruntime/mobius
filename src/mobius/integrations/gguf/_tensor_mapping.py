@@ -71,6 +71,22 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+# PLaMo owns a suffix-exact subset even though the target stems resemble
+# Llama. Its shared norm topology and Q/output value transforms are distinct.
+_PLAMO_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
 _LLAMA_EMBEDDING_MAPPING: dict[str, str] = {
     "token_embd": "token_embeddings",
     "output_norm": "output_norm",
@@ -784,6 +800,8 @@ _WEIGHT = frozenset({".weight"})
 _PROJECTION = frozenset({".weight", ".scale", ".input_scale"})
 _BIASED_PROJECTION = frozenset({".weight", ".bias", ".scale", ".input_scale"})
 
+_RECURRENT_SUFFIXES["plamo"] = dict.fromkeys(_PLAMO_MAPPING, _WEIGHT)
+
 _RECURRENT_SUFFIXES["kimi-linear"] = {
     "token_embd": _WEIGHT,
     "output": _PROJECTION,
@@ -1208,6 +1226,7 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "plamo": _PLAMO_MAPPING,
         "llama_embedding": _LLAMA_EMBEDDING_MAPPING,
         "gemma_embedding": _GEMMA_EMBEDDING_MAPPING,
         "bitnet": _BITNET_MAPPING,
