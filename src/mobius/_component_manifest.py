@@ -51,6 +51,34 @@ class ComponentDescriptor:
                 f"component {self.name!r} source_paths must not contain empty paths"
             )
 
+    def source_module_names(self, local_module_path: str) -> tuple[str, ...]:
+        """Candidate HuggingFace names for a component-local module path.
+
+        Source roots and Mobius paths commonly share an anchor segment even
+        when their prefixes differ. For example, source root
+        ``model.language_model.layers`` and local path
+        ``model.layers.0.self_attn.q_proj`` share ``layers`` and resolve to
+        ``model.language_model.layers.0.self_attn.q_proj``.
+        """
+        if not local_module_path:
+            return self.source_paths
+
+        local_parts = local_module_path.split(".")
+        candidates = [local_module_path]
+        for source_path in self.source_paths:
+            source_parts = source_path.split(".")
+            anchor = source_parts[-1]
+            anchor_indices = [
+                index for index, part in enumerate(local_parts) if part == anchor
+            ]
+            if anchor_indices:
+                for index in anchor_indices:
+                    suffix = local_parts[index + 1 :]
+                    candidates.append(".".join((*source_parts, *suffix)))
+            else:
+                candidates.append(".".join((*source_parts, *local_parts)))
+        return tuple(dict.fromkeys(candidates))
+
 
 @dataclasses.dataclass(frozen=True)
 class ComponentManifest(Mapping[str, ComponentDescriptor]):

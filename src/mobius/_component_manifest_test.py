@@ -76,6 +76,25 @@ def test_dynamic_source_resolver_is_authoritative():
     assert manifest["vision_encoder"].source_paths == ()
 
 
+def test_descriptor_maps_local_path_to_huggingface_source_name():
+    descriptor = ComponentDescriptor(
+        name="decoder",
+        module_path="decoder",
+        role="decoder",
+        source_paths=("model.language_model.layers", "lm_head"),
+    )
+
+    assert descriptor.source_module_names("model.layers.0.per_layer_input_gate") == (
+        "model.layers.0.per_layer_input_gate",
+        "model.language_model.layers.0.per_layer_input_gate",
+        "lm_head.model.layers.0.per_layer_input_gate",
+    )
+    assert descriptor.source_module_names("lm_head") == (
+        "lm_head",
+        "model.language_model.layers.lm_head",
+    )
+
+
 def test_single_component_uses_root_module_path():
     class _SingleTask:
         model_roles: ClassVar[dict[str, str]] = {"model": "encoder"}
