@@ -341,6 +341,7 @@ def _runtime_blocker_evidence_table() -> str:
             f"GGUF tokenizer metadata `{evidence.tokenizer_metadata_sha256}`; "
             f"result={evidence.result}; {evidence.tensor_count} tensors / "
             f"{evidence.logical_parameter_count:,} parameters; "
+            f"ORT {evidence.onnxruntime_version} / {evidence.execution_provider}; "
             f"{evidence.runtime} {evidence.runtime_version}; {blockers} | {withheld} |"
         )
     return "\n".join(rows)

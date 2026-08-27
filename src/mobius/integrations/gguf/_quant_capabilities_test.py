@@ -48,6 +48,8 @@ def test_runtime_blocker_candidate_is_metadata_only_and_not_budgeted_as_support(
     assert record["graph"]["matmul_count"] == 6_028
     assert record["graph"]["state_slots"]["mamba2.ssm_state"] == 23
     assert record["runtime_schema_issue"].endswith("/issues/605")
+    assert record["onnxruntime_version"] == "1.29.0"
+    assert record["execution_provider"] == "CPUExecutionProvider"
     assert "full-logit parity" in record["withheld_checks"]
     assert "separate router_probs/router_weights" in record["blockers"][1]
     assert (

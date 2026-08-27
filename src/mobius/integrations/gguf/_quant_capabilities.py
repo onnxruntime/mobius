@@ -397,6 +397,7 @@ def quantization_capability_matrix() -> dict[str, object]:
             "runtime": evidence.runtime,
             "runtime_version": evidence.runtime_version,
             "onnxruntime_version": evidence.onnxruntime_version,
+            "execution_provider": evidence.execution_provider,
             "runtime_schema_issue": evidence.runtime_schema_issue,
             "result": evidence.result,
             "blockers": list(evidence.blockers),

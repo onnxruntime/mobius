@@ -2498,6 +2498,7 @@
         "sha256": "dd9fa380ac107b0477db5a26108db9febe6378e7bb3966a107944853ec4f76f8"
       },
       "evidence_id": "nemotron-h-moe-30b-iq2-xxs-runtime-blocker",
+      "execution_provider": "CPUExecutionProvider",
       "expert_count": 128,
       "experts_per_token": 6,
       "explicit_float16_bytes": 63155880576,
