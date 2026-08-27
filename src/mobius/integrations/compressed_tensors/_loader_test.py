@@ -13,6 +13,7 @@ import onnx_ir as ir
 import pytest
 import safetensors.torch
 import torch
+from onnx_ir.passes.common import InlinePass
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
@@ -39,6 +40,13 @@ _OFFICIAL_BASE_REPOSITORY = "Qwen/Qwen3.8-27B"
 _OFFICIAL_BASE_REVISION = "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
 _OFFICIAL_BASE_CONFIG_ETAG = "706cebd746c4b6f2b1d1f892630867acfdfd3df8"
 _OFFICIAL_BASE_CONFIG_SIZE = 4_312
+_NATIVE_ARTIFACT_REPOSITORY = "tlwu/Qwen3.8-27B-NVFP4-ONNX"
+_NATIVE_ARTIFACT_REVISION = "16759da769f194f7bd760db3e2d2dc50652f7573"
+_NATIVE_ARTIFACT_GRAPH_SHA256 = (
+    "569740d8a0c83abee7e75948c420478406423cadc8dea55f37467d5d06f2d98b"
+)
+_NATIVE_ARTIFACT_GRAPH_SIZE = 1_057_196
+_NATIVE_ARTIFACT_EXTERNAL_DATA_SIZE = 21_700_000_000
 
 _HEADER_EVIDENCE = {
     "model.language_model.layers.3.self_attn.k_scale": ("BF16", [1], [2563940052, 2563940054]),
@@ -140,12 +148,18 @@ def _config(
     }
 
 
-def _linear_package() -> ModelPackage:
+def _linear_package(
+    in_features: int = 16,
+    out_features: int = 2,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+) -> ModelPackage:
     builder, op, graph = create_test_builder()
-    x = create_test_input(builder, "x", [1, 16])
-    output = Linear(16, 2, bias=False)(op, x)
+    x = create_test_input(builder, "x", [1, in_features], dtype=dtype)
+    output = Linear(in_features, out_features, bias=False)(op, x)
     output.name = "output"
+    output.dtype = dtype
     graph.outputs.append(output)
+    graph.initializers["weight"].type = ir.TensorType(dtype)
     return ModelPackage({"model": ir.Model(graph, ir_version=11)})
 
 
@@ -318,6 +332,7 @@ class TestReconstruction:
             CompressedTensorsConfig.parse(_config()),
             preprocess_weights=lambda state: {"weight": state["nvfp4.weight"]},
             fp8_kv_cache=True,
+            keep_quantized=False,
         )
 
         magnitudes = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -353,12 +368,223 @@ class TestReconstruction:
             str(tmp_path),
             CompressedTensorsConfig.parse(_config()),
             preprocess_weights=lambda state: {"weight": state["fp8.weight"]},
+            keep_quantized=False,
         )
 
         x = np.arange(1, 17, dtype=np.float32)[None, :]
         expected = x @ (weight.float() * scale.float()).numpy().T
         actual = OnnxModelSession(package["model"], device="cpu").run({"x": x})["output"]
         np.testing.assert_array_equal(actual, expected)
+
+    def test_native_nvfp4_storage_node_and_report(self, tmp_path):
+        codes = torch.arange(16, dtype=torch.uint8).repeat(2, 1)
+        packed = _pack_codes(codes)
+        scale = torch.tensor([[0.5], [2.0]], dtype=torch.float8_e4m3fn)
+        global_scale = torch.tensor([4.0], dtype=torch.float32)
+        input_global_scale = torch.tensor([8.0], dtype=torch.float32)
+        _write_checkpoint(
+            tmp_path,
+            {
+                "nvfp4.weight_packed": packed,
+                "nvfp4.weight_scale": scale,
+                "nvfp4.weight_global_scale": global_scale,
+                "nvfp4.input_global_scale": input_global_scale,
+            },
+        )
+        package = _linear_package(dtype=ir.DataType.FLOAT16)
+
+        report = stream_compressed_tensors_to_package(
+            package,
+            str(tmp_path),
+            CompressedTensorsConfig.parse(
+                _config(
+                    fp8_targets=["unused"],
+                    nvfp4_targets=["nvfp4"],
+                    ignore=["ignored.module"],
+                )
+            ),
+            preprocess_weights=lambda state: {"weight": state["nvfp4.weight"]},
+        )
+
+        model = package["model"]
+        native = next(
+            node for node in model.graph if node.op_type == "MatMulBlockQuantizedFp4Weight"
+        )
+        assert native.domain == "com.microsoft"
+        assert len(native.inputs) == 4
+        assert native.attributes["block_size"].value == 16
+        assert native.inputs[1].dtype == ir.DataType.UINT8
+        assert native.inputs[1].shape == [2, 8]
+        assert native.inputs[2].dtype == ir.DataType.UINT8
+        assert native.inputs[2].shape == [2, 1]
+        assert native.inputs[3].producer().op_type == "Div"
+        assert "weight" not in model.graph.initializers
+        assert all(
+            not (
+                initializer.dtype in {ir.DataType.FLOAT16, ir.DataType.FLOAT}
+                and initializer.shape == [2, 16]
+            )
+            for initializer in model.graph.initializers.values()
+        )
+        assert report.storage_policy == "preserved-native-block"
+        assert report.preserved_weight_formats == ("nvfp4-pack-quantized",)
+        assert report.output_is_nvfp4
+        assert "W4A16/W8A16" in report.activation_quantization
+        assert "custom ONNX Runtime" in report.runtime_support
+        metadata = json.loads(model.metadata_props["mobius.compressed_tensors.config"])
+        assert metadata["groups"][0]["targets"] == ["unused"]
+        assert metadata["groups"][1]["targets"] == ["nvfp4"]
+        assert metadata["ignore"] == ["ignored.module"]
+
+    def test_native_fp8_storage_remains_faithful(self, tmp_path):
+        weight = torch.tensor(
+            [[1.0, -2.0, 0.5, 3.0] * 4, [-1.0, 0.25, 2.0, -0.5] * 4],
+            dtype=torch.float8_e4m3fn,
+        )
+        scale = torch.tensor([[0.25], [2.0]], dtype=torch.bfloat16)
+        _write_checkpoint(
+            tmp_path,
+            {"fp8.weight": weight, "fp8.weight_scale": scale},
+        )
+        package = _linear_package(dtype=ir.DataType.FLOAT16)
+
+        stream_compressed_tensors_to_package(
+            package,
+            str(tmp_path),
+            CompressedTensorsConfig.parse(_config()),
+            preprocess_weights=lambda state: {"weight": state["fp8.weight"]},
+        )
+
+        model = package["model"]
+        native = next(
+            node for node in model.graph if node.op_type == "MatMulBlockQuantizedFp8Weight"
+        )
+        assert native.domain == "com.microsoft"
+        assert len(native.inputs) == 3
+        assert native.attributes["block_size"].value == 16
+        assert native.inputs[1].dtype == ir.DataType.FLOAT8E4M3FN
+        assert native.inputs[1].shape == [2, 16]
+        assert native.inputs[2].producer().op_type == "Cast"
+        raw_scale = native.inputs[2].producer().inputs[0]
+        assert raw_scale is not None
+        assert raw_scale.dtype == ir.DataType.BFLOAT16
+        assert raw_scale.shape == [2, 1]
+        assert raw_scale.const_value.tobytes() == scale.view(torch.uint16).numpy().tobytes()
+        assert (
+            native.inputs[1].const_value.tobytes()
+            == weight.view(torch.uint8).numpy().tobytes()
+        )
+
+    def test_native_nvfp4_function_inline_value_parity(self, tmp_path):
+        codes = torch.tensor(
+            [
+                [2, 9, 6, 12, 0, 1, 3, 4, 5, 7, 10, 11, 13, 14, 15, 8],
+                [7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8],
+            ],
+            dtype=torch.uint8,
+        )
+        packed = _pack_codes(codes)
+        scale = torch.tensor([[2.0], [0.5]], dtype=torch.float8_e4m3fn)
+        _write_checkpoint(
+            tmp_path,
+            {
+                "nvfp4.weight_packed": packed,
+                "nvfp4.weight_scale": scale,
+                "nvfp4.weight_global_scale": torch.tensor([2.0]),
+                "nvfp4.input_global_scale": torch.tensor([4.0]),
+            },
+        )
+        package = _linear_package(dtype=ir.DataType.FLOAT16)
+        stream_compressed_tensors_to_package(
+            package,
+            str(tmp_path),
+            CompressedTensorsConfig.parse(_config()),
+            preprocess_weights=lambda state: {"weight": state["nvfp4.weight"]},
+        )
+        model = package["model"]
+
+        InlinePass(
+            criteria=lambda function: (
+                function.domain == "com.microsoft"
+                and function.name == "MatMulBlockQuantizedFp4Weight"
+            )
+        )(model)
+
+        assert all(node.op_type != "MatMulBlockQuantizedFp4Weight" for node in model.graph)
+        magnitudes = np.array(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            dtype=np.float32,
+        )
+        code_np = codes.numpy()
+        expected_weight = magnitudes[code_np & 7]
+        expected_weight = np.where(
+            (code_np & 8) != 0,
+            -expected_weight,
+            expected_weight,
+        )
+        expected_weight *= np.array([[1.0], [0.25]], dtype=np.float32)
+        x = np.arange(1, 17, dtype=np.float16)[None, :]
+        actual = OnnxModelSession(model, device="cpu").run({"x": x})["output"]
+        np.testing.assert_allclose(
+            actual,
+            x @ expected_weight.astype(np.float16).T,
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+    def test_native_nvfp4_external_data_round_trip(self, tmp_path):
+        n, k = 32, 64
+        codes = torch.arange(n * k, dtype=torch.int64).reshape(n, k).to(torch.uint8)
+        codes &= 0x0F
+        packed = _pack_codes(codes)
+        scale = torch.arange(n * (k // 16), dtype=torch.int64).reshape(n, k // 16)
+        scale = (scale & 0x7E).to(torch.uint8).view(torch.float8_e4m3fn)
+        global_scale = torch.tensor([3.0], dtype=torch.float32)
+        input_global_scale = torch.tensor([5.0], dtype=torch.float32)
+        _write_checkpoint(
+            tmp_path,
+            {
+                "nvfp4.weight_packed": packed,
+                "nvfp4.weight_scale": scale,
+                "nvfp4.weight_global_scale": global_scale,
+                "nvfp4.input_global_scale": input_global_scale,
+            },
+        )
+        package = _linear_package(k, n, dtype=ir.DataType.FLOAT16)
+        stream_compressed_tensors_to_package(
+            package,
+            str(tmp_path),
+            CompressedTensorsConfig.parse(_config()),
+            preprocess_weights=lambda state: {"weight": state["nvfp4.weight"]},
+        )
+        output = tmp_path / "output"
+
+        package.save(
+            str(output),
+            external_data="onnx",
+            progress_bar=False,
+        )
+        loaded = ModelPackage.load(str(output))
+        initializers = loaded["model"].graph.initializers
+        prefix = "weight.compressed_tensors"
+
+        assert (
+            initializers[f"{prefix}.weight"].const_value.tobytes() == packed.numpy().tobytes()
+        )
+        assert (
+            initializers[f"{prefix}.weight_scale"].const_value.tobytes()
+            == scale.view(torch.uint8).numpy().tobytes()
+        )
+        assert (
+            initializers[f"{prefix}.weight_global_scale"].const_value.tobytes()
+            == global_scale.numpy().tobytes()
+        )
+        assert loaded.quantization_report is None
+        assert (
+            loaded["model"].metadata_props["mobius.compressed_tensors.storage"]
+            == "preserved-native-block"
+        )
+        assert (output / "model.onnx.data").stat().st_size < n * k * 2
 
     def test_shape_and_orphan_qparam_guards(self, tmp_path):
         _write_checkpoint(
@@ -418,6 +644,7 @@ def _tiny_qwen_vl():
         head_dim=8,
         layer_types=["full_attention", "full_attention"],
         tie_word_embeddings=False,
+        dtype=ir.DataType.FLOAT16,
         vision=VisionConfig(
             hidden_size=16,
             intermediate_size=32,
@@ -551,3 +778,41 @@ def test_pinned_qwen38_checkpoint_schema_evidence():
         "F8_E4M3",
         [17408, 5120],
     )
+
+
+def test_pinned_native_nvfp4_onnx_abi_evidence():
+    evidence = {
+        "repository": _NATIVE_ARTIFACT_REPOSITORY,
+        "revision": _NATIVE_ARTIFACT_REVISION,
+        "text_onnx_sha256": _NATIVE_ARTIFACT_GRAPH_SHA256,
+        "text_onnx_size": _NATIVE_ARTIFACT_GRAPH_SIZE,
+        "external_data_size": _NATIVE_ARTIFACT_EXTERNAL_DATA_SIZE,
+        "opset_imports": {"": 21, "com.microsoft": 1},
+        "nvfp4": {
+            "op": "com.microsoft::MatMulBlockQuantizedFp4Weight",
+            "inputs": ["A", "B", "weight_scale", "weight_scale_2"],
+            "block_size": 16,
+            "packed_shape": ["N", "K/2"],
+            "scale_shape": ["N", "K/16"],
+            "global_shape": [1],
+            "semantics": "low-nibble-first E2M1 * raw-E4M3 * weight_scale_2",
+        },
+        "fp8": {
+            "op": "com.microsoft::MatMulBlockQuantizedFp8Weight",
+            "weight_dtype": "FLOAT8E4M3FN",
+            "scale_shape": ["N", 1],
+            "block_size": "K",
+        },
+        "default_compute": "W4A16/W8A16",
+    }
+
+    encoded = json.dumps(evidence, sort_keys=True)
+    assert _NATIVE_ARTIFACT_REVISION in encoded
+    assert _NATIVE_ARTIFACT_GRAPH_SHA256 in encoded
+    assert evidence["nvfp4"]["inputs"] == [
+        "A",
+        "B",
+        "weight_scale",
+        "weight_scale_2",
+    ]
+    assert evidence["default_compute"] == "W4A16/W8A16"

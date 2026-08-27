@@ -33,6 +33,9 @@ from mobius.functions.causal_conv import (
 from mobius.functions.linear_attention import (
     linear_attention,
 )
+from mobius.functions.matmul_block_quantized_fp4_weight import (
+    matmul_block_quantized_fp4_weight,
+)
 from mobius.functions.matmul_nbits import (
     matmul_nbits,
 )
@@ -56,6 +59,11 @@ _DOMAIN = "com.microsoft"
 # (kernel_size, channels, num_heads are baked into the function body) and are
 # registered per-model by ``tasks._base._register_linear_attention_functions``.
 _FUNCTION_BUILDERS: dict[ir.OperatorIdentifier, Callable[[], ir.Function]] = {
+    (
+        _DOMAIN,
+        "MatMulBlockQuantizedFp4Weight",
+        "",
+    ): matmul_block_quantized_fp4_weight,
     (_DOMAIN, "MatMulNBits", ""): matmul_nbits,
     (_DOMAIN, "PackedMultiHeadAttention", ""): packed_multi_head_attention,
     (_DOMAIN, "SkipLayerNormalization", ""): skip_layer_normalization,
@@ -94,6 +102,13 @@ def register_function_bodies(model: ir.Model) -> None:
     for op_id in _FUNCTION_BUILDERS:
         if op_id in model.functions:
             continue
+        # The NVFP4 body contains a 256-entry E4M3 decode table and its native
+        # node is introduced only while compressed weights are loaded, after
+        # ordinary graph optimization. Avoid attaching it to unrelated models.
+        if op_id == (_DOMAIN, "MatMulBlockQuantizedFp4Weight", "") and not any(
+            node.domain == op_id[0] and node.op_type == op_id[1] for node in model.graph
+        ):
+            continue
         fn = get_function(op_id)
         if fn is not None:
             model.functions[op_id] = fn
@@ -104,6 +119,7 @@ __all__ = [
     "causal_conv_nd_with_state",
     "get_function",
     "linear_attention",
+    "matmul_block_quantized_fp4_weight",
     "matmul_nbits",
     "packed_multi_head_attention",
     "register_function_bodies",

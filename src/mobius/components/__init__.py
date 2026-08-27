@@ -55,6 +55,7 @@ __all__ = [
     "MLP",
     "MLPMultiModalProjector",
     "MuseGlimmerVisionModel",
+    "NVFP4QuantizedLinear",
     "Cosmos3EdgeMultiModalProjector",
     "MobileNetV5Encoder",
     "MoELayer",
@@ -247,6 +248,7 @@ from mobius.components._qformer import (
 )
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
+    NVFP4QuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
     TiedQuantizedLMHead,

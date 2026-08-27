@@ -250,6 +250,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
     load_weights = not args.no_weights
+    keep_quantized = not getattr(args, "dequantize", False)
     task: str | ModelTask | None = args.task
 
     # FP8 KV cache: resolve the optional per-layer scale file up front so both
@@ -450,6 +451,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
+            keep_quantized=keep_quantized,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -1248,6 +1250,14 @@ def build_parser() -> argparse.ArgumentParser:
             "(onnxruntime-genai format: {'scales': {'k_scales': [...], "
             "'v_scales': [...]}}). Only used with --features fp8-kv-cache; "
             "without it all layers use a unit scale of 1.0."
+        ),
+    )
+    build_parser.add_argument(
+        "--dequantize",
+        action="store_true",
+        help=(
+            "Explicitly reconstruct supported compressed-tensors weights as dense "
+            "floating point. By default their FP8/NVFP4 storage is preserved."
         ),
     )
     _add_shared_build_arguments(build_parser)

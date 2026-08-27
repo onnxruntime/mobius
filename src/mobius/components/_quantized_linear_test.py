@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+import onnx_ir as ir
 import pytest
 
 from mobius._build_context import build_context
@@ -16,7 +17,11 @@ from mobius._testing import (
     create_test_builder,
     create_test_input,
 )
-from mobius.components._quantized_linear import BlockQuantizedLinear, QuantizedLinear
+from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
+    NVFP4QuantizedLinear,
+    QuantizedLinear,
+)
 
 # Test dimensions
 IN_FEATURES = 64
@@ -258,6 +263,62 @@ class TestQuantizedLinearForward:
         assert "scales" in names
         assert "zero_points" in names
         assert "bias" in names
+
+
+class TestNVFP4QuantizedLinear:
+    def test_exact_parameter_abi(self):
+        linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
+
+        assert linear.weight.shape == [OUT_FEATURES, IN_FEATURES // 2]
+        assert linear.weight.dtype.name == "UINT8"
+        assert linear.weight_scale.shape == [OUT_FEATURES, IN_FEATURES // 16]
+        assert linear.weight_scale.dtype.name == "UINT8"
+        assert linear.weight_scale_2.shape == [1]
+        assert linear.weight_scale_2.dtype.name == "FLOAT"
+
+    @pytest.mark.parametrize(("in_features", "block_size"), [(63, 16), (64, 32)])
+    def test_rejects_unsupported_layout(self, in_features, block_size):
+        with pytest.raises(ValueError, match="requires"):
+            NVFP4QuantizedLinear(
+                in_features,
+                OUT_FEATURES,
+                block_size=block_size,
+            )
+
+    def test_emits_exact_native_node_and_separate_bias(self):
+        linear = NVFP4QuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            bias=True,
+        )
+        builder, op, graph = create_test_builder()
+        x = create_test_input(
+            builder,
+            "x",
+            [2, 3, IN_FEATURES],
+            dtype=ir.DataType.FLOAT16,
+        )
+
+        result = linear(op, x)
+        builder._adapt_outputs([result], "")
+
+        native = next(
+            node for node in graph if node.op_type == "MatMulBlockQuantizedFp4Weight"
+        )
+        assert native.domain == "com.microsoft"
+        assert len(native.inputs) == 4
+        assert native.attributes["block_size"].value == 16
+        assert native.outputs[0].shape == [2, 3, OUT_FEATURES]
+        assert count_op_type(graph, "Add") == 1
+        assert graph.opset_imports["com.microsoft"] == 1
+
+    def test_rejects_non_fp16_activation_abi(self):
+        linear = NVFP4QuantizedLinear(IN_FEATURES, OUT_FEATURES)
+        builder, op, _graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, IN_FEATURES])
+
+        with pytest.raises(ValueError, match="requires FLOAT16 activations"):
+            linear(op, x)
 
 
 class TestBlockQuantizedLinear:

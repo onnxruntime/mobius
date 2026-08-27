@@ -39,6 +39,7 @@ _MICROSOFT_DOMAIN = "com.microsoft"
 # namespace rather than the legacy custom-op namespace — matching the domain the
 # runtime actually registers the kernel under.
 _NXRT_DOMAIN = "pkg.nxrt"
+_MICROSOFT_NVFP4_OP = "MatMulBlockQuantizedFp4Weight"
 
 _NATIVE_BLOCK_FORMATS = {
     "mxfp4": (32, 17),
@@ -180,6 +181,73 @@ class QuantizedLinear(nn.Module):
             **_accuracy_level_attrs(self._bits),
             _domain=_MICROSOFT_DOMAIN,
         )
+        if self.bias is not None:
+            result = op.Add(result, self.bias)
+        return result
+
+
+class NVFP4QuantizedLinear(nn.Module):
+    """Linear projection backed by Microsoft's storage-faithful NVFP4 op.
+
+    The native W4A16 ABI stores two E2M1 values per weight byte, one raw E4M3
+    block-scale byte per 16 weights, and one FP32 global scale. Dynamic W4A4
+    activation quantization is not part of this four-input graph contract.
+
+    Bias is deliberately emitted as a separate ``Add`` so the registered
+    four-input ONNX Function can inline the exact no-bias ABI used by the
+    pinned reference artifact.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        block_size: int = 16,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if block_size != 16:
+            raise ValueError(
+                f"MatMulBlockQuantizedFp4Weight requires block_size=16; got {block_size}."
+            )
+        if in_features % block_size:
+            raise ValueError(
+                "MatMulBlockQuantizedFp4Weight requires K divisible by 16; "
+                f"got K={in_features}."
+            )
+        self._k = in_features
+        self._n = out_features
+        self._block_size = block_size
+        self.weight = nn.Parameter(
+            [out_features, in_features // 2],
+            dtype=ir.DataType.UINT8,
+        )
+        self.weight_scale = nn.Parameter(
+            [out_features, in_features // block_size],
+            dtype=ir.DataType.UINT8,
+        )
+        self.weight_scale_2 = nn.Parameter([1], dtype=ir.DataType.FLOAT)
+        self.bias = nn.Parameter([out_features], dtype=ir.DataType.FLOAT16) if bias else None
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        """Compute ``x @ dequant(weight).T`` through the native W4A16 ABI."""
+        if x.dtype != ir.DataType.FLOAT16:
+            raise ValueError(
+                f"MatMulBlockQuantizedFp4Weight requires FLOAT16 activations; got {x.dtype}."
+            )
+        op.builder.graph.opset_imports[_MICROSOFT_DOMAIN] = 1
+        result = getattr(op, _MICROSOFT_NVFP4_OP)(
+            x,
+            self.weight,
+            self.weight_scale,
+            self.weight_scale_2,
+            block_size=self._block_size,
+            _domain=_MICROSOFT_DOMAIN,
+        )
+        result.dtype = x.dtype
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self._n])
         if self.bias is not None:
             result = op.Add(result, self.bias)
         return result

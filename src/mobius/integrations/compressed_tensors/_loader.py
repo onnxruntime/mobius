@@ -1,17 +1,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Streaming dequantization for the compressed-tensors 0.17.2 mixed format.
+"""Storage-preserving loading for the compressed-tensors 0.17.2 mixed format.
 
-The supported fallback reconstructs dense floating-point weights one tensor at
-a time. It does not claim to preserve NVFP4 storage or dynamic activation
-quantization. No current ONNX Runtime dense operator ABI accepts the checkpoint's
-``weight_packed`` + E4M3 block scale + reciprocal global-scale contract exactly.
+The default route emits Microsoft's block-quantized FP8/NVFP4 weight MatMuls
+around the exact source payloads. The NVFP4 op carries an inlineable standard
+ONNX Function for portable weight-only fallback. Dense reconstruction remains
+available only as an explicit fallback.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
 from collections.abc import Callable, Mapping
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_VERSION_PREFIX = "0.17.2"
 _FP8_DTYPES = frozenset({"F8_E4M3", "F8_E5M2"})
+_CONFIG_METADATA = "mobius.compressed_tensors.config"
+_STORAGE_METADATA = "mobius.compressed_tensors.storage"
+_RUNTIME_METADATA = "mobius.compressed_tensors.runtime_support"
+_SOURCE_METADATA = "mobius.compressed_tensors.source"
+_ROLE_METADATA = "mobius.compressed_tensors.role"
 _AUX_SUFFIXES = (
     ".weight_scale",
     ".weight_global_scale",
@@ -217,14 +223,45 @@ class CompressedTensorsConfig:
                 return group
         return None
 
+    def metadata(self) -> dict[str, object]:
+        """Return the ordered recipe persisted into each ONNX component."""
+        return {
+            "version": self.version,
+            "groups": [
+                {
+                    "name": group.name,
+                    "format": group.format,
+                    "targets": list(group.targets),
+                    "weights": dataclasses.asdict(group.weights),
+                    "input_activations": dataclasses.asdict(group.input_activations),
+                }
+                for group in self.groups
+            ],
+            "ignore": list(self.ignore),
+            "kv_cache_scheme": (
+                dataclasses.asdict(self.kv_cache_scheme)
+                if self.kv_cache_scheme is not None
+                else None
+            ),
+        }
+
 
 @dataclasses.dataclass(frozen=True)
 class CompressedTensorsLoadReport:
-    """Capability and fallback facts for a completed checkpoint load."""
+    """Storage and runtime facts for a completed checkpoint load.
 
+    ``preserved_weight_formats`` describes serialized source storage, while
+    ``native_weight_formats`` is reserved for compute kernels proven available
+    in the active runtime. A preserved W4A16 custom-op graph therefore does not
+    claim W4A4 activation execution or universal native runtime support.
+    """
+
+    storage_policy: str
+    preserved_weight_formats: tuple[str, ...]
     native_weight_formats: tuple[str, ...]
     dequantized_weight_formats: tuple[str, ...]
     activation_quantization: str
+    runtime_support: str
     kv_cache: str
     output_is_nvfp4: bool
     assigned_initializers: int
@@ -451,7 +488,12 @@ def _validate_module_layout(
     _require_metadata(key_index, global_key, dtypes={"F32"}, rank=1)
     if key_index[global_key][1] != [1]:
         raise CompressedTensorsError(f"{global_key} must be an F32 scalar stored as [1].")
-    _require_metadata(key_index, f"{module_name}.input_global_scale", dtypes={"F32"}, rank=1)
+    _require_metadata(
+        key_index,
+        f"{module_name}.input_global_scale",
+        dtypes={"F32"},
+        rank=1,
+    )
     if key_index[f"{module_name}.input_global_scale"][1] != [1]:
         raise CompressedTensorsError(
             f"{module_name}.input_global_scale must be an F32 scalar stored as [1]."
@@ -497,6 +539,24 @@ def _torch_dtype(dtype: str) -> torch.dtype:
         raise CompressedTensorsError(f"Unsupported safetensors dtype {dtype!r}.") from error
 
 
+def _ir_dtype(dtype: str) -> ir.DataType:
+    mapping = {
+        "BF16": ir.DataType.BFLOAT16,
+        "F16": ir.DataType.FLOAT16,
+        "F32": ir.DataType.FLOAT,
+        "F8_E4M3": ir.DataType.FLOAT8E4M3FN,
+        "F8_E5M2": ir.DataType.FLOAT8E5M2,
+        "I64": ir.DataType.INT64,
+        "U8": ir.DataType.UINT8,
+    }
+    try:
+        return mapping[dtype]
+    except KeyError as error:
+        raise CompressedTensorsError(
+            f"Unsupported preserved safetensors dtype {dtype!r}."
+        ) from error
+
+
 def _map_source_weight(
     preprocess_weights: Callable[[dict[str, torch.Tensor]], dict[str, torch.Tensor]] | None,
     source_name: str,
@@ -516,16 +576,244 @@ def _map_source_weight(
     return tuple(mapped)
 
 
-def _find_initializer(package: ModelPackage, mapped_name: str) -> tuple[str, ir.Value] | None:
+def _find_initializer(
+    package: ModelPackage, mapped_name: str
+) -> tuple[str, ir.Graph, ir.Value] | None:
     for component_name, model in package.items():
         if mapped_name in model.graph.initializers:
-            return f"{component_name}.{mapped_name}", model.graph.initializers[mapped_name]
+            return (
+                f"{component_name}.{mapped_name}",
+                model.graph,
+                model.graph.initializers[mapped_name],
+            )
         prefix = f"{component_name}."
         if mapped_name.startswith(prefix):
             local_name = mapped_name[len(prefix) :]
             if local_name in model.graph.initializers:
-                return mapped_name, model.graph.initializers[local_name]
+                return mapped_name, model.graph, model.graph.initializers[local_name]
     return None
+
+
+def _lazy_source_initializer(
+    graph: ir.Graph,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    source_key: str,
+    name: str,
+    role: str,
+    *,
+    dtype: ir.DataType | None = None,
+    shape: list[int] | None = None,
+    raw_bytes: bool = False,
+) -> ir.Value:
+    _path, source_shape, source_dtype = key_index[source_key]
+    value_dtype = dtype or _ir_dtype(source_dtype)
+    value_shape = shape or source_shape
+    metadata = {_SOURCE_METADATA: source_key, _ROLE_METADATA: role}
+
+    def tensor_func() -> ir.TensorProtocol:
+        tensor = _load_tensors(key_index, (source_key,))[source_key]
+        if raw_bytes:
+            tensor = tensor.view(torch.uint8)
+        return tensor_adapters.TorchTensor(tensor, name=name)
+
+    value = ir.Value(
+        name=name,
+        shape=ir.Shape(value_shape),
+        type=ir.TensorType(value_dtype),
+        const_value=ir.LazyTensor(
+            tensor_func,
+            dtype=value_dtype,
+            shape=ir.Shape(value_shape),
+            name=name,
+            metadata_props=metadata,
+        ),
+        metadata_props=metadata,
+    )
+    graph.register_initializer(value)
+    return value
+
+
+def _projection_sites(
+    graph: ir.Graph,
+    initializer: ir.Value,
+) -> list[tuple[ir.Node, ir.Node]]:
+    """Return the exact ``Transpose(weight) -> MatMul`` sites for a Linear."""
+    sites: list[tuple[ir.Node, ir.Node]] = []
+    for transpose, input_index in initializer.uses():
+        if (
+            input_index != 0
+            or transpose.domain != ""
+            or transpose.op_type != "Transpose"
+            or tuple(transpose.attributes.get_ints("perm", ())) != (1, 0)
+        ):
+            raise CompressedTensorsError(
+                f"Quantized weight {initializer.name!r} must feed only a 2-D "
+                "Transpose(perm=[1, 0]) before MatMul."
+            )
+        transposed = transpose.outputs[0]
+        uses = list(transposed.uses())
+        if not uses:
+            raise CompressedTensorsError(
+                f"Quantized weight transpose {transpose.name!r} has no MatMul consumer."
+            )
+        for matmul, matmul_input_index in uses:
+            if matmul_input_index != 1 or matmul.domain != "" or matmul.op_type != "MatMul":
+                raise CompressedTensorsError(
+                    f"Quantized weight transpose {transpose.name!r} must feed only "
+                    "the B input of MatMul."
+                )
+            sites.append((transpose, matmul))
+    if not sites:
+        raise CompressedTensorsError(
+            f"Quantized initializer {initializer.name!r} has no Linear projection."
+        )
+    return sites
+
+
+def _replace_initializer_with_native_projection(
+    graph: ir.Graph,
+    initializer: ir.Value,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    module_name: str,
+    group: CompressionGroup,
+    logical_shape: list[int],
+) -> None:
+    """Replace a dense Linear projection with the pinned Microsoft block op."""
+    sites = _projection_sites(graph, initializer)
+    assert initializer.name is not None
+    prefix = f"{initializer.name}.compressed_tensors"
+
+    if group.format == "nvfp4-pack-quantized":
+        weight = _lazy_source_initializer(
+            graph,
+            key_index,
+            f"{module_name}.weight_packed",
+            f"{prefix}.weight",
+            "weight_packed",
+        )
+        scale = _lazy_source_initializer(
+            graph,
+            key_index,
+            f"{module_name}.weight_scale",
+            f"{prefix}.weight_scale",
+            "weight_scale",
+            dtype=ir.DataType.UINT8,
+            raw_bytes=True,
+        )
+        global_scale = _lazy_source_initializer(
+            graph,
+            key_index,
+            f"{module_name}.weight_global_scale",
+            f"{prefix}.weight_global_scale",
+            "weight_global_scale",
+        )
+        earliest_transpose = min(
+            (transpose for transpose, _ in sites),
+            key=graph.index,
+        )
+        one = ir.Value(
+            name=f"{prefix}.one",
+            shape=ir.Shape([1]),
+            type=ir.TensorType(ir.DataType.FLOAT),
+            const_value=ir.tensor(
+                torch.tensor([1.0], dtype=torch.float32),
+                name=f"{prefix}.one",
+            ),
+        )
+        graph.register_initializer(one)
+        weight_scale_2 = ir.Value(
+            name=f"{prefix}.weight_scale_2",
+            shape=ir.Shape([1]),
+            type=ir.TensorType(ir.DataType.FLOAT),
+        )
+        graph.insert_before(
+            earliest_transpose,
+            ir.Node(
+                "",
+                "Div",
+                inputs=[one, global_scale],
+                outputs=[weight_scale_2],
+                name=f"{prefix}.ReciprocalGlobalScale",
+            ),
+        )
+        op_type = "MatMulBlockQuantizedFp4Weight"
+        raw_inputs = [weight, scale, weight_scale_2]
+        attributes = {"block_size": 16}
+    else:
+        weight = _lazy_source_initializer(
+            graph,
+            key_index,
+            f"{module_name}.weight",
+            f"{prefix}.weight",
+            "weight",
+        )
+        scale = _lazy_source_initializer(
+            graph,
+            key_index,
+            f"{module_name}.weight_scale",
+            f"{prefix}.weight_scale",
+            "weight_scale",
+        )
+        if scale.dtype == ir.DataType.FLOAT:
+            native_scale = scale
+        else:
+            native_scale = ir.Value(
+                name=f"{prefix}.weight_scale_float",
+                shape=scale.shape,
+                type=ir.TensorType(ir.DataType.FLOAT),
+            )
+            earliest_transpose = min(
+                (transpose for transpose, _ in sites),
+                key=graph.index,
+            )
+            graph.insert_before(
+                earliest_transpose,
+                ir.Node(
+                    "",
+                    "Cast",
+                    inputs=[scale],
+                    outputs=[native_scale],
+                    attributes=ir.convenience.convert_attributes({"to": ir.DataType.FLOAT}),
+                    name=f"{prefix}.CastWeightScale",
+                ),
+            )
+        op_type = "MatMulBlockQuantizedFp8Weight"
+        raw_inputs = [weight, native_scale]
+        attributes = {"block_size": logical_shape[1]}
+
+    graph.opset_imports["com.microsoft"] = 1
+    removed_transposes: set[ir.Node] = set()
+    for index, (transpose, matmul) in enumerate(sites):
+        activation = matmul.inputs[0]
+        matmul_output = matmul.outputs[0]
+        assert activation is not None
+        if activation.dtype != ir.DataType.FLOAT16:
+            raise CompressedTensorsError(
+                f"{op_type} requires FLOAT16 activations, but projection "
+                f"{matmul.name!r} has {activation.dtype}. Build with dtype='f16' "
+                "or set keep_quantized=False."
+            )
+        output = ir.Value(
+            name=matmul_output.name or f"{prefix}.output_{index}",
+            shape=matmul_output.shape,
+            type=matmul_output.type,
+        )
+        node = ir.Node(
+            "com.microsoft",
+            op_type,
+            inputs=[activation, *raw_inputs],
+            outputs=[output],
+            attributes=ir.convenience.convert_attributes(attributes),
+            name=f"{prefix}.{op_type}_{index}",
+        )
+        graph.insert_before(transpose, node)
+        matmul_output.replace_all_uses_with(output, replace_graph_outputs=True)
+        graph.remove(matmul, safe=True)
+        removed_transposes.add(transpose)
+
+    for transpose in removed_transposes:
+        graph.remove(transpose, safe=True)
+    del graph.initializers[initializer.name]
 
 
 def _has_fp8_kv_cache(package: ModelPackage) -> bool:
@@ -555,13 +843,17 @@ def stream_compressed_tensors_to_package(
     | None = None,
     revision: str | None = None,
     fp8_kv_cache: bool = False,
+    keep_quantized: bool = True,
 ) -> CompressedTensorsLoadReport:
-    """Bind a mixed FP8/NVFP4 checkpoint through lazy dense reconstruction.
+    """Bind a mixed FP8/NVFP4 checkpoint through lazy source tensors.
 
-    Payload reads happen only when the package is serialized, and each closure
-    materializes one logical tensor plus its small scales. This bounds peak host
-    memory by the largest reconstructed tensor rather than the full checkpoint.
+    With ``keep_quantized=True`` (the default), source codes and scales are
+    serialized unchanged and Microsoft's native block-weight MatMul ops consume
+    them. The NVFP4 op carries a registered standard-ONNX Function fallback.
+    ``keep_quantized=False`` explicitly selects bounded dense reconstruction.
     """
+    from mobius.functions import register_function_bodies
+
     paths = _resolve_shard_paths(model_id, revision)
     key_index = _shard_key_index(paths)
 
@@ -647,7 +939,7 @@ def stream_compressed_tensors_to_package(
             located = _find_initializer(package, mapped_name)
             if located is None:
                 continue
-            qualified_name, initializer = located
+            qualified_name, graph, initializer = located
             identity = id(initializer)
             prior = target_sources.get(identity)
             if prior is not None and prior != source_key:
@@ -663,32 +955,42 @@ def stream_compressed_tensors_to_package(
                 )
             onnx_dtype = initializer.dtype
             assert onnx_dtype is not None
-            target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+            if keep_quantized and group is not None:
+                _replace_initializer_with_native_projection(
+                    graph,
+                    initializer,
+                    key_index,
+                    module_name,
+                    group,
+                    logical_shape,
+                )
+            else:
+                target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
-            def tensor_func(
-                *,
-                source=source_key,
-                module=module_name,
-                selected_group=group,
-                output_dtype=target_dtype,
-                output_name=qualified_name,
-            ) -> tensor_adapters.TorchTensor:
-                if selected_group is None:
-                    tensor = _load_tensors(key_index, (source,))[source]
-                    if tensor.dtype != output_dtype:
-                        tensor = tensor.to(output_dtype)
-                elif selected_group.format == "float-quantized":
-                    tensor = _dequantize_fp8(key_index, module, output_dtype)
-                else:
-                    tensor = _dequantize_nvfp4(key_index, module, output_dtype)
-                return tensor_adapters.TorchTensor(tensor, name=output_name)
+                def tensor_func(
+                    *,
+                    source=source_key,
+                    module=module_name,
+                    selected_group=group,
+                    output_dtype=target_dtype,
+                    output_name=qualified_name,
+                ) -> tensor_adapters.TorchTensor:
+                    if selected_group is None:
+                        tensor = _load_tensors(key_index, (source,))[source]
+                        if tensor.dtype != output_dtype:
+                            tensor = tensor.to(output_dtype)
+                    elif selected_group.format == "float-quantized":
+                        tensor = _dequantize_fp8(key_index, module, output_dtype)
+                    else:
+                        tensor = _dequantize_nvfp4(key_index, module, output_dtype)
+                    return tensor_adapters.TorchTensor(tensor, name=output_name)
 
-            initializer.const_value = ir.LazyTensor(
-                tensor_func,
-                dtype=onnx_dtype,
-                shape=ir.Shape(logical_shape),
-                name=qualified_name,
-            )
+                initializer.const_value = ir.LazyTensor(
+                    tensor_func,
+                    dtype=onnx_dtype,
+                    shape=ir.Shape(logical_shape),
+                    name=qualified_name,
+                )
             assigned.add(identity)
             target_sources[identity] = source_key
 
@@ -704,11 +1006,26 @@ def stream_compressed_tensors_to_package(
             f"{missing[:5]}."
         )
 
-    # Preserve the standard post-load graph contract without materializing the
-    # checkpoint: these folds create new LazyTensors whose closures transpose or
-    # concatenate one reconstructed projection at serialization time.
+    # Fold remaining ordinary float initializers without materializing the full
+    # checkpoint. Native block projections no longer have a dense initializer.
     for model in package.values():
+        if keep_quantized:
+            register_function_bodies(model)
         fold_initializers_after_weights(model)
+        model.metadata_props[_CONFIG_METADATA] = json.dumps(
+            config.metadata(),
+            separators=(",", ":"),
+        )
+        model.metadata_props[_STORAGE_METADATA] = (
+            "preserved-native-block" if keep_quantized else "dense-dequantized"
+        )
+        model.metadata_props[_RUNTIME_METADATA] = (
+            "faithful W4A16/W8A16 block-weight custom-op package; native execution "
+            "requires a sufficiently new/custom ONNX Runtime, and the registered "
+            "NVFP4 Function is the portable weight-only fallback"
+            if keep_quantized
+            else "dense floating-point fallback; source quantized compute is not preserved"
+        )
 
     actual_fp8_kv_cache = fp8_kv_cache and _has_fp8_kv_cache(package)
     kv_cache = (
@@ -716,21 +1033,45 @@ def stream_compressed_tensors_to_package(
         if actual_fp8_kv_cache
         else "dequantized/float graph cache; checkpoint FP8 cache scheme not enabled"
     )
+    loaded_format_set = {group.format for group, _shape, _root in layouts.values()}
+    loaded_formats = tuple(
+        dict.fromkeys(
+            group.format for group in config.groups if group.format in loaded_format_set
+        )
+    )
     report = CompressedTensorsLoadReport(
+        storage_policy=("preserved-native-block" if keep_quantized else "dense-dequantized"),
+        preserved_weight_formats=loaded_formats if keep_quantized else (),
         native_weight_formats=(),
-        dequantized_weight_formats=("float-quantized", "nvfp4-pack-quantized"),
+        dequantized_weight_formats=() if keep_quantized else loaded_formats,
         activation_quantization=(
-            "not represented: dynamic token/local activation quantization was removed"
+            "recipe metadata preserved; dynamic token/local activation quantization "
+            "is not part of the default W4A16/W8A16 graph"
+        ),
+        runtime_support=(
+            "native W4A16/W8A16 custom-op compute requires a sufficiently new/custom "
+            "ONNX Runtime; NVFP4 can be inlined to a portable weight-only function"
+            if keep_quantized
+            else "dense fallback is executable where the original float graph is supported"
         ),
         kv_cache=kv_cache,
-        output_is_nvfp4=False,
+        output_is_nvfp4=keep_quantized and "nvfp4-pack-quantized" in loaded_format_set,
         assigned_initializers=len(assigned),
     )
-    logger.warning(
-        "Loaded compressed-tensors weights through bounded dense reconstruction. "
-        "The output is no longer NVFP4/FP8 weight-quantized; dynamic activation "
-        "quantization is not represented. KV cache: %s.",
-        kv_cache,
-    )
+    if keep_quantized:
+        logger.warning(
+            "Preserved compressed-tensors FP8/NVFP4 storage through native W4A16/W8A16 "
+            "block-weight ops. Native execution requires a sufficiently new/custom "
+            "ONNX Runtime; dynamic activation quantization is metadata-only. "
+            "KV cache: %s.",
+            kv_cache,
+        )
+    else:
+        logger.warning(
+            "Loaded compressed-tensors weights through explicit bounded dense "
+            "reconstruction. The output is no longer NVFP4/FP8 weight-quantized. "
+            "KV cache: %s.",
+            kv_cache,
+        )
     package.quantization_report = report
     return report

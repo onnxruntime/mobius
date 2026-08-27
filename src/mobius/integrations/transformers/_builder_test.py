@@ -150,7 +150,111 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
     package = ModelPackage({"model": model}, config=config)
     stream = mock.Mock()
+    built_configs = []
 
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "qwen2"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "text-generation", "qwen2"),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+
+    def fake_build_from_module(_module, built_config, *args, **kwargs):
+        built_configs.append(built_config)
+        return package
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        fake_build_from_module,
+    )
+    monkeypatch.setattr(transformers_builder, "stream_compressed_tensors_to_package", stream)
+    download = mock.Mock(side_effect=AssertionError("must not eagerly download"))
+    monkeypatch.setattr(transformers_builder, "_download_weights", download)
+
+    result = transformers_builder.build_transformers_model("fake/model", revision="immutable")
+
+    assert result is package
+    download.assert_not_called()
+    stream.assert_called_once()
+    assert stream.call_args.kwargs["revision"] == "immutable"
+    assert stream.call_args.kwargs["keep_quantized"] is True
+    assert built_configs[0].dtype == ir.DataType.FLOAT16
+
+
+def test_transformers_build_can_explicitly_dequantize_compressed_tensors(
+    monkeypatch,
+) -> None:
+    quantization_config = {
+        "quant_method": "compressed-tensors",
+        "version": "0.17.2",
+        "format": "mixed-precision",
+        "quantization_status": "compressed",
+        "config_groups": {
+            "fp8": {
+                "format": "float-quantized",
+                "targets": ["fp8"],
+                "weights": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "strategy": "channel",
+                    "symmetric": True,
+                    "dynamic": False,
+                },
+                "input_activations": {
+                    "num_bits": 8,
+                    "type": "float",
+                    "strategy": "token",
+                    "symmetric": True,
+                    "dynamic": True,
+                },
+            },
+            "nvfp4": {
+                "format": "nvfp4-pack-quantized",
+                "targets": ["nvfp4"],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "strategy": "tensor_group",
+                    "symmetric": True,
+                    "dynamic": False,
+                    "group_size": 16,
+                    "scale_dtype": "torch.float8_e4m3fn",
+                },
+                "input_activations": {
+                    "num_bits": 4,
+                    "type": "float",
+                    "strategy": "tensor_group",
+                    "symmetric": True,
+                    "dynamic": "local",
+                    "group_size": 16,
+                    "scale_dtype": "torch.float8_e4m3fn",
+                },
+            },
+        },
+        "ignore": [],
+    }
+    hf_config = type(
+        "HFConfig",
+        (),
+        {"model_type": "qwen2", "quantization_config": quantization_config},
+    )()
+    config = make_config(model_type="qwen2")
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)},
+        config=config,
+    )
+    stream = mock.Mock()
     monkeypatch.setattr(
         transformers_builder,
         "_load_transformers_config",
@@ -171,15 +275,13 @@ def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
         transformers_builder, "build_from_module", lambda *args, **kwargs: package
     )
     monkeypatch.setattr(transformers_builder, "stream_compressed_tensors_to_package", stream)
-    download = mock.Mock(side_effect=AssertionError("must not eagerly download"))
-    monkeypatch.setattr(transformers_builder, "_download_weights", download)
 
-    result = transformers_builder.build_transformers_model("fake/model", revision="immutable")
+    transformers_builder.build_transformers_model(
+        "fake/model",
+        keep_quantized=False,
+    )
 
-    assert result is package
-    download.assert_not_called()
-    stream.assert_called_once()
-    assert stream.call_args.kwargs["revision"] == "immutable"
+    assert stream.call_args.kwargs["keep_quantized"] is False
 
 
 def test_compressed_checkpoint_fp8_kv_cache_requires_checkpoint_scales(

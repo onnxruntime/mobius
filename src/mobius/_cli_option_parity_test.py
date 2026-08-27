@@ -119,6 +119,12 @@ class TestKeepQuantizedRemoved:
         default = build_parser().parse_args(["build-gguf", "some.gguf", "--output", "out"])
         assert default.dequantize is False
 
+    def test_transformers_build_uses_the_same_explicit_dequantize_spelling(self):
+        args = build_parser().parse_args(
+            ["build", "--model", "some/model", "--output", "out", "--dequantize"]
+        )
+        assert args.dequantize is True
+
 
 class TestSharedSaveOptions:
     """Options that control how the package is written exist on both commands."""

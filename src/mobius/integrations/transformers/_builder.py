@@ -171,6 +171,7 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
+    keep_quantized: bool = True,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -182,6 +183,10 @@ def build_transformers_model(
     dense causal attention (executable on stock ORT) instead of the DSA
     ``IndexShare`` path, which requires the native custom-op runtime kernel.
     It is only valid for ``model_type == "glm_moe_dsa"``.
+
+    ``keep_quantized`` preserves supported compressed-tensors checkpoints in
+    their native block-weight representation. Set it to ``False`` only to
+    request explicit dense reconstruction.
     """
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
@@ -277,6 +282,19 @@ def build_transformers_model(
         config = _strip_to_text_only(config, model_type)
     if dtype is not None:
         config = dataclasses.replace(config, dtype=resolve_dtype(dtype))
+    elif compressed_tensors_config is not None and keep_quantized:
+        # The pinned Microsoft block-weight ABI is W4A16/W8A16 with FP16 A/Y.
+        config = dataclasses.replace(config, dtype=ir.DataType.FLOAT16)
+    if (
+        compressed_tensors_config is not None
+        and keep_quantized
+        and config.dtype != ir.DataType.FLOAT16
+    ):
+        raise ValueError(
+            "Storage-preserving compressed-tensors export requires dtype='f16' "
+            "for the Microsoft W4A16/W8A16 custom-op ABI. Use dtype='f16' or "
+            "set keep_quantized=False (--dequantize)."
+        )
     if output_layer_indices is not None:
         config = dataclasses.replace(
             config,
@@ -339,6 +357,7 @@ def build_transformers_model(
                 preprocess_weights=getattr(model_module, "preprocess_weights", None),
                 revision=revision,
                 fp8_kv_cache=fp8_kv_cache,
+                keep_quantized=keep_quantized,
             )
         else:
             state_dict = _download_weights(model_id, revision=revision)
