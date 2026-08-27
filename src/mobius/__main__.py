@@ -351,6 +351,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     # Build from HuggingFace model ID or local config
     if args.config:
+        import onnx_ir as ir
         import transformers
 
         config_path = args.config
@@ -382,9 +383,27 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
         if hasattr(hf_config, "text_config"):
             hf_config = hf_config.text_config
+        from mobius.integrations.compressed_tensors import (
+            CompressedTensorsConfig,
+            stream_compressed_tensors_to_package,
+        )
+
+        compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
         config = _config_from_hf(hf_config, parent_config=parent_config)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
+        elif compressed_tensors_config is not None and keep_quantized:
+            config = dataclasses.replace(config, dtype=ir.DataType.FLOAT16)
+        if (
+            compressed_tensors_config is not None
+            and keep_quantized
+            and config.dtype != ir.DataType.FLOAT16
+        ):
+            raise SystemExit(
+                "Error: storage-preserving compressed-tensors export requires "
+                "--dtype f16 for the Microsoft W4A16/W8A16 custom-op ABI. "
+                "Use --dtype f16 or --dequantize."
+            )
         if args.glm_full_attention:
             if model_type != "glm_moe_dsa":
                 raise SystemExit(
@@ -420,10 +439,32 @@ def _cmd_build(args: argparse.Namespace) -> None:
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
-            state_dict = _load_weights_from_dir(config_path)
-            if hasattr(model_module, "preprocess_weights"):
-                state_dict = model_module.preprocess_weights(state_dict)
-            pkg.apply_weights(state_dict)
+            if compressed_tensors_config is not None:
+                # Packed FP4 weights cannot pass through ordinary apply_weights.
+                # The same loader owns both faithful native storage and the
+                # explicit keep_quantized=False dense reconstruction policy.
+                checkpoint_dir = (
+                    os.path.dirname(config_path)
+                    if os.path.isfile(config_path)
+                    else config_path
+                )
+                stream_compressed_tensors_to_package(
+                    pkg,
+                    checkpoint_dir,
+                    compressed_tensors_config,
+                    preprocess_weights=getattr(
+                        model_module,
+                        "preprocess_weights",
+                        None,
+                    ),
+                    fp8_kv_cache=fp8_kv_cache,
+                    keep_quantized=keep_quantized,
+                )
+            else:
+                state_dict = _load_weights_from_dir(config_path)
+                if hasattr(model_module, "preprocess_weights"):
+                    state_dict = model_module.preprocess_weights(state_dict)
+                pkg.apply_weights(state_dict)
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:

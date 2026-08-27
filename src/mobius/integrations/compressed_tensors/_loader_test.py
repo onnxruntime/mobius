@@ -475,6 +475,67 @@ class TestReconstruction:
             == weight.view(torch.uint8).numpy().tobytes()
         )
 
+    @pytest.mark.parametrize(
+        ("dtype", "metadata_dtype"),
+        [
+            (torch.float8_e5m2, "F8_E5M2"),
+            (torch.float8_e4m3fnuz, "F8_E4M3FNUZ"),
+            (torch.float8_e5m2fnuz, "F8_E5M2FNUZ"),
+        ],
+    )
+    def test_native_fp8_rejects_non_e4m3fn_without_reinterpreting_codes(
+        self,
+        tmp_path,
+        dtype,
+        metadata_dtype,
+    ):
+        weight = torch.tensor(
+            [[1.0, -2.0, 0.5, 3.0] * 4, [-1.0, 0.25, 2.0, -0.5] * 4],
+            dtype=dtype,
+        )
+        scale = torch.tensor([[0.25], [2.0]], dtype=torch.bfloat16)
+        _write_checkpoint(
+            tmp_path,
+            {"fp8.weight": weight, "fp8.weight_scale": scale},
+        )
+
+        with pytest.raises(
+            CompressedTensorsError,
+            match=rf"FLOAT8E4M3FN.*{metadata_dtype}.*keep_quantized=False",
+        ):
+            stream_compressed_tensors_to_package(
+                _linear_package(dtype=ir.DataType.FLOAT16),
+                str(tmp_path),
+                CompressedTensorsConfig.parse(_config()),
+                preprocess_weights=lambda state: {"weight": state["fp8.weight"]},
+            )
+
+    def test_dense_fp8_e5m2_explicit_fallback_parity(self, tmp_path):
+        weight = torch.tensor(
+            [[1.0, -2.0, 0.5, 3.0] * 4, [-1.0, 0.25, 2.0, -0.5] * 4],
+            dtype=torch.float8_e5m2,
+        )
+        scale = torch.tensor([[0.25], [2.0]], dtype=torch.bfloat16)
+        _write_checkpoint(
+            tmp_path,
+            {"fp8.weight": weight, "fp8.weight_scale": scale},
+        )
+        package = _linear_package()
+
+        report = stream_compressed_tensors_to_package(
+            package,
+            str(tmp_path),
+            CompressedTensorsConfig.parse(_config()),
+            preprocess_weights=lambda state: {"weight": state["fp8.weight"]},
+            keep_quantized=False,
+        )
+
+        x = np.arange(1, 17, dtype=np.float32)[None, :]
+        expected = x @ (weight.float() * scale.float()).numpy().T
+        actual = OnnxModelSession(package["model"], device="cpu").run({"x": x})["output"]
+        np.testing.assert_array_equal(actual, expected)
+        assert report.dequantized_weight_formats == ("float-quantized",)
+
     def test_native_nvfp4_function_inline_value_parity(self, tmp_path):
         codes = torch.tensor(
             [

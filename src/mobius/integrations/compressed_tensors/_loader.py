@@ -29,7 +29,14 @@ from mobius.integrations._weight_loading import _resolve_shard_paths, _shard_key
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_VERSION_PREFIX = "0.17.2"
-_FP8_DTYPES = frozenset({"F8_E4M3", "F8_E5M2"})
+_FP8_DTYPES = frozenset(
+    {
+        "F8_E4M3",
+        "F8_E4M3FNUZ",
+        "F8_E5M2",
+        "F8_E5M2FNUZ",
+    }
+)
 _CONFIG_METADATA = "mobius.compressed_tensors.config"
 _STORAGE_METADATA = "mobius.compressed_tensors.storage"
 _RUNTIME_METADATA = "mobius.compressed_tensors.runtime_support"
@@ -526,7 +533,9 @@ def _torch_dtype(dtype: str) -> torch.dtype:
         "F32": torch.float32,
         "F64": torch.float64,
         "F8_E4M3": torch.float8_e4m3fn,
+        "F8_E4M3FNUZ": torch.float8_e4m3fnuz,
         "F8_E5M2": torch.float8_e5m2,
+        "F8_E5M2FNUZ": torch.float8_e5m2fnuz,
         "I8": torch.int8,
         "I16": torch.int16,
         "I32": torch.int32,
@@ -740,6 +749,14 @@ def _replace_initializer_with_native_projection(
         raw_inputs = [weight, scale, weight_scale_2]
         attributes = {"block_size": 16}
     else:
+        source_dtype = key_index[f"{module_name}.weight"][2]
+        if source_dtype != "F8_E4M3":
+            raise CompressedTensorsError(
+                "MatMulBlockQuantizedFp8Weight requires an exact "
+                "FLOAT8E4M3FN weight payload, but "
+                f"{module_name}.weight uses {source_dtype}. Set "
+                "keep_quantized=False (--dequantize) for dense reconstruction."
+            )
         weight = _lazy_source_initializer(
             graph,
             key_index,
