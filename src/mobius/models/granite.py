@@ -60,12 +60,15 @@ class GraniteTextModel(nn.Module):
         position_embeddings = (
             self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
         )
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
-        )
+        if attention_mask is not None:
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
+        else:
+            attention_bias = None
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)

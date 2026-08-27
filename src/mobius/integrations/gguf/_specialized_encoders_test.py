@@ -217,6 +217,14 @@ def _jina_v3_metadata(*, moe: bool = False):
     return metadata
 
 
+def test_jina_v3_rejects_unknown_rope_scaling_type() -> None:
+    metadata = _jina_v3_metadata()
+    metadata["jina-bert-v3.rope.scaling.type"] = "future-scaling"
+
+    with pytest.raises(ValueError, match=r"rope\.scaling\.type='future-scaling'"):
+        gguf_to_config(_FakeGGUF("jina-bert-v3", metadata, _jina_v3_tensors()))
+
+
 def _write_tiny_jina_v3(path: Path) -> None:
     from gguf import GGUFWriter
 

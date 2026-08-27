@@ -3686,7 +3686,7 @@ def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
         raise ValueError("granite GGUF has invalid normalization or scaling metadata")
 
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
-    supported_scaling_types = {None, "", "none", "longrope"}
+    supported_scaling_types = {None, "", "none"}
     if scaling_type not in supported_scaling_types:
         raise ValueError(f"granite GGUF has unsupported rope.scaling.type={scaling_type!r}")
 
@@ -3718,33 +3718,10 @@ def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
         raise ValueError("granite serialized rope_freqs.weight is not representable exactly")
     longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
     present_longrope = longrope_names & set(skipped_shapes)
-    if present_longrope and present_longrope != longrope_names:
-        raise ValueError("granite LongRoPE requires both long and short factor tensors")
     if present_longrope:
-        if scaling_type != "longrope":
-            raise ValueError(
-                "granite LongRoPE factor tensors require rope.scaling.type='longrope'"
-            )
-        original_context = metadata.get(f"{arch}.rope.scaling.original_context_length")
-        if original_context is None or not 0 < int(original_context) <= context:
-            raise ValueError(
-                "granite LongRoPE requires an original context length within context_length"
-            )
-        factor_types = {
-            name: getattr(qtype, "value", qtype)
-            for name, _raw, qtype, _shape in raw_items
-            if name in present_longrope
-        }
-        expected_factor_shape = (rope_dim // 2,)
-        if any(skipped_shapes[name] != expected_factor_shape for name in present_longrope):
-            raise ValueError(
-                f"granite LongRoPE factors must have shape {expected_factor_shape}"
-            )
-        if any(type_id not in {0, 1, 30} for type_id in factor_types.values()):
-            raise ValueError("granite LongRoPE factors must use F32/F16/BF16 storage")
-    elif scaling_type == "longrope":
         raise ValueError(
-            "granite rope.scaling.type='longrope' requires both serialized factor tensors"
+            "granite tensor-backed LongRoPE is unsupported because the current rotary graph "
+            "cannot preserve rope.scaling.attn_factor exactly"
         )
 
     required: dict[str, tuple[int, ...]] = {

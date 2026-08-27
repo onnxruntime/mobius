@@ -194,6 +194,14 @@ def test_smallthinker_accepts_loader_zero_scale_sentinel() -> None:
     assert config.routed_scaling_factor == pytest.approx(1.0)
 
 
+def test_smallthinker_rejects_scaling_factor_without_type() -> None:
+    model = _FakeGGUF()
+    model.metadata["smallthinker.rope.scaling.factor"] = 2.0
+
+    with pytest.raises(ValueError, match="unsupported RoPE scaling metadata"):
+        gguf_to_config(model)
+
+
 def test_smallthinker_capabilities_fail_closed_for_quantization_and_runtime() -> None:
     spec = get_arch_spec("smallthinker")
 

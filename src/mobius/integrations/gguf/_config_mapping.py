@@ -444,6 +444,39 @@ def _nextn_predict_layers(gguf_arch: str, metadata: dict[str, Any]) -> int:
     return count
 
 
+def _validate_closed_rope_scaling_metadata(
+    metadata: dict[str, Any],
+    arch: str,
+    *,
+    allowed_suffixes: set[str] | None = None,
+) -> None:
+    """Reject RoPE-scaling metadata outside an architecture's exact subset."""
+    allowed = {f"{arch}.rope.scaling.{suffix}" for suffix in (allowed_suffixes or set())}
+    unsupported = {
+        key
+        for key in metadata
+        if key.startswith(f"{arch}.rope.scaling.") and key not in allowed
+    }
+    unsupported.update(
+        key
+        for key in (
+            f"{arch}.rope.scale_linear",
+            f"{arch}.rope.factor",
+            f"{arch}.rope.original_context",
+        )
+        if key in metadata
+    )
+    if unsupported:
+        raise ValueError(
+            f"{arch} has unsupported RoPE scaling metadata: {', '.join(sorted(unsupported))}"
+        )
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if "type" in (allowed_suffixes or set()) and scaling_type not in (None, "", "none"):
+        raise ValueError(
+            f"{arch} rope.scaling.type={scaling_type!r} is not in the exact supported subset"
+        )
+
+
 def _derive_hybrid_layout(
     gguf_arch: str,
     metadata: dict[str, Any],
@@ -1648,6 +1681,7 @@ def _smallthinker_postprocess(
 ) -> ArchitectureConfig:
     """Restore the pinned llama.cpp SmallThinker routing and layer schedule."""
     arch = "smallthinker"
+    _validate_closed_rope_scaling_metadata(metadata, arch, allowed_suffixes={"type"})
     raw_gating = metadata[f"{arch}.expert_gating_func"]
     gating_value = float(raw_gating)
     if not math.isfinite(gating_value) or not gating_value.is_integer():
@@ -1797,6 +1831,7 @@ def _maincoder_postprocess(
     model: Any,
 ) -> ArchitectureConfig:
     """Restore Maincoder's tied, adjacent-pair, post-RoPE QK-norm profile."""
+    _validate_closed_rope_scaling_metadata(metadata, "maincoder")
     return dataclasses.replace(
         config,
         hidden_act="silu",
@@ -2299,27 +2334,14 @@ def _granite_postprocess(
     longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
     present_longrope = tensor_names & longrope_names
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
-    if scaling_type not in (None, "", "none", "longrope"):
+    if scaling_type not in (None, "", "none"):
         raise ValueError(
             f"granite rope.scaling.type={scaling_type!r} is not in the exact supported subset"
         )
     if present_longrope:
-        if not finetuned:
-            raise ValueError("granite LongRoPE factors require RoPE to be enabled")
-        if scaling_type != "longrope":
-            raise ValueError(
-                "granite LongRoPE factor tensors require rope.scaling.type='longrope'"
-            )
-        config = _minicpm_longrope(
-            config,
-            metadata,
-            model,
-            rope_dim=config.hidden_size // config.num_attention_heads,
-            label="Granite",
-        )
-    elif scaling_type == "longrope":
         raise ValueError(
-            "granite rope.scaling.type='longrope' requires both serialized factor tensors"
+            "granite tensor-backed LongRoPE is unsupported because the current rotary graph "
+            "cannot preserve rope.scaling.attn_factor exactly"
         )
 
     def finite_scale(suffix: str, default: float) -> float:
@@ -4015,6 +4037,7 @@ def _jina_bert_v3_postprocess(
 ) -> ArchitectureConfig:
     """Resolve JinaBERT-v3's QKV representation and exact dense/MoE schedule."""
     arch = model.architecture
+    _validate_closed_rope_scaling_metadata(metadata, arch, allowed_suffixes={"type"})
     if config.num_key_value_heads != config.num_attention_heads:
         raise ValueError(f"{arch} GGUF requires head_count_kv == head_count")
     if bool(metadata[f"{arch}.attention.causal"]):
@@ -4332,6 +4355,7 @@ def _plamo_postprocess(
 ) -> ArchitectureConfig:
     """Validate and materialize the fixed PLaMo-13B converter contract."""
     prefix = "plamo."
+    _validate_closed_rope_scaling_metadata(metadata, "plamo")
     expected_ints = {
         "context_length": 4096,
         "embedding_length": 5120,
@@ -4354,22 +4378,6 @@ def _plamo_postprocess(
     rope_dim = int(metadata.get(f"{prefix}rope.dimension_count", 128))
     if rope_dim != 128:
         raise ValueError(f"PLaMo requires full-head rope.dimension_count=128, got {rope_dim}")
-    unsupported_rope = sorted(
-        key
-        for key in metadata
-        if key.startswith(
-            (
-                f"{prefix}rope.scaling",
-                f"{prefix}rope.factor",
-                f"{prefix}rope.original_context",
-            )
-        )
-    )
-    if unsupported_rope:
-        raise ValueError(
-            "PLaMo does not support scaled-RoPE metadata: " + ", ".join(unsupported_rope)
-        )
-
     return dataclasses.replace(
         config,
         model_type="plamo",

@@ -303,7 +303,8 @@ def test_granite_moe_config_selects_shared_expert_graph() -> None:
     assert config.norm_topk_prob
 
 
-def test_granite_longrope_factors_are_consumed_exactly() -> None:
+@pytest.mark.parametrize("attention_factor", [None, 1.1])
+def test_granite_longrope_factors_fail_closed(attention_factor: float | None) -> None:
     metadata = _metadata()
     metadata.update(
         {
@@ -315,15 +316,13 @@ def test_granite_longrope_factors_are_consumed_exactly() -> None:
     tensors["rope_factors_short.weight"] = np.asarray([1.0, 1.5, 2.0, 2.5], np.float32)
     tensors["rope_factors_long.weight"] = np.asarray([3.0, 3.5, 4.0, 4.5], np.float32)
     model = _FakeGGUF(metadata, tensors)
+    if attention_factor is not None:
+        metadata["granite.rope.scaling.attn_factor"] = attention_factor
 
-    _raise_for_invalid_granite_tensor_contract(model)
-    config = gguf_to_config(model)
-    assert config.rope_type == "longrope"
-    assert config.original_max_position_embeddings == 32
-    assert config.rope_scaling == {
-        "short_factor": [1.0, 1.5, 2.0, 2.5],
-        "long_factor": [3.0, 3.5, 4.0, 4.5],
-    }
+    with pytest.raises(ValueError, match=r"unsupported rope\.scaling\.type='longrope'"):
+        _raise_for_invalid_granite_tensor_contract(model)
+    with pytest.raises(ValueError, match="not in the exact supported subset"):
+        gguf_to_config(model)
 
 
 def test_granite_rejects_unmapped_yarn_attention_factor() -> None:
@@ -342,6 +341,31 @@ def test_granite_rejects_unmapped_yarn_attention_factor() -> None:
         gguf_to_config(model)
     with pytest.raises(ValueError, match=r"unsupported rope\.scaling\.type='yarn'"):
         _raise_for_invalid_granite_tensor_contract(model)
+
+
+def test_dense_granite_static_cache_model_loads_in_ort() -> None:
+    import onnx_ir as ir
+
+    from mobius._registry import registry
+    from mobius._testing.ort_inference import OnnxModelSession
+    from mobius.tasks import CausalLMTask
+
+    config = gguf_to_config(_FakeGGUF(_metadata(), _tensors()))
+    graph = CausalLMTask(static_cache=True, max_seq_len=8).build(
+        registry.get(config.model_type)(config), config
+    )["model"]
+    for initializer in graph.graph.initializers.values():
+        if initializer.const_value is None:
+            initializer.const_value = ir.tensor(
+                np.zeros(initializer.shape, dtype=np.float32), name=initializer.name
+            )
+
+    session = OnnxModelSession(graph)
+    try:
+        assert "write_indices" in session.input_names
+        assert "attention_mask" not in session.input_names
+    finally:
+        session.close()
 
 
 def test_granite_fused_qkv_is_split_then_reverse_permuted_by_value() -> None:

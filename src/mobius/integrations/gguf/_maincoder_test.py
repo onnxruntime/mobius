@@ -180,6 +180,14 @@ def test_pinned_maincoder_config_and_real_tensor_census() -> None:
     assert config.tie_word_embeddings is True
 
 
+def test_maincoder_rejects_legacy_linear_rope_scaling() -> None:
+    model = _fixture()
+    model.metadata["maincoder.rope.scale_linear"] = 2.0
+
+    with pytest.raises(ValueError, match="unsupported RoPE scaling metadata"):
+        gguf_to_config(model)
+
+
 def test_maincoder_route_mapping_and_graph_order_are_exact() -> None:
     model = _fixture()
     config = gguf_to_config(model)

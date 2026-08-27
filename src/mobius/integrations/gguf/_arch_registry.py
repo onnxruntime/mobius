@@ -1691,9 +1691,9 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=(
             "Exact float and quantization-preserving import covers the pinned dense-or-MoE "
             "union, fused or split QKV, optional projection biases, ungated shared experts, "
-            "Granite scaling, and tensor-backed LongRoPE. Non-empty deep-stack mappings and "
-            "serialized single-factor RoPE remain fail-closed because the current text task "
-            "cannot represent those data-plane inputs or per-dimension factors. "
+            "and Granite scaling. Non-empty deep-stack mappings and tensor-backed LongRoPE "
+            "remain fail-closed because the current text task cannot represent those data-plane "
+            "inputs or preserve the serialized attention factor exactly. "
             + _RUNTIME_VALIDATION_PENDING
         ),
     ),

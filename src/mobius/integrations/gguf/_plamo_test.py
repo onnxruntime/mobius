@@ -132,6 +132,14 @@ def test_plamo_config_extracts_only_fixed_contract() -> None:
         gguf_to_config(model)
 
 
+def test_plamo_rejects_legacy_linear_rope_scaling() -> None:
+    model = _FakePlamoGGUF()
+    model.metadata["plamo.rope.scale_linear"] = 2.0
+
+    with pytest.raises(ValueError, match="unsupported RoPE scaling metadata"):
+        gguf_to_config(model)
+
+
 def test_plamo_tensor_mapping_is_suffix_exact() -> None:
     assert (
         map_gguf_to_hf_names("blk.7.attn_norm.weight", "plamo")
