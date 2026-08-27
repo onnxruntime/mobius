@@ -491,13 +491,9 @@ def preflight_local_gguf(
         is_sharded = False
         split_count = 1
         total_tensors = model.num_tensors
-        size_bytes = path.stat().st_size
+        size_bytes = model.source_size
         total_bytes = size_bytes
-        sha = None
-        if verify_checksums:
-            from mobius.integrations.gguf._shard_set import _sha256_of
-
-            sha = _sha256_of(path)
+        sha = model.source_sha256() if verify_checksums else None
         files.append(
             GgufFileMeta(
                 filename=path.name,
@@ -525,6 +521,8 @@ def preflight_local_gguf(
     if unsupported:
         blockers.append(_classification_blocker(unsupported))
     vram_weights_bytes = output_bytes
+    if not model.source_matches_path():
+        raise ValueError("GGUF source changed while its preflight report was being built.")
 
     return GgufPreflightReport(
         source=str(path),

@@ -9,7 +9,10 @@ to avoid requiring model downloads.
 
 from __future__ import annotations
 
+import os
 import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +29,7 @@ from mobius.integrations.gguf._config_mapping import (
 )
 from mobius.integrations.gguf._header import _gguf_architecture_from_header
 from mobius.integrations.gguf._reader import GGUFModel
+from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
 
 
 def _raw_gguf_string(value: bytes) -> bytes:
@@ -409,6 +413,97 @@ class TestGGUFModelReader:
     def test_file_not_found(self, tmp_path: Path):
         with pytest.raises(FileNotFoundError, match="not found"):
             GGUFModel(tmp_path / "nonexistent.gguf")
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable")
+    def test_rejects_fifo_without_waiting_for_a_writer(self, tmp_path: Path):
+        path = tmp_path / "source.gguf"
+        os.mkfifo(path)
+
+        with pytest.raises(FileNotFoundError, match="not found"):
+            GGUFModel(path)
+
+    def test_reader_fails_closed_when_source_moves_during_open(
+        self,
+        llama_gguf: Path,
+        gemma4_gguf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import gguf
+
+        original_reader = gguf.GGUFReader
+        moved_source = tmp_path / "moved-original.gguf"
+
+        def replace_path_before_reader_opens(source):
+            llama_gguf.replace(moved_source)
+            gemma4_gguf.replace(llama_gguf)
+            return original_reader(source)
+
+        monkeypatch.setattr(gguf, "GGUFReader", replace_path_before_reader_opens)
+
+        with pytest.raises(ValueError, match="source changed while the reader was opening"):
+            GGUFModel(llama_gguf)
+
+    def test_reader_fails_closed_when_symlink_is_retargeted_during_open(
+        self,
+        llama_gguf: Path,
+        gemma4_gguf: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import gguf
+
+        path = tmp_path / "source.gguf"
+        path.symlink_to(llama_gguf)
+        original_reader = gguf.GGUFReader
+
+        def retarget_symlink_before_reader_opens(source):
+            path.unlink()
+            path.symlink_to(gemma4_gguf)
+            return original_reader(source)
+
+        monkeypatch.setattr(gguf, "GGUFReader", retarget_symlink_before_reader_opens)
+
+        with pytest.raises(
+            ValueError, match="source path changed while the reader was opening"
+        ):
+            GGUFModel(path)
+
+    def test_artifact_hash_waits_for_exclusive_pinned_descriptor_access(
+        self, llama_gguf: Path
+    ):
+        model = GGUFModel(llama_gguf)
+        descriptor_held = threading.Event()
+        release_descriptor = threading.Event()
+        hash_started = threading.Event()
+
+        def hold_descriptor():
+            with model.open_source_descriptor():
+                descriptor_held.set()
+                release_descriptor.wait()
+
+        def hash_artifact():
+            hash_started.set()
+            return gguf_artifact_identity(
+                llama_gguf,
+                model,
+                architecture=model.architecture,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            holder = executor.submit(hold_descriptor)
+            assert descriptor_held.wait(timeout=1)
+            hasher = executor.submit(hash_artifact)
+            assert hash_started.wait(timeout=1)
+            try:
+                with pytest.raises(TimeoutError):
+                    hasher.result(timeout=0.05)
+            finally:
+                release_descriptor.set()
+            holder.result(timeout=1)
+            identity = hasher.result(timeout=1)
+
+        assert identity.sha256 == model.source_sha256()
 
     def test_rejects_huge_metadata_array_before_constructing_upstream_reader(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

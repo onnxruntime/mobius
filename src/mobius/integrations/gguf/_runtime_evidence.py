@@ -28,6 +28,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from mobius.integrations.gguf._reader import _descriptor_identity
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class GGUFArtifactIdentity:
@@ -668,21 +670,49 @@ def gguf_artifact_identity(
     """Fingerprint source bytes and parsed tensor census under a canonical architecture."""
     shard_paths = getattr(gguf_model, "shard_paths", None)
     if shard_paths is None:
-        stat, sha256 = _hash_regular_file(source_path)
+        open_descriptor = getattr(gguf_model, "open_source_descriptor", None)
+        if callable(open_descriptor):
+            with open_descriptor() as descriptor:
+                stat, sha256 = _hash_regular_descriptor(
+                    descriptor,
+                    path=source_path,
+                    expected_identity=gguf_model.source_identity,
+                )
+        else:
+            stat, sha256 = _hash_regular_file(source_path)
         size = stat.st_size
     else:
         paths = tuple(Path(path) for path in shard_paths)
         identity_paths = tuple(
             Path(path) for path in getattr(gguf_model, "identity_paths", paths)
         )
+        source_identities = getattr(gguf_model, "source_identities", None)
         if not paths:
             raise ValueError("A GGUF shard set must contain at least one source file.")
         if len(identity_paths) != len(paths):
             raise ValueError("GGUF shard identity paths must match the shard set length.")
+        if source_identities is None or len(source_identities) != len(paths):
+            raise ValueError(
+                "GGUF shard source identities must be captured for the complete shard set."
+            )
         digest = hashlib.sha256()
         size = 0
-        for path, identity_path in zip(paths, identity_paths):
-            stat, file_sha256 = _hash_regular_file(identity_path)
+        open_descriptor = getattr(gguf_model, "open_source_descriptor", None)
+        for index, (path, identity_path, source_identity) in enumerate(
+            zip(paths, identity_paths, source_identities)
+        ):
+            if callable(open_descriptor):
+                with open_descriptor(index) as descriptor:
+                    stat, file_sha256 = _hash_regular_descriptor(
+                        descriptor,
+                        path=identity_path,
+                        expected_identity=source_identity,
+                    )
+            else:
+                stat, file_sha256 = _hash_regular_file(
+                    identity_path,
+                    expected_identity=source_identity,
+                )
             encoded = path.name.encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
@@ -728,24 +758,56 @@ def gguf_graph_package_identity(package_dir: Path) -> GGUFGraphPackageIdentity:
     return GGUFGraphPackageIdentity(files=tuple(names), sha256=digest.hexdigest())
 
 
-def _hash_regular_file(path: Path) -> tuple[os.stat_result, str]:
+def _hash_regular_file(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int, int, int, int] | None = None,
+) -> tuple[os.stat_result, str]:
     """Hash one non-symlink regular file through the descriptor being validated."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     descriptor = os.open(path, flags)
     try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+        stat_result, sha256 = _hash_regular_descriptor(
+            descriptor,
+            path=path,
+            expected_identity=expected_identity,
+        )
+        if path.is_symlink():
             raise ValueError(f"Expected a non-symlink regular file: {path}")
-        digest = hashlib.sha256()
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-
-        def identity(value: os.stat_result) -> tuple[int, int, int, int]:
-            return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
-
-        if identity(before) != identity(after) or identity(after) != identity(path.stat()):
-            raise ValueError(f"File changed while its immutable identity was computed: {path}")
-        return after, digest.hexdigest()
+        path_descriptor = os.open(path, flags)
+        try:
+            if _descriptor_identity(descriptor) != _descriptor_identity(path_descriptor):
+                raise ValueError(f"File changed while its identity was computed: {path}")
+        finally:
+            os.close(path_descriptor)
+        return stat_result, sha256
     finally:
         os.close(descriptor)
+
+
+def _hash_regular_descriptor(
+    descriptor: int,
+    *,
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int] | None,
+) -> tuple[os.stat_result, str]:
+    """Hash the exact descriptor retained by a GGUF reader."""
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    before = os.fstat(descriptor)
+    before_identity = _descriptor_identity(descriptor)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"Expected a regular GGUF source file: {path}")
+    if expected_identity is not None and before_identity != expected_identity:
+        raise ValueError(f"File no longer matches the opened GGUF source identity: {path}")
+    digest = hashlib.sha256()
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    if before_identity != _descriptor_identity(descriptor):
+        raise ValueError(f"File changed while its immutable identity was computed: {path}")
+    return after, digest.hexdigest()

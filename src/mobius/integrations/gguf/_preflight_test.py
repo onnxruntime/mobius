@@ -69,6 +69,25 @@ def _write_sharded_gguf(
     return sorted(directory.glob(f"{stem}-*.gguf"))
 
 
+def _write_single_gguf(path: Path, *, seed: int = 0) -> Path:
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), "llama")
+    writer.add_context_length(128)
+    writer.add_embedding_length(16)
+    writer.add_block_count(1)
+    writer.add_head_count(4)
+    writer.add_head_count_kv(2)
+    writer.add_vocab_size(32)
+    tensor = np.random.default_rng(seed).standard_normal((8, 16)).astype(np.float32)
+    writer.add_tensor("token_embd.weight", tensor)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return path
+
+
 def _raw_quant_rows(qtype, n_rows: int, k: int) -> np.ndarray:
     """Zeroed raw-block bytes shaped ``(n_rows, bytes_per_row)`` for *qtype*."""
     from gguf import GGML_QUANT_SIZES
@@ -252,26 +271,33 @@ def test_local_preflight_checksums_optional(tmp_path):
 
 
 def test_local_preflight_single_file(tmp_path):
-    from gguf import GGUFWriter
-
-    path = tmp_path / "plain.gguf"
-    writer = GGUFWriter(str(path), "llama")
-    writer.add_context_length(128)
-    writer.add_embedding_length(16)
-    writer.add_block_count(1)
-    writer.add_head_count(4)
-    writer.add_head_count_kv(2)
-    writer.add_vocab_size(32)
-    writer.add_tensor("token_embd.weight", np.zeros((8, 16), np.float32))
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+    path = _write_single_gguf(tmp_path / "plain.gguf")
 
     report = preflight_local_gguf(path)
     assert not report.is_sharded
     assert report.total_files == 1
     assert report.split_count == 1
+
+
+def test_local_preflight_checksum_rejects_path_replacement(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    path = _write_single_gguf(tmp_path / "source.gguf")
+    replacement = _write_single_gguf(tmp_path / "replacement.gguf", seed=1)
+    moved_source = tmp_path / "moved-source.gguf"
+    source_sha256 = GGUFModel.source_sha256
+
+    def replace_path_before_hash(model, **kwargs):
+        path.replace(moved_source)
+        replacement.replace(path)
+        return source_sha256(model, **kwargs)
+
+    monkeypatch.setattr(GGUFModel, "source_sha256", replace_path_before_hash)
+
+    with pytest.raises(ValueError, match="source changed after its reader was opened"):
+        preflight_local_gguf(path, verify_checksums=True)
 
 
 def test_report_json_roundtrip_is_resumable(tmp_path):

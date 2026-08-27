@@ -47,10 +47,10 @@ __all__ = [
     "SHARD_FILENAME_RE",
 ]
 
-import hashlib
 import logging
 import re
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -336,6 +336,10 @@ class GgufShardSet:
             expected_sizes=expected_sizes,
         )
         _validate_shard_set(self._infos, shards)
+        if not all(shard.source_matches_path() for shard in shards):
+            raise GgufShardError(
+                "GGUF shard source changed while its manifest was being built."
+            )
 
         # Order shards by their authoritative ``split.no`` (order independence:
         # the caller may pass them in any order). Primary shard is split.no == 0.
@@ -503,6 +507,17 @@ class GgufShardSet:
         """Regular files used for immutable identity hashing, in shard order."""
         return list(self._identity_paths)
 
+    @property
+    def source_identities(self) -> list[tuple[int, int, int, int, int]]:
+        """Filesystem identities captured by the opened shard readers."""
+        return [shard.source_identity for shard in self._shards]
+
+    @contextmanager
+    def open_source_descriptor(self, index: int) -> Iterator[int]:
+        """Yield serialized access to one pinned shard descriptor."""
+        with self._shards[index].open_source_descriptor() as descriptor:
+            yield descriptor
+
     def _set_identity_paths(self, paths: list[Path]) -> None:
         """Bind trusted regular-file aliases of the opened shard sources."""
         if len(paths) != len(self._paths):
@@ -537,14 +552,6 @@ class GgufShardSet:
         )
 
 
-def _sha256_of(path: Path, *, chunk_size: int = 1 << 20) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _build_shard_infos(
     paths: list[Path],
     shards: list[GGUFModel],
@@ -567,7 +574,7 @@ def _build_shard_infos(
             index, count = split_no + 1, split_count
         else:
             _prefix, index, count = parsed
-        size_bytes = path.stat().st_size
+        size_bytes = shard.source_size
 
         expected_size = (expected_sizes or {}).get(path.name)
         if expected_size is not None and expected_size != size_bytes:
@@ -580,7 +587,7 @@ def _build_shard_infos(
         sha256: str | None = None
         want_sha = (expected_sha256 or {}).get(path.name)
         if verify_checksums:
-            sha256 = _sha256_of(path)
+            sha256 = shard.source_sha256()
             if want_sha is not None and sha256.lower() != want_sha.lower():
                 raise GgufShardError(
                     f"Shard {path.name} SHA-256 mismatch: manifest expected "

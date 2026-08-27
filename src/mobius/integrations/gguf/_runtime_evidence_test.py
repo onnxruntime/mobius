@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from collections import Counter
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
@@ -16,6 +17,7 @@ import pytest
 from mobius._builder import build_from_module
 from mobius._configs import NemotronHConfig
 from mobius.integrations.gguf import _runtime_evidence
+from mobius.integrations.gguf._reader import _descriptor_identity
 from mobius.integrations.gguf._runtime_blocker_evidence import (
     iter_runtime_blocker_evidence,
     runtime_blocker_evidence,
@@ -30,6 +32,14 @@ from mobius.integrations.gguf._runtime_evidence import (
 )
 from mobius.models.nemotron_h import NemotronHCausalLMModel
 from mobius.tasks import HybridCausalLMTask
+
+
+def _file_identity(path) -> tuple[int, int, int, int, int]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        return _descriptor_identity(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _pinned_nemotron_h_config() -> NemotronHConfig:
@@ -303,6 +313,10 @@ def test_sharded_artifact_identity_frames_every_shard_and_tensor(tmp_path) -> No
     ]
     model = SimpleNamespace(
         shard_paths=[first, second],
+        source_identities=[
+            _file_identity(first),
+            _file_identity(second),
+        ],
         reader_tensors=lambda: tensors,
     )
 
@@ -319,13 +333,13 @@ def test_sharded_artifact_identity_frames_every_shard_and_tensor(tmp_path) -> No
     assert identity.tensor_qtypes == (("F32", 1), ("Q4_K", 1))
 
     second.write_bytes(b"change")
-    changed = gguf_artifact_identity(
-        first,
-        model,
-        architecture="llama",
-        filename=first.name,
-    )
-    assert changed.sha256 != identity.sha256
+    with pytest.raises(ValueError, match="no longer matches the opened GGUF source identity"):
+        gguf_artifact_identity(
+            first,
+            model,
+            architecture="llama",
+            filename=first.name,
+        )
 
 
 def test_sharded_artifact_identity_hashes_regular_aliases_for_snapshot_links(
@@ -347,6 +361,10 @@ def test_sharded_artifact_identity_hashes_regular_aliases_for_snapshot_links(
     model = SimpleNamespace(
         shard_paths=[first, second],
         identity_paths=[first_blob, second_blob],
+        source_identities=[
+            _file_identity(first),
+            _file_identity(second),
+        ],
         reader_tensors=lambda: tensors,
     )
 
