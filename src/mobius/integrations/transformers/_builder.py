@@ -182,7 +182,6 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
-    keep_quantized: bool = True,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 

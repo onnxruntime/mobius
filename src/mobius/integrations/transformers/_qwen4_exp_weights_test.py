@@ -84,14 +84,14 @@ def test_streaming_loader_maps_packed_experts_and_ple_without_eager_checkpoint(
     )
     embedding = module.model.layers[0].ple.ple_embedding.ngram_embedding
     for shard_index in range(config.split_ngram_parts):
-        target = (
-            "model.layers.0.ple.ple_embedding.ngram_embedding."
-            f"shard_{shard_index}.weight"
+        target = f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{shard_index}.weight"
+        assert (
+            initializers[target].const_value.shape
+            == getattr(
+                embedding,
+                f"shard_{shard_index}",
+            ).weight.shape
         )
-        assert initializers[target].const_value.shape == getattr(
-            embedding,
-            f"shard_{shard_index}",
-        ).weight.shape
 
 
 def _official_package_state(package, config) -> dict[str, torch.Tensor]:
@@ -161,12 +161,16 @@ def test_multimodal_streaming_is_transactional_and_retains_no_source_tensors(
             initializer.const_value is not None
             for initializer in model.graph.initializers.values()
         )
-    ple_initializer = next(
+    ple_initializers = [
         initializer
         for initializer in package["decoder"].graph.initializers.values()
-        if initializer.name.endswith(".ple.ple_embedding.ngram_embedding.weight")
+        if ".ple.ple_embedding.ngram_embedding.shard_" in initializer.name
+        and initializer.name.endswith(".weight")
+    ]
+    assert len(ple_initializers) == config.split_ngram_parts
+    assert all(
+        isinstance(initializer.const_value, ir.LazyTensor) for initializer in ple_initializers
     )
-    assert isinstance(ple_initializer.const_value, ir.LazyTensor)
 
     failed_package = build_from_module(
         Qwen4ExpForConditionalGeneration(config),

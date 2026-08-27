@@ -233,11 +233,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             "Error: --features text-only is not supported with --config (local "
             "directory). Use --model <hf-id> --features text-only instead."
         )
-    if getattr(args, "dequantize", False) and args.config:
-        raise SystemExit(
-            "Error: --dequantize is only supported with --model. Local --config "
-            "weight loading does not carry checkpoint quantization metadata."
-        )
     if args.revision is not None and args.config:
         raise SystemExit(
             "Error: --revision is only supported with --model. "
@@ -488,7 +483,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task=task,
             dtype=dtype_override,
             load_weights=load_weights,
-            keep_quantized=not getattr(args, "dequantize", False),
             revision=revision,
             trust_remote_code=trust_remote_code,
             execution_provider=execution_provider,
@@ -1206,14 +1200,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-weights",
         action="store_true",
         help="Do not include weights in the output ONNX model.",
-    )
-    build_parser.add_argument(
-        "--dequantize",
-        action="store_true",
-        help=(
-            "Explicitly reconstruct supported quantized checkpoint weights as "
-            "dense tensors. The default preserves checkpoint storage with QDQ."
-        ),
     )
     build_parser.add_argument(
         "--trust-remote-code",
