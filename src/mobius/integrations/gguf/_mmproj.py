@@ -451,7 +451,7 @@ def _open_text_gguf(path: Any) -> Any:
     return open_gguf_model(path)
 
 
-def _resolve_mmproj_companion_path(path: str | Path) -> str:
+def _resolve_mmproj_companion_path(path: str | Path) -> Any:
     from mobius.integrations.gguf._builder import (
         _resolve_mmproj_companion_path as resolve_companion,
     )
