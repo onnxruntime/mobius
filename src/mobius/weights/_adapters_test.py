@@ -18,7 +18,7 @@ def _manifest() -> ComponentManifest:
         (
             ComponentDescriptor(
                 name="model",
-                module_path="",
+                module_attribute_path="",
                 role="decoder",
             ),
         )

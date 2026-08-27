@@ -599,7 +599,10 @@ def normalize_component_quantized_weights(
                     "component-specific tied-weight adapter."
                 )
             local_path = _local_weight_module_path(record.name, descriptor)
-            component_module = _resolve_module(module, descriptor.module_path)
+            component_module = _resolve_module(
+                module,
+                descriptor.module_attribute_path,
+            )
             local_module = (
                 _resolve_module(component_module, local_path)
                 if component_module is not None
