@@ -7893,7 +7893,12 @@ class TestMultimodalQuantizationDefault:
             return_value=expected,
         ) as build_multimodal:
             kwargs = {} if keep_quantized else {"keep_quantized": False}
-            actual = build_from_gguf("text.gguf", mmproj="mmproj.gguf", **kwargs)
+            actual = build_from_gguf(
+                "text.gguf",
+                mmproj="mmproj.gguf",
+                image_token_id=-200,
+                **kwargs,
+            )
 
         assert actual is expected
         build_multimodal.assert_called_once_with(
@@ -7901,8 +7906,15 @@ class TestMultimodalQuantizationDefault:
             "mmproj.gguf",
             dtype=None,
             execution_provider="default",
+            image_token_id=-200,
             keep_quantized=keep_quantized,
         )
+
+    def test_image_token_id_requires_mmproj(self):
+        from mobius.integrations.gguf import build_from_gguf
+
+        with pytest.raises(ValueError, match="requires a companion mmproj"):
+            build_from_gguf("text.gguf", image_token_id=-200)
 
 
 class TestRawTensorIterator:

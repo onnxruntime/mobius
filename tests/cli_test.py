@@ -19,7 +19,7 @@ import numpy as np
 import onnx
 import pytest
 
-from mobius.__main__ import _save_package, main
+from mobius.__main__ import _save_package, build_parser, main
 
 
 def _write_gated_gguf(path: Path, *, architecture: str, quantized: bool) -> None:
@@ -1112,6 +1112,22 @@ class TestCLIBuildRuntime:
 
 class TestCLIBuildGGUF:
     """The CLI must preserve the public GGUF architecture gate for every mode."""
+
+    def test_image_token_id_accepts_negative_processor_sentinel(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "build-gguf",
+                "text.gguf",
+                "--output",
+                "output",
+                "--mmproj",
+                "mmproj.gguf",
+                "--image-token-id",
+                "-200",
+            ]
+        )
+
+        assert args.image_token_id == -200
 
     def test_runtime_requires_explicit_pinned_tokenizer_before_output_creation(
         self, tmp_path: Path

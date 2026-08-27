@@ -95,6 +95,28 @@ class VisionLanguageTask(ModelTask):
         return _make_model(graph)
 
 
+class GGUFProjectorVisionLanguageTask(VisionLanguageTask):
+    """Generic sidecar split with the processor-native float image boundary."""
+
+    def _build_vision(
+        self,
+        vision: nn.Module,
+        config: ArchitectureConfig,
+    ) -> ir.Model:
+        """Build one image per call and expose rank-2 projected feature rows."""
+        image_size = (config.vision.image_size if config.vision else None) or 224
+        graph, builder = _make_graph(name="vision_encoder")
+        pixel_values = builder.input(
+            "pixel_values",
+            dtype=ir.DataType.FLOAT,
+            shape=[1, 3, image_size, image_size],
+        )
+        image_features = vision(builder.op, pixel_values=pixel_values)
+        image_features = builder.op.Squeeze(image_features, [0])
+        builder.add_output(image_features, "image_features")
+        return _make_model(graph)
+
+
 class Gemma3VisionLanguageTask(VisionLanguageTask):
     """Gemma 3 split with the processor-native, single-image vision boundary."""
 

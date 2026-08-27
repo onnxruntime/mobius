@@ -105,6 +105,10 @@ def test_registry_and_verdict_views_are_immutable() -> None:
 
 def test_graph_import_is_conservative_and_artifact_backed() -> None:
     assert supported_projector_types() == (
+        "mlp",
+        "ldp",
+        "ldpv2",
+        "adapter",
         "qwen2vl_merger",
         "qwen2.5vl_merger",
         "gemma3",
@@ -113,8 +117,13 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
     )
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
     assert set(pins) == {
+        "glm-edge-v-2b-adapter-f16",
         "gemma3-4b-f16",
         "gemma4-e2b-f16",
+        "llava-llama3-8b-mlp-f16",
+        "minicpm-v2-resampler-f16",
+        "mobilevlm-1.7b-ldp-f16",
+        "mobilevlm-v2-1.7b-ldpv2-f16",
         "muse-glimmer-30b-bf16",
         "qwen2-vl-2b-f16",
         "qwen25-vl-3b-f16",
@@ -127,6 +136,27 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         assert spec.real_artifact_ids
         assert all(artifact_id in pins for artifact_id in spec.real_artifact_ids)
         assert all(pins[artifact_id].parity_test for artifact_id in spec.real_artifact_ids)
+
+    cohort = [
+        pins[artifact_id]
+        for artifact_id in (
+            "llava-llama3-8b-mlp-f16",
+            "mobilevlm-1.7b-ldp-f16",
+            "mobilevlm-v2-1.7b-ldpv2-f16",
+            "glm-edge-v-2b-adapter-f16",
+            "minicpm-v2-resampler-f16",
+        )
+    ]
+    assert all(pin.paired_text_revision for pin in cohort)
+    processor_evidence = {pin.projector_types[0]: pin.processor_revision for pin in cohort}
+    assert processor_evidence == {
+        "mlp": "b20fb3040caaf5d0b3751c0d86a94efdf5bb007d",
+        "ldp": None,
+        "ldpv2": None,
+        "adapter": "2053707733f99ab52e943904f43c2359a94301ef",
+        "resampler": None,
+    }
+    assert sum(pin.size + (pin.paired_text_size or 0) for pin in cohort) <= 16 * 1024**3
 
 
 def test_deferred_lfm2_and_pixtral_artifacts_are_immutably_available() -> None:
@@ -300,7 +330,7 @@ def test_missing_modality_and_global_projector_fails_closed() -> None:
         projector_type_for_modality({}, MMProjModality.GENERATED_AUDIO)
 
 
-@pytest.mark.parametrize("projector_type", ["mlp", "gemma4a", "qwen2.5o"])
+@pytest.mark.parametrize("projector_type", ["gemma4a", "qwen2.5o"])
 def test_deferred_projector_has_no_dispatch_or_loader_closure(projector_type: str) -> None:
     spec = get_projector_spec(projector_type)
     assert not spec.is_supported

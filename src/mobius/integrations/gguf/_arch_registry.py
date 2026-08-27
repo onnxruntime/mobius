@@ -634,6 +634,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         aliases=frozenset({"mistral"}),
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
+        vlm_builder="generic_projector",
         llama_qk_permute=True,
         runtime=Support.SUPPORTED,
         runtime_evidence_ids=(
@@ -1009,6 +1010,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="chatglm",
         tensor_map_recipe=("chatglm",),
         config_postprocessor="chatglm",
+        vlm_builder="generic_projector",
         required_metadata=("attention.layer_norm_rms_epsilon",),
         rope_interleave=True,
         runtime=Support.DEFERRED,
@@ -2006,6 +2008,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         config_postprocessor="minicpm",
         tensor_map_recipe=("llama",),
         tensor_processor="llama",
+        vlm_builder="generic_projector",
         required_metadata=(
             "attention.layer_norm_rms_epsilon",
             "embedding_scale",

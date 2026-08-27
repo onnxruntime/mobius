@@ -40,6 +40,7 @@ __all__ = [
     "FeatureExtractionTask",
     "GGUFEncoderFeatureExtractionTask",
     "GGUFEmbeddingFeatureExtractionTask",
+    "GGUFProjectorVisionLanguageTask",
     "FunASRSpeechLanguageTask",
     "Gemma3VisionLanguageTask",
     "Gemma3nTask",
@@ -180,6 +181,7 @@ from mobius.tasks._vision_language import Qwen3VLVisionLanguageTask
 from mobius.tasks._vision_language_3model import (
     Cosmos3EdgeVLTask,
     Gemma3VisionLanguageTask,
+    GGUFProjectorVisionLanguageTask,
     GlmOcrVLTask,
     HybridQwenVLTask,
     Lfm2VlTask,

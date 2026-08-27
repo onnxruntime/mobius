@@ -110,20 +110,7 @@ class ProjectorSpec:
         verdicts = (self.metadata, self.tensor_map, self.graph, self.runtime)
         if any(verdict is not Support.SUPPORTED for verdict in verdicts) and not self.reason:
             raise ValueError(f"{self.projector_type}: unsupported capability needs a reason")
-        if self.is_importable:
-            if not self.builder or not self.target_architectures:
-                raise ValueError(
-                    f"{self.projector_type}: importable projector needs builder and target"
-                )
-            if not self.required_metadata or not self.required_top_tensors:
-                raise ValueError(
-                    f"{self.projector_type}: importable projector needs an exact loader closure"
-                )
-            if not self.real_artifact_ids:
-                raise ValueError(
-                    f"{self.projector_type}: importable projector needs real artifact evidence"
-                )
-        elif any(
+        has_loader_data = any(
             (
                 self.builder,
                 self.required_metadata,
@@ -135,9 +122,26 @@ class ProjectorSpec:
                 self.tensor_roles,
                 self.real_artifact_ids,
             )
-        ):
+        )
+        has_supported_schema = (
+            self.metadata is Support.SUPPORTED and self.tensor_map is Support.SUPPORTED
+        )
+        if has_supported_schema and has_loader_data:
+            if not self.builder or not self.target_architectures:
+                raise ValueError(
+                    f"{self.projector_type}: mapped projector needs builder and target"
+                )
+            if not self.required_metadata or not self.required_top_tensors:
+                raise ValueError(
+                    f"{self.projector_type}: mapped projector needs an exact loader closure"
+                )
+            if not self.real_artifact_ids:
+                raise ValueError(
+                    f"{self.projector_type}: mapped projector needs real artifact evidence"
+                )
+        elif has_loader_data:
             raise ValueError(
-                f"{self.projector_type}: deferred/rejected projector cannot expose loader data"
+                f"{self.projector_type}: rejected metadata/tensor mapping cannot expose loader data"
             )
 
     @property
@@ -182,11 +186,37 @@ class MMProjArtifactPin:
     tensor_qtypes: tuple[tuple[str, int], ...]
     tensor_count: int
     parity_test: str
+    paired_text_repository: str | None = None
+    paired_text_revision: str | None = None
+    paired_text_size: int | None = None
     processor_repository: str | None = None
     processor_revision: str | None = None
     processor_files: tuple[str, ...] = ()
     processor_class: str | None = None
     processor_contract: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.size <= 0 or len(self.revision) != 40 or len(self.lfs_sha256) != 64:
+            raise ValueError(f"{self.artifact_id}: immutable sidecar identity is required")
+        paired_fields = (
+            self.paired_text_repository,
+            self.paired_text_revision,
+            self.paired_text_size,
+        )
+        if any(value is not None for value in paired_fields):
+            if (
+                not all(value is not None for value in paired_fields)
+                or len(self.paired_text_revision or "") != 40
+                or int(self.paired_text_size or 0) <= 0
+            ):
+                raise ValueError(
+                    f"{self.artifact_id}: paired text repository, immutable revision, "
+                    "and positive size must be specified together"
+                )
+        if self.processor_repository is not None and len(self.processor_revision or "") != 40:
+            raise ValueError(
+                f"{self.artifact_id}: processor source requires an immutable revision"
+            )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -505,36 +535,208 @@ def _rejected(
     )
 
 
+_CLIP_TOP = (
+    "v.class_embd",
+    "v.patch_embd.weight",
+    "v.position_embd.weight",
+    "v.pre_ln.weight",
+    "v.pre_ln.bias",
+)
+_SIGLIP_TOP = (
+    "v.patch_embd.weight",
+    "v.patch_embd.bias",
+    "v.position_embd.weight",
+    "v.post_ln.weight",
+    "v.post_ln.bias",
+)
+_GENERIC_BLOCK_SUFFIXES = (
+    "attn_q.weight",
+    "attn_q.bias",
+    "attn_k.weight",
+    "attn_k.bias",
+    "attn_v.weight",
+    "attn_v.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ln1.weight",
+    "ln1.bias",
+    "ln2.weight",
+    "ln2.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+)
+_LDP_TOP = [
+    "mm.model.mlp.1.weight",
+    "mm.model.mlp.1.bias",
+    "mm.model.mlp.3.weight",
+    "mm.model.mlp.3.bias",
+]
+for _block in (1, 2):
+    _prefix = f"mm.model.mb_block.{_block}.block"
+    _LDP_TOP.extend(
+        (
+            f"{_prefix}.0.0.weight",
+            f"{_prefix}.0.1.weight",
+            f"{_prefix}.0.1.bias",
+            f"{_prefix}.1.fc1.weight",
+            f"{_prefix}.1.fc1.bias",
+            f"{_prefix}.1.fc2.weight",
+            f"{_prefix}.1.fc2.bias",
+            f"{_prefix}.2.0.weight",
+            f"{_prefix}.2.1.weight",
+            f"{_prefix}.2.1.bias",
+        )
+    )
+
 _SPECS: tuple[ProjectorSpec, ...] = (
-    _deferred(
+    ProjectorSpec(
         "mlp",
         "PROJECTOR_TYPE_MLP",
         _VISION_BASE,
-        "LLaVA MLP topology and class-token feature selection are not implemented by the GGUF builder.",
+        target_architectures=frozenset({"llama"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason="Graph-supported; paired LLaVA runtime parity remains deferred.",
+        builder="generic_projector",
+        required_metadata=_COMMON_REQUIRED_VISION_METADATA,
+        required_top_tensors=(
+            *_CLIP_TOP,
+            "mm.0.weight",
+            "mm.0.bias",
+        ),
+        optional_top_tensors=("mm.2.weight", "mm.2.bias"),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(("v.", MMProjTensorRole.ENCODER), ("mm.", MMProjTensorRole.PROJECTOR)),
+        real_artifact_ids=("llava-llama3-8b-mlp-f16",),
     ),
-    _deferred(
+    ProjectorSpec(
         "ldp",
         "PROJECTOR_TYPE_LDP",
         _VISION_BASE,
-        "MobileVLM LDP convolutional projector semantics are not implemented.",
+        target_architectures=frozenset({"llama"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason="Graph-supported; paired MobileVLM runtime parity remains deferred.",
+        builder="generic_projector",
+        required_metadata=_COMMON_REQUIRED_VISION_METADATA,
+        required_top_tensors=(*_CLIP_TOP, *_LDP_TOP),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(("v.", MMProjTensorRole.ENCODER), ("mm.", MMProjTensorRole.PROJECTOR)),
+        real_artifact_ids=("mobilevlm-1.7b-ldp-f16",),
     ),
-    _deferred(
+    ProjectorSpec(
         "ldpv2",
         "PROJECTOR_TYPE_LDPV2",
         _VISION_BASE,
-        "MobileVLM LDPv2 pooling/projector semantics are not implemented.",
+        target_architectures=frozenset({"llama"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason="Graph-supported; paired MobileVLM-V2 runtime parity remains deferred.",
+        builder="generic_projector",
+        required_metadata=_COMMON_REQUIRED_VISION_METADATA,
+        required_top_tensors=(
+            *_CLIP_TOP,
+            "mm.model.mlp.0.weight",
+            "mm.model.mlp.0.bias",
+            "mm.model.mlp.2.weight",
+            "mm.model.mlp.2.bias",
+            "mm.model.peg.0.weight",
+            "mm.model.peg.0.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(("v.", MMProjTensorRole.ENCODER), ("mm.", MMProjTensorRole.PROJECTOR)),
+        real_artifact_ids=("mobilevlm-v2-1.7b-ldpv2-f16",),
     ),
-    _deferred(
+    ProjectorSpec(
         "resampler",
         "PROJECTOR_TYPE_MINICPMV",
         _VISION_BASE,
-        "MiniCPM-V query resampler and positional interpolation are not implemented.",
+        target_architectures=frozenset({"minicpm"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.DEFERRED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Metadata and exact tensor mapping are supported, including learned query "
+            "positions. Graph construction is deferred because the real MiniCPM-V2 "
+            "processor emits variable patch-aligned image heights and widths while the "
+            "current vision graph fixes a 448x448 input and 32x32 position grid."
+        ),
+        builder="generic_projector",
+        required_metadata=_COMMON_REQUIRED_VISION_METADATA,
+        required_top_tensors=(
+            *_SIGLIP_TOP,
+            "resampler.query",
+            "resampler.pos_embed",
+            "resampler.proj.weight",
+            "resampler.kv.weight",
+            "resampler.attn.q.weight",
+            "resampler.attn.k.weight",
+            "resampler.attn.v.weight",
+            "resampler.attn.q.bias",
+            "resampler.attn.k.bias",
+            "resampler.attn.v.bias",
+            "resampler.attn.out.weight",
+            "resampler.attn.out.bias",
+            "resampler.ln_q.weight",
+            "resampler.ln_q.bias",
+            "resampler.ln_kv.weight",
+            "resampler.ln_kv.bias",
+            "resampler.ln_post.weight",
+            "resampler.ln_post.bias",
+        ),
+        optional_top_tensors=("resampler.pos_embed_k",),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("resampler.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("minicpm-v2-resampler-f16",),
     ),
-    _deferred(
+    ProjectorSpec(
         "adapter",
         "PROJECTOR_TYPE_GLM_EDGE",
         _VISION_BASE,
-        "GLM-Edge adapter tensor closure and graph are not implemented.",
+        target_architectures=frozenset({"chatglm"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason="Graph-supported; paired GLM-Edge runtime parity remains deferred.",
+        builder="generic_projector",
+        required_metadata=_COMMON_REQUIRED_VISION_METADATA,
+        required_top_tensors=(
+            *_SIGLIP_TOP,
+            "adapter.boi",
+            "adapter.eoi",
+            "adapter.conv.weight",
+            "adapter.conv.bias",
+            "adapter.linear.linear.weight",
+            "adapter.linear.norm1.weight",
+            "adapter.linear.norm1.bias",
+            "adapter.linear.dense_h_to_4h.weight",
+            "adapter.linear.gate.weight",
+            "adapter.linear.dense_4h_to_h.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("adapter.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("glm-edge-v-2b-adapter-f16",),
     ),
     ProjectorSpec(
         projector_type="qwen2vl_merger",
@@ -1075,6 +1277,141 @@ MMPROJ_ARTIFACT_AVAILABILITY_PINS: tuple[MMProjArtifactAvailabilityPin, ...] = (
 )
 
 MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
+    MMProjArtifactPin(
+        artifact_id="llava-llama3-8b-mlp-f16",
+        repository="xtuner/llava-llama-3-8b-v1_1-gguf",
+        revision="344f1bfe987bcbdc7e650b134d23670d5ffb5892",
+        filename="llava-llama-3-8b-v1_1-mmproj-f16.gguf",
+        size=624_434_368,
+        lfs_sha256="eb569aba7d65cf3da1d0369610eb6869f4a53ee369992a804d5810a80e9fa035",
+        projector_types=("mlp",),
+        paired_text_architecture="llama",
+        paired_text_target="Meta-Llama-3-8B-Instruct-Q2_K.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1024),
+            ("clip.vision.block_count", 23),
+            ("clip.vision.image_size", 336),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 235), ("F16", 142)),
+        tensor_count=377,
+        parity_test="TestGenericGGUFProjectors.test_mlp_matches_nonzero_reference",
+        paired_text_repository="bartowski/Meta-Llama-3-8B-Instruct-GGUF",
+        paired_text_revision="4ebc4aa83d60a5d6f9e1e1e9272a4d6306d770c1",
+        paired_text_size=3_179_131_456,
+        processor_repository="xtuner/llava-llama-3-8b-v1_1-transformers",
+        processor_revision="b20fb3040caaf5d0b3751c0d86a94efdf5bb007d",
+        processor_files=("config.json", "preprocessor_config.json"),
+        processor_contract=(("pixel_values", "float32 [1,3,336,336]"),),
+    ),
+    MMProjArtifactPin(
+        artifact_id="mobilevlm-1.7b-ldp-f16",
+        repository="guinmoon/MobileVLM-1.7B-GGUF",
+        revision="7e0cdbd2d642d938ce82fadde991360500c7d7cf",
+        filename="MobileVLM-1.7B-mmproj-f16.gguf",
+        size=620_384_896,
+        lfs_sha256="7d9855d323cee2a1797a88f9d7057ce26b21dcd62a50b382c4ff44ea60c77e39",
+        projector_types=("ldp",),
+        paired_text_architecture="llama",
+        paired_text_target="MobileVLM-1.7B-Q4_K.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1024),
+            ("clip.vision.block_count", 23),
+            ("clip.vision.image_size", 336),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 247), ("F16", 150)),
+        tensor_count=397,
+        parity_test=(
+            "TestGenericGGUFProjectors."
+            "test_ldp_matches_nonzero_reference_and_144_token_contract"
+        ),
+        paired_text_repository="guinmoon/MobileVLM-1.7B-GGUF",
+        paired_text_revision="7e0cdbd2d642d938ce82fadde991360500c7d7cf",
+        paired_text_size=834_055_776,
+    ),
+    MMProjArtifactPin(
+        artifact_id="mobilevlm-v2-1.7b-ldpv2-f16",
+        repository="ZiangWu/MobileVLM_V2-1.7B-GGUF",
+        revision="422c888cc387d71831bedf48d59f0a66b27fad68",
+        filename="mmproj-model-f16.gguf",
+        size=595_103_072,
+        lfs_sha256="57966afa654e9d46a11b2a4b17989c2d487cd961f702c4fe310f86db5e30aab4",
+        projector_types=("ldpv2",),
+        paired_text_architecture="llama",
+        paired_text_target="ggml-model-q4_k.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1024),
+            ("clip.vision.block_count", 23),
+            ("clip.vision.image_size", 336),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 236), ("F16", 143)),
+        tensor_count=379,
+        parity_test=(
+            "TestGenericGGUFProjectors."
+            "test_ldpv2_matches_nonzero_reference_and_144_token_contract"
+        ),
+        paired_text_repository="ZiangWu/MobileVLM_V2-1.7B-GGUF",
+        paired_text_revision="422c888cc387d71831bedf48d59f0a66b27fad68",
+        paired_text_size=791_817_856,
+    ),
+    MMProjArtifactPin(
+        artifact_id="glm-edge-v-2b-adapter-f16",
+        repository="zai-org/glm-edge-v-2b-gguf",
+        revision="d76cbe14f1d3a9405f664cbb5ae0c9537197429a",
+        filename="mmproj-model-f16.gguf",
+        size=933_229_600,
+        lfs_sha256="69a11ec5f54219fef9fd6bf9bc3209f0e6ef1564462cc4705dd93b2cd2a8198c",
+        projector_types=("adapter",),
+        paired_text_architecture="chatglm",
+        paired_text_target="ggml-model-Q4_0.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1152),
+            ("clip.vision.block_count", 27),
+            ("clip.vision.image_size", 672),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 278), ("F16", 169)),
+        tensor_count=447,
+        parity_test=(
+            "TestGenericGGUFProjectors."
+            "test_adapter_matches_nonzero_reference_and_boundary_rows"
+        ),
+        paired_text_repository="zai-org/glm-edge-v-2b-gguf",
+        paired_text_revision="d76cbe14f1d3a9405f664cbb5ae0c9537197429a",
+        paired_text_size=931_269_056,
+        processor_repository="THUDM/glm-edge-v-2b",
+        processor_revision="2053707733f99ab52e943904f43c2359a94301ef",
+        processor_files=("config.json", "preprocessor_config.json"),
+        processor_contract=(("pixel_values", "float32 [1,3,672,672]"),),
+    ),
+    MMProjArtifactPin(
+        artifact_id="minicpm-v2-resampler-f16",
+        repository="openbmb/MiniCPM-V-2-gguf",
+        revision="3a38804c39d96c935a6b542581f51171aefa06a5",
+        filename="mmproj-model-f16.gguf",
+        size=866_071_872,
+        lfs_sha256="79611c59b5ad5b0547256602e3fb546a3041bcf6db5058091b6bcaa31f3a1c95",
+        projector_types=("resampler",),
+        paired_text_architecture="minicpm",
+        paired_text_target="ggml-model-Q2_K.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1152),
+            ("clip.vision.block_count", 26),
+            ("clip.vision.image_size", 448),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 276), ("F16", 164)),
+        tensor_count=440,
+        parity_test=(
+            "component-only: TestGenericGGUFProjectors."
+            "test_resampler_matches_nonzero_reference_including_query_positions"
+        ),
+        paired_text_repository="openbmb/MiniCPM-V-2-gguf",
+        paired_text_revision="3a38804c39d96c935a6b542581f51171aefa06a5",
+        paired_text_size=1_297_193_376,
+    ),
     MMProjArtifactPin(
         artifact_id="qwen2-vl-2b-f16",
         repository="ggml-org/Qwen2-VL-2B-Instruct-GGUF",
