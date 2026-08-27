@@ -2570,9 +2570,13 @@ class TestReuseGgufWeights:
         def mutate_source_before_verification(path, payload):
             nonlocal mutated
             if path.name.startswith(".gguf-reuse.json.") and path.name.endswith(".tmp"):
-                source = bytearray(gguf_path.read_bytes())
-                source[-1] ^= 1
-                gguf_path.write_bytes(source)
+                with gguf_path.open("r+b") as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    value = stream.read(1)
+                    stream.seek(-1, os.SEEK_END)
+                    stream.write(bytes([value[0] ^ 0xFF]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 mutated = True
             return real_write_json(path, payload)
 
@@ -2700,24 +2704,33 @@ class TestReuseGgufWeights:
         build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
             str(tmp_path), progress_bar=False
         )
-        moved_source = tmp_path / "moved-source.gguf"
         source_matches_path = GGUFModel.source_matches_path
+        path_is_symlink = Path.is_symlink
         raced = False
+        symlink_recheck_observed = False
 
         def replace_after_handle_comparison(model, path=None):
             nonlocal raced
             matches = source_matches_path(model, path)
             if not raced and Path(model._path) == gguf_path:
-                gguf_path.replace(moved_source)
-                _symlink_or_skip(gguf_path, moved_source)
+                assert matches
                 raced = True
             return matches
 
+        def report_post_comparison_symlink(path):
+            nonlocal symlink_recheck_observed
+            if path == gguf_path and raced:
+                symlink_recheck_observed = True
+                return True
+            return path_is_symlink(path)
+
         monkeypatch.setattr(GGUFModel, "source_matches_path", replace_after_handle_comparison)
+        monkeypatch.setattr(Path, "is_symlink", report_post_comparison_symlink)
 
         with pytest.raises(ValueError, match="reuse manifest was verified"):
             verify_gguf_reuse_manifest(tmp_path)
         assert raced
+        assert symlink_recheck_observed
 
     def test_reuse_verifier_rechecks_source_after_onnx_validation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
