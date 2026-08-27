@@ -91,9 +91,7 @@ def test_hy_v3_preprocesses_separate_stacked_experts() -> None:
     np.testing.assert_array_equal(
         result["model.layers.1.mlp.experts.2.gate_proj.weight"], gate[2]
     )
-    np.testing.assert_array_equal(
-        result["model.layers.1.mlp.experts.2.up_proj.weight"], up[2]
-    )
+    np.testing.assert_array_equal(result["model.layers.1.mlp.experts.2.up_proj.weight"], up[2])
 
 
 def test_hy_v3_mtp_uses_exactly_one_independent_cache_layer() -> None:
@@ -121,9 +119,7 @@ def test_hy_v3_mtp_uses_exactly_one_independent_cache_layer() -> None:
 def test_hy_v3_router_matches_selection_biased_sigmoid_reference() -> None:
     builder, op, graph = create_test_builder()
     hidden = create_test_input(builder, "hidden", [1, 2, 3], dtype=ir.DataType.FLOAT16)
-    correction = create_test_input(
-        builder, "correction", [4], dtype=ir.DataType.FLOAT16
-    )
+    correction = create_test_input(builder, "correction", [4], dtype=ir.DataType.FLOAT16)
     gate = HyV3TopKGate(
         3,
         4,
@@ -144,9 +140,7 @@ def test_hy_v3_router_matches_selection_biased_sigmoid_reference() -> None:
         dtype=np.float32,
     )
     model.graph.initializers["weight"].const_value = ir.tensor(matrix)
-    hidden_value = np.array(
-        [[[0.4, -0.2, 0.7], [-0.3, 0.8, 0.1]]], dtype=np.float16
-    )
+    hidden_value = np.array([[[0.4, -0.2, 0.7], [-0.3, 0.8, 0.1]]], dtype=np.float16)
     correction_value = np.array([0.0, 0.35, -0.1, 0.2], dtype=np.float16)
     session = OnnxModelSession(model, device="cpu")
     actual = session.run({"hidden": hidden_value, "correction": correction_value})
@@ -172,7 +166,9 @@ def test_hy_v3_router_matches_selection_biased_sigmoid_reference() -> None:
         )
         assert actual_by_expert.keys() == expected_by_expert.keys()
         for expert, expected in expected_by_expert.items():
-            np.testing.assert_allclose(actual_by_expert[expert], expected, rtol=1e-6, atol=1e-6)
+            np.testing.assert_allclose(
+                actual_by_expert[expert], expected, rtol=1e-6, atol=1e-6
+            )
 
 
 def test_hy_v3_official_router_uses_additive_normalization_epsilon() -> None:

@@ -160,7 +160,9 @@ def validate_hy_v3_tensor_contract(gguf_model) -> None:
     expert_width = _integer(metadata, prefix + "expert_feed_forward_length")
     nextn = int(metadata.get(prefix + "nextn_predict_layers", 0))
     head_dim = int(
-        metadata.get(prefix + "attention.key_length", metadata[prefix + "rope.dimension_count"])
+        metadata.get(
+            prefix + "attention.key_length", metadata[prefix + "rope.dimension_count"]
+        )
     )
     value_dim = int(metadata.get(prefix + "attention.value_length", head_dim))
     rope_dim = _integer(metadata, prefix + "rope.dimension_count")
@@ -205,10 +207,7 @@ def validate_hy_v3_tensor_contract(gguf_model) -> None:
         raise ValueError("hy_v3 GGUF has invalid attention, MoE, or NextN geometry")
 
     names = set(gguf_model.tensor_names)
-    has_nextn_tensors = (
-        nextn == 1
-        and f"blk.{total_layers - 1}.nextn.eh_proj.weight" in names
-    )
+    has_nextn_tensors = nextn == 1 and f"blk.{total_layers - 1}.nextn.eh_proj.weight" in names
     if not nextn and any(".nextn." in name for name in names):
         raise ValueError("hy_v3 GGUF contains NextN tensors without nextn_predict_layers=1")
 
@@ -306,13 +305,15 @@ def validate_hy_v3_tensor_contract(gguf_model) -> None:
     explicit_float = {
         name
         for name in actual
-        if name.endswith("_norm.weight")
-        or name.endswith(".ffn_gate_inp.weight")
-        or name.endswith(".enorm.weight")
-        or name.endswith(".hnorm.weight")
-        or name.endswith(".shared_head_norm.weight")
-        or name.endswith(".exp_probs_b")
-        or name == "output_norm.weight"
+        if name.endswith(
+            (
+                "_norm.weight",
+                ".ffn_gate_inp.weight",
+                ".enorm.weight",
+                ".hnorm.weight",
+                ".exp_probs_b",
+            )
+        )
     }
     quantized_auxiliary = sorted(
         name for name in explicit_float if quant_specs[name].is_quantized_storage
@@ -324,8 +325,7 @@ def validate_hy_v3_tensor_contract(gguf_model) -> None:
         )
 
     trunk_biases = [
-        f"blk.{layer}.exp_probs_b" in actual
-        for layer in range(dense_prefix, trunk_layers)
+        f"blk.{layer}.exp_probs_b" in actual for layer in range(dense_prefix, trunk_layers)
     ]
     if any(trunk_biases) and not all(trunk_biases):
         raise ValueError(

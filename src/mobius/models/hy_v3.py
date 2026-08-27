@@ -124,9 +124,7 @@ class HyV3MoEBlock(MoELayer):
         )
         super().__init__(config, gate=gate, linear_class=linear_class)
         self.e_score_correction_bias = (
-            nn.Parameter([config.num_local_experts])
-            if config.use_expert_bias
-            else None
+            nn.Parameter([config.num_local_experts]) if config.use_expert_bias else None
         )
         shared_config = dataclasses.replace(
             config, intermediate_size=config.shared_expert_intermediate_size
@@ -183,20 +181,14 @@ class HyV3DecoderLayer(nn.Module):
         super().__init__()
         linear_class = linear_class_for_config(config)
         self.self_attn = Attention(config, linear_class=linear_class)
-        use_moe = (
-            layer_idx >= config.first_k_dense_replace
-            if force_moe is None
-            else force_moe
-        )
+        use_moe = layer_idx >= config.first_k_dense_replace if force_moe is None else force_moe
         self.mlp = (
             HyV3MoEBlock(config, linear_class=linear_class)
             if use_moe
             else MLP(config, linear_class=linear_class)
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -236,7 +228,10 @@ class HyV3TextModel(TextModel):
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
         self.layers = nn.ModuleList(
-            [HyV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                HyV3DecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
 
 
@@ -363,8 +358,6 @@ class HyV3MtpModel(nn.Module):
             present_key_values.append(present_kv)
         hidden_states = self.norm(op, hidden_states)
         prediction = (
-            self.lm_head(op, hidden_states)
-            if self.lm_head is not None
-            else hidden_states
+            self.lm_head(op, hidden_states) if self.lm_head is not None else hidden_states
         )
         return prediction, present_key_values

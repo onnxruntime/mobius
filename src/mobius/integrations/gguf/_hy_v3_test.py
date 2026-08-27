@@ -149,9 +149,7 @@ def _write_hy_v3(
         else:
             writer.add_float32(key, value)
     rng = np.random.default_rng(0)
-    for name, shape in _tensor_shapes(
-        fused_experts=fused_experts, qkv_bias=qkv_bias
-    ).items():
+    for name, shape in _tensor_shapes(fused_experts=fused_experts, qkv_bias=qkv_bias).items():
         if not include_mtp and name.startswith("blk.2."):
             continue
         writer.add_tensor(name, rng.normal(0.0, 0.02, shape).astype(np.float32))
@@ -181,10 +179,7 @@ def _fake() -> _FakeGGUF:
 
     return _FakeGGUF(
         _metadata(),
-        {
-            name: (GGMLQuantizationType.F32, shape)
-            for name, shape in _tensor_shapes().items()
-        },
+        {name: (GGMLQuantizationType.F32, shape) for name, shape in _tensor_shapes().items()},
     )
 
 
@@ -212,7 +207,7 @@ def test_hy_v3_exact_contract_rejects_unknown_tensor() -> None:
         next(iter(model.tensors.values()))[0],
         (_H,),
     )
-    with pytest.raises(ValueError, match="unexpected=.*hyper_connection"):
+    with pytest.raises(ValueError, match=r"unexpected=.*hyper_connection"):
         validate_hy_v3_tensor_contract(model)
 
 
@@ -298,9 +293,7 @@ def test_hy_v3_target_only_split_builds_without_sidecar(tmp_path: Path) -> None:
 
     path = tmp_path / "tiny-hy-v3-target.gguf"
     _write_hy_v3(path, include_mtp=False, qkv_bias=True)
-    package = build_from_gguf(
-        path, keep_quantized=False, static_cache=True, max_seq_len=32
-    )
+    package = build_from_gguf(path, keep_quantized=False, static_cache=True, max_seq_len=32)
 
     assert package.mtp_head is None
     assert sum(node.op_type == "Attention" for node in package["model"].graph) == 2
