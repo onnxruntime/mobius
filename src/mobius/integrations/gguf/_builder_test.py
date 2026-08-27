@@ -8124,8 +8124,6 @@ class TestGGUFPreflightGuards:
         [
             "bailingmoe3",
             "deepseek4",
-            "arctic",
-            "dbrx",
             "gpt-oss",
             "grok",
             "grovemoe",

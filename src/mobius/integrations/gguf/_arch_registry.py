@@ -383,10 +383,6 @@ _ENCODER_GRAPH_MISMATCH = {
         "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
         "BertModel has absolute positions and no MoE path."
     ),
-    "nomic-bert-moe": (
-        "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
-        "moe_every_n_layers. Mobius has no encoder MoE graph with that schedule."
-    ),
 }
 
 _FINAL_CENSUS_DEFERRED_REASONS = {
@@ -484,11 +480,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "ERNIE 4.5 requires exact fused-QKV and fused-gate/up converter splits plus an "
         "optional attention-output bias and ERNIE-specific position metadata. Similarity "
         "to Qwen/Llama is not a suffix-exact tensor or graph contract."
-    ),
-    "ernie4_5-moe": (
-        "ERNIE 4.5 MoE selects periodic expert blocks after a dense prefix, permits an "
-        "optional gate-expert matrix, and uses normalized routing with optional shared "
-        "experts. Mobius has no matching per-layer schedule or converter transform."
     ),
     "granite": (
         "The granite architecture is a conditional dense-or-MoE union with residual, "
@@ -1494,6 +1485,24 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=_ENCODER_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
+        gguf_arch="nomic-bert-moe",
+        model_type="nomic_bert_moe",
+        module_type="nomic_bert_moe_gguf",
+        tensor_map_recipe=("nomic_bert", "nomic_bert_moe_extras"),
+        config_postprocessor="specialized_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+            "moe_every_n_layers",
+            "expert_count",
+            "expert_used_count",
+            "rope.freq_base",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=_ENCODER_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="jina-bert-v2",
         model_type="bert",
         module_type="jina_bert_v2_gguf",
@@ -1697,19 +1706,55 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     # ------------------------- Remaining conventional-attention MoE (audited/deferred)
     GGUFArchitectureSpec(
         gguf_arch="arctic",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="arctic",
+        module_type="arctic_gguf",
+        tensor_map_recipe=("llama", "arctic_extras"),
+        config_postprocessor="arctic",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+        ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        quantized_import=Support.REJECTED,
         runtime=Support.DEFERRED,
-        reason=_ARCTIC_GGUF_GRAPH_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="dbrx",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="dbrx",
+        module_type="dbrx_gguf",
+        tensor_map_recipe=("llama", "dbrx_extras", "moe_extras"),
+        config_postprocessor="dbrx",
+        required_metadata=(
+            "attention.layer_norm_epsilon",
+            "attention.clamp_kqv",
+            "expert_count",
+            "expert_used_count",
+        ),
+        quantized_import=Support.REJECTED,
         runtime=Support.DEFERRED,
-        reason=_DBRX_GGUF_GRAPH_REASON,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="ernie4_5-moe",
+        model_type="ernie4_5_moe",
+        module_type="ernie4_5_moe_gguf",
+        tensor_map_recipe=("llama", "moe_extras", "ernie45_moe_extras"),
+        config_key_map="ernie45_moe",
+        config_postprocessor="ernie45_moe",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "interleave_moe_layer_step",
+        ),
+        rope_interleave=True,
+        quantized_import=Support.REJECTED,
+        runtime=Support.DEFERRED,
+        reason=_RUNTIME_VALIDATION_PENDING + " " + _NO_QUANTIZED_PROJECTION_REASON,
     ),
     GGUFArchitectureSpec(
         gguf_arch="gpt-oss",

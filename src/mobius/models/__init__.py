@@ -5,6 +5,7 @@ from __future__ import annotations
 
 __all__ = [
     "ApertusCausalLMModel",
+    "ArcticGGUFCausalLMModel",
     "ArceeCausalLMModel",
     "AutoencoderKLModel",
     "AutoencoderKLQwenImageModel",
@@ -33,6 +34,7 @@ __all__ = [
     "DeepSeekOCR2CausalLMModel",
     "DeepSeekV3CausalLMModel",
     "DeepSeekV4CausalLMModel",
+    "DbrxGGUFCausalLMModel",
     "DFlashDraftModel",
     "Eagle3DraftModel",
     "DiTTransformer2DModel",
@@ -43,6 +45,7 @@ __all__ = [
     "DogeCausalLMModel",
     "EncDecRNNTModel",
     "Ernie45MoECausalLMModel",
+    "Ernie45MoEGGUFCausalLMModel",
     "ErnieCausalLMModel",
     "ExaOne4CausalLMModel",
     "FalconCausalLMModel",
@@ -126,6 +129,7 @@ __all__ = [
     "NemotronHCausalLMModel",
     "NeoBertGGUFModel",
     "NomicBertGGUFModel",
+    "NomicBertMoEGGUFModel",
     "NemotronParseForConditionalGeneration",
     "OLMo2CausalLMModel",
     "OLMoCausalLMModel",
@@ -269,6 +273,7 @@ from mobius.models.gguf_encoders import (
     JinaBertV2GGUFModel,
     NeoBertGGUFModel,
     NomicBertGGUFModel,
+    NomicBertMoEGGUFModel,
 )
 from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
@@ -316,7 +321,10 @@ from mobius.models.minimax_music3 import (
     MiniMaxMusic3Vocoder,
 )
 from mobius.models.moe import (
+    ArcticGGUFCausalLMModel,
+    DbrxGGUFCausalLMModel,
     Ernie45MoECausalLMModel,
+    Ernie45MoEGGUFCausalLMModel,
     Glm4MoECausalLMModel,
     HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,

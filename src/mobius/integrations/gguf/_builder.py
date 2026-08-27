@@ -700,6 +700,7 @@ def _validate_gguf_model(
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
+    _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
@@ -2692,6 +2693,507 @@ def _raise_for_invalid_conventional_moe_tensor_contract(gguf_model) -> None:
         )
 
 
+def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
+    """Validate exact tensor ownership for dedicated GGUF MoE cohort graphs."""
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    architecture = gguf_model.architecture
+    if architecture not in {"arctic", "dbrx", "ernie4_5-moe", "nomic-bert-moe"}:
+        return
+
+    metadata = gguf_model.metadata
+    required_suffixes: tuple[str, ...]
+    required: dict[str, tuple[int, ...]]
+    optional: dict[str, tuple[int, ...]]
+    output_biases: set[str]
+    if architecture == "ernie4_5-moe":
+        required_suffixes = (
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "interleave_moe_layer_step",
+        )
+        missing_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in required_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+            )
+        hidden = int(metadata[f"{architecture}.embedding_length"])
+        dense_intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+        expert_intermediate = int(metadata[f"{architecture}.expert_feed_forward_length"])
+        layers = int(metadata[f"{architecture}.block_count"])
+        heads = int(metadata[f"{architecture}.attention.head_count"])
+        kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+        experts = int(metadata[f"{architecture}.expert_count"])
+        top_k = int(metadata[f"{architecture}.expert_used_count"])
+        frequency = int(metadata[f"{architecture}.interleave_moe_layer_step"])
+        dense_prefix = int(metadata.get(f"{architecture}.leading_dense_block_count", 0))
+        shared_intermediate = int(
+            metadata.get(f"{architecture}.expert_shared_feed_forward_length", 0)
+        )
+        vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+            metadata.get("tokenizer.ggml.tokens", ())
+        )
+        routed_layers = (
+            [
+                layer
+                for layer in range(layers)
+                if layer >= dense_prefix and (layer + 1) % frequency == 0
+            ]
+            if frequency > 0
+            else []
+        )
+        if (
+            min(
+                hidden,
+                dense_intermediate,
+                expert_intermediate,
+                layers,
+                heads,
+                kv_heads,
+                experts,
+                top_k,
+                vocab,
+                frequency,
+            )
+            <= 0
+            or hidden % heads
+            or heads % kv_heads
+            or top_k > experts
+            or not 0 <= dense_prefix <= layers
+            or not routed_layers
+        ):
+            raise ValueError(f"{architecture} GGUF has invalid MoE geometry")
+        eps = float(metadata[f"{architecture}.attention.layer_norm_rms_epsilon"])
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError(f"{architecture} GGUF has invalid normalization epsilon")
+
+        actual = {
+            name: tuple(int(dimension) for dimension in shape)
+            for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+            if not is_known_skip(name)
+        }
+        required = {
+            "token_embd.weight": (vocab, hidden),
+            "output_norm.weight": (hidden,),
+        }
+        optional = {"output.weight": (vocab, hidden)}
+        correction_biases: set[str] = set()
+        head_dim = hidden // heads
+        q_width = heads * head_dim
+        kv_width = kv_heads * head_dim
+        routed_set = set(routed_layers)
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_q.weight": (q_width, hidden),
+                    prefix + "attn_k.weight": (kv_width, hidden),
+                    prefix + "attn_v.weight": (kv_width, hidden),
+                    prefix + "attn_output.weight": (hidden, q_width),
+                    prefix + "ffn_norm.weight": (hidden,),
+                }
+            )
+            if layer not in routed_set:
+                required.update(
+                    {
+                        prefix + "ffn_gate.weight": (dense_intermediate, hidden),
+                        prefix + "ffn_up.weight": (dense_intermediate, hidden),
+                        prefix + "ffn_down.weight": (hidden, dense_intermediate),
+                    }
+                )
+                continue
+            required.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        expert_intermediate,
+                    ),
+                }
+            )
+            correction_biases.add(prefix + "exp_probs_b.bias")
+            optional[prefix + "exp_probs_b.bias"] = (experts,)
+            if shared_intermediate > 0:
+                required.update(
+                    {
+                        prefix + "ffn_gate_shexp.weight": (shared_intermediate, hidden),
+                        prefix + "ffn_up_shexp.weight": (shared_intermediate, hidden),
+                        prefix + "ffn_down_shexp.weight": (hidden, shared_intermediate),
+                    }
+                )
+        present_correction_biases = correction_biases & set(actual)
+        if present_correction_biases and present_correction_biases != correction_biases:
+            raise ValueError(
+                f"{architecture} correction bias tensors must be complete across routed layers"
+            )
+        allowed = set(required) | set(optional)
+        missing = sorted(set(required) - set(actual))
+        unexpected = sorted(set(actual) - allowed)
+        malformed = {
+            name: (required.get(name, optional.get(name)), actual[name])
+            for name in allowed & set(actual)
+            if actual[name] != required.get(name, optional.get(name))
+        }
+        if missing or unexpected or malformed:
+            raise ValueError(
+                f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+                f"unexpected={unexpected}, malformed={malformed}"
+            )
+        return
+
+    elif architecture == "arctic":
+        required_suffixes = (
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_rms_epsilon",
+            "expert_count",
+            "expert_used_count",
+        )
+        missing_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in required_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+            )
+        hidden = int(metadata[f"{architecture}.embedding_length"])
+        expert_intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+        layers = int(metadata[f"{architecture}.block_count"])
+        heads = int(metadata[f"{architecture}.attention.head_count"])
+        kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+        experts = int(metadata[f"{architecture}.expert_count"])
+        top_k = int(metadata[f"{architecture}.expert_used_count"])
+        vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+            metadata.get("tokenizer.ggml.tokens", ())
+        )
+        if (
+            min(hidden, expert_intermediate, layers, heads, kv_heads, experts, top_k, vocab)
+            <= 0
+            or hidden % heads
+            or heads % kv_heads
+            or top_k > experts
+        ):
+            raise ValueError("arctic GGUF has invalid MoE geometry")
+        eps = float(metadata[f"{architecture}.attention.layer_norm_rms_epsilon"])
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError("arctic GGUF has invalid normalization epsilon")
+        actual = {
+            name: tuple(int(dimension) for dimension in shape)
+            for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+            if not is_known_skip(name)
+        }
+        required = {
+            "token_embd.weight": (vocab, hidden),
+            "output_norm.weight": (hidden,),
+        }
+        optional = {"output.weight": (vocab, hidden)}
+        head_dim = hidden // heads
+        q_width = heads * head_dim
+        kv_width = kv_heads * head_dim
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            required.update(
+                {
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_q.weight": (q_width, hidden),
+                    prefix + "attn_k.weight": (kv_width, hidden),
+                    prefix + "attn_v.weight": (kv_width, hidden),
+                    prefix + "attn_output.weight": (hidden, q_width),
+                    prefix + "ffn_norm.weight": (hidden,),
+                    prefix + "ffn_gate.weight": (hidden, hidden),
+                    prefix + "ffn_up.weight": (hidden, hidden),
+                    prefix + "ffn_down.weight": (hidden, hidden),
+                    prefix + "ffn_norm_exps.weight": (hidden,),
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        expert_intermediate,
+                    ),
+                }
+            )
+        allowed = set(required) | set(optional)
+        missing = sorted(set(required) - set(actual))
+        unexpected = sorted(set(actual) - allowed)
+        malformed = {
+            name: (required.get(name, optional.get(name)), actual[name])
+            for name in allowed & set(actual)
+            if actual[name] != required.get(name, optional.get(name))
+        }
+        if missing or unexpected or malformed:
+            raise ValueError(
+                f"Invalid arctic GGUF tensor closure: missing={missing}, "
+                f"unexpected={unexpected}, malformed={malformed}"
+            )
+        return
+
+    elif architecture == "nomic-bert-moe":
+        required_suffixes = (
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_epsilon",
+            "attention.causal",
+            "moe_every_n_layers",
+            "expert_count",
+            "expert_used_count",
+            "rope.freq_base",
+        )
+        missing_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in required_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+            )
+        hidden = int(metadata[f"{architecture}.embedding_length"])
+        intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+        layers = int(metadata[f"{architecture}.block_count"])
+        heads = int(metadata[f"{architecture}.attention.head_count"])
+        kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+        experts = int(metadata[f"{architecture}.expert_count"])
+        top_k = int(metadata[f"{architecture}.expert_used_count"])
+        frequency = int(metadata[f"{architecture}.moe_every_n_layers"])
+        token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+        vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+            metadata.get("tokenizer.ggml.tokens", ())
+        )
+        if (
+            min(
+                hidden,
+                intermediate,
+                layers,
+                heads,
+                kv_heads,
+                experts,
+                top_k,
+                token_types,
+                vocab,
+            )
+            <= 0
+            or hidden % heads
+            or kv_heads != heads
+            or top_k > experts
+            or frequency < 2
+            or bool(metadata[f"{architecture}.attention.causal"])
+        ):
+            raise ValueError(f"{architecture} GGUF has invalid encoder MoE geometry")
+        eps = float(metadata[f"{architecture}.attention.layer_norm_epsilon"])
+        if not math.isfinite(eps) or eps <= 0:
+            raise ValueError(f"{architecture} GGUF has invalid normalization epsilon")
+
+        actual = {
+            name: tuple(int(dimension) for dimension in shape)
+            for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+            if not is_known_skip(name)
+        }
+        required = {
+            "token_embd.weight": (vocab, hidden),
+            "token_embd_norm.weight": (hidden,),
+            "token_embd_norm.bias": (hidden,),
+        }
+        optional = {
+            # llama.cpp stores NomicBERT-MoE's only token-type row as a vector.
+            "token_types.weight": (hidden,),
+        }
+        qkv_biases: set[str] = set()
+        output_biases = set()
+        dense_up_biases: set[str] = set()
+        dense_down_biases: set[str] = set()
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            required.update(
+                {
+                    prefix + "attn_qkv.weight": (3 * hidden, hidden),
+                    prefix + "attn_output.weight": (hidden, hidden),
+                    prefix + "attn_output_norm.weight": (hidden,),
+                    prefix + "attn_output_norm.bias": (hidden,),
+                    prefix + "layer_output_norm.weight": (hidden,),
+                    prefix + "layer_output_norm.bias": (hidden,),
+                }
+            )
+            qkv_biases.add(prefix + "attn_qkv.bias")
+            output_biases.add(prefix + "attn_output.bias")
+            optional[prefix + "attn_qkv.bias"] = (3 * hidden,)
+            optional[prefix + "attn_output.bias"] = (hidden,)
+            if layer % frequency == 1:
+                required.update(
+                    {
+                        prefix + "ffn_gate_inp.weight": (experts, hidden),
+                        prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                        prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+                    }
+                )
+            else:
+                required.update(
+                    {
+                        prefix + "ffn_up.weight": (intermediate, hidden),
+                        prefix + "ffn_down.weight": (hidden, intermediate),
+                    }
+                )
+                dense_up_biases.add(prefix + "ffn_up.bias")
+                dense_down_biases.add(prefix + "ffn_down.bias")
+                optional[prefix + "ffn_up.bias"] = (intermediate,)
+                optional[prefix + "ffn_down.bias"] = (hidden,)
+
+        for label, family in (
+            ("fused QKV bias", qkv_biases),
+            ("attention output bias", output_biases),
+            ("dense FFN up bias", dense_up_biases),
+            ("dense FFN down bias", dense_down_biases),
+        ):
+            present = family & set(actual)
+            if present and present != family:
+                raise ValueError(
+                    f"{architecture} {label} tensors must be present for every applicable layer"
+                )
+        allowed = set(required) | set(optional)
+        missing = sorted(set(required) - set(actual))
+        unexpected = sorted(set(actual) - allowed)
+        malformed = {
+            name: (required.get(name, optional.get(name)), actual[name])
+            for name in allowed & set(actual)
+            if actual[name] != required.get(name, optional.get(name))
+        }
+        if missing or unexpected or malformed:
+            raise ValueError(
+                f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+                f"unexpected={unexpected}, malformed={malformed}"
+            )
+        return
+
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.layer_norm_epsilon",
+        "attention.clamp_kqv",
+        "expert_count",
+        "expert_used_count",
+    )
+    missing_metadata = [
+        f"{architecture}.{suffix}"
+        for suffix in required_suffixes
+        if f"{architecture}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+        )
+
+    hidden = int(metadata[f"{architecture}.embedding_length"])
+    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+    layers = int(metadata[f"{architecture}.block_count"])
+    heads = int(metadata[f"{architecture}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+    experts = int(metadata[f"{architecture}.expert_count"])
+    top_k = int(metadata[f"{architecture}.expert_used_count"])
+    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    if (
+        min(hidden, intermediate, layers, heads, kv_heads, experts, top_k, vocab) <= 0
+        or hidden % heads
+        or heads % kv_heads
+        or top_k > experts
+    ):
+        raise ValueError(f"{architecture} GGUF has invalid MoE geometry")
+    eps = float(metadata[f"{architecture}.attention.layer_norm_epsilon"])
+    clamp = float(metadata[f"{architecture}.attention.clamp_kqv"])
+    if not math.isfinite(eps) or eps <= 0 or not math.isfinite(clamp) or clamp < 0:
+        raise ValueError(f"{architecture} GGUF has invalid normalization or QKV clamp")
+
+    head_dim = hidden // heads
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+        if not is_known_skip(name)
+    }
+    required = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+        "output.weight": (vocab, hidden),
+    }
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_qkv.weight": (q_width + 2 * kv_width, hidden),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "attn_output_norm.weight": (hidden,),
+                prefix + "ffn_gate_inp.weight": (experts, hidden),
+                prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
+                prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+            }
+        )
+
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required))
+    malformed = {
+        name: (required[name], actual[name])
+        for name in set(required) & set(actual)
+        if actual[name] != required[name]
+    }
+    if missing or unexpected or malformed or out_of_range:
+        raise ValueError(
+            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+            f"unexpected={unexpected}, malformed={malformed}, out_of_range={out_of_range}"
+        )
+
+
 def _raise_for_invalid_falcon_h1_tensor_contract(gguf_model) -> None:
     """Validate Falcon-H1's complete parallel attention/Mamba2 tensor closure."""
     if gguf_model.architecture != "falcon-h1":
@@ -3350,6 +3852,7 @@ def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
         "eurobert",
         "neo-bert",
         "nomic-bert",
+        "nomic-bert-moe",
         "jina-bert-v2",
     }:
         return
@@ -5696,6 +6199,7 @@ def build_from_gguf(
         "eurobert",
         "neo-bert",
         "nomic-bert",
+        "nomic-bert-moe",
         "jina-bert-v2",
         "gemma-embedding",
         "llama-embed",
@@ -5808,7 +6312,13 @@ def build_from_gguf(
         from mobius.tasks import CausalLMTask
 
         resolved_task = CausalLMTask(static_cache=True, max_seq_len=max_seq_len)
-    elif gguf_arch in {"eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"}:
+    elif gguf_arch in {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "nomic-bert-moe",
+        "jina-bert-v2",
+    }:
         from mobius.tasks import GGUFEncoderFeatureExtractionTask
 
         resolved_task = GGUFEncoderFeatureExtractionTask()
@@ -6082,6 +6592,7 @@ def build_from_gguf(
         "eurobert",
         "neo-bert",
         "nomic-bert",
+        "nomic-bert-moe",
         "jina-bert-v2",
         "gemma-embedding",
         "llama-embed",

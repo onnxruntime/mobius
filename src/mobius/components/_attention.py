@@ -275,21 +275,7 @@ class Attention(nn.Module):
         # Gemma2-style logit soft-capping; 0.0 means disabled.
         self._softcap = getattr(config, "attn_logit_softcapping", 0.0) or 0.0
 
-        self.q_proj = linear_class(
-            self.hidden_size,
-            self.num_attention_heads * self.head_dim,
-            bias=config.attn_qkv_bias,
-        )
-        self.k_proj = linear_class(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attn_qkv_bias,
-        )
-        self.v_proj = linear_class(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attn_qkv_bias,
-        )
+        self._init_qkv_projections(config, linear_class)
         self.o_proj = linear_class(
             self.num_attention_heads * self.head_dim,
             self.hidden_size,
@@ -314,6 +300,24 @@ class Attention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+    def _init_qkv_projections(self, config: ArchitectureConfig, linear_class: type) -> None:
+        """Create the default independent query, key, and value projections."""
+        self.q_proj = linear_class(
+            self.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            bias=config.attn_qkv_bias,
+        )
+        self.k_proj = linear_class(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attn_qkv_bias,
+        )
+        self.v_proj = linear_class(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=config.attn_qkv_bias,
+        )
+
     def forward(
         self,
         op: OpBuilder,
@@ -323,9 +327,7 @@ class Attention(nn.Module):
         past_key_value: tuple | None = None,
         static_cache: StaticCacheState | None = None,
     ):
-        query_states = self.q_proj(op, hidden_states)
-        key_states = self.k_proj(op, hidden_states)
-        value_states = self.v_proj(op, hidden_states)
+        query_states, key_states, value_states = self._project_qkv(op, hidden_states)
         if not math.isclose(self._key_multiplier, 1.0):
             key_states = op.Mul(key_states, self._key_multiplier)
 
@@ -402,6 +404,16 @@ class Attention(nn.Module):
         attn_output = self._project_output(op, attn_output)
         return attn_output, (present_key, present_value)
 
+    def _project_qkv(
+        self, op: OpBuilder, hidden_states: ir.Value
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        """Project hidden states into Q, K, and V tensors."""
+        return (
+            self.q_proj(op, hidden_states),
+            self.k_proj(op, hidden_states),
+            self.v_proj(op, hidden_states),
+        )
+
     def _project_output(self, op: OpBuilder, attn_output: ir.Value) -> ir.Value:
         """Apply architecture-specific processing before the output projection."""
         return self.o_proj(op, attn_output)
@@ -464,6 +476,51 @@ class Attention(nn.Module):
 
         attn_out = self._project_output(op, attn_out)
         return attn_out, (present_key, present_value)
+
+
+class FusedQKVAttention(Attention):
+    """Attention whose checkpoint stores one contiguous Q/K/V projection.
+
+    The projection rows are ordered ``[Q | K | V]``. An optional symmetric
+    activation clamp is applied to the fused output before it is split, so
+    callers can represent architectures where clipping is part of the fused
+    projection contract rather than an independent per-projection transform.
+    """
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        *,
+        clamp: float | None = None,
+        linear_class: type | None = None,
+    ):
+        super().__init__(config, linear_class=linear_class)
+        self._clamp = clamp
+
+    def _init_qkv_projections(self, config: ArchitectureConfig, linear_class: type) -> None:
+        self._q_width = self.num_attention_heads * self.head_dim
+        self._kv_width = self.num_key_value_heads * self.head_dim
+        self.qkv_proj = linear_class(
+            self.hidden_size,
+            self._q_width + 2 * self._kv_width,
+            bias=config.attn_qkv_bias,
+        )
+
+    def _project_qkv(
+        self, op: OpBuilder, hidden_states: ir.Value
+    ) -> tuple[ir.Value, ir.Value, ir.Value]:
+        # Keep clipping ahead of the split: this is observably different from
+        # clipping only Q/K after RoPE or leaving V unclipped.
+        qkv = self.qkv_proj(op, hidden_states)  # (B, S, Q + K + V)
+        if self._clamp is not None and self._clamp > 0:
+            limit = op.CastLike(self._clamp, qkv)
+            qkv = op.Clip(qkv, op.Neg(limit), limit)
+        return op.Split(
+            qkv,
+            [self._q_width, self._kv_width, self._kv_width],
+            axis=-1,
+            _outputs=3,
+        )
 
 
 class Qwen35Attention(nn.Module):

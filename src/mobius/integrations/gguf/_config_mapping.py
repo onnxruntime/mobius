@@ -266,6 +266,11 @@ _CONVENTIONAL_SHARED_MOE_KEY_MAP = {
     "leading_dense_block_count": "first_k_dense_replace",
 }
 
+_ERNIE45_MOE_KEY_MAP = {
+    "leading_dense_block_count": "first_k_dense_replace",
+    "interleave_moe_layer_step": "moe_layer_frequency",
+}
+
 _QWEN4EXP_KEY_MAP = {
     "attention.key_length": "head_dim",
     "expert_count": "num_local_experts",
@@ -312,6 +317,7 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minicpm": _MINICPM_KEY_MAP,
         "minicpm3": _MINICPM3_KEY_MAP,
         "conventional_shared_moe": _CONVENTIONAL_SHARED_MOE_KEY_MAP,
+        "ernie45_moe": _ERNIE45_MOE_KEY_MAP,
         "qwen4exp": _QWEN4EXP_KEY_MAP,
         "t5": _T5_KEY_MAP,
     }
@@ -1481,6 +1487,110 @@ def _moe_postprocess(
         updates["norm_topk_prob"] = False
 
     return dataclasses.replace(config, **updates)
+
+
+def _dbrx_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Restore the fused-clamped attention and LayerNorm DBRX profile."""
+    config = _moe_postprocess(config, metadata, model)
+    arch = "dbrx"
+    clamp = float(metadata[f"{arch}.attention.clamp_kqv"])
+    if not math.isfinite(clamp) or clamp < 0:
+        raise ValueError(f"{arch}.attention.clamp_kqv must be finite and non-negative")
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        attention_clamp=clamp,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        tie_word_embeddings=False,
+        rope_type="default",
+    )
+
+
+def _arctic_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Restore Arctic's dual-branch routing and optional tied output."""
+    config = _moe_postprocess(config, metadata, model)
+    route_scale = float(metadata.get("arctic.expert_weights_scale", 1.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError("arctic.expert_weights_scale must be finite and positive")
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        norm_topk_prob=True,
+        routed_scaling_factor=route_scale,
+        tie_word_embeddings="output.weight" not in model.tensor_names,
+        rope_type="default",
+    )
+
+
+def _ernie45_moe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore ERNIE's periodic bias-corrected routed/shared MoE profile."""
+    config = _moe_postprocess(config, metadata, model)
+    frequency = int(metadata["ernie4_5-moe.interleave_moe_layer_step"])
+    dense_prefix = int(metadata.get("ernie4_5-moe.leading_dense_block_count", 0))
+    if frequency <= 0:
+        raise ValueError("ernie4_5-moe.interleave_moe_layer_step must be positive")
+    if not 0 <= dense_prefix <= config.num_hidden_layers:
+        raise ValueError("ernie4_5-moe.leading_dense_block_count is out of range")
+    routed_layers = [
+        layer
+        for layer in range(config.num_hidden_layers)
+        if layer >= dense_prefix and (layer + 1) % frequency == 0
+    ]
+    if not routed_layers:
+        raise ValueError("ernie4_5-moe schedule must select at least one routed layer")
+    names = set(model.tensor_names)
+    correction = {f"blk.{layer}.exp_probs_b.bias" for layer in routed_layers}
+    present_correction = correction & names
+    if present_correction and present_correction != correction:
+        raise ValueError("ernie4_5-moe correction bias must be complete across routed layers")
+    shared_width = config.shared_expert_intermediate_size
+    shared_count = int(metadata.get("ernie4_5-moe.expert_shared_count", 0))
+    if shared_count > 0 and (shared_width is None or shared_width <= 0):
+        raise ValueError("ernie4_5-moe shared experts require a positive shared FFN width")
+    if shared_count == 0:
+        shared_width = None
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        first_k_dense_replace=dense_prefix,
+        moe_layer_frequency=frequency,
+        scoring_func="softmax",
+        topk_method="greedy",
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+        routing_weight_normalization_floor=6.103515625e-5,
+        routed_scaling_factor=1.0,
+        use_expert_bias=bool(present_correction),
+        shared_expert_intermediate_size=shared_width,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        tie_word_embeddings="output.weight" not in names,
+        rope_type="default",
+        rope_interleave=True,
+    )
 
 
 def _talkie_postprocess(
@@ -3487,6 +3597,41 @@ def _specialized_encoder_postprocess(
     names = set(model.tensor_names)
     layers = config.num_hidden_layers
 
+    if arch == "nomic-bert-moe":
+        frequency = int(metadata[f"{arch}.moe_every_n_layers"])
+        if frequency < 2:
+            raise ValueError("nomic-bert-moe.moe_every_n_layers must be at least 2")
+        token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+        if token_types <= 0:
+            raise ValueError("nomic-bert-moe requires tokenizer.ggml.token_type_count")
+
+        def _scheduled_family(suffix: str, layer_ids: list[int]) -> bool:
+            expected = {f"blk.{layer}.{suffix}" for layer in layer_ids}
+            present = expected & names
+            if present and present != expected:
+                raise ValueError(f"{arch} optional tensor family {suffix!r} must be complete")
+            return bool(present)
+
+        all_layers = list(range(layers))
+        dense_layers = [layer for layer in all_layers if layer % frequency != 1]
+        config.pooling_type = pooling_type
+        config.moe_layer_frequency = frequency
+        config.hidden_act = "gelu_pytorch_tanh"
+        config.norm_topk_prob = False
+        config.routed_scaling_factor = 1.0
+        config.type_vocab_size = token_types
+        config.encoder_use_token_type_embeddings = "token_types.weight" in names
+        fused_bias = _scheduled_family("attn_qkv.bias", all_layers)
+        config.encoder_q_bias = fused_bias
+        config.encoder_k_bias = fused_bias
+        config.encoder_v_bias = fused_bias
+        config.attn_qkv_bias = fused_bias
+        config.attn_o_bias = _scheduled_family("attn_output.bias", all_layers)
+        config.encoder_ffn_up_bias = _scheduled_family("ffn_up.bias", dense_layers)
+        config.encoder_ffn_down_bias = _scheduled_family("ffn_down.bias", dense_layers)
+        config.mlp_bias = config.encoder_ffn_up_bias or config.encoder_ffn_down_bias
+        return config
+
     def _all_or_none(suffix: str) -> bool:
         expected = {f"blk.{layer}.{suffix}" for layer in range(layers)}
         present = expected & names
@@ -3963,6 +4108,9 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "rnd1": _rnd1_postprocess,
     "olmo": _olmo_postprocess,
     "moe": _moe_postprocess,
+    "dbrx": _dbrx_postprocess,
+    "arctic": _arctic_postprocess,
+    "ernie45_moe": _ernie45_moe_postprocess,
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
     "granitemoe": _granitemoe_postprocess,
     "phimoe": _phimoe_postprocess,
