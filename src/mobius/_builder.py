@@ -162,12 +162,16 @@ def build_from_module(
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)
     resolved_task = get_task(task)
+    component_manifest = resolved_task.component_manifest()
     capabilities = ep_registry.require(execution_provider)
     with build_context(capabilities, dtype):
         package = resolved_task.build(module, config)
 
     for name, model in package.items():
-        role = resolved_task.model_roles.get(name) or _MODEL_ROLE_MAP.get(name, "decoder")
+        descriptor = component_manifest.get(name)
+        role = (
+            descriptor.role if descriptor is not None else _MODEL_ROLE_MAP.get(name, "decoder")
+        )
         optimize_model(
             model,
             ep=execution_provider,

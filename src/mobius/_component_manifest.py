@@ -1,0 +1,135 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Canonical metadata for the components of a model package."""
+
+from __future__ import annotations
+
+__all__ = [
+    "ComponentDescriptor",
+    "ComponentManifest",
+    "get_hf_component_sources",
+    "resolve_component_manifest",
+]
+
+import dataclasses
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class ComponentDescriptor:
+    """One package component and all metadata needed to address it.
+
+    Attributes:
+        name: Key used by :class:`~mobius.ModelPackage`.
+        module_path: Dotted path from the top-level Mobius module to the
+            sub-module that constructs this component. The empty string means
+            the top-level module itself.
+        role: Optimization role such as ``decoder``, ``encoder``, ``embedding``
+            or ``glue``.
+        source_paths: Runtime HuggingFace ``named_modules()`` paths whose
+            weights belong to this component.
+    """
+
+    name: str
+    module_path: str
+    role: str
+    source_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("component name must not be empty")
+        if not self.role:
+            raise ValueError(f"component {self.name!r} must declare a role")
+        if any(not path for path in self.source_paths):
+            raise ValueError(
+                f"component {self.name!r} source_paths must not contain empty paths"
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class ComponentManifest(Mapping[str, ComponentDescriptor]):
+    """Ordered, immutable component metadata keyed by package component name."""
+
+    components: tuple[ComponentDescriptor, ...]
+    _by_name: Mapping[str, ComponentDescriptor] = dataclasses.field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        by_name: dict[str, ComponentDescriptor] = {}
+        for component in self.components:
+            if component.name in by_name:
+                raise ValueError(
+                    f"component manifest declares {component.name!r} more than once"
+                )
+            by_name[component.name] = component
+        object.__setattr__(self, "_by_name", MappingProxyType(by_name))
+
+    def __getitem__(self, name: str) -> ComponentDescriptor:
+        return self._by_name[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._by_name)
+
+    def __len__(self) -> int:
+        return len(self._by_name)
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Component names in task declaration order."""
+        return tuple(self._by_name)
+
+
+def get_hf_component_sources(
+    module_class: type,
+    model_type: str,
+    hf_config: object,
+) -> dict[str, tuple[str, ...]]:
+    """Read runtime HuggingFace component paths from a registered model class."""
+    resolver = getattr(module_class, "get_hf_component_sources", None)
+    if resolver is not None:
+        resolved = resolver(model_type=model_type, hf_config=hf_config)
+    else:
+        resolved = getattr(module_class, "HF_COMPONENT_SOURCES", {})
+    return {name: tuple(paths) for name, paths in resolved.items()}
+
+
+def resolve_component_manifest(
+    task: object,
+    *,
+    module_class: type | None = None,
+    model_type: str | None = None,
+    hf_config: object | None = None,
+) -> ComponentManifest:
+    """Combine task roles/paths and model source ownership into one manifest."""
+    roles = dict(getattr(task, "model_roles", {}) or {})
+    component_spec = getattr(task, "components", None)
+    module_paths = dict(component_spec.items()) if component_spec is not None else {}
+
+    component_sources: dict[str, tuple[str, ...]] = {}
+    if module_class is not None and model_type is not None and hf_config is not None:
+        component_sources = get_hf_component_sources(
+            module_class,
+            model_type,
+            hf_config,
+        )
+
+    ordered_names = tuple(dict.fromkeys((*roles, *module_paths)))
+    descriptors = tuple(
+        ComponentDescriptor(
+            name=name,
+            module_path=module_paths.get(name, "" if name == "model" else name),
+            role=roles.get(name, "decoder"),
+            source_paths=component_sources.get(name, ()),
+        )
+        for name in ordered_names
+    )
+    return ComponentManifest(descriptors)
