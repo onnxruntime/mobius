@@ -63,7 +63,11 @@ the original token IDs for PLE. The processor contract is the pinned Qwen3
 image processor with vision start/end tokens 248053/248054. This package is
 explicitly image-only: config extraction validates the checkpoint's video token
 but removes it from runtime metadata, the embedding graph exposes no video
-feature input, and direct configs that request video support fail closed.
+feature input, and direct configs that request video support fail closed. The
+embedding graph also publishes `mobius.unsupported_token_ids` and carries a
+dynamic ONNX Gather guard: any source video token is sanitized before vocabulary
+lookup and then forces an out-of-range index error, so direct graph execution
+cannot silently treat `<|video_pad|>` as ordinary text.
 
 QSA uses standard ONNX operators to reproduce the selected-token mask, then
 runs ordinary dense attention under that mask. This is numerically faithful,

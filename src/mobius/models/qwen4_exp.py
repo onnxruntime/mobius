@@ -1385,6 +1385,57 @@ class Qwen4ExpVisionEncoderModel(Qwen3VLVisionEncoderModel):
         return super().forward(op, pixel_values, image_grid_thw)
 
 
+class Qwen4ExpImageOnlyEmbeddingModel(Qwen25VLEmbeddingModel):
+    """Image-only mixer that fails execution when a video token is present."""
+
+    def __init__(self, config: Qwen4ExpConfig):
+        super().__init__(config)
+        if config.unsupported_video_token_id is None:
+            raise ValueError(
+                "Qwen4-Exp image-only embedding requires the source video token "
+                "for its execution guard"
+            )
+        self._unsupported_video_token_id = config.unsupported_video_token_id
+        self._pad_token_id = config.pad_token_id
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        image_features: ir.Value,
+    ):
+        video_mask = op.Equal(
+            input_ids,
+            op.Constant(value_int=self._unsupported_video_token_id),
+        )
+        safe_input_ids = op.Where(
+            video_mask,
+            op.Expand(
+                op.Constant(value_int=self._pad_token_id),
+                op.Shape(input_ids),
+            ),
+            input_ids,
+        )
+        inputs_embeds = super().forward(
+            op,
+            safe_input_ids,
+            image_features,
+        )
+
+        # Gather index 0 for image/text requests and index 1 for unsupported
+        # video requests. The one-element table makes video execution fail
+        # deterministically instead of treating <|video_pad|> as a text token.
+        video_present = op.ReduceMax(
+            op.Cast(video_mask, to=ir.DataType.INT64),
+            keepdims=False,
+        )
+        guard = op.Gather(
+            op.CastLike(op.Constant(value_floats=[0.0]), inputs_embeds),
+            video_present,
+        )
+        return op.Add(inputs_embeds, guard)
+
+
 class Qwen4ExpForConditionalGeneration(nn.Module):
     """Qwen3.8 Flash-Next/Qwen4-Exp three-model vision-language pipeline.
 
@@ -1421,7 +1472,7 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         self.config = config
         self.decoder = Qwen4ExpVLDecoderModel(config)
         self.vision_encoder = Qwen4ExpVisionEncoderModel(config)
-        self.embedding = Qwen25VLEmbeddingModel(config)
+        self.embedding = Qwen4ExpImageOnlyEmbeddingModel(config)
 
     def forward(self, op: OpBuilder, **kwargs):
         raise NotImplementedError(

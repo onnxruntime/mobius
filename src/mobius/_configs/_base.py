@@ -1556,6 +1556,7 @@ class Qwen4ExpConfig(CausalLMConfig):
     mamba_ssm_dtype: ir.DataType = ir.DataType.FLOAT
     mtp_num_hidden_layers: int = 0
     mtp_use_dedicated_embeddings: bool = False
+    unsupported_video_token_id: int | None = None
 
     def __post_init__(self) -> None:
         self.ple_layer_ids = sorted(set(self.ple_layer_ids or []))
@@ -1821,6 +1822,7 @@ class Qwen4ExpConfig(CausalLMConfig):
             # of the source token above, but do not publish runtime video support
             # until a video producer/preprocessor route exists.
             fields["video_token_id"] = None
+            fields["unsupported_video_token_id"] = base.video_token_id
         return cls(**fields)
 
 

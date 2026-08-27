@@ -269,15 +269,20 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             config.vision is not None and config.vision.deepstack_visual_indexes
         ):
             raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
+        embedding = build_embedding_from_features(
+            module.embedding,
+            config,
+            feature_name="image_features",
+            feature_dim=config.hidden_size,
+        )
+        embedding.metadata_props["mobius.unsupported_token_ids"] = json.dumps(
+            {"video": config.unsupported_video_token_id},
+            separators=(",", ":"),
+        )
         models = {
             "decoder": self._build_decoder(module.decoder, config),
             "vision_encoder": self._build_vision(module.vision_encoder, config),
-            "embedding": build_embedding_from_features(
-                module.embedding,
-                config,
-                feature_name="image_features",
-                feature_dim=config.hidden_size,
-            ),
+            "embedding": embedding,
         }
         return ModelPackage(models, config=config)
 

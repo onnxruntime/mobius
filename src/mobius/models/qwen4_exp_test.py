@@ -101,6 +101,7 @@ def _vl_config(**overrides) -> Qwen4ExpConfig:
         ),
         image_token_id=30,
         video_token_id=None,
+        unsupported_video_token_id=31,
         vision_start_token_id=29,
         vision_end_token_id=28,
         mrope_section=[1, 1, 0],
@@ -225,6 +226,7 @@ def test_pinned_config_fields_extract_and_normalize_schedule():
     assert multimodal.vision.out_hidden_size == 2560
     assert multimodal.image_token_id == 248056
     assert multimodal.video_token_id is None
+    assert multimodal.unsupported_video_token_id == 248057
     assert multimodal.vision_start_token_id == 248053
     assert multimodal.vision_end_token_id == 248054
     assert multimodal.deepstack_visual_indexes == []
@@ -360,6 +362,9 @@ def test_multimodal_package_exposes_exact_three_model_io():
         "input_ids",
         "image_features",
     }
+    assert json.loads(package["embedding"].metadata_props["mobius.unsupported_token_ids"]) == {
+        "video": config.unsupported_video_token_id
+    }
 
 
 def test_multimodal_wrapper_fails_closed_without_exact_composite_shape():
@@ -386,6 +391,8 @@ def test_multimodal_wrapper_fails_closed_without_exact_composite_shape():
 
 
 def test_multimodal_embedding_preserves_global_image_order():
+    import onnxruntime as ort
+
     from mobius.integrations._weight_loading import apply_weights
 
     config = _vl_config()
@@ -421,6 +428,18 @@ def test_multimodal_embedding_preserves_global_image_order():
                 "image_features": image_features,
             }
         )["inputs_embeds"]
+        video_input_ids = input_ids.copy()
+        video_input_ids[0, 3] = config.unsupported_video_token_id
+        with pytest.raises(
+            ort.capi.onnxruntime_pybind11_state.InvalidArgument,
+            match="indices element out of data bounds",
+        ):
+            session.run(
+                {
+                    "input_ids": video_input_ids,
+                    "image_features": image_features,
+                }
+            )
     finally:
         session.close()
 
@@ -430,6 +449,7 @@ def test_multimodal_embedding_preserves_global_image_order():
 
 
 def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_path):
+    from mobius._model_package import ModelPackage
     from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
     from mobius.integrations.onnx_genai.workflow_metadata import (
         build_vlm_workflow_metadata,
@@ -487,6 +507,33 @@ def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_p
             config=config,
         )
     assert not onnx_genai_output.exists()
+
+    override_output = tmp_path / "override"
+    override_output.mkdir()
+    sentinel = override_output / "sentinel.bin"
+    sentinel.write_bytes(b"unchanged")
+    snapshot = {path.name: path.read_bytes() for path in override_output.iterdir()}
+    non_qwen_override = SimpleNamespace(model_type="qwen2")
+    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
+        write_onnx_genai_config(
+            package,
+            str(override_output),
+            config=non_qwen_override,
+        )
+    assert {path.name: path.read_bytes() for path in override_output.iterdir()} == snapshot
+
+    structurally_identical = ModelPackage(
+        dict(package),
+        config=non_qwen_override,
+    )
+    structural_output = tmp_path / "structural"
+    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
+        write_onnx_genai_config(
+            structurally_identical,
+            str(structural_output),
+            config=non_qwen_override,
+        )
+    assert not structural_output.exists()
 
 
 def test_ort_genai_text_export_also_fails_before_writing_artifacts(tmp_path):
@@ -658,6 +705,10 @@ def test_real_image_processor_outputs_feed_vision_graph():
 
 @pytest.mark.integration
 def test_real_video_and_mixed_processor_outputs_have_no_export_route():
+    import onnxruntime as ort
+
+    from mobius.integrations._weight_loading import apply_weights
+
     try:
         from transformers import AutoProcessor
     except ImportError:
@@ -697,6 +748,40 @@ def test_real_video_and_mixed_processor_outputs_have_no_export_route():
     assert {"pixel_values_videos", "video_grid_thw"}.isdisjoint(
         value.name for value in package["vision_encoder"].graph.inputs
     )
+
+    embedding = package["embedding"]
+    apply_weights(
+        embedding,
+        {
+            "embedding.embed_tokens.weight": torch.zeros(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        },
+    )
+    processor_ids = np.asarray(processed["input_ids"], dtype=np.int64)
+    tiny_ids = np.mod(processor_ids, config.vocab_size)
+    tiny_ids[processor_ids == 248056] = config.image_token_id
+    tiny_ids[processor_ids == 248057] = config.unsupported_video_token_id
+    image_count = int(np.count_nonzero(tiny_ids == config.image_token_id))
+    image_features = np.zeros(
+        (image_count, config.hidden_size),
+        dtype=np.float32,
+    )
+    session = OnnxModelSession(embedding)
+    try:
+        with pytest.raises(
+            ort.capi.onnxruntime_pybind11_state.InvalidArgument,
+            match="indices element out of data bounds",
+        ):
+            session.run(
+                {
+                    "input_ids": tiny_ids,
+                    "image_features": image_features,
+                }
+            )
+    finally:
+        session.close()
 
 
 def test_graph_exposes_exact_heterogeneous_state_abi():
