@@ -16,7 +16,11 @@ from mobius._testing import (
     create_test_builder,
     create_test_input,
 )
-from mobius.components._quantized_linear import BlockQuantizedLinear, QuantizedLinear
+from mobius.components._quantized_linear import (
+    BlockQuantizedLinear,
+    ClippableQuantizedLinear,
+    QuantizedLinear,
+)
 
 # Test dimensions
 IN_FEATURES = 64
@@ -313,6 +317,35 @@ class TestBlockQuantizedLinear:
             BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="q4_k")
 
 
+class TestClippableQuantizedLinear:
+    def test_keeps_clipping_parameters(self):
+        linear = ClippableQuantizedLinear(IN_FEATURES, OUT_FEATURES)
+        names = {name for name, _ in linear.named_parameters()}
+        assert {
+            "weight",
+            "scales",
+            "input_min",
+            "input_max",
+            "output_min",
+            "output_max",
+        } <= names
+
+    def test_graph_clips_around_matmulnbits(self):
+        linear = ClippableQuantizedLinear(
+            IN_FEATURES,
+            OUT_FEATURES,
+            bits=8,
+            block_size=32,
+        )
+        b, op, graph = create_test_builder()
+        x = create_test_input(b, "x", [1, 4, IN_FEATURES])
+        result = linear(op, x)
+        b._adapt_outputs([result], "")
+
+        assert count_op_type(graph, "MatMulNBits") == 1
+        assert count_op_type(graph, "Clip") == 2
+
+
 class TestMakeQuantizedLinearFactory:
     """Tests for the make_quantized_linear_factory closure."""
 
@@ -347,6 +380,22 @@ class TestMakeQuantizedLinearFactory:
         assert instance._k == 32
         assert instance._n == 64
         assert instance.bias is None
+
+    def test_clippable_factory_uses_requested_layout(self):
+        from mobius.components._quantized_linear import (
+            make_clippable_quantized_linear_factory,
+        )
+
+        factory = make_clippable_quantized_linear_factory(
+            bits=8,
+            block_size=32,
+            has_zero_point=True,
+        )
+        linear = factory(IN_FEATURES, OUT_FEATURES, bias=False)
+
+        assert isinstance(linear, ClippableQuantizedLinear)
+        assert linear.weight.shape == [OUT_FEATURES, 2, 32]
+        assert linear.zero_points is not None
 
 
 class TestQuantizedEmbeddingInit:

@@ -16,6 +16,7 @@ To run a single model::
 
 from __future__ import annotations
 
+import dataclasses
 import re
 
 import ml_dtypes
@@ -57,6 +58,7 @@ from mobius._configs import (
     AudioConfig,
     CodePredictorConfig,
     MMSConfig,
+    QuantizationConfig,
     SpeakerEncoderConfig,
     TTSConfig,
     VisionConfig,
@@ -218,6 +220,34 @@ def _make_params(
             test_id = model_type
         params.append(pytest.param(model_type, overrides, id=test_id))
     return params
+
+
+def _with_component_quantization(config: ArchitectureConfig, task):
+    """Assign distinct tiny affine layouts to every materialized component."""
+    layouts = ((4, 16), (8, 32), (2, 16))
+    component_quantization = {}
+    for index, (component, role) in enumerate(task.model_roles.items()):
+        if role == "glue":
+            continue
+        if component == "audio_encoder" and config.audio is None:
+            continue
+        bits, group_size = layouts[index % len(layouts)]
+        component_quantization[component] = QuantizationConfig(
+            bits=bits,
+            group_size=group_size,
+            quant_method="olive",
+            sym=True,
+            quantize_embeddings=role == "embedding",
+        )
+    decoder_quantization = component_quantization.get(
+        "decoder",
+        component_quantization.get("model"),
+    )
+    return dataclasses.replace(
+        config,
+        quantization=decoder_quantization,
+        component_quantization=component_quantization,
+    )
 
 
 # Configs imported from _test_configs — strip the is_representative flag
@@ -526,6 +556,19 @@ class TestBuildSeq2SeqGraph:
 
         dec_outputs = {out.name for out in pkg["decoder"].graph.outputs}
         assert "logits" in dec_outputs
+
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        assert set(package) == {"encoder", "decoder"}
 
     def test_onnx_checker_passes(self, model_type: str, config_overrides: dict):
         """Run the ONNX CheckerPass to catch attribute/shape/type errors."""
@@ -6828,6 +6871,35 @@ class TestBuildVLGraph:
             pixel_values = next(i for i in vision.graph.inputs if i.name == "pixel_values")
             assert pixel_values.dtype == ir.DataType.FLOAT
 
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        """Every VL task accepts an independent affine layout per component."""
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        for component, model in package.items():
+            quantization = config.component_quantization.get(component)
+            if quantization is None:
+                continue
+            quantized_nodes = [
+                node
+                for node in model.graph
+                if node.op_type in {"MatMulNBits", "GatherBlockQuantized"}
+            ]
+            if not quantized_nodes:
+                assert not any(node.op_type == "MatMul" for node in model.graph), (
+                    f"{model_type}/{component} kept eligible MatMul projections float"
+                )
+            for node in quantized_nodes:
+                assert node.attributes["bits"].as_int() == quantization.bits
+                assert node.attributes["block_size"].as_int() == quantization.group_size
+
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""
         config = _base_config(**config_overrides)
@@ -6895,6 +6967,19 @@ class TestBuildSpeechGraph:
             assert model.graph is not None, f"{model_type}/{name} graph is None"
             assert len(model.graph.inputs) > 0, f"{model_type}/{name} has no inputs"
             assert len(model.graph.outputs) > 0, f"{model_type}/{name} has no outputs"
+
+    def test_component_quantization_builds(self, model_type: str, config_overrides: dict):
+        config = _base_config(**config_overrides)
+        task = get_task(_default_task_for_model(model_type))
+        config = _with_component_quantization(config, task)
+
+        package = build_from_module(
+            registry.get(model_type)(config),
+            config,
+            task=task,
+        )
+
+        assert package
 
     def test_has_initializers(self, model_type: str, config_overrides: dict):
         """Verify all sub-models have non-empty initializers."""

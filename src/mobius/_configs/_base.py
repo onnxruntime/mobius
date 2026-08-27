@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import onnx_ir as ir
@@ -371,6 +372,104 @@ def _extract_audio_config(config, parent_config, model_type: str) -> dict:
     return _dispatch(config, parent_config, model_type)
 
 
+_COMPONENT_QUANTIZATION_ALIASES = {
+    "text": "decoder",
+    "vision": "vision_encoder",
+    "audio": "audio_encoder",
+}
+
+
+def _get_config_value(config: object, name: str) -> object | None:
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def _parse_component_quantization_mapping(
+    value: object,
+    *,
+    expert_dtype: object | None,
+) -> dict[str, QuantizationConfig]:
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            "component_quantization must be a mapping of component names to "
+            f"quantization configs, got {type(value).__name__}"
+        )
+
+    result: dict[str, QuantizationConfig] = {}
+    for raw_name, raw_config in value.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise ValueError("component_quantization keys must be non-empty strings")
+        name = _COMPONENT_QUANTIZATION_ALIASES.get(raw_name, raw_name)
+        quantization = QuantizationConfig.from_value(
+            raw_config,
+            expert_dtype=expert_dtype,
+        )
+        if quantization is None:
+            continue
+        if name in result:
+            raise ValueError(
+                f"component_quantization declares component {name!r} more than once"
+            )
+        result[name] = quantization
+    return result
+
+
+def _extract_component_quantization(
+    config: object,
+    parent_config: object | None,
+    decoder_quantization: QuantizationConfig | None,
+) -> dict[str, QuantizationConfig] | None:
+    """Extract authoritative explicit or nested component configurations."""
+    sources = []
+    for source in (parent_config, config):
+        if source is not None and all(id(source) != id(item) for item in sources):
+            sources.append(source)
+
+    for source in sources:
+        declaration = _get_config_value(source, "component_quantization")
+        if declaration is None:
+            declaration = _get_config_value(source, "component_quantization_config")
+        if declaration is None:
+            root_quantization = _get_config_value(source, "quantization_config")
+            if hasattr(root_quantization, "to_dict"):
+                root_quantization = root_quantization.to_dict()
+            if isinstance(root_quantization, Mapping):
+                declaration = root_quantization.get("components")
+        if declaration is not None:
+            return _parse_component_quantization_mapping(
+                declaration,
+                expert_dtype=_get_config_value(source, "expert_dtype"),
+            )
+
+    composite = parent_config or config
+    nested: dict[str, QuantizationConfig] = {}
+    found_nested_declaration = False
+    for field_name, component_name in (
+        ("vision_config", "vision_encoder"),
+        ("audio_config", "audio_encoder"),
+    ):
+        sub_config = _get_config_value(composite, field_name)
+        if sub_config is None:
+            continue
+        raw_quantization = _get_config_value(sub_config, "quantization_config")
+        if raw_quantization is None:
+            continue
+        found_nested_declaration = True
+        quantization = QuantizationConfig.from_value(
+            raw_quantization,
+            expert_dtype=_get_config_value(sub_config, "expert_dtype"),
+        )
+        if quantization is not None:
+            nested[component_name] = quantization
+
+    if not found_nested_declaration:
+        return None
+    if decoder_quantization is not None:
+        nested["decoder"] = dataclasses.replace(decoder_quantization)
+    return nested
+
+
 @dataclasses.dataclass
 class BaseModelConfig:
     """Base configuration shared by all model architectures.
@@ -395,6 +494,9 @@ class BaseModelConfig:
     # Model dtype (from HF config dtype)
     dtype: ir.DataType = ir.DataType.FLOAT
     quantization: QuantizationConfig | None = None
+    # ``None`` keeps legacy model-wide behavior. A mapping is authoritative:
+    # omitted components remain floating point.
+    component_quantization: dict[str, QuantizationConfig] | None = None
 
     # HuggingFace identity and token metadata used by package persistence.
     model_type: str | None = None
@@ -402,6 +504,27 @@ class BaseModelConfig:
     eos_token_id: int | list[int] | None = None
     mask_token_id: int | None = None
     diffusion_shift_logits: bool = False
+
+    def quantization_for(self, component: str) -> QuantizationConfig | None:
+        """Return the effective quantization plan for one package component."""
+        if self.component_quantization is None:
+            return self.quantization
+        candidates = {
+            "decoder": ("decoder", "model"),
+            "model": ("model", "decoder"),
+            "vision_encoder": ("vision_encoder", "vision"),
+            "vision": ("vision", "vision_encoder"),
+            "audio_encoder": ("audio_encoder", "audio"),
+            "audio": ("audio", "audio_encoder"),
+        }.get(component, (component,))
+        return next(
+            (
+                self.component_quantization[name]
+                for name in candidates
+                if name in self.component_quantization
+            ),
+            None,
+        )
 
 
 @dataclasses.dataclass
@@ -1369,6 +1492,17 @@ class ArchitectureConfig(BaseModelConfig):
             quant = None
         if quant is None and parent_config is not None:
             quant = QuantizationConfig.from_transformers(parent_config)
+        component_quantization = _extract_component_quantization(
+            config,
+            parent_config,
+            quant,
+        )
+        if component_quantization is not None:
+            options["component_quantization"] = component_quantization
+            quant = component_quantization.get(
+                "decoder",
+                component_quantization.get("model"),
+            )
         if quant is not None:
             options["quantization"] = quant
 
