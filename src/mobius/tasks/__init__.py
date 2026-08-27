@@ -23,6 +23,7 @@ __all__ = [
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
+    "SmallThinkerGGUFCausalLMTask",
     "CTCAsrTask",
     "FeatureCTCAsrTask",
     "RNNTTask",
@@ -116,6 +117,7 @@ from mobius.tasks._base import (
 from mobius.tasks._causal_lm import (
     CausalLMTask,
     HybridCausalLMTask,
+    SmallThinkerGGUFCausalLMTask,
 )
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
@@ -226,6 +228,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "moshi-depformer": MoshiDepformerTask,
     "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "smallthinker-gguf-text-generation": SmallThinkerGGUFCausalLMTask,
     "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,

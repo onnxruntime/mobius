@@ -143,10 +143,11 @@ _GROVEMOE_GGUF_GRAPH_REASON = (
 )
 
 _SMALLTHINKER_GGUF_GRAPH_REASON = (
-    "The pinned SmallThinker graph computes router logits from the unnormalized layer input, "
-    "uses ReLU experts with metadata-selected sigmoid or softmax gating, and can disable RoPE "
-    "or select sliding-window attention per layer. Mobius's generic MoE graph routes after "
-    "the FFN norm with softmax/SwiGLU experts and has no matching per-layer RoPE schedule."
+    "The exact float-import graph owns SmallThinker's pre-norm router, ReGLU experts, "
+    "metadata-selected sigmoid/softmax gate, and per-layer SWA/NoPE schedule. Quantization "
+    "preservation is rejected because QMoE implements SwiGLU and cannot represent this ReGLU "
+    "contract. Runtime packaging remains deferred until a representative real-weight GGUF "
+    "passes full-logit prefill and cached-decode parity."
 )
 
 _CHAMELEON_GGUF_GRAPH_REASON = (
@@ -1853,10 +1854,29 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="smallthinker",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="smallthinker_gguf",
+        module_type="smallthinker_gguf",
+        tensor_map_recipe=("smallthinker",),
+        config_postprocessor="smallthinker",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "rope.dimension_count",
+            "rope.freq_base",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_gating_func",
+        ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
         runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
         reason=_SMALLTHINKER_GGUF_GRAPH_REASON,
     ),
     # ------------------------------ Remaining multimodal text backbones (audited/deferred)

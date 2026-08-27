@@ -705,6 +705,7 @@ def _validate_gguf_model(
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     _raise_for_invalid_maincoder_tensor_contract(gguf_model)
     _raise_for_invalid_granite_tensor_contract(gguf_model)
+    _raise_for_invalid_smallthinker_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
@@ -2698,6 +2699,229 @@ def _raise_for_invalid_maincoder_tensor_contract(gguf_model) -> None:
         raise ValueError(
             "Maincoder normalization tensors must use float GGUF storage: "
             f"{quantized_auxiliary}"
+        )
+
+
+def _raise_for_invalid_smallthinker_tensor_contract(gguf_model) -> None:
+    """Validate SmallThinker's complete tensor, shape, and qtype closure."""
+    if gguf_model.architecture != "smallthinker":
+        return
+
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+    )
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    arch = "smallthinker"
+    metadata = gguf_model.metadata
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.layer_norm_rms_epsilon",
+        "rope.dimension_count",
+        "rope.freq_base",
+        "expert_count",
+        "expert_used_count",
+        "expert_feed_forward_length",
+        "expert_gating_func",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}"
+        for suffix in required_suffixes
+        if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"smallthinker GGUF is missing required metadata: {missing_metadata}")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata[f"{arch}.attention.head_count_kv"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    expert_intermediate = int(metadata[f"{arch}.expert_feed_forward_length"])
+    context = int(metadata[f"{arch}.context_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    head_dim = int(
+        metadata.get(f"{arch}.attention.key_length", hidden // heads if heads > 0 else 0)
+    )
+    value_dim = int(metadata.get(f"{arch}.attention.value_length", head_dim))
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    if (
+        min(
+            hidden,
+            intermediate,
+            layers,
+            heads,
+            kv_heads,
+            experts,
+            top_k,
+            expert_intermediate,
+            context,
+            vocab,
+            head_dim,
+        )
+        <= 0
+        or hidden != heads * head_dim
+        or heads % kv_heads
+        or value_dim != head_dim
+        or rope_dim != head_dim
+        or intermediate != expert_intermediate
+        or top_k > experts
+        or not math.isfinite(epsilon)
+        or epsilon <= 0
+        or not math.isfinite(rope_base)
+        or rope_base <= 0
+    ):
+        raise ValueError("smallthinker GGUF has invalid model geometry")
+
+    items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in items
+        if not is_known_skip(name)
+    }
+    qtypes = {name: qtype for name, _raw, qtype, _shape in items}
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (vocab, hidden),
+    }
+    all_projection_biases: set[str] = set()
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate_inp.weight": (experts, hidden),
+                prefix + "ffn_gate_exps.weight": (
+                    experts,
+                    expert_intermediate,
+                    hidden,
+                ),
+                prefix + "ffn_up_exps.weight": (
+                    experts,
+                    expert_intermediate,
+                    hidden,
+                ),
+                prefix + "ffn_down_exps.weight": (
+                    experts,
+                    hidden,
+                    expert_intermediate,
+                ),
+            }
+        )
+
+        fused_weight = prefix + "attn_qkv.weight"
+        split_weights = {
+            prefix + "attn_q.weight": (q_width, hidden),
+            prefix + "attn_k.weight": (kv_width, hidden),
+            prefix + "attn_v.weight": (kv_width, hidden),
+        }
+        has_fused = fused_weight in actual
+        present_split = set(split_weights) & set(actual)
+        if has_fused == bool(present_split) or (
+            present_split and present_split != set(split_weights)
+        ):
+            raise ValueError(
+                f"smallthinker layer {layer} must contain exactly one complete QKV "
+                "layout: fused attn_qkv or split attn_q/attn_k/attn_v"
+            )
+        if has_fused:
+            required[fused_weight] = (q_width + 2 * kv_width, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_width + 2 * kv_width,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        else:
+            required.update(split_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_width,),
+                prefix + "attn_k.bias": (kv_width,),
+                prefix + "attn_v.bias": (kv_width,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        if alternate_biases & set(actual):
+            raise ValueError(
+                f"smallthinker layer {layer} QKV bias layout does not match its weights"
+            )
+        present_biases = set(selected_biases) & set(actual)
+        if present_biases and present_biases != set(selected_biases):
+            raise ValueError(
+                f"smallthinker layer {layer} has a partial attention Q/K/V bias set"
+            )
+        optional.update(selected_biases)
+        all_projection_biases.update(selected_biases)
+
+    present_biases = all_projection_biases & set(actual)
+    if present_biases and present_biases != all_projection_biases:
+        raise ValueError(
+            "smallthinker attention Q/K/V biases must be present in every layer "
+            "or absent entirely"
+        )
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    if missing or unexpected or malformed or out_of_range:
+        raise ValueError(
+            "Invalid smallthinker GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}, "
+            f"out_of_range={out_of_range}"
+        )
+
+    unsupported_qtypes = {}
+    for name, qtype in qtypes.items():
+        if name not in allowed:
+            continue
+        quant_spec = get_quant_spec(qtype)
+        if quant_spec is None or quant_spec.dequantize is not Support.SUPPORTED:
+            unsupported_qtypes[name] = getattr(qtype, "name", str(qtype))
+    if unsupported_qtypes:
+        raise ValueError(
+            "smallthinker GGUF contains qtypes without a supported float "
+            f"dequantization route: {unsupported_qtypes}"
+        )
+
+    float_types = float_storage_type_ids()
+    non_float_norms = sorted(
+        name
+        for name, qtype in qtypes.items()
+        if name.endswith(("attn_norm.weight", "ffn_norm.weight", "output_norm.weight"))
+        and getattr(qtype, "value", qtype) not in float_types
+    )
+    if non_float_norms:
+        raise ValueError(
+            "smallthinker normalization tensors must use F32/F16/BF16 storage: "
+            f"{non_float_norms}"
         )
 
 
@@ -6749,6 +6973,23 @@ def build_from_gguf(
         ):
             raise ValueError(
                 "plamo GGUF only supports the dedicated 'plamo-text-generation' task"
+            )
+    if gguf_arch == "smallthinker":
+        from mobius.tasks import SmallThinkerGGUFCausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for SmallThinker GGUF; "
+                "the exact graph uses its dedicated dynamic concat-grow KV-cache task"
+            )
+        if (
+            task is not None
+            and task != "smallthinker-gguf-text-generation"
+            and not isinstance(task, SmallThinkerGGUFCausalLMTask)
+        ):
+            raise ValueError(
+                "smallthinker GGUF only supports the dedicated "
+                "'smallthinker-gguf-text-generation' task"
             )
     if gguf_arch == "qwen4exp":
         from mobius.tasks import Qwen4ExpCausalLMTask

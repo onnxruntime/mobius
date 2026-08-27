@@ -935,6 +935,24 @@ _DEEPSEEK_SHARED_MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
 }
 
+_SMALLTHINKER_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+}
+
+
 _DIFFUSION_FUSED_QKV: dict[str, str] = {
     "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
 }
@@ -1274,6 +1292,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "moe_extras": _MOE_EXTRAS,
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
         "deepseek_shared_moe_extras": _DEEPSEEK_SHARED_MOE_EXTRAS,
+        "smallthinker": _SMALLTHINKER_MAPPING,
         "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
         "dbrx_extras": _DBRX_EXTRAS,
         "nomic_bert_moe_extras": _NOMIC_BERT_MOE_EXTRAS,

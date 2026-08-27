@@ -189,6 +189,7 @@ __all__ = [
     "QwenCausalLMModel",
     "QwenImageTransformer2DModel",
     "SD3Transformer2DModel",
+    "SmallThinkerGGUFCausalLMModel",
     "SmolLM3CausalLMModel",
     "StarCoder2CausalLMModel",
     "T2IAdapterModel",
@@ -421,6 +422,7 @@ from mobius.models.qwen_vl import (
 )
 from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
+from mobius.models.smallthinker import SmallThinkerGGUFCausalLMModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel

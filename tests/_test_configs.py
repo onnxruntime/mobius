@@ -580,6 +580,23 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
     ),
     ("qwen3_vl_text", {"attn_qk_norm": True}, False),
     ("smollm3", {"no_rope_layers": [1, 0]}, True),  # exercise per-layer RoPE gating
+    (
+        "smallthinker_gguf",
+        {
+            "hidden_act": "relu",
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "scoring_func": "softmax",
+            "norm_topk_prob": True,
+            "routing_weight_normalization_floor": 6.103515625e-5,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "no_rope_layers": [0, 1],
+            "sliding_window": 16,
+            "rope_local_base_freq": 50_000.0,
+        },
+        True,
+    ),
     # === Mixture of Experts ===
     (
         "phimoe",

@@ -8139,7 +8139,6 @@ class TestGGUFPreflightGuards:
             "gpt-oss",
             "grok",
             "grovemoe",
-            "smallthinker",
             "chameleon",
             "cogvlm",
             "deepseek2-ocr",

@@ -1141,7 +1141,11 @@ def _lfm2moe_postprocess(
     """
     del model
     arch = "lfm2moe"
-    gating = int(metadata[f"{arch}.expert_gating_func"])
+    raw_gating = metadata[f"{arch}.expert_gating_func"]
+    gating_value = float(raw_gating)
+    if not math.isfinite(gating_value) or not gating_value.is_integer():
+        raise ValueError("smallthinker.expert_gating_func must be an integer")
+    gating = int(gating_value)
     if gating != 2:
         raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
     num_dense_layers = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
@@ -1634,6 +1638,131 @@ def _ernie45_moe_postprocess(
         tie_word_embeddings="output.weight" not in names,
         rope_type="default",
         rope_interleave=True,
+    )
+
+
+def _smallthinker_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the pinned llama.cpp SmallThinker routing and layer schedule."""
+    arch = "smallthinker"
+    gating = int(metadata[f"{arch}.expert_gating_func"])
+    if gating not in (1, 2):
+        raise ValueError(
+            f"smallthinker.expert_gating_func must be SOFTMAX (1) or SIGMOID (2), got {gating}"
+        )
+    if config.num_local_experts is None or config.num_experts_per_tok is None:
+        raise ValueError("SmallThinker requires expert_count and expert_used_count")
+    if not 1 <= config.num_experts_per_tok <= config.num_local_experts:
+        raise ValueError(
+            "smallthinker.expert_used_count must be in "
+            f"[1, {config.num_local_experts}], got {config.num_experts_per_tok}"
+        )
+    if config.moe_intermediate_size is None or config.moe_intermediate_size <= 0:
+        raise ValueError("smallthinker.expert_feed_forward_length must be positive")
+    if config.intermediate_size != config.moe_intermediate_size:
+        raise ValueError(
+            "smallthinker.feed_forward_length must equal "
+            "smallthinker.expert_feed_forward_length"
+        )
+    if metadata.get(f"{arch}.expert_weights_norm", True) is not True:
+        raise ValueError("SmallThinker requires normalized top-k expert weights")
+
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError(
+            "smallthinker.expert_weights_scale must resolve to a finite positive value"
+        )
+
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if scaling_type not in (None, "", "none"):
+        raise ValueError(
+            "SmallThinker supports only unscaled/default RoPE, "
+            f"got rope.scaling.type={scaling_type!r}"
+        )
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    if not math.isfinite(rope_base) or rope_base <= 0:
+        raise ValueError("smallthinker.rope.freq_base must be finite and positive")
+
+    layers = config.num_hidden_layers
+    raw_window = metadata.get(f"{arch}.attention.sliding_window")
+    if isinstance(raw_window, (list, tuple, np.ndarray)):
+        raise TypeError("smallthinker.attention.sliding_window must be a scalar")
+    window_value = 0.0 if raw_window is None else float(raw_window)
+    if not math.isfinite(window_value) or not window_value.is_integer() or window_value < 0:
+        raise ValueError(
+            "smallthinker.attention.sliding_window must be a non-negative integer"
+        )
+    window_enabled = window_value > 0
+    if window_enabled:
+        raw_period = metadata.get(f"{arch}.attention.sliding_window_pattern", 4)
+        if isinstance(raw_period, (list, tuple, np.ndarray)):
+            raise TypeError("smallthinker.attention.sliding_window_pattern must be a scalar")
+        period_value = float(raw_period)
+        if (
+            not math.isfinite(period_value)
+            or not period_value.is_integer()
+            or period_value < 0
+        ):
+            raise ValueError(
+                "smallthinker.attention.sliding_window_pattern must be a non-negative integer"
+            )
+        period = int(period_value)
+        layer_types = [
+            ("sliding_attention" if period == 0 or layer % period != 0 else "full_attention")
+            for layer in range(layers)
+        ]
+        # The pinned loader forces 4096 regardless of the serialized positive value.
+        sliding_window = 4096
+        # With SWA enabled, llama.cpp disables RoPE on layers 0, 4, 8, ...
+        use_rope_layers = [0 if layer % 4 == 0 else 1 for layer in range(layers)]
+        local_rope_base = float(metadata.get(f"{arch}.rope.freq_base_swa", rope_base))
+        if not math.isfinite(local_rope_base) or local_rope_base <= 0:
+            raise ValueError("smallthinker.rope.freq_base_swa must be finite and positive")
+    else:
+        if f"{arch}.attention.sliding_window_pattern" in metadata:
+            raise ValueError(
+                "smallthinker.attention.sliding_window_pattern requires a positive "
+                "attention.sliding_window"
+            )
+        if f"{arch}.rope.freq_base_swa" in metadata:
+            raise ValueError(
+                "smallthinker.rope.freq_base_swa requires a positive attention.sliding_window"
+            )
+        layer_types = ["full_attention"] * layers
+        sliding_window = None
+        use_rope_layers = [1] * layers
+        local_rope_base = rope_base
+
+    return dataclasses.replace(
+        config,
+        hidden_act="relu",
+        tie_word_embeddings="output.weight" not in set(model.tensor_names),
+        attn_qkv_bias=any(
+            name.endswith(("attn_q.bias", "attn_qkv.bias")) for name in model.tensor_names
+        ),
+        attn_o_bias=False,
+        mlp_bias=False,
+        rope_type="default",
+        rope_interleave=False,
+        rope_theta=rope_base,
+        rope_local_base_freq=local_rope_base,
+        partial_rotary_factor=1.0,
+        layer_types=layer_types,
+        no_rope_layers=use_rope_layers,
+        sliding_window=sliding_window,
+        scoring_func="softmax" if gating == 1 else "sigmoid",
+        norm_topk_prob=True,
+        routed_scaling_factor=route_scale,
+        routing_weight_normalization_floor=6.103515625e-5,
+        n_group=1,
+        topk_group=1,
+        use_expert_bias=False,
+        disable_qmoe=True,
     )
 
 
@@ -4440,6 +4569,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "dbrx": _dbrx_postprocess,
     "arctic": _arctic_postprocess,
     "ernie45_moe": _ernie45_moe_postprocess,
+    "smallthinker": _smallthinker_postprocess,
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
     "granite": _granite_postprocess,
     "granitemoe": _granitemoe_postprocess,

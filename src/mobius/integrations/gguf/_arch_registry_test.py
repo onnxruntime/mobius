@@ -346,6 +346,7 @@ class TestCapabilityClosure:
             "qwen",
             "refact",
             "starcoder",
+            "smallthinker",
             "talkie",
             "xverse",
         }
@@ -1098,7 +1099,6 @@ class TestPinnedRemainingConventionalMoECohort:
         "gpt-oss",
         "grok",
         "grovemoe",
-        "smallthinker",
     )
     _DEFERRED_ARCHITECTURES = tuple(
         architecture
@@ -1111,7 +1111,6 @@ class TestPinnedRemainingConventionalMoECohort:
         "gpt-oss": 24,
         "grok": 24,
         "grovemoe": 23,
-        "smallthinker": 18,
     }
 
     @pytest.mark.parametrize("architecture", _DEFERRED_ARCHITECTURES)
@@ -1244,7 +1243,6 @@ class TestPinnedRemainingConventionalMoECohort:
             ("gpt-oss", ("MXFP4", "expert biases", "attention sinks")),
             ("grok", ("softcaps", "sqrt(2)/2", "dense-plus-routed")),
             ("grovemoe", ("separate selections", "adjugate", "Q/K RMSNorm")),
-            ("smallthinker", ("unnormalized", "sigmoid or softmax", "ReLU")),
         ],
     )
     def test_graph_and_routing_mismatch_is_explicit(
