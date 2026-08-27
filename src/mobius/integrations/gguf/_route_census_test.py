@@ -114,7 +114,7 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
 def test_recent_pr_reconciliation_is_explicit() -> None:
     assert [(record.number, record.state_at_audit) for record in RECENT_PR_DEPENDENCIES] == [
         (645, "merged"),
-        (651, "open"),
+        (651, "merged"),
         (652, "open"),
         (656, "open"),
     ]

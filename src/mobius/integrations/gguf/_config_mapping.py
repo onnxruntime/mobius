@@ -2292,6 +2292,9 @@ def _granite_postprocess(
 ) -> ArchitectureConfig:
     """Select the exact dense or MoE Granite graph and restore GGUF scaling."""
     arch = "granite"
+    _validate_closed_rope_scaling_metadata(
+        metadata, arch, allowed_suffixes={"type", "finetuned"}
+    )
     num_experts = int(config.num_local_experts or 0)
     top_k = int(config.num_experts_per_tok or 0)
     if num_experts < 0 or top_k < 0 or bool(num_experts) != bool(top_k):

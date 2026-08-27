@@ -321,7 +321,7 @@ def test_granite_longrope_factors_fail_closed(attention_factor: float | None) ->
 
     with pytest.raises(ValueError, match=r"unsupported rope\.scaling\.type='longrope'"):
         _raise_for_invalid_granite_tensor_contract(model)
-    with pytest.raises(ValueError, match="not in the exact supported subset"):
+    with pytest.raises(ValueError, match="unsupported RoPE scaling metadata"):
         gguf_to_config(model)
 
 
@@ -337,10 +337,18 @@ def test_granite_rejects_unmapped_yarn_attention_factor() -> None:
     )
     model = _FakeGGUF(metadata, _tensors())
 
-    with pytest.raises(ValueError, match="not in the exact supported subset"):
+    with pytest.raises(ValueError, match="unsupported RoPE scaling metadata"):
         gguf_to_config(model)
     with pytest.raises(ValueError, match=r"unsupported rope\.scaling\.type='yarn'"):
         _raise_for_invalid_granite_tensor_contract(model)
+
+
+def test_granite_rejects_attention_factor_without_scaling_type() -> None:
+    metadata = _metadata()
+    metadata["granite.rope.scaling.attn_factor"] = 1.1
+
+    with pytest.raises(ValueError, match="unsupported RoPE scaling metadata"):
+        gguf_to_config(_FakeGGUF(metadata, _tensors()))
 
 
 def test_dense_granite_static_cache_model_loads_in_ort() -> None:

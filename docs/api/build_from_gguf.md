@@ -111,7 +111,7 @@ remain machine-readable in `_route_census.py`; this table groups only shared nex
 | `intentionally-rejected` | `policy-rejections` | `projector:pockettts_gen`, `projector:qwen3tts_gen` | sidecar role must become a valid projector contract |
 | `intentionally-rejected` | `policy-rejections` | `mtp:bailingmoe2`, `mtp:dots3note`, `mtp:exaone-moe`, `mtp:exaone4`, `mtp:gemma4-assistant`, `mtp:glm4`, `mtp:glm4moe`, `mtp:graniteswitch`, `mtp:nemotron_h` | upstream executable ownership change |
 
-Recent PR dependencies: #645 (merged) — authoritative tokenizer route inventory and compiled-semantics blockers; #651 (open) — gemma4 tokenizer evidence; do not duplicate its oracle fixture or evidence record; #652 (open) — complete-shard identity and bounded header preflight for multi-file artifacts; #656 (open) — incoming qwen4exp header/config route; payload remains blocked on mixed native-block ABI.
+Recent PR dependencies: #645 (merged) — authoritative tokenizer route inventory and compiled-semantics blockers; #651 (merged) — gemma4 tokenizer evidence merged into the authoritative route census; #652 (open) — complete-shard identity and bounded header preflight for multi-file artifacts; #656 (open) — incoming qwen4exp header/config route; payload remains blocked on mixed native-block ABI.
 
 ## Tokenizer evidence
 

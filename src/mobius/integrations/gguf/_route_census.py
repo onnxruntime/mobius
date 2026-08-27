@@ -65,8 +65,8 @@ RECENT_PR_DEPENDENCIES: tuple[RecentPRDependency, ...] = (
     RecentPRDependency(
         651,
         "Validate Gemma4 GGUF tokenizer reconstruction",
-        "open",
-        "gemma4 tokenizer evidence; do not duplicate its oracle fixture or evidence record",
+        "merged",
+        "gemma4 tokenizer evidence merged into the authoritative route census",
     ),
     RecentPRDependency(
         652,
