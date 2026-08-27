@@ -509,10 +509,12 @@ class Qwen4ExpShardedEmbedding(nn.Module):
 
     def __init__(self, num_embeddings: int, embedding_dim: int, num_shards: int):
         super().__init__()
-        if num_shards <= 0 or num_embeddings % num_shards:
+        remainder = num_embeddings % num_shards if num_shards > 0 else num_embeddings
+        if num_shards <= 0 or remainder:
             raise ValueError(
-                "Qwen4-Exp PLE embedding rows must divide split_ngram_parts exactly: "
-                f"{num_embeddings} % {num_shards}"
+                "Qwen4-Exp PLE embedding rows must be exactly divisible by "
+                f"split_ngram_parts: {num_embeddings} rows / {num_shards} shards "
+                f"leaves remainder {remainder}"
             )
         self._rows_per_shard = num_embeddings // num_shards
         self._num_shards = num_shards
@@ -520,25 +522,30 @@ class Qwen4ExpShardedEmbedding(nn.Module):
             setattr(
                 self,
                 f"shard_{shard_index}",
-                Embedding(self._rows_per_shard, embedding_dim),
+                Qwen4ExpEmbeddingShard(self._rows_per_shard, embedding_dim),
             )
 
     def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
-        result = None
-        for shard_index in range(self._num_shards):
-            start = shard_index * self._rows_per_shard
-            end = start + self._rows_per_shard
-            local_ids = op.Clip(op.Sub(input_ids, start), 0, self._rows_per_shard - 1)
-            gathered = getattr(self, f"shard_{shard_index}")(op, local_ids)
-            selected = op.And(op.GreaterOrEqual(input_ids, start), op.Less(input_ids, end))
-            shard_result = op.Where(
-                op.Unsqueeze(selected, [-1]),
-                gathered,
-                op.CastLike(0.0, gathered),
-            )
-            result = shard_result if result is None else op.Add(result, shard_result)
-        assert result is not None
-        return result
+        table = op.Concat(
+            *[
+                getattr(self, f"shard_{shard_index}")(op)
+                for shard_index in range(self._num_shards)
+            ],
+            axis=0,
+        )
+        return op.Gather(table, input_ids)
+
+
+class Qwen4ExpEmbeddingShard(nn.Module):
+    """One storage shard contributing rows to the logical PLE embedding."""
+
+    def __init__(self, rows: int, embedding_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter([rows, embedding_dim])
+
+    def forward(self, op: OpBuilder) -> ir.Value:
+        del op
+        return self.weight
 
 
 class _PLEDepthwiseConv1d(nn.Module):
@@ -998,13 +1005,8 @@ class Qwen4ExpMoEBlock(Qwen2MoELayer):
         self.experts = Qwen4ExpExperts(config)
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value):
-        routing_weights, selected_experts = self.gate(op, hidden_states)
-        expert_output = self.experts(
-            op,
-            hidden_states,
-            selected_experts,
-            routing_weights,
-        )
+        router_probabilities = self.gate(op, hidden_states)
+        expert_output = self.experts(op, hidden_states, router_probabilities)
         shared_output = self.shared_expert(op, hidden_states)
         shared_gate = op.Sigmoid(self.shared_expert_gate(op, hidden_states))
         return op.Add(expert_output, op.Mul(shared_output, shared_gate))
@@ -1020,6 +1022,8 @@ class Qwen4ExpExperts(nn.Module):
         self._hidden_size = config.hidden_size
         self._num_experts = config.num_local_experts
         self._top_k = config.num_experts_per_tok
+        self._normalize = int(config.norm_topk_prob)
+        self._routing_scale = config.routed_scaling_factor
         self._intermediate_size = config.moe_intermediate_size
         self.gate_up_proj = nn.Parameter(
             [
@@ -1040,63 +1044,47 @@ class Qwen4ExpExperts(nn.Module):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        selected_experts: ir.Value,
-        routing_weights: ir.Value,
+        router_probabilities: ir.Value,
     ) -> ir.Value:
-        # Dispatch only the tokens routed to each expert. Dynamic Gather on the
-        # expert bank would replicate full matrices into (B,S,K,...), which is
-        # prohibitive at production prefill lengths.
         original_shape = op.Shape(hidden_states)
         flat_hidden = op.Reshape(hidden_states, [-1, self._hidden_size])
         assert self._top_k is not None
-        flat_indices = op.Reshape(selected_experts, [-1, self._top_k])
-        flat_weights = op.Reshape(routing_weights, [-1, self._top_k])
+        router_probs = op.Reshape(
+            router_probabilities,
+            [-1, self._num_experts],
+        )
+        # ORT's fused MoE consumes interleaved SwiGLU rows:
+        # [gate_0, up_0, gate_1, up_1, ...].
+        interleaved = op.Reshape(
+            op.Transpose(
+                op.Reshape(
+                    self.gate_up_proj,
+                    [self._num_experts, 2, self._intermediate_size, self._hidden_size],
+                ),
+                perm=[0, 2, 1, 3],
+            ),
+            [self._num_experts, 2 * self._intermediate_size, self._hidden_size],
+        )
         output = op.CastLike(
-            op.ConstantOfShape(op.Shape(flat_hidden)),
+            op.MoE(  # type: ignore[attr-defined]
+                flat_hidden,
+                router_probs,
+                interleaved,
+                None,
+                self.down_proj,
+                activation_type="swiglu",
+                k=self._top_k,
+                normalize_routing_weights=self._normalize,
+                activation_alpha=1.0,
+                activation_beta=0.0,
+                swiglu_limit=float("inf"),
+                swiglu_fusion=1,
+                _domain="com.microsoft",
+            ),
             flat_hidden,
         )
-
-        for expert_index in range(self._num_experts):
-            matches = op.Equal(flat_indices, expert_index)
-            coordinates = op.Transpose(op.NonZero(matches), perm=[1, 0])
-            token_indices = op.Squeeze(op.Gather(coordinates, [0], axis=1), [1])
-            expert_hidden = op.Gather(flat_hidden, token_indices, axis=0)
-
-            gate_up = op.Squeeze(
-                op.Gather(self.gate_up_proj, [expert_index], axis=0),
-                [0],
-            )
-            projected = op.MatMul(
-                expert_hidden,
-                op.Transpose(gate_up, perm=[1, 0]),
-            )
-            gate, up = op.Split(
-                projected,
-                [self._intermediate_size, self._intermediate_size],
-                axis=-1,
-                _outputs=2,
-            )
-            activated = op.Mul(op.Swish(gate), up)
-
-            down = op.Squeeze(
-                op.Gather(self.down_proj, [expert_index], axis=0),
-                [0],
-            )
-            expert_output = op.MatMul(
-                activated,
-                op.Transpose(down, perm=[1, 0]),
-            )
-            route_weight = op.GatherND(flat_weights, coordinates)
-            weighted = op.Mul(expert_output, op.Unsqueeze(route_weight, [-1]))
-            scattered = op.ScatterND(
-                op.CastLike(
-                    op.ConstantOfShape(op.Shape(flat_hidden)),
-                    flat_hidden,
-                ),
-                op.Unsqueeze(token_indices, [-1]),
-                weighted,
-            )
-            output = op.Add(output, scattered)
+        if self._routing_scale != 1.0:  # noqa: RUF069
+            output = op.Mul(output, op.CastLike(self._routing_scale, output))
         return op.Reshape(output, original_shape)
 
 
@@ -1109,20 +1097,7 @@ class Qwen4ExpTopKGate(SoftmaxTopKGate):
             op.Cast(logits, to=ir.DataType.FLOAT),
             axis=-1,
         )
-        routing_weights, selected_experts = op.TopK(
-            probabilities,
-            op.Constant(value_ints=[self.top_k]),
-            axis=-1,
-            _outputs=2,
-        )
-        if self.norm_topk_prob:
-            routing_weights = op.Div(
-                routing_weights,
-                op.ReduceSum(routing_weights, [-1], keepdims=True),
-            )
-        if self.routed_scaling_factor != 1.0:  # noqa: RUF069
-            routing_weights = op.Mul(routing_weights, self.routed_scaling_factor)
-        return op.CastLike(routing_weights, hidden_states), selected_experts
+        return probabilities
 
 
 class Qwen4ExpDecoderLayer(nn.Module):

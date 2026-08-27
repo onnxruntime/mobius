@@ -943,27 +943,46 @@ def test_parameter_names_match_upstream_modules():
     assert "model.layers.1.mlp.shared_expert_gate.weight" in names
 
 
+def test_ple_uses_one_logical_gather_independent_of_shard_count():
+    _, _, two_shards = _build(_config(split_ngram_parts=2))
+    _, _, four_shards = _build(_config(split_ngram_parts=4))
+
+    def ple_ops(model):
+        return [
+            node.op_type
+            for node in model.graph
+            if node.name is not None and "/ple/ple_embedding/ngram_embedding/" in node.name
+        ]
+
+    assert ple_ops(two_shards) == ple_ops(four_shards) == ["Concat", "Gather"]
+
+
+def test_ple_shard_divisibility_error_reports_remainder():
+    with pytest.raises(
+        ValueError,
+        match=r"must be exactly divisible.*152 rows / 5 shards leaves remainder 2",
+    ):
+        _build(_config(split_ngram_parts=5))
+
+
 def test_moe_executes_only_packed_topk_experts():
     _config_value, _module, model = _build()
-    expert_nodes = [
-        node
-        for node in model.graph
-        if node.outputs[0].name is not None and ".mlp.experts." in node.outputs[0].name
-    ]
-    weight_gathers = [
-        node
-        for node in expert_nodes
-        if node.op_type == "Gather"
-        and node.inputs[0].name is not None
-        and node.inputs[0].name.endswith(
-            (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
-        )
-    ]
-    assert len(weight_gathers) == 8
-    assert all(node.inputs[1].const_value is not None for node in weight_gathers)
-    assert sum(node.op_type == "NonZero" for node in expert_nodes) == 4
-    assert sum(node.op_type == "MatMul" for node in expert_nodes) == 8
+    moe_nodes = [node for node in model.graph if node.op_type == "MoE"]
+    assert len(moe_nodes) == _config_value.num_hidden_layers
+    assert all(node.domain == "com.microsoft" for node in moe_nodes)
+    assert all(
+        node.attributes["k"].value == _config_value.num_experts_per_tok for node in moe_nodes
+    )
+    assert not any(node.op_type == "NonZero" for node in model.graph)
     assert not any(".mlp.experts.0." in name for name in model.graph.initializers)
+
+
+def test_moe_graph_size_does_not_scale_with_expert_count():
+    _, _, two_experts = _build(_config(num_local_experts=2))
+    _, _, four_experts = _build(_config(num_local_experts=4))
+
+    assert two_experts.graph.num_nodes() == four_experts.graph.num_nodes()
+    assert sum(node.op_type == "MoE" for node in four_experts.graph) == 2
 
 
 def test_preprocess_validates_packed_experts_and_joins_ple_shards():

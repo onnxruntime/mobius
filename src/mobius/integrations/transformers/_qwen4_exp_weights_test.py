@@ -82,16 +82,14 @@ def test_streaming_loader_maps_packed_experts_and_ple_without_eager_checkpoint(
         initializers["model.layers.0.mlp.experts.gate_up_proj"].const_value.dtype
         == ir.DataType.FLOAT
     )
-    embedding = module.model.layers[0].ple.ple_embedding.ngram_embedding
-    for shard_index in range(config.split_ngram_parts):
-        target = f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{shard_index}.weight"
-        assert (
-            initializers[target].const_value.shape
-            == getattr(
-                embedding,
-                f"shard_{shard_index}",
-            ).weight.shape
-        )
+    ple_initializers = [
+        initializer
+        for initializer in initializers.values()
+        if ".ple.ple_embedding.ngram_embedding" in initializer.name
+        and initializer.name.endswith("__concat")
+    ]
+    assert len(ple_initializers) == 1
+    assert isinstance(ple_initializers[0].const_value, ir.LazyTensor)
 
 
 def _official_package_state(package, config) -> dict[str, torch.Tensor]:
@@ -164,10 +162,10 @@ def test_multimodal_streaming_is_transactional_and_retains_no_source_tensors(
     ple_initializers = [
         initializer
         for initializer in package["decoder"].graph.initializers.values()
-        if ".ple.ple_embedding.ngram_embedding.shard_" in initializer.name
-        and initializer.name.endswith(".weight")
+        if ".ple.ple_embedding.ngram_embedding" in initializer.name
+        and initializer.name.endswith("__concat")
     ]
-    assert len(ple_initializers) == config.split_ngram_parts
+    assert len(ple_initializers) == 1
     assert all(
         isinstance(initializer.const_value, ir.LazyTensor) for initializer in ple_initializers
     )
