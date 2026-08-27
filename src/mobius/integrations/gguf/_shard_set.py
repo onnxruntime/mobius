@@ -40,6 +40,7 @@ __all__ = [
     "GgufShardSet",
     "ShardInfo",
     "GgufShardManifest",
+    "MAX_GGUF_SHARD_COUNT",
     "discover_gguf_shards",
     "parse_shard_filename",
     "open_gguf_model",
@@ -59,6 +60,8 @@ import numpy as np
 from mobius.integrations.gguf._reader import GGUFModel
 
 logger = logging.getLogger(__name__)
+
+MAX_GGUF_SHARD_COUNT = 1024
 
 #: ``<name>-<index>-of-<count>.gguf`` where index/count are five-digit,
 #: one-based. Matches the llama.cpp ``SHARD_NAME_FORMAT`` and the reader's
@@ -152,7 +155,7 @@ def discover_gguf_shards(path: str | Path) -> list[Path]:
 def _discover_in_directory(directory: Path) -> list[Path]:
     groups: dict[tuple[str, int], list[Path]] = {}
     single_files: list[Path] = []
-    for candidate in sorted(directory.glob("*.gguf")):
+    for candidate in _gguf_files(directory):
         parsed = parse_shard_filename(candidate.name)
         if parsed is None:
             single_files.append(candidate)
@@ -186,11 +189,11 @@ def _discover_in_directory(directory: Path) -> list[Path]:
 
 def _collect_shard_group(directory: Path, prefix: str, count: int) -> list[Path]:
     """Collect and order the ``count`` shards named ``<prefix>-i-of-count``."""
-    if count < 1:
+    if count < 1 or count > MAX_GGUF_SHARD_COUNT:
         raise GgufShardError(f"Invalid shard count {count} in split filename")
 
     by_index: dict[int, Path] = {}
-    for candidate in directory.glob(f"{glob_escape(prefix)}-*-of-{count:05d}.gguf"):
+    for candidate in _gguf_files(directory):
         parsed = parse_shard_filename(candidate.name)
         if parsed is None:
             continue
@@ -220,11 +223,13 @@ def _collect_shard_group(directory: Path, prefix: str, count: int) -> list[Path]
     return [by_index[i] for i in range(1, count + 1)]
 
 
-def glob_escape(value: str) -> str:
-    """Escape glob metacharacters in a literal filename prefix."""
-    # ``pathlib.Path.glob`` uses fnmatch semantics; escape the wildcard set so a
-    # prefix containing ``[`` / ``*`` / ``?`` is matched literally.
-    return re.sub(r"([\[\]\*\?])", r"[\1]", value)
+def _gguf_files(directory: Path) -> list[Path]:
+    """List GGUF files with suffix matching independent of filesystem casing."""
+    return sorted(
+        candidate
+        for candidate in directory.iterdir()
+        if candidate.is_file() and candidate.suffix.lower() == ".gguf"
+    )
 
 
 @dataclass(frozen=True)

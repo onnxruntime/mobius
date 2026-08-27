@@ -212,6 +212,30 @@ def test_order_independence(tmp_path):
         assert other.manifest.split_count == ref.manifest.split_count
 
 
+def test_uppercase_gguf_suffix_discovers_complete_set_on_case_sensitive_filesystems(
+    tmp_path,
+):
+    shards = _write_sharded_gguf(tmp_path, split_max_tensors=3)
+    uppercase = []
+    for shard in shards:
+        renamed = shard.with_suffix(".GGUF")
+        shard.rename(renamed)
+        uppercase.append(renamed)
+
+    model = open_gguf_model(uppercase[1])
+
+    assert isinstance(model, GgufShardSet)
+    assert model.num_tensors == len(_tensor_names(3))
+
+
+def test_local_shard_count_is_bounded_before_sibling_allocation(tmp_path):
+    path = tmp_path / "model-00001-of-01025.gguf"
+    path.write_bytes(b"")
+
+    with pytest.raises(GgufShardError, match=r"Invalid shard count 1025"):
+        discover_gguf_shards(path)
+
+
 def test_open_directory(tmp_path):
     _write_sharded_gguf(tmp_path, split_max_tensors=3)
     model = open_gguf_model(tmp_path)  # a directory holding one split set
@@ -940,6 +964,20 @@ def test_hub_renamed_discovery_caps_header_candidates_before_probing():
         )
 
     preflight.assert_not_called()
+
+
+def test_hub_split_count_is_bounded_before_candidate_allocation():
+    from mobius.integrations.gguf import _builder as builder
+
+    info = builder.GGUFHeaderInfo(
+        architecture="llama",
+        tensor_count=0,
+        split_no=0,
+        split_count=1025,
+        split_tensors_count=1,
+    )
+    with pytest.raises(ValueError, match=r"count=1025, maximum=1024"):
+        builder._validate_preflight_split_header(info, source="oversized.gguf")
 
 
 def test_hub_renamed_incomplete_set_rejected_before_download(tmp_path):

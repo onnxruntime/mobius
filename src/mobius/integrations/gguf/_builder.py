@@ -57,6 +57,7 @@ from mobius.integrations.gguf._header import (
     _gguf_architecture_from_header,
     _gguf_header_info_from_header,
 )
+from mobius.integrations.gguf._shard_set import MAX_GGUF_SHARD_COUNT
 from mobius.integrations.gguf._spec import Support, TensorRole
 
 _HUB_PREFLIGHT_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (OSError,)
@@ -485,10 +486,15 @@ def _validate_preflight_split_header(info: GGUFHeaderInfo, *, source: str) -> No
     assert info.split_no is not None
     assert info.split_count is not None
     assert info.split_tensors_count is not None
-    if info.split_count <= 0 or not 0 <= info.split_no < info.split_count:
+    if (
+        info.split_count <= 0
+        or info.split_count > MAX_GGUF_SHARD_COUNT
+        or not 0 <= info.split_no < info.split_count
+    ):
         raise ValueError(
             f"GGUF header {source!r} has invalid split bookkeeping "
-            f"(no={info.split_no}, count={info.split_count}). "
+            f"(no={info.split_no}, count={info.split_count}, maximum="
+            f"{MAX_GGUF_SHARD_COUNT}). "
             "No payload was downloaded."
         )
     if info.split_tensors_count < info.tensor_count:
@@ -4850,6 +4856,11 @@ def _select_complete_hf_gguf_set(
 
     prefix = selected_path.name[: selected_match.start()]
     count = int(selected_match.group("count"))
+    if count > MAX_GGUF_SHARD_COUNT:
+        raise ValueError(
+            f"GGUF split set {filename!r} declares {count} shards, exceeding "
+            f"the supported maximum {MAX_GGUF_SHARD_COUNT}. No payload was downloaded."
+        )
     by_index: dict[int, str] = {}
     for candidate in gguf_files:
         candidate_path = PurePosixPath(candidate)
@@ -4967,12 +4978,15 @@ def _select_hf_gguf_set_from_split_headers(
         if info.architecture is not None:
             declared_architectures[name] = info.architecture
 
-    expected_nos = set(range(selected_info.split_count))
-    if set(by_split_no) != expected_nos:
+    observed_nos = sorted(by_split_no)
+    complete_nos = len(observed_nos) == selected_info.split_count and all(
+        split_no == expected for expected, split_no in enumerate(observed_nos)
+    )
+    if not complete_nos:
         raise ValueError(
             "Incomplete GGUF split set discovered from bounded headers: "
-            f"expected split.no values {sorted(expected_nos)}, got "
-            f"{sorted(by_split_no)}. No payload was downloaded."
+            f"expected split.no values 0..{selected_info.split_count - 1}, got "
+            f"{observed_nos}. No payload was downloaded."
         )
     if primary_architecture is None:
         raise ValueError(
