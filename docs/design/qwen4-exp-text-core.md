@@ -151,8 +151,12 @@ external-data initializer. Standard ONNX QDQ reconstructs the logical weights:
 - its `[Br,Bc]` scale grid becomes `[Br*Bc]` and feeds
   `DequantizeLinear(axis=0)`;
 - inverse reshape/transpose plus a final slice restores `[R,C]`;
-- the PLE `[1]` scale is reshaped to a scalar for per-tensor
-  `DequantizeLinear`.
+- each PLE shard is scalar-dequantized independently before its Gather (standard
+  ONNX Gather does not accept FLOAT8); a dependency chain prevents the next
+  shard DQ from running before the previous token-sized Gather completes.
+  Masked outputs accumulate without a full-table Concat or a roughly 95 GiB
+  destination, so peak runtime storage is one code shard plus one dense shard
+  and any explicit output-dtype cast.
 
 The transform is invertible for source codes, and the external data keeps their
 exact bytes. `weight-loading-report.json` records

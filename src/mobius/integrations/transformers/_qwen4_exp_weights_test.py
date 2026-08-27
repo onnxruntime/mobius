@@ -85,11 +85,13 @@ def test_streaming_loader_maps_packed_experts_and_ple_without_eager_checkpoint(
     ple_initializers = [
         initializer
         for initializer in initializers.values()
-        if ".ple.ple_embedding.ngram_embedding" in initializer.name
-        and initializer.name.endswith("__concat")
+        if ".ple.ple_embedding.ngram_embedding.shard_" in initializer.name
+        and initializer.name.endswith(".weight")
     ]
-    assert len(ple_initializers) == 1
-    assert isinstance(ple_initializers[0].const_value, ir.LazyTensor)
+    assert len(ple_initializers) == config.split_ngram_parts
+    assert all(
+        isinstance(initializer.const_value, ir.LazyTensor) for initializer in ple_initializers
+    )
 
 
 def _official_package_state(package, config) -> dict[str, torch.Tensor]:
@@ -162,10 +164,10 @@ def test_multimodal_streaming_is_transactional_and_retains_no_source_tensors(
     ple_initializers = [
         initializer
         for initializer in package["decoder"].graph.initializers.values()
-        if ".ple.ple_embedding.ngram_embedding" in initializer.name
-        and initializer.name.endswith("__concat")
+        if ".ple.ple_embedding.ngram_embedding.shard_" in initializer.name
+        and initializer.name.endswith(".weight")
     ]
-    assert len(ple_initializers) == 1
+    assert len(ple_initializers) == config.split_ngram_parts
     assert all(
         isinstance(initializer.const_value, ir.LazyTensor) for initializer in ple_initializers
     )

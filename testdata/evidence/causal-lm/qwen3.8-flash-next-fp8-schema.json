@@ -129,7 +129,7 @@
     "storage_preserving": true,
     "native_fp8": false,
     "native_fp8_reason": "No available ONNX Runtime MatMul/MoE ABI consumes F8_E4M3 weights with BF16 128x128 inverse-scale grids exactly.",
-    "qdq_recipe": "tile-major [Br*Bc,16384] DequantizeLinear(axis=0), inverse layout, and slice; PLE uses scalar DequantizeLinear",
+    "qdq_recipe": "tile-major [Br*Bc,16384] DequantizeLinear(axis=0), inverse layout, and slice; PLE scalar-dequantizes one FP8 shard at a time under an explicit dependency chain, then gathers and mask-accumulates token rows",
     "runtime_execution_proven": false,
     "dense_fallback": "explicit --dequantize / keep_quantized=False only",
     "peak_host_working_set": "bounded by one output shard plus source initializer serialization overhead; defaults to 1 GiB shards, rejects limits above 5 GB, and forces external-data serialization to one worker",

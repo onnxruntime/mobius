@@ -10,6 +10,7 @@ import re
 from types import SimpleNamespace
 from unittest import mock
 
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx_ir as ir
@@ -929,6 +930,11 @@ def test_bfloat16_router_projects_before_float32_softmax():
     assert router_cast.op_type == "Cast"
     assert router_cast.outputs[0].dtype == ir.DataType.FLOAT
     assert router_cast.outputs[0].consumers()[0].op_type == "Softmax"
+    moe = next(node for node in model.graph if node.op_type == "MoE")
+    assert moe.inputs[0].dtype == ir.DataType.BFLOAT16
+    assert moe.inputs[1].dtype == ir.DataType.BFLOAT16
+    assert moe.inputs[2].dtype == ir.DataType.BFLOAT16
+    assert moe.inputs[4].dtype == ir.DataType.BFLOAT16
 
 
 def test_parameter_names_match_upstream_modules():
@@ -943,7 +949,7 @@ def test_parameter_names_match_upstream_modules():
     assert "model.layers.1.mlp.shared_expert_gate.weight" in names
 
 
-def test_ple_uses_one_logical_gather_independent_of_shard_count():
+def test_ple_uses_bounded_per_shard_gathers_without_table_concat():
     _, _, two_shards = _build(_config(split_ngram_parts=2))
     _, _, four_shards = _build(_config(split_ngram_parts=4))
 
@@ -954,7 +960,10 @@ def test_ple_uses_one_logical_gather_independent_of_shard_count():
             if node.name is not None and "/ple/ple_embedding/ngram_embedding/" in node.name
         ]
 
-    assert ple_ops(two_shards) == ple_ops(four_shards) == ["Concat", "Gather"]
+    assert ple_ops(two_shards).count("Gather") == 2
+    assert ple_ops(four_shards).count("Gather") == 4
+    assert "Concat" not in ple_ops(two_shards)
+    assert "Concat" not in ple_ops(four_shards)
 
 
 def test_ple_shard_divisibility_error_reports_remainder():
@@ -1567,6 +1576,24 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
     assert sum(node.op_type == "DequantizeLinear" for node in model.graph.all_nodes()) == len(
         fp8_names
     )
+    ple_code_names = {
+        name for name in fp8_names if ".ple.ple_embedding.ngram_embedding.shard_" in name
+    }
+    ple_dequantize = [
+        node
+        for node in model.graph.all_nodes()
+        if node.op_type == "DequantizeLinear" and node.inputs[0].name in ple_code_names
+    ]
+    assert len(ple_dequantize) == config.split_ngram_parts
+    for node in ple_dequantize:
+        consumer = node.outputs[0].consumers()[0]
+        if consumer.op_type == "Cast":
+            consumer = consumer.outputs[0].consumers()[0]
+        assert consumer.op_type == "Gather"
+    dependent_scales = [
+        node.inputs[1] for node in ple_dequantize if node.inputs[1].producer().op_type == "Add"
+    ]
+    assert len(dependent_scales) == config.split_ngram_parts - 1
     assert report["output_weight_format"] == "fp8_qdq"
     assert report["storage_preserving"] is True
     assert report["native_fp8"] is False
@@ -1575,8 +1602,14 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
         < report["dense_equivalent_bytes"]
     )
     assert report["qdq_recipe"]["code_mapping"] == "bijective"
+    assert report["qdq_recipe"]["ple_shards_execute_sequentially"] is True
     assert report["qdq_recipe"]["source_code_tensors"] == len(fp8_names)
     assert len(report["qdq_recipe"]["canonical_code_mapping_sha256"]) == 64
+    ple_source = source[
+        "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    ]
+    expected_ple_peak = ple_source.numel() * (1 + 2 + 4) + 2
+    assert report["largest_ple_runtime_working_set_bytes"] == expected_ple_peak
     assert model.metadata_props["mobius.fp8_qdq_recipe"]
 
     output = tmp_path / "qdq"
@@ -1602,6 +1635,48 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
     loaded_package = type(package).load(str(output))
     assert loaded_package.weight_loading_report["output_weight_format"] == "fp8_qdq"
     assert loaded_package.weight_loading_report["serializer_max_workers"] == 1
+
+
+def test_bfloat16_fp8_qdq_reaches_only_declared_ort_capability_gap(tmp_path):
+    config = _fp8_config(dtype=ir.DataType.BFLOAT16)
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+    stream_qdq_safetensors_to_model(
+        model,
+        str(tmp_path),
+        module.build_fp8_streaming_plan,
+    )
+
+    try:
+        session = OnnxModelSession(model)
+    except Exception as error:
+        message = str(error)
+        assert "Optype (MoE)" not in message
+        assert "MoE" not in message or "Type parameter" not in message
+        return
+
+    states = _initial_states()
+    for name, value in states.items():
+        if value.dtype == np.float32 and not name.endswith(".recurrent_state"):
+            states[name] = value.astype(ml_dtypes.bfloat16)
+    try:
+        outputs = session.run(
+            states
+            | {
+                "input_ids": np.array([[2]], dtype=np.int64),
+                "attention_mask": np.ones((1, 1), dtype=np.int64),
+                "position_ids": np.array([[0]], dtype=np.int64),
+            }
+        )
+        assert outputs["logits"].shape == (1, 1, config.vocab_size)
+    finally:
+        session.close()
 
 
 @pytest.mark.parametrize(

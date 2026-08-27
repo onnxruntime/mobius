@@ -522,30 +522,32 @@ class Qwen4ExpShardedEmbedding(nn.Module):
             setattr(
                 self,
                 f"shard_{shard_index}",
-                Qwen4ExpEmbeddingShard(self._rows_per_shard, embedding_dim),
+                Embedding(self._rows_per_shard, embedding_dim),
             )
 
     def forward(self, op: OpBuilder, input_ids: ir.Value) -> ir.Value:
-        table = op.Concat(
-            *[
-                getattr(self, f"shard_{shard_index}")(op)
-                for shard_index in range(self._num_shards)
-            ],
-            axis=0,
-        )
-        return op.Gather(table, input_ids)
-
-
-class Qwen4ExpEmbeddingShard(nn.Module):
-    """One storage shard contributing rows to the logical PLE embedding."""
-
-    def __init__(self, rows: int, embedding_dim: int):
-        super().__init__()
-        self.weight = nn.Parameter([rows, embedding_dim])
-
-    def forward(self, op: OpBuilder) -> ir.Value:
-        del op
-        return self.weight
+        result = None
+        for shard_index in range(self._num_shards):
+            start = shard_index * self._rows_per_shard
+            end = start + self._rows_per_shard
+            local_ids = op.Clip(
+                op.Sub(input_ids, start),
+                0,
+                self._rows_per_shard - 1,
+            )
+            gathered = getattr(self, f"shard_{shard_index}")(op, local_ids)
+            selected = op.And(
+                op.GreaterOrEqual(input_ids, start),
+                op.Less(input_ids, end),
+            )
+            shard_result = op.Where(
+                op.Unsqueeze(selected, [-1]),
+                gathered,
+                op.CastLike(0.0, gathered),
+            )
+            result = shard_result if result is None else op.Add(result, shard_result)
+        assert result is not None
+        return result
 
 
 class _PLEDepthwiseConv1d(nn.Module):
@@ -1020,6 +1022,7 @@ class Qwen4ExpExperts(nn.Module):
         assert config.num_local_experts is not None
         assert config.moe_intermediate_size is not None
         self._hidden_size = config.hidden_size
+        self._dtype = config.dtype
         self._num_experts = config.num_local_experts
         self._top_k = config.num_experts_per_tok
         self._normalize = int(config.norm_topk_prob)
@@ -1053,6 +1056,9 @@ class Qwen4ExpExperts(nn.Module):
             router_probabilities,
             [-1, self._num_experts],
         )
+        # Qwen computes softmax in float32, then the fused MoE consumes routing
+        # probabilities in the same T as hidden/expert weights.
+        router_probs = op.Cast(router_probs, to=self._dtype)
         # ORT's fused MoE consumes interleaved SwiGLU rows:
         # [gate_0, up_0, gate_1, up_1, ...].
         interleaved = op.Reshape(

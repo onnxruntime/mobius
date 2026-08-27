@@ -1020,6 +1020,7 @@ def _build_scalar_fp8_qdq(
     *,
     target_dtype: ir.DataType,
     prefix: str,
+    dependency: ir.Value | None = None,
 ) -> ir.Value:
     assert source.scale_name is not None
     codes = _qdq_source_initializer(graph, source.source_name, key_index)
@@ -1034,6 +1035,70 @@ def _build_scalar_fp8_qdq(
         dtype=ir.DataType.BFLOAT16,
         shape=[],
     )
+    if dependency is not None:
+        # Force PLE shards to execute sequentially. Equal reads the previous
+        # token-sized Gather result; its finite count multiplied by zero adds an
+        # exact dependency without changing the next shard's scale.
+        self_equal = _append_standard_node(
+            graph,
+            "Equal",
+            [dependency, dependency],
+            name=f"{prefix}.dependency_equal",
+            dtype=ir.DataType.BOOL,
+            shape=list(dependency.shape),
+        )
+        counted = _append_standard_node(
+            graph,
+            "Cast",
+            [self_equal],
+            name=f"{prefix}.dependency_cast",
+            dtype=ir.DataType.INT64,
+            shape=list(dependency.shape),
+            attributes={"to": int(ir.DataType.INT64.value)},
+        )
+        count = _append_standard_node(
+            graph,
+            "ReduceSum",
+            [counted],
+            name=f"{prefix}.dependency_sum",
+            dtype=ir.DataType.INT64,
+            shape=[],
+            attributes={"keepdims": 0},
+        )
+        count_bf16 = _append_standard_node(
+            graph,
+            "Cast",
+            [count],
+            name=f"{prefix}.dependency_sum_bf16",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+            attributes={"to": int(ir.DataType.BFLOAT16.value)},
+        )
+        zero_bf16 = _append_standard_node(
+            graph,
+            "Cast",
+            [_graph_constant(graph, f"{prefix}.dependency_zero", [0], shape=())],
+            name=f"{prefix}.dependency_zero_bf16",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+            attributes={"to": int(ir.DataType.BFLOAT16.value)},
+        )
+        dependency_zero = _append_standard_node(
+            graph,
+            "Mul",
+            [count_bf16, zero_bf16],
+            name=f"{prefix}.dependency_mul",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+        )
+        scalar = _append_standard_node(
+            graph,
+            "Add",
+            [scalar, dependency_zero],
+            name=f"{prefix}.dependent_scale",
+            dtype=ir.DataType.BFLOAT16,
+            shape=[],
+        )
     dequantized = _append_standard_node(
         graph,
         "DequantizeLinear",
@@ -1231,6 +1296,37 @@ def _build_fp8_qdq_source(
     raise ValueError(f"QDQ requires an FP8 source, got mode {source.mode!r}")
 
 
+def _replace_ple_gather_with_qdq(
+    graph: ir.Graph,
+    target: ir.Value,
+    source: StreamingWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    *,
+    prefix: str,
+    dependency: ir.Value | None,
+) -> ir.Value:
+    """Dequantize one PLE shard and serialize execution before the next shard."""
+    uses = list(target.uses())
+    if len(uses) != 1 or uses[0][0].op_type != "Gather":
+        raise ValueError(
+            f"PLE QDQ target '{target.name}' must have exactly one Gather consumer"
+        )
+    gather = uses[0][0]
+    gathered = gather.outputs[0]
+    if gathered.shape is None or target.dtype is None:
+        raise ValueError(f"PLE QDQ target '{target.name}' has incomplete type information")
+    replacement = _build_scalar_fp8_qdq(
+        graph,
+        source,
+        key_index,
+        target_dtype=target.dtype,
+        prefix=prefix,
+        dependency=dependency,
+    )
+    target.replace_all_uses_with(replacement)
+    return gathered
+
+
 def stream_qdq_safetensors_to_model(
     model: ir.Model,
     model_id: str,
@@ -1253,6 +1349,7 @@ def stream_qdq_safetensors_to_model(
     scale_to_targets: dict[str, list[str]] = {}
     validated_scalar_scales: dict[str, float] = {}
     largest_source_cast_overlap_bytes = 0
+    largest_ple_runtime_working_set_bytes = 0
 
     def record_qdq_source(source: StreamingWeightSource, target_label: str) -> None:
         prior = code_to_target.get(source.source_name)
@@ -1311,6 +1408,7 @@ def stream_qdq_safetensors_to_model(
     # Validate the complete plan before registering any source initializer or
     # appending any QDQ node. A malformed late target must not leave a partially
     # mutated graph.
+    ple_dependencies: dict[str, ir.Value] = {}
     for target_name, source in plan.targets.items():
         target = graph.initializers.get(target_name)
         if target is None:
@@ -1338,6 +1436,26 @@ def stream_qdq_safetensors_to_model(
                 record_qdq_source(source, target_name)
                 assert source.scale_name is not None
                 consumed.add(source.scale_name)
+                if (
+                    source.mode == "fp8_scalar"
+                    and ".ple.ple_embedding.ngram_embedding.shard_" in target_name
+                ):
+                    _path, code_shape, code_dtype = key_index[source.source_name]
+                    _scale_path, scale_shape, scale_dtype = key_index[source.scale_name]
+                    code_bytes = math.prod(code_shape) * _SAFETENSORS_DTYPE_BYTES[code_dtype]
+                    bf16_bytes = math.prod(code_shape) * 2
+                    cast_bytes = (
+                        (math.prod(code_shape) * target.dtype.bitwidth + 7) // 8
+                        if target.dtype != ir.DataType.BFLOAT16
+                        else 0
+                    )
+                    scale_bytes = (
+                        math.prod(scale_shape) * _SAFETENSORS_DTYPE_BYTES[scale_dtype]
+                    )
+                    largest_ple_runtime_working_set_bytes = max(
+                        largest_ple_runtime_working_set_bytes,
+                        code_bytes + bf16_bytes + cast_bytes + scale_bytes,
+                    )
             consumed.add(source.source_name)
             continue
 
@@ -1445,6 +1563,23 @@ def stream_qdq_safetensors_to_model(
                 consumed.add(source.source_name)
                 assigned.add(target_name)
                 continue
+            if (
+                source.mode == "fp8_scalar"
+                and ".ple.ple_embedding.ngram_embedding.shard_" in target_name
+            ):
+                assert source.scale_name is not None
+                ple_dependencies[source.scale_name] = _replace_ple_gather_with_qdq(
+                    graph,
+                    target,
+                    source,
+                    key_index,
+                    prefix=prefix,
+                    dependency=ple_dependencies.get(source.scale_name),
+                )
+                del graph.initializers[target_name]
+                assigned.add(target_name)
+                qdq_targets += 1
+                continue
             replacement = _build_fp8_qdq_source(
                 graph,
                 source,
@@ -1542,9 +1677,14 @@ def stream_qdq_safetensors_to_model(
             "[R,C] -> pad -> [Br,128,Bc,128] -> transpose(0,2,1,3) "
             "-> [Br*Bc,16384] -> DequantizeLinear(axis=0) -> inverse -> slice"
         ),
-        "ple_transform": "DequantizeLinear(float8_codes, reshape(bf16_scale,[ ]))",
+        "ple_transform": (
+            "per-shard Gather(float8_codes, local_ids) -> "
+            "DequantizeLinear(gathered_rows, reshape(bf16_scale,[ ])); "
+            "masked shard outputs accumulate without a full-table destination"
+        ),
         "source_codes_preserved": True,
         "source_scales_preserved": True,
+        "ple_shards_execute_sequentially": True,
         "native_fp8_compute": False,
         "runtime_execution_proven": False,
         "qdq_targets": qdq_targets,
@@ -1568,6 +1708,7 @@ def stream_qdq_safetensors_to_model(
         "native_fp8": False,
         "streaming_external_data": True,
         "largest_source_cast_overlap_bytes": largest_source_cast_overlap_bytes,
+        "largest_ple_runtime_working_set_bytes": (largest_ple_runtime_working_set_bytes),
         "stored_fp8_code_bytes": stored_code_bytes,
         "stored_scale_bytes": stored_scale_bytes,
         "dense_equivalent_bytes": dense_equivalent_bytes,
