@@ -130,7 +130,7 @@ def test_malformed_record_fails_closed(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="entries must be objects"):
+    with pytest.raises(TypeError, match="entries must be objects"):
         GGUFQuantizationReport.read_json(path)
 
 

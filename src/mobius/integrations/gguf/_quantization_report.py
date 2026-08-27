@@ -118,7 +118,9 @@ class GGUFQuantizationReport:
         census_bytes: Counter[str] = Counter()
         for qtype, source_bytes in source_qtypes:
             if source_bytes < 0:
-                raise ValueError(f"GGUF tensor source bytes must be non-negative, got {source_bytes}")
+                raise ValueError(
+                    f"GGUF tensor source bytes must be non-negative, got {source_bytes}"
+                )
             census_counts[qtype] += 1
             census_bytes[qtype] += source_bytes
         census = tuple(
@@ -127,7 +129,9 @@ class GGUFQuantizationReport:
         )
 
         records = tuple(sorted(tensor_records, key=lambda record: record.name))
-        grouped: dict[QuantizationDisposition, list[QuantizationTensorRecord]] = defaultdict(list)
+        grouped: dict[QuantizationDisposition, list[QuantizationTensorRecord]] = defaultdict(
+            list
+        )
         for record in records:
             grouped[record.disposition].append(record)
         dispositions = tuple(
@@ -160,7 +164,9 @@ class GGUFQuantizationReport:
             source_qtype_census=census,
             target_storage_format=target_storage_format,
             dispositions=dispositions,
-            source_fidelity=not any(record.disposition in fidelity_breaks for record in records),
+            source_fidelity=not any(
+                record.disposition in fidelity_breaks for record in records
+            ),
             storage_quantized=any(
                 record.disposition in quantized_dispositions for record in records
             ),
@@ -262,7 +268,9 @@ class GGUFQuantizationReport:
         return {
             "schema_version": self.schema_version,
             "converted_from": self.converted_from,
-            "source_qtype_census": [dataclasses.asdict(stat) for stat in self.source_qtype_census],
+            "source_qtype_census": [
+                dataclasses.asdict(stat) for stat in self.source_qtype_census
+            ],
             "target_storage_format": self.target_storage_format,
             "dispositions": [
                 {
@@ -301,22 +309,26 @@ class GGUFQuantizationReport:
         """Validate and restore a report from its JSON representation."""
         schema_version = payload.get("schema_version")
         if schema_version != 1:
-            raise ValueError(f"Unsupported GGUF quantization report schema: {schema_version!r}")
+            raise ValueError(
+                f"Unsupported GGUF quantization report schema: {schema_version!r}"
+            )
 
         def required_string(key: str) -> str:
             value = payload.get(key)
             if not isinstance(value, str):
-                raise ValueError(f"GGUF quantization report {key!r} must be a string")
+                raise TypeError(f"GGUF quantization report {key!r} must be a string")
             return value
 
         def required_bool(key: str) -> bool:
             value = payload.get(key)
             if not isinstance(value, bool):
-                raise ValueError(f"GGUF quantization report {key!r} must be a boolean")
+                raise TypeError(f"GGUF quantization report {key!r} must be a boolean")
             return value
 
         def nonnegative_int(value: object, *, field: str) -> int:
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"GGUF quantization report {field!r} must be an integer")
+            if value < 0:
                 raise ValueError(
                     f"GGUF quantization report {field!r} must be a non-negative integer"
                 )
@@ -325,17 +337,15 @@ class GGUFQuantizationReport:
         def mapping_string(record: Mapping[str, object], key: str, *, field: str) -> str:
             value = record.get(key)
             if not isinstance(value, str):
-                raise ValueError(f"GGUF quantization report {field!r} must be a string")
+                raise TypeError(f"GGUF quantization report {field!r} must be a string")
             return value
 
         def records(key: str) -> tuple[QuantizationTensorRecord, ...]:
             raw_records = payload.get(key)
             if not isinstance(raw_records, list):
-                raise ValueError(f"GGUF quantization report {key!r} must be a list")
+                raise TypeError(f"GGUF quantization report {key!r} must be a list")
             if not all(isinstance(record, Mapping) for record in raw_records):
-                raise ValueError(
-                    f"GGUF quantization report {key!r} entries must be objects"
-                )
+                raise TypeError(f"GGUF quantization report {key!r} entries must be objects")
             return tuple(
                 QuantizationTensorRecord(
                     name=mapping_string(record, "name", field=f"{key}.name"),
@@ -363,11 +373,11 @@ class GGUFQuantizationReport:
         raw_census = payload.get("source_qtype_census")
         raw_dispositions = payload.get("dispositions")
         if not isinstance(raw_census, list) or not isinstance(raw_dispositions, list):
-            raise ValueError("GGUF quantization report census/dispositions must be lists")
+            raise TypeError("GGUF quantization report census/dispositions must be lists")
         if not all(isinstance(stat, Mapping) for stat in raw_census):
-            raise ValueError("GGUF quantization report census entries must be objects")
+            raise TypeError("GGUF quantization report census entries must be objects")
         if not all(isinstance(stat, Mapping) for stat in raw_dispositions):
-            raise ValueError("GGUF quantization report disposition entries must be objects")
+            raise TypeError("GGUF quantization report disposition entries must be objects")
         census = tuple(
             QuantizationTypeStat(
                 qtype=mapping_string(
@@ -392,9 +402,8 @@ class GGUFQuantizationReport:
             if not isinstance(raw_qtypes, list) or not all(
                 isinstance(item, str) for item in raw_qtypes
             ):
-                raise ValueError(
-                    "GGUF quantization report 'dispositions.qtypes' must be a list "
-                    "of strings"
+                raise TypeError(
+                    "GGUF quantization report 'dispositions.qtypes' must be a list of strings"
                 )
             dispositions.append(
                 QuantizationDispositionStat(
@@ -418,7 +427,7 @@ class GGUFQuantizationReport:
             )
         converted_from = payload.get("converted_from")
         if converted_from is not None and not isinstance(converted_from, str):
-            raise ValueError(
+            raise TypeError(
                 "GGUF quantization report 'converted_from' must be a string or null"
             )
         report = cls(
@@ -457,5 +466,5 @@ class GGUFQuantizationReport:
         """Load and validate a persisted report artifact."""
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(payload, Mapping):
-            raise ValueError("GGUF quantization report root must be an object")
+            raise TypeError("GGUF quantization report root must be an object")
         return cls.from_dict(payload)
