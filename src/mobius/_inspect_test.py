@@ -51,7 +51,7 @@ def test_single_component_llm_returns_one_component(monkeypatch):
     assert components == [ComponentInfo(name="model", role="decoder")]
 
 
-def test_qwen4_composite_inspection_fails_closed(monkeypatch):
+def test_qwen4_composite_inspection_reports_all_component_sources(monkeypatch):
     _patch_autoconfig(
         monkeypatch,
         SimpleNamespace(
@@ -59,8 +59,20 @@ def test_qwen4_composite_inspection_fails_closed(monkeypatch):
             architectures=["Qwen4ExpForConditionalGeneration"],
         ),
     )
-    with pytest.raises(ValueError, match="multimodal component inspection is unavailable"):
-        inspect_components("fake/qwen4")
+    components = {component.name: component for component in inspect_components("fake/qwen4")}
+    assert {name: component.role for name, component in components.items()} == {
+        "decoder": "decoder",
+        "vision_encoder": "encoder",
+        "embedding": "embedding",
+    }
+    assert components["decoder"].source_paths == (
+        "model.language_model.layers",
+        "model.language_model.rotary_emb",
+        "model.language_model.hyper_connection_mixer",
+        "lm_head",
+    )
+    assert components["vision_encoder"].source_paths == ("model.visual",)
+    assert components["embedding"].source_paths == ("model.language_model.embed_tokens",)
 
 
 def test_vlm_returns_decoder_vision_embedding(monkeypatch):

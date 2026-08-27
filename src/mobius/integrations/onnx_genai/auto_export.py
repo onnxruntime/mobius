@@ -849,6 +849,24 @@ def write_onnx_genai_config(
     from ``kwargs`` or discovered from the package; ``num_inference_steps`` /
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
+    package_config = getattr(pkg, "config", None)
+    config_types = {
+        getattr(candidate, "model_type", None)
+        for candidate in (package_config, config)
+        if candidate is not None
+    }
+    decoder = pkg.get("decoder") or pkg.get("model")
+    decoder_inputs = (
+        {value.name for value in decoder.graph.inputs} if decoder is not None else set()
+    )
+    qwen4_signature = {"ple_input_ids", "past_position_ids"} <= decoder_inputs
+    if config_types & {"qwen4_exp", "qwen4_exp_text"} or qwen4_signature:
+        raise ValueError(
+            "onnx-genai cannot represent Qwen4-Exp's required ple_input_ids "
+            "and four-axis position state. Use ModelPackage.save() and the "
+            "decoder's mobius.state_manifest metadata; refusing to write an "
+            "incomplete workflow."
+        )
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
         resolved_config = config if config is not None else getattr(pkg, "config", None)

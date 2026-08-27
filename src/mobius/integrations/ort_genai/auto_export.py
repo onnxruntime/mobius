@@ -175,8 +175,10 @@ _DECODER_SEMANTIC_INPUTS = frozenset(
 )
 _CACHE_NAME = re.compile(
     r"^(?P<prefix>.+\.)(?P<index>[0-9]+)\.(?P<kind>"
-    r"key|value|conv_state|recurrent_state|ssm_state)$"
+    r"key|value|conv_state|recurrent_state|ssm_state|"
+    r"index_key|ple_conv_state|ple_context)$"
 )
+_QWEN4_EXP_MODEL_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
 
 
 @dataclass(frozen=True)
@@ -234,6 +236,8 @@ _QWEN_VL_MODEL_TYPES = frozenset(
         "qwen3_5_moe_vl",
         "qwen3_5_moe_text",
         "videochat_flash_qwen",
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
 _QWEN35_VL_MODEL_TYPES = frozenset(
@@ -523,16 +527,14 @@ def _load_generation_config(model_id: str):
 def _graph_input_names(model: ir.Model) -> list[str]:
     """Return non-KV-cache input names from an ONNX model graph.
 
-    Filters out KV cache inputs (``past_key_values.*`` and ``past_*``)
-    since those are represented as template patterns in genai_config.json,
-    not as literal graph input names.
+    Filters out indexed cache inputs (``past_key_values.*``), since those
+    are represented as template patterns in genai_config.json. Semantic state
+    such as ``past_position_ids`` remains explicit and graph-derived.
     """
     return [
         inp.name
         for inp in model.graph.inputs
-        if inp.name is not None
-        and not inp.name.startswith("past_key_values.")
-        and not inp.name.startswith("past_")
+        if inp.name is not None and not inp.name.startswith("past_key_values.")
     ]
 
 
@@ -1195,14 +1197,16 @@ def _write_vision_processor_config(
             or 2
         )
 
-        # CLIP-standard normalization defaults
-        image_mean = [0.48145466, 0.4578275, 0.40821073]
-        image_std = [0.26862954, 0.26130258, 0.27577711]
+        is_qwen4_exp = model_type in _QWEN4_EXP_MODEL_TYPES
+        # Qwen4-Exp is pinned to the checkpoint's Qwen processor constants.
+        # Other generic VLMs retain the CLIP-standard fallback.
+        image_mean = [0.5, 0.5, 0.5] if is_qwen4_exp else [0.48145466, 0.4578275, 0.40821073]
+        image_std = [0.5, 0.5, 0.5] if is_qwen4_exp else [0.26862954, 0.26130258, 0.27577711]
         rescale_factor = 1.0 / 255.0
-        min_pixels = 784
-        max_pixels = 2371600
+        min_pixels = 65_536 if is_qwen4_exp else 784
+        max_pixels = 16_777_216 if is_qwen4_exp else 2_371_600
         image_size = getattr(vision, "image_size", None)
-        resample = None
+        resample = 3 if is_qwen4_exp else None
 
         if hf_model_id is not None:
             try:
@@ -1237,10 +1241,21 @@ def _write_vision_processor_config(
                             min_pixels = size.get("shortest_edge") or min_pixels
                             max_pixels = size.get("longest_edge") or max_pixels
             except Exception:
+                if is_qwen4_exp:
+                    image_mean = [0.5, 0.5, 0.5]
+                    image_std = [0.5, 0.5, 0.5]
+                    rescale_factor = 1.0 / 255.0
+                    resample = 3
+                    min_pixels = 65_536
+                    max_pixels = 16_777_216
                 logger.warning(
-                    "Could not load HF processor for %s; "
-                    "using CLIP-standard normalization defaults",
+                    "Could not load HF processor for %s; using %s",
                     hf_model_id,
+                    (
+                        "pinned Qwen4-Exp processor constants"
+                        if is_qwen4_exp
+                        else "CLIP-standard normalization defaults"
+                    ),
                     exc_info=True,
                 )
 
@@ -1513,6 +1528,11 @@ def _write_genai_config(
 
     Returns the path to the written file.
     """
+    if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
+        raise ValueError(
+            "onnxruntime-genai cannot represent Qwen4-Exp's heterogeneous "
+            "state contract; use ModelPackage.save() and mobius.state_manifest"
+        )
     from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
 
     # --- Discover decoder inputs from the ONNX graph ---
@@ -1596,7 +1616,8 @@ def _write_genai_config(
                 "that lowers *all* full-attention layers to "
                 "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
             )
-        supports_in_place_kv_cache = has_gqa or has_recurrent_state
+        else:
+            supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
     sliding_window = None
     window_size = getattr(config, "sliding_window", None)
@@ -1714,6 +1735,7 @@ def _write_genai_config(
                 if (
                     model_type in {"mage_vl", "qwen3_vl", "qwen3_vl_text"}
                     or model_type in _QWEN35_VL_MODEL_TYPES
+                    or model_type in _QWEN4_EXP_MODEL_TYPES
                 ):
                     patch_size = getattr(vision_cfg, "patch_size", None)
                     window_size = getattr(vision_cfg, "window_size", None)
@@ -1834,11 +1856,13 @@ def _write_genai_config(
 def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
     """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
     config = getattr(pkg, "config", None)
-    if getattr(config, "model_type", None) == "qwen4_exp_text":
+    if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
         raise ValueError(
-            "ORT GenAI released config cannot represent Qwen4-Exp's "
-            "past_position_ids, QSA index-key cache, and PLE context states. "
-            "Export without --runtime ort-genai and run the ONNX model directly."
+            "onnxruntime-genai 0.15.2 cannot represent Qwen4-Exp's explicit "
+            "four-axis position state or heterogeneous per-layer PLE/QSA state "
+            "membership. Use ModelPackage.save() and the decoder ONNX model's "
+            "'mobius.state_manifest' metadata; refusing to emit an unsupported "
+            "genai_config.json."
         )
     if getattr(config, "model_type", None) == "parakeet_ctc":
         raise ValueError(

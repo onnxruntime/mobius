@@ -127,6 +127,7 @@ from mobius.models import (
     Qwen3VLCausalLMModel,
     Qwen3VLTextModel,
     Qwen4ExpCausalLMModel,
+    Qwen4ExpForConditionalGeneration,
     Qwen25VLCausalLMModel,
     Qwen25VLTextModel,
     Qwen35CausalLMModel,
@@ -667,11 +668,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "qwen3_moe": ModelRegistration(MoECausalLMModel),
     "qwen3_next": ModelRegistration(Qwen3NextCausalLMModel),
     "qwen4_exp": ModelRegistration(
-        Qwen4ExpCausalLMModel,
-        task="qwen4-exp-text-generation",
+        Qwen4ExpForConditionalGeneration,
+        task="qwen4-exp-vision-language",
         config_class=Qwen4ExpConfig,
+        test_model_id="Qwen/Qwen3.8-Flash-Next",
         family="qwen",
-        variant="moe+gdn+qsa+ple",
+        variant="multimodal+moe+gdn+qsa+ple",
         test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "qwen4_exp_text": ModelRegistration(
@@ -683,11 +685,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "Qwen4ExpForConditionalGeneration": ModelRegistration(
-        Qwen4ExpCausalLMModel,
-        task="qwen4-exp-text-generation",
+        Qwen4ExpForConditionalGeneration,
+        task="qwen4-exp-vision-language",
         config_class=Qwen4ExpConfig,
+        test_model_id="Qwen/Qwen3.8-Flash-Next",
         family="qwen",
-        variant="text-core",
+        variant="multimodal",
         test_revision="f5d08274bafd880402bd16f5e3e6c514136ec06c",
     ),
     "qwen3_omni_moe": ModelRegistration(MoECausalLMModel),
@@ -1047,8 +1050,7 @@ _TEXT_ONLY_MODEL_TYPE: dict[str, str] = {
     "qwen3_5_moe_vl": "qwen3_5_moe_text",
     "qwen3_5_moe_text": "qwen3_5_moe_text",
     # Qwen3.8 Flash-Next is published as a multimodal qwen4_exp composite.
-    # This PR supports its exact text core only; callers must opt into the
-    # existing text-only extraction path until the wrapper is implemented.
+    # text_only=True selects the same exact decoder without the vision stages.
     "qwen4_exp": "qwen4_exp_text",
     "qwen4_exp_text": "qwen4_exp_text",
 }
@@ -1454,6 +1456,8 @@ _FAMILY_OVERRIDES: dict[str, str] = {
     "qwen3_5": "qwen",
     "qwen3_5_moe_vl": "qwen",
     "qwen3_5_vl": "qwen",
+    "qwen4_exp": "qwen",
+    "qwen4_exp_text": "qwen",
     "qwen3_omni_moe": "qwen",
     "qwen3_asr": "qwen",
     "qwen3_forced_aligner": "qwen",

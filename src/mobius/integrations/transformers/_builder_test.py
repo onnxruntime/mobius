@@ -58,31 +58,152 @@ def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     download.assert_called_once_with("fake/model", revision=None)
 
 
-def test_qwen4_composite_architecture_requires_text_only(monkeypatch) -> None:
-    hf_config = type(
-        "HFConfig",
+def test_text_only_resolution_ignores_multimodal_parent_architecture() -> None:
+    from mobius.models import Qwen4ExpCausalLMModel
+
+    parent = type(
+        "Qwen4ExpParent",
+        (),
+        {"architectures": ["Qwen4ExpForConditionalGeneration"]},
+    )()
+    module_class, task, model_type = transformers_builder._resolve_module_class(
+        "qwen4_exp_text",
+        parent,
+        None,
+        None,
+        allow_parent_architecture_override=False,
+    )
+    assert module_class is Qwen4ExpCausalLMModel
+    assert task is None
+    assert model_type == "qwen4_exp_text"
+
+
+def test_qwen4_text_only_build_excludes_composite_config(monkeypatch) -> None:
+    text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
+    parent_config = type(
+        "Qwen4ExpParent",
         (),
         {
-            "model_type": "renamed_qwen4",
+            "model_type": "qwen4_exp",
             "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": text_config,
+            "vision_config": object(),
         },
     )()
+    config = make_config(model_type="qwen4_exp", vision=object())
+    model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
+
     monkeypatch.setattr(
         transformers_builder,
         "_load_transformers_config",
-        lambda *args, **kwargs: (hf_config, False),
+        lambda *args, **kwargs: (parent_config, False),
     )
     monkeypatch.setattr(
         transformers_builder,
         "_select_primary_config",
-        lambda value: (value, value, "qwen4_exp_text"),
+        lambda value: (text_config, parent_config, "qwen4_exp"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "text-generation", "qwen4_exp_text"),
     )
 
-    with pytest.raises(ValueError, match="Pass text_only=True"):
-        transformers_builder.build_transformers_model(
-            "fake/qwen4",
-            load_weights=False,
+    def config_from_hf(_config, *, parent_config, module_class):
+        assert parent_config is None
+        assert module_class is _DummyModule
+        return config
+
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", config_from_hf)
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda _module, built_config, *args, **kwargs: ModelPackage(
+            {"model": model},
+            config=built_config,
+        ),
+    )
+
+    package = transformers_builder.build_transformers_model(
+        "Qwen/Qwen3.8-Flash-Next",
+        text_only=True,
+        load_weights=False,
+    )
+    assert package.config.model_type == "qwen4_exp_text"
+    assert package.config.vision is None
+
+
+def test_qwen4_multimodal_build_streams_entire_package_without_eager_loader(
+    monkeypatch,
+) -> None:
+    text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
+    parent_config = type(
+        "Qwen4ExpParent",
+        (),
+        {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": text_config,
+            "vision_config": object(),
+            "quantization_config": None,
+        },
+    )()
+    config = make_config(model_type="qwen4_exp")
+    package = ModelPackage(
+        {
+            name: ir.Model(ir.Graph([], [], nodes=[], name=name), ir_version=11)
+            for name in ("decoder", "vision_encoder", "embedding")
+        },
+        config=config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (text_config, parent_config, "qwen4_exp"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            _DummyModule,
+            "qwen4-exp-vision-language",
+            "qwen4_exp",
+        ),
+    )
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda *args, **kwargs: package,
+    )
+    eager = mock.Mock(side_effect=AssertionError("must not eagerly download"))
+    monkeypatch.setattr(transformers_builder, "_download_weights", eager)
+
+    with mock.patch(
+        "mobius.integrations.transformers._qwen4_exp_weights."
+        "stream_qwen4_exp_safetensors_to_package"
+    ) as stream:
+        result = transformers_builder.build_transformers_model(
+            "Qwen/Qwen3.8-Flash-Next",
+            revision="immutable",
         )
+
+    assert result is package
+    eager.assert_not_called()
+    stream.assert_called_once_with(
+        package,
+        "Qwen/Qwen3.8-Flash-Next",
+        config,
+        revision="immutable",
+    )
+    assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
+        "immutable"
+    }
 
 
 def test_transformers_build_routes_compressed_tensors_to_streaming_loader(

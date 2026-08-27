@@ -734,18 +734,26 @@ def _processor_values(
 _STATE_INPUT = re.compile(
     r"^past_key_values\.(?P<layer>\d+)\."
     r"(?:(?P<scope>self|cross)\.)?"
-    r"(?P<role>key|value|conv_state|recurrent_state|ssm_state)$"
+    r"(?P<role>key|value|conv_state|recurrent_state|ssm_state|"
+    r"index_key|ple_conv_state|ple_context)$"
 )
 _STATIC_CACHE_PORT = re.compile(
     r"^(?P<updated>updated_)?(?P<role>key|value)_cache\.(?P<layer>\d+)$"
 )
 _REPLACE_ROLES = {
     "lightning_attention": {"recurrent_state"},
-    "linear_attention": {"conv_state", "recurrent_state"},
+    "linear_attention": {
+        "conv_state",
+        "recurrent_state",
+        "ple_conv_state",
+        "ple_context",
+    },
+    "qwen_sparse_attention": {"index_key"},
     "conv": {"conv_state"},
     "mamba": {"conv_state", "ssm_state"},
     "mamba2": {"conv_state", "ssm_state"},
 }
+_NO_KV_LAYER_TYPES = set(_REPLACE_ROLES) - {"qwen_sparse_attention"}
 _STATELESS_LAYER_TYPES = {"mlp", "moe"}
 
 
@@ -802,7 +810,7 @@ def _state_and_kv_pairs(
             layer_type = str(layer_types[layer])
 
         if role in {"key", "value"}:
-            if layer_type in _REPLACE_ROLES or layer_type in _STATELESS_LAYER_TYPES:
+            if layer_type in _NO_KV_LAYER_TYPES or layer_type in _STATELESS_LAYER_TYPES:
                 raise ValueError(
                     f"Decoder port {input_port.name!r} declares KV role {role!r}, but "
                     f"config.layer_types[{layer}]={layer_type!r} does not declare KV "
@@ -922,12 +930,24 @@ _POSITION_PROGRAM_REGISTRY = (
         ),
         sections_attribute="mrope_section",
     ),
+    _PositionProgram(
+        rank=4,
+        axes=("text", "temporal", "height", "width"),
+        generation="processor_coordinates",
+        continuation="carry_state",
+        matches=lambda config: (
+            getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}
+            and bool(getattr(config, "mrope_interleaved", False))
+            and bool(getattr(config, "mrope_section", None))
+        ),
+        sections_attribute="mrope_section",
+    ),
 )
 
 
 def _positions_from_registry(position: _Port, config: Any) -> dict[str, Any]:
     if position.rank == 3:
-        semantic_rank = 3
+        semantic_rank = 4 if position.dims[0] == 4 else 3
     elif position.rank == 2:
         semantic_rank = 1
     else:
@@ -956,7 +976,7 @@ def _positions_from_registry(position: _Port, config: Any) -> dict[str, Any]:
     raise ValueError(
         f"Cannot emit position metadata for decoder port {position.name!r} with "
         f"shape {position.dims}: no position registry entry matches the explicit "
-        "config. Rank-3 axes and continuation are never guessed. Regenerate with "
+        "config. Rank-3 axes and multi-axis continuation are never guessed. Regenerate with "
         "mrope_interleaved/mrope_section declarations or register this position contract."
     )
 
@@ -1085,6 +1105,26 @@ def _decoder_io(
         io["cross_kv_outputs"] = cross_kv_outputs
     if state_pairs:
         io["state_pairs"] = state_pairs
+    past_position_ids = input_by_name.get("past_position_ids")
+    present_position_ids = output_by_name.get("present_position_ids")
+    if (past_position_ids is None) != (present_position_ids is None):
+        raise ValueError(
+            "Decoder position history must expose paired past_position_ids and "
+            "present_position_ids ports"
+        )
+    if past_position_ids is not None and present_position_ids is not None:
+        if past_position_ids.dtype != present_position_ids.dtype:
+            raise ValueError(
+                "Decoder position history must preserve dtype across decode steps"
+            )
+        io.setdefault("state_pairs", []).append(
+            {
+                "input": past_position_ids.name,
+                "output": present_position_ids.name,
+                "init": "zeros",
+                "update": "replace",
+            }
+        )
     consumed_outputs = set(kv_outputs) | set(cross_kv_outputs)
     hidden_outputs = [
         port

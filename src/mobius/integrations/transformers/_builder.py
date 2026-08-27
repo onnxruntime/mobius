@@ -120,10 +120,12 @@ def _resolve_module_class(
     parent_config,
     module_class: type[nn.Module] | None,
     task: str | ModelTask | None,
+    *,
+    allow_parent_architecture_override: bool = True,
 ) -> tuple[type[nn.Module], str | ModelTask | None, str]:
     """Resolve architecture aliases and structural fallback registrations."""
     architectures = getattr(parent_config, "architectures", None) or []
-    if architectures and architectures[0] in registry:
+    if allow_parent_architecture_override and architectures and architectures[0] in registry:
         architecture_key = architectures[0]
         model_type_class = registry.get(model_type) if model_type in registry else None
         architecture_class = registry.get(architecture_key)
@@ -222,12 +224,6 @@ def build_transformers_model(
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
 
-    if _is_qwen4_exp_composite(parent_config) and not text_only:
-        raise ValueError(
-            "Qwen4-Exp multimodal export is not implemented in this text-core PR. "
-            "Pass text_only=True to export the qwen4_exp_text causal decoder."
-        )
-
     compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
     if text_only:
         from mobius._registry import _TEXT_ONLY_MODEL_TYPE
@@ -246,10 +242,12 @@ def build_transformers_model(
         parent_config,
         module_class,
         task,
+        allow_parent_architecture_override=not text_only,
     )
+    config_parent = None if text_only and model_type == "qwen4_exp_text" else parent_config
     config = _config_from_hf(
         hf_config,
-        parent_config=parent_config,
+        parent_config=config_parent,
         module_class=module_class,
     )
     if (
@@ -334,17 +332,17 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type == "qwen4_exp_text":
+        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        if model_type == "qwen4_exp_text":
+        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
             from mobius.integrations.transformers._qwen4_exp_weights import (
-                stream_qwen4_exp_safetensors_to_model,
+                stream_qwen4_exp_safetensors_to_package,
             )
 
-            stream_qwen4_exp_safetensors_to_model(
-                package["model"],
+            stream_qwen4_exp_safetensors_to_package(
+                package,
                 model_id,
                 config,
                 revision=revision,

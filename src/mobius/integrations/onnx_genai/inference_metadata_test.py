@@ -247,6 +247,92 @@ def _model(
     return model
 
 
+def test_qwen4_decoder_metadata_preserves_qsa_kv_index_and_four_axis_positions():
+    decoder = _model(
+        "decoder",
+        [
+            _value("inputs_embeds", ir.DataType.FLOAT, ["batch", "sequence", 16]),
+            _value("ple_input_ids", ir.DataType.INT64, ["batch", "sequence"]),
+            _value(
+                "attention_mask",
+                ir.DataType.INT64,
+                ["batch", "total_sequence"],
+            ),
+            _value("position_ids", ir.DataType.INT64, [4, "batch", "sequence"]),
+            _value(
+                "past_position_ids",
+                ir.DataType.INT64,
+                [4, "batch", "past_sequence"],
+            ),
+            _value(
+                "past_key_values.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 1, "past_sequence", 8],
+            ),
+            _value(
+                "past_key_values.0.value",
+                ir.DataType.FLOAT,
+                ["batch", 1, "past_sequence", 8],
+            ),
+            _value(
+                "past_key_values.0.index_key",
+                ir.DataType.FLOAT,
+                ["batch", "past_sequence", 8],
+            ),
+        ],
+        [
+            ("logits", ir.DataType.FLOAT, ["batch", "sequence", 32]),
+            (
+                "present_position_ids",
+                ir.DataType.INT64,
+                [4, "batch", "total_sequence"],
+            ),
+            (
+                "present.0.key",
+                ir.DataType.FLOAT,
+                ["batch", 1, "total_sequence", 8],
+            ),
+            (
+                "present.0.value",
+                ir.DataType.FLOAT,
+                ["batch", 1, "total_sequence", 8],
+            ),
+            (
+                "present.0.index_key",
+                ir.DataType.FLOAT,
+                ["batch", "total_sequence", 8],
+            ),
+        ],
+    )
+
+    @dataclasses.dataclass
+    class Config:
+        model_type: str = "qwen4_exp"
+        layer_types: tuple[str, ...] = ("qwen_sparse_attention",)
+        mrope_interleaved: bool = True
+        mrope_section: tuple[int, ...] = (1, 1, 0)
+
+    io, positions = _decoder_io(decoder, {"inputs_embeds"}, Config())
+    assert io["kv_inputs"] == [
+        "past_key_values.0.key",
+        "past_key_values.0.value",
+    ]
+    assert {(pair["input"], pair["output"]) for pair in io["state_pairs"]} == {
+        ("past_key_values.0.index_key", "present.0.index_key"),
+        ("past_position_ids", "present_position_ids"),
+    }
+    assert positions == {
+        "input": "position_ids",
+        "rank": 4,
+        "tensor_rank": 3,
+        "dtype": "int64",
+        "generation": "processor_coordinates",
+        "continuation": "carry_state",
+        "axes": ["text", "temporal", "height", "width"],
+        "sections": [1, 1, 0],
+    }
+
+
 @dataclasses.dataclass
 class _VisionConfig:
     image_size: int = 448

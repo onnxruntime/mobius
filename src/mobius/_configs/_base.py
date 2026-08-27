@@ -1533,7 +1533,7 @@ class CausalLMConfig(ArchitectureConfig):
 
 @dataclasses.dataclass
 class Qwen4ExpConfig(CausalLMConfig):
-    """Exact text-core configuration for experimental Qwen4/Qwen3.8 Flash-Next."""
+    """Exact configuration for experimental Qwen4/Qwen3.8 Flash-Next."""
 
     hc_count: int = 4
     hc_lowrank: int = 320
@@ -1556,6 +1556,7 @@ class Qwen4ExpConfig(CausalLMConfig):
     mamba_ssm_dtype: ir.DataType = ir.DataType.FLOAT
     mtp_num_hidden_layers: int = 0
     mtp_use_dedicated_embeddings: bool = False
+    unsupported_video_token_id: int | None = None
 
     def __post_init__(self) -> None:
         self.ple_layer_ids = sorted(set(self.ple_layer_ids or []))
@@ -1717,6 +1718,68 @@ class Qwen4ExpConfig(CausalLMConfig):
         parent = parent_config or (config if text is not config else None)
         base = ArchitectureConfig.from_transformers(text, parent)
         fields = _shallow_fields(base)
+        is_multimodal = (
+            getattr(parent, "model_type", None) == "qwen4_exp"
+            and getattr(parent, "vision_config", None) is not None
+        )
+        if is_multimodal:
+            if getattr(parent, "language_model_only", False):
+                raise ValueError(
+                    "Qwen4-Exp multimodal export requires language_model_only=false"
+                )
+            if base.video_token_id != 248057:
+                raise ValueError(
+                    "Unsupported Qwen4-Exp video token contract: expected source "
+                    f"video_token_id 248057, got {base.video_token_id}"
+                )
+            vision = base.vision
+            if vision is None:
+                raise ValueError("Qwen4-Exp multimodal config requires vision_config")
+            expected = {
+                "num_hidden_layers": 27,
+                "hidden_size": 1152,
+                "intermediate_size": 4304,
+                "num_attention_heads": 16,
+                "in_channels": 3,
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "spatial_merge_size": 2,
+                "num_position_embeddings": 2304,
+                "out_hidden_size": 2560,
+                "hidden_act": "gelu_pytorch_tanh",
+            }
+            actual = {
+                "num_hidden_layers": vision.num_hidden_layers,
+                "hidden_size": vision.hidden_size,
+                "intermediate_size": vision.intermediate_size,
+                "num_attention_heads": vision.num_attention_heads,
+                "in_channels": vision.in_channels,
+                "patch_size": vision.patch_size,
+                "temporal_patch_size": vision.temporal_patch_size,
+                "spatial_merge_size": vision.spatial_merge_size,
+                "num_position_embeddings": vision.num_position_embeddings,
+                "out_hidden_size": vision.out_hidden_size,
+                "hidden_act": vision.hidden_act,
+            }
+            mismatches = {
+                name: (actual[name], value)
+                for name, value in expected.items()
+                if actual[name] != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "Unsupported Qwen4-Exp vision variant; expected the pinned "
+                    f"Qwen3/Qwen3.5 tower, got mismatches {mismatches}"
+                )
+            if vision.deepstack_visual_indexes:
+                raise ValueError(
+                    "Unsupported Qwen4-Exp vision variant: DeepStack must be disabled"
+                )
+            if base.hidden_size != 2560:
+                raise ValueError(
+                    "Unsupported Qwen4-Exp multimodal projection width: "
+                    f"expected text hidden_size 2560, got {base.hidden_size}"
+                )
         mamba_ssm_dtype = _resolve_dtype_value(getattr(text, "mamba_ssm_dtype", "float32"))
         if mamba_ssm_dtype is None:
             raise ValueError(
@@ -1729,7 +1792,7 @@ class Qwen4ExpConfig(CausalLMConfig):
                 for value in layer_types
             ]
         fields.update(
-            model_type="qwen4_exp_text",
+            model_type="qwen4_exp" if is_multimodal else "qwen4_exp_text",
             layer_types=layer_types,
             hc_count=getattr(text, "hc_count", 4),
             hc_lowrank=getattr(text, "hc_lowrank", 320),
@@ -1754,6 +1817,12 @@ class Qwen4ExpConfig(CausalLMConfig):
             mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0),
             mtp_use_dedicated_embeddings=getattr(text, "mtp_use_dedicated_embeddings", False),
         )
+        if is_multimodal:
+            # The current package is explicitly image-only. Preserve validation
+            # of the source token above, but do not publish runtime video support
+            # until a video producer/preprocessor route exists.
+            fields["video_token_id"] = None
+            fields["unsupported_video_token_id"] = base.video_token_id
         return cls(**fields)
 
 

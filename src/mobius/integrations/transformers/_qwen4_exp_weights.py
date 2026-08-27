@@ -5,24 +5,31 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import onnx_ir as ir
 import torch
 from onnx_ir import tensor_adapters
 from safetensors import safe_open
 
 from mobius._configs import Qwen4ExpConfig
+from mobius._model_package import ModelPackage
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.integrations._weight_loading import _resolve_shard_paths, _shard_key_index
+from mobius.models.qwen4_exp import _qwen4_exp_ple_buffer_values
 
 _PLE_TABLE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight"
-_PLE_BUFFER_SUFFIXES = (
-    ".ple_embedding.layer_multipliers",
-    ".ple_embedding.ngram_heads_vocab_sizes",
-    ".ple_embedding.ngram_heads_offsets",
-)
 
 
 def _source_name(target_name: str) -> str:
+    if target_name.startswith("decoder."):
+        return _source_name(target_name[len("decoder.") :])
+    if target_name == "embedding.embed_tokens.weight":
+        return "model.language_model.embed_tokens.weight"
+    if target_name.startswith("vision_encoder.visual."):
+        source_name = f"model.visual.{target_name[len('vision_encoder.visual.') :]}"
+        source_name = source_name.replace(".mlp.up_proj.", ".mlp.linear_fc1.")
+        return source_name.replace(".mlp.down_proj.", ".mlp.linear_fc2.")
     if target_name.startswith("model."):
         return f"model.language_model.{target_name[len('model.') :]}"
     return target_name
@@ -107,16 +114,18 @@ def _lazy_concat_tensor(
     )
 
 
-def stream_qwen4_exp_safetensors_to_model(
-    model: ir.Model,
-    model_id: str,
-    config: Qwen4ExpConfig,
-    *,
-    revision: str | None = None,
-) -> None:
-    """Bind official Qwen4-Exp weights without materializing the checkpoint."""
-    paths = _resolve_shard_paths(model_id, revision)
-    key_index = _shard_key_index(paths)
+@dataclasses.dataclass(frozen=True)
+class Qwen4ExpStreamingReport:
+    """Bounded-memory accounting for one transactional package binding."""
+
+    model_count: int
+    initializer_count: int
+    lazy_initializer_count: int
+    eagerly_validated_bytes: int
+    retained_source_tensor_count: int = 0
+
+
+def _validate_unquantized_checkpoint(key_index) -> None:
     quantized = sorted(
         name
         for name, (_path, _shape, dtype) in key_index.items()
@@ -128,26 +137,49 @@ def stream_qwen4_exp_safetensors_to_model(
             f"found quantized tensors such as {quantized[:5]}"
         )
 
+
+def _validate_deterministic_ple_buffers(
+    config: Qwen4ExpConfig,
+    key_index,
+) -> int:
+    validated_bytes = 0
+    for ple_layer_index, layer_id in enumerate(config.ple_layer_ids or []):
+        expected_values, _padded_vocab_size = _qwen4_exp_ple_buffer_values(
+            config,
+            ple_layer_index,
+        )
+        prefix = f"model.language_model.layers.{layer_id - 1}.ple.ple_embedding."
+        for buffer_name, expected_array in expected_values.items():
+            source_name = f"{prefix}{buffer_name}"
+            located = key_index.get(source_name)
+            if located is None:
+                raise ValueError(
+                    f"Qwen4-Exp checkpoint is missing deterministic buffer '{source_name}'"
+                )
+            source_path, source_shape, _dtype = located
+            _validate_shape(source_name, source_shape, list(expected_array.shape))
+            with safe_open(source_path, framework="pt") as handle:
+                actual = handle.get_tensor(source_name)
+            expected = torch.from_numpy(expected_array)
+            if not torch.equal(actual.cpu(), expected):
+                raise ValueError(
+                    f"Qwen4-Exp deterministic buffer {source_name} does not "
+                    "match the pinned hash construction"
+                )
+            validated_bytes += actual.numel() * actual.element_size()
+    return validated_bytes
+
+
+def _plan_model_bindings(
+    model: ir.Model,
+    config: Qwen4ExpConfig,
+    key_index,
+) -> tuple[list[tuple[ir.Value, ir.TensorProtocol]], int]:
+    bindings: list[tuple[ir.Value, ir.TensorProtocol]] = []
+    eagerly_validated_bytes = 0
     parameter_names = set(model.graph.initializers)
     for target_name, initializer in model.graph.initializers.items():
         if initializer.const_value is not None:
-            if target_name.endswith(_PLE_BUFFER_SUFFIXES):
-                source_name = _source_name(target_name)
-                located = key_index.get(source_name)
-                if located is None:
-                    raise ValueError(
-                        f"Qwen4-Exp checkpoint is missing deterministic buffer '{source_name}'"
-                    )
-                source_path, source_shape, _dtype = located
-                _validate_shape(source_name, source_shape, [int(d) for d in initializer.shape])
-                with safe_open(source_path, framework="pt") as handle:
-                    actual = handle.get_tensor(source_name)
-                expected = torch.from_numpy(initializer.const_value.numpy())
-                if not torch.equal(actual.cpu(), expected):
-                    raise ValueError(
-                        f"Qwen4-Exp deterministic buffer {source_name} does not match "
-                        "the pinned hash construction"
-                    )
             continue
 
         if target_name.endswith(_PLE_TABLE_SUFFIX):
@@ -175,7 +207,7 @@ def stream_qwen4_exp_safetensors_to_model(
                     f"Qwen4-Exp PLE shards contain {source_rows} rows, "
                     f"expected {int(initializer.shape[0])}"
                 )
-            initializer.const_value = _lazy_concat_tensor(initializer, sources)
+            bindings.append((initializer, _lazy_concat_tensor(initializer, sources)))
             continue
 
         source_name = _source_name(target_name)
@@ -187,11 +219,88 @@ def stream_qwen4_exp_safetensors_to_model(
             )
         source_path, source_shape, _dtype = located
         _validate_shape(source_name, source_shape, [int(d) for d in initializer.shape])
-        initializer.const_value = _lazy_source_tensor(initializer, source_path, source_name)
+        bindings.append(
+            (initializer, _lazy_source_tensor(initializer, source_path, source_name))
+        )
 
+    assigned = {initializer.name for initializer, _value in bindings}
     unassigned = [
-        name for name in parameter_names if model.graph.initializers[name].const_value is None
+        name
+        for name in parameter_names
+        if model.graph.initializers[name].const_value is None and name not in assigned
     ]
     if unassigned:
         raise ValueError(f"Qwen4-Exp streaming left initializers unassigned: {unassigned[:5]}")
-    fold_initializers_after_weights(model)
+    return bindings, eagerly_validated_bytes
+
+
+def _stage_model(
+    model: ir.Model,
+    config: Qwen4ExpConfig,
+    key_index,
+) -> tuple[ir.Model, int, int]:
+    staged = model.clone()
+    bindings, validated_bytes = _plan_model_bindings(staged, config, key_index)
+    for initializer, value in bindings:
+        initializer.const_value = value
+    fold_initializers_after_weights(staged)
+    return staged, len(bindings), validated_bytes
+
+
+def stream_qwen4_exp_safetensors_to_model(
+    model: ir.Model,
+    model_id: str,
+    config: Qwen4ExpConfig,
+    *,
+    revision: str | None = None,
+) -> Qwen4ExpStreamingReport:
+    """Bind one Qwen4-Exp graph without retaining the checkpoint state dict."""
+    paths = _resolve_shard_paths(model_id, revision)
+    key_index = _shard_key_index(paths)
+    _validate_unquantized_checkpoint(key_index)
+    deterministic_bytes = _validate_deterministic_ple_buffers(config, key_index)
+    staged, lazy_count, validated_bytes = _stage_model(model, config, key_index)
+    model.graph = staged.graph
+    return Qwen4ExpStreamingReport(
+        model_count=1,
+        initializer_count=len(model.graph.initializers),
+        lazy_initializer_count=lazy_count,
+        eagerly_validated_bytes=deterministic_bytes + validated_bytes,
+    )
+
+
+def stream_qwen4_exp_safetensors_to_package(
+    package: ModelPackage,
+    model_id: str,
+    config: Qwen4ExpConfig,
+    *,
+    revision: str | None = None,
+) -> Qwen4ExpStreamingReport:
+    """Transactionally bind every Qwen4-Exp package component from one shard index."""
+    paths = _resolve_shard_paths(model_id, revision)
+    key_index = _shard_key_index(paths)
+    _validate_unquantized_checkpoint(key_index)
+    validated_bytes = _validate_deterministic_ple_buffers(config, key_index)
+
+    staged_models: dict[str, ir.Model] = {}
+    initializer_count = 0
+    lazy_initializer_count = 0
+    for name, model in package.items():
+        staged, model_lazy_count, model_validated_bytes = _stage_model(
+            model,
+            config,
+            key_index,
+        )
+        staged_models[name] = staged
+        validated_bytes += model_validated_bytes
+        initializer_count += len(staged.graph.initializers)
+        lazy_initializer_count += model_lazy_count
+
+    # Commit only after every cloned component has bound and folded successfully.
+    package.update(staged_models)
+    return Qwen4ExpStreamingReport(
+        model_count=len(package),
+        initializer_count=initializer_count,
+        lazy_initializer_count=lazy_initializer_count,
+        eagerly_validated_bytes=validated_bytes,
+    )

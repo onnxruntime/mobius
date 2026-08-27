@@ -3377,16 +3377,16 @@ class TestGraphInputNames:
         result = _graph_input_names(model)
         assert result == ["input_ids", "attention_mask"]
 
-    def test_filters_past_prefix(self):
-        """Inputs starting with 'past_' are also filtered out."""
+    def test_preserves_semantic_past_inputs(self):
+        """Semantic state inputs stay explicit while indexed caches use templates."""
         model = _mock_model_with_inputs(
             [
                 "input_ids",
-                "past_something",
+                "past_position_ids",
             ]
         )
         result = _graph_input_names(model)
-        assert result == ["input_ids"]
+        assert result == ["input_ids", "past_position_ids"]
 
     def test_skips_none_names(self):
         """Inputs with name=None are skipped."""
