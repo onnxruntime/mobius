@@ -169,6 +169,11 @@ def _discover_in_directory(directory: Path) -> list[Path]:
             f"{directory} contains multiple non-sharded .gguf files "
             f"{[f.name for f in single_files]}; specify one explicitly."
         )
+    if single_files:
+        raise GgufShardError(
+            f"{directory} contains both GGUF split sets and standalone files "
+            f"{[f.name for f in single_files]}; specify one file explicitly."
+        )
     if len(groups) > 1:
         summaries = ", ".join(f"{prefix}-*-of-{count:05d}" for prefix, count in sorted(groups))
         raise GgufShardError(

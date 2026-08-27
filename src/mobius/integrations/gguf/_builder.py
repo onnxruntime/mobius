@@ -78,6 +78,7 @@ _GGUF_SHARD_FILENAME_RE = re.compile(
 )
 _NEMOTRON_H_MOE_ARCHITECTURE = "nemotron_h_moe"
 _GGUF_HEADER_RANGE_BYTES = 16 * 1024 * 1024
+_GGUF_SPLIT_DISCOVERY_MULTIPLIER = 4
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -505,6 +506,7 @@ def _preflight_hf_gguf_file(
     revision: str = "main",
     allow_mmproj_companion: bool = False,
     expected_architecture: str | None = None,
+    dispatch_architecture: bool = True,
 ) -> str | _GGUFPreflightRevision:
     """Validate the exact selected Hub file header and return its immutable revision."""
     source = f"{repo_id}@{revision}:{filename}"
@@ -592,12 +594,16 @@ def _preflight_hf_gguf_file(
         return commit_hash
     _validate_preflight_split_header(header_info, source=source)
     architecture = header_info.architecture
-    if expected_architecture is not None and architecture != expected_architecture:
+    if (
+        dispatch_architecture
+        and expected_architecture is not None
+        and architecture != expected_architecture
+    ):
         raise ValueError(
             f"Expected a {expected_architecture!r} mmproj GGUF for {source!r}, "
             f"got architecture {architecture!r}. No payload was downloaded."
         )
-    if architecture is None:
+    if architecture is None and dispatch_architecture:
         if (
             header_info.split_count is None
             or header_info.split_count <= 1
@@ -608,14 +614,14 @@ def _preflight_hf_gguf_file(
                 "is not a continuation shard in a complete split set. "
                 "No payload was downloaded."
             )
-    else:
+    elif architecture is not None and dispatch_architecture:
         _raise_for_unsupported_gguf_architecture(
             architecture,
             source=source,
             allow_mmproj_companion=allow_mmproj_companion,
             allow_preflight_only=True,
         )
-    if architecture == "qwen4exp":
+    if architecture == "qwen4exp" and dispatch_architecture:
         from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_hub_source
 
         validate_qwen4exp_hub_source(repo_id=repo_id, revision=commit_hash)
@@ -4905,6 +4911,13 @@ def _select_hf_gguf_set_from_split_headers(
         if PurePosixPath(name).parent == selected_path.parent
         and name.lower().endswith(".gguf")
     )
+    candidate_limit = selected_info.split_count * _GGUF_SPLIT_DISCOVERY_MULTIPLIER
+    if len(candidates) > candidate_limit:
+        raise ValueError(
+            f"Renamed GGUF split discovery found {len(candidates)} candidate files, "
+            f"exceeding the bounded limit {candidate_limit} for split.count="
+            f"{selected_info.split_count}. No additional headers or payloads were read."
+        )
     preflights: dict[str, _GGUFPreflightRevision] = {selected_filename: selected_preflight}
     by_split_no: dict[int, str] = {}
     primary_architecture: str | None = None
@@ -4916,6 +4929,7 @@ def _select_hf_gguf_set_from_split_headers(
                 repo_id,
                 name,
                 revision=revision,
+                dispatch_architecture=False,
             )
             if not isinstance(candidate_preflight, _GGUFPreflightRevision):
                 raise ValueError(
@@ -4965,6 +4979,16 @@ def _select_hf_gguf_set_from_split_headers(
             "GGUF split set has no authoritative primary architecture. "
             "No payload was downloaded."
         )
+    primary_filename = by_split_no[0]
+    _raise_for_unsupported_gguf_architecture(
+        primary_architecture,
+        source=f"{repo_id}@{revision}:{primary_filename}",
+        allow_preflight_only=True,
+    )
+    if primary_architecture == "qwen4exp":
+        from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_hub_source
+
+        validate_qwen4exp_hub_source(repo_id=repo_id, revision=revision)
     mismatched_architectures = {
         name: architecture
         for name, architecture in declared_architectures.items()

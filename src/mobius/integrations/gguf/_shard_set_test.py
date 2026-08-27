@@ -219,6 +219,17 @@ def test_open_directory(tmp_path):
     assert model.num_tensors == len(_tensor_names(3))
 
 
+def test_open_directory_rejects_split_set_mixed_with_standalone_file(tmp_path):
+    _write_sharded_gguf(tmp_path, split_max_tensors=3)
+    _write_single_gguf(tmp_path, stem="standalone")
+
+    with pytest.raises(
+        GgufShardError,
+        match=r"both GGUF split sets and standalone files",
+    ):
+        open_gguf_model(tmp_path)
+
+
 def test_discover_confined_to_directory(tmp_path):
     shards = _write_sharded_gguf(tmp_path, split_max_tensors=3)
     found = discover_gguf_shards(shards[2])
@@ -831,6 +842,7 @@ def test_hub_renamed_shard_headers_enumerate_complete_set_before_download(tmp_pa
     remote_files = [
         f"weights/{chr(ord('a') + index)}.gguf" for index in range(len(source_shards))
     ]
+    mmproj_name = "weights/mmproj.gguf"
     local_dir = tmp_path / "downloaded"
     local_dir.mkdir()
     local_by_remote: dict[str, Path] = {}
@@ -841,7 +853,7 @@ def test_hub_renamed_shard_headers_enumerate_complete_set_before_download(tmp_pa
 
     commit = "a" * 40
     api = mock.Mock()
-    api.list_repo_files.return_value = remote_files
+    api.list_repo_files.return_value = [*remote_files, mmproj_name]
     api.get_paths_info.return_value = [
         SimpleNamespace(
             path=name,
@@ -851,7 +863,19 @@ def test_hub_renamed_shard_headers_enumerate_complete_set_before_download(tmp_pa
         for name, path in local_by_remote.items()
     ]
 
-    def preflight(_repo_id, filename, *, revision):
+    def preflight(_repo_id, filename, *, revision, dispatch_architecture=True):
+        if filename == mmproj_name:
+            assert not dispatch_architecture
+            return builder._GGUFPreflightRevision(
+                commit,
+                builder.GGUFHeaderInfo(
+                    architecture="clip",
+                    tensor_count=1,
+                    split_no=None,
+                    split_count=None,
+                    split_tensors_count=None,
+                ),
+            )
         path = local_by_remote[filename]
         info = builder._gguf_header_info_from_header_prefix(
             path.read_bytes(),
@@ -888,6 +912,36 @@ def test_hub_renamed_shard_headers_enumerate_complete_set_before_download(tmp_pa
     assert model.num_tensors == len(_tensor_names(3))
 
 
+def test_hub_renamed_discovery_caps_header_candidates_before_probing():
+    from mobius.integrations.gguf import _builder as builder
+
+    selected = builder._GGUFPreflightRevision(
+        "a" * 40,
+        builder.GGUFHeaderInfo(
+            architecture=None,
+            tensor_count=1,
+            split_no=1,
+            split_count=2,
+            split_tensors_count=2,
+        ),
+    )
+    candidates = [f"weights/candidate-{index}.gguf" for index in range(9)]
+    candidates[0] = "weights/selected.gguf"
+    with (
+        mock.patch.object(builder, "_preflight_hf_gguf_file") as preflight,
+        pytest.raises(ValueError, match=r"bounded limit 8.*No additional headers"),
+    ):
+        builder._select_hf_gguf_set_from_split_headers(
+            candidates,
+            repo_id="owner/repo",
+            selected_filename="weights/selected.gguf",
+            revision="a" * 40,
+            selected_preflight=selected,
+        )
+
+    preflight.assert_not_called()
+
+
 def test_hub_renamed_incomplete_set_rejected_before_download(tmp_path):
     from mobius.integrations.gguf import _builder as builder
 
@@ -905,7 +959,7 @@ def test_hub_renamed_incomplete_set_rejected_before_download(tmp_path):
     api = mock.Mock()
     api.list_repo_files.return_value = remote_files
 
-    def preflight(_repo_id, filename, *, revision):
+    def preflight(_repo_id, filename, *, revision, dispatch_architecture=True):
         path = local_by_remote[filename]
         info = builder._gguf_header_info_from_header_prefix(
             path.read_bytes(),
