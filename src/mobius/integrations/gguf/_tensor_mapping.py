@@ -71,6 +71,22 @@ _LLAMA_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_norm": ("model.layers.{bid}.post_attention_layernorm"),
 }
 
+# PLaMo owns a suffix-exact subset even though the target stems resemble
+# Llama. Its shared norm topology and Q/output value transforms are distinct.
+_PLAMO_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+}
+
 _LLAMA_EMBEDDING_MAPPING: dict[str, str] = {
     "token_embd": "token_embeddings",
     "output_norm": "output_norm",
@@ -666,6 +682,11 @@ _JINA_BERT_V2_MAPPING: dict[str, str] = {
     "blk.{bid}.attn_norm_2": "layers.{bid}.extra_attention_norm",
 }
 
+_JINA_BERT_V3_MAPPING: dict[str, str] = {
+    **_NOMIC_BERT_MAPPING,
+    "blk.{bid}.attn_qkv": "layers.{bid}.attention.qkv",
+}
+
 _T5_MAPPING: dict[str, str] = {
     "token_embd": "shared",
     "output": "lm_head",
@@ -778,6 +799,8 @@ _RECURRENT_SUFFIXES: dict[str, dict[str, frozenset[str]]] = {
 _WEIGHT = frozenset({".weight"})
 _PROJECTION = frozenset({".weight", ".scale", ".input_scale"})
 _BIASED_PROJECTION = frozenset({".weight", ".bias", ".scale", ".input_scale"})
+
+_RECURRENT_SUFFIXES["plamo"] = dict.fromkeys(_PLAMO_MAPPING, _WEIGHT)
 
 _RECURRENT_SUFFIXES["kimi-linear"] = {
     "token_embd": _WEIGHT,
@@ -911,6 +934,24 @@ _DEEPSEEK_SHARED_MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
     "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
 }
+
+_SMALLTHINKER_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+}
+
 
 _DIFFUSION_FUSED_QKV: dict[str, str] = {
     "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
@@ -1203,6 +1244,7 @@ _MUSE_GLIMMER_EXTRAS: dict[str, str] = {
 _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
     {
         "llama": _LLAMA_MAPPING,
+        "plamo": _PLAMO_MAPPING,
         "llama_embedding": _LLAMA_EMBEDDING_MAPPING,
         "gemma_embedding": _GEMMA_EMBEDDING_MAPPING,
         "bitnet": _BITNET_MAPPING,
@@ -1242,6 +1284,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "neo_bert": _NEO_BERT_MAPPING,
         "nomic_bert": _NOMIC_BERT_MAPPING,
         "jina_bert_v2": _JINA_BERT_V2_MAPPING,
+        "jina_bert_v3": _JINA_BERT_V3_MAPPING,
         "t5": _T5_MAPPING,
         "gemma2_extras": _GEMMA2_EXTRAS,
         "gemma3_extras": _GEMMA3_EXTRAS,
@@ -1249,6 +1292,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "moe_extras": _MOE_EXTRAS,
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
         "deepseek_shared_moe_extras": _DEEPSEEK_SHARED_MOE_EXTRAS,
+        "smallthinker": _SMALLTHINKER_MAPPING,
         "diffusion_fused_qkv": _DIFFUSION_FUSED_QKV,
         "dbrx_extras": _DBRX_EXTRAS,
         "nomic_bert_moe_extras": _NOMIC_BERT_MOE_EXTRAS,

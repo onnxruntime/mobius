@@ -314,6 +314,17 @@ class CausalLMTask(ModelTask):
         return ModelPackage({"model": _make_model(graph)}, config=config)
 
 
+class SmallThinkerGGUFCausalLMTask(CausalLMTask):
+    """SmallThinker's exact dynamic concat-grow KV-cache ABI."""
+
+    def __init__(self, *, prune_prefill_prefix: bool = False):
+        super().__init__(
+            static_cache=False,
+            paged_cache=False,
+            prune_prefill_prefix=prune_prefill_prefix,
+        )
+
+
 class HybridCausalLMTask(ModelTask):
     """Causal LM with hybrid KV cache + DeltaNet recurrent states.
 

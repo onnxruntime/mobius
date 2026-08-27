@@ -104,6 +104,7 @@ from mobius.models import (
     LLaDAMoEModel,
     Llama4CausalLMModel,
     MageVLForConditionalGeneration,
+    MaincoderCausalLMModel,
     MoECausalLMModel,
     MoonshineForConditionalGeneration,
     NanoChatCausalLMModel,
@@ -121,6 +122,7 @@ from mobius.models import (
     PhiCausalLMModel,
     PhiMoEGGUFCausalLMModel,
     Plamo2ForCausalLM,
+    PlamoGGUFCausalLMModel,
     PLMCausalLMModel,
     Qwen2MoECausalLMModel,
     Qwen2VLCausalLMModel,
@@ -141,6 +143,7 @@ from mobius.models import (
     Qwen35VLTextModel,
     QwenCausalLMModel,
     RND1Model,
+    SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
     WhisperForConditionalGeneration,
@@ -169,6 +172,7 @@ from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGU
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,
+    JinaBertV3GGUFModel,
     NeoBertGGUFModel,
     NomicBertGGUFModel,
     NomicBertMoEGGUFModel,
@@ -477,6 +481,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "arcee": ModelRegistration(ArceeCausalLMModel),
     "bitnet": ModelRegistration(BitNetCausalLMModel),
     "talkie": ModelRegistration(TalkieForCausalLM),
+    "maincoder": ModelRegistration(
+        MaincoderCausalLMModel,
+        test_model_id="Maincode/Maincoder-1B",
+        test_revision="088ec98640bdeb105f46a9ef6a1370ed5d0d2ea5",
+    ),
     "bloom": ModelRegistration(BloomCausalLMModel),
     "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
@@ -558,6 +567,10 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "glm4": ModelRegistration(Glm4CausalLMModel),
     "gpt_neox": ModelRegistration(GPTNeoXCausalLMModel),
     "gguf_legacy": ModelRegistration(ExactLegacyGGUFCausalLMModel),
+    "gguf_plamo": ModelRegistration(
+        PlamoGGUFCausalLMModel,
+        task="plamo-text-generation",
+    ),
     "gpt_neox_japanese": ModelRegistration(GPTNeoXJapaneseCausalLMModel),
     "gpt_oss": ModelRegistration(GPTOSSCausalLMModel),
     "gptj": ModelRegistration(GPTJCausalLMModel),
@@ -635,6 +648,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         variant="speculators",
     ),
     "shieldgemma2": ModelRegistration(Gemma2CausalLMModel),
+    "smallthinker_gguf": ModelRegistration(
+        SmallThinkerGGUFCausalLMModel,
+        task="smallthinker-gguf-text-generation",
+        family="smallthinker",
+        variant="gguf",
+    ),
     "smollm3": ModelRegistration(SmolLM3CausalLMModel),
     "stablelm": ModelRegistration(LayerNormCausalLMModel),
     "starcoder2": ModelRegistration(StarCoder2CausalLMModel),
@@ -881,6 +900,12 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "jina_bert_v2_gguf": ModelRegistration(
         JinaBertV2GGUFModel, task="gguf-encoder-feature-extraction"
+    ),
+    "jina_bert_v3_gguf": ModelRegistration(
+        JinaBertV3GGUFModel,
+        task="gguf-encoder-feature-extraction",
+        test_model_id="jinaai/jina-embeddings-v3",
+        test_revision="ab036b023d30b4d1138c4c3bfa9f0c445ab455d6",
     ),
     "neo_bert_gguf": ModelRegistration(
         NeoBertGGUFModel, task="gguf-encoder-feature-extraction"

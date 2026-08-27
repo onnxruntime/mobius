@@ -64,8 +64,8 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-runtime-abi-blocked": 102,
-        "evidence-only": 100,
-        "immediately-implementable": 58,
+        "evidence-only": 105,
+        "immediately-implementable": 53,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }
@@ -105,7 +105,7 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
     assert by_id["projector:pixtral"].category == "immediately-implementable"
     assert by_id["projector:qwen3tts_gen"].category == "intentionally-rejected"
     assert by_id["tokenizer:llama4"].category == "artifact-unavailable"
-    assert "PR #652" in by_id["tokenizer:llama4"].dependencies
+    assert "PR #652" not in by_id["tokenizer:llama4"].dependencies
     assert by_id["mtp:qwen35"].category == "evidence-only"
     assert by_id["mtp:deepseek2"].category == "dependency-or-runtime-abi-blocked"
     assert by_id["mtp:exaone4"].category == "intentionally-rejected"
@@ -114,9 +114,10 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
 def test_recent_pr_reconciliation_is_explicit() -> None:
     assert [(record.number, record.state_at_audit) for record in RECENT_PR_DEPENDENCIES] == [
         (645, "merged"),
-        (651, "open"),
-        (652, "open"),
-        (656, "open"),
+        (651, "merged"),
+        (652, "closed"),
+        (656, "merged"),
+        (675, "merged"),
     ]
 
 

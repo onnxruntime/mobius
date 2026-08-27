@@ -444,6 +444,39 @@ def _nextn_predict_layers(gguf_arch: str, metadata: dict[str, Any]) -> int:
     return count
 
 
+def _validate_closed_rope_scaling_metadata(
+    metadata: dict[str, Any],
+    arch: str,
+    *,
+    allowed_suffixes: set[str] | None = None,
+) -> None:
+    """Reject RoPE-scaling metadata outside an architecture's exact subset."""
+    allowed = {f"{arch}.rope.scaling.{suffix}" for suffix in (allowed_suffixes or set())}
+    unsupported = {
+        key
+        for key in metadata
+        if key.startswith(f"{arch}.rope.scaling.") and key not in allowed
+    }
+    unsupported.update(
+        key
+        for key in (
+            f"{arch}.rope.scale_linear",
+            f"{arch}.rope.factor",
+            f"{arch}.rope.original_context",
+        )
+        if key in metadata
+    )
+    if unsupported:
+        raise ValueError(
+            f"{arch} has unsupported RoPE scaling metadata: {', '.join(sorted(unsupported))}"
+        )
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if "type" in (allowed_suffixes or set()) and scaling_type not in (None, "", "none"):
+        raise ValueError(
+            f"{arch} rope.scaling.type={scaling_type!r} is not in the exact supported subset"
+        )
+
+
 def _derive_hybrid_layout(
     gguf_arch: str,
     metadata: dict[str, Any],
@@ -1141,7 +1174,11 @@ def _lfm2moe_postprocess(
     """
     del model
     arch = "lfm2moe"
-    gating = int(metadata[f"{arch}.expert_gating_func"])
+    raw_gating = metadata[f"{arch}.expert_gating_func"]
+    gating_value = float(raw_gating)
+    if not math.isfinite(gating_value) or not gating_value.is_integer():
+        raise ValueError(f"{arch}.expert_gating_func must be an integer")
+    gating = int(gating_value)
     if gating != 2:
         raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
     num_dense_layers = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
@@ -1637,6 +1674,139 @@ def _ernie45_moe_postprocess(
     )
 
 
+def _smallthinker_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the pinned llama.cpp SmallThinker routing and layer schedule."""
+    arch = "smallthinker"
+    _validate_closed_rope_scaling_metadata(metadata, arch, allowed_suffixes={"type"})
+    raw_gating = metadata[f"{arch}.expert_gating_func"]
+    gating_value = float(raw_gating)
+    if not math.isfinite(gating_value) or not gating_value.is_integer():
+        raise ValueError("smallthinker.expert_gating_func must be an integer")
+    gating = int(gating_value)
+    if gating not in (1, 2):
+        raise ValueError(
+            f"smallthinker.expert_gating_func must be SOFTMAX (1) or SIGMOID (2), got {gating}"
+        )
+    if config.num_local_experts is None or config.num_experts_per_tok is None:
+        raise ValueError("SmallThinker requires expert_count and expert_used_count")
+    if not 1 <= config.num_experts_per_tok <= config.num_local_experts:
+        raise ValueError(
+            "smallthinker.expert_used_count must be in "
+            f"[1, {config.num_local_experts}], got {config.num_experts_per_tok}"
+        )
+    if config.moe_intermediate_size is None or config.moe_intermediate_size <= 0:
+        raise ValueError("smallthinker.expert_feed_forward_length must be positive")
+    if config.intermediate_size != config.moe_intermediate_size:
+        raise ValueError(
+            "smallthinker.feed_forward_length must equal "
+            "smallthinker.expert_feed_forward_length"
+        )
+    if metadata.get(f"{arch}.expert_weights_norm", True) is not True:
+        raise ValueError("SmallThinker requires normalized top-k expert weights")
+
+    raw_route_scale = metadata.get(f"{arch}.expert_weights_scale", 0.0)
+    route_scale = float(raw_route_scale)
+    if not math.isfinite(route_scale) or not math.isclose(
+        route_scale, 0.0, rel_tol=0.0, abs_tol=0.0
+    ):
+        raise ValueError(
+            "smallthinker.expert_weights_scale must be absent or the zero sentinel "
+            "because the pinned loader does not consume a routing scale"
+        )
+    route_scale = 1.0
+
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if scaling_type not in (None, "", "none"):
+        raise ValueError(
+            "SmallThinker supports only unscaled/default RoPE, "
+            f"got rope.scaling.type={scaling_type!r}"
+        )
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    if not math.isfinite(rope_base) or rope_base <= 0:
+        raise ValueError("smallthinker.rope.freq_base must be finite and positive")
+
+    layers = config.num_hidden_layers
+    raw_window = metadata.get(f"{arch}.attention.sliding_window")
+    if isinstance(raw_window, (list, tuple, np.ndarray)):
+        raise TypeError("smallthinker.attention.sliding_window must be a scalar")
+    window_value = 0.0 if raw_window is None else float(raw_window)
+    if not math.isfinite(window_value) or not window_value.is_integer() or window_value < 0:
+        raise ValueError(
+            "smallthinker.attention.sliding_window must be a non-negative integer"
+        )
+    window_enabled = window_value > 0
+    if window_enabled:
+        raw_period = metadata.get(f"{arch}.attention.sliding_window_pattern", 4)
+        if isinstance(raw_period, (list, tuple, np.ndarray)):
+            raise TypeError("smallthinker.attention.sliding_window_pattern must be a scalar")
+        period_value = float(raw_period)
+        if (
+            not math.isfinite(period_value)
+            or not period_value.is_integer()
+            or period_value < 0
+        ):
+            raise ValueError(
+                "smallthinker.attention.sliding_window_pattern must be a non-negative integer"
+            )
+        period = int(period_value)
+        layer_types = [
+            ("sliding_attention" if period == 0 or layer % period != 0 else "full_attention")
+            for layer in range(layers)
+        ]
+        # The pinned loader forces 4096 regardless of the serialized positive value.
+        sliding_window = 4096
+        # With SWA enabled, llama.cpp disables RoPE on layers 0, 4, 8, ...
+        use_rope_layers = [0 if layer % 4 == 0 else 1 for layer in range(layers)]
+        local_rope_base = float(metadata.get(f"{arch}.rope.freq_base_swa", rope_base))
+        if not math.isfinite(local_rope_base) or local_rope_base <= 0:
+            raise ValueError("smallthinker.rope.freq_base_swa must be finite and positive")
+    else:
+        if f"{arch}.attention.sliding_window_pattern" in metadata:
+            raise ValueError(
+                "smallthinker.attention.sliding_window_pattern requires a positive "
+                "attention.sliding_window"
+            )
+        if f"{arch}.rope.freq_base_swa" in metadata:
+            raise ValueError(
+                "smallthinker.rope.freq_base_swa requires a positive attention.sliding_window"
+            )
+        layer_types = ["full_attention"] * layers
+        sliding_window = None
+        use_rope_layers = [1] * layers
+        local_rope_base = rope_base
+
+    return dataclasses.replace(
+        config,
+        hidden_act="relu",
+        tie_word_embeddings="output.weight" not in set(model.tensor_names),
+        attn_qkv_bias=any(
+            name.endswith(("attn_q.bias", "attn_qkv.bias")) for name in model.tensor_names
+        ),
+        attn_o_bias=False,
+        mlp_bias=False,
+        rope_type="default",
+        rope_interleave=False,
+        rope_theta=rope_base,
+        rope_local_base_freq=local_rope_base,
+        partial_rotary_factor=1.0,
+        layer_types=layer_types,
+        no_rope_layers=use_rope_layers,
+        sliding_window=sliding_window,
+        scoring_func="softmax" if gating == 1 else "sigmoid",
+        norm_topk_prob=True,
+        routed_scaling_factor=route_scale,
+        routing_weight_normalization_floor=6.103515625e-5,
+        n_group=1,
+        topk_group=1,
+        use_expert_bias=False,
+        disable_qmoe=True,
+    )
+
+
 def _talkie_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -1652,6 +1822,27 @@ def _talkie_postprocess(
         logit_scale=float(metadata[f"{arch}.logit_scale"]),
         rope_type="default",
         rope_interleave=False,
+    )
+
+
+def _maincoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore Maincoder's tied, adjacent-pair, post-RoPE QK-norm profile."""
+    _validate_closed_rope_scaling_metadata(metadata, "maincoder")
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        tie_word_embeddings=True,
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        rope_type="default",
+        rope_interleave=True,
     )
 
 
@@ -2094,6 +2285,123 @@ def _granitemoe_postprocess(
     )
 
 
+def _granite_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Select the exact dense or MoE Granite graph and restore GGUF scaling."""
+    arch = "granite"
+    _validate_closed_rope_scaling_metadata(
+        metadata, arch, allowed_suffixes={"type", "finetuned"}
+    )
+    num_experts = int(config.num_local_experts or 0)
+    top_k = int(config.num_experts_per_tok or 0)
+    if num_experts < 0 or top_k < 0 or bool(num_experts) != bool(top_k):
+        raise ValueError(
+            "granite expert_count and expert_used_count must both be zero or both positive"
+        )
+    if num_experts and top_k > num_experts:
+        raise ValueError(
+            f"granite.expert_used_count must be in [1, {num_experts}], got {top_k}"
+        )
+
+    shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+    if shared_width < 0:
+        raise ValueError("granite.expert_shared_feed_forward_length must not be negative")
+    if not num_experts and shared_width:
+        raise ValueError("granite.expert_shared_feed_forward_length requires routed experts")
+
+    deepstack = metadata.get(f"{arch}.deepstack_mapping")
+    if deepstack is not None:
+        if not isinstance(deepstack, (list, tuple, np.ndarray)):
+            raise ValueError("granite.deepstack_mapping must be an integer array")
+        mapping = [int(value) for value in deepstack]
+        if mapping and len(mapping) != config.num_hidden_layers:
+            raise ValueError("granite.deepstack_mapping must match block_count")
+        if any(value != -1 for value in mapping):
+            raise NotImplementedError(
+                "granite deep-stack embedding injection is unsupported by the text task; "
+                "only an absent, empty, or all -1 mapping is accepted"
+            )
+
+    finetuned = metadata.get(f"{arch}.rope.scaling.finetuned", True)
+    if not isinstance(finetuned, (bool, np.bool_)):
+        raise TypeError("granite.rope.scaling.finetuned must be boolean")
+    tensor_names = set(getattr(model, "tensor_names", ()) or ())
+    if "rope_freqs.weight" in tensor_names:
+        raise ValueError(
+            "granite serialized rope_freqs.weight is unsupported because the exact "
+            "per-dimension frequency factors are not representable by the current rotary graph"
+        )
+    longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
+    present_longrope = tensor_names & longrope_names
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if scaling_type not in (None, "", "none"):
+        raise ValueError(
+            f"granite rope.scaling.type={scaling_type!r} is not in the exact supported subset"
+        )
+    if present_longrope:
+        raise ValueError(
+            "granite tensor-backed LongRoPE is unsupported because the current rotary graph "
+            "cannot preserve rope.scaling.attn_factor exactly"
+        )
+
+    def finite_scale(suffix: str, default: float) -> float:
+        value = float(metadata.get(f"{arch}.{suffix}", default))
+        if not math.isfinite(value):
+            raise ValueError(f"granite.{suffix} must be finite")
+        return value
+
+    logit_scale = finite_scale("logit_scale", 0.0)
+    if math.isclose(logit_scale, 0.0, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("granite.logit_scale must be nonzero")
+    embedding_scale = finite_scale("embedding_scale", 0.0) or 1.0
+    residual_scale = finite_scale("residual_scale", 0.0) or 1.0
+    attention_scale = finite_scale("attention.scale", 0.0) or None
+    raw_expert_width = metadata.get(f"{arch}.expert_feed_forward_length")
+    if raw_expert_width is not None:
+        if isinstance(raw_expert_width, (bool, np.bool_)):
+            serialized_expert_width = None
+        elif isinstance(raw_expert_width, (int, np.integer)):
+            serialized_expert_width = int(raw_expert_width)
+        elif isinstance(raw_expert_width, (float, np.floating)):
+            numeric_expert_width = float(raw_expert_width)
+            serialized_expert_width = (
+                int(numeric_expert_width)
+                if math.isfinite(numeric_expert_width) and numeric_expert_width.is_integer()
+                else None
+            )
+        else:
+            serialized_expert_width = None
+        if serialized_expert_width != config.intermediate_size:
+            raise ValueError(
+                "granite.expert_feed_forward_length must equal feed_forward_length "
+                "because the pinned loader sizes routed experts from feed_forward_length"
+            )
+    expert_width = config.intermediate_size
+
+    return dataclasses.replace(
+        config,
+        model_type="granitemoe" if num_experts else "granite",
+        hidden_act="silu",
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        moe_intermediate_size=expert_width if num_experts else None,
+        shared_expert_intermediate_size=shared_width or None,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        embedding_multiplier=embedding_scale,
+        residual_multiplier=residual_scale,
+        attention_multiplier=attention_scale,
+        logits_scaling=logit_scale,
+        rope_type=config.rope_type if finetuned else None,
+        rope_theta=config.rope_theta if finetuned else None,
+        rope_scaling=config.rope_scaling if finetuned else None,
+        partial_rotary_factor=config.partial_rotary_factor if finetuned else None,
+    )
+
+
 def _jamba_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2434,6 +2742,7 @@ def _minicpm_longrope(
     model: Any,
     *,
     rope_dim: int,
+    label: str = "MiniCPM",
 ) -> ArchitectureConfig:
     tensor_names = set(getattr(model, "tensor_names", ()) or ())
     long_name = "rope_factors_long.weight"
@@ -2443,11 +2752,11 @@ def _minicpm_longrope(
         return config
     if present != {long_name, short_name}:
         raise ValueError(
-            "MiniCPM LongRoPE requires both rope_factors_long.weight and "
+            f"{label} LongRoPE requires both rope_factors_long.weight and "
             "rope_factors_short.weight"
         )
     if model is None or not hasattr(model, "get_tensor"):
-        raise ValueError("MiniCPM LongRoPE factors could not be read from the GGUF model")
+        raise ValueError(f"{label} LongRoPE factors could not be read from the GGUF model")
 
     raw_types = {
         name: getattr(qtype, "value", qtype)
@@ -2455,7 +2764,7 @@ def _minicpm_longrope(
         if name in present
     }
     if any(type_id not in {0, 1, 30} for type_id in raw_types.values()):
-        raise ValueError("MiniCPM LongRoPE factors must use F32/F16/BF16 storage")
+        raise ValueError(f"{label} LongRoPE factors must use F32/F16/BF16 storage")
 
     long_factor = np.asarray(model.get_tensor(long_name), dtype=np.float32).reshape(-1)
     short_factor = np.asarray(model.get_tensor(short_name), dtype=np.float32).reshape(-1)
@@ -2471,7 +2780,7 @@ def _minicpm_longrope(
         or np.any(short_factor <= 0)
     ):
         raise ValueError(
-            f"MiniCPM LongRoPE factors must be finite positive vectors of length {expected}"
+            f"{label} LongRoPE factors must be finite positive vectors of length {expected}"
         )
 
     arch = model.architecture
@@ -2481,13 +2790,13 @@ def _minicpm_longrope(
         # checkpoint has original_context == context and identical factor tables.
         if not np.array_equal(long_factor, short_factor):
             raise ValueError(
-                "MiniCPM LongRoPE with distinct long/short factors requires "
+                f"{label} LongRoPE with distinct long/short factors requires "
                 "rope.scaling.original_context_length"
             )
         original_context = config.max_position_embeddings
     original_context = int(original_context)
     if not 0 < original_context <= config.max_position_embeddings:
-        raise ValueError("MiniCPM LongRoPE original context is outside the model context")
+        raise ValueError(f"{label} LongRoPE original context is outside the model context")
 
     return dataclasses.replace(
         config,
@@ -3740,6 +4049,94 @@ def _specialized_encoder_postprocess(
     return config
 
 
+def _jina_bert_v3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Resolve JinaBERT-v3's QKV representation and exact dense/MoE schedule."""
+    arch = model.architecture
+    _validate_closed_rope_scaling_metadata(metadata, arch, allowed_suffixes={"type"})
+    if config.num_key_value_heads != config.num_attention_heads:
+        raise ValueError(f"{arch} GGUF requires head_count_kv == head_count")
+    if bool(metadata[f"{arch}.attention.causal"]):
+        raise ValueError(f"{arch}.attention.causal must be false for encoder import")
+
+    pooling_type = int(metadata.get(f"{arch}.pooling_type", 0))
+    if pooling_type not in {0, 1, 2}:
+        raise ValueError(f"{arch}.pooling_type={pooling_type} is not a known encoder pooling")
+    if metadata.get(f"{arch}.classifier.output_labels"):
+        raise ValueError(f"{arch} classifier heads are not part of feature extraction")
+
+    names = set(model.tensor_names)
+    layer_count = config.num_hidden_layers
+    layers = range(layer_count)
+
+    def _all_or_none(suffix: str, selected_layers=layers) -> bool:
+        expected = {f"blk.{layer}.{suffix}" for layer in selected_layers}
+        present = expected & names
+        if present and present != expected:
+            raise ValueError(
+                f"{arch} optional tensor family {suffix!r} must be all-layers or absent"
+            )
+        return bool(present)
+
+    fused = {f"blk.{layer}.attn_qkv.weight" for layer in layers}
+    split = {
+        f"blk.{layer}.attn_{projection}.weight"
+        for layer in layers
+        for projection in ("q", "k", "v")
+    }
+    if fused <= names and not names & split:
+        config.encoder_fused_qkv = True
+        config.attn_qkv_bias = _all_or_none("attn_qkv.bias")
+        config.encoder_q_bias = False
+        config.encoder_k_bias = False
+        config.encoder_v_bias = False
+    elif split <= names and not names & fused:
+        config.encoder_fused_qkv = False
+        config.attn_qkv_bias = False
+        config.encoder_q_bias = _all_or_none("attn_q.bias")
+        config.encoder_k_bias = _all_or_none("attn_k.bias")
+        config.encoder_v_bias = _all_or_none("attn_v.bias")
+    else:
+        raise ValueError(
+            f"{arch} requires a uniform complete fused-QKV or split-Q/K/V tensor family"
+        )
+
+    config.attn_o_bias = _all_or_none("attn_output.bias")
+    config.pooling_type = pooling_type
+    token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+    if token_types <= 0:
+        raise ValueError(f"{arch} tokenizer.ggml.token_type_count must be positive")
+    config.type_vocab_size = token_types
+    config.encoder_use_token_type_embeddings = "token_types.weight" in names
+    config.hidden_act = "gelu_pytorch_tanh"
+
+    interval = int(metadata.get(f"{arch}.moe_every_n_layers", 0))
+    expert_metadata = tuple(
+        suffix
+        for suffix in (
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_weights_norm",
+            "expert_weights_scale",
+        )
+        if f"{arch}.{suffix}" in metadata
+    )
+    if interval != 0 or expert_metadata:
+        raise ValueError(
+            f"{arch} MoE metadata is unsupported: the pinned loader does not read "
+            "moe_every_n_layers, so only its reachable dense tensor path is importable"
+        )
+
+    config.encoder_ffn_up_bias = _all_or_none("ffn_up.bias")
+    config.encoder_ffn_down_bias = _all_or_none("ffn_down.bias")
+    config.mlp_bias = config.encoder_ffn_up_bias or config.encoder_ffn_down_bias
+    return config
+
+
 def _gguf_embedding_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -3972,6 +4369,57 @@ def _exact_legacy_gguf_postprocess(
     return dataclasses.replace(config, **fields)
 
 
+def _plamo_postprocess(
+    config: ArchitectureConfig, metadata: dict[str, Any], model: Any
+) -> ArchitectureConfig:
+    """Validate and materialize the fixed PLaMo-13B converter contract."""
+    prefix = "plamo."
+    _validate_closed_rope_scaling_metadata(metadata, "plamo")
+    expected_ints = {
+        "context_length": 4096,
+        "embedding_length": 5120,
+        "block_count": 40,
+        "feed_forward_length": 16640,
+        "attention.head_count": 40,
+        "attention.head_count_kv": 5,
+    }
+    for suffix, expected in expected_ints.items():
+        actual = int(metadata[f"{prefix}{suffix}"])
+        if actual != expected:
+            raise ValueError(f"PLaMo requires {prefix}{suffix}={expected}, got {actual}")
+
+    epsilon = float(metadata[f"{prefix}attention.layer_norm_rms_epsilon"])
+    if not math.isclose(epsilon, 1e-6, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"PLaMo requires RMSNorm epsilon 1e-6, got {epsilon}")
+    rope_theta = float(metadata.get(f"{prefix}rope.freq_base", 10000.0))
+    if not math.isclose(rope_theta, 10000.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"PLaMo requires rope.freq_base=10000, got {rope_theta}")
+    rope_dim = int(metadata.get(f"{prefix}rope.dimension_count", 128))
+    if rope_dim != 128:
+        raise ValueError(f"PLaMo requires full-head rope.dimension_count=128, got {rope_dim}")
+    return dataclasses.replace(
+        config,
+        model_type="plamo",
+        hidden_size=5120,
+        intermediate_size=16640,
+        num_hidden_layers=40,
+        num_attention_heads=40,
+        num_key_value_heads=5,
+        head_dim=128,
+        max_position_embeddings=4096,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        rope_interleave=False,
+        hidden_act="silu",
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        tie_word_embeddings=False,
+    )
+
+
 def _plm_postprocess(
     config: ArchitectureConfig, metadata: dict[str, Any], model: Any
 ) -> ArchitectureConfig:
@@ -4155,7 +4603,9 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "dbrx": _dbrx_postprocess,
     "arctic": _arctic_postprocess,
     "ernie45_moe": _ernie45_moe_postprocess,
+    "smallthinker": _smallthinker_postprocess,
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
+    "granite": _granite_postprocess,
     "granitemoe": _granitemoe_postprocess,
     "phimoe": _phimoe_postprocess,
     "pangu_embedded": _pangu_embedded_postprocess,
@@ -4172,6 +4622,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "mamba": _mamba_postprocess,
     "mamba2": _mamba2_postprocess,
     "falcon_h1": _falcon_h1_postprocess,
+    "plamo": _plamo_postprocess,
     "plamo2": _plamo2_postprocess,
     "plm": _plm_postprocess,
     "jamba": _jamba_postprocess,
@@ -4182,8 +4633,10 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "bert_encoder": _bert_encoder_postprocess,
     "modern_bert_encoder": _modern_bert_encoder_postprocess,
     "specialized_encoder": _specialized_encoder_postprocess,
+    "jina_bert_v3_encoder": _jina_bert_v3_postprocess,
     "gguf_embedding": _gguf_embedding_postprocess,
     "talkie": _talkie_postprocess,
+    "maincoder": _maincoder_postprocess,
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
     "kimi_linear": _kimi_linear_postprocess,

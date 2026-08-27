@@ -143,10 +143,11 @@ _GROVEMOE_GGUF_GRAPH_REASON = (
 )
 
 _SMALLTHINKER_GGUF_GRAPH_REASON = (
-    "The pinned SmallThinker graph computes router logits from the unnormalized layer input, "
-    "uses ReLU experts with metadata-selected sigmoid or softmax gating, and can disable RoPE "
-    "or select sliding-window attention per layer. Mobius's generic MoE graph routes after "
-    "the FFN norm with softmax/SwiGLU experts and has no matching per-layer RoPE schedule."
+    "The exact float-import graph owns SmallThinker's pre-norm router, ReGLU experts, "
+    "metadata-selected sigmoid/softmax gate, and per-layer SWA/NoPE schedule. Quantization "
+    "preservation is rejected because QMoE implements SwiGLU and cannot represent this ReGLU "
+    "contract. Runtime packaging remains deferred until a representative real-weight GGUF "
+    "passes full-logit prefill and cached-decode parity."
 )
 
 _CHAMELEON_GGUF_GRAPH_REASON = (
@@ -378,12 +379,7 @@ _WAVTOKENIZER_DEC_REASON = (
     "runtime packaging is refused before graph construction."
 )
 
-_ENCODER_GRAPH_MISMATCH = {
-    "jina-bert-v3": (
-        "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
-        "BertModel has absolute positions and no MoE path."
-    ),
-}
+_ENCODER_GRAPH_MISMATCH: dict[str, str] = {}
 
 _FINAL_CENSUS_DEFERRED_REASONS = {
     # Dense / legacy / embedding.
@@ -438,11 +434,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "attention-output bias plus conditional LongRoPE factor tensors. Mobius has no "
         "exact graph or suffix closure for this misleadingly named architecture."
     ),
-    "plamo": (
-        "PLaMo uses one RMSNorm feeding attention and FFN in parallel, fixed grouped-query "
-        "geometry, and converter-specific Q/output projection shuffles. Sequential Llama "
-        "topology and direct external tensor reuse would both be incorrect."
-    ),
     "plamo3": (
         "PLaMo3 requires fused QKV and fused SwiGLU, four norm sites with architecture-"
         "specific offset transforms, Q/K norm before RoPE, and a periodic full/sliding "
@@ -480,12 +471,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "ERNIE 4.5 requires exact fused-QKV and fused-gate/up converter splits plus an "
         "optional attention-output bias and ERNIE-specific position metadata. Similarity "
         "to Qwen/Llama is not a suffix-exact tensor or graph contract."
-    ),
-    "granite": (
-        "The granite architecture is a conditional dense-or-MoE union with residual, "
-        "embedding, attention, and inverse-logit scales, optional biases/RoPE factors, "
-        "shared experts, and optional deep-stack inputs. It is not the GraniteMoE or "
-        "GraniteHybrid GGUF contract."
     ),
     "granite_swa": (
         "Granite SWA requires attention sinks, a complete interleaved sliding-window "
@@ -1346,6 +1331,30 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="plamo",
+        model_type="plamo",
+        module_type="gguf_plamo",
+        config_postprocessor="plamo",
+        tensor_map_recipe=("plamo",),
+        tensor_processor="plamo",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "block_count",
+            "feed_forward_length",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact graph/config/tensor import is implemented for the pinned PLaMo-13B "
+            "converter contract. Runtime remains deferred pending representative real-weight "
+            "prefill and expanded-cache decode parity."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="plamo2",
         model_type="plamo2",
         config_key_map="plamo2",
@@ -1420,6 +1429,26 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         runtime=Support.DEFERRED,
         reason=_ENCODER_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="jina-bert-v3",
+        model_type="jina-bert-v3",
+        module_type="jina_bert_v3_gguf",
+        tensor_map_recipe=("jina_bert_v3",),
+        config_postprocessor="jina_bert_v3_encoder",
+        required_metadata=(
+            "attention.causal",
+            "attention.layer_norm_epsilon",
+            "rope.freq_base",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "The dedicated graph and float importer preserve the pinned RoPE, post-norm, "
+            "and sequential GELU contracts of the reachable dense loader path. The pinned "
+            "loader does not read moe_every_n_layers, so MoE schedules, quantized packed "
+            "projections, and runtime packaging remain fail-closed pending proof."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="modern-bert",
@@ -1648,6 +1677,27 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
+        gguf_arch="granite",
+        model_type="granite",
+        tensor_map_recipe=("llama", "diffusion_fused_qkv", "moe_extras"),
+        config_postprocessor="granite",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "logit_scale",
+        ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Exact float and quantization-preserving import covers the pinned dense-or-MoE "
+            "union, fused or split QKV, optional projection biases, ungated shared experts, "
+            "and Granite scaling. Non-empty deep-stack mappings and tensor-backed LongRoPE "
+            "remain fail-closed because the current text task cannot represent those data-plane "
+            "inputs or preserve the serialized attention factor exactly. "
+            + _RUNTIME_VALIDATION_PENDING
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="granitemoe",
         model_type="granitemoe",
         tensor_map_recipe=("llama", "moe_extras"),
@@ -1784,10 +1834,29 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     ),
     GGUFArchitectureSpec(
         gguf_arch="smallthinker",
-        config=Support.DEFERRED,
-        tensor_map=Support.DEFERRED,
-        graph=Support.DEFERRED,
+        model_type="smallthinker_gguf",
+        module_type="smallthinker_gguf",
+        tensor_map_recipe=("smallthinker",),
+        config_postprocessor="smallthinker",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "rope.dimension_count",
+            "rope.freq_base",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_gating_func",
+        ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
         runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
         reason=_SMALLTHINKER_GGUF_GRAPH_REASON,
     ),
     # ------------------------------ Remaining multimodal text backbones (audited/deferred)
@@ -2360,6 +2429,35 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="maincoder",
+        model_type="maincoder",
+        tensor_map_recipe=("llama", "exact_legacy_gguf_extras"),
+        config_postprocessor="maincoder",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        rope_interleave=True,
+        llama_qk_permute=False,
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact float import is covered with learned per-head Q/K RMSNorm after "
+            "adjacent-pair RoPE, sequential pre-norm SwiGLU blocks, causal GQA cache, "
+            "and a tied output head. Packed projection preservation and runtime packaging "
+            "remain deferred; use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="wavtokenizer-dec",
         config=Support.DEFERRED,
         tensor_map=Support.DEFERRED,
@@ -2388,6 +2486,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "gemma-embedding",
             "jais2",
             "minicpm",
+            "maincoder",
             "plm",
             "orion",
             "pangu-embedded",

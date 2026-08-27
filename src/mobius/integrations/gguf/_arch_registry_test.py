@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 93
+_EXPECTED_SUPPORTED_COUNT = 98
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -68,6 +68,7 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "command-r",
         "ernie4_5",
         "gptneox",
+        "granite",
         "jais",
         "jais2",
         "minicpm",
@@ -76,10 +77,12 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "orion",
         "pangu-embedded",
         "plm",
+        "plamo",
         "qwen",
         "refact",
         "gemma-embedding",
         "llama-embed",
+        "maincoder",
         "starcoder",
         "xverse",
     }
@@ -185,6 +188,7 @@ _EXPECTED_QUANTIZED_IMPORT_ARCHITECTURES = frozenset(
         "gemma2",
         "gemma3",
         "gemma4",
+        "granite",
         "granitemoe",
         "hunyuan-dense",
         "jamba",
@@ -316,10 +320,12 @@ class TestCapabilityClosure:
             "granitehybrid",
             "internlm2",
             "jina-bert-v2",
+            "jina-bert-v3",
             "llama-embed",
             "lfm2moe",
             "mamba",
             "mamba2",
+            "maincoder",
             "nemotron_h",
             "nemotron_h_moe",
             "neo-bert",
@@ -336,9 +342,11 @@ class TestCapabilityClosure:
             "mpt",
             "openelm",
             "orion",
+            "plamo",
             "qwen",
             "refact",
             "starcoder",
+            "smallthinker",
             "talkie",
             "xverse",
         }
@@ -1091,7 +1099,6 @@ class TestPinnedRemainingConventionalMoECohort:
         "gpt-oss",
         "grok",
         "grovemoe",
-        "smallthinker",
     )
     _DEFERRED_ARCHITECTURES = tuple(
         architecture
@@ -1104,7 +1111,6 @@ class TestPinnedRemainingConventionalMoECohort:
         "gpt-oss": 24,
         "grok": 24,
         "grovemoe": 23,
-        "smallthinker": 18,
     }
 
     @pytest.mark.parametrize("architecture", _DEFERRED_ARCHITECTURES)
@@ -1237,7 +1243,6 @@ class TestPinnedRemainingConventionalMoECohort:
             ("gpt-oss", ("MXFP4", "expert biases", "attention sinks")),
             ("grok", ("softcaps", "sqrt(2)/2", "dense-plus-routed")),
             ("grovemoe", ("separate selections", "adjugate", "Q/K RMSNorm")),
-            ("smallthinker", ("unnormalized", "sigmoid or softmax", "ReLU")),
         ],
     )
     def test_graph_and_routing_mismatch_is_explicit(

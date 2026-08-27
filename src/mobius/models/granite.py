@@ -26,10 +26,16 @@ class GraniteTextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        from mobius.models.moe import _quantized_linear_class
+
         self._dtype = config.dtype
         self.embed_tokens = embedding_for_config(config)
+        linear_class = _quantized_linear_class(config)
         self.layers = nn.ModuleList(
-            [create_decoder_layer(config) for _ in range(config.num_hidden_layers)]
+            [
+                create_decoder_layer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)
@@ -51,13 +57,18 @@ class GraniteTextModel(nn.Module):
         # Apply embedding multiplier
         hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
 
-        position_embeddings = self.rotary_emb(op, position_ids)
-        attention_bias = create_attention_bias(
-            op,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            dtype=self._dtype,
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
         )
+        if attention_mask is not None:
+            attention_bias = create_attention_bias(
+                op,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                dtype=self._dtype,
+            )
+        else:
+            attention_bias = None
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
@@ -157,7 +168,9 @@ class GraniteMoETextModel(nn.Module):
         # Apply Granite embedding multiplier
         hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
 
-        position_embeddings = self.rotary_emb(op, position_ids)
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
         if attention_mask is not None:
             attention_bias = create_attention_bias(
                 op,

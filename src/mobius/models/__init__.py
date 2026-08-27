@@ -57,6 +57,7 @@ __all__ = [
     "GPTNeoXCausalLMModel",
     "GPTNeoXJapaneseCausalLMModel",
     "ExactLegacyGGUFCausalLMModel",
+    "PlamoGGUFCausalLMModel",
     "GPTOSSCausalLMModel",
     "EuroBertGGUFModel",
     "Gemma2CausalLMModel",
@@ -89,6 +90,7 @@ __all__ = [
     "MageVLForConditionalGeneration",
     "JambaCausalLMModel",
     "JinaBertV2GGUFModel",
+    "JinaBertV3GGUFModel",
     "Jais2CausalLMModel",
     "JetMoeCausalLMModel",
     "KimiK3CausalLMModel",
@@ -108,6 +110,7 @@ __all__ = [
     "MPTCausalLMModel",
     "Mamba2CausalLMModel",
     "MambaCausalLMModel",
+    "MaincoderCausalLMModel",
     "MiniMaxCausalLMModel",
     "MiniCPM3CausalLMModel",
     "MiniCPMCausalLMModel",
@@ -186,6 +189,7 @@ __all__ = [
     "QwenCausalLMModel",
     "QwenImageTransformer2DModel",
     "SD3Transformer2DModel",
+    "SmallThinkerGGUFCausalLMModel",
     "SmolLM3CausalLMModel",
     "StarCoder2CausalLMModel",
     "T2IAdapterModel",
@@ -271,11 +275,13 @@ from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGU
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,
+    JinaBertV3GGUFModel,
     NeoBertGGUFModel,
     NomicBertGGUFModel,
     NomicBertMoEGGUFModel,
 )
 from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
+from mobius.models.gguf_plamo import PlamoGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
@@ -308,6 +314,7 @@ from mobius.models.llama4 import Llama4CausalLMModel
 from mobius.models.llava import LLaVAModel
 from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
+from mobius.models.maincoder import MaincoderCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
 from mobius.models.mimi import MimiModel, mimi_default_config
 from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
@@ -415,6 +422,7 @@ from mobius.models.qwen_vl import (
 )
 from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel
+from mobius.models.smallthinker import SmallThinkerGGUFCausalLMModel
 from mobius.models.smollm import SmolLM3CausalLMModel
 from mobius.models.sortformer import SortformerConfig, SortformerDiarizationModel
 from mobius.models.starcoder2 import StarCoder2CausalLMModel

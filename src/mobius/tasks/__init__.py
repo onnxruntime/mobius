@@ -23,6 +23,7 @@ __all__ = [
     "AudioCTCTask",
     "AudioFeatureExtractionTask",
     "CausalLMTask",
+    "SmallThinkerGGUFCausalLMTask",
     "CTCAsrTask",
     "FeatureCTCAsrTask",
     "RNNTTask",
@@ -75,6 +76,7 @@ __all__ = [
     "OPSET_VERSION",
     "ObjectDetectionTask",
     "Phi4MMMultiModalTask",
+    "PlamoCausalLMTask",
     "Plamo2CausalLMTask",
     "PixtralVLTask",
     "Qwen3VLVisionLanguageTask",
@@ -115,6 +117,7 @@ from mobius.tasks._base import (
 from mobius.tasks._causal_lm import (
     CausalLMTask,
     HybridCausalLMTask,
+    SmallThinkerGGUFCausalLMTask,
 )
 from mobius.tasks._codec import CodecTask
 from mobius.tasks._controlnet import ControlNetTask
@@ -156,6 +159,7 @@ from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
 from mobius.tasks._phi4mm_multimodal import Phi4MMMultiModalTask
+from mobius.tasks._plamo import PlamoCausalLMTask
 from mobius.tasks._plamo2 import Plamo2CausalLMTask
 from mobius.tasks._qwen4_exp import (
     Qwen4ExpCausalLMTask,
@@ -224,12 +228,14 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "moshi-depformer": MoshiDepformerTask,
     "moshi-temporal": MoshiTemporalTask,
     "text-generation": CausalLMTask,
+    "smallthinker-gguf-text-generation": SmallThinkerGGUFCausalLMTask,
     "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,
     "falcon-h1-text-generation": FalconH1CausalLMTask,
+    "plamo-text-generation": PlamoCausalLMTask,
     "plamo2-text-generation": Plamo2CausalLMTask,
     "dflash-draft": DFlashDraftTask,
     "eagle3-draft": Eagle3DraftTask,

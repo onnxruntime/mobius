@@ -390,9 +390,7 @@ def test_pangu_embedded_tied_output_has_single_embedding_owner() -> None:
 @pytest.mark.parametrize(
     ("architecture", "reason_fragments"),
     [
-        ("maincoder", ("after RoPE", "ordering")),
         ("mistral4", ("conditional dense/MoE", "overrides graph construction")),
-        ("plamo", ("parallel", "Q/output projection shuffles")),
         ("plamo3", ("fused QKV", "periodic full/sliding", "iSWA cache ABI")),
     ],
 )

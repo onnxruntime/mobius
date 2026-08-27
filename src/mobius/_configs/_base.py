@@ -486,6 +486,7 @@ class ArchitectureConfig(BaseModelConfig):
     encoder_qk_norm: bool = False
     encoder_extra_attention_norm: bool = False
     encoder_fused_geglu: bool = False
+    encoder_fused_qkv: bool = False
     pooling_type: int = 0
     embedding_dense_2_out: int | None = None
     embedding_dense_3_in: int | None = None

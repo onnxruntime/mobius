@@ -51,7 +51,7 @@ class RecentPRDependency:
 
     number: int
     title: str
-    state_at_audit: Literal["merged", "open"]
+    state_at_audit: Literal["merged", "open", "closed"]
     dependency: str
 
 
@@ -65,20 +65,26 @@ RECENT_PR_DEPENDENCIES: tuple[RecentPRDependency, ...] = (
     RecentPRDependency(
         651,
         "Validate Gemma4 GGUF tokenizer reconstruction",
-        "open",
-        "gemma4 tokenizer evidence; do not duplicate its oracle fixture or evidence record",
+        "merged",
+        "gemma4 tokenizer evidence merged into the authoritative route census",
     ),
     RecentPRDependency(
         652,
         "Support complete sharded GGUF imports",
-        "open",
-        "complete-shard identity and bounded header preflight for multi-file artifacts",
+        "closed",
+        "superseded by merged PR #656",
     ),
     RecentPRDependency(
         656,
         "Add exact fail-closed Qwen4Exp GGUF support",
-        "open",
-        "incoming qwen4exp header/config route; payload remains blocked on mixed native-block ABI",
+        "merged",
+        "qwen4exp route and complete sharded import merged, superseding PR #652",
+    ),
+    RecentPRDependency(
+        675,
+        "Fix sharded GGUF evidence edge cases",
+        "merged",
+        "follow-up hardening for sharded GGUF evidence edge cases after PR #656",
     ),
 )
 
@@ -280,8 +286,6 @@ def _tokenizer_items() -> list[GGUFRouteWorkItem]:
             )
         if record.identifier == "gemma4":
             dependencies += ("PR #651",)
-        if record.identifier == "llama4":
-            dependencies += ("PR #652",)
         items.append(
             GGUFRouteWorkItem(
                 f"tokenizer:{record.identifier}",

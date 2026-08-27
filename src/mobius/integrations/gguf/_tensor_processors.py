@@ -597,6 +597,65 @@ def _process_granitehybrid(
     return state_dict
 
 
+def _plamo_unshuffle_q(tensor: torch.Tensor, config: Any) -> torch.Tensor:
+    """Invert the converter's ``[repeat, kv, head] -> [kv, repeat, head]`` Q shuffle."""
+    heads = int(config.num_attention_heads)
+    kv_heads = int(config.num_key_value_heads)
+    head_dim = int(config.head_dim)
+    hidden = int(config.hidden_size)
+    if heads % kv_heads:
+        raise ValueError("PLaMo Q shuffle requires query heads divisible by KV heads")
+    if tensor.dim() != 2 or tuple(tensor.shape) != (heads * head_dim, hidden):
+        raise ValueError(
+            "PLaMo Q projection must have shape "
+            f"{(heads * head_dim, hidden)}, got {tuple(tensor.shape)}"
+        )
+    repeat = heads // kv_heads
+    return (
+        tensor.reshape(kv_heads, repeat, head_dim, hidden)
+        .permute(1, 0, 2, 3)
+        .reshape(heads * head_dim, hidden)
+        .contiguous()
+    )
+
+
+def _plamo_unshuffle_output(tensor: torch.Tensor, config: Any) -> torch.Tensor:
+    """Invert the converter's output-input-head shuffle."""
+    heads = int(config.num_attention_heads)
+    kv_heads = int(config.num_key_value_heads)
+    head_dim = int(config.head_dim)
+    hidden = int(config.hidden_size)
+    if heads % kv_heads:
+        raise ValueError("PLaMo output shuffle requires query heads divisible by KV heads")
+    if tensor.dim() != 2 or tuple(tensor.shape) != (hidden, heads * head_dim):
+        raise ValueError(
+            "PLaMo output projection must have shape "
+            f"{(hidden, heads * head_dim)}, got {tuple(tensor.shape)}"
+        )
+    repeat = heads // kv_heads
+    return (
+        tensor.reshape(hidden, kv_heads, repeat, head_dim)
+        .permute(0, 2, 1, 3)
+        .reshape(hidden, heads * head_dim)
+        .contiguous()
+    )
+
+
+def _process_plamo(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore source PLaMo Q/output layouts after llama.cpp conversion."""
+    q_suffix = ".self_attn.q_proj.weight"
+    output_suffix = ".self_attn.o_proj.weight"
+    for name in tuple(state_dict):
+        if name.endswith(q_suffix):
+            state_dict[name] = _plamo_unshuffle_q(state_dict[name], config)
+        elif name.endswith(output_suffix):
+            state_dict[name] = _plamo_unshuffle_output(state_dict[name], config)
+    return state_dict
+
+
 # Named weight processors. The architecture registry refers to these by name,
 # which is why the table is keyed on the processor's own identity rather than on
 # a model_type. Every name here must be referenced by at least one architecture
@@ -616,6 +675,7 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "gpt2": _process_gpt2,
     "mamba": _process_mamba,
     "nemotron_h": _process_nemotron_h,
+    "plamo": _process_plamo,
     "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
     "kimi_linear": _process_kimi_linear,

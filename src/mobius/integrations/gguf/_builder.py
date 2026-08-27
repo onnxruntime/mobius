@@ -685,6 +685,10 @@ def _validate_gguf_model(
     validate_mtp_tensor_contract(gguf_model)
     _raise_for_unsupported_auxiliary_quantization(gguf_model)
     _raise_for_invalid_falcon_h1_tensor_contract(gguf_model)
+    _raise_for_invalid_plamo_tensor_contract(
+        gguf_model,
+        keep_quantized=keep_quantized,
+    )
     _raise_for_invalid_plamo2_tensor_contract(gguf_model)
     _raise_for_invalid_minimax_tensor_contract(gguf_model)
     _raise_for_invalid_kimi_k3_tensor_contract(gguf_model)
@@ -699,6 +703,9 @@ def _validate_gguf_model(
     _raise_for_invalid_embedding_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
+    _raise_for_invalid_maincoder_tensor_contract(gguf_model)
+    _raise_for_invalid_granite_tensor_contract(gguf_model)
+    _raise_for_invalid_smallthinker_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
@@ -2014,6 +2021,121 @@ def _raise_for_invalid_dense_c01_tensor_contract(gguf_model) -> None:
         )
 
 
+def _raise_for_invalid_plamo_tensor_contract(
+    gguf_model,
+    *,
+    keep_quantized: bool | None,
+) -> None:
+    """Validate the fixed converter-emitted PLaMo-13B tensor/value contract."""
+    if gguf_model.architecture != "plamo":
+        return
+
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+    )
+
+    metadata = gguf_model.metadata
+    expected_metadata = {
+        "plamo.context_length": 4096,
+        "plamo.embedding_length": 5120,
+        "plamo.block_count": 40,
+        "plamo.feed_forward_length": 16640,
+        "plamo.attention.head_count": 40,
+        "plamo.attention.head_count_kv": 5,
+    }
+    missing_metadata = sorted(set(expected_metadata) - set(metadata))
+    if missing_metadata:
+        raise ValueError(
+            f"PLaMo GGUF is missing required architecture metadata: {missing_metadata}"
+        )
+    invalid_metadata = {
+        key: (expected, metadata[key])
+        for key, expected in expected_metadata.items()
+        if int(metadata[key]) != expected
+    }
+    if invalid_metadata:
+        raise ValueError(f"PLaMo GGUF has unsupported fixed geometry: {invalid_metadata}")
+    if int(metadata.get("plamo.rope.dimension_count", 128)) != 128:
+        raise ValueError("PLaMo GGUF requires full-head rope.dimension_count=128")
+    if not math.isclose(
+        float(metadata.get("plamo.rope.freq_base", 10000.0)),
+        10000.0,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    ):
+        raise ValueError("PLaMo GGUF requires rope.freq_base=10000")
+
+    items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in items
+    }
+    if "token_embd.weight" not in actual or len(actual["token_embd.weight"]) != 2:
+        raise ValueError("PLaMo GGUF requires a rank-2 token_embd.weight tensor")
+    vocab, hidden = actual["token_embd.weight"]
+    if hidden != 5120 or vocab <= 0:
+        raise ValueError(
+            "PLaMo token_embd.weight must have shape [positive_vocab, 5120], "
+            f"got {actual['token_embd.weight']}"
+        )
+
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, 5120),
+        "output_norm.weight": (5120,),
+        "output.weight": (vocab, 5120),
+    }
+    for layer in range(40):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (5120,),
+                prefix + "attn_q.weight": (5120, 5120),
+                prefix + "attn_k.weight": (640, 5120),
+                prefix + "attn_v.weight": (640, 5120),
+                prefix + "attn_output.weight": (5120, 5120),
+                prefix + "ffn_gate.weight": (16640, 5120),
+                prefix + "ffn_up.weight": (16640, 5120),
+                prefix + "ffn_down.weight": (5120, 16640),
+            }
+        )
+
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required))
+    malformed = {
+        name: (required[name], actual[name])
+        for name in set(required) & set(actual)
+        if required[name] != actual[name]
+    }
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid PLaMo exact GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+    float_types = float_storage_type_ids()
+    unsupported_qtypes: dict[str, str] = {}
+    packed_shuffle_tensors: list[str] = []
+    for name, _raw, qtype, _shape in items:
+        qtype_id = getattr(qtype, "value", qtype)
+        quant_spec = get_quant_spec(qtype)
+        if quant_spec is None or quant_spec.dequantize is not Support.SUPPORTED:
+            unsupported_qtypes[name] = str(getattr(qtype, "name", qtype))
+        if (
+            keep_quantized
+            and qtype_id not in float_types
+            and name.endswith(("attn_q.weight", "attn_output.weight"))
+        ):
+            packed_shuffle_tensors.append(name)
+    if unsupported_qtypes:
+        raise ValueError(f"PLaMo GGUF contains unsupported qtypes: {unsupported_qtypes}")
+    if packed_shuffle_tensors:
+        raise ValueError(
+            "PLaMo keep_quantized=True cannot preserve packed Q/output tensors that "
+            "require value shuffles: " + ", ".join(sorted(packed_shuffle_tensors))
+        )
+
+
 def _raise_for_invalid_exact_legacy_decoder_tensor_contract(gguf_model) -> None:
     """Validate narrowed executable unions for six conventional GGUF decoders."""
     architecture = gguf_model.architecture
@@ -2427,6 +2549,379 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         raise ValueError(
             f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
             f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_maincoder_tensor_contract(gguf_model) -> None:
+    """Validate Maincoder metadata, geometry, qtypes, and tied tensor closure."""
+    if gguf_model.architecture != "maincoder":
+        return
+
+    metadata = gguf_model.metadata
+    arch = "maincoder"
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.key_length",
+        "attention.value_length",
+        "attention.layer_norm_rms_epsilon",
+        "rope.freq_base",
+        "rope.dimension_count",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}"
+        for suffix in required_suffixes
+        if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"Maincoder GGUF is missing required metadata: {missing_metadata}")
+
+    def _positive_int(suffix: str) -> int:
+        key = f"{arch}.{suffix}"
+        value = metadata[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{key} must be a positive integer, got {value!r}")
+        try:
+            integer = int(value)
+        except (ValueError, OverflowError) as error:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}") from error
+        if integer <= 0 or integer != value:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}")
+        return integer
+
+    _positive_int("context_length")
+    hidden = _positive_int("embedding_length")
+    intermediate = _positive_int("feed_forward_length")
+    blocks = _positive_int("block_count")
+    query_heads = _positive_int("attention.head_count")
+    kv_heads = _positive_int("attention.head_count_kv")
+    key_length = _positive_int("attention.key_length")
+    value_length = _positive_int("attention.value_length")
+    rope_dimension = _positive_int("rope.dimension_count")
+    epsilon = metadata[f"{arch}.attention.layer_norm_rms_epsilon"]
+    rope_base = metadata[f"{arch}.rope.freq_base"]
+    for key, value in (
+        (f"{arch}.attention.layer_norm_rms_epsilon", epsilon),
+        (f"{arch}.rope.freq_base", rope_base),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{key} must be a finite positive number, got {value!r}")
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{key} must be a finite positive number, got {value!r}")
+
+    if query_heads % kv_heads:
+        raise ValueError(
+            "maincoder.attention.head_count must be divisible by "
+            "maincoder.attention.head_count_kv"
+        )
+    if hidden != query_heads * key_length:
+        raise ValueError(
+            "Maincoder requires embedding_length == attention.head_count * "
+            f"attention.key_length, got {hidden} != {query_heads} * {key_length}"
+        )
+    if value_length != key_length or rope_dimension != key_length:
+        raise ValueError(
+            "Maincoder requires equal full-head key/value/RoPE dimensions, got "
+            f"key={key_length}, value={value_length}, rope={rope_dimension}"
+        )
+    scaling_keys = sorted(key for key in metadata if key.startswith(f"{arch}.rope.scaling."))
+    if scaling_keys:
+        raise ValueError(
+            "Maincoder's promoted profile does not support scaled/sectioned RoPE "
+            f"metadata: {scaling_keys}"
+        )
+
+    actual: dict[str, tuple[int, ...]] = {}
+    qtypes: dict[str, Any] = {}
+    for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
+        actual[name] = tuple(int(dim) for dim in shape)
+        qtypes[name] = qtype
+
+    kv_hidden = kv_heads * key_length
+    required = {
+        "token_embd.weight": (-1, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    for block in range(blocks):
+        prefix = f"blk.{block}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_q.weight": (hidden, hidden),
+                prefix + "attn_k.weight": (kv_hidden, hidden),
+                prefix + "attn_v.weight": (kv_hidden, hidden),
+                prefix + "attn_output.weight": (hidden, hidden),
+                prefix + "attn_q_norm.weight": (key_length,),
+                prefix + "attn_k_norm.weight": (key_length,),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+        )
+
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required))
+    malformed = {
+        name: (expected, actual[name])
+        for name, expected in required.items()
+        if name in actual
+        and (
+            len(expected) != len(actual[name])
+            or any(want != -1 and want != got for want, got in zip(expected, actual[name]))
+        )
+    }
+    vocab = actual.get("token_embd.weight", (0,))[0]
+    if vocab <= 0:
+        malformed["token_embd.weight"] = (
+            required["token_embd.weight"],
+            actual.get("token_embd.weight"),
+        )
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid maincoder GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    float_qtypes = float_storage_type_ids()
+    quantized_auxiliary = sorted(
+        name
+        for name, shape in actual.items()
+        if len(shape) == 1 and getattr(qtypes[name], "value", qtypes[name]) not in float_qtypes
+    )
+    if quantized_auxiliary:
+        raise ValueError(
+            "Maincoder normalization tensors must use float GGUF storage: "
+            f"{quantized_auxiliary}"
+        )
+
+
+def _raise_for_invalid_smallthinker_tensor_contract(gguf_model) -> None:
+    """Validate SmallThinker's complete tensor, shape, and qtype closure."""
+    if gguf_model.architecture != "smallthinker":
+        return
+
+    from mobius.integrations.gguf._quant_registry import (
+        float_storage_type_ids,
+        get_quant_spec,
+    )
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    arch = "smallthinker"
+    metadata = gguf_model.metadata
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.layer_norm_rms_epsilon",
+        "rope.dimension_count",
+        "rope.freq_base",
+        "expert_count",
+        "expert_used_count",
+        "expert_feed_forward_length",
+        "expert_gating_func",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}"
+        for suffix in required_suffixes
+        if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"smallthinker GGUF is missing required metadata: {missing_metadata}")
+
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata[f"{arch}.attention.head_count_kv"])
+    experts = int(metadata[f"{arch}.expert_count"])
+    top_k = int(metadata[f"{arch}.expert_used_count"])
+    expert_intermediate = int(metadata[f"{arch}.expert_feed_forward_length"])
+    context = int(metadata[f"{arch}.context_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0)) or len(
+        metadata.get("tokenizer.ggml.tokens", ())
+    )
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    rope_base = float(metadata[f"{arch}.rope.freq_base"])
+    head_dim = int(
+        metadata.get(f"{arch}.attention.key_length", hidden // heads if heads > 0 else 0)
+    )
+    value_dim = int(metadata.get(f"{arch}.attention.value_length", head_dim))
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    if (
+        min(
+            hidden,
+            intermediate,
+            layers,
+            heads,
+            kv_heads,
+            experts,
+            top_k,
+            expert_intermediate,
+            context,
+            vocab,
+            head_dim,
+        )
+        <= 0
+        or hidden != heads * head_dim
+        or heads % kv_heads
+        or value_dim != head_dim
+        or rope_dim != head_dim
+        or intermediate != expert_intermediate
+        or top_k > experts
+        or not math.isfinite(epsilon)
+        or epsilon <= 0
+        or not math.isfinite(rope_base)
+        or rope_base <= 0
+    ):
+        raise ValueError("smallthinker GGUF has invalid model geometry")
+
+    items = list(gguf_model.tensor_items_raw())
+    actual = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in items
+        if not is_known_skip(name)
+    }
+    qtypes = {name: qtype for name, _raw, qtype, _shape in items}
+    required: dict[str, tuple[int, ...]] = {
+        "token_embd.weight": (vocab, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    optional: dict[str, tuple[int, ...]] = {
+        "output.weight": (vocab, hidden),
+    }
+    all_projection_biases: set[str] = set()
+    q_width = heads * head_dim
+    kv_width = kv_heads * head_dim
+    for layer in range(layers):
+        prefix = f"blk.{layer}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_output.weight": (hidden, q_width),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate_inp.weight": (experts, hidden),
+                prefix + "ffn_gate_exps.weight": (
+                    experts,
+                    expert_intermediate,
+                    hidden,
+                ),
+                prefix + "ffn_up_exps.weight": (
+                    experts,
+                    expert_intermediate,
+                    hidden,
+                ),
+                prefix + "ffn_down_exps.weight": (
+                    experts,
+                    hidden,
+                    expert_intermediate,
+                ),
+            }
+        )
+
+        fused_weight = prefix + "attn_qkv.weight"
+        split_weights = {
+            prefix + "attn_q.weight": (q_width, hidden),
+            prefix + "attn_k.weight": (kv_width, hidden),
+            prefix + "attn_v.weight": (kv_width, hidden),
+        }
+        has_fused = fused_weight in actual
+        present_split = set(split_weights) & set(actual)
+        if has_fused == bool(present_split) or (
+            present_split and present_split != set(split_weights)
+        ):
+            raise ValueError(
+                f"smallthinker layer {layer} must contain exactly one complete QKV "
+                "layout: fused attn_qkv or split attn_q/attn_k/attn_v"
+            )
+        if has_fused:
+            required[fused_weight] = (q_width + 2 * kv_width, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_width + 2 * kv_width,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        else:
+            required.update(split_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_width,),
+                prefix + "attn_k.bias": (kv_width,),
+                prefix + "attn_v.bias": (kv_width,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        if alternate_biases & set(actual):
+            raise ValueError(
+                f"smallthinker layer {layer} QKV bias layout does not match its weights"
+            )
+        present_biases = set(selected_biases) & set(actual)
+        if present_biases and present_biases != set(selected_biases):
+            raise ValueError(
+                f"smallthinker layer {layer} has a partial attention Q/K/V bias set"
+            )
+        optional.update(selected_biases)
+        all_projection_biases.update(selected_biases)
+
+    present_biases = all_projection_biases & set(actual)
+    if present_biases and present_biases != all_projection_biases:
+        raise ValueError(
+            "smallthinker attention Q/K/V biases must be present in every layer "
+            "or absent entirely"
+        )
+
+    allowed = set(required) | set(optional)
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - allowed)
+    malformed = {
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & set(actual)
+        if actual[name] != required.get(name, optional.get(name))
+    }
+    out_of_range = sorted(
+        name
+        for name in actual
+        if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
+    )
+    if missing or unexpected or malformed or out_of_range:
+        raise ValueError(
+            "Invalid smallthinker GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}, "
+            f"out_of_range={out_of_range}"
+        )
+
+    unsupported_qtypes = {}
+    for name, qtype in qtypes.items():
+        if name not in allowed:
+            continue
+        quant_spec = get_quant_spec(qtype)
+        if quant_spec is None or quant_spec.dequantize is not Support.SUPPORTED:
+            unsupported_qtypes[name] = getattr(qtype, "name", str(qtype))
+    if unsupported_qtypes:
+        raise ValueError(
+            "smallthinker GGUF contains qtypes without a supported float "
+            f"dequantization route: {unsupported_qtypes}"
+        )
+
+    float_types = float_storage_type_ids()
+    non_float_norms = sorted(
+        name
+        for name, qtype in qtypes.items()
+        if name.endswith(("attn_norm.weight", "ffn_norm.weight", "output_norm.weight"))
+        and getattr(qtype, "value", qtype) not in float_types
+    )
+    if non_float_norms:
+        raise ValueError(
+            "smallthinker normalization tensors must use F32/F16/BF16 storage: "
+            f"{non_float_norms}"
         )
 
 
@@ -2870,6 +3365,87 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
             )
         return
 
+    elif architecture == "dbrx":
+        required_suffixes = (
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.layer_norm_epsilon",
+            "attention.clamp_kqv",
+            "expert_count",
+            "expert_used_count",
+        )
+        missing_metadata = [
+            f"{architecture}.{suffix}"
+            for suffix in required_suffixes
+            if f"{architecture}.{suffix}" not in metadata
+        ]
+        if missing_metadata:
+            raise ValueError(
+                f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
+            )
+        hidden = int(metadata[f"{architecture}.embedding_length"])
+        intermediate = int(metadata[f"{architecture}.feed_forward_length"])
+        layers = int(metadata[f"{architecture}.block_count"])
+        heads = int(metadata[f"{architecture}.attention.head_count"])
+        kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
+        experts = int(metadata[f"{architecture}.expert_count"])
+        top_k = int(metadata[f"{architecture}.expert_used_count"])
+        vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+            metadata.get("tokenizer.ggml.tokens", ())
+        )
+        if (
+            min(hidden, intermediate, layers, heads, kv_heads, experts, top_k, vocab) <= 0
+            or hidden % heads
+            or heads % kv_heads
+            or top_k > experts
+        ):
+            raise ValueError(f"{architecture} GGUF has invalid MoE geometry")
+        head_dim = hidden // heads
+        query_width = heads * head_dim
+        kv_width = kv_heads * head_dim
+        qkv_width = query_width + 2 * kv_width
+
+        actual = {
+            name: tuple(int(dimension) for dimension in shape)
+            for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+            if not is_known_skip(name)
+        }
+        required = {
+            "token_embd.weight": (vocab, hidden),
+            "output_norm.weight": (hidden,),
+            "output.weight": (vocab, hidden),
+        }
+        for layer in range(layers):
+            prefix = f"blk.{layer}."
+            required.update(
+                {
+                    prefix + "attn_qkv.weight": (qkv_width, hidden),
+                    prefix + "attn_output.weight": (hidden, query_width),
+                    prefix + "attn_norm.weight": (hidden,),
+                    prefix + "attn_output_norm.weight": (hidden,),
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
+                    prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
+                    prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+                }
+            )
+        missing = sorted(set(required) - set(actual))
+        unexpected = sorted(set(actual) - set(required))
+        malformed = {
+            name: (required[name], actual[name])
+            for name in set(required) & set(actual)
+            if actual[name] != required[name]
+        }
+        if missing or unexpected or malformed:
+            raise ValueError(
+                f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
+                f"unexpected={unexpected}, malformed={malformed}"
+            )
+        return
+
     elif architecture == "arctic":
         required_suffixes = (
             "context_length",
@@ -3113,93 +3689,283 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
             )
         return
 
+
+def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
+    """Validate Granite's architecture-wide dense-or-MoE tensor union."""
+    if gguf_model.architecture != "granite":
+        return
+
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    metadata = gguf_model.metadata
+    arch = "granite"
     required_suffixes = (
         "context_length",
         "embedding_length",
         "feed_forward_length",
         "block_count",
         "attention.head_count",
-        "attention.layer_norm_epsilon",
-        "attention.clamp_kqv",
-        "expert_count",
-        "expert_used_count",
+        "attention.layer_norm_rms_epsilon",
+        "logit_scale",
     )
     missing_metadata = [
-        f"{architecture}.{suffix}"
+        f"{arch}.{suffix}"
         for suffix in required_suffixes
-        if f"{architecture}.{suffix}" not in metadata
+        if f"{arch}.{suffix}" not in metadata
     ]
     if missing_metadata:
-        raise ValueError(
-            f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
-        )
+        raise ValueError(f"granite GGUF is missing required metadata: {missing_metadata}")
 
-    hidden = int(metadata[f"{architecture}.embedding_length"])
-    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
-    layers = int(metadata[f"{architecture}.block_count"])
-    heads = int(metadata[f"{architecture}.attention.head_count"])
-    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
-    experts = int(metadata[f"{architecture}.expert_count"])
-    top_k = int(metadata[f"{architecture}.expert_used_count"])
-    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{arch}.attention.head_count_kv", heads))
+    context = int(metadata[f"{arch}.context_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0)) or len(
         metadata.get("tokenizer.ggml.tokens", ())
     )
+    experts = int(metadata.get(f"{arch}.expert_count", 0))
+    top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
+    raw_expert_intermediate = metadata.get(f"{arch}.expert_feed_forward_length")
+    if raw_expert_intermediate is not None:
+        if isinstance(raw_expert_intermediate, (bool, np.bool_)):
+            serialized_expert_intermediate = None
+        elif isinstance(raw_expert_intermediate, (int, np.integer)):
+            serialized_expert_intermediate = int(raw_expert_intermediate)
+        elif isinstance(raw_expert_intermediate, (float, np.floating)):
+            numeric_expert_intermediate = float(raw_expert_intermediate)
+            serialized_expert_intermediate = (
+                int(numeric_expert_intermediate)
+                if math.isfinite(numeric_expert_intermediate)
+                and numeric_expert_intermediate.is_integer()
+                else None
+            )
+        else:
+            serialized_expert_intermediate = None
+        if serialized_expert_intermediate != intermediate:
+            raise ValueError(
+                "granite.expert_feed_forward_length must equal feed_forward_length "
+                "because the pinned loader sizes routed experts from feed_forward_length"
+            )
+    expert_intermediate = intermediate
+    shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
     if (
-        min(hidden, intermediate, layers, heads, kv_heads, experts, top_k, vocab) <= 0
+        min(hidden, intermediate, layers, heads, kv_heads, context, vocab) <= 0
         or hidden % heads
         or heads % kv_heads
-        or top_k > experts
+        or experts < 0
+        or top_k < 0
+        or bool(experts) != bool(top_k)
+        or (experts and (top_k > experts or expert_intermediate <= 0))
+        or shared_width < 0
+        or (not experts and shared_width)
     ):
-        raise ValueError(f"{architecture} GGUF has invalid MoE geometry")
-    eps = float(metadata[f"{architecture}.attention.layer_norm_epsilon"])
-    clamp = float(metadata[f"{architecture}.attention.clamp_kqv"])
-    if not math.isfinite(eps) or eps <= 0 or not math.isfinite(clamp) or clamp < 0:
-        raise ValueError(f"{architecture} GGUF has invalid normalization or QKV clamp")
+        raise ValueError("granite GGUF has invalid dense/MoE geometry")
 
     head_dim = hidden // heads
-    q_width = heads * head_dim
-    kv_width = kv_heads * head_dim
+    key_dim = int(metadata.get(f"{arch}.attention.key_length", head_dim))
+    value_dim = int(metadata.get(f"{arch}.attention.value_length", head_dim))
+    rope_dim = int(metadata.get(f"{arch}.rope.dimension_count", head_dim))
+    if key_dim != head_dim or value_dim != head_dim or rope_dim != head_dim or rope_dim % 2:
+        raise ValueError(
+            "granite attention key/value/rotary dimensions must equal embedding_length / "
+            "attention.head_count"
+        )
+
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    logit_scale = float(metadata[f"{arch}.logit_scale"])
+    optional_scales = [
+        float(metadata.get(f"{arch}.{suffix}", 0.0))
+        for suffix in ("embedding_scale", "residual_scale", "attention.scale")
+    ]
+    if (
+        not math.isfinite(epsilon)
+        or epsilon <= 0
+        or not math.isfinite(logit_scale)
+        or math.isclose(logit_scale, 0.0, rel_tol=0.0, abs_tol=0.0)
+        or not all(math.isfinite(value) for value in optional_scales)
+    ):
+        raise ValueError("granite GGUF has invalid normalization or scaling metadata")
+
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    supported_scaling_types = {None, "", "none"}
+    if scaling_type not in supported_scaling_types:
+        raise ValueError(f"granite GGUF has unsupported rope.scaling.type={scaling_type!r}")
+
+    deepstack = metadata.get(f"{arch}.deepstack_mapping")
+    if deepstack is not None:
+        if not isinstance(deepstack, (list, tuple, np.ndarray)):
+            raise ValueError("granite.deepstack_mapping must be an integer array")
+        mapping = [int(value) for value in deepstack]
+        if mapping and len(mapping) != layers:
+            raise ValueError("granite.deepstack_mapping must match block_count")
+        if any(value != -1 for value in mapping):
+            raise NotImplementedError(
+                "granite deep-stack embedding injection is unsupported by the text task; "
+                "only an absent, empty, or all -1 mapping is accepted"
+            )
+
+    raw_items = list(gguf_model.tensor_items_raw())
     actual = {
         name: tuple(int(dimension) for dimension in shape)
-        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+        for name, _raw, _qtype, shape in raw_items
         if not is_known_skip(name)
     }
-    required = {
+    skipped_shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in raw_items
+        if is_known_skip(name) and not name.startswith("tokenizer.")
+    }
+    if "rope_freqs.weight" in skipped_shapes:
+        raise ValueError("granite serialized rope_freqs.weight is not representable exactly")
+    longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
+    present_longrope = longrope_names & set(skipped_shapes)
+    if present_longrope:
+        raise ValueError(
+            "granite tensor-backed LongRoPE is unsupported because the current rotary graph "
+            "cannot preserve rope.scaling.attn_factor exactly"
+        )
+
+    required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
         "output_norm.weight": (hidden,),
-        "output.weight": (vocab, hidden),
     }
+    optional: dict[str, tuple[int, ...]] = {"output.weight": (vocab, hidden)}
+    q_width = hidden
+    kv_width = kv_heads * head_dim
+    selected_qkv_biases: set[str] = set()
+    attention_output_biases: set[str] = set()
+    dense_ffn_biases: set[str] = set()
     for layer in range(layers):
         prefix = f"blk.{layer}."
         required.update(
             {
                 prefix + "attn_norm.weight": (hidden,),
-                prefix + "attn_qkv.weight": (q_width + 2 * kv_width, hidden),
                 prefix + "attn_output.weight": (hidden, q_width),
-                prefix + "attn_output_norm.weight": (hidden,),
-                prefix + "ffn_gate_inp.weight": (experts, hidden),
-                prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
-                prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
-                prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+                prefix + "ffn_norm.weight": (hidden,),
             }
         )
+        optional[prefix + "attn_output.bias"] = (hidden,)
+        attention_output_biases.add(prefix + "attn_output.bias")
 
+        fused_weight = prefix + "attn_qkv.weight"
+        split_weights = {
+            prefix + "attn_q.weight": (q_width, hidden),
+            prefix + "attn_k.weight": (kv_width, hidden),
+            prefix + "attn_v.weight": (kv_width, hidden),
+        }
+        has_fused = fused_weight in actual
+        present_split = set(split_weights) & set(actual)
+        if has_fused == bool(present_split) or (
+            present_split and present_split != set(split_weights)
+        ):
+            raise ValueError(
+                f"granite layer {layer} must contain exactly one complete QKV layout"
+            )
+        if has_fused:
+            required[fused_weight] = (q_width + 2 * kv_width, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_width + 2 * kv_width,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        else:
+            required.update(split_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_width,),
+                prefix + "attn_k.bias": (kv_width,),
+                prefix + "attn_v.bias": (kv_width,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        if alternate_biases & set(actual):
+            raise ValueError(
+                f"granite layer {layer} QKV bias layout does not match its weights"
+            )
+        present_biases = set(selected_biases) & set(actual)
+        if present_biases and present_biases != set(selected_biases):
+            raise ValueError(f"granite layer {layer} has a partial QKV bias set")
+        optional.update(selected_biases)
+        selected_qkv_biases.update(selected_biases)
+
+        if experts:
+            required.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        expert_intermediate,
+                    ),
+                }
+            )
+            if shared_width:
+                required.update(
+                    {
+                        prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                    }
+                )
+        else:
+            dense_weights = {
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+            required.update(dense_weights)
+            layer_biases = {
+                prefix + "ffn_gate.bias": (intermediate,),
+                prefix + "ffn_up.bias": (intermediate,),
+                prefix + "ffn_down.bias": (hidden,),
+            }
+            present_biases = set(layer_biases) & set(actual)
+            if present_biases and present_biases != set(layer_biases):
+                raise ValueError(f"granite layer {layer} has a partial dense FFN bias set")
+            optional.update(layer_biases)
+            dense_ffn_biases.update(layer_biases)
+
+    actual_names = set(actual)
+    for family_name, family in (
+        ("QKV projection biases", selected_qkv_biases),
+        ("attention output biases", attention_output_biases),
+        ("dense FFN biases", dense_ffn_biases),
+    ):
+        present = family & actual_names
+        if present and present != family:
+            raise ValueError(
+                f"granite {family_name} must be present in every layer or absent entirely"
+            )
+    allowed = set(required) | set(optional)
+    allowed = set(required) | set(optional)
     out_of_range = sorted(
         name
         for name in actual
         if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
     )
-    missing = sorted(set(required) - set(actual))
-    unexpected = sorted(set(actual) - set(required))
+    missing = sorted(set(required) - actual_names)
+    unexpected = sorted(actual_names - allowed)
     malformed = {
-        name: (required[name], actual[name])
-        for name in set(required) & set(actual)
-        if actual[name] != required[name]
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & actual_names
+        if actual[name] != required.get(name, optional.get(name))
     }
     if missing or unexpected or malformed or out_of_range:
         raise ValueError(
-            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
-            f"unexpected={unexpected}, malformed={malformed}, out_of_range={out_of_range}"
+            "Invalid granite GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}, "
+            f"out_of_range={out_of_range}"
         )
 
 
@@ -3863,6 +4629,7 @@ def _raise_for_unsupported_encoder_heads(gguf_model) -> None:
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
     }:
         return
     head_tensors = [
@@ -4036,7 +4803,13 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
     from mobius.integrations.gguf._tensor_mapping import is_known_skip
 
     arch = gguf_model.architecture
-    if arch not in {"eurobert", "neo-bert", "nomic-bert", "jina-bert-v2"}:
+    if arch not in {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "jina-bert-v2",
+        "jina-bert-v3",
+    }:
         return
     metadata = gguf_model.metadata
     geometry = (
@@ -4068,7 +4841,7 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
     if key_length != head_dim or value_length != head_dim:
         raise ValueError(f"{arch} GGUF requires full-width equal Q/K/V heads")
     if arch != "jina-bert-v2":
-        rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+        rope_dim = int(metadata.get(f"{arch}.rope.dimension_count", head_dim))
         if rope_dim != head_dim:
             raise ValueError(f"{arch} GGUF requires full-head RoPE")
 
@@ -4094,7 +4867,9 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
     else:
         if token_types <= 0:
             raise ValueError(f"{arch} tokenizer.ggml.token_type_count must be positive")
-        token_type_shape = (token_types, hidden)
+        token_type_shape = (
+            (hidden,) if arch == "jina-bert-v3" and token_types == 1 else (token_types, hidden)
+        )
         if arch == "jina-bert-v2":
             required["token_types.weight"] = token_type_shape
         else:
@@ -4107,6 +4882,23 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
         )
 
     optional_families: dict[str, set[str]] = {}
+    moe_interval = int(metadata.get(f"{arch}.moe_every_n_layers", 0))
+    if arch == "jina-bert-v3":
+        expert_metadata = any(
+            f"{arch}.{suffix}" in metadata
+            for suffix in (
+                "expert_count",
+                "expert_used_count",
+                "expert_feed_forward_length",
+                "expert_weights_norm",
+                "expert_weights_scale",
+            )
+        )
+        if moe_interval != 0 or expert_metadata:
+            raise ValueError(
+                f"{arch} MoE metadata is unsupported because the pinned loader never "
+                "loads moe_every_n_layers"
+            )
     for layer in range(layers):
         prefix = f"blk.{layer}."
         if arch in {"eurobert", "neo-bert"}:
@@ -4135,6 +4927,36 @@ def _raise_for_invalid_specialized_encoder_tensor_contract(gguf_model) -> None:
                         prefix + "ffn_up.weight": (2 * intermediate, hidden),
                     }
                 )
+            continue
+
+        if arch == "jina-bert-v3":
+            required.update(
+                {
+                    prefix + "attn_output.weight": (hidden, hidden),
+                    prefix + "attn_output_norm.weight": (hidden,),
+                    prefix + "attn_output_norm.bias": (hidden,),
+                    prefix + "layer_output_norm.weight": (hidden,),
+                    prefix + "layer_output_norm.bias": (hidden,),
+                }
+            )
+            fused = prefix + "attn_qkv.weight" in actual
+            if fused:
+                required[prefix + "attn_qkv.weight"] = (3 * hidden, hidden)
+                optional[prefix + "attn_qkv.bias"] = (3 * hidden,)
+            else:
+                for projection in ("q", "k", "v"):
+                    required[prefix + f"attn_{projection}.weight"] = (hidden, hidden)
+                    optional[prefix + f"attn_{projection}.bias"] = (hidden,)
+            optional[prefix + "attn_output.bias"] = (hidden,)
+
+            required.update(
+                {
+                    prefix + "ffn_up.weight": (intermediate, hidden),
+                    prefix + "ffn_down.weight": (hidden, intermediate),
+                }
+            )
+            optional[prefix + "ffn_up.bias"] = (intermediate,)
+            optional[prefix + "ffn_down.bias"] = (hidden,)
             continue
 
         required.update(
@@ -5823,6 +6645,7 @@ _SPECIALIZED_ENCODER_FINGERPRINT_ARCHITECTURES = frozenset(
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
         "gemma-embedding",
         "llama-embed",
     }
@@ -5840,10 +6663,13 @@ _SPECIALIZED_ENCODER_FINGERPRINT_FIELDS = (
     "pooling_type",
     "embedding_dense_2_out",
     "embedding_dense_3_in",
+    "encoder_fused_qkv",
 )
 _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
     "attention_clamp": frozenset({"dbrx"}),
+    "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
+    "routing_weight_normalization_floor": frozenset({"dots1", "ernie4_5-moe", "smallthinker"}),
 }
 
 
@@ -5859,6 +6685,18 @@ def _graph_config_fields_for_fingerprint(config, gguf_arch: str) -> dict[str, ob
         if gguf_arch not in consumers:
             fields.pop(field_name, None)
     return fields
+
+
+def _serialize_route_graph_config(config: Any, gguf_arch: str) -> str:
+    """Serialize the architecture-isolated graph fields for route fingerprints."""
+    import json
+
+    return json.dumps(
+        _graph_config_fields_for_fingerprint(config, gguf_arch),
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def build_from_gguf(
@@ -6082,6 +6920,16 @@ def build_from_gguf(
 
     tokenizer_verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(gguf_path))
     gguf_arch = gguf_model.architecture
+    if gguf_arch == "plamo" and reuse_gguf_weights:
+        raise ValueError(
+            "reuse_gguf_weights=True is not supported for PLaMo because its Q/output "
+            "projection shuffles require materialized value transforms"
+        )
+    if gguf_arch == "plamo" and static_cache:
+        raise ValueError(
+            "static_cache=True is not supported for PLaMo; the exact source contract "
+            "stores cyclically expanded 40-head dynamic K/V state"
+        )
     if static_cache and gguf_arch in {
         "gptneox",
         "jais",
@@ -6211,6 +7059,34 @@ def build_from_gguf(
             raise ValueError(
                 "plamo2 GGUF only supports the dedicated 'plamo2-text-generation' task"
             )
+    if gguf_arch == "plamo":
+        from mobius.tasks import PlamoCausalLMTask
+
+        if (
+            task is not None
+            and task != "plamo-text-generation"
+            and not isinstance(task, PlamoCausalLMTask)
+        ):
+            raise ValueError(
+                "plamo GGUF only supports the dedicated 'plamo-text-generation' task"
+            )
+    if gguf_arch == "smallthinker":
+        from mobius.tasks import SmallThinkerGGUFCausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for SmallThinker GGUF; "
+                "the exact graph uses its dedicated dynamic concat-grow KV-cache task"
+            )
+        if (
+            task is not None
+            and task != "smallthinker-gguf-text-generation"
+            and not isinstance(task, SmallThinkerGGUFCausalLMTask)
+        ):
+            raise ValueError(
+                "smallthinker GGUF only supports the dedicated "
+                "'smallthinker-gguf-text-generation' task"
+            )
     if gguf_arch == "qwen4exp":
         from mobius.tasks import Qwen4ExpCausalLMTask
 
@@ -6262,6 +7138,7 @@ def build_from_gguf(
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
         "gemma-embedding",
         "llama-embed",
     }:
@@ -6379,6 +7256,7 @@ def build_from_gguf(
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
     }:
         from mobius.tasks import GGUFEncoderFeatureExtractionTask
 
@@ -6648,13 +7526,7 @@ def build_from_gguf(
         task_state = resolved_task
     else:
         task_state = dict(sorted(vars(resolved_task).items()))
-    graph_config_fields = _graph_config_fields_for_fingerprint(config, spec.gguf_arch)
-    graph_config = json.dumps(
-        graph_config_fields,
-        default=str,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    graph_config = _serialize_route_graph_config(config, spec.gguf_arch)
     pkg.gguf_import_route = json.dumps(
         {
             "architecture": spec.gguf_arch,
@@ -7001,6 +7873,14 @@ def _normalize_gguf_weights(
     for key, value in state_dict.items():
         if config is not None:
             _validate_moe_weight_shape(key, tuple(value.shape), config, gguf_arch=gguf_arch)
+        if (
+            gguf_arch == "jina-bert-v3"
+            and key == "token_type_embeddings.weight"
+            and value.dim() == 1
+        ):
+            # GGUF elides the unit token-type dimension; ONNX Gather needs [1, hidden].
+            result[key] = value.unsqueeze(0)
+            continue
         if gguf_arch in {"dream", "llada-moe", "rnd1"} and ".self_attn.qkv_proj." in key:
             suffix = key.rsplit(".", 1)[-1]
             q_width = int(config.num_attention_heads) * int(config.head_dim)
