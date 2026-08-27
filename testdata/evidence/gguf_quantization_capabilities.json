@@ -2481,6 +2481,101 @@
       "storage_role": "storage-quantized"
     }
   ],
+  "runtime_blocker_evidence": [
+    {
+      "architecture": "nemotron_h_moe",
+      "blockers": [
+        "The smallest model GGUF in the pinned 29-file repository revision is 18,010,755,296 bytes, above the 16 GiB bounded-artifact policy; explicit float16/float32 weights require 63,155,880,576/126,311,761,152 bytes.",
+        "The normal optimized CPU export has 37,142 nodes (40,167 before Mobius optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed experts remain an ONNX loop. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. QMoE has separate router_probs/router_weights for correction-biased selection with unbiased sigmoid mixing, while shared experts and optional latent projections can surround it; those are not fused-op blockers. The pinned 30B has no latent projection. QMoE does not support GGUF IQ2_XXS storage, and Mobius has no proven IQ2_XXS packer/kernel path.",
+        "ORT GenAI 0.15.2 discovers sparse/nonconsecutive KV and conv/recurrent slots, but derives recurrent_state names while this export uses ssm_state, does not beam-reorder recurrent state, and rejects nonzero recurrent-state rewind.",
+        "The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is not serialized; exact ORT tokenizer materialization is unavailable."
+      ],
+      "bounded_header_bytes": 16777216,
+      "bounded_header_sha256": "db14a1223f2f4cfaaa265eafd763b760702c83a5007c72e2f3f265b0e7439dff",
+      "config": {
+        "repository": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "revision": "bf77c3174f68ad409e1c2aa60daeb46e32d1c606",
+        "sha256": "dd9fa380ac107b0477db5a26108db9febe6378e7bb3966a107944853ec4f76f8"
+      },
+      "evidence_id": "nemotron-h-moe-30b-iq2-xxs-runtime-blocker",
+      "execution_provider": "CPUExecutionProvider",
+      "expert_count": 128,
+      "experts_per_token": 6,
+      "explicit_float16_bytes": 63155880576,
+      "explicit_float32_bytes": 126311761152,
+      "filename": "nvidia_Nemotron-3-Nano-30B-A3B-IQ2_XXS.gguf",
+      "graph": {
+        "initializer_count": 6255,
+        "matmul_count": 6028,
+        "node_count": 37142,
+        "pre_optimization_node_count": 40167,
+        "state_slots": {
+          "attention.key": 6,
+          "attention.value": 6,
+          "mamba2.conv_state": 23,
+          "mamba2.ssm_state": 23
+        }
+      },
+      "layer_counts": {
+        "full_attention": 6,
+        "mamba2": 23,
+        "moe": 23
+      },
+      "lfs_sha256": "f3da710c046ce7cc6ff28a9b5f1a9153ac72e3f60603e51c7bb679d80716b58a",
+      "logical_parameter_count": 31577940288,
+      "onnxruntime_version": "1.29.0",
+      "repository": "bartowski/nvidia_Nemotron-3-Nano-30B-A3B-GGUF",
+      "result": "blocked",
+      "revision": "1fc64d5b160654ec892df2708aa893b0e96e6491",
+      "runtime": "ort-genai",
+      "runtime_schema_issue": "https://github.com/onnxruntime/mobius/issues/605",
+      "runtime_version": "0.15.2",
+      "size": 18010755296,
+      "tensor_count": 401,
+      "tensor_qtypes": {
+        "F32": 237,
+        "IQ2_XXS": 23,
+        "IQ4_NL": 100,
+        "Q4_K": 6,
+        "Q5_0": 12,
+        "Q8_0": 23
+      },
+      "tokenizer": {
+        "assets": [
+          {
+            "filename": "chat_template.jinja",
+            "sha256": "ab7813c3abdd9cb655905a410728b26c7884eca45ddfab8d9f931553485a7862",
+            "size": 10504
+          },
+          {
+            "filename": "special_tokens_map.json",
+            "sha256": "e3a4f63da745f02317a45e00e6476c17fc66ac41faf14bb1b0be1f3211b0ca53",
+            "size": 420
+          },
+          {
+            "filename": "tokenizer.json",
+            "sha256": "c6021eb6847e682f89aa52d5eb6e8c7d902a23acfc8137e25211cf84828f1592",
+            "size": 17077485
+          },
+          {
+            "filename": "tokenizer_config.json",
+            "sha256": "3d568e506d0905285ae90a3fdd1482be7b6d0bf0b8ca9514d75dad4257b0827a",
+            "size": 188049
+          }
+        ],
+        "metadata_sha256": "6089bcaf08b3fe0d49379ca7e85bd3c93e8705bac6130636425c159212971225",
+        "repository": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "revision": "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"
+      },
+      "withheld_checks": [
+        "cached decode and deterministic generation",
+        "full-logit parity",
+        "package and report roundtrip",
+        "state replay, rollback, and reorder",
+        "tensor value closure"
+      ]
+    }
+  ],
   "schema_version": 1,
   "selected_artifacts": [
     {

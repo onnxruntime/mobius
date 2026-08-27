@@ -328,6 +328,36 @@ def test_assess_sparse_moe_allows_int4_moe():
     assert blockers == []
 
 
+@pytest.mark.parametrize("quantization", [None, "IQ2_XXS"])
+def test_assess_sparse_moe_rejects_every_nemotron_h_quantized_route(quantization):
+    ok, blockers = _assess_sparse_moe(
+        architecture="nemotron_h_moe",
+        model_type="nemotron_h",
+        num_experts=None,
+        quantization=quantization,
+        source="pinned/nemotron-h.gguf",
+    )
+    assert ok is False
+    assert len(blockers) == 1
+    assert "exposes ReLU rather than ReLU2" in blockers[0]
+    assert "no proven IQ2_XXS packer/kernel path" in blockers[0]
+    assert "separate router_probs/router_weights can represent" in blockers[0]
+    assert "are not incompatibilities" in blockers[0]
+    assert "keep_quantized=False" in blockers[0]
+
+
+def test_assess_sparse_moe_does_not_misclassify_dense_nemotron_h():
+    ok, blockers = _assess_sparse_moe(
+        architecture="nemotron_h",
+        model_type="nemotron_h",
+        num_experts=None,
+        quantization="F16",
+        source="pinned/nemotron-h.gguf",
+    )
+    assert ok is True
+    assert blockers == []
+
+
 @pytest.mark.parametrize(
     "text,expected",
     [

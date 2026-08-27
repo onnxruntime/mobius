@@ -34,6 +34,9 @@ from mobius.integrations.gguf._route_census import (
     RECENT_PR_DEPENDENCIES,
     render_remaining_route_batches,
 )
+from mobius.integrations.gguf._runtime_blocker_evidence import (
+    iter_runtime_blocker_evidence,
+)
 from mobius.integrations.gguf._runtime_evidence import runtime_evidence
 from mobius.integrations.gguf._spec import GGUFArchitectureSpec, StorageRole, Support
 from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
@@ -323,6 +326,27 @@ def _runtime_evidence_table() -> str:
     return "\n".join(rows)
 
 
+def _runtime_blocker_evidence_table() -> str:
+    rows = [
+        "| Evidence ID | Pinned candidate | Bounded result | Withheld runtime claims |",
+        "|---|---|---|---|",
+    ]
+    for evidence in iter_runtime_blocker_evidence():
+        blockers = "<br>".join(evidence.blockers)
+        withheld = ", ".join(evidence.withheld_checks)
+        rows.append(
+            f"| `{evidence.evidence_id}` | `{evidence.repository}@{evidence.revision}`<br>"
+            f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}` | "
+            f"config/tokenizer `{evidence.config_repository}@{evidence.config_revision}`; "
+            f"GGUF tokenizer metadata `{evidence.tokenizer_metadata_sha256}`; "
+            f"result={evidence.result}; {evidence.tensor_count} tensors / "
+            f"{evidence.logical_parameter_count:,} parameters; "
+            f"ORT {evidence.onnxruntime_version} / {evidence.execution_provider}; "
+            f"{evidence.runtime} {evidence.runtime_version}; {blockers} | {withheld} |"
+        )
+    return "\n".join(rows)
+
+
 def _tokenizer_evidence_table() -> str:
     rows = [
         "| Evidence ID | GGUF identity | Official source | Exact tokenizer proof |",
@@ -571,6 +595,10 @@ evidence match.
 {_runtime_evidence_table()}
 
 Runtime support above is independent from tokenizer materialization support below.
+
+### Fail-closed runtime evidence
+
+{_runtime_blocker_evidence_table()}
 
 ## Remaining route work
 

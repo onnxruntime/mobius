@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import cast
 
 from mobius.integrations.gguf._quant_registry import iter_quant_specs, quant_import_decision
+from mobius.integrations.gguf._runtime_blocker_evidence import (
+    iter_runtime_blocker_evidence,
+)
 from mobius.integrations.gguf._runtime_evidence import iter_runtime_evidence
 from mobius.integrations.gguf._spec import (
     QuantImportRoute,
@@ -351,6 +354,57 @@ def quantization_capability_matrix() -> dict[str, object]:
                 },
             }
         )
+    runtime_blockers = [
+        {
+            "evidence_id": evidence.evidence_id,
+            "architecture": evidence.architecture,
+            "repository": evidence.repository,
+            "revision": evidence.revision,
+            "filename": evidence.filename,
+            "size": evidence.size,
+            "lfs_sha256": evidence.lfs_sha256,
+            "config": {
+                "repository": evidence.config_repository,
+                "revision": evidence.config_revision,
+                "sha256": evidence.config_sha256,
+            },
+            "tokenizer": {
+                "repository": evidence.tokenizer_repository,
+                "revision": evidence.tokenizer_revision,
+                "metadata_sha256": evidence.tokenizer_metadata_sha256,
+                "assets": [
+                    {"filename": name, "size": size, "sha256": sha256}
+                    for name, size, sha256 in evidence.tokenizer_assets
+                ],
+            },
+            "tensor_count": evidence.tensor_count,
+            "tensor_qtypes": dict(evidence.tensor_qtypes),
+            "logical_parameter_count": evidence.logical_parameter_count,
+            "explicit_float16_bytes": evidence.explicit_float16_bytes,
+            "explicit_float32_bytes": evidence.explicit_float32_bytes,
+            "bounded_header_bytes": evidence.bounded_header_bytes,
+            "bounded_header_sha256": evidence.bounded_header_sha256,
+            "expert_count": evidence.expert_count,
+            "experts_per_token": evidence.experts_per_token,
+            "layer_counts": dict(evidence.layer_counts),
+            "graph": {
+                "pre_optimization_node_count": evidence.pre_optimization_graph_node_count,
+                "node_count": evidence.graph_node_count,
+                "initializer_count": evidence.graph_initializer_count,
+                "matmul_count": evidence.graph_matmul_count,
+                "state_slots": dict(evidence.state_slots),
+            },
+            "runtime": evidence.runtime,
+            "runtime_version": evidence.runtime_version,
+            "onnxruntime_version": evidence.onnxruntime_version,
+            "execution_provider": evidence.execution_provider,
+            "runtime_schema_issue": evidence.runtime_schema_issue,
+            "result": evidence.result,
+            "blockers": list(evidence.blockers),
+            "withheld_checks": list(evidence.withheld_checks),
+        }
+        for evidence in iter_runtime_blocker_evidence()
+    ]
     return {
         "schema_version": 1,
         "llama_cpp_commit": UPSTREAM_COMMIT,
@@ -379,6 +433,7 @@ def quantization_capability_matrix() -> dict[str, object]:
             key: list(value) for key, value in sorted(_TRANSFORM_EVIDENCE.items())
         },
         "selected_artifacts": artifacts,
+        "runtime_blocker_evidence": runtime_blockers,
         "lossy_target_artifacts": list(_LOSSY_TARGET_ARTIFACTS),
         "qtypes": qtypes,
     }

@@ -283,11 +283,12 @@ class NemotronHMoEBlock(nn.Module):
         [optional] expert_output → fc2_latent_proj → hidden
         output = expert_output + shared_experts(original_hidden)
 
-    Note: ``com.microsoft.MoE`` fused op is **not compatible** with NemotronH
-    because NemotronH uses squared ReLU (relu2) activation, which the fused
-    op doesn't support (only silu/gelu/relu/none). Additionally, NemotronH
-    uses sigmoid routing with correction bias (not softmax), and the fused
-    op has no softmax bypass option. We use loop-over-experts dispatch.
+    ORT 1.29 ``com.microsoft.MoE``/``QMoE`` cannot implement the routed
+    experts faithfully because their exposed activation set has ReLU but no
+    ReLU2. ``QMoE`` does have separate selection and mixing inputs, so the
+    correction-biased selection and unbiased sigmoid weights are representable.
+    Shared experts and optional latent projections can remain as surrounding
+    graph operations. We use loop-over-experts dispatch.
 
     HuggingFace reference: ``NemotronHMoE``.
     """

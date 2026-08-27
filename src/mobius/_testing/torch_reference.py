@@ -113,7 +113,7 @@ def _install_dynamic_cache_legacy_shims() -> None:
         transformers.DynamicCache.get_usable_length = _get_usable_length  # type: ignore[method-assign]
 
 
-def _fix_nemotron_h_init_weights(
+def _fix_nemotron_h_dt_bias(
     model: torch.nn.Module, model_id: str, revision: str | None = None
 ) -> None:
     """Restore Mamba2 params from checkpoint after HF clobbers them.
@@ -245,7 +245,7 @@ def load_torch_model(
         revision=revision,
         trust_remote_code=trust_remote_code,
     )
-    _fix_nemotron_h_init_weights(model, model_id, revision)
+    _fix_nemotron_h_dt_bias(model, model_id, revision)
     model.eval()
 
     if tokenizer.pad_token is None:

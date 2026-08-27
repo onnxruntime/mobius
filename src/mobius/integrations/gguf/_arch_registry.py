@@ -257,9 +257,10 @@ _JAMBA_RUNTIME_VALIDATION_PENDING = (
     "Exact mixed attention/Mamba and dense/routed-MoE schedules, strict tensor closure "
     "and shapes, GGUF value transforms, compatible projection quantization, value-checked "
     "expert ordering, reduced Transformers parity, and multi-token ORT state threading, "
-    "reorder, and replay are covered. Generic ORT GenAI runtime packaging remains deferred "
-    "because its released cache schema cannot represent heterogeneous KV, convolution, and "
-    "recurrent state slots; tracked by #605."
+    "reorder, and replay are covered. ORT GenAI 0.15.2 discovers sparse KV and "
+    "conv/recurrent slots, but expects recurrent_state where Mobius exports ssm_state, "
+    "does not beam-reorder recurrent state, and rejects nonzero recurrent-state rewind; "
+    "tracked by #605."
 )
 
 _RWKV_GRAPH_REASONS = {
@@ -1171,12 +1172,17 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         reason=(
             "Exact mixed attention/Mamba2/dense/MoE scheduling, sigmoid correction-bias "
             "routing, shared experts, optional latent projections, and strict GGUF tensor "
-            "closure are supported. Generic ORT GenAI runtime packaging remains deferred "
-            "because its released cache schema cannot represent heterogeneous KV, "
-            "convolution, and recurrent state slots; tracked by onnxruntime/mobius#605. "
+            "closure are supported. ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent "
+            "slots, but derives recurrent_state where Mobius exports ssm_state, does not "
+            "beam-reorder recurrent state, and rejects nonzero recurrent-state rewind; "
+            "tracked by onnxruntime/mobius#605. "
+            "Pinned blocker evidence: nemotron-h-moe-30b-iq2-xxs-runtime-blocker. "
             "Quantization preservation is unsupported because mixed Mamba2 recurrent "
-            "parameters must remain dequantized and correction-biased sigmoid experts "
-            "cannot use the fused MoE ABI. Use keep_quantized=False for explicit float import."
+            "parameters must remain dequantized, the fused MoE/QMoE ABI has no ReLU2 "
+            "activation, and QMoE has no GGUF IQ2_XXS storage or proven Mobius packer/kernel "
+            "path. Separate QMoE selection/mixing inputs can represent correction-biased "
+            "sigmoid routing; shared experts and latent projections can surround the op. "
+            "Use keep_quantized=False for explicit float import."
         ),
     ),
     GGUFArchitectureSpec(
@@ -1203,9 +1209,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "value-preserving float expert fusion, and strict pinned tensor closure are "
             "supported. Quantized sources require explicit dequantization because the "
             "current graph has no exact packed 3-D expert ABI; use keep_quantized=False. "
-            "Generic ORT GenAI runtime packaging remains deferred because its released cache "
-            "schema cannot represent heterogeneous KV, convolution, and recurrent state "
-            "slots; tracked by onnxruntime/mobius#605."
+            "ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent slots, but expects "
+            "recurrent_state where Mobius exports ssm_state, does not beam-reorder recurrent "
+            "state, and rejects nonzero recurrent-state rewind; tracked by "
+            "onnxruntime/mobius#605."
         ),
     ),
     GGUFArchitectureSpec(
@@ -1370,9 +1377,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=(
             "The dedicated graph and GGUF importer preserve PLaMo2's alternating "
-            "Mamba1/attention layers and mixed state ABI, but released ORT GenAI "
-            "cannot represent heterogeneous per-layer state. Runtime packaging "
-            "remains deferred to onnxruntime/mobius#605."
+            "Mamba1/attention layers and mixed state ABI. ORT GenAI 0.15.2 discovers "
+            "sparse KV and conv/recurrent slots, but its recurrent-state naming, beam "
+            "reorder, and nonzero-rewind contracts do not yet match this export. Runtime "
+            "packaging remains deferred to onnxruntime/mobius#605."
         ),
     ),
     GGUFArchitectureSpec(
