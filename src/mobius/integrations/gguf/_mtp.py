@@ -36,6 +36,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+from collections.abc import Callable
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,7 @@ from mobius.integrations.gguf._spec import Support
 
 if TYPE_CHECKING:
     from mobius._model_package import ModelPackage
+    from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
 
 logger = logging.getLogger(__name__)
 
@@ -552,6 +554,7 @@ def build_mtp_head_from_gguf(
     *,
     preserve_quantization: bool,
     execution_provider: str = "default",
+    on_preflight: Callable[[GGUFQuantizationReport], None] | None = None,
 ) -> ModelPackage | None:
     """Build the Qwen3.5/3.8 MTP head sidecar :class:`ModelPackage` from GGUF.
 
@@ -566,6 +569,7 @@ def build_mtp_head_from_gguf(
         _load_dequantized_state_dict,
         _load_quantized_state_dict,
         _normalize_gguf_weights,
+        _preflight_quantization_report,
         _replace_native_block_linears,
     )
     from mobius.integrations.gguf._tensor_processors import process_tensors
@@ -609,9 +613,27 @@ def build_mtp_head_from_gguf(
             gguf_arch,
             name_mapper=_mapper,
         )
+    quantization_report = _preflight_quantization_report(
+        gguf_model,
+        gguf_arch,
+        module,
+        mtp_config,
+        preserve_quantization=preserve_quantization,
+        target_bits=(mtp_config.quantization.bits if preserve_quantization else None),
+        target_block_size=(
+            mtp_config.quantization.group_size if preserve_quantization else None
+        ),
+        execution_provider=execution_provider,
+        name_mapper=_mapper,
+        dequantize_float_linear_types={"lm_head": {"Q4_1"}},
+        emit_warning=False,
+    )
+    if on_preflight is not None:
+        on_preflight(quantization_report)
     pkg = build_from_module(
         module, mtp_config, Qwen35MtpTask(), execution_provider=execution_provider
     )
+    pkg.gguf_quantization_report = quantization_report
 
     if preserve_quantization:
         state_dict = _load_quantized_state_dict(

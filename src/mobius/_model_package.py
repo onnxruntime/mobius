@@ -29,7 +29,7 @@ import threading
 from collections import UserDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import onnx_ir as ir
 import rfc8785
@@ -45,11 +45,15 @@ from mobius.adapters import (
 from mobius.generation import PolicyComponent
 from mobius.integrations._weight_loading import _assign_weight
 
+if TYPE_CHECKING:
+    from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
+
 logger = logging.getLogger(__name__)
 
 _PACKAGE_MANIFEST = ".mobius-package.json"
 _PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
 _MTP_SIDECAR_BASENAME = ".mobius-mtp"
+_QUANTIZATION_REPORT = "quantization_report.json"
 
 
 def _read_mtp_sidecar_name(directory: str) -> str | None:
@@ -128,10 +132,12 @@ def _validate_mtp_chain(package: ModelPackage) -> None:
                     f"case-insensitively; {name!r} collides with another component."
                 )
             component_keys.add(collision_key)
-            if collision_key == _PACKAGE_MANIFEST.casefold():
+            if collision_key in {
+                _PACKAGE_MANIFEST.casefold(),
+                _QUANTIZATION_REPORT.casefold(),
+            }:
                 raise ValueError(
-                    f"ModelPackage component name {_PACKAGE_MANIFEST!r} is reserved "
-                    "for package metadata."
+                    f"ModelPackage component name {name!r} is reserved for package metadata."
                 )
         sidecar = current.mtp_head
         if sidecar is None:
@@ -165,6 +171,11 @@ def _validate_mtp_save_paths(
 ) -> None:
     """Reject unsafe output paths throughout the package chain before any writes."""
     _validate_output_directory(directory, kind="package", inspect_contents=False)
+    report_path = os.path.join(directory, _QUANTIZATION_REPORT)
+    if os.path.lexists(report_path) and (
+        os.path.islink(report_path) or not os.path.isfile(report_path)
+    ):
+        raise ValueError("ModelPackage quantization report output must be a real file.")
     previous_sidecar_name = _read_mtp_sidecar_name(directory)
     selected = [name for name in package if components is None or components(name)]
     if len(selected) > 1:
@@ -280,6 +291,7 @@ class ModelPackage(UserDict[str, ir.Model]):
     ) -> None:
         super().__init__(models or {})
         self.config = config
+        self.gguf_quantization_report: GGUFQuantizationReport | None = None
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
         self.mtp_head: ModelPackage | None = None
@@ -416,6 +428,11 @@ class ModelPackage(UserDict[str, ir.Model]):
                 )
         previous_sidecar_name = _read_mtp_sidecar_name(directory)
         os.makedirs(directory, exist_ok=True)
+        quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
+        if self.gguf_quantization_report is not None:
+            self.gguf_quantization_report.write_json(quantization_report_path)
+        elif os.path.isfile(quantization_report_path):
+            os.remove(quantization_report_path)
         selected = {
             name: model
             for name, model in self.data.items()
@@ -875,6 +892,17 @@ class ModelPackage(UserDict[str, ir.Model]):
                     name = filename.removesuffix(".onnx")
                     models[name] = ir.load(os.path.join(directory, filename))
         package = cls(models)
+        quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
+        if os.path.lexists(quantization_report_path):
+            if os.path.islink(quantization_report_path) or not os.path.isfile(
+                quantization_report_path
+            ):
+                raise ValueError("ModelPackage quantization report must be a real file.")
+            from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
+
+            package.gguf_quantization_report = GGUFQuantizationReport.read_json(
+                quantization_report_path
+            )
         package._load_policy_components(directory)
         if mtp_dir is not None:
             package.mtp_head = cls._load(mtp_dir, ancestors)

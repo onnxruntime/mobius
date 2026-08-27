@@ -1718,12 +1718,13 @@ def build_gemma4_vlm_from_gguf(
         include_audio: When ``True``, also build the (experimental) audio
             encoder. Off by default — see the module docstring.
         keep_quantized: Preserve the text backbone's GGUF quantization when
-            present. This is the default: decoder projections become
+            present as quantized target storage. This is the default: decoder projections become
             MatMulNBits and compatible token-embedding tables become
             GatherBlockQuantized. Incompatible embedding qtypes or shapes stay
             float. Quantized projection source types, including native
             IQ/MXFP4 blocks, are normalized to the common affine layout rather
-            than retained byte-for-byte. Set to ``False`` to dequantize all
+            than retained byte-for-byte. Lossy normalization emits one warning
+            and is recorded in ``quantization_report.json``. Set to ``False`` to dequantize all
             text weights. The vision (and audio) encoder always stays float
             because its weights come from the mmproj as F16 — see the "Mixed
             precision" note below.
@@ -1746,6 +1747,7 @@ def build_gemma4_vlm_from_gguf(
     from mobius._builder import resolve_dtype
     from mobius.integrations.gguf._builder import (
         _has_quantized_weights,
+        _preflight_quantization_report,
         _reject_unsupported_quantization_preservation,
         _validate_gguf_model,
     )
@@ -1883,9 +1885,32 @@ def build_gemma4_vlm_from_gguf(
     from mobius._builder import build_from_module
 
     module = Gemma4Model(config)
+
+    def target_name(hf_name: str) -> str:
+        if hf_name.startswith("language_model.lm_head."):
+            return "decoder.lm_head." + hf_name.removeprefix("language_model.lm_head.")
+        if hf_name.startswith("language_model.embed_tokens"):
+            return "embedding." + hf_name.removeprefix("language_model.")
+        if hf_name.startswith("language_model."):
+            return "decoder.model." + hf_name.removeprefix("language_model.")
+        return hf_name
+
+    quantization_report = _preflight_quantization_report(
+        text_gguf,
+        "gemma4",
+        module,
+        config,
+        preserve_quantization=preserve_quantization,
+        target_bits=(config.quantization.bits if preserve_quantization else None),
+        target_block_size=(config.quantization.group_size if preserve_quantization else None),
+        execution_provider=execution_provider,
+        name_mapper=lambda name, _architecture: _text_gguf_name_to_hf_multimodal(name),
+        target_name_mapper=target_name,
+    )
     pkg = build_from_module(
         module, config, task=Gemma4Task(), execution_provider=execution_provider
     )
+    pkg.gguf_quantization_report = quantization_report
     logger.info("Built Gemma4 VLM graph (%d components: %s)", len(pkg), list(pkg))
 
     # 3. Assemble the combined HF-multimodal state dict from both GGUFs. The

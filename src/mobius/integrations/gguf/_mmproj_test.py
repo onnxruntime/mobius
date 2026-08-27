@@ -1506,6 +1506,10 @@ class TestKeepQuantizedMixedPrecision:
         ]
         assert float_embedding.const_value is not None
         assert list(float_embedding.shape) == [64, 32]
+        assert package.gguf_quantization_report.storage_quantized is True
+        assert package.gguf_quantization_report.target_storage_format == (
+            "INT4 affine block-32"
+        )
 
         missing = [
             f"{component}:{name}"
@@ -1518,6 +1522,7 @@ class TestKeepQuantizedMixedPrecision:
         output_dir = tmp_path / "saved"
         package.save(str(output_dir), progress_bar=False)
         reloaded = ModelPackage.load(str(output_dir))
+        assert reloaded.gguf_quantization_report == package.gguf_quantization_report
         assert set(reloaded) == {"decoder", "vision_encoder", "embedding"}
         assert all(
             initializer.const_value is not None
@@ -1533,7 +1538,7 @@ class TestKeepQuantizedMixedPrecision:
         text_gguf = tmp_path / "gemma4-q4-f32-projection.gguf"
         _write_quantized_gemma4_text_gguf(text_gguf, float_projection=True)
 
-        with pytest.raises(ValueError, match=r"would quantize float projection"):
+        with pytest.raises(ValueError, match=r"would quantize a source-float tensor"):
             build_gemma4_vlm_from_gguf(text_gguf, clip_mmproj_gguf, image_token_id=63)
 
         package = build_gemma4_vlm_from_gguf(

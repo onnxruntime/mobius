@@ -620,9 +620,14 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
 
     if keep_quantized:
-        print("Preserving supported GGUF quantization (float-only inputs stay float)...")
+        print(
+            "Quantized-target mode: classifying GGUF qtypes before conversion; "
+            "lossy requantization will be reported..."
+        )
     else:
-        print("Dequantized mode: converting GGUF weights to float...")
+        print(
+            "Dequantized mode: converting GGUF weights to explicitly reported float storage..."
+        )
 
     gguf_path = args.gguf_path
     gguf_reference = gguf_path
@@ -1264,7 +1269,11 @@ def build_parser() -> argparse.ArgumentParser:
     gguf_parser.add_argument(
         "--dequantize",
         action="store_true",
-        help="Dequantize all GGUF weights to float instead of preserving quantization.",
+        help=(
+            "Dequantize all mapped GGUF weights to float. Without this flag, Mobius "
+            "keeps quantized target storage where supported, but may lossily normalize "
+            "source qtypes and emits a quantization_report.json fidelity report."
+        ),
     )
     gguf_parser.add_argument(
         "--reuse-gguf-weights",

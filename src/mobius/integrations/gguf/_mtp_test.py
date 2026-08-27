@@ -594,7 +594,7 @@ class TestBuildMtpHead:
         assert "embed_tokens.weight" not in sidecar.graph.initializers
         assert not any("nextn" in name for name in target.graph.initializers)
 
-    def test_asymmetric_dedicated_head_requires_explicit_dequantization(self, tmp_path: Path):
+    def test_asymmetric_dedicated_head_is_reported_as_float(self, tmp_path: Path):
         import onnxruntime as ort
 
         from mobius.integrations.gguf import build_from_gguf
@@ -612,12 +612,13 @@ class TestBuildMtpHead:
             asymmetric_dedicated_head=True,
         )
         shared = build_from_gguf(shared_path, keep_quantized=True).mtp_head
-        with pytest.raises(
-            ValueError,
-            match=r"nextn\.shared_head_head\.weight \(Q4_1\).*cannot represent",
-        ):
-            build_from_gguf(dedicated_path, keep_quantized=True)
-        dedicated = build_from_gguf(dedicated_path, keep_quantized=False).mtp_head
+        dedicated_package = build_from_gguf(dedicated_path, keep_quantized=True)
+        dedicated = dedicated_package.mtp_head
+        assert dedicated_package.gguf_quantization_report.source_fidelity is False
+        assert any(
+            record.name == "blk.1.nextn.shared_head_head.weight"
+            for record in dedicated_package.gguf_quantization_report.explicit_float_tensors
+        )
         shared_dir = tmp_path / "shared"
         dedicated_dir = tmp_path / "dedicated"
         shared.save(shared_dir, progress_bar=False, check_weights=True)

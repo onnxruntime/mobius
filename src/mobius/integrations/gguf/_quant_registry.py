@@ -161,8 +161,8 @@ _REQUIRES_EXPLICIT_ZERO_POINT: frozenset[str] = frozenset(
     }
 )
 
-#: Value-preserving types in which an untied ``lm_head`` may stay quantized.
-#: Lossy dequantize/requantize routes fail closed.
+#: Direct/value-preserving types in which an untied ``lm_head`` may use the
+#: quantized graph target without builder-specific normalization.
 _LM_HEAD_PRESERVE: frozenset[str] = frozenset(
     {
         "Q1_0",
@@ -354,6 +354,11 @@ def quant_import_decision(
                 "Re-quantize to a supported qtype."
             ),
         )
+    target = (
+        None
+        if target_bits is None or target_block_size is None
+        else (target_bits, target_block_size)
+    )
     if (
         tensor_role
         in {
@@ -363,9 +368,18 @@ def quant_import_decision(
         and spec.native_preserve is not None
     ):
         if spec.dequantize is Support.SUPPORTED:
+            if target is not None and target != (4, 32):
+                return (
+                    QuantImportRoute.REJECTED,
+                    None,
+                    (
+                        "Conversion from the native GGUF block ABI currently supports "
+                        f"only the affine (4, 32) target, not {target}."
+                    ),
+                )
             return (
                 QuantImportRoute.DEQUANTIZE_REQUANTIZE,
-                None,
+                RepackExactness.LOSSY,
                 (
                     "GatherBlockQuantized does not consume BlockQuantizedMatMul's "
                     "native GGUF byte ABI; the embedding must use the affine Gather ABI."
@@ -409,23 +423,40 @@ def quant_import_decision(
         # then splits the packed rows across those complete expert targets.
         # Non-native qtypes therefore use the same declared affine/decode
         # policy as ordinary projections below.
-    target = (
-        None
-        if target_bits is None or target_block_size is None
-        else (target_bits, target_block_size)
-    )
     if (
         target is not None
         and spec.affine_repack is not None
         and spec.affine_repack.as_params() != target
     ):
         if spec.dequantize is Support.SUPPORTED:
+            if target != (4, 32):
+                return (
+                    QuantImportRoute.REJECTED,
+                    None,
+                    (
+                        "Lossy dequantize/requantize conversion currently supports only "
+                        f"the affine (4, 32) target, not {target}."
+                    ),
+                )
             return (
                 QuantImportRoute.DEQUANTIZE_REQUANTIZE,
                 RepackExactness.LOSSY,
                 (
                     f"The exact {spec.repack_params} affine layout does not match target "
                     f"{target}; conversion through float is lossy."
+                ),
+            )
+        if (
+            target is not None
+            and spec.import_route is QuantImportRoute.DEQUANTIZE_REQUANTIZE
+            and target != (4, 32)
+        ):
+            return (
+                QuantImportRoute.REJECTED,
+                None,
+                (
+                    "Lossy dequantize/requantize conversion currently supports only "
+                    f"the affine (4, 32) target, not {target}."
                 ),
             )
         return (

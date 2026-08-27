@@ -96,8 +96,8 @@ pkg = build("facebook/wav2vec2-base")
 
 ### Build from a GGUF file
 
-Convert a GGUF model (e.g. from llama.cpp) to ONNX. Supported quantization is
-preserved by default:
+Convert a GGUF model (e.g. from llama.cpp) to ONNX. Quantized target storage is
+used by default where the selected graph supports it:
 
 ```python
 from mobius import build_from_gguf
@@ -115,6 +115,20 @@ mobius build-gguf path/to/model.gguf --output output/model/
 Pass `--dequantize` on the CLI, or `keep_quantized=False` to
 `build_from_gguf()`, when a fully float ONNX model is required. F32-, F16-, and
 BF16-only GGUFs automatically use the float path.
+
+`keep_quantized=True` does **not** promise source byte or numerical fidelity.
+Some qtypes are byte-preserved or losslessly repacked, while others are
+dequantized and lossily requantized to a target such as INT4 affine block-32.
+Mobius emits one aggregate warning for lossy conversion and saves the complete
+classification as `quantization_report.json`; do not label normalized output as
+the source GGUF preset (for example, Q4_K_M). The report lists source qtype
+counts/bytes, explicit float tensors, storage fidelity, and compute capability.
+
+Packed storage and runtime compute are separate. A runtime may execute a native
+`MatMulNBits` custom op, or Mobius may inline its portable standard-ONNX
+fallback (nibble `BitShift`/`BitwiseAnd`, `DequantizeLinear`, then float
+`MatMul`). Inlining the fallback does not replace packed weight initializers
+with dense float initializers and does not promise a particular ORT kernel.
 
 > **Note**: GGUF support requires the optional `gguf` package:
 > `pip install mobius-onnx[gguf]`

@@ -114,12 +114,15 @@ class TestMatMulNBitsInlineParity:
         model, feeds, *_ = _build_matmulnbits_model(n_out=8, k_in=64, block=32)
         reference = _run(model, feeds)
 
-        inlined, feeds2, *_ = _build_matmulnbits_model(n_out=8, k_in=64, block=32)
+        inlined, feeds2, packed, *_ = _build_matmulnbits_model(n_out=8, k_in=64, block=32)
         self._inline(inlined)
         # Op is expanded: no MatMulNBits left, DequantizeLinear present.
         ops = [n.op_type for n in inlined.graph]
         assert "MatMulNBits" not in ops
         assert "DequantizeLinear" in ops
+        packed_initializer = inlined.graph.initializers["B"]
+        assert packed_initializer.dtype == ir.DataType.UINT8
+        np.testing.assert_array_equal(np.asarray(packed_initializer.const_value), packed)
         got = _run(inlined, feeds2)
 
         np.testing.assert_allclose(got, reference, rtol=0, atol=0)

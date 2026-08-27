@@ -364,10 +364,11 @@ mobius build --model Qwen/Qwen2.5-0.5B --output output_dir/ \
 
 Build an ONNX model from a GGUF file (e.g. from llama.cpp). This is an explicit
 opt-in import path; `mobius build` does not auto-discover or select GGUF files.
-Supported GGUF quantization is preserved by default through byte-preserving
-native blocks or value-preserving affine repacking. Mixed source qtypes that
-would require lossy dequantization/requantization, including Q4_K_M presets,
-fail closed and require `--dequantize`.
+Quantized target storage is used by default where supported. Native blocks may
+remain byte-identical and affine repacks may be numerically exact, but mixed
+source qtypes can be lossily dequantized/requantized to a common packed target.
+Mobius emits one aggregate warning and writes `quantization_report.json`; this
+mode does not guarantee source-preset fidelity.
 
 > **Note**: Requires the optional `gguf` package: `pip install mobius-onnx[gguf]`
 
@@ -389,7 +390,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 |--------|-------------|
 | `--output OUTPUT_DIR`, `-o OUTPUT_DIR` | Required output directory for the ONNX model. |
 | `--max-shard-size SIZE` | Maximum external-data shard size (e.g. `5GB`). |
-| `--dequantize` | Explicitly dequantize all GGUF weights to float. |
+| `--dequantize` | Explicitly dequantize all mapped GGUF weights to float storage and report no quantized-storage claim. |
 | `--dtype DTYPE` | Target dtype for model weights: `f16`, `bf16`, `f32`. |
 | `--external-data FORMAT` | External data format: `onnx` (default) or `safetensors`. |
 | `--ep EP` | Target execution provider for EP-aware optimization. |
@@ -404,7 +405,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 ### Examples
 
 ```bash
-# Basic GGUF conversion (preserves supported quantization)
+# Basic GGUF conversion (quantized target storage where supported)
 mobius build-gguf model.gguf --output output/
 
 # Explicitly dequantize all weights
@@ -415,12 +416,16 @@ mobius build-gguf model.gguf --output output/ --dtype f16
 ```
 
 F32-, F16-, and BF16-only files build normally as float models because they
-contain no quantization to preserve.
-Quantized files containing only qtypes with no supported preservation target
-(for example, pure Q5_K weights) fail instead of silently becoming
-float. Re-run with `--dequantize` to request explicit float conversion.
-The same rule applies when only some projection tensors are incompatible with
-the selected affine target; Mobius does not silently requantize those tensors.
+contain no quantization to convert. Supported decoder-backed qtypes such as
+Q5_K are explicitly dequantized and requantized to a packed target such as INT4
+affine block-32, with their lossy disposition recorded in the report. Unknown
+qtypes, missing dequantizers, and mapped tensors whose disposition cannot be
+determined still fail closed before payload conversion.
+
+Storage and compute are separate report fields. Packed MatMulNBits initializers
+may use a native custom op or the portable inline fallback
+(`BitShift`/`BitwiseAnd`, `DequantizeLinear`, float `MatMul`). The fallback does
+not convert packed initializers to dense float storage or promise an ORT kernel.
 
 Encoder-only BERT and ModernBERT GGUF backbones auto-select
 `feature-extraction` and output `last_hidden_state`; they do not produce logits

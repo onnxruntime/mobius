@@ -27,8 +27,18 @@ package = build_from_gguf("model.gguf")
 package.save("output")
 ```
 
-Use `keep_quantized=False` for explicit float import. Pass `mmproj=` only for an
-evidenced multimodal sidecar. The CLI equivalent is `mobius build model.gguf -o output`.
+`keep_quantized=True` requests quantized target storage where supported; it does
+not guarantee source byte or numerical fidelity. Mobius classifies qtypes before
+payload conversion, emits one aggregate warning for lossy requantization, and
+saves the typed result as `quantization_report.json`. Use
+`keep_quantized=False` for explicit float import.
+
+Storage and compute are separate: packed MatMulNBits initializers may use a
+native custom op or a portable inline fallback with nibble unpack,
+`DequantizeLinear`, and float `MatMul`. The fallback does not replace packed
+initializers with dense float storage or promise a particular ORT kernel. Pass
+`mmproj=` only for an evidenced multimodal sidecar. The CLI equivalent is
+`mobius build model.gguf -o output`.
 
 ## API
 

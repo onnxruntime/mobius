@@ -542,15 +542,19 @@ class TestKimiK3GGUFBuild:
         finally:
             session.close()
 
-    def test_separate_quantized_mla_requires_explicit_dequantization(
-        self, tmp_path: Path
-    ) -> None:
-        from mobius.integrations.gguf import build_from_gguf
+    def test_separate_quantized_mla_is_reported_as_lossy(self, tmp_path: Path, caplog) -> None:
+        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
 
         path = tmp_path / "kimi-k3-q4.gguf"
         _write_kimi_k3_gguf(path, quantized=True)
-        with pytest.raises(ValueError, match=r"attn_k_b\.weight \(Q4_0\)"):
-            build_from_gguf(path, keep_quantized=True)
+        with caplog.at_level("WARNING"):
+            package = build_from_gguf(path, keep_quantized=True)
+        assert caplog.text.count("GGUF QUANTIZATION FIDELITY WARNING") == 1
+        assert any(
+            record.name.endswith(("attn_k_b.weight", "attn_v_b.weight"))
+            and record.disposition is QuantizationDisposition.LOSSY_REQUANTIZE
+            for record in package.gguf_quantization_report.tensor_records
+        )
 
         model = build_from_gguf(path, keep_quantized=False)["model"]
         assert all(node.op_type != "MatMulNBits" for node in model.graph)
