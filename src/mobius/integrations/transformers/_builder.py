@@ -13,6 +13,10 @@ import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._builder import build_from_module, resolve_dtype
+from mobius._component_quantization import (
+    normalize_component_quantized_weights,
+    validate_quantized_component_bindings,
+)
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
@@ -25,6 +29,7 @@ from mobius.integrations.compressed_tensors import (
     stream_compressed_tensors_to_package,
 )
 from mobius.tasks import ModelTask
+from mobius.weights import adapt_model_weights
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,7 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
         "boa_token_id",
         "vision",
         "audio",
+        "component_quantization",
     ):
         if name in field_names:
             overrides[name] = None
@@ -327,6 +333,14 @@ def build_transformers_model(
     if task is None:
         task = _default_task_for_model(model_type)
 
+    from mobius.tasks import get_task
+
+    resolved_task = get_task(task)
+    component_manifest = resolved_task.component_manifest(
+        module_class=module_class,
+        model_type=model_type,
+        hf_config=parent_config,
+    )
     model_module = module_class(config)
     package = build_from_module(
         model_module,
@@ -337,6 +351,7 @@ def build_transformers_model(
         fp8_kv_cache=fp8_kv_cache,
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
+        component_manifest=component_manifest,
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
@@ -399,12 +414,25 @@ def build_transformers_model(
             )
         else:
             state_dict = _download_weights(model_id, revision=revision)
-            if hasattr(model_module, "preprocess_weights"):
-                state_dict = model_module.preprocess_weights(state_dict)
+            state_dict = adapt_model_weights(
+                model_module,
+                state_dict,
+                config=config,
+                manifest=component_manifest,
+            )
+            state_dict = normalize_component_quantized_weights(
+                state_dict,
+                model_module,
+                config,
+                package.keys(),
+                manifest=component_manifest,
+                task=resolved_task,
+            )
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),
             )
+        validate_quantized_component_bindings(package, config)
     return package
 
 

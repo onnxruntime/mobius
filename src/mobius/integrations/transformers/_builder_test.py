@@ -12,6 +12,7 @@ import onnx_ir as ir
 import pytest
 from onnxscript import nn
 
+from mobius._configs import QuantizationConfig
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -263,6 +264,29 @@ def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revisi
     if revision is not None:
         expected_kwargs["revision"] = revision
     assert calls == [("unsloth/Qwen3.8-Flash-Next-FP8", expected_kwargs)]
+
+
+def test_strip_to_text_only_drops_component_quantization() -> None:
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+    )
+    config = make_config(
+        quantization=decoder,
+        component_quantization={
+            "decoder": decoder,
+            "vision_encoder": QuantizationConfig(
+                bits=8,
+                group_size=32,
+                quant_method="olive",
+            ),
+        },
+    )
+
+    stripped = transformers_builder._strip_to_text_only(config, "qwen2")
+    assert stripped.component_quantization is None
+    assert stripped.quantization is decoder
 
 
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:

@@ -33,7 +33,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._build_context import ep_capabilities, is_prefill_prefix_pruning_enabled
-from mobius._configs import ArchitectureConfig, Gemma4Config
+from mobius._configs import ArchitectureConfig, Gemma4Config, QuantizationConfig
 from mobius._weight_utils import (
     is_packed_quant_key,
     preprocess_quantized_weights,
@@ -51,6 +51,7 @@ from mobius.components import (
     ScaleFreeRMSNorm,
     create_attention_bias,
     initialize_rope,
+    make_clippable_quantized_linear_factory,
     make_quantized_linear_factory,
 )
 from mobius.components._activations import get_activation
@@ -139,83 +140,89 @@ def _retain_last_bias_query_row(op: OpBuilder, bias: ir.Value | None) -> ir.Valu
     return op.Unsqueeze(last, op.Constant(value_ints=[2]))
 
 
-def _text_quantization_config(config: Gemma4Config):
-    """Return the active weight-quantization config, or ``None`` when off."""
-    quantization_config = getattr(config, "quantization", None)
-    if quantization_config is None or quantization_config.quant_method == "none":
+def _active_quantization(
+    quantization: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    if quantization is None or quantization.quant_method == "none":
         return None
-    return quantization_config
+    return quantization
 
 
-def _quantized_linear_class(config: Gemma4Config) -> type | None:
-    """Return the checkpoint's QuantizedLinear factory, or ``None`` when off."""
-    quantization_config = _text_quantization_config(config)
-    if quantization_config is None:
+def _component_quantization_config(
+    config: Gemma4Config,
+    component: str,
+    *,
+    source_module_names: tuple[str, ...] = (),
+) -> QuantizationConfig | None:
+    if config.component_quantization is not None:
+        quantization = config.quantization_for(component)
+    else:
+        quantization = config.quantization
+        if component == "vision_encoder" and (
+            quantization is None or not quantization.quantize_vision
+        ):
+            return None
+        if component == "audio_encoder":
+            return None
+    quantization = _active_quantization(quantization)
+    if quantization is not None and source_module_names:
+        quantization = quantization.for_module(source_module_names)
+    return quantization
+
+
+def _quantized_linear_class(
+    config: Gemma4Config,
+    quantization: QuantizationConfig | None,
+) -> type | None:
+    if quantization is None:
         return None
     zero_point_dtype = (
-        config.dtype
-        if getattr(quantization_config, "float_zero_point", False)
-        else ir.DataType.UINT8
+        config.dtype if getattr(quantization, "float_zero_point", False) else ir.DataType.UINT8
     )
     return make_quantized_linear_factory(
-        bits=quantization_config.bits,
-        block_size=quantization_config.group_size,
-        has_zero_point=not quantization_config.sym,
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
         zero_point_dtype=zero_point_dtype,
     )
 
 
 def _text_linear_class(config: Gemma4Config) -> type | None:
     """Return a QuantizedLinear factory for text projections, or ``None``."""
-    return _quantized_linear_class(config)
+    return _quantized_linear_class(
+        config,
+        _component_quantization_config(config, "decoder"),
+    )
 
 
 def _vision_linear_classes(config: Gemma4Config) -> tuple[type, type]:
     """Return plain and activation-clipped Linear classes for the vision graph."""
-    quantization_config = _text_quantization_config(config)
-    quantized_linear = _quantized_linear_class(config)
-    if (
-        quantization_config is None
-        or not quantization_config.quantize_vision
-        or quantized_linear is None
-    ):
+    quantization = _component_quantization_config(config, "vision_encoder")
+    quantized_linear = _quantized_linear_class(config, quantization)
+    if quantization is None or quantized_linear is None:
         return Linear, ClippableLinear
-
-    class QuantizedClippableLinear(quantized_linear):
-        """MatMulNBits projection with Gemma4's learned activation clipping."""
-
-        def __init__(self, in_features: int, out_features: int, bias: bool = False):
-            super().__init__(in_features, out_features, bias=bias)
-            self.input_min = nn.Parameter([])
-            self.input_max = nn.Parameter([])
-            self.output_min = nn.Parameter([])
-            self.output_max = nn.Parameter([])
-
-        def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
-            x = op.Clip(x, self.input_min, self.input_max)
-            return op.Clip(
-                super().forward(op, x),
-                self.output_min,
-                self.output_max,
-            )
-
-    return quantized_linear, QuantizedClippableLinear
-
-
-def _text_embeddings_quantized(config: Gemma4Config) -> bool:
-    """Whether the text token-embedding tables use GatherBlockQuantized."""
-    quantization_config = _text_quantization_config(config)
-    return quantization_config is not None and bool(
-        getattr(quantization_config, "quantize_embeddings", False)
+    zero_point_dtype = (
+        config.dtype if getattr(quantization, "float_zero_point", False) else ir.DataType.UINT8
+    )
+    return (
+        quantized_linear,
+        make_clippable_quantized_linear_factory(
+            bits=quantization.bits,
+            block_size=quantization.group_size,
+            has_zero_point=not quantization.sym,
+            zero_point_dtype=zero_point_dtype,
+        ),
     )
 
 
 def _text_lm_head_quantized(config: Gemma4Config) -> bool:
     """Whether the text LM head projection uses MatMulNBits."""
-    quantization_config = _text_quantization_config(config)
-    return quantization_config is not None and bool(
-        getattr(quantization_config, "quantize_lm_head", False)
+    quantization = _component_quantization_config(
+        config,
+        "decoder",
+        source_module_names=("lm_head", "model.language_model.lm_head"),
     )
+    return quantization is not None and bool(getattr(quantization, "quantize_lm_head", False))
 
 
 def _make_scaled_word_embedding(
@@ -223,6 +230,9 @@ def _make_scaled_word_embedding(
     num_embeddings: int,
     embedding_dim: int,
     embed_scale: float,
+    *,
+    component: str = "decoder",
+    source_module_names: tuple[str, ...] = ("model.language_model.embed_tokens",),
 ):
     """Build a scaled token embedding, quantized when the config requests it.
 
@@ -230,9 +240,14 @@ def _make_scaled_word_embedding(
     lookup) when embedding quantization is enabled and the embedding dimension
     is block-aligned, otherwise a float :class:`Gemma3TextScaledWordEmbedding`.
     """
-    quantization_config = _text_quantization_config(config)
+    quantization_config = _component_quantization_config(
+        config,
+        component,
+        source_module_names=source_module_names,
+    )
     if (
-        _text_embeddings_quantized(config)
+        quantization_config is not None
+        and quantization_config.quantize_embeddings
         and embedding_dim % quantization_config.group_size == 0
     ):
         return Gemma4ScaledQuantizedWordEmbedding(
@@ -1952,6 +1967,7 @@ class Gemma4TextModel(nn.Module):
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 float(self._per_layer_dim**0.5),
+                source_module_names=("model.language_model.embed_tokens_per_layer",),
             )
             # Split [V, D] tables — used when split_per_layer_embedding is True
             # (i.e. the fused table exceeds the EP's max_buffer_size, e.g. WebGPU's
@@ -2767,6 +2783,8 @@ class Gemma4EmbeddingModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             embed_scale,
+            component="embedding",
+            source_module_names=("model.language_model.embed_tokens",),
         )
         self.image_token_id = config.image_token_id or 0
         # Audio token ID is only set when the model has an audio encoder.
@@ -2786,6 +2804,8 @@ class Gemma4EmbeddingModel(nn.Module):
                 vocab_per_layer,
                 self._num_layers * self._per_layer_dim,
                 float(self._per_layer_dim**0.5),
+                component="embedding",
+                source_module_names=("model.language_model.embed_tokens_per_layer",),
             )
             self.per_layer_model_projection = Linear(
                 config.hidden_size,
@@ -3305,6 +3325,25 @@ class Gemma4Model(nn.Module):
             "model.language_model.per_layer_projection_norm",
         ),
     }
+    HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
+        "decoder": {
+            "model": "model.language_model",
+            "lm_head": "lm_head",
+        },
+        "vision_encoder": {
+            "encoder": "model.vision_tower.encoder",
+            "projector": "model.embed_vision.embedding_projection",
+        },
+        "audio_encoder": {
+            "encoder": "model.audio_tower",
+            "projector": "model.embed_audio.embedding_projection",
+        },
+        "embedding": {
+            "embed_tokens": "model.language_model.embed_tokens",
+            "embed_tokens_per_layer": ("model.language_model.embed_tokens_per_layer"),
+            "per_layer_model_projection": ("model.language_model.per_layer_model_projection"),
+        },
+    }
 
     def __init__(self, config: Gemma4Config):
         super().__init__()
@@ -3384,6 +3423,14 @@ class Gemma4Model(nn.Module):
                 elif any(suffix.startswith(p) for p in per_layer_prefixes):
                     # Per-layer embedding weights → embedding sub-model
                     renamed["embedding." + suffix] = value
+                elif (
+                    suffix.startswith("embed_tokens.")
+                    and self.config.component_quantization is not None
+                ):
+                    # The split decoder consumes inputs_embeds and has no token
+                    # table initializer. Route authoritative component-plan
+                    # embedding sidecars only to the embedding graph.
+                    renamed["embedding." + suffix] = value
                 else:
                     # All other text weights nest under decoder.model.*
                     onnx_key = "decoder.model." + suffix
@@ -3461,11 +3508,11 @@ class Gemma4Model(nn.Module):
         _remap_moe_expert_weights(renamed, self.config)
 
         quantization = self.config.quantization
-        if quantization is not None and quantization.quant_method in {
-            "olive",
-            "gptq",
-            "awq",
-        }:
+        if (
+            self.config.component_quantization is None
+            and quantization is not None
+            and quantization.quant_method in {"olive", "gptq", "awq"}
+        ):
             tie = self.config.tie_word_embeddings
             apply_tie = tie and any(
                 key in renamed
@@ -3558,6 +3605,22 @@ class Gemma4UnifiedModel(nn.Module):
         "vision_encoder": ("model.vision_embedder", "model.embed_vision"),
         "audio_encoder": ("model.embed_audio",),
         "embedding": ("model.language_model.embed_tokens",),
+    }
+    HF_COMPONENT_MODULE_ALIASES: ClassVar[dict[str, dict[str, str]]] = {
+        "decoder": {
+            "model": "model.language_model",
+            "lm_head": "lm_head",
+        },
+        "vision_encoder": {
+            "patch_dense": "model.vision_embedder.patch_dense",
+            "projector": "model.embed_vision.embedding_projection",
+        },
+        "audio_encoder": {
+            "projector": "model.embed_audio.embedding_projection",
+        },
+        "embedding": {
+            "embed_tokens": "model.language_model.embed_tokens",
+        },
     }
 
     def __init__(self, config: Gemma4Config):

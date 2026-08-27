@@ -1058,6 +1058,77 @@ class TestQuantizationConfig:
         assert qc.quantize_lm_head is True
         assert qc.quantize_vision is True
 
+    def test_component_plan_matches_exact_and_regex_module_rules(self):
+        qc = QuantizationConfig.from_value(
+            {
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+                "modules_to_not_convert": [
+                    r"re:.*\.per_layer_input_gate",
+                ],
+                "overrides": {
+                    "model.layers.0.q_proj": {
+                        "bits": 8,
+                        "group_size": 64,
+                    }
+                },
+            }
+        )
+
+        assert qc is not None
+        assert qc.for_module(("model.language_model.layers.0.per_layer_input_gate",)) is None
+        overridden = qc.for_module(("model.layers.0.q_proj",))
+        assert overridden is not None
+        assert (overridden.bits, overridden.group_size) == (8, 64)
+
+    def test_invalid_component_regex_fails_during_config_parse(self):
+        with pytest.raises(ValueError, match="Invalid quantization regex"):
+            QuantizationConfig.from_value(
+                {
+                    "quant_method": "olive",
+                    "modules_to_not_convert": ["re:("],
+                }
+            )
+
+    def test_architecture_config_parses_explicit_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            component_quantization={
+                "decoder": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "modules_to_not_convert": [
+                        r"re:.*\.per_layer_projection",
+                    ],
+                },
+                "vision": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                },
+            },
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("decoder").modules_to_not_convert
+
     def test_quantize_component_flags_default_false(self):
         qc = QuantizationConfig()
         assert qc.quantize_embeddings is False
