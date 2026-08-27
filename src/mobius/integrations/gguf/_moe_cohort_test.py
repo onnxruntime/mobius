@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from mobius.integrations.gguf._builder import (
     _graph_config_fields_for_fingerprint,
     _normalize_gguf_weights,
     _raise_for_invalid_moe_cohort_tensor_contract,
+    _serialize_route_graph_config,
 )
 from mobius.integrations.gguf._config_mapping import gguf_to_config
 from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
@@ -98,6 +100,54 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
     assert current_bytes == legacy_bytes
 
 
+def test_hy_v3_route_fingerprint_includes_routing_floor() -> None:
+    config = ArchitectureConfig(routing_weight_normalization_floor=6.103515625e-5)
+    default_floor = _serialize_route_graph_config(config, "hy_v3")
+    changed_floor = _serialize_route_graph_config(
+        dataclasses.replace(config, routing_weight_normalization_floor=0.25),
+        "hy_v3",
+    )
+
+    assert json.loads(default_floor)["routing_weight_normalization_floor"] == pytest.approx(
+        6.103515625e-5
+    )
+    assert json.loads(changed_floor)["routing_weight_normalization_floor"] == pytest.approx(
+        0.25
+    )
+    assert default_floor != changed_floor
+    assert (
+        hashlib.sha256(default_floor.encode()).digest()
+        != hashlib.sha256(changed_floor.encode()).digest()
+    )
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "llama",
+        "qwen2",
+        "lfm2",
+        "qwen35moe",
+        "arctic",
+        "dbrx",
+        "nomic-bert-moe",
+        "jina-bert-v3",
+    ],
+)
+def test_unaffected_route_fingerprints_ignore_routing_floor(architecture: str) -> None:
+    config = ArchitectureConfig(routing_weight_normalization_floor=6.103515625e-5)
+    baseline = _serialize_route_graph_config(config, architecture)
+    changed = _serialize_route_graph_config(
+        dataclasses.replace(config, routing_weight_normalization_floor=0.25),
+        architecture,
+    )
+
+    assert changed.encode() == baseline.encode()
+    assert (
+        hashlib.sha256(changed.encode()).digest() == hashlib.sha256(baseline.encode()).digest()
+    )
+
+
 @pytest.mark.parametrize(
     ("architecture", "included"),
     [
@@ -108,6 +158,7 @@ def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
             frozenset({"moe_layer_frequency", "routing_weight_normalization_floor"}),
         ),
         ("nomic-bert-moe", frozenset({"moe_layer_frequency"})),
+        ("hy_v3", frozenset({"routing_weight_normalization_floor"})),
         ("smallthinker", frozenset({"routing_weight_normalization_floor"})),
     ],
 )
