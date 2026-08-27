@@ -1031,6 +1031,7 @@ def gguf_to_config(
         partial_rotary_factor=partial_rotary_factor,
         rope_interleave=rope_interleave,
         mrope_section=mrope_section,
+        mrope_interleaved=canonical_arch in {"qwen35", "qwen35moe"},
         num_decoder_layers=hf_fields.get("num_decoder_layers"),
         decoder_start_token_id=hf_fields.get("decoder_start_token_id"),
         relative_attention_num_buckets=hf_fields.get("relative_attention_num_buckets", 32),

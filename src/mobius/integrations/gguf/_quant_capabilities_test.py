@@ -136,10 +136,10 @@ def test_selected_real_artifacts_stay_within_global_budget() -> None:
     assert isinstance(policy, dict)
     assert isinstance(artifacts, list)
     assert isinstance(lossy, list)
-    assert len(artifacts) == 3
+    assert len(artifacts) == 4
     assert len(lossy) == 1
     selected = sum(int(record["size"]) for record in [*artifacts, *lossy])
-    assert selected == 1_763_532_768
+    assert selected == 2_390_132_320
     assert selected == policy["selected_artifact_bytes"]
     assert selected <= policy["max_selected_artifact_bytes"]
     assert lossy[0]["lfs_sha256"] == (
@@ -147,3 +147,12 @@ def test_selected_real_artifacts_stay_within_global_budget() -> None:
     )
     assert "source_fidelity=false" in lossy[0]["disposition"]
     assert "runtime support deferred" in lossy[0]["runtime_disposition"]
+
+    qwen = next(record for record in artifacts if record["filename"].endswith("Q2_K.gguf"))
+    [runtime] = qwen["runtime_results"]
+    assert runtime["source_fidelity"] is False
+    assert runtime["storage_quantized"] is False
+    assert runtime["target_storage_format"] == "float"
+    assert runtime["compute_mode"] == "float operators"
+    assert '"preserve_quantization":false' in runtime["import_route"]
+    assert "Explicit-float correctness route only" in runtime["limitations"]

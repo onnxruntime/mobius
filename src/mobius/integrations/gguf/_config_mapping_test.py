@@ -1473,13 +1473,11 @@ class TestQwen35MtpBlockExclusion:
 
 
 class TestQwen35RopeInterleave:
-    """M-RoPE section metadata is not a GPT-J adjacent-pair rotation signal.
+    """Qwen3.5 uses interleaved M-RoPE sections with split-half rotation.
 
-    Qwen3.5/3.8 rotate with split-half (NEOX) semantics. Deriving the flat
-    ``rope_interleave`` from section presence corrupts RoPE — the exported
-    GroupQueryAttention/RotaryEmbedding gets ``rotary_interleaved=1`` and the
-    full-attention layers emit garbage tokens. The mapping must keep
-    ``rope_interleave`` False for section-carrying non-interleaving arches.
+    The flat ``rope_interleave`` flag selects GPT-J adjacent-pair rotation and
+    must remain false. ``mrope_interleaved`` independently selects Qwen3.5's
+    temporal/height/width channel assignment and must be true.
     """
 
     def _fake_model(self, metadata: dict, architecture: str = "qwen35") -> object:
@@ -1526,6 +1524,7 @@ class TestQwen35RopeInterleave:
         config = gguf_to_config(self._fake_model(md))
 
         assert config.rope_interleave is False
+        assert config.mrope_interleaved is True
 
     def test_missing_sections_fail_closed(self) -> None:
         from mobius.integrations.gguf._config_mapping import gguf_to_config

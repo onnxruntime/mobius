@@ -56,7 +56,7 @@ def test_every_route_has_one_actionable_classification() -> None:
     assert {item.category for item in items} == allowed
     assert all(item.batch and item.dependencies and item.reason.strip() for item in items)
     assert Counter(item.kind for item in items) == {
-        "architecture": 145,
+        "architecture": 144,
         "projector": 60,
         "tokenizer": 57,
         "mtp": 22,
@@ -64,7 +64,7 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-runtime-abi-blocked": 101,
-        "evidence-only": 95,
+        "evidence-only": 94,
         "immediately-implementable": 67,
         "intentionally-rejected": 19,
         "artifact-unavailable": 4,

@@ -4291,6 +4291,61 @@ class TestBuildQuantizedGguf:
             stat.source_bytes for stat in report.source_qtype_census
         )
 
+    def test_qwen35moe_mixed_float_experts_fail_closed_on_default_route(self) -> None:
+        """The quantized Qwen3.5-MoE route must not requantize source-float experts."""
+        from gguf import GGMLQuantizationType
+        from onnxscript import nn
+
+        from mobius.components import QuantizedLinear
+        from mobius.integrations.gguf._builder import _preflight_quantization_report
+
+        def make_expert() -> nn.Module:
+            expert = nn.Module()
+            expert.gate_proj = QuantizedLinear(64, 64)
+            expert.up_proj = QuantizedLinear(64, 64)
+            expert.down_proj = QuantizedLinear(64, 64)
+            return expert
+
+        mlp = nn.Module()
+        mlp.experts = nn.ModuleList([make_expert(), make_expert()])
+        layer = nn.Module()
+        layer.mlp = mlp
+        layer.self_attn = nn.Module()
+        layer.self_attn.o_proj = QuantizedLinear(64, 64)
+        module = nn.Module()
+        module.model = nn.Module()
+        module.model.layers = nn.ModuleList([layer])
+        tensors = [
+            SimpleNamespace(
+                name="blk.0.attn_output.weight",
+                tensor_type=GGMLQuantizationType.Q4_0,
+                shape=(64, 64),
+                n_bytes=2_304,
+            ),
+            SimpleNamespace(
+                name="blk.0.ffn_gate_exps.weight",
+                tensor_type=GGMLQuantizationType.F16,
+                shape=(64, 64, 2),
+                n_bytes=16_384,
+            ),
+        ]
+        source = SimpleNamespace(reader_tensors=lambda: iter(tensors), _reader=None)
+
+        with pytest.raises(
+            ValueError,
+            match="selected quantized graph would quantize a source-float tensor",
+        ):
+            _preflight_quantization_report(
+                source,
+                "qwen35moe",
+                module,
+                SimpleNamespace(),
+                preserve_quantization=True,
+                target_bits=4,
+                target_block_size=32,
+                execution_provider="cpu",
+            )
+
     def test_norms_are_float(self, q4_0_gguf: Path):
         """Norm weights remain float, not quantized."""
         import onnx_ir as ir

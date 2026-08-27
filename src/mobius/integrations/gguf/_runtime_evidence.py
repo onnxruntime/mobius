@@ -69,6 +69,10 @@ class GGUFRuntimeEvidence:
     tensor_count: int
     tensor_qtypes: tuple[tuple[str, int], ...]
     import_route: str
+    source_fidelity: bool
+    storage_quantized: bool
+    target_storage_format: str
+    compute_mode: str
     graph_files: tuple[str, ...]
     graph_sha256: str
     runtime_package_files: tuple[str, ...]
@@ -82,6 +86,7 @@ class GGUFRuntimeEvidence:
     runtime: str
     runtime_version: str
     result: str = "passed"
+    limitations: str | None = None
 
     def __post_init__(self) -> None:
         text_fields = (
@@ -97,6 +102,8 @@ class GGUFRuntimeEvidence:
             self.tokenizer_revision,
             self.tokenizer_metadata_sha256,
             self.import_route,
+            self.target_storage_format,
+            self.compute_mode,
             self.graph_sha256,
             self.runtime_package_sha256,
             self.parity_test,
@@ -147,6 +154,8 @@ class GGUFRuntimeEvidence:
             raise ValueError(
                 "GGUF runtime evidence may only support a route after a passed result"
             )
+        if self.limitations is not None and not self.limitations.strip():
+            raise ValueError("GGUF runtime evidence limitations must be non-empty")
         asset_names = tuple(asset[0] for asset in self.tokenizer_assets)
         if (
             not self.tokenizer_assets
@@ -230,6 +239,10 @@ _SMOLLM_F16_ONNX_RUNTIME = GGUFRuntimeEvidence(
     tensor_count=272,
     tensor_qtypes=(("F16", 211), ("F32", 61)),
     import_route=_SMOLLM_F16_ROUTE,
+    source_fidelity=True,
+    storage_quantized=False,
+    target_storage_format="float",
+    compute_mode="float operators",
     graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
     graph_sha256="4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
     runtime_package_files=(
@@ -316,6 +329,10 @@ _QWEN25_Q8_ORT_GENAI = GGUFRuntimeEvidence(
     tensor_count=291,
     tensor_qtypes=(("F32", 121), ("Q8_0", 170)),
     import_route='{"architecture":"qwen2","config_sha256":"f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500","execution_provider":"cpu","model_type":"qwen2","module_type":"qwen2","preserve_quantization":true,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":[],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"text-generation"},"tensor_map_recipe":["llama"]}',
+    source_fidelity=True,
+    storage_quantized=True,
+    target_storage_format="native GGUF block storage",
+    compute_mode="runtime-dependent native custom op or inline standard-ONNX fallback",
     graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
     graph_sha256="240e5e374803c94efdb17eee39c09b0d3e9aed10b6d8b4e1c92e39918ea2155e",
     runtime_package_files=(
@@ -377,6 +394,10 @@ _LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
     tensor_count=148,
     tensor_qtypes=(("F16", 93), ("F32", 55)),
     import_route='{"architecture":"lfm2","config_sha256":"c961bba579ea33a2472a7c5d3f469c76f1f8c7aae8440a7eaa86bc6e878a42f4","execution_provider":"cpu","model_type":"lfm2","module_type":"lfm2","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":false,"required_metadata":["attention.head_count_kv","attention.layer_norm_rms_epsilon","shortconv.l_cache"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"hybrid-text-generation"},"tensor_map_recipe":["lfm2"]}',
+    source_fidelity=True,
+    storage_quantized=False,
+    target_storage_format="float",
+    compute_mode="float operators",
     graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
     graph_sha256="27e4ebb4c0c8b6c01ee57fa7825f34c5ddadc8ca5dc0c75d989e4507d4dcdfdb",
     runtime_package_files=(
@@ -405,12 +426,90 @@ _LFM2_350M_F16_ORT_GENAI = GGUFRuntimeEvidence(
     runtime_version="0.15.2",
 )
 
+_QWEN35MOE_087B_Q2_K_ORT_GENAI = GGUFRuntimeEvidence(
+    evidence_id="qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",
+    architecture="qwen35moe",
+    repository="Flexan/kshitijthakkar-qwen3.5-moe-0.87B-d0.8B-GGUF",
+    revision="a9b8adbec2cc87479c772dac1944f313b4036c26",
+    filename="qwen3.5-moe-0.87B-d0.8B.Q2_K.gguf",
+    size=626_599_552,
+    lfs_sha256="e8a84df1a50ce65cf80c2b55bba8c6e80f913679fdf9e9439f2c3b52ef3145d5",
+    config_repository="kshitijthakkar/qwen3.5-moe-0.87B-d0.8B",
+    config_revision="e5b5b3d7c3cc5593196902fd3c23964e891a6ea6",
+    tokenizer_repository="kshitijthakkar/qwen3.5-moe-0.87B-d0.8B",
+    tokenizer_revision="e5b5b3d7c3cc5593196902fd3c23964e891a6ea6",
+    tokenizer_metadata_sha256="45302b58b2086a666a874652d0e9e1d5b4b26e786ffbaf9362a4f902eba0b10d",
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            7_755,
+            "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+        ),
+        (
+            "tokenizer.json",
+            12_807_982,
+            "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+        ),
+        (
+            "tokenizer_config.json",
+            16_709,
+            "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c",
+        ),
+    ),
+    tensor_count=441,
+    tensor_qtypes=(
+        ("F16", 48),
+        ("F32", 181),
+        ("Q2_K", 193),
+        ("Q5_K", 6),
+        ("Q6_K", 1),
+        ("Q8_0", 12),
+    ),
+    import_route='{"architecture":"qwen35moe","config_sha256":"f61aa39910c1b2ef27b9f8c707ef17dc7d16eff6fd97fae33d3a2eb367bf76f9","execution_provider":"cpu","model_type":"qwen3_5_moe","module_type":"qwen3_5_moe","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":null,"llama_qk_permute":false,"offset_norm":true,"required_metadata":["attention.layer_norm_rms_epsilon","expert_count","expert_used_count","rope.dimension_sections","ssm.conv_kernel","ssm.group_count","ssm.inner_size","ssm.state_size","ssm.time_step_rank"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":true,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"hybrid-text-generation"},"tensor_map_recipe":["llama","moe_extras","qwen35_hybrid_extras"]}',
+    source_fidelity=False,
+    storage_quantized=False,
+    target_storage_format="float",
+    compute_mode="float operators",
+    graph_files=("model.onnx", "model.onnx.data", "quantization_report.json"),
+    graph_sha256="8c1aa1075cee03ffd5ce5bbd283ee88b2466e6c1d645f0a41e542230951d6f09",
+    runtime_package_files=(
+        "chat_template.jinja",
+        "genai_config.json",
+        "gguf_tokenizer_manifest.json",
+        "model.onnx",
+        "model.onnx.data",
+        "quantization_report.json",
+        "runtime_compatibility.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ),
+    runtime_package_sha256="bd69cf72acffd393a706bb012c23990acfdaf3a43e25ad919ef1148afac42a15",
+    parity_test="test_promoted_gguf_full_runtime_evidence[qwen3.5-moe-0.87b-q2-k]",
+    parity_kind="full-logit",
+    deterministic_test="test_promoted_gguf_full_runtime_evidence[qwen3.5-moe-0.87b-q2-k]",
+    stateful_semantics=(
+        "hybrid convolution, recurrent, and KV state prefill, replay, rollback, reorder, "
+        "and 20 cache-threaded decode steps"
+    ),
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
+    runtime="ort-genai",
+    runtime_version="0.15.2",
+    limitations=(
+        "Explicit-float correctness route only: source quantization is dequantized, dense "
+        "MoE execution is opt-in, and the selected publisher marks this reduced checkpoint "
+        "as low quality. Same-value full-logit comparison uses atol=0.35 because small "
+        "backend differences can cross a routed-expert boundary; all greedy tokens match."
+    ),
+)
+
 _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType(
     {
         record.evidence_id: record
         for record in (
             _LFM2_350M_F16_ORT_GENAI,
             _QWEN25_Q8_ORT_GENAI,
+            _QWEN35MOE_087B_Q2_K_ORT_GENAI,
             _SMOLLM_F16_ONNX_RUNTIME,
             _SMOLLM_F16_ORT_GENAI,
         )
