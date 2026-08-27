@@ -202,6 +202,16 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         True,
     ),
     (
+        "maincoder",
+        {
+            "hidden_act": "silu",
+            "tie_word_embeddings": True,
+            "rms_norm_eps": 1e-5,
+            "rope_interleave": True,
+        },
+        True,
+    ),
+    (
         "lfm2",
         {
             "_config_cls": Lfm2Config,

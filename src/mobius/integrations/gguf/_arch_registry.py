@@ -2360,6 +2360,35 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
     ),
     GGUFArchitectureSpec(
+        gguf_arch="maincoder",
+        model_type="maincoder",
+        tensor_map_recipe=("llama", "exact_legacy_gguf_extras"),
+        config_postprocessor="maincoder",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+        ),
+        rope_interleave=True,
+        llama_qk_permute=False,
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact float import is covered with learned per-head Q/K RMSNorm after "
+            "adjacent-pair RoPE, sequential pre-norm SwiGLU blocks, causal GQA cache, "
+            "and a tied output head. Packed projection preservation and runtime packaging "
+            "remain deferred; use keep_quantized=False."
+        ),
+    ),
+    GGUFArchitectureSpec(
         gguf_arch="wavtokenizer-dec",
         config=Support.DEFERRED,
         tensor_map=Support.DEFERRED,
@@ -2388,6 +2417,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "gemma-embedding",
             "jais2",
             "minicpm",
+            "maincoder",
             "plm",
             "orion",
             "pangu-embedded",

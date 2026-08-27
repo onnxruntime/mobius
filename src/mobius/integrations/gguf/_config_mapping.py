@@ -1655,6 +1655,26 @@ def _talkie_postprocess(
     )
 
 
+def _maincoder_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore Maincoder's tied, adjacent-pair, post-RoPE QK-norm profile."""
+    return dataclasses.replace(
+        config,
+        hidden_act="silu",
+        tie_word_embeddings=True,
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        rope_type="default",
+        rope_interleave=True,
+    )
+
+
 def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str) -> None:
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
     if scaling_type in (None, "", "none"):
@@ -4184,6 +4204,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "specialized_encoder": _specialized_encoder_postprocess,
     "gguf_embedding": _gguf_embedding_postprocess,
     "talkie": _talkie_postprocess,
+    "maincoder": _maincoder_postprocess,
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
     "kimi_linear": _kimi_linear_postprocess,

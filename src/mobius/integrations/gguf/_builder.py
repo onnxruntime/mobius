@@ -699,6 +699,7 @@ def _validate_gguf_model(
     _raise_for_invalid_embedding_tensor_contract(gguf_model)
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
+    _raise_for_invalid_maincoder_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
@@ -2427,6 +2428,156 @@ def _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model) -> None:
         raise ValueError(
             f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
             f"unexpected={unexpected}, malformed={malformed}"
+        )
+
+
+def _raise_for_invalid_maincoder_tensor_contract(gguf_model) -> None:
+    """Validate Maincoder metadata, geometry, qtypes, and tied tensor closure."""
+    if gguf_model.architecture != "maincoder":
+        return
+
+    metadata = gguf_model.metadata
+    arch = "maincoder"
+    required_suffixes = (
+        "context_length",
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "attention.head_count",
+        "attention.head_count_kv",
+        "attention.key_length",
+        "attention.value_length",
+        "attention.layer_norm_rms_epsilon",
+        "rope.freq_base",
+        "rope.dimension_count",
+    )
+    missing_metadata = [
+        f"{arch}.{suffix}"
+        for suffix in required_suffixes
+        if f"{arch}.{suffix}" not in metadata
+    ]
+    if missing_metadata:
+        raise ValueError(f"Maincoder GGUF is missing required metadata: {missing_metadata}")
+
+    def _positive_int(suffix: str) -> int:
+        key = f"{arch}.{suffix}"
+        value = metadata[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{key} must be a positive integer, got {value!r}")
+        try:
+            integer = int(value)
+        except (ValueError, OverflowError) as error:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}") from error
+        if integer <= 0 or integer != value:
+            raise ValueError(f"{key} must be a positive integer, got {value!r}")
+        return integer
+
+    _positive_int("context_length")
+    hidden = _positive_int("embedding_length")
+    intermediate = _positive_int("feed_forward_length")
+    blocks = _positive_int("block_count")
+    query_heads = _positive_int("attention.head_count")
+    kv_heads = _positive_int("attention.head_count_kv")
+    key_length = _positive_int("attention.key_length")
+    value_length = _positive_int("attention.value_length")
+    rope_dimension = _positive_int("rope.dimension_count")
+    epsilon = metadata[f"{arch}.attention.layer_norm_rms_epsilon"]
+    rope_base = metadata[f"{arch}.rope.freq_base"]
+    for key, value in (
+        (f"{arch}.attention.layer_norm_rms_epsilon", epsilon),
+        (f"{arch}.rope.freq_base", rope_base),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{key} must be a finite positive number, got {value!r}")
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{key} must be a finite positive number, got {value!r}")
+
+    if query_heads % kv_heads:
+        raise ValueError(
+            "maincoder.attention.head_count must be divisible by "
+            "maincoder.attention.head_count_kv"
+        )
+    if hidden != query_heads * key_length:
+        raise ValueError(
+            "Maincoder requires embedding_length == attention.head_count * "
+            f"attention.key_length, got {hidden} != {query_heads} * {key_length}"
+        )
+    if value_length != key_length or rope_dimension != key_length:
+        raise ValueError(
+            "Maincoder requires equal full-head key/value/RoPE dimensions, got "
+            f"key={key_length}, value={value_length}, rope={rope_dimension}"
+        )
+    scaling_keys = sorted(key for key in metadata if key.startswith(f"{arch}.rope.scaling."))
+    if scaling_keys:
+        raise ValueError(
+            "Maincoder's promoted profile does not support scaled/sectioned RoPE "
+            f"metadata: {scaling_keys}"
+        )
+
+    actual: dict[str, tuple[int, ...]] = {}
+    qtypes: dict[str, Any] = {}
+    for name, _raw, qtype, shape in gguf_model.tensor_items_raw():
+        actual[name] = tuple(int(dim) for dim in shape)
+        qtypes[name] = qtype
+
+    kv_hidden = kv_heads * key_length
+    required = {
+        "token_embd.weight": (-1, hidden),
+        "output_norm.weight": (hidden,),
+    }
+    for block in range(blocks):
+        prefix = f"blk.{block}."
+        required.update(
+            {
+                prefix + "attn_norm.weight": (hidden,),
+                prefix + "attn_q.weight": (hidden, hidden),
+                prefix + "attn_k.weight": (kv_hidden, hidden),
+                prefix + "attn_v.weight": (kv_hidden, hidden),
+                prefix + "attn_output.weight": (hidden, hidden),
+                prefix + "attn_q_norm.weight": (key_length,),
+                prefix + "attn_k_norm.weight": (key_length,),
+                prefix + "ffn_norm.weight": (hidden,),
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+        )
+
+    missing = sorted(set(required) - set(actual))
+    unexpected = sorted(set(actual) - set(required))
+    malformed = {
+        name: (expected, actual[name])
+        for name, expected in required.items()
+        if name in actual
+        and (
+            len(expected) != len(actual[name])
+            or any(want != -1 and want != got for want, got in zip(expected, actual[name]))
+        )
+    }
+    vocab = actual.get("token_embd.weight", (0,))[0]
+    if vocab <= 0:
+        malformed["token_embd.weight"] = (
+            required["token_embd.weight"],
+            actual.get("token_embd.weight"),
+        )
+    if missing or unexpected or malformed:
+        raise ValueError(
+            "Invalid maincoder GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}"
+        )
+
+    from mobius.integrations.gguf._quant_registry import float_storage_type_ids
+
+    float_qtypes = float_storage_type_ids()
+    quantized_auxiliary = sorted(
+        name
+        for name, shape in actual.items()
+        if len(shape) == 1 and getattr(qtypes[name], "value", qtypes[name]) not in float_qtypes
+    )
+    if quantized_auxiliary:
+        raise ValueError(
+            "Maincoder normalization tensors must use float GGUF storage: "
+            f"{quantized_auxiliary}"
         )
 
 
