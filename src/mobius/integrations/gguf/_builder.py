@@ -704,6 +704,7 @@ def _validate_gguf_model(
     _raise_for_invalid_dense_c01_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_decoder_tensor_contract(gguf_model)
     _raise_for_invalid_maincoder_tensor_contract(gguf_model)
+    _raise_for_invalid_granite_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
@@ -3383,93 +3384,284 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
             )
         return
 
+def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
+    """Validate Granite's architecture-wide dense-or-MoE tensor union."""
+    if gguf_model.architecture != "granite":
+        return
+
+    from mobius.integrations.gguf._tensor_mapping import is_known_skip
+
+    metadata = gguf_model.metadata
+    arch = "granite"
     required_suffixes = (
         "context_length",
         "embedding_length",
         "feed_forward_length",
         "block_count",
         "attention.head_count",
-        "attention.layer_norm_epsilon",
-        "attention.clamp_kqv",
-        "expert_count",
-        "expert_used_count",
+        "attention.layer_norm_rms_epsilon",
+        "logit_scale",
     )
     missing_metadata = [
-        f"{architecture}.{suffix}"
+        f"{arch}.{suffix}"
         for suffix in required_suffixes
-        if f"{architecture}.{suffix}" not in metadata
+        if f"{arch}.{suffix}" not in metadata
     ]
     if missing_metadata:
-        raise ValueError(
-            f"{architecture} GGUF is missing required MoE metadata: {missing_metadata}"
-        )
+        raise ValueError(f"granite GGUF is missing required metadata: {missing_metadata}")
 
-    hidden = int(metadata[f"{architecture}.embedding_length"])
-    intermediate = int(metadata[f"{architecture}.feed_forward_length"])
-    layers = int(metadata[f"{architecture}.block_count"])
-    heads = int(metadata[f"{architecture}.attention.head_count"])
-    kv_heads = int(metadata.get(f"{architecture}.attention.head_count_kv", heads))
-    experts = int(metadata[f"{architecture}.expert_count"])
-    top_k = int(metadata[f"{architecture}.expert_used_count"])
-    vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
+    hidden = int(metadata[f"{arch}.embedding_length"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    layers = int(metadata[f"{arch}.block_count"])
+    heads = int(metadata[f"{arch}.attention.head_count"])
+    kv_heads = int(metadata.get(f"{arch}.attention.head_count_kv", heads))
+    context = int(metadata[f"{arch}.context_length"])
+    vocab = int(metadata.get(f"{arch}.vocab_size", 0)) or len(
         metadata.get("tokenizer.ggml.tokens", ())
     )
+    experts = int(metadata.get(f"{arch}.expert_count", 0))
+    top_k = int(metadata.get(f"{arch}.expert_used_count", 0))
+    expert_intermediate = int(metadata.get(f"{arch}.expert_feed_forward_length", intermediate))
+    shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
     if (
-        min(hidden, intermediate, layers, heads, kv_heads, experts, top_k, vocab) <= 0
+        min(hidden, intermediate, layers, heads, kv_heads, context, vocab) <= 0
         or hidden % heads
         or heads % kv_heads
-        or top_k > experts
+        or experts < 0
+        or top_k < 0
+        or bool(experts) != bool(top_k)
+        or (experts and (top_k > experts or expert_intermediate <= 0))
+        or shared_width < 0
+        or (not experts and shared_width)
     ):
-        raise ValueError(f"{architecture} GGUF has invalid MoE geometry")
-    eps = float(metadata[f"{architecture}.attention.layer_norm_epsilon"])
-    clamp = float(metadata[f"{architecture}.attention.clamp_kqv"])
-    if not math.isfinite(eps) or eps <= 0 or not math.isfinite(clamp) or clamp < 0:
-        raise ValueError(f"{architecture} GGUF has invalid normalization or QKV clamp")
+        raise ValueError("granite GGUF has invalid dense/MoE geometry")
 
     head_dim = hidden // heads
-    q_width = heads * head_dim
-    kv_width = kv_heads * head_dim
+    key_dim = int(metadata.get(f"{arch}.attention.key_length", head_dim))
+    value_dim = int(metadata.get(f"{arch}.attention.value_length", head_dim))
+    rope_dim = int(metadata.get(f"{arch}.rope.dimension_count", head_dim))
+    if key_dim != head_dim or value_dim != head_dim or rope_dim != head_dim or rope_dim % 2:
+        raise ValueError(
+            "granite attention key/value/rotary dimensions must equal embedding_length / "
+            "attention.head_count"
+        )
+
+    epsilon = float(metadata[f"{arch}.attention.layer_norm_rms_epsilon"])
+    logit_scale = float(metadata[f"{arch}.logit_scale"])
+    optional_scales = [
+        float(metadata.get(f"{arch}.{suffix}", 0.0))
+        for suffix in ("embedding_scale", "residual_scale", "attention.scale")
+    ]
+    if (
+        not math.isfinite(epsilon)
+        or epsilon <= 0
+        or not math.isfinite(logit_scale)
+        or math.isclose(logit_scale, 0.0, rel_tol=0.0, abs_tol=0.0)
+        or not all(math.isfinite(value) for value in optional_scales)
+    ):
+        raise ValueError("granite GGUF has invalid normalization or scaling metadata")
+
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    supported_scaling_types = {None, "", "none", "yarn", "longrope"}
+    if scaling_type not in supported_scaling_types:
+        raise ValueError(f"granite GGUF has unsupported rope.scaling.type={scaling_type!r}")
+
+    deepstack = metadata.get(f"{arch}.deepstack_mapping")
+    if deepstack is not None:
+        if not isinstance(deepstack, (list, tuple, np.ndarray)):
+            raise ValueError("granite.deepstack_mapping must be an integer array")
+        mapping = [int(value) for value in deepstack]
+        if mapping and len(mapping) != layers:
+            raise ValueError("granite.deepstack_mapping must match block_count")
+        if any(value != -1 for value in mapping):
+            raise NotImplementedError(
+                "granite deep-stack embedding injection is unsupported by the text task; "
+                "only an absent, empty, or all -1 mapping is accepted"
+            )
+
+    raw_items = list(gguf_model.tensor_items_raw())
     actual = {
         name: tuple(int(dimension) for dimension in shape)
-        for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
+        for name, _raw, _qtype, shape in raw_items
         if not is_known_skip(name)
     }
-    required = {
+    skipped_shapes = {
+        name: tuple(int(dimension) for dimension in shape)
+        for name, _raw, _qtype, shape in raw_items
+        if is_known_skip(name) and not name.startswith("tokenizer.")
+    }
+    if "rope_freqs.weight" in skipped_shapes:
+        raise ValueError("granite serialized rope_freqs.weight is not representable exactly")
+    longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
+    present_longrope = longrope_names & set(skipped_shapes)
+    if present_longrope and present_longrope != longrope_names:
+        raise ValueError("granite LongRoPE requires both long and short factor tensors")
+    if present_longrope:
+        if scaling_type != "longrope":
+            raise ValueError(
+                "granite LongRoPE factor tensors require rope.scaling.type='longrope'"
+            )
+        original_context = metadata.get(f"{arch}.rope.scaling.original_context_length")
+        if original_context is None or not 0 < int(original_context) <= context:
+            raise ValueError(
+                "granite LongRoPE requires an original context length within context_length"
+            )
+        factor_types = {
+            name: getattr(qtype, "value", qtype)
+            for name, _raw, qtype, _shape in raw_items
+            if name in present_longrope
+        }
+        expected_factor_shape = (rope_dim // 2,)
+        if any(skipped_shapes[name] != expected_factor_shape for name in present_longrope):
+            raise ValueError(
+                f"granite LongRoPE factors must have shape {expected_factor_shape}"
+            )
+        if any(type_id not in {0, 1, 30} for type_id in factor_types.values()):
+            raise ValueError("granite LongRoPE factors must use F32/F16/BF16 storage")
+    elif scaling_type == "longrope":
+        raise ValueError(
+            "granite rope.scaling.type='longrope' requires both serialized factor tensors"
+        )
+
+    required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
         "output_norm.weight": (hidden,),
-        "output.weight": (vocab, hidden),
     }
+    optional: dict[str, tuple[int, ...]] = {"output.weight": (vocab, hidden)}
+    q_width = hidden
+    kv_width = kv_heads * head_dim
+    selected_qkv_biases: set[str] = set()
+    attention_output_biases: set[str] = set()
+    dense_ffn_biases: set[str] = set()
     for layer in range(layers):
         prefix = f"blk.{layer}."
         required.update(
             {
                 prefix + "attn_norm.weight": (hidden,),
-                prefix + "attn_qkv.weight": (q_width + 2 * kv_width, hidden),
                 prefix + "attn_output.weight": (hidden, q_width),
-                prefix + "attn_output_norm.weight": (hidden,),
-                prefix + "ffn_gate_inp.weight": (experts, hidden),
-                prefix + "ffn_gate_exps.weight": (experts, intermediate, hidden),
-                prefix + "ffn_up_exps.weight": (experts, intermediate, hidden),
-                prefix + "ffn_down_exps.weight": (experts, hidden, intermediate),
+                prefix + "ffn_norm.weight": (hidden,),
             }
         )
+        optional[prefix + "attn_output.bias"] = (hidden,)
+        attention_output_biases.add(prefix + "attn_output.bias")
 
+        fused_weight = prefix + "attn_qkv.weight"
+        split_weights = {
+            prefix + "attn_q.weight": (q_width, hidden),
+            prefix + "attn_k.weight": (kv_width, hidden),
+            prefix + "attn_v.weight": (kv_width, hidden),
+        }
+        has_fused = fused_weight in actual
+        present_split = set(split_weights) & set(actual)
+        if has_fused == bool(present_split) or (
+            present_split and present_split != set(split_weights)
+        ):
+            raise ValueError(
+                f"granite layer {layer} must contain exactly one complete QKV layout"
+            )
+        if has_fused:
+            required[fused_weight] = (q_width + 2 * kv_width, hidden)
+            selected_biases = {prefix + "attn_qkv.bias": (q_width + 2 * kv_width,)}
+            alternate_biases = {
+                prefix + "attn_q.bias",
+                prefix + "attn_k.bias",
+                prefix + "attn_v.bias",
+            }
+        else:
+            required.update(split_weights)
+            selected_biases = {
+                prefix + "attn_q.bias": (q_width,),
+                prefix + "attn_k.bias": (kv_width,),
+                prefix + "attn_v.bias": (kv_width,),
+            }
+            alternate_biases = {prefix + "attn_qkv.bias"}
+        if alternate_biases & set(actual):
+            raise ValueError(
+                f"granite layer {layer} QKV bias layout does not match its weights"
+            )
+        present_biases = set(selected_biases) & set(actual)
+        if present_biases and present_biases != set(selected_biases):
+            raise ValueError(f"granite layer {layer} has a partial QKV bias set")
+        optional.update(selected_biases)
+        selected_qkv_biases.update(selected_biases)
+
+        if experts:
+            required.update(
+                {
+                    prefix + "ffn_gate_inp.weight": (experts, hidden),
+                    prefix + "ffn_gate_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_up_exps.weight": (
+                        experts,
+                        expert_intermediate,
+                        hidden,
+                    ),
+                    prefix + "ffn_down_exps.weight": (
+                        experts,
+                        hidden,
+                        expert_intermediate,
+                    ),
+                }
+            )
+            if shared_width:
+                required.update(
+                    {
+                        prefix + "ffn_gate_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_up_shexp.weight": (shared_width, hidden),
+                        prefix + "ffn_down_shexp.weight": (hidden, shared_width),
+                    }
+                )
+        else:
+            dense_weights = {
+                prefix + "ffn_gate.weight": (intermediate, hidden),
+                prefix + "ffn_up.weight": (intermediate, hidden),
+                prefix + "ffn_down.weight": (hidden, intermediate),
+            }
+            required.update(dense_weights)
+            layer_biases = {
+                prefix + "ffn_gate.bias": (intermediate,),
+                prefix + "ffn_up.bias": (intermediate,),
+                prefix + "ffn_down.bias": (hidden,),
+            }
+            present_biases = set(layer_biases) & set(actual)
+            if present_biases and present_biases != set(layer_biases):
+                raise ValueError(f"granite layer {layer} has a partial dense FFN bias set")
+            optional.update(layer_biases)
+            dense_ffn_biases.update(layer_biases)
+
+    actual_names = set(actual)
+    for family_name, family in (
+        ("QKV projection biases", selected_qkv_biases),
+        ("attention output biases", attention_output_biases),
+        ("dense FFN biases", dense_ffn_biases),
+    ):
+        present = family & actual_names
+        if present and present != family:
+            raise ValueError(
+                f"granite {family_name} must be present in every layer or absent entirely"
+            )
+    allowed = set(required) | set(optional)
+    allowed = set(required) | set(optional)
     out_of_range = sorted(
         name
         for name in actual
         if (match := re.match(r"^blk\.(\d+)\.", name)) and int(match.group(1)) >= layers
     )
-    missing = sorted(set(required) - set(actual))
-    unexpected = sorted(set(actual) - set(required))
+    missing = sorted(set(required) - actual_names)
+    unexpected = sorted(actual_names - allowed)
     malformed = {
-        name: (required[name], actual[name])
-        for name in set(required) & set(actual)
-        if actual[name] != required[name]
+        name: (required.get(name, optional.get(name)), actual[name])
+        for name in allowed & actual_names
+        if actual[name] != required.get(name, optional.get(name))
     }
     if missing or unexpected or malformed or out_of_range:
         raise ValueError(
-            f"Invalid {architecture} GGUF tensor closure: missing={missing}, "
-            f"unexpected={unexpected}, malformed={malformed}, out_of_range={out_of_range}"
+            "Invalid granite GGUF tensor closure: "
+            f"missing={missing}, unexpected={unexpected}, malformed={malformed}, "
+            f"out_of_range={out_of_range}"
         )
 
 

@@ -2114,6 +2114,117 @@ def _granitemoe_postprocess(
     )
 
 
+def _granite_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Select the exact dense or MoE Granite graph and restore GGUF scaling."""
+    arch = "granite"
+    num_experts = int(config.num_local_experts or 0)
+    top_k = int(config.num_experts_per_tok or 0)
+    if num_experts < 0 or top_k < 0 or bool(num_experts) != bool(top_k):
+        raise ValueError(
+            "granite expert_count and expert_used_count must both be zero or both positive"
+        )
+    if num_experts and top_k > num_experts:
+        raise ValueError(
+            f"granite.expert_used_count must be in [1, {num_experts}], got {top_k}"
+        )
+
+    shared_width = int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+    if shared_width < 0:
+        raise ValueError("granite.expert_shared_feed_forward_length must not be negative")
+    if not num_experts and shared_width:
+        raise ValueError("granite.expert_shared_feed_forward_length requires routed experts")
+
+    deepstack = metadata.get(f"{arch}.deepstack_mapping")
+    if deepstack is not None:
+        if not isinstance(deepstack, (list, tuple, np.ndarray)):
+            raise ValueError("granite.deepstack_mapping must be an integer array")
+        mapping = [int(value) for value in deepstack]
+        if mapping and len(mapping) != config.num_hidden_layers:
+            raise ValueError("granite.deepstack_mapping must match block_count")
+        if any(value != -1 for value in mapping):
+            raise NotImplementedError(
+                "granite deep-stack embedding injection is unsupported by the text task; "
+                "only an absent, empty, or all -1 mapping is accepted"
+            )
+
+    finetuned = metadata.get(f"{arch}.rope.scaling.finetuned", True)
+    if not isinstance(finetuned, (bool, np.bool_)):
+        raise TypeError("granite.rope.scaling.finetuned must be boolean")
+    tensor_names = set(getattr(model, "tensor_names", ()) or ())
+    if "rope_freqs.weight" in tensor_names:
+        raise ValueError(
+            "granite serialized rope_freqs.weight is unsupported because the exact "
+            "per-dimension frequency factors are not representable by the current rotary graph"
+        )
+    longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
+    present_longrope = tensor_names & longrope_names
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    if scaling_type not in (None, "", "none", "yarn", "longrope"):
+        raise ValueError(
+            f"granite rope.scaling.type={scaling_type!r} is not in the exact supported subset"
+        )
+    if present_longrope:
+        if not finetuned:
+            raise ValueError("granite LongRoPE factors require RoPE to be enabled")
+        if scaling_type != "longrope":
+            raise ValueError(
+                "granite LongRoPE factor tensors require rope.scaling.type='longrope'"
+            )
+        config = _minicpm_longrope(
+            config,
+            metadata,
+            model,
+            rope_dim=config.hidden_size // config.num_attention_heads,
+            label="Granite",
+        )
+    elif scaling_type == "longrope":
+        raise ValueError(
+            "granite rope.scaling.type='longrope' requires both serialized factor tensors"
+        )
+
+    def finite_scale(suffix: str, default: float) -> float:
+        value = float(metadata.get(f"{arch}.{suffix}", default))
+        if not math.isfinite(value):
+            raise ValueError(f"granite.{suffix} must be finite")
+        return value
+
+    logit_scale = finite_scale("logit_scale", 0.0)
+    if math.isclose(logit_scale, 0.0, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("granite.logit_scale must be nonzero")
+    embedding_scale = finite_scale("embedding_scale", 0.0) or 1.0
+    residual_scale = finite_scale("residual_scale", 0.0) or 1.0
+    attention_scale = finite_scale("attention.scale", 0.0) or None
+    expert_width = int(
+        metadata.get(f"{arch}.expert_feed_forward_length", config.intermediate_size)
+    )
+    if num_experts and expert_width <= 0:
+        raise ValueError("granite expert feed-forward width must be positive")
+
+    return dataclasses.replace(
+        config,
+        model_type="granitemoe" if num_experts else "granite",
+        hidden_act="silu",
+        num_local_experts=num_experts or None,
+        num_experts_per_tok=top_k or None,
+        moe_intermediate_size=expert_width if num_experts else None,
+        shared_expert_intermediate_size=shared_width or None,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        embedding_multiplier=embedding_scale,
+        residual_multiplier=residual_scale,
+        attention_multiplier=attention_scale,
+        logits_scaling=logit_scale,
+        rope_type=config.rope_type if finetuned else None,
+        rope_theta=config.rope_theta if finetuned else None,
+        rope_scaling=config.rope_scaling if finetuned else None,
+        partial_rotary_factor=config.partial_rotary_factor if finetuned else None,
+    )
+
+
 def _jamba_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -2454,6 +2565,7 @@ def _minicpm_longrope(
     model: Any,
     *,
     rope_dim: int,
+    label: str = "MiniCPM",
 ) -> ArchitectureConfig:
     tensor_names = set(getattr(model, "tensor_names", ()) or ())
     long_name = "rope_factors_long.weight"
@@ -2463,11 +2575,11 @@ def _minicpm_longrope(
         return config
     if present != {long_name, short_name}:
         raise ValueError(
-            "MiniCPM LongRoPE requires both rope_factors_long.weight and "
+            f"{label} LongRoPE requires both rope_factors_long.weight and "
             "rope_factors_short.weight"
         )
     if model is None or not hasattr(model, "get_tensor"):
-        raise ValueError("MiniCPM LongRoPE factors could not be read from the GGUF model")
+        raise ValueError(f"{label} LongRoPE factors could not be read from the GGUF model")
 
     raw_types = {
         name: getattr(qtype, "value", qtype)
@@ -2475,7 +2587,7 @@ def _minicpm_longrope(
         if name in present
     }
     if any(type_id not in {0, 1, 30} for type_id in raw_types.values()):
-        raise ValueError("MiniCPM LongRoPE factors must use F32/F16/BF16 storage")
+        raise ValueError(f"{label} LongRoPE factors must use F32/F16/BF16 storage")
 
     long_factor = np.asarray(model.get_tensor(long_name), dtype=np.float32).reshape(-1)
     short_factor = np.asarray(model.get_tensor(short_name), dtype=np.float32).reshape(-1)
@@ -2491,7 +2603,7 @@ def _minicpm_longrope(
         or np.any(short_factor <= 0)
     ):
         raise ValueError(
-            f"MiniCPM LongRoPE factors must be finite positive vectors of length {expected}"
+            f"{label} LongRoPE factors must be finite positive vectors of length {expected}"
         )
 
     arch = model.architecture
@@ -2501,13 +2613,13 @@ def _minicpm_longrope(
         # checkpoint has original_context == context and identical factor tables.
         if not np.array_equal(long_factor, short_factor):
             raise ValueError(
-                "MiniCPM LongRoPE with distinct long/short factors requires "
+                f"{label} LongRoPE with distinct long/short factors requires "
                 "rope.scaling.original_context_length"
             )
         original_context = config.max_position_embeddings
     original_context = int(original_context)
     if not 0 < original_context <= config.max_position_embeddings:
-        raise ValueError("MiniCPM LongRoPE original context is outside the model context")
+        raise ValueError(f"{label} LongRoPE original context is outside the model context")
 
     return dataclasses.replace(
         config,
@@ -4329,6 +4441,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "arctic": _arctic_postprocess,
     "ernie45_moe": _ernie45_moe_postprocess,
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
+    "granite": _granite_postprocess,
     "granitemoe": _granitemoe_postprocess,
     "phimoe": _phimoe_postprocess,
     "pangu_embedded": _pangu_embedded_postprocess,

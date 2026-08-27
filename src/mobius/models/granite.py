@@ -26,10 +26,16 @@ class GraniteTextModel(nn.Module):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
+        from mobius.models.moe import _quantized_linear_class
+
         self._dtype = config.dtype
         self.embed_tokens = embedding_for_config(config)
+        linear_class = _quantized_linear_class(config)
         self.layers = nn.ModuleList(
-            [create_decoder_layer(config) for _ in range(config.num_hidden_layers)]
+            [
+                create_decoder_layer(config, linear_class=linear_class)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = initialize_rope(config)

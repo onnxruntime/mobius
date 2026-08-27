@@ -486,6 +486,11 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "shared experts, and optional deep-stack inputs. It is not the GraniteMoE or "
         "GraniteHybrid GGUF contract."
     ),
+    "ernie4_5-moe": (
+        "ERNIE 4.5 MoE selects periodic expert blocks after a dense prefix, permits an "
+        "optional gate-expert matrix, and uses normalized routing with optional shared "
+        "experts. Mobius has no matching per-layer schedule or converter transform."
+    ),
     "granite_swa": (
         "Granite SWA requires attention sinks, a complete interleaved sliding-window "
         "schedule, residual/logit scaling, fused routed gate-up experts, and optional "
@@ -1689,6 +1694,27 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         ),
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="granite",
+        model_type="granite",
+        tensor_map_recipe=("llama", "diffusion_fused_qkv", "moe_extras"),
+        config_postprocessor="granite",
+        required_metadata=(
+            "attention.layer_norm_rms_epsilon",
+            "logit_scale",
+        ),
+        tensor_processor="llama",
+        llama_qk_permute=True,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Exact float and quantization-preserving import covers the pinned dense-or-MoE "
+            "union, fused or split QKV, optional projection biases, ungated shared experts, "
+            "Granite scaling, and tensor-backed LongRoPE. Non-empty deep-stack mappings and "
+            "serialized single-factor RoPE remain fail-closed because the current text task "
+            "cannot represent those data-plane inputs or per-dimension factors. "
+            + _RUNTIME_VALIDATION_PENDING
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="granitemoe",
