@@ -452,6 +452,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
+            from mobius._component_quantization import (
+                validate_quantized_component_bindings,
+            )
+
             if compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
                 # The same loader owns both faithful native storage and the
@@ -475,8 +479,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 )
             else:
                 state_dict = _load_weights_from_dir(config_path)
-                if hasattr(model_module, "preprocess_weights"):
-                    state_dict = model_module.preprocess_weights(state_dict)
+                from mobius.weights import adapt_model_weights
+
+                state_dict = adapt_model_weights(
+                    model_module,
+                    state_dict,
+                    config=config,
+                    manifest=component_manifest,
+                )
                 from mobius._component_quantization import (
                     normalize_component_quantized_weights,
                 )
@@ -490,6 +500,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                     task=resolved_task,
                 )
                 pkg.apply_weights(state_dict)
+            validate_quantized_component_bindings(pkg, config)
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:

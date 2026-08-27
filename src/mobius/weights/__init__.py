@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+from mobius.weights._adapters import (
+    ModelWeightAdapter,
+    WeightAdapterContext,
+    adapt_model_weights,
+)
 from mobius.weights._codecs import (
     QuantizationCodec,
     QuantizationCodecRegistry,
@@ -19,10 +24,13 @@ from mobius.weights._records import (
 
 __all__ = [
     "FloatWeight",
+    "ModelWeightAdapter",
     "PackedWeight",
     "QuantizationCodec",
     "QuantizationCodecRegistry",
     "WeightBundle",
+    "WeightAdapterContext",
     "WeightRecord",
     "codec_registry",
+    "adapt_model_weights",
 ]

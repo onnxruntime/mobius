@@ -11,7 +11,12 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
+from mobius._configs import (
+    AudioConfig,
+    Gemma4AudioConfig,
+    Gemma4Config,
+    QuantizationConfig,
+)
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -380,6 +385,222 @@ def test_component_regex_keeps_per_layer_decoder_projections_float():
     assert isinstance(layer.self_attn.q_proj, QuantizedLinear)
     assert type(layer.per_layer_input_gate) is Linear
     assert type(layer.per_layer_projection) is Linear
+
+
+class TestGemma4ComponentWeightAdapters:
+    @staticmethod
+    def _config() -> Gemma4Config:
+        decoder = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            sym=True,
+            modules_to_not_convert=(
+                r"re:.*\.per_layer_input_gate",
+                r"re:.*\.per_layer_projection",
+            ),
+        )
+        return _tiny_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=16,
+            vocab_size_per_layer_input=256,
+            audio=Gemma4AudioConfig(
+                input_size=32,
+                num_layers=1,
+                hidden_size=32,
+                output_proj_dims=64,
+                subsampling_conv_channels=[16, 8],
+                audio_token_id=254,
+            ),
+            quantization=decoder,
+            component_quantization={
+                "decoder": decoder,
+                "vision_encoder": QuantizationConfig(
+                    bits=8,
+                    group_size=32,
+                    quant_method="olive",
+                    sym=True,
+                ),
+                "audio_encoder": QuantizationConfig(
+                    bits=2,
+                    group_size=16,
+                    quant_method="olive",
+                    sym=True,
+                ),
+                "embedding": QuantizationConfig(
+                    bits=8,
+                    group_size=16,
+                    quant_method="olive",
+                    sym=True,
+                ),
+            },
+        )
+
+    @staticmethod
+    def _layouts(graph) -> set[tuple[int, int]]:
+        return {
+            (
+                node.attributes["bits"].as_int(),
+                node.attributes["block_size"].as_int(),
+            )
+            for node in graph
+            if node.op_type == "MatMulNBits"
+        }
+
+    def test_builds_each_component_with_its_declared_layout(self):
+        from mobius._builder import build_from_module
+
+        config = self._config()
+        package = build_from_module(
+            Gemma4Model(config),
+            config,
+            task="gemma4",
+        )
+
+        assert self._layouts(package["decoder"].graph) == {(4, 16)}
+        assert self._layouts(package["vision_encoder"].graph) == {(8, 32)}
+        assert self._layouts(package["audio_encoder"].graph) == {(2, 16)}
+        assert self._layouts(package["embedding"].graph) == {(8, 16)}
+
+    def test_vision_full_hf_linear_exclusion_matches_local_module(self):
+        from mobius._component_quantization import configure_component_quantization
+        from mobius.components import ClippableLinear, ClippableQuantizedLinear
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        vision_quantization = dataclasses.replace(
+            config.component_quantization["vision_encoder"],
+            modules_to_not_convert=(
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear",
+            ),
+        )
+        config = dataclasses.replace(
+            config,
+            vision=dataclasses.replace(
+                config.vision,
+                use_clipped_linears=True,
+            ),
+            component_quantization={
+                **config.component_quantization,
+                "vision_encoder": vision_quantization,
+            },
+        )
+        module = Gemma4Model(config)
+
+        configure_component_quantization(module, config, Gemma4Task())
+
+        attention = module.vision_encoder.encoder.layers[0].self_attn
+        assert type(attention.q_proj) is ClippableLinear
+        assert isinstance(attention.k_proj, ClippableQuantizedLinear)
+
+    def test_routes_raw_sidecars_to_each_component_codec(self):
+        from mobius._component_quantization import (
+            configure_component_quantization,
+            normalize_component_quantized_weights,
+        )
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        module = Gemma4Model(config)
+        task = Gemma4Task()
+        manifest = configure_component_quantization(module, config, task)
+        state_dict = {
+            "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.0.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                32, 32, dtype=torch.uint8
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                32, 1
+            ),
+            "model.audio_tower.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                32, 8, dtype=torch.uint8
+            ),
+            "model.audio_tower.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                32, 2
+            ),
+            "model.language_model.per_layer_model_projection.weight_qweight": torch.zeros(
+                32, 64, dtype=torch.uint8
+            ),
+            "model.language_model.per_layer_model_projection.weight_scales": torch.ones(32, 4),
+        }
+
+        renamed = module.preprocess_weights(state_dict)
+        result = normalize_component_quantized_weights(
+            renamed,
+            module,
+            config,
+            ("decoder", "vision_encoder", "audio_encoder", "embedding"),
+            manifest=manifest,
+            task=task,
+        )
+
+        assert result["decoder.model.layers.0.self_attn.q_proj.weight"].shape == (
+            64,
+            4,
+            8,
+        )
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            1,
+            32,
+        )
+        assert result["audio_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            2,
+            4,
+        )
+        assert result["embedding.per_layer_model_projection.weight"].shape == (
+            32,
+            4,
+            16,
+        )
+
+    def test_quantized_embedding_sidecars_route_only_to_embedding_component(self):
+        from mobius._component_quantization import (
+            configure_component_quantization,
+            normalize_component_quantized_weights,
+        )
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        embedding_quantization = dataclasses.replace(
+            config.component_quantization["embedding"],
+            quantize_embeddings=True,
+        )
+        config = dataclasses.replace(
+            config,
+            component_quantization={
+                **config.component_quantization,
+                "embedding": embedding_quantization,
+            },
+        )
+        module = Gemma4Model(config)
+        task = Gemma4Task()
+        manifest = configure_component_quantization(module, config, task)
+        renamed = module.preprocess_weights(
+            {
+                "model.language_model.embed_tokens.weight_qweight": torch.zeros(
+                    256, 64, dtype=torch.uint8
+                ),
+                "model.language_model.embed_tokens.weight_scales": torch.ones(256, 4),
+            }
+        )
+
+        assert not any(key.startswith("decoder.") for key in renamed)
+        result = normalize_component_quantized_weights(
+            renamed,
+            module,
+            config,
+            ("decoder", "vision_encoder", "audio_encoder", "embedding"),
+            manifest=manifest,
+            task=task,
+        )
+
+        assert result["embedding.embed_tokens.qweight"].shape == (256, 64)
+        assert result["embedding.embed_tokens.scales"].shape == (256, 4)
 
 
 class TestScaleFreeRMSNormOverflow:

@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   point while the rest of the component binds existing packed weights.
 - Mobius validates and normalizes existing Olive, GPTQ, and AWQ sidecars per
   component. It does not quantize floating-point checkpoint weights.
+- Gemma4, Qwen3.5/QMoE, and T5 adapters preserve their architecture-specific
+  rename, tied-weight, and expert-packing semantics while handing independently
+  routed component sidecars to the generic codec and binding validator.
 
 ### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
 
