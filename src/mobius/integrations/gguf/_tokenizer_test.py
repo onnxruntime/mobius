@@ -198,6 +198,40 @@ class TestInspectGgufTokenizer:
         assert verdict.pre == "default"
         assert verdict.canonical_pre == "default"
 
+    @pytest.mark.parametrize("architecture", ["minicpm", "minicpm3"])
+    def test_minicpm_legacy_default_pre_is_architecture_scoped_and_deferred(
+        self, architecture: str
+    ):
+        metadata = _metadata(pre="default")
+        metadata["general.architecture"] = architecture
+        metadata["tokenizer.ggml.model"] = "llama"
+        metadata.pop("tokenizer.ggml.merges")
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.pre == "default"
+        assert verdict.canonical_pre == "default"
+        assert "exact ORT tokenizer materialization is unavailable" in verdict.reason
+
+    def test_legacy_default_pre_remains_rejected_for_other_sentencepiece_architectures(self):
+        metadata = _metadata(pre="default")
+        metadata["general.architecture"] = "llama"
+        metadata["tokenizer.ggml.model"] = "llama"
+        metadata.pop("tokenizer.ggml.merges")
+
+        with pytest.raises(ValueError, match="pre for non-BPE model"):
+            inspect_gguf_tokenizer(metadata)
+
+    def test_legacy_default_pre_rejects_non_string_architecture_cleanly(self):
+        metadata = _metadata(pre="default")
+        metadata["general.architecture"] = ["minicpm"]
+        metadata["tokenizer.ggml.model"] = "llama"
+        metadata.pop("tokenizer.ggml.merges")
+
+        with pytest.raises(ValueError, match="pre for non-BPE model"):
+            inspect_gguf_tokenizer(metadata)
+
     def test_exact_embedded_json_is_copy_route(self):
         verdict = inspect_gguf_tokenizer(_metadata(embedded=True))
         assert verdict.route == "copy"

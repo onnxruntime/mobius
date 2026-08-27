@@ -405,6 +405,11 @@ def _tokenizer_blocker_evidence_table() -> str:
             f"<br>`{evidence.source_config_asset[0]}` "
             f"{evidence.source_config_asset[1]:,} B `{evidence.source_config_asset[2]}`"
         )
+        if evidence.bounded_header_bytes is not None:
+            identity += (
+                f"<br>first {evidence.bounded_header_bytes:,} B "
+                f"`{evidence.bounded_header_sha256}`"
+            )
         closure = (
             f"architecture `{evidence.architecture}`; pre `{evidence.pre_identifier}`<br>"
             f"metadata `{evidence.tokenizer_metadata_sha256}`<br>"
@@ -418,6 +423,21 @@ def _tokenizer_blocker_evidence_table() -> str:
             f"normalizer `{evidence.source_normalizer}`; "
             f"pipeline `{evidence.source_pipeline_sha256}`"
         )
+        if (
+            evidence.source_model_token_count is not None
+            and evidence.source_merge_count is not None
+            and evidence.source_score_mismatch_count is not None
+            and evidence.source_type_mismatch_count is not None
+            and evidence.source_chat_template_sha256 is not None
+        ):
+            closure += (
+                f"<br>source model tokens={evidence.source_model_token_count:,}; "
+                f"source merges={evidence.source_merge_count:,}; "
+                f"score mismatches={evidence.source_score_mismatch_count:,}; "
+                f"type mismatches={evidence.source_type_mismatch_count:,}<br>"
+                f"GGUF chat `{evidence.chat_template_sha256}` vs source "
+                f"`{evidence.source_chat_template_sha256}`"
+            )
         witness = (
             f"{evidence.disposition}<br>"
             f"`{text.encode('unicode_escape').decode()}`: llama.cpp `{list(llamacpp_ids)}` "
@@ -426,6 +446,12 @@ def _tokenizer_blocker_evidence_table() -> str:
             f"llama.cpp oracle `{evidence.llamacpp_oracle[0]}`: "
             f"{evidence.llamacpp_oracle[1]} cases `{evidence.llamacpp_oracle[2]}`"
         )
+        if evidence.oracle_mismatch_count is not None:
+            witness += (
+                f"<br>{evidence.oracle_mismatch_count} mismatches "
+                f"{list(evidence.oracle_mismatch_count_by_mode)} by mode; "
+                f"source oracle `{evidence.source_oracle_sha256}`"
+            )
         rows.append(
             f"- `{evidence.evidence_id}` — **GGUF/source:** {_cell(identity)}; "
             f"**closure:** {_cell(closure)}; **witness:** {_cell(witness)}"
@@ -466,6 +492,22 @@ def render_document() -> str:
     recent_prs = "; ".join(
         f"#{record.number} ({record.state_at_audit}) — {record.dependency}"
         for record in RECENT_PR_DEPENDENCIES
+    )
+    tokenizer_scope_note = " ".join(
+        (
+            "Each row is independently artifact-scoped and proves ordered tokenizer semantics,",
+            "source assets, embedding alignment, and the final materialized hash.",
+            "Shared rows also require identical pinned llama.cpp dispatch.",
+            "This does not claim graph or runtime support.",
+        )
+    )
+    tokenizer_refresh_note = " ".join(
+        (
+            "The compact MiniCPM fixture is reproducible through",
+            "`scripts/generate_minicpm_tokenizer_oracle.py`, which validates immutable 16 MiB",
+            "header slices and official tokenizer hashes, builds tokenizer-only GGUFs and the",
+            "pinned llama.cpp tokenizer tool, then recomputes hashes and mismatch witnesses.",
+        )
     )
     return f"""# `build_from_gguf()`
 
@@ -548,16 +590,13 @@ from mobius.integrations.gguf import materialize_evidenced_gguf_tokenizer
 materialize_evidenced_gguf_tokenizer("Qwen3.5-0.8B-Q4_0.gguf", "tokenizer")
 ```
 
-Each row is independently artifact-scoped. Evidence proves ordered tokens, merges or scores,
-token types, special IDs, source pipeline/config assets, representative encodings, embedding
-alignment, any non-matchable padding extension, and the final materialized hash. Shared rows
-additionally require every exact identifier to select the same implementation and flag overrides
-in pinned `llama-vocab.cpp`; the tokenizer matrix links each promoted route to its dispatch line.
-This does not claim graph or runtime support.
+{tokenizer_scope_note}
 
 ### Fail-closed tokenizer evidence
 
 {_tokenizer_blocker_evidence_table()}
+
+{tokenizer_refresh_note}
 
 ## Supported GGUF architectures
 
