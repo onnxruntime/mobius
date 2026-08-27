@@ -130,7 +130,9 @@ migrate in one change.
 @dataclasses.dataclass(frozen=True)
 class ComponentDescriptor:
     name: str
-    module_path: str
+    # Dotted Python attribute path from the root nn.Module passed to task.build().
+    # This is neither a ModelPackage key nor a checkpoint key prefix.
+    module_attribute_path: str
     role: str
     source_paths: tuple[str, ...]
 
@@ -275,7 +277,7 @@ class AffinePackedWeight:
     bits: int
     group_size: int
     symmetric: bool
-    format: str
+    method: str
 
 
 @dataclasses.dataclass(frozen=True)
