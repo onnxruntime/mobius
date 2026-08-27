@@ -612,6 +612,10 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _format_filenames(names: list[str]) -> str:
+    return ", ".join(repr(name) for name in sorted(names))
+
+
 def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None:
     """Fail closed on any structural inconsistency in the split set."""
     n = len(infos)
@@ -641,7 +645,8 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
     missing_counts = [info.path.name for info in infos if info.split_count is None]
     if missing_counts:
         raise GgufShardError(
-            f"Every shard must declare split.count; missing from {missing_counts}."
+            "Every shard must declare split.count; missing from "
+            f"{_format_filenames(missing_counts)}."
         )
     declared_counts = {info.split_count for info in infos}
     if declared_counts != {filename_count}:
@@ -653,7 +658,9 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
     # split.no must be a contiguous 0..count-1 permutation when present.
     missing_nos = [info.path.name for info in infos if info.split_no is None]
     if missing_nos:
-        raise GgufShardError(f"Every shard must declare split.no; missing from {missing_nos}.")
+        raise GgufShardError(
+            f"Every shard must declare split.no; missing from {_format_filenames(missing_nos)}."
+        )
     split_nos = [info.split_no for info in infos]
     if sorted(split_nos) != list(range(n)):
         raise GgufShardError(
@@ -678,7 +685,7 @@ def _validate_shard_set(infos: list[ShardInfo], shards: list[GGUFModel]) -> None
     if missing_tensor_totals:
         raise GgufShardError(
             "Every shard must declare split.tensors.count; missing from "
-            f"{missing_tensor_totals}."
+            f"{_format_filenames(missing_tensor_totals)}."
         )
     declared_tensor_totals = {info.split_tensors_count for info in infos}
     observed_total = sum(info.tensor_count for info in infos)

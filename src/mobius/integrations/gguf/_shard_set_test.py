@@ -25,6 +25,7 @@ from mobius.integrations.gguf._shard_set import (
     GgufShardManifest,
     GgufShardSet,
     _merge_metadata,
+    _validate_shard_set,
     discover_gguf_shards,
     open_gguf_model,
     parse_shard_filename,
@@ -487,6 +488,47 @@ def test_continuation_may_repeat_primary_semantics_but_cannot_override_them(tmp_
             infos,
             [SimpleNamespace(metadata=primary_metadata), repeated],
         )
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "metadata_name"),
+    [
+        ("split_count", "split.count"),
+        ("split_no", "split.no"),
+        ("split_tensors_count", "split.tensors.count"),
+    ],
+)
+def test_missing_split_metadata_errors_sort_filenames(missing_field, metadata_name):
+    infos = [
+        SimpleNamespace(
+            path=Path("tiny-00002-of-00002.gguf"),
+            filename_index=2,
+            filename_count=2,
+            split_no=1,
+            split_count=2,
+            split_tensors_count=2,
+            tensor_count=1,
+        ),
+        SimpleNamespace(
+            path=Path("tiny-00001-of-00002.gguf"),
+            filename_index=1,
+            filename_count=2,
+            split_no=0,
+            split_count=2,
+            split_tensors_count=2,
+            tensor_count=1,
+        ),
+    ]
+    for info in infos:
+        setattr(info, missing_field, None)
+
+    with pytest.raises(GgufShardError) as caught:
+        _validate_shard_set(infos, [mock.Mock(), mock.Mock()])
+
+    assert str(caught.value) == (
+        f"Every shard must declare {metadata_name}; missing from "
+        "'tiny-00001-of-00002.gguf', 'tiny-00002-of-00002.gguf'."
+    )
 
 
 def test_open_validates_primary_metadata_authority_eagerly(tmp_path):
@@ -1094,22 +1136,51 @@ def test_hub_download_space_counts_only_uncached_shards(tmp_path):
     assert preflight.call_args.args == (missing.stat().st_size,)
 
 
-def test_hub_cache_identity_paths_resolve_only_inside_cache(tmp_path):
+def test_regular_file_identity_paths_resolve_local_symlinks(tmp_path):
     from mobius.integrations.gguf import _builder as builder
 
-    cache = tmp_path / "hub"
-    blobs = cache / "blobs"
-    snapshot = cache / "snapshots" / ("a" * 40)
-    blobs.mkdir(parents=True)
-    snapshot.mkdir(parents=True)
-    blob = blobs / "abc"
+    blob = tmp_path / "blob"
     blob.write_bytes(b"GGUF")
-    shard = snapshot / "model-00001-of-00002.gguf"
+    shard = tmp_path / "model-00001-of-00002.gguf"
     shard.symlink_to(blob)
 
-    with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(cache)):
-        assert builder._hub_cache_identity_paths([shard]) == [blob]
-        assert builder._hub_cache_identity_paths([tmp_path / "outside.gguf"]) is None
+    assert builder._regular_file_identity_paths([shard]) == [blob]
+    assert builder._regular_file_identity_paths([tmp_path / "missing.gguf"]) is None
+
+
+def test_build_binds_local_symlinked_shards_to_regular_identity_paths(tmp_path):
+    from mobius.integrations.gguf import _builder as builder
+    from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+    targets = _write_sharded_gguf(tmp_path / "targets")
+    links_dir = tmp_path / "links"
+    links_dir.mkdir()
+    links = []
+    for target in targets:
+        link = links_dir / target.name
+        link.symlink_to(target)
+        links.append(link)
+
+    class _ValidationReachedError(Exception):
+        pass
+
+    def validate(model, *, source, **_kwargs):
+        assert model.identity_paths == [target.resolve() for target in targets]
+        identity = gguf_artifact_identity(
+            Path(source),
+            model,
+            architecture=model.architecture,
+        )
+        assert identity.tensor_count == sum(
+            info.tensor_count for info in model.manifest.shards
+        )
+        raise _ValidationReachedError
+
+    with (
+        mock.patch.object(builder, "_validate_gguf_model", side_effect=validate),
+        pytest.raises(_ValidationReachedError),
+    ):
+        builder.build_from_gguf(links[0])
 
 
 # --------------------------------------------------------------------------- #
