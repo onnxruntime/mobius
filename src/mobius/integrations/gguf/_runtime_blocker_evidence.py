@@ -45,6 +45,7 @@ class GGUFRuntimeBlockerEvidence:
     expert_count: int
     experts_per_token: int
     layer_counts: tuple[tuple[str, int], ...]
+    pre_optimization_graph_node_count: int
     graph_node_count: int
     graph_initializer_count: int
     graph_matmul_count: int
@@ -97,12 +98,18 @@ class GGUFRuntimeBlockerEvidence:
             self.bounded_header_bytes,
             self.expert_count,
             self.experts_per_token,
+            self.pre_optimization_graph_node_count,
             self.graph_node_count,
             self.graph_initializer_count,
             self.graph_matmul_count,
         )
         if any(value <= 0 for value in positive):
             raise ValueError("GGUF runtime blocker evidence counts and sizes must be positive")
+        if self.pre_optimization_graph_node_count < self.graph_node_count:
+            raise ValueError(
+                "GGUF runtime blocker pre-optimization node count must not be smaller "
+                "than its production node count"
+            )
         if self.explicit_float16_bytes != self.logical_parameter_count * 2:
             raise ValueError("GGUF runtime blocker float16 size contradicts parameter count")
         if self.explicit_float32_bytes != self.logical_parameter_count * 4:
@@ -193,7 +200,8 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
     expert_count=128,
     experts_per_token=6,
     layer_counts=(("full_attention", 6), ("mamba2", 23), ("moe", 23)),
-    graph_node_count=40_167,
+    pre_optimization_graph_node_count=40_167,
+    graph_node_count=37_142,
     graph_initializer_count=6_255,
     graph_matmul_count=6_028,
     state_slots=(
@@ -214,14 +222,20 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
             "float16/float32 weights require 63,155,880,576/126,311,761,152 bytes."
         ),
         (
-            "Nemotron-H correction-biased sigmoid routing, unbiased sigmoid weights, ReLU2 "
-            "experts, shared expert, and optional latent projections cannot use "
-            "com.microsoft.MoE; the truthful production graph retains 40,167 nodes and "
-            "6,028 MatMul nodes."
+            "The normal optimized CPU export has 37,142 nodes (40,167 before Mobius "
+            "optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed "
+            "experts remain an ONNX loop. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. "
+            "QMoE has separate router_probs/router_weights for correction-biased "
+            "selection with unbiased sigmoid mixing, while shared experts and optional "
+            "latent projections can surround it; those are not fused-op blockers. The "
+            "pinned 30B has no latent projection. QMoE does not support GGUF IQ2_XXS "
+            "storage, and Mobius has no proven IQ2_XXS packer/kernel path."
         ),
         (
-            "ORT GenAI 0.15.2 cannot describe the 58 heterogeneous attention key/value and "
-            "Mamba2 convolution/recurrent state slots required for package replay and reorder."
+            "ORT GenAI 0.15.2 discovers sparse/nonconsecutive KV and conv/recurrent "
+            "slots, but derives recurrent_state names while this export uses ssm_state, "
+            "does not beam-reorder recurrent state, and rejects nonzero recurrent-state "
+            "rewind."
         ),
         (
             "The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is "

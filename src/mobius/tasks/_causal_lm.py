@@ -410,8 +410,10 @@ class HybridCausalLMTask(ModelTask):
         _register_linear_attention_functions(model, config)
         if config.model_type in {"jamba", "nemotron_h"}:
             model.metadata_props["mobius.runtime_support"] = (
-                "Deferred: heterogeneous attention KV and Mamba convolution/recurrent state "
-                "discovery is tracked by https://github.com/onnxruntime/mobius/issues/605"
+                "Deferred: ORT GenAI 0.15.2 discovers sparse KV and conv/recurrent slots, "
+                "but derives recurrent_state where Mobius exports ssm_state, does not "
+                "beam-reorder recurrent state, and rejects nonzero recurrent-state rewind; "
+                "tracked by https://github.com/onnxruntime/mobius/issues/605"
             )
         return ModelPackage({"model": model}, config=config)
 

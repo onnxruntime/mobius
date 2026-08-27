@@ -339,9 +339,10 @@ def test_assess_sparse_moe_rejects_every_nemotron_h_quantized_route(quantization
     )
     assert ok is False
     assert len(blockers) == 1
-    assert "correction-biased sigmoid" in blockers[0]
-    assert "ReLU2" in blockers[0]
-    assert "com.microsoft::MoE/QMoE cannot represent" in blockers[0]
+    assert "exposes ReLU rather than ReLU2" in blockers[0]
+    assert "no proven IQ2_XXS packer/kernel path" in blockers[0]
+    assert "separate router_probs/router_weights can represent" in blockers[0]
+    assert "are not incompatibilities" in blockers[0]
     assert "keep_quantized=False" in blockers[0]
 
 

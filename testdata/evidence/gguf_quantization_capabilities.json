@@ -2486,8 +2486,8 @@
       "architecture": "nemotron_h_moe",
       "blockers": [
         "The smallest model GGUF in the pinned 29-file repository revision is 18,010,755,296 bytes, above the 16 GiB bounded-artifact policy; explicit float16/float32 weights require 63,155,880,576/126,311,761,152 bytes.",
-        "Nemotron-H correction-biased sigmoid routing, unbiased sigmoid weights, ReLU2 experts, shared expert, and optional latent projections cannot use com.microsoft.MoE; the truthful production graph retains 40,167 nodes and 6,028 MatMul nodes.",
-        "ORT GenAI 0.15.2 cannot describe the 58 heterogeneous attention key/value and Mamba2 convolution/recurrent state slots required for package replay and reorder.",
+        "The normal optimized CPU export has 37,142 nodes (40,167 before Mobius optimization) and 6,028 MatMul nodes because its truthful ReLU2 routed experts remain an ONNX loop. ORT 1.29 MoE/QMoE exposes ReLU but not ReLU2. QMoE has separate router_probs/router_weights for correction-biased selection with unbiased sigmoid mixing, while shared experts and optional latent projections can surround it; those are not fused-op blockers. The pinned 30B has no latent projection. QMoE does not support GGUF IQ2_XXS storage, and Mobius has no proven IQ2_XXS packer/kernel path.",
+        "ORT GenAI 0.15.2 discovers sparse/nonconsecutive KV and conv/recurrent slots, but derives recurrent_state names while this export uses ssm_state, does not beam-reorder recurrent state, and rejects nonzero recurrent-state rewind.",
         "The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is not serialized; exact ORT tokenizer materialization is unavailable."
       ],
       "bounded_header_bytes": 16777216,
@@ -2506,7 +2506,8 @@
       "graph": {
         "initializer_count": 6255,
         "matmul_count": 6028,
-        "node_count": 40167,
+        "node_count": 37142,
+        "pre_optimization_node_count": 40167,
         "state_slots": {
           "attention.key": 6,
           "attention.value": 6,

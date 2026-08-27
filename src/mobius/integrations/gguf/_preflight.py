@@ -313,11 +313,13 @@ def _assess_sparse_moe(
 
     if is_nemotron_h_moe:
         blocker = (
-            f"sparse-MoE fusion blocker: {source} uses Nemotron-H correction-biased "
-            "sigmoid selection with unbiased sigmoid routing weights, ReLU2 experts, "
-            "and a shared expert. com.microsoft::MoE/QMoE cannot represent those "
-            "semantics, so neither native blocks nor an int4 MatMulNBits repack provide "
-            "a truthful sparse runtime route. build_from_gguf fails closed unless "
+            f"sparse-MoE fusion blocker: {source} uses ReLU2 routed experts, but ORT "
+            "1.29 com.microsoft::MoE/QMoE exposes ReLU rather than ReLU2. QMoE also "
+            "does not support GGUF IQ2_XXS storage, and Mobius has no proven IQ2_XXS "
+            "packer/kernel path. QMoE's separate router_probs/router_weights can "
+            "represent correction-biased selection with unbiased sigmoid mixing; "
+            "shared experts and optional latent projections can surround the fused op "
+            "and are not incompatibilities. build_from_gguf fails closed unless "
             "keep_quantized=False explicitly selects the loop-over-experts float graph."
         )
         return False, [blocker]

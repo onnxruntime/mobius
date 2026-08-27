@@ -388,6 +388,7 @@ def quantization_capability_matrix() -> dict[str, object]:
             "experts_per_token": evidence.experts_per_token,
             "layer_counts": dict(evidence.layer_counts),
             "graph": {
+                "pre_optimization_node_count": evidence.pre_optimization_graph_node_count,
                 "node_count": evidence.graph_node_count,
                 "initializer_count": evidence.graph_initializer_count,
                 "matmul_count": evidence.graph_matmul_count,

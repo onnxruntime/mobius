@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 
+import onnx_ir as ir
 import pytest
 
+from mobius._builder import build_from_module
+from mobius._configs import NemotronHConfig
 from mobius.integrations.gguf import _runtime_evidence
 from mobius.integrations.gguf._runtime_blocker_evidence import (
     iter_runtime_blocker_evidence,
@@ -24,6 +28,47 @@ from mobius.integrations.gguf._runtime_evidence import (
     validate_quant_runtime_evidence_ids,
     validate_runtime_evidence_ids,
 )
+from mobius.models.nemotron_h import NemotronHCausalLMModel
+from mobius.tasks import HybridCausalLMTask
+
+
+def _pinned_nemotron_h_config() -> NemotronHConfig:
+    pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    layer_types = {
+        "M": "mamba2",
+        "E": "moe",
+        "*": "full_attention",
+    }
+    return NemotronHConfig(
+        model_type="nemotron_h",
+        vocab_size=131_072,
+        hidden_size=2_688,
+        intermediate_size=1_856,
+        num_hidden_layers=len(pattern),
+        num_attention_heads=32,
+        num_key_value_heads=2,
+        head_dim=128,
+        rms_norm_eps=1e-5,
+        layer_types=[layer_types[layer] for layer in pattern],
+        hidden_act="relu2",
+        mamba_n_heads=64,
+        mamba_d_head=64,
+        mamba_d_state=128,
+        mamba_n_groups=8,
+        mamba_d_conv=4,
+        mamba_expand=2,
+        mamba_conv_bias=True,
+        mamba_proj_bias=False,
+        mamba_time_step_min=0.001,
+        num_local_experts=128,
+        num_experts_per_tok=6,
+        moe_intermediate_size=1_856,
+        moe_latent_size=None,
+        shared_expert_intermediate_size=3_712,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        dtype=ir.DataType.BFLOAT16,
+    )
 
 
 def _record(payload: bytes) -> GGUFRuntimeEvidence:
@@ -106,6 +151,47 @@ def test_nemotron_h_runtime_blocker_is_pinned_without_support_claim() -> None:
     assert record.runtime_schema_issue.endswith("/issues/605")
     assert _runtime_evidence.runtime_evidence(record.evidence_id) is None
     assert "full-logit parity" in record.withheld_checks
+    assert record.graph_node_count == 37_142
+    assert record.pre_optimization_graph_node_count == 40_167
+    assert "separate router_probs/router_weights" in record.blockers[1]
+    assert "not fused-op blockers" in record.blockers[1]
+    assert "has no latent projection" in record.blockers[1]
+    assert "discovers sparse/nonconsecutive KV" in record.blockers[2]
+    assert (
+        "derives recurrent_state names while this export uses ssm_state" in record.blockers[2]
+    )
+    assert "does not beam-reorder recurrent state" in record.blockers[2]
+    assert "rejects nonzero recurrent-state rewind" in record.blockers[2]
+    assert all("cannot describe" not in blocker for blocker in record.blockers)
+
+
+def test_nemotron_h_runtime_blocker_graph_census_matches_pinned_config() -> None:
+    evidence = iter_runtime_blocker_evidence()[0]
+    config = _pinned_nemotron_h_config()
+
+    raw_graph = (
+        HybridCausalLMTask()
+        .build(
+            NemotronHCausalLMModel(config),
+            config,
+        )["model"]
+        .graph
+    )
+    assert len(raw_graph) == evidence.pre_optimization_graph_node_count
+
+    production_graph = build_from_module(
+        NemotronHCausalLMModel(config),
+        config,
+        task="hybrid-text-generation",
+        execution_provider="cpu",
+    )["model"].graph
+    op_counts = Counter(node.op_type for node in production_graph)
+
+    assert len(production_graph) == evidence.graph_node_count
+    assert len(production_graph.initializers) == evidence.graph_initializer_count
+    assert op_counts["MatMul"] == evidence.graph_matmul_count
+    assert len(production_graph.inputs) == 60
+    assert len(production_graph.outputs) == 59
 
 
 def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(

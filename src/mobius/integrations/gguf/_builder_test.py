@@ -7346,10 +7346,11 @@ class TestNemotronHMoEGGUFBuild:
         _write_nemotron_h_moe_gguf(path, quantized=False)
         package = build_from_gguf(path)
         model = package["model"]
-        assert (
-            "heterogeneous attention KV and Mamba convolution/recurrent state"
-            in (model.metadata_props["mobius.runtime_support"])
-        )
+        runtime_support = model.metadata_props["mobius.runtime_support"]
+        assert "discovers sparse KV and conv/recurrent slots" in runtime_support
+        assert "derives recurrent_state where Mobius exports ssm_state" in runtime_support
+        assert "does not beam-reorder recurrent state" in runtime_support
+        assert "rejects nonzero recurrent-state rewind" in runtime_support
         assert [value.name for value in model.graph.outputs] == [
             "logits",
             "present.0.conv_state",
