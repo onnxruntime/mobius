@@ -6966,7 +6966,7 @@ def _normalize_gguf_weights(
     result: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
         if config is not None:
-            _validate_moe_weight_shape(key, tuple(value.shape), config)
+            _validate_moe_weight_shape(key, tuple(value.shape), config, gguf_arch=gguf_arch)
         if gguf_arch in {"dream", "llada-moe", "rnd1"} and ".self_attn.qkv_proj." in key:
             suffix = key.rsplit(".", 1)[-1]
             q_width = int(config.num_attention_heads) * int(config.head_dim)
@@ -7028,12 +7028,15 @@ def _normalize_gguf_weights(
 
         # Stacked expert weights [num_experts, out, ...] → per-expert.
         unpacked = False
+        expert_containers = [
+            ".mlp.experts",
+            ".feed_forward.experts",
+            ".block_sparse_moe.moe.experts",
+        ]
+        if gguf_arch == "arctic":
+            expert_containers.append(".moe.experts")
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            for container in (
-                ".mlp.experts",
-                ".feed_forward.experts",
-                ".block_sparse_moe.moe.experts",
-            ):
+            for container in expert_containers:
                 marker = f"{container}.{proj}."
                 if marker in key and value.dim() >= 3:
                     prefix, suffix = key.rsplit(marker, 1)
@@ -8245,7 +8248,12 @@ def _load_quantized_state_dict(
             if warn_unmapped:
                 logger.warning("Unmapped GGUF tensor: %s (skipped)", gguf_name)
             continue
-        _validate_moe_weight_shape(hf_name, tuple(int(dim) for dim in np_shape), config)
+        _validate_moe_weight_shape(
+            hf_name,
+            tuple(int(dim) for dim in np_shape),
+            config,
+            gguf_arch=gguf_arch,
+        )
         module_hf_name = hf_name
         if gguf_arch == "bert" and module_hf_name.startswith("bert."):
             module_hf_name = module_hf_name[len("bert.") :]
@@ -8816,14 +8824,21 @@ def _validate_moe_weight_shape(
     name: str,
     shape: tuple[int, ...],
     config,
+    *,
+    gguf_arch: str | None = None,
 ) -> None:
     """Reject router/expert tensors that could otherwise be partially routed."""
     num_experts = getattr(config, "num_local_experts", None)
     if num_experts is None:
         return
     expert_size = getattr(config, "moe_intermediate_size", None) or config.intermediate_size
+    expert_markers = [".mlp.experts.", ".feed_forward.experts."]
+    router_suffixes = [".mlp.gate.weight", ".feed_forward.gate.weight"]
+    if gguf_arch == "arctic":
+        expert_markers.append(".moe.experts.")
+        router_suffixes.append(".moe.gate.weight")
     expert_marker = next(
-        (marker for marker in (".mlp.experts.", ".feed_forward.experts.") if marker in name),
+        (marker for marker in expert_markers if marker in name),
         None,
     )
     if expert_marker is not None:
@@ -8839,7 +8854,7 @@ def _validate_moe_weight_shape(
             raise ValueError(
                 f"Invalid stacked expert shape for {name}: expected {expected}, got {shape}"
             )
-    elif name.endswith((".mlp.gate.weight", ".feed_forward.gate.weight")):
+    elif name.endswith(tuple(router_suffixes)):
         expected = (num_experts, config.hidden_size)
         if shape != expected:
             raise ValueError(

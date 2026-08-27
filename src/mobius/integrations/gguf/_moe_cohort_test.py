@@ -8,11 +8,13 @@ from types import SimpleNamespace
 import numpy as np
 import onnx_ir as ir
 import pytest
+import torch
 
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.gguf._arch_registry import Support, get_arch_spec
 from mobius.integrations.gguf._builder import (
+    _normalize_gguf_weights,
     _raise_for_invalid_moe_cohort_tensor_contract,
 )
 from mobius.integrations.gguf._config_mapping import gguf_to_config
@@ -423,6 +425,41 @@ def test_cohort_exact_tensor_closure_and_tiny_graph(architecture: str) -> None:
         assert not any("past_key_values" in value.name for value in graph.inputs)
     else:
         assert graph.outputs[0].name == "logits"
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["arctic", "dbrx", "ernie4_5-moe", "nomic-bert-moe"],
+)
+def test_cohort_stacked_experts_unpack_to_graph_parameters(architecture: str) -> None:
+    source = _fixture(architecture)
+    config = gguf_to_config(source)
+    module = registry.get(get_arch_spec(architecture).module_type)(config)
+    stacked_experts = {
+        map_gguf_to_hf_names(name, architecture): torch.zeros(shape)
+        for name, shape in source._tensors.items()
+        if any(
+            projection in name
+            for projection in ("ffn_gate_exps.", "ffn_up_exps.", "ffn_down_exps.")
+        )
+    }
+
+    normalized = _normalize_gguf_weights(stacked_experts, architecture, config)
+    expected = {name for name, _parameter in module.named_parameters() if ".experts." in name}
+
+    assert set(normalized) == expected
+
+
+def test_arctic_moe_normalization_rejects_malformed_router_and_experts() -> None:
+    source = _fixture("arctic")
+    config = gguf_to_config(source)
+    router = map_gguf_to_hf_names("blk.0.ffn_gate_inp.weight", "arctic")
+    experts = map_gguf_to_hf_names("blk.0.ffn_gate_exps.weight", "arctic")
+
+    with pytest.raises(ValueError, match="Invalid router shape"):
+        _normalize_gguf_weights({router: torch.zeros(3, 8)}, "arctic", config)
+    with pytest.raises(ValueError, match="Invalid stacked expert shape"):
+        _normalize_gguf_weights({experts: torch.zeros(4, 11, 8)}, "arctic", config)
 
 
 @pytest.mark.parametrize(
