@@ -2997,6 +2997,10 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
         top_k = int(metadata[f"{architecture}.expert_used_count"])
         frequency = int(metadata[f"{architecture}.moe_every_n_layers"])
         token_types = int(metadata.get("tokenizer.ggml.token_type_count", 0))
+        if token_types <= 0:
+            raise ValueError(
+                "nomic-bert-moe requires a positive tokenizer.ggml.token_type_count"
+            )
         vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
             metadata.get("tokenizer.ggml.tokens", ())
         )
@@ -3009,7 +3013,6 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
                 kv_heads,
                 experts,
                 top_k,
-                token_types,
                 vocab,
             )
             <= 0

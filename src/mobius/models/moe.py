@@ -223,7 +223,7 @@ class MoETextModel(nn.Module):
         num_local_experts = config.num_local_experts
         num_experts_per_tok = config.num_experts_per_tok
         if num_local_experts is None or num_experts_per_tok is None:
-            raise ValueError("MoE decoder requires expert_count and expert_used_count")
+            raise ValueError("MoE decoder requires num_local_experts and num_experts_per_tok")
 
         def _make_gate() -> nn.Module:
             if gate_factory is None:

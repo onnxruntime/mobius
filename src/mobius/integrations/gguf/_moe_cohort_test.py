@@ -520,6 +520,14 @@ def test_ernie_rejects_ignored_attention_output_bias() -> None:
         _raise_for_invalid_moe_cohort_tensor_contract(source)
 
 
+def test_nomic_requires_positive_token_type_count() -> None:
+    source = _fixture("nomic-bert-moe")
+    del source.metadata["tokenizer.ggml.token_type_count"]
+
+    with pytest.raises(ValueError, match=r"tokenizer\.ggml\.token_type_count"):
+        _raise_for_invalid_moe_cohort_tensor_contract(source)
+
+
 @pytest.mark.parametrize(
     "architecture",
     ["arctic", "dbrx", "ernie4_5-moe", "nomic-bert-moe"],
