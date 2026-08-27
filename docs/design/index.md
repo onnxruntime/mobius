@@ -11,6 +11,7 @@ deepseek-v4-flash-export
 gguf-support-proposal
 golden-infra-design
 multi-tier-testing-strategy
+per-component-quantization-loading
 perf-benchmarking
 phi4mm-architecture
 phi4mm-four-model-split
