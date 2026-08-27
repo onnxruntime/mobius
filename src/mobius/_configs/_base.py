@@ -1993,16 +1993,16 @@ class KimiK3Config(CausalLMConfig):
     def from_transformers(cls, config, parent_config=None) -> KimiK3Config:
         parent = parent_config or config
         text = _as_attribute_config(getattr(config, "text_config", None)) or config
-        base = ArchitectureConfig.from_transformers(text, parent)
-        if (
-            base.quantization is not None
-            and base.quantization.quant_method == "compressed-tensors"
-        ):
+        quantization_config = getattr(text, "quantization_config", None)
+        from mobius.integrations.compressed_tensors import is_compressed_tensors_config
+
+        if is_compressed_tensors_config(quantization_config):
             raise NotImplementedError(
                 "Kimi-K3 compressed-tensors checkpoints use selective MXFP4 routed "
                 "experts, which are not representable by the generic quantized-linear "
                 "loader. Use a GGUF checkpoint or an unquantized state dict."
             )
+        base = ArchitectureConfig.from_transformers(text, parent)
         linear = _as_attribute_config(getattr(text, "linear_attn_config", None))
         if linear is None:
             raise ValueError("Kimi-K3 requires text_config.linear_attn_config")

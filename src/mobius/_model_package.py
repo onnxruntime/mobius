@@ -281,6 +281,13 @@ class ModelPackage(UserDict[str, ir.Model]):
     Attributes:
         config: The architecture configuration used to build the models,
             or ``None`` if not available (e.g. after :meth:`load`).
+        gguf_quantization_report: Optional persisted report describing GGUF
+            source-storage preservation and conversion behavior.
+        quantization_report: Optional transient, loader-specific metadata describing
+            quantization handling. The concrete report type and schema belong to the
+            integration that produced it (for example, ``CompressedTensorsLoadReport``);
+            they are not a stable shared ``ModelPackage`` API and are not persisted by
+            :meth:`save`.
         mtp_head: Optional nested MTP sidecar package. :meth:`save` records its
             collision-free directory in an explicit package manifest, and
             :meth:`load` restores it automatically.
@@ -298,6 +305,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         super().__init__(models or {})
         self.config = config
         self.gguf_quantization_report: GGUFQuantizationReport | None = None
+        self.quantization_report: object | None = None
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
         self.mtp_head: ModelPackage | None = None

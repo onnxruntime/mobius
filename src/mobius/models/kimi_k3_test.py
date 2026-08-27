@@ -78,6 +78,11 @@ def _config() -> KimiK3Config:
     return KimiK3Config.from_transformers(parent)
 
 
+class _ToDictQuantizationConfig:
+    def to_dict(self) -> dict[str, str]:
+        return {"quant_method": "compressed-tensors"}
+
+
 def test_config_extracts_nested_k3_semantics() -> None:
     config = _config()
 
@@ -104,8 +109,20 @@ def test_config_rejects_non_k3_gate_profile() -> None:
         KimiK3Config.from_transformers(parent)
 
 
-def test_config_rejects_selective_compressed_tensors_checkpoint() -> None:
-    text = _text_config(quantization_config={"quant_method": "compressed-tensors"})
+@pytest.mark.parametrize(
+    "quantization_config",
+    [
+        pytest.param({"quant_method": "compressed-tensors"}, id="mapping"),
+        pytest.param(
+            types.SimpleNamespace(quant_method="compressed-tensors"), id="attributes"
+        ),
+        pytest.param(_ToDictQuantizationConfig(), id="to-dict"),
+    ],
+)
+def test_config_rejects_selective_compressed_tensors_checkpoint(
+    quantization_config,
+) -> None:
+    text = _text_config(quantization_config=quantization_config)
     parent = types.SimpleNamespace(model_type="kimi_k3", text_config=text)
 
     with pytest.raises(NotImplementedError, match="selective MXFP4"):
