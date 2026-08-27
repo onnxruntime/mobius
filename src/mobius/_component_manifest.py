@@ -75,8 +75,6 @@ class ComponentDescriptor:
                 for index in anchor_indices:
                     suffix = local_parts[index + 1 :]
                     candidates.append(".".join((*source_parts, *suffix)))
-            else:
-                candidates.append(".".join((*source_parts, *local_parts)))
         return tuple(dict.fromkeys(candidates))
 
 
