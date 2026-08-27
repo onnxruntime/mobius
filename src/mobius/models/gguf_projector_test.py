@@ -154,7 +154,9 @@ def test_minicpm_embedding_replaces_only_boundary_scoped_unknown_tokens(tmp_path
         task=GGUFProjectorVisionLanguageTask(),
     )["embedding"]
     embedding = np.arange(8 * 128, dtype=np.float32).reshape(8, 128)
-    model.graph.initializers["embedding.embed_tokens.weight"].const_value = ir.tensor(embedding)
+    model.graph.initializers["embedding.embed_tokens.weight"].const_value = ir.tensor(
+        embedding
+    )
     model_path = tmp_path / "embedding.onnx"
     ir.save(model, model_path)
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
@@ -209,7 +211,9 @@ def test_embedding_sanitizes_negative_media_sentinel_before_gather(tmp_path):
         task=GGUFProjectorVisionLanguageTask(),
     )["embedding"]
     embedding = np.arange(32, dtype=np.float32).reshape(8, 4)
-    model.graph.initializers["embedding.embed_tokens.weight"].const_value = ir.tensor(embedding)
+    model.graph.initializers["embedding.embed_tokens.weight"].const_value = ir.tensor(
+        embedding
+    )
     model_path = tmp_path / "negative-sentinel.onnx"
     ir.save(model, model_path)
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
