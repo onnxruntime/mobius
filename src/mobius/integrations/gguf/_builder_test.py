@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import errno
+import dataclasses
 import json
 import os
 import re
@@ -21,6 +22,36 @@ import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 from huggingface_hub.utils import OfflineModeIsEnabled
+
+
+@pytest.mark.parametrize("architecture", ["llama", "qwen2", "lfm2", "qwen35moe"])
+def test_existing_evidence_route_fingerprints_ignore_jina_fused_qkv(
+    architecture: str,
+) -> None:
+    from mobius._testing import make_config
+    from mobius.integrations.gguf._builder import _serialize_route_graph_config
+
+    config = make_config()
+    legacy = _serialize_route_graph_config(config, architecture)
+    changed = _serialize_route_graph_config(
+        dataclasses.replace(config, encoder_fused_qkv=True),
+        architecture,
+    )
+
+    assert changed == legacy
+
+
+def test_jina_v3_route_fingerprint_retains_fused_qkv_semantics() -> None:
+    from mobius._testing import make_config
+    from mobius.integrations.gguf._builder import _serialize_route_graph_config
+
+    split = _serialize_route_graph_config(make_config(), "jina-bert-v3")
+    fused = _serialize_route_graph_config(
+        make_config(encoder_fused_qkv=True),
+        "jina-bert-v3",
+    )
+
+    assert fused != split
 
 
 def _gguf_header_prefix(*architectures: str) -> bytes:

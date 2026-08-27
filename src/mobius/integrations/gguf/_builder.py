@@ -3686,7 +3686,7 @@ def _raise_for_invalid_granite_tensor_contract(gguf_model) -> None:
         raise ValueError("granite GGUF has invalid normalization or scaling metadata")
 
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
-    supported_scaling_types = {None, "", "none", "yarn", "longrope"}
+    supported_scaling_types = {None, "", "none", "longrope"}
     if scaling_type not in supported_scaling_types:
         raise ValueError(f"granite GGUF has unsupported rope.scaling.type={scaling_type!r}")
 
@@ -6565,6 +6565,7 @@ _SPECIALIZED_ENCODER_FINGERPRINT_ARCHITECTURES = frozenset(
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
         "gemma-embedding",
         "llama-embed",
     }
@@ -6585,6 +6586,7 @@ _SPECIALIZED_ENCODER_FINGERPRINT_FIELDS = (
 )
 _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
     "attention_clamp": frozenset({"dbrx"}),
+    "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
 }
 
@@ -6601,6 +6603,16 @@ def _graph_config_fields_for_fingerprint(config, gguf_arch: str) -> dict[str, ob
         if gguf_arch not in consumers:
             fields.pop(field_name, None)
     return fields
+
+
+def _serialize_route_graph_config(config: Any, gguf_arch: str) -> str:
+    """Serialize the architecture-isolated graph fields for route fingerprints."""
+    return json.dumps(
+        _graph_config_fields_for_fingerprint(config, gguf_arch),
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 def build_from_gguf(
@@ -7042,6 +7054,7 @@ def build_from_gguf(
         "nomic-bert",
         "nomic-bert-moe",
         "jina-bert-v2",
+        "jina-bert-v3",
         "gemma-embedding",
         "llama-embed",
     }:
@@ -7429,13 +7442,7 @@ def build_from_gguf(
         task_state = resolved_task
     else:
         task_state = dict(sorted(vars(resolved_task).items()))
-    graph_config_fields = _graph_config_fields_for_fingerprint(config, spec.gguf_arch)
-    graph_config = json.dumps(
-        graph_config_fields,
-        default=str,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    graph_config = _serialize_route_graph_config(config, spec.gguf_arch)
     pkg.gguf_import_route = json.dumps(
         {
             "architecture": spec.gguf_arch,

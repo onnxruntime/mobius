@@ -326,6 +326,24 @@ def test_granite_longrope_factors_are_consumed_exactly() -> None:
     }
 
 
+def test_granite_rejects_unmapped_yarn_attention_factor() -> None:
+    metadata = _metadata()
+    metadata.update(
+        {
+            "granite.rope.scaling.type": "yarn",
+            "granite.rope.scaling.factor": 4.0,
+            "granite.rope.scaling.original_context_length": 32,
+            "granite.rope.scaling.attn_factor": 1.1,
+        }
+    )
+    model = _FakeGGUF(metadata, _tensors())
+
+    with pytest.raises(ValueError, match="not in the exact supported subset"):
+        gguf_to_config(model)
+    with pytest.raises(ValueError, match=r"unsupported rope\.scaling\.type='yarn'"):
+        _raise_for_invalid_granite_tensor_contract(model)
+
+
 def test_granite_fused_qkv_is_split_then_reverse_permuted_by_value() -> None:
     q_width = _HIDDEN
     kv_width = _KV_HEADS * _HEAD_DIM

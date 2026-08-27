@@ -25,7 +25,14 @@ from mobius.tasks import SmallThinkerGGUFCausalLMTask
 
 
 class _FakeGGUF:
-    def __init__(self, *, gating: int = 1, sliding: bool = False, fused_qkv: bool = False):
+    def __init__(
+        self,
+        *,
+        gating: int | float = 1,
+        sliding: bool = False,
+        fused_qkv: bool = False,
+        expert_weights_scale: float | None = None,
+    ):
         hidden, expert_width, layers, vocab = 8, 6, 2, 24
         heads, kv_heads, head_dim, experts = 2, 1, 4, 4
         self.architecture = "smallthinker"
@@ -45,6 +52,8 @@ class _FakeGGUF:
             "smallthinker.expert_feed_forward_length": expert_width,
             "smallthinker.expert_gating_func": gating,
         }
+        if expert_weights_scale is not None:
+            self.metadata["smallthinker.expert_weights_scale"] = expert_weights_scale
         if sliding:
             self.metadata.update(
                 {
@@ -162,6 +171,27 @@ def test_smallthinker_config_restores_routing_and_swa_schedule(
     assert config.no_rope_layers == [0, 1]
     assert config.rope_theta == pytest.approx(10_000.0)
     assert config.rope_local_base_freq == pytest.approx(20_000.0)
+
+
+@pytest.mark.parametrize(
+    ("model", "match"),
+    [
+        (_FakeGGUF(gating=1.5), "expert_gating_func must be an integer"),
+        (
+            _FakeGGUF(expert_weights_scale=1.25),
+            "expert_weights_scale must be absent or the zero sentinel",
+        ),
+    ],
+)
+def test_smallthinker_rejects_unproven_routing_metadata(model: _FakeGGUF, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        gguf_to_config(model)
+
+
+def test_smallthinker_accepts_loader_zero_scale_sentinel() -> None:
+    config = gguf_to_config(_FakeGGUF(expert_weights_scale=0.0))
+
+    assert config.routed_scaling_factor == pytest.approx(1.0)
 
 
 def test_smallthinker_capabilities_fail_closed_for_quantization_and_runtime() -> None:

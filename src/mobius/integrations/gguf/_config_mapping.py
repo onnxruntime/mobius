@@ -1648,7 +1648,11 @@ def _smallthinker_postprocess(
 ) -> ArchitectureConfig:
     """Restore the pinned llama.cpp SmallThinker routing and layer schedule."""
     arch = "smallthinker"
-    gating = int(metadata[f"{arch}.expert_gating_func"])
+    raw_gating = metadata[f"{arch}.expert_gating_func"]
+    gating_value = float(raw_gating)
+    if not math.isfinite(gating_value) or not gating_value.is_integer():
+        raise ValueError("smallthinker.expert_gating_func must be an integer")
+    gating = int(gating_value)
     if gating not in (1, 2):
         raise ValueError(
             f"smallthinker.expert_gating_func must be SOFTMAX (1) or SIGMOID (2), got {gating}"
@@ -1670,13 +1674,16 @@ def _smallthinker_postprocess(
     if metadata.get(f"{arch}.expert_weights_norm", True) is not True:
         raise ValueError("SmallThinker requires normalized top-k expert weights")
 
-    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
-    if math.isclose(route_scale, 0.0):
-        route_scale = 1.0
-    if not math.isfinite(route_scale) or route_scale <= 0:
+    raw_route_scale = metadata.get(f"{arch}.expert_weights_scale", 0.0)
+    route_scale = float(raw_route_scale)
+    if not math.isfinite(route_scale) or not math.isclose(
+        route_scale, 0.0, rel_tol=0.0, abs_tol=0.0
+    ):
         raise ValueError(
-            "smallthinker.expert_weights_scale must resolve to a finite positive value"
+            "smallthinker.expert_weights_scale must be absent or the zero sentinel "
+            "because the pinned loader does not consume a routing scale"
         )
+    route_scale = 1.0
 
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
     if scaling_type not in (None, "", "none"):
@@ -2292,7 +2299,7 @@ def _granite_postprocess(
     longrope_names = {"rope_factors_long.weight", "rope_factors_short.weight"}
     present_longrope = tensor_names & longrope_names
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
-    if scaling_type not in (None, "", "none", "yarn", "longrope"):
+    if scaling_type not in (None, "", "none", "longrope"):
         raise ValueError(
             f"granite rope.scaling.type={scaling_type!r} is not in the exact supported subset"
         )

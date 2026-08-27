@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -216,6 +217,32 @@ def _jina_v3_metadata(*, moe: bool = False):
     return metadata
 
 
+def _write_tiny_jina_v3(path: Path) -> None:
+    from gguf import GGUFWriter
+
+    arch = "jina-bert-v3"
+    writer = GGUFWriter(str(path), arch)
+    writer.add_context_length(128)
+    writer.add_embedding_length(8)
+    writer.add_feed_forward_length(16)
+    writer.add_block_count(2)
+    writer.add_head_count(2)
+    writer.add_head_count_kv(2)
+    writer.add_vocab_size(32)
+    writer.add_rope_freq_base(1_000.0)
+    writer.add_rope_dimension_count(4)
+    writer.add_bool(f"{arch}.attention.causal", False)
+    writer.add_float32(f"{arch}.attention.layer_norm_epsilon", 1e-5)
+    writer.add_uint32(f"{arch}.pooling_type", 0)
+    writer.add_uint32("tokenizer.ggml.token_type_count", 2)
+    for name, shape in _jina_v3_tensors(fused_qkv=True).items():
+        writer.add_tensor(name, np.zeros(shape, dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
 @pytest.mark.parametrize(
     ("arch", "model_type", "module_type"),
     [
@@ -341,6 +368,20 @@ def test_jina_v3_rejects_malformed_schedule_and_tensor_mix() -> None:
 
     with pytest.raises(ValueError, match="pinned loader"):
         gguf_to_config(_FakeGGUF(arch, metadata, tensors))
+
+
+def test_jina_v3_builder_rejects_cache_and_incompatible_task_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    path = tmp_path / "jina-v3.gguf"
+    _write_tiny_jina_v3(path)
+
+    with pytest.raises(ValueError, match="encoder-only"):
+        build_from_gguf(path, static_cache=True)
+    with pytest.raises(ValueError, match="only supports task='feature-extraction'"):
+        build_from_gguf(path, task="text-generation")
 
 
 def test_jina_v3_exact_tensor_mapping_and_singleton_token_type_transform() -> None:

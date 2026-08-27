@@ -194,6 +194,16 @@ _COVERAGE_SKIP: dict[str, str] = {
     "jina_bert_v2_gguf": "GGUF-only specialized encoder — no native HF model_type route "
     "for generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT "
     "parity are covered by _specialized_encoders_test.py.",
+    "jina_bert_v3_gguf": "GGUF-only specialized encoder with a pinned L2 source config; "
+    "dedicated GGUF config, graph, closure, and synthetic ORT parity are covered by "
+    "_specialized_encoders_test.py, while real-weight L4/L5 remains deferred.",
+    "gguf_plamo": "GGUF-only fixed PLaMo-13B converter route whose RoPE and expanded-cache "
+    "semantics are restored by GGUF metadata postprocessing, not the native HF config "
+    "path; exact config/graph/value tests cover it and the smallest immutable GGUF exceeds "
+    "the bounded L4/L5 artifact budget.",
+    "smallthinker_gguf": "GGUF-only SmallThinker route whose routing and SWA/NoPE schedules "
+    "are restored by GGUF metadata postprocessing, not the native HF config path; dedicated "
+    "config/graph/synthetic execution tests cover it while real-weight L4/L5 is deferred.",
     "neo_bert_gguf": "GGUF-only specialized encoder — no native HF model_type route for "
     "generic L2/L4/L5; pinned HF-to-GGUF config semantics and synthetic ORT parity "
     "are covered by _specialized_encoders_test.py.",
@@ -277,6 +287,8 @@ _COVERAGE_SKIP: dict[str, str] = {
     "llama4_text": "Very large MoE (109B) — no small public checkpoint",
     "orion": "Orion's public checkpoint is 14B; L1 graph/config/tensor closure is "
     "covered, but no small public artifact exists for bounded L4/L5 validation.",
+    "maincoder": "Maincoder's pinned L2 source config and dedicated GGUF graph/value/cache "
+    "tests cover the exact route; packed import and real-weight L4/L5 remain deferred.",
     "qwen3_5_moe": "The bounded reduced GGUF runtime fixture proves the explicit-float "
     "hybrid state route, but the registered upstream checkpoint remains too large for "
     "ordinary L4/L5 golden generation.",
