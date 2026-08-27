@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions, version
 from pathlib import Path
@@ -284,7 +285,7 @@ _PROMOTED_RUNTIME_CASES = (
             1578,
             1829,
         ),
-        atol=0.1,
+        atol=1e-4,
         cache_atol=1e-4,
         dequantize=True,
     ),
@@ -440,7 +441,7 @@ _PROMOTED_RUNTIME_CASES = (
             16273,
             13231,
         ),
-        atol=4e-4,
+        atol=1e-5,
         cache_atol=2e-6,
         dequantize=True,
     ),
@@ -709,13 +710,6 @@ def _load_low_cost_same_value_reference(
     reference_kind: str,
 ) -> torch.nn.Module:
     """Load the exact dequantized GGUF values into an independent Transformers graph."""
-    from mobius.integrations.gguf._builder import (
-        _load_dequantized_state_dict,
-        _normalize_gguf_weights,
-    )
-    from mobius.integrations.gguf._config_mapping import gguf_to_config
-    from mobius.integrations.gguf._tensor_processors import process_tensors
-
     if reference_kind == "direct":
         config = AutoConfig.from_pretrained(
             evidence.config_repository,
@@ -729,16 +723,6 @@ def _load_low_cost_same_value_reference(
             dtype=torch.float32,
         ).eval()
 
-    gguf_model = GGUFModel(gguf_path)
-    config = gguf_to_config(gguf_model)
-    state = _normalize_gguf_weights(
-        process_tensors(
-            _load_dequantized_state_dict(gguf_model, evidence.architecture),
-            config,
-        ),
-        evidence.architecture,
-        config,
-    )
     hf_config = (
         MptConfig.from_pretrained(
             evidence.config_repository,
@@ -750,49 +734,127 @@ def _load_low_cost_same_value_reference(
             revision=evidence.config_revision,
         )
     )
+    from gguf import GGMLQuantizationType, GGUFReader, dequantize
+
+    # The oracle reads and maps upstream GGUF tensors directly. It deliberately
+    # shares no Mobius tensor loader, name mapping, value processor, or normalizer.
+    source: dict[str, torch.Tensor] = {}
+    for tensor in GGUFReader(gguf_path).tensors:
+        shape = tuple(int(dimension) for dimension in reversed(tensor.shape))
+        if tensor.tensor_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
+            value = tensor.data.reshape(shape)
+        else:
+            value = dequantize(tensor.data, tensor.tensor_type).reshape(shape)
+        source[tensor.name] = torch.from_numpy(np.array(value, copy=True)).float()
+
+    def qkv_to_gptneox(value: torch.Tensor) -> torch.Tensor:
+        q, k, v = value.chunk(3, dim=0)
+        heads = int(hf_config.num_attention_heads)
+        head_dim = q.shape[0] // heads
+        tail = q.shape[1:]
+        return (
+            torch.stack(
+                (
+                    q.reshape(heads, head_dim, *tail),
+                    k.reshape(heads, head_dim, *tail),
+                    v.reshape(heads, head_dim, *tail),
+                ),
+                dim=1,
+            )
+            .reshape(value.shape)
+            .contiguous()
+        )
+
+    def undo_llama_qk_permutation(value: torch.Tensor, heads: int) -> torch.Tensor:
+        head_half = value.shape[0] // heads // 2
+        return (
+            value.reshape(heads, head_half, 2, *value.shape[1:])
+            .swapaxes(1, 2)
+            .reshape(value.shape)
+        )
+
     renamed: dict[str, torch.Tensor] = {}
-    for name, tensor in state.items():
-        value = torch.from_numpy(np.asarray(tensor)).float()
-        if reference_kind == "gptneox":
-            if ".self_attn.qkv_proj." in name:
-                q, k, v = value.chunk(3, dim=0)
-                heads = int(hf_config.num_attention_heads)
-                head_dim = q.shape[0] // heads
-                tail = q.shape[1:]
-                value = (
-                    torch.stack(
-                        (
-                            q.reshape(heads, head_dim, *tail),
-                            k.reshape(heads, head_dim, *tail),
-                            v.reshape(heads, head_dim, *tail),
-                        ),
-                        dim=1,
-                    )
-                    .reshape(value.shape)
-                    .contiguous()
+    global_names = {
+        "gptneox": {
+            "token_embd.weight": "gpt_neox.embed_in.weight",
+            "output_norm.weight": "gpt_neox.final_layer_norm.weight",
+            "output_norm.bias": "gpt_neox.final_layer_norm.bias",
+            "output.weight": "lm_head.weight",
+        },
+        "mpt": {
+            "token_embd.weight": "transformer.wte.weight",
+            "output_norm.weight": "transformer.norm_f.weight",
+        },
+        "olmo": {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+        },
+        "starcoder": {
+            "token_embd.weight": "transformer.wte.weight",
+            "position_embd.weight": "transformer.wpe.weight",
+            "output_norm.weight": "transformer.ln_f.weight",
+            "output_norm.bias": "transformer.ln_f.bias",
+        },
+    }[reference_kind]
+    layer_names = {
+        "gptneox": {
+            "attn_norm": "input_layernorm",
+            "attn_qkv": "attention.query_key_value",
+            "attn_output": "attention.dense",
+            "ffn_norm": "post_attention_layernorm",
+            "ffn_up": "mlp.dense_h_to_4h",
+            "ffn_down": "mlp.dense_4h_to_h",
+        },
+        "mpt": {
+            "attn_norm": "norm_1",
+            "attn_qkv": "attn.Wqkv",
+            "attn_output": "attn.out_proj",
+            "ffn_norm": "norm_2",
+            "ffn_up": "ffn.up_proj",
+            "ffn_down": "ffn.down_proj",
+        },
+        "olmo": {
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_output": "self_attn.o_proj",
+            "ffn_gate": "mlp.gate_proj",
+            "ffn_up": "mlp.up_proj",
+            "ffn_down": "mlp.down_proj",
+        },
+        "starcoder": {
+            "attn_norm": "ln_1",
+            "attn_qkv": "attn.c_attn",
+            "attn_output": "attn.c_proj",
+            "ffn_norm": "ln_2",
+            "ffn_up": "mlp.c_fc",
+            "ffn_down": "mlp.c_proj",
+        },
+    }[reference_kind]
+    layer_prefix = {
+        "gptneox": "gpt_neox.layers",
+        "mpt": "transformer.blocks",
+        "olmo": "model.layers",
+        "starcoder": "transformer.h",
+    }[reference_kind]
+    for name, value in source.items():
+        target = global_names.get(name)
+        if target is None:
+            parts = name.split(".")
+            assert parts[0] == "blk" and len(parts) == 4, name
+            target_stem = layer_names[parts[2]]
+            target = f"{layer_prefix}.{int(parts[1])}.{target_stem}.{parts[3]}"
+            if reference_kind == "gptneox" and parts[2] == "attn_qkv":
+                value = qkv_to_gptneox(value)
+            elif reference_kind == "olmo" and parts[2] in {"attn_q", "attn_k"}:
+                heads = int(
+                    hf_config.num_attention_heads
+                    if parts[2] == "attn_q"
+                    else hf_config.num_key_value_heads
                 )
-            name = name.replace("model.embed_tokens", "gpt_neox.embed_in")
-            name = name.replace("model.layers", "gpt_neox.layers")
-            name = name.replace(".self_attn.qkv_proj", ".attention.query_key_value")
-            name = name.replace(".self_attn.o_proj", ".attention.dense")
-            name = name.replace(".mlp.up_proj", ".mlp.dense_h_to_4h")
-            name = name.replace(".mlp.down_proj", ".mlp.dense_4h_to_h")
-            name = name.replace("model.norm", "gpt_neox.final_layer_norm")
-        elif reference_kind == "starcoder":
-            name = name.replace(".attn.o_proj", ".attn.c_proj")
-            name = name.replace(".mlp.up_proj", ".mlp.c_fc")
-            name = name.replace(".mlp.down_proj", ".mlp.c_proj")
-        elif reference_kind == "mpt":
-            name = name.replace("model.embed_tokens", "transformer.wte")
-            name = name.replace("model.layers", "transformer.blocks")
-            name = name.replace(".input_layernorm", ".norm_1")
-            name = name.replace(".self_attn.qkv_proj", ".attn.Wqkv")
-            name = name.replace(".self_attn.o_proj", ".attn.out_proj")
-            name = name.replace(".post_attention_layernorm", ".norm_2")
-            name = name.replace(".mlp.up_proj", ".ffn.up_proj")
-            name = name.replace(".mlp.down_proj", ".ffn.down_proj")
-            name = name.replace("model.norm", "transformer.norm_f")
-        renamed[name] = value
+                value = undo_llama_qk_permutation(value, heads)
+        renamed[target] = value
+    assert len(renamed) == len(source)
 
     if reference_kind == "gptneox":
         reference = GPTNeoXForCausalLM(hf_config)
@@ -1557,11 +1619,26 @@ def test_promoted_gguf_full_runtime_evidence(
             revision=evidence.config_revision,
         )
     else:
-        reference = _load_low_cost_same_value_reference(
-            gguf_path,
-            evidence,
-            case.reference_kind,
-        )
+        with ExitStack() as reference_guard:
+            if case.reference_kind in {"gptneox", "mpt", "olmo", "starcoder"}:
+                for helper in (
+                    "mobius.integrations.gguf._builder._load_dequantized_state_dict",
+                    "mobius.integrations.gguf._builder._normalize_gguf_weights",
+                    "mobius.integrations.gguf._tensor_processors.process_tensors",
+                ):
+                    reference_guard.enter_context(
+                        mock.patch(
+                            helper,
+                            side_effect=AssertionError(
+                                "same-artifact reference reused the production weight path"
+                            ),
+                        )
+                    )
+            reference = _load_low_cost_same_value_reference(
+                gguf_path,
+                evidence,
+                case.reference_kind,
+            )
     input_ids = prompt_ids.numpy()
     with torch.no_grad():
         reference_logits = reference(prompt_ids, use_cache=False).logits.numpy()
@@ -1581,6 +1658,27 @@ def test_promoted_gguf_full_runtime_evidence(
         rtol=1e-4,
         atol=case.atol,
     )
+    if evidence.architecture in {"gpt2", "starcoder2"}:
+        mutated_config = AutoConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+        if evidence.architecture == "gpt2":
+            mutated_config.activation_function = "gelu"
+        else:
+            mutated_config.hidden_act = "gelu"
+        mutated = AutoModelForCausalLM.from_config(mutated_config).eval()
+        mutated.load_state_dict(reference.state_dict(), assign=True, strict=True)
+        with torch.no_grad():
+            mutated_logits = mutated(prompt_ids, use_cache=False).logits.numpy()
+        with pytest.raises(AssertionError):
+            np.testing.assert_allclose(
+                ort_output["logits"],
+                mutated_logits,
+                rtol=1e-4,
+                atol=case.atol,
+            )
+        del mutated, mutated_logits
 
     state = _next_cache(ort_output)
     generated: list[int] = []

@@ -1382,11 +1382,17 @@ class TestDefaultActivation:
 
         assert _default_activation(model_type) == "gelu_pytorch_tanh"
 
-    @pytest.mark.parametrize("model_type", ["gpt2", "bloom", "starcoder2", "t5"])
+    @pytest.mark.parametrize("model_type", ["bloom", "t5"])
     def test_gelu_models(self, model_type: str) -> None:
         from mobius.integrations.gguf._config_mapping import _default_activation
 
         assert _default_activation(model_type) == "gelu"
+
+    @pytest.mark.parametrize("model_type", ["gpt2", "starcoder2"])
+    def test_architecture_default_uses_tanh_approximate_gelu(self, model_type: str) -> None:
+        from mobius.integrations.gguf._config_mapping import _default_activation
+
+        assert _default_activation(model_type) == "gelu_pytorch_tanh"
 
     @pytest.mark.parametrize("model_type", ["llama", "qwen2", "mistral"])
     def test_silu_default(self, model_type: str) -> None:

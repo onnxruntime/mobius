@@ -4764,15 +4764,17 @@ def _default_activation(model_type: str) -> str:
     # Most modern models use SiLU/Swish
     if model_type == "arcee":
         return "relu2"
+    if model_type in {"gpt2", "starcoder2"}:
+        # These architectures use tanh-approximate GELU by default. Their GGUF
+        # metadata omits that architecture-owned choice, so exact GELU is not equivalent.
+        return "gelu_pytorch_tanh"
     gelu_models = {
         "bert",
         "bloom",
-        "gpt2",
         "gpt_bigcode",
         "jais2",
         "kclgpt",
         "modernbert",
-        "starcoder2",
         "t5",
     }
     if model_type in gelu_models:
