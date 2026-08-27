@@ -387,6 +387,7 @@ class MiniCPMResamplerProjector(nn.Module):
         if text_hidden_size % 4:
             raise ValueError("MiniCPM resampler width must be divisible by four")
         self.query = nn.Parameter([num_queries, text_hidden_size])
+        self.pos_embed = nn.Parameter([num_queries, text_hidden_size])
         self.kv = Linear(vision_hidden_size, text_hidden_size, bias=False)
         self.ln_q = LayerNorm(text_hidden_size, eps=eps)
         self.ln_kv = LayerNorm(text_hidden_size, eps=eps)
@@ -438,7 +439,7 @@ class MiniCPMResamplerProjector(nn.Module):
             op.Unsqueeze(self.query, [0]),
             op.Concat(batch, [self._num_queries, self._hidden], axis=0),
         )
-        query = self.ln_q(op, query)
+        query = op.Add(self.ln_q(op, query), op.Unsqueeze(self.pos_embed, [0]))
         value = self.ln_kv(op, self.kv(op, vision_features))
         key = op.Add(value, op.Unsqueeze(self._position_embedding(op, value), [0]))
 

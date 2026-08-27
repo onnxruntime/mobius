@@ -52,7 +52,6 @@ import math
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 
@@ -444,92 +443,14 @@ def _canonical_text_architecture(architecture: str) -> str:
     return architecture if arch_spec is None else arch_spec.gguf_arch
 
 
-def _normalized_identity(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip().casefold()
+def _validate_mmproj_container_type(mmproj_gguf: Any) -> None:
+    """Validate only the serialized sidecar role, never publisher identity labels.
 
-
-def _normalized_repository(value: object) -> str:
-    if not isinstance(value, str):
-        return ""
-    repository = value.strip()
-    if not repository:
-        return ""
-    parsed = urlsplit(repository)
-    if parsed.scheme:
-        path = parsed.path.rstrip("/")
-        if path.casefold().endswith(".git"):
-            path = path[:-4]
-        return urlunsplit(
-            (
-                parsed.scheme.casefold(),
-                parsed.netloc.casefold(),
-                path.casefold(),
-                parsed.query,
-                parsed.fragment,
-            )
-        )
-    repository = repository.rstrip("/")
-    if repository.casefold().endswith(".git"):
-        repository = repository[:-4]
-    return repository.casefold()
-
-
-def _validate_mmproj_source_identity(text_gguf: Any, mmproj_gguf: Any) -> None:
-    """Require stable name and repository bindings independent of file location."""
-    # llama.cpp's pinned Gemma3 converter predates mmproj identity metadata.
-    # Scope this compatibility path to the exact architecture/projector pair;
-    # every other sidecar retains the stronger identity binding below.
-    legacy_gemma3 = (
-        _canonical_text_architecture(text_gguf.architecture) == "gemma3"
-        and projector_type_for_modality(mmproj_gguf.metadata, MMProjModality.VISION)
-        == "gemma3"
-        and "general.name" not in mmproj_gguf.metadata
-    )
-    if legacy_gemma3:
-        general_type = mmproj_gguf.metadata.get("general.type")
-        if general_type not in (None, "mmproj", "clip-vision"):
-            raise ValueError(
-                f"clip sidecar general.type must be 'mmproj', got {general_type!r}."
-            )
-        return
-
-    bindings: tuple[tuple[str, Callable[[object], str]], ...] = (
-        ("general.name", _normalized_identity),
-        ("general.base_model.0.name", _normalized_identity),
-        ("general.base_model.0.repo_url", _normalized_repository),
-    )
-    for key, normalize in bindings:
-        text_present = key in text_gguf.metadata
-        sidecar_present = key in mmproj_gguf.metadata
-        if key == "general.name" and not (text_present and sidecar_present):
-            raise ValueError(
-                "Cannot establish a trusted text/mmproj pairing: both files must declare "
-                "non-empty general.name metadata."
-            )
-        if text_present != sidecar_present:
-            raise ValueError(
-                "Cannot establish a trusted text/mmproj pairing: identity binding "
-                f"{key!r} is present on only one file."
-            )
-        if not text_present:
-            continue
-        text_value = text_gguf.metadata[key]
-        sidecar_value = mmproj_gguf.metadata[key]
-        text_identity = normalize(text_value)
-        sidecar_identity = normalize(sidecar_value)
-        if not text_identity or not sidecar_identity:
-            raise ValueError(
-                "Cannot establish a trusted text/mmproj pairing: identity binding "
-                f"{key!r} must be a non-empty string on both files."
-            )
-        if text_identity != sidecar_identity:
-            raise ValueError(
-                "mmproj source identity does not match the text GGUF: "
-                f"{key} is {sidecar_value!r} on the sidecar and {text_value!r} "
-                "on the text model."
-            )
+    Real GGUF pairs commonly carry paths, download labels, case differences, or
+    omit ``general.name`` entirely. Compatibility is instead established below
+    from the text architecture, projector type, exact metadata/tensor closure,
+    tensor shapes, output width, and tokenizer media-token content.
+    """
     general_type = mmproj_gguf.metadata.get("general.type")
     if general_type not in (None, "mmproj", "clip-vision"):
         raise ValueError(
@@ -998,6 +919,42 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
                 mmproj_gguf, f"v.blk.{layer}.ffn_down.weight", (hidden, intermediate)
             )
             _expect_mmproj_shape(mmproj_gguf, f"v.blk.{layer}.ffn_down.bias", (hidden,))
+        return
+
+    if spec.builder == "generic_projector":
+        grid = int(md["clip.vision.image_size"]) // patch
+        has_class_token = "v.class_embd" in mmproj_gguf.tensor_names
+        _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            "v.position_embd.weight",
+            (grid * grid + int(has_class_token), hidden),
+        )
+        if has_class_token:
+            _expect_mmproj_shape(mmproj_gguf, "v.class_embd", (hidden,))
+            for name in ("v.pre_ln.weight", "v.pre_ln.bias"):
+                _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+        else:
+            for name in ("v.patch_embd.bias", "v.post_ln.weight", "v.post_ln.bias"):
+                _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+        for layer in range(layers):
+            prefix = f"v.blk.{layer}."
+            for stem in ("ln1", "ln2"):
+                for kind in ("weight", "bias"):
+                    _expect_mmproj_shape(mmproj_gguf, prefix + stem + "." + kind, (hidden,))
+            for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+            _expect_mmproj_shape(
+                mmproj_gguf, prefix + "ffn_down.weight", (intermediate, hidden)
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (intermediate,))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.weight", (hidden, intermediate))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (hidden,))
+        vision = read_mmproj_generic_vision_config(mmproj_gguf)
+        if vision is None:
+            raise ValueError("Generic GGUF projector has no vision configuration.")
+        _generic_projector_dimensions(mmproj_gguf, spec.projector_type, vision)
 
 
 def _preflight_mmproj_pair(
@@ -1012,7 +969,7 @@ def _preflight_mmproj_pair(
             f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
             f"{mmproj_gguf.architecture!r}."
         )
-    _validate_mmproj_source_identity(text_gguf, mmproj_gguf)
+    _validate_mmproj_container_type(mmproj_gguf)
     text_arch = _canonical_text_architecture(text_gguf.architecture)
     resolved: dict[MMProjModality, ProjectorSpec] = {}
     for modality in modalities:
@@ -1026,17 +983,6 @@ def _preflight_mmproj_pair(
         if modality not in spec.modalities:
             raise ValueError(
                 f"Projector {projector_type!r} is not a {modality.value} projector."
-            )
-        if not spec.is_importable:
-            blocked = ", ".join(
-                name
-                for name, verdict in spec.verdicts.items()
-                if name != "runtime" and verdict is not Support.SUPPORTED
-            )
-            raise NotImplementedError(
-                f"clip projector {projector_type!r} is known at llama.cpp "
-                f"{LLAMA_CPP_MMPROJ_SHA} but is deferred/rejected "
-                f"({blocked} unavailable): {spec.reason}"
             )
         if text_arch not in spec.target_architectures:
             raise ValueError(
@@ -1052,6 +998,17 @@ def _preflight_mmproj_pair(
                 f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
             )
         _validate_mmproj_tensor_closure(mmproj_gguf, spec)
+        if not spec.is_importable:
+            blocked = ", ".join(
+                name
+                for name, verdict in spec.verdicts.items()
+                if name != "runtime" and verdict is not Support.SUPPORTED
+            )
+            raise NotImplementedError(
+                f"clip projector {projector_type!r} is known at llama.cpp "
+                f"{LLAMA_CPP_MMPROJ_SHA} but is deferred/rejected "
+                f"({blocked} unavailable): {spec.reason}"
+            )
         resolved[modality] = spec
     return resolved
 
@@ -1409,7 +1366,7 @@ def _mmproj_generic_to_onnx(mmproj_gguf: Any, projector_type: str) -> dict:
     )
 
     state_dict: dict[str, torch.Tensor] = {}
-    compatibility_only = {"resampler.pos_embed", "resampler.pos_embed_k"}
+    compatibility_only = {"resampler.pos_embed_k"}
     for name in mmproj_gguf.tensor_names:
         if name in compatibility_only:
             continue
@@ -1462,15 +1419,22 @@ def _generic_projector_dimensions(
         if has_second_weight != has_second_bias:
             raise ValueError("MLP projector mm.2 weight and bias must be present together.")
         second = shape("mm.2.weight") if has_second_weight else None
-        if (
-            len(first) != 2
-            or first[1] != vision_width
-            or (second is not None and second != (first[0], first[0]))
-        ):
+        if len(first) != 2 or first[1] != vision_width:
             raise ValueError(
                 f"MLP projector shapes {first}/{second} do not form "
                 f"{vision_width}->hidden->hidden."
             )
+        width = first[0]
+        expected = {
+            "mm.0.bias": (width,),
+            **(
+                {"mm.2.weight": (width, width), "mm.2.bias": (width,)}
+                if second is not None
+                else {}
+            ),
+        }
+        for name, expected_shape in expected.items():
+            _expect_mmproj_shape(mmproj_gguf, name, expected_shape)
         return first[0], None, None
     if projector_type == "ldp":
         if grid != 24:
@@ -1479,6 +1443,26 @@ def _generic_projector_dimensions(
         second = shape("mm.model.mlp.3.weight")
         if len(first) != 2 or first[1] != vision_width or second != (first[0], first[0]):
             raise ValueError(f"LDP MLP shapes {first}/{second} are inconsistent.")
+        width = first[0]
+        squeeze = width // 4
+        for name in ("mm.model.mlp.1.bias", "mm.model.mlp.3.bias"):
+            _expect_mmproj_shape(mmproj_gguf, name, (width,))
+        for block in (1, 2):
+            prefix = f"mm.model.mb_block.{block}.block."
+            expected = {
+                "0.0.weight": (width, 3, 3),
+                "0.1.weight": (width,),
+                "0.1.bias": (width,),
+                "1.fc1.weight": (squeeze, width),
+                "1.fc1.bias": (squeeze,),
+                "1.fc2.weight": (width, squeeze),
+                "1.fc2.bias": (width,),
+                "2.0.weight": (width, width),
+                "2.1.weight": (width,),
+                "2.1.bias": (width,),
+            }
+            for suffix, expected_shape in expected.items():
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, expected_shape)
         return first[0], None, None
     if projector_type == "ldpv2":
         if grid != 24:
@@ -1495,6 +1479,9 @@ def _generic_projector_dimensions(
             raise ValueError(
                 f"LDPv2 projector shapes {first}/{second}/{peg} are inconsistent."
             )
+        width = first[0]
+        for name in ("mm.model.mlp.0.bias", "mm.model.mlp.2.bias", "mm.model.peg.0.bias"):
+            _expect_mmproj_shape(mmproj_gguf, name, (width,))
         return first[0], None, None
     if projector_type == "adapter":
         conv = shape("adapter.conv.weight")
@@ -1508,13 +1495,28 @@ def _generic_projector_dimensions(
             or down != (conv[0], up[0])
         ):
             raise ValueError(f"Adapter projector shapes {conv}/{up}/{down} are inconsistent.")
+        width = conv[0]
+        intermediate = up[0]
+        expected = {
+            "adapter.boi": (width,),
+            "adapter.eoi": (width,),
+            "adapter.conv.bias": (width,),
+            "adapter.linear.linear.weight": (width, width),
+            "adapter.linear.norm1.weight": (width,),
+            "adapter.linear.norm1.bias": (width,),
+            "adapter.linear.gate.weight": (intermediate, width),
+        }
+        for name, expected_shape in expected.items():
+            _expect_mmproj_shape(mmproj_gguf, name, expected_shape)
         return conv[0], up[0], None
     if projector_type == "resampler":
         query = shape("resampler.query")
+        query_position = shape("resampler.pos_embed")
         kv = shape("resampler.kv.weight")
         proj = shape("resampler.proj.weight")
         if (
             len(query) != 2
+            or query_position != query
             or kv != (query[1], vision_width)
             or proj
             != (
@@ -1527,6 +1529,27 @@ def _generic_projector_dimensions(
             )
         if grid * grid != shape("v.position_embd.weight")[0]:
             raise ValueError("Resampler vision position rows do not match its patch grid.")
+        width = query[1]
+        expected = {
+            "resampler.attn.q.weight": (width, width),
+            "resampler.attn.k.weight": (width, width),
+            "resampler.attn.v.weight": (width, width),
+            "resampler.attn.out.weight": (width, width),
+            "resampler.attn.q.bias": (width,),
+            "resampler.attn.k.bias": (width,),
+            "resampler.attn.v.bias": (width,),
+            "resampler.attn.out.bias": (width,),
+            "resampler.ln_q.weight": (width,),
+            "resampler.ln_q.bias": (width,),
+            "resampler.ln_kv.weight": (width,),
+            "resampler.ln_kv.bias": (width,),
+            "resampler.ln_post.weight": (width,),
+            "resampler.ln_post.bias": (width,),
+        }
+        if "resampler.pos_embed_k" in mmproj_gguf.tensor_names:
+            expected["resampler.pos_embed_k"] = (grid * grid, width)
+        for name, expected_shape in expected.items():
+            _expect_mmproj_shape(mmproj_gguf, name, expected_shape)
         return query[1], None, query[0]
     raise ValueError(f"Unknown generic GGUF projector type {projector_type!r}")
 

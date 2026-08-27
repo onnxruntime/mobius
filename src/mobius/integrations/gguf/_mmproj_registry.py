@@ -110,20 +110,7 @@ class ProjectorSpec:
         verdicts = (self.metadata, self.tensor_map, self.graph, self.runtime)
         if any(verdict is not Support.SUPPORTED for verdict in verdicts) and not self.reason:
             raise ValueError(f"{self.projector_type}: unsupported capability needs a reason")
-        if self.is_importable:
-            if not self.builder or not self.target_architectures:
-                raise ValueError(
-                    f"{self.projector_type}: importable projector needs builder and target"
-                )
-            if not self.required_metadata or not self.required_top_tensors:
-                raise ValueError(
-                    f"{self.projector_type}: importable projector needs an exact loader closure"
-                )
-            if not self.real_artifact_ids:
-                raise ValueError(
-                    f"{self.projector_type}: importable projector needs real artifact evidence"
-                )
-        elif any(
+        has_loader_data = any(
             (
                 self.builder,
                 self.required_metadata,
@@ -135,9 +122,26 @@ class ProjectorSpec:
                 self.tensor_roles,
                 self.real_artifact_ids,
             )
-        ):
+        )
+        has_supported_schema = (
+            self.metadata is Support.SUPPORTED and self.tensor_map is Support.SUPPORTED
+        )
+        if has_supported_schema and has_loader_data:
+            if not self.builder or not self.target_architectures:
+                raise ValueError(
+                    f"{self.projector_type}: mapped projector needs builder and target"
+                )
+            if not self.required_metadata or not self.required_top_tensors:
+                raise ValueError(
+                    f"{self.projector_type}: mapped projector needs an exact loader closure"
+                )
+            if not self.real_artifact_ids:
+                raise ValueError(
+                    f"{self.projector_type}: mapped projector needs real artifact evidence"
+                )
+        elif has_loader_data:
             raise ValueError(
-                f"{self.projector_type}: deferred/rejected projector cannot expose loader data"
+                f"{self.projector_type}: rejected metadata/tensor mapping cannot expose loader data"
             )
 
     @property
@@ -661,17 +665,20 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         target_architectures=frozenset({"minicpm"}),
         metadata=Support.SUPPORTED,
         tensor_map=Support.SUPPORTED,
-        graph=Support.SUPPORTED,
+        graph=Support.DEFERRED,
         runtime=Support.DEFERRED,
         reason=(
-            "Graph-supported; pinned MiniCPM-V position-table selection and paired "
-            "runtime parity remain deferred."
+            "Metadata and exact tensor mapping are supported, including learned query "
+            "positions. Graph construction is deferred because the real MiniCPM-V2 "
+            "processor emits variable patch-aligned image heights and widths while the "
+            "current vision graph fixes a 448x448 input and 32x32 position grid."
         ),
         builder="generic_projector",
         required_metadata=_COMMON_REQUIRED_VISION_METADATA,
         required_top_tensors=(
             *_SIGLIP_TOP,
             "resampler.query",
+            "resampler.pos_embed",
             "resampler.proj.weight",
             "resampler.kv.weight",
             "resampler.attn.q.weight",
@@ -689,7 +696,7 @@ _SPECS: tuple[ProjectorSpec, ...] = (
             "resampler.ln_post.weight",
             "resampler.ln_post.bias",
         ),
-        optional_top_tensors=("resampler.pos_embed", "resampler.pos_embed_k"),
+        optional_top_tensors=("resampler.pos_embed_k",),
         block_prefix="v.blk.",
         block_suffixes=_GENERIC_BLOCK_SUFFIXES,
         tensor_roles=(
@@ -1279,7 +1286,7 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         lfs_sha256="eb569aba7d65cf3da1d0369610eb6869f4a53ee369992a804d5810a80e9fa035",
         projector_types=("mlp",),
         paired_text_architecture="llama",
-        paired_text_target="llava-llama-3-8b-v1_1-int4.gguf",
+        paired_text_target="Meta-Llama-3-8B-Instruct-Q2_K.gguf",
         metadata=(
             ("clip.vision.embedding_length", 1024),
             ("clip.vision.block_count", 23),
@@ -1288,10 +1295,10 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 235), ("F16", 142)),
         tensor_count=377,
-        parity_test="graph-only: TestGenericGGUFProjectors.test_mlp_graph",
-        paired_text_repository="xtuner/llava-llama-3-8b-v1_1-gguf",
-        paired_text_revision="344f1bfe987bcbdc7e650b134d23670d5ffb5892",
-        paired_text_size=4_921_246_944,
+        parity_test="TestGenericGGUFProjectors.test_mlp_matches_nonzero_reference",
+        paired_text_repository="bartowski/Meta-Llama-3-8B-Instruct-GGUF",
+        paired_text_revision="4ebc4aa83d60a5d6f9e1e1e9272a4d6306d770c1",
+        paired_text_size=3_179_131_456,
         processor_repository="xtuner/llava-llama-3-8b-v1_1-transformers",
         processor_revision="b20fb3040caaf5d0b3751c0d86a94efdf5bb007d",
         processor_files=("config.json", "preprocessor_config.json"),
@@ -1315,14 +1322,13 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 247), ("F16", 150)),
         tensor_count=397,
-        parity_test="graph-only: TestGenericGGUFProjectors.test_ldp_graph",
+        parity_test=(
+            "TestGenericGGUFProjectors."
+            "test_ldp_matches_nonzero_reference_and_144_token_contract"
+        ),
         paired_text_repository="guinmoon/MobileVLM-1.7B-GGUF",
         paired_text_revision="7e0cdbd2d642d938ce82fadde991360500c7d7cf",
         paired_text_size=834_055_776,
-        processor_repository="mtgv/MobileVLM-1.7B",
-        processor_revision="79168d5a284246ddee653c76ab9773dc8ce28876",
-        processor_files=("config.json", "preprocessor_config.json"),
-        processor_contract=(("pixel_values", "float32 [1,3,336,336]"),),
     ),
     MMProjArtifactPin(
         artifact_id="mobilevlm-v2-1.7b-ldpv2-f16",
@@ -1342,14 +1348,13 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 236), ("F16", 143)),
         tensor_count=379,
-        parity_test="graph-only: TestGenericGGUFProjectors.test_ldpv2_graph",
+        parity_test=(
+            "TestGenericGGUFProjectors."
+            "test_ldpv2_matches_nonzero_reference_and_144_token_contract"
+        ),
         paired_text_repository="ZiangWu/MobileVLM_V2-1.7B-GGUF",
         paired_text_revision="422c888cc387d71831bedf48d59f0a66b27fad68",
         paired_text_size=791_817_856,
-        processor_repository="mtgv/MobileVLM_V2-1.7B",
-        processor_revision="9a5b623a83feae6a6b2ecad7a843334ccc119ce1",
-        processor_files=("config.json", "preprocessor_config.json"),
-        processor_contract=(("pixel_values", "float32 [1,3,336,336]"),),
     ),
     MMProjArtifactPin(
         artifact_id="glm-edge-v-2b-adapter-f16",
@@ -1369,7 +1374,10 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 278), ("F16", 169)),
         tensor_count=447,
-        parity_test="graph-only: TestGenericGGUFProjectors.test_adapter_graph",
+        parity_test=(
+            "TestGenericGGUFProjectors."
+            "test_adapter_matches_nonzero_reference_and_boundary_rows"
+        ),
         paired_text_repository="zai-org/glm-edge-v-2b-gguf",
         paired_text_revision="d76cbe14f1d3a9405f664cbb5ae0c9537197429a",
         paired_text_size=931_269_056,
@@ -1396,14 +1404,13 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         tensor_qtypes=(("F32", 276), ("F16", 164)),
         tensor_count=440,
-        parity_test="graph-only: TestGenericGGUFProjectors.test_resampler_graph",
+        parity_test=(
+            "component-only: TestGenericGGUFProjectors."
+            "test_resampler_matches_nonzero_reference_including_query_positions"
+        ),
         paired_text_repository="openbmb/MiniCPM-V-2-gguf",
         paired_text_revision="3a38804c39d96c935a6b542581f51171aefa06a5",
         paired_text_size=1_297_193_376,
-        processor_repository="openbmb/MiniCPM-V-2",
-        processor_revision="b9a02dbfcc87e471b13f8d1c6963747db31427db",
-        processor_files=("config.json", "preprocessor_config.json"),
-        processor_contract=(("pixel_values", "float32 [1,3,448,448]"),),
     ),
     MMProjArtifactPin(
         artifact_id="qwen2-vl-2b-f16",

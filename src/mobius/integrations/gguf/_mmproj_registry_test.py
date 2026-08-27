@@ -108,7 +108,6 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "mlp",
         "ldp",
         "ldpv2",
-        "resampler",
         "adapter",
         "qwen2vl_merger",
         "qwen2.5vl_merger",
@@ -148,7 +147,15 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
             "minicpm-v2-resampler-f16",
         )
     ]
-    assert all(pin.paired_text_revision and pin.processor_revision for pin in cohort)
+    assert all(pin.paired_text_revision for pin in cohort)
+    processor_evidence = {pin.projector_types[0]: pin.processor_revision for pin in cohort}
+    assert processor_evidence == {
+        "mlp": "b20fb3040caaf5d0b3751c0d86a94efdf5bb007d",
+        "ldp": None,
+        "ldpv2": None,
+        "adapter": "2053707733f99ab52e943904f43c2359a94301ef",
+        "resampler": None,
+    }
     assert sum(pin.size + (pin.paired_text_size or 0) for pin in cohort) <= 16 * 1024**3
 
 

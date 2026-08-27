@@ -224,6 +224,14 @@ def _projector_items() -> list[GGUFRouteWorkItem]:
                 "processor boundary",
                 "deterministic multimodal package execution",
             )
+        elif (
+            spec.metadata is Support.SUPPORTED
+            and spec.tensor_map is Support.SUPPORTED
+            and spec.graph is Support.DEFERRED
+        ):
+            category = "dependency-or-runtime-abi-blocked"
+            batch = "projector-runtime-abi"
+            dependencies = ("dynamic processor-to-graph media shape ABI",)
         elif spec.projector_type in _PROJECTOR_ARTIFACT_UNAVAILABLE:
             category = "artifact-unavailable"
             batch = "projector-artifact-discovery"

@@ -505,6 +505,12 @@ def _tokenizer_blocker_evidence_table() -> str:
 
 
 def _projector_evidence_table() -> str:
+    generic_types = {"adapter", "ldp", "ldpv2", "mlp", "resampler"}
+    generic_total = sum(
+        pin.size + (pin.paired_text_size or 0)
+        for pin in MMPROJ_ARTIFACT_PINS
+        if generic_types.intersection(pin.projector_types)
+    )
     rows = [
         (
             "| Artifact ID | Immutable sidecar | Bytes | SHA-256 | Projector types | "
@@ -534,10 +540,10 @@ def _projector_evidence_table() -> str:
         (
             "",
             (
-                "The five generic projector evidence pairs total **12,414,806,816 bytes** "
+                f"The five generic projector evidence pairs total **{generic_total:,} bytes** "
                 "(sidecars plus paired text GGUFs), below the 16 GiB evidence budget. "
-                "Runtime remains deferred; these pins establish immutable schema and "
-                "graph-construction evidence only."
+                "Runtime remains deferred; four routes have independent nonzero-weight graph "
+                "parity, while MiniCPM resampler remains component-only and graph-deferred."
             ),
         )
     )

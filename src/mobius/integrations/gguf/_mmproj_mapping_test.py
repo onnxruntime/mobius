@@ -56,6 +56,7 @@ class TestGenericProjectorMapping:
                 "resampler.attn.out.weight",
                 "projector.attn_out.weight",
             ),
+            ("resampler", "resampler.pos_embed", "projector.pos_embed"),
         ],
     )
     def test_projector_names(

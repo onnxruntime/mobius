@@ -234,6 +234,7 @@ def map_generic_projector_to_onnx(name: str, projector_type: str) -> str | None:
     if projector_type == "resampler":
         return {
             "resampler.query": "projector.query",
+            "resampler.pos_embed": "projector.pos_embed",
             "resampler.kv.weight": "projector.kv.weight",
             "resampler.attn.q.weight": "projector.attn_q.weight",
             "resampler.attn.q.bias": "projector.attn_q.bias",

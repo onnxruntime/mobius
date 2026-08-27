@@ -57,6 +57,27 @@ def test_generic_projector_unknown_variant_fails_closed():
         _generic_projector_dimensions(sidecar, "future-projector", vision)
 
 
+def test_resampler_query_position_shape_must_match_learned_queries():
+    from mobius._configs._sub_configs import VisionConfig
+    from mobius.integrations.gguf._mmproj import _generic_projector_dimensions
+
+    shapes = {
+        "resampler.query": (4, 128),
+        "resampler.pos_embed": (3, 128),
+        "resampler.kv.weight": (128, 8),
+        "resampler.proj.weight": (128, 128),
+        "v.position_embd.weight": (4, 8),
+    }
+    sidecar = SimpleNamespace(
+        get_tensor_shape=shapes.__getitem__,
+        tensor_names=tuple(shapes),
+    )
+    vision = VisionConfig(image_size=28, patch_size=14, hidden_size=8)
+
+    with pytest.raises(ValueError, match="Resampler projector shapes"):
+        _generic_projector_dimensions(sidecar, "resampler", vision)
+
+
 def test_text_gguf_opener_preserves_resolved_shard_manifest(monkeypatch):
     from mobius.integrations.gguf import _mmproj, _shard_set
 
@@ -713,105 +734,21 @@ class TestMultimodalPreflightGuards:
             _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
 
     @pytest.mark.parametrize("missing_side", ["text", "mmproj"])
-    def test_missing_identity_on_either_side_fails_closed(
-        self, tmp_path: Path, missing_side: str
-    ):
+    def test_publisher_name_is_not_a_pairing_contract(self, tmp_path: Path, missing_side: str):
         from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
         from mobius.integrations.gguf._mmproj_registry import MMProjModality
 
-        text_path = tmp_path / "gemma4.gguf"
+        text_path = tmp_path / "text.gguf"
         mmproj_path = tmp_path / "mmproj.gguf"
         _write_minimal_gguf(text_path, "gemma4")
         _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
         text, mmproj = self._load_pair(text_path, mmproj_path)
         (text if missing_side == "text" else mmproj).metadata.pop("general.name")
 
-        with pytest.raises(ValueError, match=r"both files must declare.*general\.name"):
-            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
-
-    @pytest.mark.parametrize(
-        ("key", "mismatched"),
-        [
-            ("general.name", "Other-Gemma"),
-            (
-                "general.base_model.0.repo_url",
-                "https://huggingface.co/example/other-gemma",
-            ),
-        ],
-    )
-    def test_identity_binding_mismatch_is_rejected(
-        self, tmp_path: Path, key: str, mismatched: str
-    ):
-        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
-        from mobius.integrations.gguf._mmproj_registry import MMProjModality
-
-        text_path = tmp_path / "gemma4.gguf"
-        mmproj_path = tmp_path / "mmproj.gguf"
-        _write_minimal_gguf(text_path, "gemma4")
-        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
-        text, mmproj = self._load_pair(text_path, mmproj_path)
-        mmproj.metadata[key] = mismatched
-
-        with pytest.raises(ValueError, match=key):
-            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
-
-    def test_matching_identity_survives_file_relocation(self, tmp_path: Path):
-        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
-        from mobius.integrations.gguf._mmproj_registry import MMProjModality
-
-        text_path = tmp_path / "relocated" / "text" / "renamed-model.gguf"
-        mmproj_path = tmp_path / "another-root" / "renamed-sidecar.gguf"
-        text_path.parent.mkdir(parents=True)
-        mmproj_path.parent.mkdir(parents=True)
-        _write_minimal_gguf(text_path, "gemma4")
-        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
-        text, mmproj = self._load_pair(text_path, mmproj_path)
-
         resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
         assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
 
-    @pytest.mark.parametrize(
-        ("text_name", "sidecar_name"),
-        [
-            ("Model-A", "ModelA"),
-            ("org/model", "orgmodel"),
-            ("model_a", "model-a"),
-        ],
-    )
-    def test_identity_normalization_preserves_meaningful_separators(
-        self, tmp_path: Path, text_name: str, sidecar_name: str
-    ):
-        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
-        from mobius.integrations.gguf._mmproj_registry import MMProjModality
-
-        text_path = tmp_path / "gemma4.gguf"
-        mmproj_path = tmp_path / "mmproj.gguf"
-        _write_minimal_gguf(text_path, "gemma4")
-        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
-        text, mmproj = self._load_pair(text_path, mmproj_path)
-        text.metadata["general.name"] = text_name
-        mmproj.metadata["general.name"] = sidecar_name
-
-        with pytest.raises(ValueError, match=r"general\.name"):
-            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
-
-    @pytest.mark.parametrize("empty_value", ["", " \t "])
-    def test_empty_identity_values_are_rejected(self, tmp_path: Path, empty_value: str):
-        from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
-        from mobius.integrations.gguf._mmproj_registry import MMProjModality
-
-        text_path = tmp_path / "gemma4.gguf"
-        mmproj_path = tmp_path / "mmproj.gguf"
-        _write_minimal_gguf(text_path, "gemma4")
-        _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
-        text, mmproj = self._load_pair(text_path, mmproj_path)
-        text.metadata["general.name"] = empty_value
-        mmproj.metadata["general.name"] = empty_value
-
-        with pytest.raises(ValueError, match=r"non-empty string"):
-            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
-
-    def test_one_sided_present_empty_optional_binding_is_not_treated_absent(
+    def test_path_and_case_mismatched_publisher_labels_do_not_override_content(
         self, tmp_path: Path
     ):
         from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
@@ -822,13 +759,15 @@ class TestMultimodalPreflightGuards:
         _write_minimal_gguf(text_path, "gemma4")
         _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
         text, mmproj = self._load_pair(text_path, mmproj_path)
-        text.metadata["general.base_model.0.repo_url"] = ""
-        mmproj.metadata.pop("general.base_model.0.repo_url")
+        text.metadata["general.name"] = "Downloads/Model"
+        mmproj.metadata["general.name"] = "../work/MODEL"
+        text.metadata["general.base_model.0.repo_url"] = "publisher/text"
+        mmproj.metadata["general.base_model.0.repo_url"] = "publisher/sidecar"
 
-        with pytest.raises(ValueError, match=r"present on only one file"):
-            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
+        assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
 
-    def test_repository_canonicalization_only_normalizes_url_syntax(self, tmp_path: Path):
+    def test_invalid_sidecar_container_type_still_fails_closed(self, tmp_path: Path):
         from mobius.integrations.gguf._mmproj import _preflight_mmproj_pair
         from mobius.integrations.gguf._mmproj_registry import MMProjModality
 
@@ -837,12 +776,10 @@ class TestMultimodalPreflightGuards:
         _write_minimal_gguf(text_path, "gemma4")
         _write_clip_mmproj_gguf(mmproj_path, with_audio=False)
         text, mmproj = self._load_pair(text_path, mmproj_path)
-        text.metadata["general.base_model.0.repo_url"] = (
-            "HTTPS://HUGGINGFACE.CO/Google/Gemma-4-E2B-It.git/"
-        )
+        mmproj.metadata["general.type"] = "model"
 
-        resolved = _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
-        assert resolved[MMProjModality.VISION].projector_type == "gemma4v"
+        with pytest.raises(ValueError, match=r"general\.type"):
+            _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
 
     @pytest.mark.parametrize(
         "patch_shape",
