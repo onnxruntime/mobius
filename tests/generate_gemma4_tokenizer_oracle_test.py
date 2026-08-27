@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 import pytest
+from tokenizers import Tokenizer
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS_DIR = _ROOT / "scripts"
@@ -23,15 +25,22 @@ from generate_gemma4_tokenizer_oracle import (  # noqa: E402
     RANDOM_COUNT,
     RANDOM_LENGTH_STOP,
     ROUTE_FIXED_INPUTS,
+    ROUTES,
     SEED,
     _generator_sha256,
+    _read_header,
     _write_or_check_fixture,
     build_corpus,
+    load_qualification_inputs,
     ordered_results_sha256,
     render_fixture,
 )
 
+from mobius.integrations.gguf import _tokenizer  # noqa: E402
+from mobius.integrations.gguf._tokenizer_evidence import tokenizer_evidence  # noqa: E402
+
 _FIXTURE = _ROOT / "tests/data/gguf_gemma4_tokenizer_oracle.json"
+_QUALIFICATION_INPUTS = _ROOT / "tests/data/gguf_gemma4_qualification_inputs.tar.xz"
 
 
 def _fixture() -> dict:
@@ -58,6 +67,10 @@ def test_committed_fixture_binds_exact_generators_corpora_and_outputs() -> None:
     }
     assert fixture["random_alphabet"] == "".join(RANDOM_ALPHABET)
     assert fixture["modes"] == [list(mode) for mode in MODES]
+    assert fixture["qualification_inputs"] == {
+        "path": "tests/data/gguf_gemma4_qualification_inputs.tar.xz",
+        "sha256": hashlib.sha256(_QUALIFICATION_INPUTS.read_bytes()).hexdigest(),
+    }
 
     for route in fixture["routes"]:
         corpus = build_corpus(route["name"])
@@ -70,6 +83,92 @@ def test_committed_fixture_binds_exact_generators_corpora_and_outputs() -> None:
         for token_ids, decoded_hex in outputs:
             assert all(type(token_id) is int for token_id in token_ids)
             bytes.fromhex(decoded_hex)
+
+
+def _materialize_current_gemma4(
+    tmp_path: Path,
+    *,
+    check_materialized_digest: bool,
+) -> tuple[Tokenizer, dict]:
+    fixture = _fixture()
+    inputs = load_qualification_inputs(_QUALIFICATION_INPUTS)
+    assert set(inputs) == {
+        "gemma4.header",
+        "source/chat_template.jinja",
+        "source/config.json",
+        "source/tokenizer.json",
+        "source/tokenizer_config.json",
+    }
+    evidence = tokenizer_evidence("gemma4-e2b-iq2-native-tokenizer")
+    assert evidence is not None
+    assets = (evidence.source_config_asset, *evidence.tokenizer_assets)
+    for name, size, digest in assets:
+        payload = inputs[f"source/{name}"]
+        assert len(payload) == size
+        assert hashlib.sha256(payload).hexdigest() == digest
+
+    header = tmp_path / "gemma4.header"
+    header.write_bytes(inputs["gemma4.header"])
+    metadata = _read_header(header, ROUTES[0])
+    payloads = {
+        name.removeprefix("source/"): payload
+        for name, payload in inputs.items()
+        if name.startswith("source/")
+    }
+    digest, native = _tokenizer._validate_pinned_tokenizer(
+        metadata,
+        payloads,
+        reconstruct_gemma4_from_gguf=True,
+    )
+    if check_materialized_digest:
+        assert digest == evidence.materialized_tokenizer_sha256
+    return Tokenizer.from_str(native.decode("utf-8")), fixture
+
+
+def _assert_current_gemma4_matches_oracle(
+    tmp_path: Path,
+    *,
+    check_materialized_digest: bool = True,
+) -> None:
+    tokenizer, fixture = _materialize_current_gemma4(
+        tmp_path,
+        check_materialized_digest=check_materialized_digest,
+    )
+    route = next(item for item in fixture["routes"] if item["name"] == "gemma4")
+    corpus = build_corpus("gemma4")
+    cases = [(mode, text) for mode in MODES for text in corpus]
+    assert len(cases) == len(route["expected_outputs"]) == 480
+    for index, ((mode, text), (expected_ids, expected_hex)) in enumerate(
+        zip(cases, route["expected_outputs"], strict=True)
+    ):
+        add_special = mode[0] == "add-special"
+        tokenizer.encode_special_tokens = mode[1] == "no-parse-special"
+        actual_ids = tokenizer.encode(text, add_special_tokens=add_special).ids
+        assert actual_ids == expected_ids, f"tokenization output {index} differs"
+        decode_ids = list(expected_ids)
+        if add_special and decode_ids and decode_ids[0] == 2:
+            decode_ids.pop(0)
+        actual_hex = tokenizer.decode(decode_ids, skip_special_tokens=False).encode().hex()
+        assert actual_hex == expected_hex, f"detokenization output {index} differs"
+
+
+def test_current_gemma4_reconstruction_matches_all_llamacpp_outputs(tmp_path: Path) -> None:
+    _assert_current_gemma4_matches_oracle(tmp_path)
+
+
+def test_reconstruction_behavior_drift_fails_oracle_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replacements = tuple(
+        item for item in _tokenizer._GEMMA4_CLEANUP_REPLACEMENTS if item != (" ?", "?")
+    )
+    monkeypatch.setattr(_tokenizer, "_GEMMA4_CLEANUP_REPLACEMENTS", replacements)
+    with pytest.raises(AssertionError, match="detokenization output"):
+        _assert_current_gemma4_matches_oracle(
+            tmp_path,
+            check_materialized_digest=False,
+        )
 
 
 def test_fixture_is_canonical_utf8_lf_generator_output() -> None:

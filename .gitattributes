@@ -1,2 +1,3 @@
 tests/data/gguf_minicpm_tokenizer_oracle.json text eol=lf
 tests/data/gguf_gemma4_tokenizer_oracle.json text eol=lf
+tests/data/gguf_gemma4_qualification_inputs.tar.xz binary

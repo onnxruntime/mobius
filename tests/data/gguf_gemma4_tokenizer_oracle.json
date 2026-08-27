@@ -2,7 +2,7 @@
   "generator_sources": [
     {
       "path": "scripts/generate_gemma4_tokenizer_oracle.py",
-      "sha256": "918e7ee8f983ec7b6c9b9ec89b4c62b8be3cb86f0ea1ac8b1c6db55c36cc890f"
+      "sha256": "2f4d53b82df099a9857400fb9e5548c1a35ea26cf82443075f41c2aceb40f478"
     },
     {
       "path": "scripts/generate_minicpm_tokenizer_oracle.py",
@@ -11,6 +11,10 @@
   ],
   "serialization": "UTF-8 compact JSON arrays (ensure_ascii=false; separators=(',',':')); fixture rendered as UTF-8 indented JSON with LF",
   "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+  "qualification_inputs": {
+    "path": "tests/data/gguf_gemma4_qualification_inputs.tar.xz",
+    "sha256": "37e431b1a73fbbd924771e649f373a30f5f23e021939bf4cd85ee044a80fc98f"
+  },
   "seed": 650,
   "random_count": 128,
   "random_length_stop_exclusive": 193,

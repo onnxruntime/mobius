@@ -14,12 +14,15 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import io
 import json
+import lzma
 import os
 import random
 import shutil
 import string
 import subprocess
+import tarfile
 import tempfile
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -101,6 +104,7 @@ RANDOM_ALPHABET = tuple(
 )
 _GENERATOR_PATH = "scripts/generate_gemma4_tokenizer_oracle.py"
 _SHARED_GENERATOR_PATH = "scripts/generate_minicpm_tokenizer_oracle.py"
+_QUALIFICATION_INPUTS_PATH = "tests/data/gguf_gemma4_qualification_inputs.tar.xz"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -258,6 +262,53 @@ def render_fixture(payload: object) -> bytes:
     for marker, expected_outputs in replacements.items():
         rendered = rendered.replace(marker, expected_outputs)
     return (rendered + "\n").encode("utf-8")
+
+
+def render_qualification_inputs(header: Path, source_dir: Path) -> bytes:
+    """Return a deterministic compressed archive of exact Gemma4 replay inputs."""
+    route = ROUTES[0]
+    _read_header(header, route)
+    payloads, _ = _load_source_assets(route, source_dir)
+    files = {
+        "gemma4.header": header.read_bytes(),
+        **{f"source/{name}": payload for name, payload in payloads.items()},
+    }
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, payload in sorted(files.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            info.mode = 0o644
+            info.mtime = 0
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            tar.addfile(info, io.BytesIO(payload))
+    return lzma.compress(
+        archive.getvalue(),
+        format=lzma.FORMAT_XZ,
+        check=lzma.CHECK_CRC64,
+        preset=9 | lzma.PRESET_EXTREME,
+    )
+
+
+def load_qualification_inputs(path: Path) -> dict[str, bytes]:
+    """Load regular files from a deterministic Gemma4 qualification archive."""
+    result = {}
+    with tarfile.open(
+        fileobj=io.BytesIO(lzma.decompress(path.read_bytes())), mode="r:"
+    ) as tar:
+        for member in tar.getmembers():
+            if not member.isfile() or member.name in result:
+                raise ValueError(
+                    "Gemma4 qualification archive must contain unique regular files"
+                )
+            stream = tar.extractfile(member)
+            if stream is None:
+                raise ValueError("Gemma4 qualification archive member is unreadable")
+            result[member.name] = stream.read()
+    return result
 
 
 def build_corpus(route_name: str) -> tuple[str, ...]:
@@ -646,6 +697,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("tests/data/gguf_gemma4_tokenizer_oracle.json"),
     )
+    parser.add_argument(
+        "--qualification-inputs-output",
+        type=Path,
+        default=Path(_QUALIFICATION_INPUTS_PATH),
+    )
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--jobs", type=int, default=8)
     return parser
@@ -659,6 +715,15 @@ def main() -> None:
         "gemma4": (args.gemma4_header, args.gemma4_source_dir),
         "granite-fallback": (args.granite_header, args.granite_source_dir),
     }
+    qualification_inputs = render_qualification_inputs(
+        args.gemma4_header,
+        args.gemma4_source_dir,
+    )
+    _write_or_check_fixture(
+        args.qualification_inputs_output,
+        qualification_inputs,
+        check=args.check,
+    )
     with tempfile.TemporaryDirectory(prefix="gemma4-tokenizer-oracle-") as temporary:
         temp = Path(temporary)
         executable = _build_oracle(args.llamacpp_source, temp / "build", jobs=args.jobs)
@@ -689,6 +754,10 @@ def main() -> None:
             "fixture rendered as UTF-8 indented JSON with LF"
         ),
         "llamacpp_commit": UPSTREAM_COMMIT,
+        "qualification_inputs": {
+            "path": _QUALIFICATION_INPUTS_PATH,
+            "sha256": _sha256(qualification_inputs),
+        },
         "seed": SEED,
         "random_count": RANDOM_COUNT,
         "random_length_stop_exclusive": RANDOM_LENGTH_STOP,

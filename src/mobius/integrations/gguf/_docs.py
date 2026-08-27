@@ -552,6 +552,7 @@ def render_document() -> str:
             "`scripts/generate_*_tokenizer_oracle.py` workflows, which validate immutable",
             "bounded headers and official tokenizer hashes, build tokenizer-only GGUFs and the",
             "pinned llama.cpp helper, then recompute exact outputs and mismatch witnesses.",
+            "The committed Gemma4 inputs also replay the current reconstruction network-free.",
         )
     )
     return f"""# `build_from_gguf()`
