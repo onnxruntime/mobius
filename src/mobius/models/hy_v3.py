@@ -124,8 +124,12 @@ class HyV3MoEBlock(MoELayer):
         )
         super().__init__(config, gate=gate, linear_class=linear_class)
         self.e_score_correction_bias = (
-            nn.Parameter([config.num_local_experts]) if config.use_expert_bias else None
+            nn.Parameter([config.num_local_experts], dtype=ir.DataType.FLOAT)
+            if config.use_expert_bias
+            else None
         )
+        if self.e_score_correction_bias is not None:
+            self.e_score_correction_bias._keep_float32 = True  # type: ignore[attr-defined]
         shared_config = dataclasses.replace(
             config, intermediate_size=config.shared_expert_intermediate_size
         )

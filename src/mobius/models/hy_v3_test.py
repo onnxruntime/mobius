@@ -9,8 +9,11 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 import torch
+from onnxscript import nn
 
+from mobius import build_from_module
 from mobius._configs import HyV3Config, HyV3MtpConfig
+from mobius._optimizations import SymbolicShapeInferencePass
 from mobius._testing import create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.hy_v3 import (
@@ -201,6 +204,91 @@ def test_hy_v3_router_matches_selection_biased_sigmoid_reference() -> None:
             np.testing.assert_allclose(
                 actual_by_expert[expert], expected, rtol=1e-6, atol=1e-6
             )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [ir.DataType.FLOAT16, ir.DataType.BFLOAT16],
+)
+@pytest.mark.parametrize(
+    "config_class,task,num_hidden_layers,first_k_dense_replace",
+    [
+        (HyV3Config, "text-generation", 2, 1),
+        (HyV3MtpConfig, HyV3MtpTask(), 1, 0),
+    ],
+)
+def test_hy_v3_reduced_precision_keeps_selection_bias_in_float32(
+    config_class,
+    task,
+    num_hidden_layers: int,
+    first_k_dense_replace: int,
+    dtype: ir.DataType,
+) -> None:
+    overrides = dict(
+        dtype=dtype,
+        num_hidden_layers=num_hidden_layers,
+        first_k_dense_replace=first_k_dense_replace,
+    )
+    if config_class is HyV3MtpConfig:
+        overrides.update(use_dedicated_embeddings=False, use_dedicated_lm_head=False)
+    config = _config(config_class, **overrides)
+    module = HyV3CausalLMModel(config) if config_class is HyV3Config else HyV3MtpModel(config)
+    model = build_from_module(module, config, task=task)["model"]
+    SymbolicShapeInferencePass()(model)
+
+    bias_name = (
+        "model.layers.1.mlp.e_score_correction_bias"
+        if config_class is HyV3Config
+        else "layers.0.mlp.e_score_correction_bias"
+    )
+    assert model.graph.initializers[bias_name].dtype == ir.DataType.FLOAT
+    selection_add = next(
+        node
+        for node in model.graph
+        if node.op_type == "Add"
+        and any(value is not None and value.name == bias_name for value in node.inputs)
+    )
+    assert all(
+        value is None or value.dtype == ir.DataType.FLOAT for value in selection_add.inputs
+    )
+
+
+def test_hy_v3_float32_bias_preserves_near_boundary_expert_selection() -> None:
+    builder, op, graph = create_test_builder()
+    hidden = create_test_input(builder, "hidden", [1, 1, 1], dtype=ir.DataType.FLOAT16)
+    gate = HyV3TopKGate(
+        1,
+        4,
+        2,
+        normalize=False,
+        normalization_floor=None,
+        normalization_epsilon=None,
+        routed_scaling_factor=1.0,
+    )
+    correction = nn.Parameter([4], dtype=ir.DataType.FLOAT)
+    correction._keep_float32 = True
+    correction.const_value = ir.tensor(np.array([1.0002, 1.0001, 1.0, -1.0], dtype=np.float32))
+    experts = gate(op, hidden, correction)[1]
+    experts.name = "experts"
+    graph.outputs.append(experts)
+    correction.name = "correction"
+    graph.register_initializer(correction)
+    model = ir.Model(graph, ir_version=10)
+
+    model.graph.initializers["weight"].const_value = ir.tensor(
+        np.zeros((4, 1), dtype=np.float32)
+    )
+    near_boundary = model.graph.initializers["correction"].const_value.numpy()
+
+    session = OnnxModelSession(model, device="cpu")
+    actual = session.run({"hidden": np.zeros((1, 1, 1), dtype=np.float16)})["experts"]
+    session.close()
+
+    expected = np.argpartition(np.full(4, 0.5, dtype=np.float32) + near_boundary, -2)[-2:]
+    assert set(actual.reshape(-1).tolist()) == set(expected.tolist()) == {0, 1}
+    rounded = near_boundary.astype(np.float16).astype(np.float32)
+    rounded_expected = np.argpartition(np.full(4, 0.5, dtype=np.float32) + rounded, -2)[-2:]
+    assert set(rounded_expected.tolist()) != {0, 1}
 
 
 def test_hy_v3_official_router_uses_additive_normalization_epsilon() -> None:
