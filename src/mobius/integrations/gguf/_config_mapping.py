@@ -1539,6 +1539,50 @@ def _arctic_postprocess(
     )
 
 
+def _ernie45_shared_expert_width(
+    metadata: dict[str, Any],
+    tensor_names: Iterable[str],
+    routed_layers: Iterable[int],
+) -> tuple[int | None, int | None]:
+    """Resolve ERNIE's merged shared MLP width and optional width multiplier."""
+    width = int(metadata.get("ernie4_5-moe.expert_shared_feed_forward_length", 0))
+    count_value = metadata.get("ernie4_5-moe.expert_shared_count")
+    count = None if count_value is None else int(count_value)
+    expected = {
+        f"blk.{layer}.ffn_{projection}_shexp.weight"
+        for layer in routed_layers
+        for projection in ("gate", "up", "down")
+    }
+    present = expected & set(tensor_names)
+
+    if width < 0:
+        raise ValueError("ernie4_5-moe.expert_shared_feed_forward_length must be non-negative")
+    if width == 0:
+        if present:
+            raise ValueError(
+                "ernie4_5-moe shared-expert tensors require a positive shared FFN width"
+            )
+        if count not in {None, 0}:
+            raise ValueError(
+                "ernie4_5-moe.expert_shared_count requires a positive shared FFN width"
+            )
+        return None, count
+
+    if present != expected:
+        raise ValueError(
+            "ernie4_5-moe positive shared FFN width requires complete shared-expert tensors"
+        )
+    if count is not None:
+        expert_width = int(metadata["ernie4_5-moe.expert_feed_forward_length"])
+        if count <= 0 or width != count * expert_width:
+            expected_width = count * expert_width
+            raise ValueError(
+                "ernie4_5-moe.expert_shared_count is inconsistent with its merged shared "
+                f"FFN width: expected {expected_width}, got {width}"
+            )
+    return width, count
+
+
 def _ernie45_moe_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -1564,12 +1608,11 @@ def _ernie45_moe_postprocess(
     present_correction = correction & names
     if present_correction and present_correction != correction:
         raise ValueError("ernie4_5-moe correction bias must be complete across routed layers")
-    shared_width = config.shared_expert_intermediate_size
-    shared_count = int(metadata.get("ernie4_5-moe.expert_shared_count", 0))
-    if shared_count > 0 and (shared_width is None or shared_width <= 0):
-        raise ValueError("ernie4_5-moe shared experts require a positive shared FFN width")
-    if shared_count == 0:
-        shared_width = None
+    shared_width, shared_count = _ernie45_shared_expert_width(
+        metadata,
+        names,
+        routed_layers,
+    )
     return dataclasses.replace(
         config,
         hidden_act="silu",
@@ -1584,6 +1627,7 @@ def _ernie45_moe_postprocess(
         routed_scaling_factor=1.0,
         use_expert_bias=bool(present_correction),
         shared_expert_intermediate_size=shared_width,
+        n_shared_experts=shared_count,
         attn_qkv_bias=False,
         attn_o_bias=False,
         mlp_bias=False,

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,10 +12,13 @@ import onnx_ir as ir
 import pytest
 import torch
 
+from mobius._configs import ArchitectureConfig
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.gguf._arch_registry import Support, get_arch_spec
 from mobius.integrations.gguf._builder import (
+    _SPECIALIZED_ENCODER_FINGERPRINT_FIELDS,
+    _graph_config_fields_for_fingerprint,
     _normalize_gguf_weights,
     _raise_for_invalid_moe_cohort_tensor_contract,
 )
@@ -55,6 +60,60 @@ _IMPORT_EVIDENCE = {
         "downloaded": 273_286_112,
     },
 }
+
+
+@pytest.mark.parametrize("architecture", ["llama", "qwen2", "lfm2", "qwen35moe"])
+def test_new_cohort_fields_preserve_existing_route_fingerprint_bytes(
+    architecture: str,
+) -> None:
+    config = ArchitectureConfig(
+        hidden_size=8,
+        intermediate_size=12,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        attention_clamp=8.0,
+        moe_layer_frequency=2,
+    )
+    legacy_fields = dataclasses.asdict(config)
+    for field_name in (
+        *_SPECIALIZED_ENCODER_FINGERPRINT_FIELDS,
+        "attention_clamp",
+        "moe_layer_frequency",
+    ):
+        legacy_fields.pop(field_name, None)
+    legacy_bytes = json.dumps(
+        legacy_fields,
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    current_bytes = json.dumps(
+        _graph_config_fields_for_fingerprint(config, architecture),
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    assert current_bytes == legacy_bytes
+
+
+@pytest.mark.parametrize(
+    ("architecture", "included"),
+    [
+        ("arctic", frozenset()),
+        ("dbrx", frozenset({"attention_clamp"})),
+        ("ernie4_5-moe", frozenset({"moe_layer_frequency"})),
+        ("nomic-bert-moe", frozenset({"moe_layer_frequency"})),
+    ],
+)
+def test_cohort_route_fingerprint_includes_only_consumed_new_fields(
+    architecture: str,
+    included: frozenset[str],
+) -> None:
+    config = ArchitectureConfig(attention_clamp=8.0, moe_layer_frequency=2)
+    fields = _graph_config_fields_for_fingerprint(config, architecture)
+
+    assert included == {"attention_clamp", "moe_layer_frequency"} & fields.keys()
 
 
 class _FakeGGUF:
@@ -216,8 +275,8 @@ def _fixture(architecture: str) -> _FakeGGUF:
             {
                 f"{architecture}.attention.layer_norm_rms_epsilon": 1e-5,
                 f"{architecture}.expert_feed_forward_length": expert_intermediate,
-                f"{architecture}.expert_shared_count": 1,
-                f"{architecture}.expert_shared_feed_forward_length": expert_intermediate,
+                f"{architecture}.expert_shared_count": 2,
+                f"{architecture}.expert_shared_feed_forward_length": 2 * expert_intermediate,
                 f"{architecture}.leading_dense_block_count": 1,
                 f"{architecture}.interleave_moe_layer_step": 2,
             }
@@ -262,9 +321,18 @@ def _fixture(architecture: str) -> _FakeGGUF:
                             hidden,
                             expert_intermediate,
                         ),
-                        prefix + "ffn_gate_shexp.weight": (expert_intermediate, hidden),
-                        prefix + "ffn_up_shexp.weight": (expert_intermediate, hidden),
-                        prefix + "ffn_down_shexp.weight": (hidden, expert_intermediate),
+                        prefix + "ffn_gate_shexp.weight": (
+                            2 * expert_intermediate,
+                            hidden,
+                        ),
+                        prefix + "ffn_up_shexp.weight": (
+                            2 * expert_intermediate,
+                            hidden,
+                        ),
+                        prefix + "ffn_down_shexp.weight": (
+                            hidden,
+                            2 * expert_intermediate,
+                        ),
                     }
                 )
             else:
@@ -502,12 +570,45 @@ def test_cohort_config_preserves_routing_and_schedule_semantics() -> None:
     assert ernie.first_k_dense_replace == 1
     assert ernie.use_expert_bias
     assert ernie.norm_topk_prob
+    assert ernie.shared_expert_intermediate_size == 12
+    assert ernie.n_shared_experts == 2
     assert ernie.routing_weight_normalization_floor == pytest.approx(6.103515625e-5)
 
     nomic = gguf_to_config(_fixture("nomic-bert-moe"))
     assert nomic.moe_layer_frequency == 2
     assert nomic.norm_topk_prob is False
     assert nomic.hidden_act == "gelu_pytorch_tanh"
+
+
+def test_ernie_shared_expert_width_is_authoritative_without_count() -> None:
+    source = _fixture("ernie4_5-moe")
+    del source.metadata["ernie4_5-moe.expert_shared_count"]
+
+    _raise_for_invalid_moe_cohort_tensor_contract(source)
+    config = gguf_to_config(source)
+    module = registry.get(get_arch_spec(source.architecture).module_type)(config)
+
+    assert config.shared_expert_intermediate_size == 12
+    assert config.n_shared_experts is None
+    assert any("shared_expert" in name for name, _parameter in module.named_parameters())
+
+
+@pytest.mark.parametrize("shared_count", [0, 1, 3])
+def test_ernie_shared_expert_count_must_match_width(shared_count: int) -> None:
+    source = _fixture("ernie4_5-moe")
+    source.metadata["ernie4_5-moe.expert_shared_count"] = shared_count
+
+    with pytest.raises(ValueError, match="expert_shared_count"):
+        _raise_for_invalid_moe_cohort_tensor_contract(source)
+
+
+def test_ernie_shared_expert_width_requires_complete_tensors() -> None:
+    source = _fixture("ernie4_5-moe")
+    del source._tensors["blk.1.ffn_gate_shexp.weight"]
+    source.tensor_names = list(source._tensors)
+
+    with pytest.raises(ValueError, match="complete shared-expert tensors"):
+        _raise_for_invalid_moe_cohort_tensor_contract(source)
 
 
 def test_ernie_rejects_ignored_attention_output_bias() -> None:

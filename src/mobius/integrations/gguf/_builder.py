@@ -23,7 +23,7 @@ import re
 import shutil
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -2738,9 +2738,6 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
         top_k = int(metadata[f"{architecture}.expert_used_count"])
         frequency = int(metadata[f"{architecture}.interleave_moe_layer_step"])
         dense_prefix = int(metadata.get(f"{architecture}.leading_dense_block_count", 0))
-        shared_intermediate = int(
-            metadata.get(f"{architecture}.expert_shared_feed_forward_length", 0)
-        )
         vocab = int(metadata.get(f"{architecture}.vocab_size", 0)) or len(
             metadata.get("tokenizer.ggml.tokens", ())
         )
@@ -2783,6 +2780,15 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
             for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
             if not is_known_skip(name)
         }
+        from mobius.integrations.gguf._config_mapping import (
+            _ernie45_shared_expert_width,
+        )
+
+        shared_intermediate, _shared_count = _ernie45_shared_expert_width(
+            metadata,
+            actual,
+            routed_layers,
+        )
         required = {
             "token_embd.weight": (vocab, hidden),
             "output_norm.weight": (hidden,),
@@ -2836,7 +2842,7 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
             )
             correction_biases.add(prefix + "exp_probs_b.bias")
             optional[prefix + "exp_probs_b.bias"] = (experts,)
-            if shared_intermediate > 0:
+            if shared_intermediate is not None:
                 required.update(
                     {
                         prefix + "ffn_gate_shexp.weight": (shared_intermediate, hidden),
@@ -5810,6 +5816,51 @@ def _logical_source_filename(reference: str | Path, resolved_path: str | Path) -
     return resolved.name
 
 
+_SPECIALIZED_ENCODER_FINGERPRINT_ARCHITECTURES = frozenset(
+    {
+        "eurobert",
+        "neo-bert",
+        "nomic-bert",
+        "nomic-bert-moe",
+        "jina-bert-v2",
+        "gemma-embedding",
+        "llama-embed",
+    }
+)
+_SPECIALIZED_ENCODER_FINGERPRINT_FIELDS = (
+    "encoder_use_token_type_embeddings",
+    "encoder_q_bias",
+    "encoder_k_bias",
+    "encoder_v_bias",
+    "encoder_ffn_up_bias",
+    "encoder_ffn_down_bias",
+    "encoder_qk_norm",
+    "encoder_extra_attention_norm",
+    "encoder_fused_geglu",
+    "pooling_type",
+    "embedding_dense_2_out",
+    "embedding_dense_3_in",
+)
+_ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
+    "attention_clamp": frozenset({"dbrx"}),
+    "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
+}
+
+
+def _graph_config_fields_for_fingerprint(config, gguf_arch: str) -> dict[str, object]:
+    """Serialize only fields consumed by an architecture's imported graph."""
+    fields = asdict(config)
+    if gguf_arch not in _SPECIALIZED_ENCODER_FINGERPRINT_ARCHITECTURES:
+        # Keep established route fingerprints byte-identical when encoder-only
+        # graph fields are added to ArchitectureConfig.
+        for field_name in _SPECIALIZED_ENCODER_FINGERPRINT_FIELDS:
+            fields.pop(field_name, None)
+    for field_name, consumers in _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS.items():
+        if gguf_arch not in consumers:
+            fields.pop(field_name, None)
+    return fields
+
+
 def build_from_gguf(
     gguf_path: str | Path,
     *,
@@ -6590,34 +6641,7 @@ def build_from_gguf(
         task_state = resolved_task
     else:
         task_state = dict(sorted(vars(resolved_task).items()))
-    graph_config_fields = dataclasses.asdict(config)
-    if spec.gguf_arch not in {
-        "eurobert",
-        "neo-bert",
-        "nomic-bert",
-        "nomic-bert-moe",
-        "jina-bert-v2",
-        "gemma-embedding",
-        "llama-embed",
-    }:
-        # These fields were added for specialized encoder graph variants. Keep
-        # the established route fingerprint byte-identical for every existing
-        # architecture so pinned runtime evidence remains valid.
-        for field_name in (
-            "encoder_use_token_type_embeddings",
-            "encoder_q_bias",
-            "encoder_k_bias",
-            "encoder_v_bias",
-            "encoder_ffn_up_bias",
-            "encoder_ffn_down_bias",
-            "encoder_qk_norm",
-            "encoder_extra_attention_norm",
-            "encoder_fused_geglu",
-            "pooling_type",
-            "embedding_dense_2_out",
-            "embedding_dense_3_in",
-        ):
-            graph_config_fields.pop(field_name, None)
+    graph_config_fields = _graph_config_fields_for_fingerprint(config, spec.gguf_arch)
     graph_config = json.dumps(
         graph_config_fields,
         default=str,
