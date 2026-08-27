@@ -52,6 +52,7 @@ __all__ = [
     "GlmMoeDsaTask",
     "GlmOcrVLTask",
     "HybridCausalLMTask",
+    "HyV3MtpTask",
     "FalconH1CausalLMTask",
     "Cosmos3EdgeVLTask",
     "HybridQwenVLTask",
@@ -144,6 +145,7 @@ from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
 from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
 from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
+from mobius.tasks._hy_v3_mtp import HyV3MtpTask
 from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._kimi_k3 import KimiK3CausalLMTask
 from mobius.tasks._kimi_linear import KimiLinearCausalLMTask
@@ -232,6 +234,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "t5-text-encoding": T5TextEncoderTask,
     "deepseek-v4": DeepSeekV4Task,
     "hybrid-text-generation": HybridCausalLMTask,
+    "hy-v3-mtp": HyV3MtpTask,
     "kimi-k3-text-generation": KimiK3CausalLMTask,
     "kimi-linear-text-generation": KimiLinearCausalLMTask,
     "falcon-h1-text-generation": FalconH1CausalLMTask,

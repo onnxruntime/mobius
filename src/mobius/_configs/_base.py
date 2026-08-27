@@ -2529,6 +2529,63 @@ class Qwen35MtpConfig(CausalLMConfig):
         return cls(**fields)
 
 
+@dataclasses.dataclass
+class HyV3Config(CausalLMConfig):
+    """Configuration for Hunyuan-V3 dense-prefix and routed/shared MoE blocks."""
+
+    enable_moe_fp32_combine: bool = True
+    routing_weight_normalization_epsilon: float | None = None
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> HyV3Config:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        layer_types = list(
+            getattr(config, "mlp_layer_types", None)
+            or ["dense"] + ["sparse"] * max(int(base.num_hidden_layers) - 1, 0)
+        )
+        if len(layer_types) != base.num_hidden_layers:
+            raise ValueError("HYV3 mlp_layer_types must have one entry per decoder layer")
+        dense_prefix = 0
+        while dense_prefix < len(layer_types) and layer_types[dense_prefix] == "dense":
+            dense_prefix += 1
+        if any(kind != "sparse" for kind in layer_types[dense_prefix:]):
+            raise ValueError(
+                "HYV3 supports a contiguous leading dense prefix followed by sparse layers"
+            )
+        num_shared = int(getattr(config, "num_shared_experts", None) or 1)
+        moe_width = int(
+            getattr(config, "moe_intermediate_size", None) or base.intermediate_size
+        )
+        fields.update(
+            first_k_dense_replace=dense_prefix,
+            shared_expert_intermediate_size=moe_width * num_shared,
+            n_shared_experts=num_shared,
+            routed_scaling_factor=float(
+                getattr(config, "router_scaling_factor", None) or base.routed_scaling_factor
+            ),
+            norm_topk_prob=True,
+            routing_weight_normalization_floor=None,
+            routing_weight_normalization_epsilon=1e-20,
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            use_expert_bias=True,
+            disable_qmoe=True,
+            attn_qk_norm=True,
+            attn_qk_norm_full=False,
+            enable_moe_fp32_combine=bool(getattr(config, "enable_moe_fp32_combine", True)),
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
+class HyV3MtpConfig(HyV3Config):
+    """Configuration for one independently cached Hunyuan-V3 NextN block."""
+
+    use_dedicated_embeddings: bool = False
+    use_dedicated_lm_head: bool = False
+
+
 def _speculators_layer_namespace(layer_cfg: dict):
     """Build a config-like namespace from a speculators ``transformer_layer_config``.
 

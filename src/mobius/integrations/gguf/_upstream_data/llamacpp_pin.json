@@ -16,7 +16,7 @@
   "converter_metadata_emitters": ["bailingmoe2", "bailingmoe3", "cohere2moe", "deepseek2", "deepseek32", "deepseek4", "dots3note", "exaone-moe", "exaone4", "gemma4-assistant", "glm-dsa", "glm4", "glm4moe", "hy_v3", "mimo2", "nemotron_h_moe", "qwen35", "qwen35moe", "qwen3next", "step35"],
   "converter_mtp_only_opt_in": ["bailingmoe3", "deepseek2", "deepseek32", "deepseek4", "dots3note", "glm-dsa", "hy_v3", "nemotron_h_moe", "qwen35", "qwen35moe", "qwen3next", "step35"],
   "non_mtp_metadata_reemitters": ["graniteswitch"],
-  "mobius_supported_sidecars": ["qwen35"],
+  "mobius_supported_sidecars": ["hy_v3", "qwen35"],
   "mobius_runtime_status": "DEFERRED"
 },
 "architectures": {

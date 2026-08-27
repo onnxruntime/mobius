@@ -708,6 +708,9 @@ def _validate_gguf_model(
     _raise_for_invalid_smallthinker_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
+    from mobius.integrations.gguf._hy_v3 import validate_hy_v3_tensor_contract
+
+    validate_hy_v3_tensor_contract(gguf_model)
     from mobius.integrations.gguf._draft import validate_draft_tensor_contract
 
     validate_draft_tensor_contract(gguf_model)
@@ -6669,7 +6672,9 @@ _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
     "attention_clamp": frozenset({"dbrx"}),
     "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
-    "routing_weight_normalization_floor": frozenset({"dots1", "ernie4_5-moe", "smallthinker"}),
+    "routing_weight_normalization_floor": frozenset(
+        {"dots1", "ernie4_5-moe", "hy_v3", "smallthinker"}
+    ),
 }
 
 
@@ -6942,7 +6947,13 @@ def build_from_gguf(
             f"static_cache=True is not supported for exact legacy {gguf_arch} GGUF models; "
             "their dedicated decoder layers currently implement dynamic KV cache only."
         )
-    if static_cache and int(gguf_model.metadata.get(f"{gguf_arch}.nextn_predict_layers", 0)):
+    mtp_count = int(gguf_model.metadata.get(f"{gguf_arch}.nextn_predict_layers", 0))
+    block_count = int(gguf_model.metadata.get(f"{gguf_arch}.block_count", 0))
+    has_physical_mtp = gguf_arch != "hy_v3" or (
+        mtp_count == 1
+        and f"blk.{block_count - 1}.nextn.eh_proj.weight" in gguf_model.tensor_names
+    )
+    if static_cache and mtp_count and has_physical_mtp:
         raise ValueError(
             "static_cache=True cannot represent the GGUF MTP head's independent "
             "dynamic concat-grow KV cache; refusing to silently omit the sidecar"

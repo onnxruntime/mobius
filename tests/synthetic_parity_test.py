@@ -187,6 +187,9 @@ _ATOL_OVERRIDES: dict[str, float] = {
     # keeps ~2x headroom over the higher measurement while staying 16x
     # tighter than the old 0.04.
     "deepseek_v3": 0.0025,
+    # HYV3 uses fused expert banks in Transformers and sequential experts in ONNX.
+    # With identical weights this changes only float32 accumulation order (~0.0014).
+    "hy_v3": 0.002,
     # dots1: same DeepSeek V3 architecture (sigmoid routing + shared experts).
     # MoE dispatch accumulation differences → similar tolerance needed.
     "dots1": 0.04,
@@ -418,6 +421,7 @@ _HF_EXTRA_CONFIG: dict[str, dict] = {
     },
     # HunYuanMoEV1 requires head_dim (defaults to None, causing pow(None, float) error).
     "hunyuan_v1_moe": {"head_dim": TINY_HEAD_DIM},
+    "hy_v3": {"head_dim": TINY_HEAD_DIM},
     # Llama4Text requires head_dim to match our tiny num_heads x head_dim = hidden_size.
     # Disable MoE (we use dense CausalLMModel) and Llama4-specific attention features
     # (QK-norm and temperature tuning) not implemented in CausalLMModel.
@@ -509,7 +513,37 @@ def _adapt_qwen4_exp_text_config(hf_kwargs: dict) -> None:
     }
 
 
+def _adapt_hy_v3_config(hf_kwargs: dict) -> None:
+    """Translate Mobius' explicit routing fields to native Transformers HYV3."""
+    num_experts = hf_kwargs.pop("num_local_experts")
+    expert_width = hf_kwargs["moe_intermediate_size"]
+    shared_width = hf_kwargs.pop("shared_expert_intermediate_size")
+    dense_prefix = hf_kwargs.pop("first_k_dense_replace")
+    num_layers = hf_kwargs["num_hidden_layers"]
+    hf_kwargs["num_experts"] = num_experts
+    hf_kwargs["num_shared_experts"] = shared_width // expert_width
+    hf_kwargs["mlp_layer_types"] = ["dense"] * dense_prefix + ["sparse"] * (
+        num_layers - dense_prefix
+    )
+    hf_kwargs["router_scaling_factor"] = hf_kwargs.pop("routed_scaling_factor")
+    hf_kwargs["rope_parameters"] = {
+        "rope_type": hf_kwargs.pop("rope_type", "default"),
+        "rope_theta": hf_kwargs.pop("rope_theta", 10_000.0),
+    }
+    for field in (
+        "disable_qmoe",
+        "norm_topk_prob",
+        "routing_weight_normalization_epsilon",
+        "routing_weight_normalization_floor",
+        "scoring_func",
+        "topk_method",
+        "use_expert_bias",
+    ):
+        hf_kwargs.pop(field, None)
+
+
 _HF_CONFIG_ADAPTERS = {
+    "hy_v3": _adapt_hy_v3_config,
     "muse_glimmer_text": _adapt_muse_glimmer_text_config,
     "qwen4_exp_text": _adapt_qwen4_exp_text_config,
 }

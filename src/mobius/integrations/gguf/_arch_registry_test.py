@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 98
+_EXPECTED_SUPPORTED_COUNT = 99
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -69,6 +69,7 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "ernie4_5",
         "gptneox",
         "granite",
+        "hy_v3",
         "jais",
         "jais2",
         "minicpm",
@@ -338,6 +339,7 @@ class TestCapabilityClosure:
             "gpt2",
             "codeshell",
             "gptneox",
+            "hy_v3",
             "jais",
             "mpt",
             "openelm",

@@ -268,8 +268,8 @@ class TestPinnedMtpCensus:
             architecture
             for architecture, capability in capabilities.items()
             if capability.support is Support.SUPPORTED
-        } == {"qwen35"}
-        assert census["mobius_supported_sidecars"] == ["qwen35"]
+        } == {"hy_v3", "qwen35"}
+        assert census["mobius_supported_sidecars"] == ["hy_v3", "qwen35"]
         assert census["mobius_runtime_status"] == "DEFERRED"
 
     def test_exact_pinned_metadata_and_tensor_names(self):
