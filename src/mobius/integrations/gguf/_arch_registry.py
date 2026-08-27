@@ -575,8 +575,9 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
     ),
     "hy_v3": (
         "Hunyuan-V3 executes a full-attention NextN head with Q/K norms and optional "
-        "sigmoid routed/shared experts, seeded from target hidden state. Its hyper/routing "
-        "semantics are not Mobius's dense Qwen3.5 sidecar."
+        "sigmoid routed/shared experts, seeded from target hidden state. The current "
+        "official and llama.cpp implementations use ordinary pre-norm residual blocks, "
+        "not hyper-connections."
     ),
     "mimo2": (
         "MiMo2 requires fused-QKV dense MTP blocks, attention sinks, interleaved sliding "
@@ -1755,6 +1756,38 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="hy_v3",
+        model_type="hy_v3",
+        tensor_map_recipe=("llama", "hy_v3_extras"),
+        config_postprocessor="hy_v3",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+        ),
+        tensor_processor="llama",
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact full-attention trunk and independently cached NextN sidecar graphs are "
+            "covered, including per-head Q/K RMSNorm, a contiguous dense prefix, "
+            "selection-biased sigmoid routed SwiGLU experts, and an ungated shared expert. "
+            "Quantization preservation fails closed because CUDA QMoE cannot honor "
+            "selection-only correction bias; use keep_quantized=False. No representative "
+            "artifact is at most 16 GiB, so real-weight runtime and generation remain "
+            "deferred."
+        ),
+    ),
     # ------------------------- Remaining conventional-attention MoE (audited/deferred)
     GGUFArchitectureSpec(
         gguf_arch="arctic",
@@ -2482,6 +2515,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "command-r",
             "ernie4_5",
             "gptneox",
+            "hy_v3",
             "jais",
             "gemma-embedding",
             "jais2",

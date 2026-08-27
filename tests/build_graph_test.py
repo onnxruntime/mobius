@@ -6188,6 +6188,10 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # src/mobius/models/_qwen35_mtp_test.py and the registered dense-qwen35
     # GGUF capability in src/mobius/integrations/gguf/_mtp_test.py.
     "Qwen35MtpModel",
+    # HyV3 MTP head: bespoke IO contract with target hidden states and a
+    # one-layer independent cache. Covered by models/hy_v3_test.py and the
+    # combined/target-only GGUF tests in integrations/gguf/_hy_v3_test.py.
+    "HyV3MtpModel",
     # EAGLE-3 drafter: bespoke IO contract (inputs_embeds, fused_hidden,
     # recycled_hidden and draft-vocab logits). Covered by _eagle3_test.py.
     "Eagle3LlamaForCausalLM",

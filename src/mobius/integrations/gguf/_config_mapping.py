@@ -38,6 +38,7 @@ from mobius._configs import (
     Gemma2Config,
     Gemma4Config,
     GraniteMoeHybridConfig,
+    HyV3Config,
     JambaConfig,
     KimiK3Config,
     KimiLinearConfig,
@@ -1143,6 +1144,12 @@ def gguf_to_config(
 
     # Re-surface after any postprocessor swap so the MTP metadata survives on
     # the final config instance.
+    if gguf_arch == "hy_v3" and mtp_block_indices:
+        probe = f"blk.{mtp_block_indices[0]}.nextn.eh_proj.weight"
+        if probe not in set(model.tensor_names):
+            # llama.cpp permits a target-only split file whose metadata retains
+            # the appended block count while the MTP tensors live elsewhere.
+            mtp_block_indices = []
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices
 
@@ -1844,6 +1851,104 @@ def _maincoder_postprocess(
         rope_type="default",
         rope_interleave=True,
     )
+
+
+def _hy_v3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> HyV3Config:
+    """Restore the exact llama.cpp HYV3 full-attention and MoE contract."""
+    arch = "hy_v3"
+    names = set(model.tensor_names)
+    total_layers = int(metadata[f"{arch}.block_count"])
+    trunk_layers = int(config.num_hidden_layers)
+    if total_layers - trunk_layers not in (0, 1):
+        raise ValueError(
+            "hy_v3 supports a trunk-only file or exactly one appended NextN block"
+        )
+
+    gating = int(metadata.get(f"{arch}.expert_gating_func", 2))
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+
+    block_kinds = [
+        "sparse" if f"blk.{layer}.ffn_gate_inp.weight" in names else "dense"
+        for layer in range(trunk_layers)
+    ]
+    dense_prefix = 0
+    while dense_prefix < trunk_layers and block_kinds[dense_prefix] == "dense":
+        dense_prefix += 1
+    if any(kind != "sparse" for kind in block_kinds[dense_prefix:]):
+        raise ValueError("hy_v3 dense FFN blocks must form one contiguous leading prefix")
+    if dense_prefix == trunk_layers:
+        raise ValueError("hy_v3 requires at least one routed expert block")
+
+    num_experts = int(config.num_local_experts or 0)
+    top_k = int(config.num_experts_per_tok or 0)
+    moe_width = int(config.moe_intermediate_size or 0)
+    if min(num_experts, top_k, moe_width) <= 0 or top_k > num_experts:
+        raise ValueError("hy_v3 requires valid expert count, top-k, and expert FFN width")
+    shared_width = int(config.shared_expert_intermediate_size or moe_width)
+    if shared_width <= 0:
+        raise ValueError("hy_v3 shared expert width must be positive")
+
+    correction_biases = [
+        f"blk.{layer}.exp_probs_b" in names for layer in range(dense_prefix, trunk_layers)
+    ]
+    if any(correction_biases) and not all(correction_biases):
+        raise ValueError(
+            "hy_v3 expert selection bias must be present in every routed trunk layer or absent"
+        )
+
+    has_mtp_tensors = (
+        total_layers > trunk_layers and f"blk.{total_layers - 1}.nextn.eh_proj.weight" in names
+    )
+    serialized_layers = total_layers if has_mtp_tensors else trunk_layers
+    qkv_biases = []
+    for layer in range(serialized_layers):
+        fused = f"blk.{layer}.attn_qkv.bias" in names
+        split_count = sum(
+            f"blk.{layer}.attn_{projection}.bias" in names for projection in ("q", "k", "v")
+        )
+        if split_count not in (0, 3) or (fused and split_count):
+            raise ValueError(f"hy_v3 layer {layer} has a partial or ambiguous Q/K/V bias set")
+        qkv_biases.append(fused or split_count == 3)
+    if any(qkv_biases) and not all(qkv_biases):
+        raise ValueError("hy_v3 Q/K/V bias presence must be uniform across all blocks")
+
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 1.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError("hy_v3 expert_weights_scale must be finite and positive")
+
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="hy_v3",
+        hidden_act="silu",
+        tie_word_embeddings="output.weight" not in names,
+        attn_qkv_bias=all(qkv_biases),
+        attn_o_bias=False,
+        mlp_bias=False,
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        rope_type="default",
+        partial_rotary_factor=1.0,
+        first_k_dense_replace=dense_prefix,
+        n_shared_experts=max(shared_width // moe_width, 1),
+        shared_expert_intermediate_size=shared_width,
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm")),
+        routed_scaling_factor=route_scale,
+        routing_weight_normalization_floor=6.103515625e-5,
+        routing_weight_normalization_epsilon=None,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        use_expert_bias=all(correction_biases),
+        disable_qmoe=True,
+        enable_moe_fp32_combine=True,
+    )
+    return HyV3Config(**fields)
 
 
 def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str) -> None:
@@ -4607,6 +4712,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
     "granite": _granite_postprocess,
     "granitemoe": _granitemoe_postprocess,
+    "hy_v3": _hy_v3_postprocess,
     "phimoe": _phimoe_postprocess,
     "pangu_embedded": _pangu_embedded_postprocess,
     "dense_sliding": _dense_sliding_postprocess,

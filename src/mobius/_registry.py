@@ -30,6 +30,7 @@ from mobius._configs import (
     Gemma3nMultiModalConfig,
     Gemma4AssistantConfig,
     Gemma4Config,
+    HyV3Config,
     Jais2Config,
     KimiK3Config,
     KimiLinearConfig,
@@ -92,6 +93,8 @@ from mobius.models import (
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
+    HyV3CausalLMModel,
+    HyV3MtpModel,
     InternLM2CausalLMModel,
     Jais2CausalLMModel,
     KimiK3CausalLMModel,
@@ -576,6 +579,7 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gptj": ModelRegistration(GPTJCausalLMModel),
     "granite": ModelRegistration(GraniteCausalLMModel),
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
+    "hy_v3": ModelRegistration(HyV3CausalLMModel, config_class=HyV3Config),
     "internlm2": ModelRegistration(InternLM2CausalLMModel),
     "llama4_text": ModelRegistration(Llama4CausalLMModel),
     "lfm2": ModelRegistration(Lfm2CausalLMModel, config_class=Lfm2Config),
@@ -613,6 +617,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     # architecture name and exposes the ``qwen35-mtp`` task.
     "Qwen35MtpModel": ModelRegistration(
         Qwen35MtpModel, task="qwen35-mtp", family="qwen", variant="mtp"
+    ),
+    "HyV3MtpModel": ModelRegistration(
+        HyV3MtpModel, task="hy-v3-mtp", family="hunyuan", variant="mtp"
     ),
     "Eagle3LlamaForCausalLM": ModelRegistration(
         Eagle3DraftModel,

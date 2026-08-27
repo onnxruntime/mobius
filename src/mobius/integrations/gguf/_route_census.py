@@ -108,7 +108,6 @@ _ARCHITECTURE_ABI_BLOCKED = frozenset(
         "granite_swa",
         "graniteswitch",
         "hunyuan_vl",
-        "hy_v3",
         "laguna",
         "llama4",
         "mellum",

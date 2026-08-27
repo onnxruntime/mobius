@@ -95,6 +95,10 @@ _SKIP_REASONS: dict[str, str] = {
     # (--glm-full-attention) dense-MLA fallback has no custom ops and would
     # be exercised by this harness if the tiny config defaulted to it.
     "glm_moe_dsa": "DSA/IndexShare emits pkg.nxrt::IndexShare, unsupported by stock ORT",
+    # The official HYV3 implementation requires remote code and its smallest artifact is
+    # too large for this harness. The selection-biased sigmoid router has an independent
+    # executable synthetic reference in models/hy_v3_test.py.
+    "hy_v3": "Official HYV3 requires remote code; covered by dedicated synthetic parity",
 }
 
 # Per-model atol overrides for L3 synthetic parity.

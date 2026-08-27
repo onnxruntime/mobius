@@ -68,6 +68,15 @@ _DENSE_QWEN35_MTP = MtpArchitectureCapability(
         "with the standard per-block nextn conditioning tensors."
     ),
 )
+_HY_V3_MTP = MtpArchitectureCapability(
+    support=Support.SUPPORTED,
+    loader_behavior="executed-sidecar",
+    block_kind="dense-or-routed-full-attention",
+    reason=(
+        "The appended block is one ordinary full-attention HYV3 decoder layer with "
+        "per-head Q/K RMSNorm and either dense SwiGLU or sigmoid routed/shared experts."
+    ),
+)
 
 _PINNED_MTP_CAPABILITIES = MappingProxyType(
     {
@@ -111,12 +120,7 @@ _PINNED_MTP_CAPABILITIES = MappingProxyType(
             "routed-dsa-mla",
             "the MTP block carries GLM DSA/MLA and routed-expert semantics",
         ),
-        "hy_v3": MtpArchitectureCapability(
-            Support.REJECTED,
-            "executed-sidecar",
-            "routed-hyperconnection",
-            "the MTP block carries HY-V3 hyper-connections and routed experts",
-        ),
+        "hy_v3": _HY_V3_MTP,
         "mimo2": MtpArchitectureCapability(
             Support.REJECTED,
             "executed-sidecar",
@@ -244,9 +248,40 @@ _MTP_STEM_MAP: dict[str, str] = {
     "ffn_up": "layers.0.mlp.up_proj",
     "ffn_down": "layers.0.mlp.down_proj",
 }
-_SUPPORTED_MTP_BLOCK_TENSORS: frozenset[str] = frozenset(
-    f"{stem}.weight" for stem in _MTP_STEM_MAP
-)
+_HY_V3_MTP_STEM_MAP: dict[str, str] = {
+    "nextn.enorm": "pre_fc_norm_embedding",
+    "nextn.hnorm": "pre_fc_norm_hidden",
+    "nextn.eh_proj": "fc",
+    "nextn.embed_tokens": "embed_tokens",
+    "nextn.shared_head_norm": "norm",
+    "nextn.shared_head_head": "lm_head",
+    "attn_norm": "layers.0.input_layernorm",
+    "attn_qkv": "layers.0.self_attn.qkv_proj",
+    "attn_q": "layers.0.self_attn.q_proj",
+    "attn_k": "layers.0.self_attn.k_proj",
+    "attn_v": "layers.0.self_attn.v_proj",
+    "attn_output": "layers.0.self_attn.o_proj",
+    "attn_q_norm": "layers.0.self_attn.q_norm",
+    "attn_k_norm": "layers.0.self_attn.k_norm",
+    "ffn_norm": "layers.0.post_attention_layernorm",
+    "ffn_gate": "layers.0.mlp.gate_proj",
+    "ffn_up": "layers.0.mlp.up_proj",
+    "ffn_down": "layers.0.mlp.down_proj",
+    "ffn_gate_inp": "layers.0.mlp.gate",
+    "exp_probs_b": "layers.0.mlp.e_score_correction_bias",
+    "ffn_gate_exps": "layers.0.mlp.experts.gate_proj",
+    "ffn_up_exps": "layers.0.mlp.experts.up_proj",
+    "ffn_down_exps": "layers.0.mlp.experts.down_proj",
+    "ffn_gate_up_exps": "layers.0.mlp.experts.gate_up_proj",
+    "ffn_gate_shexp": "layers.0.mlp.shared_experts.gate_proj",
+    "ffn_up_shexp": "layers.0.mlp.shared_experts.up_proj",
+    "ffn_down_shexp": "layers.0.mlp.shared_experts.down_proj",
+}
+
+
+def _mtp_stem_map(architecture: str) -> dict[str, str]:
+    return _HY_V3_MTP_STEM_MAP if architecture == "hy_v3" else _MTP_STEM_MAP
+
 
 # Head norms that are ``OffsetRMSNorm`` (``1 + weight``) but whose target name
 # does not end in ``norm.weight`` — the generic offset-strip in
@@ -300,7 +335,7 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
                 unknown_mtp_tensors.append(name)
                 continue
             stem = suffix[: -len(".weight")]
-            if stem not in _MTP_STEM_MAP:
+            if stem not in _mtp_stem_map(architecture):
                 unknown_mtp_tensors.append(name)
                 continue
             modern_tensors.setdefault(block_index, set()).add(stem)
@@ -346,15 +381,20 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
             f"pinned loader behavior={capability.loader_behavior}, "
             f"block kind={capability.block_kind}"
         )
-    if not (modern_tensors or legacy_tensors):
-        raise ValueError(
-            f"{architecture} GGUF declares {exact_key}={count} but contains no MTP tensors"
-        )
     if count != 1:
         raise ValueError(
             f"{architecture} GGUF declares {exact_key}={count}, but only exactly one "
             "appended MTP block can be represented; refusing to silently truncate "
             "the remaining heads"
+        )
+    if architecture == "hy_v3" and not modern_tensors:
+        from mobius.integrations.gguf._hy_v3 import validate_hy_v3_tensor_contract
+
+        validate_hy_v3_tensor_contract(gguf_model)
+        return
+    if not (modern_tensors or legacy_tensors):
+        raise ValueError(
+            f"{architecture} GGUF declares {exact_key}={count} but contains no MTP tensors"
         )
     if legacy_tensors:
         raise ValueError(
@@ -378,11 +418,15 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
             f"{expected_block}, got blocks {sorted(modern_tensors)}"
         )
     block_prefix = f"blk.{expected_block}."
+    supported_block_tensors = frozenset(
+        f"{stem}{'' if stem == 'exp_probs_b' else '.weight'}"
+        for stem in _mtp_stem_map(architecture)
+    )
     unexpected_block_tensors = sorted(
         name
         for name in tensor_names
         if name.startswith(block_prefix)
-        and name.removeprefix(block_prefix) not in _SUPPORTED_MTP_BLOCK_TENSORS
+        and name.removeprefix(block_prefix) not in supported_block_tensors
     )
     if unexpected_block_tensors:
         raise ValueError(
@@ -397,6 +441,11 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
             f"{architecture} GGUF MTP block {expected_block} is missing required tensor "
             f"stem(s): {missing}"
         )
+    if architecture == "hy_v3":
+        from mobius.integrations.gguf._hy_v3 import validate_hy_v3_tensor_contract
+
+        validate_hy_v3_tensor_contract(gguf_model)
+        return
 
     hidden = int(metadata[f"{architecture}.embedding_length"])
     vocab = int(metadata.get(f"{architecture}.vocab_size", 0))
@@ -459,7 +508,11 @@ def validate_mtp_tensor_contract(gguf_model) -> None:
         )
 
 
-def map_gguf_mtp_to_hf_names(gguf_name: str, mtp_block_index: int) -> str | None:
+def map_gguf_mtp_to_hf_names(
+    gguf_name: str,
+    mtp_block_index: int,
+    architecture: str = "qwen35",
+) -> str | None:
     """Map a GGUF MTP-block tensor name to its head-module parameter name.
 
     Returns ``None`` for every tensor that is not part of the MTP block at
@@ -481,9 +534,11 @@ def map_gguf_mtp_to_hf_names(gguf_name: str, mtp_block_index: int) -> str | None
             break
     else:
         stem, tail = stem_with_suffix, ""
-    target = _MTP_STEM_MAP.get(stem)
+    target = _mtp_stem_map(architecture).get(stem)
     if target is None:
         return None
+    if architecture == "hy_v3" and stem == "exp_probs_b":
+        return target
     return target + tail
 
 
@@ -506,26 +561,32 @@ def derive_mtp_config(
     full-attention layers.  Only the head-specific overrides — a single
     ``full_attention`` layer — are forced.
     """
-    from mobius._configs import Qwen35MtpConfig
+    from mobius._configs import HyV3MtpConfig, Qwen35MtpConfig
 
-    accepted = {f.name for f in dataclasses.fields(Qwen35MtpConfig)}
+    config_class = (
+        HyV3MtpConfig if getattr(config, "model_type", None) == "hy_v3" else Qwen35MtpConfig
+    )
+    accepted = {f.name for f in dataclasses.fields(config_class)}
     fields = {
         f.name: getattr(config, f.name)
         for f in dataclasses.fields(config)
         if f.name in accepted
     }
     fields["num_hidden_layers"] = 1
-    fields["layer_types"] = ["full_attention"]
+    if config_class is Qwen35MtpConfig:
+        fields["layer_types"] = ["full_attention"]
     fields["output_layer_indices"] = None
     fields["output_final_hidden_state"] = False
     fields["use_dedicated_embeddings"] = use_dedicated_embeddings
     fields["use_dedicated_lm_head"] = use_dedicated_lm_head
-    mtp_config = Qwen35MtpConfig(**fields)
+    mtp_config = config_class(**fields)
     # Preserve the model_type so tensor processors / quantization dispatch the
     # same way as the backbone.
     mtp_config.model_type = getattr(config, "model_type", None)
-    mtp_config._gguf_model_type = getattr(config, "_gguf_model_type", None)
-    mtp_config._gguf_arch = getattr(config, "_gguf_arch", None)
+    setattr(  # noqa: B010
+        mtp_config, "_gguf_model_type", getattr(config, "_gguf_model_type", None)
+    )
+    setattr(mtp_config, "_gguf_arch", getattr(config, "_gguf_arch", None))  # noqa: B010
     return mtp_config
 
 
@@ -573,8 +634,9 @@ def build_mtp_head_from_gguf(
         _replace_native_block_linears,
     )
     from mobius.integrations.gguf._tensor_processors import process_tensors
+    from mobius.models import HyV3MtpModel
     from mobius.models.qwen35_mtp import Qwen35MtpModel
-    from mobius.tasks import Qwen35MtpTask
+    from mobius.tasks import HyV3MtpTask, Qwen35MtpTask
 
     mtp_blocks = getattr(config, "_gguf_mtp_block_indices", None)
     if not mtp_blocks:
@@ -593,18 +655,24 @@ def build_mtp_head_from_gguf(
     use_dedicated_embeddings = f"{mtp_prefix}embed_tokens.weight" in tensor_names
     use_dedicated_norm = f"{mtp_prefix}shared_head_norm.weight" in tensor_names
     use_dedicated_lm_head = f"{mtp_prefix}shared_head_head.weight" in tensor_names
+    is_hy_v3 = gguf_arch == "hy_v3"
 
     mtp_config = derive_mtp_config(
         config,
         use_dedicated_embeddings=use_dedicated_embeddings,
         use_dedicated_lm_head=use_dedicated_lm_head,
     )
-    module = Qwen35MtpModel(mtp_config)
+    if is_hy_v3:
+        mtp_config.first_k_dense_replace = (
+            0 if f"blk.{mtp_block_index}.ffn_gate_inp.weight" in tensor_names else 1
+        )
+        mtp_config.use_expert_bias = f"blk.{mtp_block_index}.exp_probs_b" in tensor_names
+    module = HyV3MtpModel(mtp_config) if is_hy_v3 else Qwen35MtpModel(mtp_config)
 
     def _mapper(gguf_name: str, _arch: str) -> str | None:
         if not use_dedicated_norm and gguf_name == "output_norm.weight":
             return "norm.weight"
-        return map_gguf_mtp_to_hf_names(gguf_name, mtp_block_index)
+        return map_gguf_mtp_to_hf_names(gguf_name, mtp_block_index, gguf_arch)
 
     if preserve_quantization:
         _replace_native_block_linears(
@@ -631,7 +699,10 @@ def build_mtp_head_from_gguf(
     if on_preflight is not None:
         on_preflight(quantization_report)
     pkg = build_from_module(
-        module, mtp_config, Qwen35MtpTask(), execution_provider=execution_provider
+        module,
+        mtp_config,
+        HyV3MtpTask() if is_hy_v3 else Qwen35MtpTask(),
+        execution_provider=execution_provider,
     )
     pkg.gguf_quantization_report = quantization_report
 
@@ -673,18 +744,16 @@ def build_mtp_head_from_gguf(
     state_dict = _normalize_gguf_weights(state_dict, gguf_arch, mtp_config)
     state_dict = _strip_mtp_offset_norms(state_dict, gguf_arch)
 
-    if hasattr(module, "preprocess_weights"):
-        # NOTE: intentionally NOT calling ``module.preprocess_weights`` here.
-        # ``Qwen35MtpModel.preprocess_weights`` strips a ``mtp.`` prefix and
-        # drops everything else; our mapper already emits the final
-        # head-internal names (``fc.weight``, ``layers.0.*``), so running it
-        # would drop the whole state dict.
-        pass
+    # Qwen35's preprocessor strips a source ``mtp.`` prefix that this mapper
+    # already removed. HYV3's preprocessor only expands expert banks and is safe.
+    if is_hy_v3:
+        state_dict = module.preprocess_weights(state_dict)
 
     prefix_map = getattr(module, "weight_prefix_map", None)
     pkg.apply_weights(state_dict, prefix_map=prefix_map)
     logger.info(
-        "Built Qwen3.5/3.8 MTP head sidecar from GGUF block %d (%d tensors).",
+        "Built %s MTP head sidecar from GGUF block %d (%d tensors).",
+        gguf_arch,
         mtp_block_index,
         len(state_dict),
     )
