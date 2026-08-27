@@ -235,6 +235,27 @@ def test_hy_v3_exact_contract_rejects_quantized_router() -> None:
         validate_hy_v3_tensor_contract(model)
 
 
+@pytest.mark.parametrize("qtype_name", ["I8", "I16", "Q8_1", "Q8_K"])
+def test_hy_v3_exact_contract_rejects_non_weight_storage(qtype_name: str) -> None:
+    from gguf import GGMLQuantizationType
+
+    model = _fake()
+    model.tensors["blk.1.attn_q.weight"] = (
+        getattr(GGMLQuantizationType, qtype_name),
+        (_HEADS * _HEAD_DIM, _H),
+    )
+    with pytest.raises(ValueError, match="must use float, F64, or quantized weight storage"):
+        validate_hy_v3_tensor_contract(model)
+
+
+def test_hy_v3_exact_contract_accepts_f64_weight_storage() -> None:
+    from gguf import GGMLQuantizationType
+
+    model = _fake()
+    model.tensors["blk.1.attn_norm.weight"] = (GGMLQuantizationType.F64, (_H,))
+    validate_hy_v3_tensor_contract(model)
+
+
 def test_hy_v3_exact_contract_rejects_noncontiguous_dense_schedule() -> None:
     model = _fake()
     for suffix in (

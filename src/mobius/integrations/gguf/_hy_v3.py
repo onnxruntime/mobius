@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from mobius.integrations.gguf._quant_registry import get_quant_spec
+from mobius.integrations.gguf._spec import StorageRole
 from mobius.integrations.gguf._tensor_mapping import is_known_skip
 
 _BLOCK_RE = re.compile(r"^blk\.(\d+)\.")
@@ -274,6 +275,17 @@ def validate_hy_v3_tensor_contract(gguf_model) -> None:
             raise ValueError(f"hy_v3 tensor {name} has an unclassified GGUF storage type")
         quant_specs[name] = spec
 
+    invalid_weight_storage = sorted(
+        name
+        for name, spec in quant_specs.items()
+        if spec.role not in {StorageRole.FLOAT, StorageRole.QUANTIZED} and spec.name != "F64"
+    )
+    if invalid_weight_storage:
+        raise ValueError(
+            "hy_v3 model tensors must use float, F64, or quantized weight storage, "
+            f"got non-weight storage for {invalid_weight_storage}"
+        )
+
     allowed = set(required) | set(optional)
     missing = sorted(set(required) - set(actual))
     unexpected = sorted(set(actual) - allowed)
@@ -308,7 +320,9 @@ def validate_hy_v3_tensor_contract(gguf_model) -> None:
         )
     }
     quantized_auxiliary = sorted(
-        name for name in explicit_float if quant_specs[name].is_quantized_storage
+        name
+        for name in explicit_float
+        if quant_specs[name].role is not StorageRole.FLOAT and quant_specs[name].name != "F64"
     )
     if quantized_auxiliary:
         raise ValueError(
