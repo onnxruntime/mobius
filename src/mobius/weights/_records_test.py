@@ -15,7 +15,7 @@ from mobius.weights import FloatWeight, WeightBundle, WeightRecord
 def _component() -> ComponentDescriptor:
     return ComponentDescriptor(
         name="decoder",
-        module_path="decoder",
+        module_attribute_path="decoder",
         role="decoder",
         source_paths=("model.layers",),
     )
