@@ -1887,6 +1887,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         False,
     ),
+    (
+        "gguf_plamo",
+        {
+            "hidden_act": "silu",
+            "num_attention_heads": TINY_HEADS,
+            "num_key_value_heads": TINY_KV_HEADS,
+        },
+        True,
+    ),
     # phi3small: different partial_rotary_factor
     (
         "phi3small",
