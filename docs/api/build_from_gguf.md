@@ -40,13 +40,8 @@ initializers with dense float storage or promise a particular ORT kernel. Pass
 `mmproj=` only for an evidenced multimodal sidecar. The CLI equivalent is
 `mobius build model.gguf -o output`.
 
-Split GGUF models are accepted by pointing at any local
-`model-00001-of-000NN.gguf` shard. Mobius discovers the exact sibling set in the same
-directory, validates all split metadata and tensor ownership, and reads tensors lazily from
-their owning shard without concatenating payloads. Hub references such as
-`owner/repo@revision:path/model-00002-of-00003.gguf` resolve the complete set at one immutable
-commit, preflight its total download size against free cache space, and never build from a
-partial download.
+Local split shards validate same-directory siblings and read owned tensors lazily. Hub shard
+references resolve the complete set at one immutable commit and reject partial downloads.
 
 ## API
 
@@ -104,6 +99,7 @@ remain machine-readable in `_route_census.py`; this table groups only shared nex
 | `evidence-only` | `projector-runtime-evidence` | `projector:gemma3`, `projector:gemma4v`, `projector:muse-glimmer`, `projector:qwen2.5vl_merger`, `projector:qwen2vl_merger` | paired text target; processor boundary; deterministic multimodal package execution |
 | `evidence-only` | `tokenizer-artifact-evidence` | `tokenizer:bailingmoe`, `tokenizer:bailingmoe2`, `tokenizer:chatglm-bpe`, `tokenizer:cohere2moe`, `tokenizer:glm4`, `tokenizer:granite-embed-multi-311m`, `tokenizer:llada-moe`, `tokenizer:tiny_aya` | immutable GGUF/source pair; ordered vocabulary and encoding parity |
 | `evidence-only` | `tokenizer-artifact-evidence` | `tokenizer:gemma4` | immutable GGUF/source pair; ordered vocabulary and encoding parity; PR #651 |
+| `immediately-implementable` | `architecture-implementation` | `architecture:qwen4exp` | dedicated graph topology; cache/state contract; synthetic parity |
 | `immediately-implementable` | `architecture-implementation` | `architecture:arctic`, `architecture:dbrx`, `architecture:ernie4_5-moe`, `architecture:granite`, `architecture:grok`, `architecture:grovemoe`, `architecture:hunyuan-moe`, `architecture:jina-bert-v3`, `architecture:maincoder`, `architecture:minimax-m2`, `architecture:mistral4`, `architecture:nomic-bert-moe`, `architecture:plamo`, `architecture:smallthinker` | exact metadata extraction; tensor closure; dedicated graph and parity |
 | `immediately-implementable` | `architecture-implementation` | `architecture:glm-dsa` | suffix-exact tensor mapping; packed-value transform proof; graph closure |
 | `immediately-implementable` | `projector-implementation` | `projector:adapter`, `projector:cogvlm`, `projector:deepseekocr`, `projector:deepseekocr2`, `projector:dots3note_a`, `projector:dots3note_v`, `projector:dots_ocr`, `projector:exaone4_5`, `projector:gemma3na`, `projector:gemma3nv`, `projector:gemma4a`, `projector:gemma4ua`, `projector:gemma4uv`, `projector:glm4v`, `projector:glma`, `projector:granite4_vision`, `projector:granite_speech`, `projector:hunyuanvl`, `projector:idefics3`, `projector:internvl`, `projector:janus_pro`, `projector:kimik25`, `projector:kimivl`, `projector:ldp`, `projector:ldpv2`, `projector:lfm2`, `projector:lfm2a`, `projector:lightonocr`, `projector:llama4`, `projector:meralion`, `projector:mimo_audio`, `projector:mimovl`, `projector:minicpmv4_6`, `projector:minimax_m3`, `projector:mlp`, `projector:musicflamingo`, `projector:nemotron_v2_vl`, `projector:paddleocr`, `projector:parakeet`, `projector:pixtral`, `projector:pockettts_spkenc`, `projector:qwen2.5o`, `projector:qwen2a`, `projector:qwen3a`, `projector:qwen3tts_spkenc`, `projector:qwen3vl_merger`, `projector:resampler`, `projector:step3vl`, `projector:ultravox`, `projector:voxtral`, `projector:yasa2`, `projector:youtuvl` | metadata schema; tensor closure; component graph parity |

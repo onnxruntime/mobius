@@ -500,13 +500,8 @@ initializers with dense float storage or promise a particular ORT kernel. Pass
 `mmproj=` only for an evidenced multimodal sidecar. The CLI equivalent is
 `mobius build model.gguf -o output`.
 
-Split GGUF models are accepted by pointing at any local
-`model-00001-of-000NN.gguf` shard. Mobius discovers the exact sibling set in the same
-directory, validates all split metadata and tensor ownership, and reads tensors lazily from
-their owning shard without concatenating payloads. Hub references such as
-`owner/repo@revision:path/model-00002-of-00003.gguf` resolve the complete set at one immutable
-commit, preflight its total download size against free cache space, and never build from a
-partial download.
+Local split shards validate same-directory siblings and read owned tensors lazily. Hub shard
+references resolve the complete set at one immutable commit and reject partial downloads.
 
 ## API
 
