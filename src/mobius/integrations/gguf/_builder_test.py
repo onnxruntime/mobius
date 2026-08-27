@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -45,6 +46,18 @@ def _gguf_header_prefix(*architectures: str) -> bytes:
             *entries,
         ]
     )
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
 
 
 def _run_gather_block_quantized(
@@ -2467,7 +2480,6 @@ class TestReuseGgufWeights:
     def test_mixed_save_preserves_ranges_and_runs(self, tmp_path: Path):
         from mobius._model_package import ModelPackage
         from mobius.integrations.gguf import (
-            _reuse,
             build_from_gguf,
             verify_gguf_reuse_manifest,
         )
@@ -2475,7 +2487,14 @@ class TestReuseGgufWeights:
         gguf_path = tmp_path / "model.gguf"
         _write_quantized_gguf(gguf_path, projection_quantization="f32")
         package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
-        with mock.patch.object(_reuse, "_sha256", wraps=_reuse._sha256) as sha256:
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        with mock.patch.object(
+            GGUFModel,
+            "source_sha256",
+            autospec=True,
+            side_effect=GGUFModel.source_sha256,
+        ) as sha256:
             package.save(str(tmp_path), progress_bar=False)
         assert sha256.call_count == 1
 
@@ -2551,9 +2570,13 @@ class TestReuseGgufWeights:
         def mutate_source_before_verification(path, payload):
             nonlocal mutated
             if path.name.startswith(".gguf-reuse.json.") and path.name.endswith(".tmp"):
-                source = bytearray(gguf_path.read_bytes())
-                source[-1] ^= 1
-                gguf_path.write_bytes(source)
+                with gguf_path.open("r+b") as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    value = stream.read(1)
+                    stream.seek(-1, os.SEEK_END)
+                    stream.write(bytes([value[0] ^ 0xFF]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 mutated = True
             return real_write_json(path, payload)
 
@@ -2561,6 +2584,211 @@ class TestReuseGgufWeights:
         with pytest.raises(ValueError, match="source identity mismatch"):
             package.save(str(tmp_path), progress_bar=False)
 
+        assert mutated
+        assert not (tmp_path / "model.onnx").exists()
+        assert not (tmp_path / "gguf-reuse.json").exists()
+
+    def test_reuse_plan_hashes_the_model_source_used_for_tensor_parsing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        source_sha256 = GGUFModel.source_sha256
+        mutated = False
+
+        def mutate_before_plan_hash(model, **kwargs):
+            nonlocal mutated
+            if not mutated and Path(model._path) == gguf_path:
+                with gguf_path.open("r+b") as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    value = stream.read(1)
+                    stream.seek(-1, os.SEEK_END)
+                    stream.write(bytes([value[0] ^ 0xFF]))
+                mutated = True
+            return source_sha256(model, **kwargs)
+
+        monkeypatch.setattr(GGUFModel, "source_sha256", mutate_before_plan_hash)
+
+        with pytest.raises(ValueError, match="source changed after its reader was opened"):
+            build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        assert mutated
+
+    def test_reuse_plan_with_relative_source_survives_cwd_change(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import build_from_gguf, verify_gguf_reuse_manifest
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        monkeypatch.chdir(tmp_path)
+        package = build_from_gguf(Path("model.gguf"), reuse_gguf_weights=True)
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.chdir(other)
+
+        package.save(str(tmp_path), progress_bar=False)
+        verify_gguf_reuse_manifest(tmp_path)
+
+    def test_reuse_verifier_detects_mutation_between_hash_and_tensor_validation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import build_from_gguf, verify_gguf_reuse_manifest
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        source_sha256 = GGUFModel.source_sha256
+        mutated = False
+
+        def mutate_after_verifier_hash(model, **kwargs):
+            nonlocal mutated
+            digest = source_sha256(model, **kwargs)
+            if not mutated and Path(model._path) == gguf_path:
+                with gguf_path.open("r+b") as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    value = stream.read(1)
+                    stream.seek(-1, os.SEEK_END)
+                    stream.write(bytes([value[0] ^ 0xFF]))
+                mutated = True
+            return digest
+
+        monkeypatch.setattr(GGUFModel, "source_sha256", mutate_after_verifier_hash)
+
+        with pytest.raises(ValueError, match="reuse manifest was verified"):
+            verify_gguf_reuse_manifest(tmp_path)
+        assert mutated
+
+    def test_reuse_verifier_rejects_source_replaced_by_symlink_before_open(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import build_from_gguf, verify_gguf_reuse_manifest
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        moved_source = tmp_path / "moved-source.gguf"
+        original_init = GGUFModel.__init__
+        raced = False
+
+        def replace_before_verifier_open(model, path, **kwargs):
+            nonlocal raced
+            if not raced and Path(path) == gguf_path:
+                gguf_path.replace(moved_source)
+                _symlink_or_skip(gguf_path, moved_source)
+                raced = True
+            return original_init(model, path, **kwargs)
+
+        monkeypatch.setattr(GGUFModel, "__init__", replace_before_verifier_open)
+
+        with pytest.raises(ValueError, match="source is missing or unsafe"):
+            verify_gguf_reuse_manifest(tmp_path)
+        assert raced
+
+    def test_reuse_verifier_rechecks_symlink_after_final_handle_comparison(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import build_from_gguf, verify_gguf_reuse_manifest
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        source_matches_path = GGUFModel.source_matches_path
+        path_is_symlink = Path.is_symlink
+        raced = False
+        symlink_recheck_observed = False
+
+        def replace_after_handle_comparison(model, path=None):
+            nonlocal raced
+            matches = source_matches_path(model, path)
+            if not raced and Path(model._path) == gguf_path:
+                assert matches
+                raced = True
+            return matches
+
+        def report_post_comparison_symlink(path):
+            nonlocal symlink_recheck_observed
+            if path == gguf_path and raced:
+                symlink_recheck_observed = True
+                return True
+            return path_is_symlink(path)
+
+        monkeypatch.setattr(GGUFModel, "source_matches_path", replace_after_handle_comparison)
+        monkeypatch.setattr(Path, "is_symlink", report_post_comparison_symlink)
+
+        with pytest.raises(ValueError, match="reuse manifest was verified"):
+            verify_gguf_reuse_manifest(tmp_path)
+        assert raced
+        assert symlink_recheck_observed
+
+    def test_reuse_verifier_rechecks_source_after_onnx_validation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import _reuse, build_from_gguf
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
+            str(tmp_path), progress_bar=False
+        )
+        load_model = _reuse.ir.load
+        mutated = False
+
+        def mutate_after_onnx_load(path):
+            nonlocal mutated
+            model = load_model(path)
+            if not mutated:
+                with gguf_path.open("r+b") as stream:
+                    stream.seek(-1, os.SEEK_END)
+                    value = stream.read(1)
+                    stream.seek(-1, os.SEEK_END)
+                    stream.write(bytes([value[0] ^ 0xFF]))
+                mutated = True
+            return model
+
+        monkeypatch.setattr(_reuse.ir, "load", mutate_after_onnx_load)
+
+        with pytest.raises(ValueError, match="reuse manifest was verified"):
+            _reuse.verify_gguf_reuse_manifest(tmp_path)
+        assert mutated
+
+    def test_reuse_save_rechecks_source_immediately_before_publication(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from mobius.integrations.gguf import _reuse, build_from_gguf
+
+        gguf_path = tmp_path / "model.gguf"
+        _write_quantized_gguf(gguf_path, projection_quantization="f32")
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        verify_manifest = _reuse.verify_gguf_reuse_manifest
+        mutated = False
+
+        def mutate_after_verification(*args, **kwargs):
+            nonlocal mutated
+            result = verify_manifest(*args, **kwargs)
+            with gguf_path.open("r+b") as stream:
+                stream.seek(-1, os.SEEK_END)
+                value = stream.read(1)
+                stream.seek(-1, os.SEEK_END)
+                stream.write(bytes([value[0] ^ 0xFF]))
+            mutated = True
+            return result
+
+        monkeypatch.setattr(_reuse, "verify_gguf_reuse_manifest", mutate_after_verification)
+
+        with pytest.raises(ValueError, match="package was being prepared"):
+            package.save(str(tmp_path), progress_bar=False)
         assert mutated
         assert not (tmp_path / "model.onnx").exists()
         assert not (tmp_path / "gguf-reuse.json").exists()
@@ -4239,6 +4467,50 @@ class TestBuildQuantizedGguf:
             f"INT{expected_bits} affine block-128"
         }
         assert any(node.op_type == "MatMulNBits" for node in package["model"].graph)
+
+    def test_tencent_q1_0_reads_pinned_bytes_during_symlink_aba(self, tmp_path: Path):
+        from mobius.integrations.gguf._reader import GGUFModel
+        from mobius.integrations.gguf._tencent_q1_0 import parse_tencent_q1_0_tensor
+
+        source_a = tmp_path / "source-a.gguf"
+        source_b = tmp_path / "source-b.gguf"
+        _write_tencent_q1_0_gguf(source_a)
+        _write_tencent_q1_0_gguf(source_b)
+        inspect_b = GGUFModel(source_b)
+        _read_b, data_offset_b, tensor_b = inspect_b._tensor_source("blk.0.attn_q.weight")
+        tensor_offset_b = int(tensor_b.field.parts[tensor_b.field.data[-1]][0])
+        inspect_b.close()
+        with source_b.open("r+b") as stream:
+            stream.seek(data_offset_b + tensor_offset_b + 2)
+            value = stream.read(1)
+            stream.seek(data_offset_b + tensor_offset_b + 2)
+            stream.write(bytes([value[0] ^ 0xFF]))
+
+        logical = tmp_path / "logical.gguf"
+        _symlink_or_skip(logical, source_a)
+        model_a = GGUFModel(logical)
+        read_a, data_offset_a, tensor_a = model_a._tensor_source("blk.0.attn_q.weight")
+        expected = parse_tencent_q1_0_tensor(read_a, data_offset_a, tensor_a)
+
+        logical.unlink()
+        _symlink_or_skip(logical, source_b)
+        injected = parse_tencent_q1_0_tensor(read_a, data_offset_a, tensor_a)
+        logical.unlink()
+        _symlink_or_skip(logical, source_a)
+
+        model_b = GGUFModel(source_b)
+        read_b, replacement_offset, replacement_tensor = model_b._tensor_source(
+            "blk.0.attn_q.weight"
+        )
+        replacement = parse_tencent_q1_0_tensor(
+            read_b,
+            replacement_offset,
+            replacement_tensor,
+        )
+
+        np.testing.assert_array_equal(injected.weight, expected.weight)
+        assert not np.array_equal(injected.weight, replacement.weight)
+        assert model_a.source_matches_path()
 
     def test_preflight_records_mapped_bias_and_scale_parameters(self) -> None:
         from gguf import GGMLQuantizationType

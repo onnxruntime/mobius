@@ -12,7 +12,9 @@ touching the network.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import re
 from pathlib import Path
 
@@ -28,6 +30,18 @@ from mobius.integrations.gguf._preflight import (
     preflight_gguf,
     preflight_local_gguf,
 )
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
 
 
 def _write_sharded_gguf(
@@ -67,6 +81,25 @@ def _write_sharded_gguf(
     writer.write_tensors_to_file()
     writer.close()
     return sorted(directory.glob(f"{stem}-*.gguf"))
+
+
+def _write_single_gguf(path: Path, *, seed: int = 0) -> Path:
+    from gguf import GGUFWriter
+
+    writer = GGUFWriter(str(path), "llama")
+    writer.add_context_length(128)
+    writer.add_embedding_length(16)
+    writer.add_block_count(1)
+    writer.add_head_count(4)
+    writer.add_head_count_kv(2)
+    writer.add_vocab_size(32)
+    tensor = np.random.default_rng(seed).standard_normal((8, 16)).astype(np.float32)
+    writer.add_tensor("token_embd.weight", tensor)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return path
 
 
 def _raw_quant_rows(qtype, n_rows: int, k: int) -> np.ndarray:
@@ -252,26 +285,35 @@ def test_local_preflight_checksums_optional(tmp_path):
 
 
 def test_local_preflight_single_file(tmp_path):
-    from gguf import GGUFWriter
-
-    path = tmp_path / "plain.gguf"
-    writer = GGUFWriter(str(path), "llama")
-    writer.add_context_length(128)
-    writer.add_embedding_length(16)
-    writer.add_block_count(1)
-    writer.add_head_count(4)
-    writer.add_head_count_kv(2)
-    writer.add_vocab_size(32)
-    writer.add_tensor("token_embd.weight", np.zeros((8, 16), np.float32))
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+    path = _write_single_gguf(tmp_path / "plain.gguf")
 
     report = preflight_local_gguf(path)
     assert not report.is_sharded
     assert report.total_files == 1
     assert report.split_count == 1
+
+
+def test_local_preflight_checksum_rejects_path_replacement(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    source = _write_single_gguf(tmp_path / "source.gguf")
+    replacement = _write_single_gguf(tmp_path / "replacement.gguf", seed=1)
+    path = tmp_path / "logical.gguf"
+    _symlink_or_skip(path, source)
+    source_sha256 = GGUFModel.source_sha256
+
+    def replace_path_before_hash(model, **kwargs):
+        digest = source_sha256(model, **kwargs)
+        path.unlink()
+        _symlink_or_skip(path, replacement)
+        return digest
+
+    monkeypatch.setattr(GGUFModel, "source_sha256", replace_path_before_hash)
+
+    with pytest.raises(ValueError, match="preflight report was being built"):
+        preflight_local_gguf(path, verify_checksums=True)
 
 
 def test_report_json_roundtrip_is_resumable(tmp_path):

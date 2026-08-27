@@ -7,7 +7,6 @@ from __future__ import annotations
 
 __all__ = ["GGUFReuseCandidate", "GGUFReusePlan", "verify_gguf_reuse_manifest"]
 
-import hashlib
 import json
 import os
 import re
@@ -15,7 +14,7 @@ import stat
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, TypedDict
 
@@ -24,6 +23,7 @@ import onnx_ir as ir
 
 if TYPE_CHECKING:
     from mobius._model_package import ModelPackage
+    from mobius.integrations.gguf._reader import GGUFModel
 
 if os.name == "nt":
     import msvcrt
@@ -92,20 +92,14 @@ class GGUFReusePlan:
     size: int
     sha256: str
     tensors: tuple[GGUFReuseTensor, ...]
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    source_model: GGUFModel = field(compare=False, repr=False)
 
 
 def attach_reused_initializers(
     package: ModelPackage,
     source_path: str | Path,
     candidates: dict[str, GGUFReuseCandidate],
+    source_model: GGUFModel,
 ) -> None:
     """Replace eligible in-memory initializers with GGUF ExternalTensors."""
     if len(package) != 1:
@@ -166,11 +160,19 @@ def attach_reused_initializers(
             "weights use the ONNX sidecar."
         )
 
+    source_size = source_model.source_size
+    source_sha256 = source_model.source_sha256()
+    if not source_model.source_matches_path(source):
+        raise ValueError(
+            "The GGUF source changed while its reuse plan was being created. "
+            "Retry the build with an unchanged source file."
+        )
     package.gguf_reuse_plan = GGUFReusePlan(
         source_path=source,
-        size=source.stat().st_size,
-        sha256=_sha256(source),
+        size=source_size,
+        sha256=source_sha256,
         tensors=tuple(sorted(reused, key=lambda tensor: tensor.initializer)),
+        source_model=source_model,
     )
 
 
@@ -338,21 +340,10 @@ def _insert_external_transform(
     graph.insert_before(earliest_consumer, nodes)
 
 
-def _source_identity(path: Path) -> tuple[int, int, int, int, int]:
-    source_stat = path.stat()
-    return (
-        source_stat.st_dev,
-        source_stat.st_ino,
-        source_stat.st_size,
-        source_stat.st_mtime_ns,
-        source_stat.st_ctime_ns,
-    )
-
-
 def _validate_source(
     plan: GGUFReusePlan,
     output_directory: Path,
-) -> tuple[int, int, int, int, int]:
+) -> None:
     source = plan.source_path
     if source.is_symlink():
         raise ValueError("The GGUF source became a symlink; refusing an unsafe external path.")
@@ -374,21 +365,21 @@ def _validate_source(
                 f"The GGUF source is hard-linked to generated artifact "
                 f"{generated_name!r}. Use an independent real file."
             )
-    identity = _source_identity(source)
-    if identity[2] != plan.size:
+    if plan.source_model.source_size != plan.size:
         raise ValueError(
             "The GGUF source no longer matches the file used to build this package "
             "(size changed). Rebuild from the intended GGUF."
         )
-    return identity
+    if not plan.source_model.source_matches_path(source):
+        raise ValueError(
+            "The GGUF source changed while this package was being prepared. "
+            "Retry the save with an unchanged source file."
+        )
 
 
-def _require_source_identity(
-    plan: GGUFReusePlan,
-    expected: tuple[int, int, int, int, int],
-) -> None:
+def _require_source_identity(plan: GGUFReusePlan) -> None:
     source = plan.source_path
-    if source.is_symlink() or _source_identity(source) != expected:
+    if source.is_symlink() or not plan.source_model.source_matches_path(source):
         raise ValueError(
             "The GGUF source changed while this package was being prepared. "
             "Retry the save with an unchanged source file."
@@ -828,10 +819,10 @@ def save_reuse_package(
     path = Path(path)
     # Pin cheap file identity before taking the package-wide writer lock. The
     # final verifier hashes the source exactly once immediately before publish.
-    source_identity = _validate_source(plan, path.parent)
+    _validate_source(plan, path.parent)
     with _package_lock(path.parent):
         _recover_transaction_locked(path.parent)
-        _require_source_identity(plan, source_identity)
+        _require_source_identity(plan)
         token = uuid.uuid4().hex
         staged_model = path.with_name(f".{path.name}.{token}.tmp")
         staged_sidecar = path.with_name(f".{_SIDECAR_NAME}.{token}.tmp")
@@ -891,6 +882,7 @@ def save_reuse_package(
             }
             if memory_initializers:
                 replacements[final_sidecar] = staged_sidecar
+            _require_source_identity(plan)
             _replace_artifacts_locked(
                 replacements,
                 (path, final_sidecar, final_manifest),
@@ -966,42 +958,56 @@ def verify_gguf_reuse_manifest(
     source = root / location
     if source.is_symlink() or not source.is_file():
         raise ValueError(f"GGUF manifest source is missing or unsafe: {source}")
-    if (
-        source.stat().st_size != source_info["size"]
-        or _sha256(source) != source_info["sha256"]
-    ):
-        raise ValueError("GGUF source identity mismatch (size or SHA-256).")
-    reused_entries = manifest["reused_tensors"]
-    converted_names = manifest["converted_tensors"]
-    if len({entry["initializer"] for entry in reused_entries}) != len(reused_entries):
-        raise ValueError("GGUF reuse manifest contains duplicate initializer routes.")
-    if len(set(converted_names)) != len(converted_names):
-        raise ValueError("GGUF reuse manifest contains duplicate converted tensors.")
-    reused_names = {entry["initializer"] for entry in reused_entries}
-    if reused_names.intersection(converted_names):
-        raise ValueError("GGUF reused and converted initializer routes must be disjoint.")
+    from mobius.integrations.gguf._reader import GGUFModel, _path_matches_source_identity
 
-    from mobius.integrations.gguf._reader import GGUFModel
-
-    gguf_model = GGUFModel(source)
-    reused_by_name = {entry["initializer"]: entry for entry in reused_entries}
-    for tensor in reused_entries:
-        if tensor["offset"] < 0 or tensor["length"] <= 0:
-            raise ValueError(f"Invalid GGUF range for {tensor['initializer']!r}.")
-        if tensor["offset"] + tensor["length"] > source_info["size"]:
-            raise ValueError(f"GGUF range exceeds the source for {tensor['initializer']!r}.")
-        actual_offset, actual_length, actual_qtype = gguf_model.tensor_storage_range(
-            tensor["source_tensor"]
-        )
-        if (actual_offset, actual_length, actual_qtype) != (
-            tensor["offset"],
-            tensor["length"],
-            tensor["qtype"],
+    try:
+        gguf_model = GGUFModel(source, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"GGUF manifest source is missing or unsafe: {source}") from error
+    try:
+        if source.is_symlink():
+            raise ValueError(f"GGUF manifest source is missing or unsafe: {source}")
+        if (
+            gguf_model.source_size != source_info["size"]
+            or gguf_model.source_sha256() != source_info["sha256"]
         ):
-            raise ValueError(
-                f"Manifest GGUF route does not match source tensor "
-                f"{tensor['source_tensor']!r}."
+            raise ValueError("GGUF source identity mismatch (size or SHA-256).")
+        reused_entries = manifest["reused_tensors"]
+        converted_names = manifest["converted_tensors"]
+        if len({entry["initializer"] for entry in reused_entries}) != len(reused_entries):
+            raise ValueError("GGUF reuse manifest contains duplicate initializer routes.")
+        if len(set(converted_names)) != len(converted_names):
+            raise ValueError("GGUF reuse manifest contains duplicate converted tensors.")
+        reused_names = {entry["initializer"] for entry in reused_entries}
+        if reused_names.intersection(converted_names):
+            raise ValueError("GGUF reused and converted initializer routes must be disjoint.")
+
+        reused_by_name = {entry["initializer"]: entry for entry in reused_entries}
+        for tensor in reused_entries:
+            if tensor["offset"] < 0 or tensor["length"] <= 0:
+                raise ValueError(f"Invalid GGUF range for {tensor['initializer']!r}.")
+            if tensor["offset"] + tensor["length"] > source_info["size"]:
+                raise ValueError(
+                    f"GGUF range exceeds the source for {tensor['initializer']!r}."
+                )
+            actual_offset, actual_length, actual_qtype = gguf_model.tensor_storage_range(
+                tensor["source_tensor"]
             )
+            if (actual_offset, actual_length, actual_qtype) != (
+                tensor["offset"],
+                tensor["length"],
+                tensor["qtype"],
+            ):
+                raise ValueError(
+                    f"Manifest GGUF route does not match source tensor "
+                    f"{tensor['source_tensor']!r}."
+                )
+        source_matches = gguf_model.source_matches_path()
+        if not source_matches or source.is_symlink():
+            raise ValueError("GGUF source changed while its reuse manifest was verified.")
+        source_identity = gguf_model.source_identity
+    finally:
+        gguf_model.close()
 
     model_file = Path(model_path) if model_path is not None else root / "model.onnx"
     _require_regular_or_missing(model_file, artifact="model")
@@ -1107,6 +1113,13 @@ def verify_gguf_reuse_manifest(
         if start < previous_end:
             raise ValueError(f"Overlapping sidecar range for initializer {name!r}.")
         previous_end = end
+    source_matches = _path_matches_source_identity(
+        source,
+        source_identity,
+        follow_symlinks=False,
+    )
+    if not source_matches or source.is_symlink():
+        raise ValueError("GGUF source changed while its reuse manifest was verified.")
 
 
 def _verify_transform_graph(

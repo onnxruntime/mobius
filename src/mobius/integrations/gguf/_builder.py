@@ -5274,22 +5274,13 @@ def _resolve_mmproj_companion_path(
     return _resolve_gguf_path_impl(gguf_path, allow_mmproj_companion=True)
 
 
-def _hub_cache_identity_paths(paths: Collection[Path]) -> list[Path] | None:
-    """Resolve trusted Hub snapshot links to regular blob paths for hashing."""
-    from huggingface_hub.constants import HF_HUB_CACHE
-
-    cache_root = Path(HF_HUB_CACHE).expanduser().absolute()
+def _regular_file_identity_paths(paths: Collection[Path]) -> list[Path] | None:
+    """Resolve opened shard paths to regular-file targets for identity hashing."""
     resolved_paths: list[Path] = []
     for path in paths:
-        absolute = path.expanduser().absolute()
         try:
-            absolute.relative_to(cache_root)
-        except ValueError:
-            return None
-        resolved = absolute.resolve(strict=True)
-        try:
-            resolved.relative_to(cache_root)
-        except ValueError:
+            resolved = path.expanduser().resolve(strict=True)
+        except OSError:
             return None
         if not resolved.is_file() or resolved.is_symlink():
             return None
@@ -5504,7 +5495,7 @@ def build_from_gguf(
             shard_open_kwargs["expected_sizes"] = expected_sizes
         gguf_model = open_gguf_model(gguf_path, **shard_open_kwargs)
     if isinstance(gguf_model, GgufShardSet):
-        identity_paths = _hub_cache_identity_paths(gguf_model.shard_paths)
+        identity_paths = _regular_file_identity_paths(gguf_model.shard_paths)
         if identity_paths is not None:
             gguf_model._set_identity_paths(identity_paths)
     _validate_gguf_model(
@@ -6049,7 +6040,7 @@ def build_from_gguf(
             for name, tensor in state_dict.items()
             if id(tensor) in reuse_candidates_by_id
         }
-        attach_reused_initializers(pkg, gguf_path, final_candidates)
+        attach_reused_initializers(pkg, gguf_path, final_candidates, gguf_model)
 
     # 9b. Sparse-MoE fusion + honesty gate (final graph state).
     # Now that every native block carries its real packed bytes, collapse the
@@ -8175,11 +8166,11 @@ def _load_quantized_state_dict(
             n_repacked += num_experts
         elif should_repack:
             if is_tencent_q1_0_tensor:
-                gguf_path, data_section_offset, reader_tensor = gguf_model._tensor_source(
-                    gguf_name
+                read_source_range, data_section_offset, reader_tensor = (
+                    gguf_model._tensor_source(gguf_name)
                 )
                 repacked = parse_tencent_q1_0_tensor(
-                    str(gguf_path),
+                    read_source_range,
                     data_section_offset,
                     reader_tensor,
                 )
