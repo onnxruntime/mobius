@@ -22,14 +22,6 @@ def _integer(metadata: dict[str, Any], key: str) -> int:
     return value
 
 
-def _add_projection(
-    shapes: dict[str, tuple[int, ...]],
-    name: str,
-    shape: tuple[int, ...],
-) -> None:
-    shapes[name] = shape
-
-
 def _add_attention(
     required: dict[str, tuple[int, ...]],
     optional: dict[str, tuple[int, ...]],
