@@ -353,6 +353,17 @@ class TestModelPackageSaveLoad:
         assert pkg["model"].graph is not None
         assert loaded["model"].graph.num_nodes() == pkg["model"].graph.num_nodes()
 
+    def test_save_without_report_rejects_stale_report(self, tmp_path):
+        report_path = tmp_path / "quantization_report.json"
+        report_path.write_text('{"user": "owned"}\n', encoding="utf-8")
+        pkg = ModelPackage({"model": _make_simple_model("model")})
+
+        with pytest.raises(ValueError, match=r"stale quantization_report.json"):
+            pkg.save(str(tmp_path))
+
+        assert report_path.read_text(encoding="utf-8") == '{"user": "owned"}\n'
+        assert not (tmp_path / "model.onnx").exists()
+
     def test_load_multiple(self, tmp_path):
         pkg = ModelPackage(
             {

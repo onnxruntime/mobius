@@ -6179,7 +6179,7 @@ def _preflight_quantization_report(
     emit_warning: bool = True,
     include_tensor: Callable[[str], bool] | None = None,
 ):
-    """Classify every mapped weight from header metadata before payload conversion."""
+    """Classify every mapped tensor from header metadata before payload conversion."""
     from mobius.components import (
         BlockQuantizedLinear,
         Embedding,
@@ -6203,6 +6203,11 @@ def _preflight_quantization_report(
         RepackExactness,
         Support,
         TensorRole,
+    )
+    from mobius.integrations.gguf._tencent_q1_0 import (
+        is_tencent_q1_0_layout,
+        tencent_q1_0_source_nbytes,
+        tencent_q1_0_target_bits,
     )
     from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 
@@ -6231,6 +6236,7 @@ def _preflight_quantization_report(
             embedding_stems.add(module_name)
 
     float_type_ids = float_storage_type_ids()
+    tencent_q1_0 = is_tencent_q1_0_layout(gguf_model)
     source_qtypes: list[tuple[str, int]] = []
     records: list[QuantizationTensorRecord] = []
     rejected: list[QuantizationTensorRecord] = []
@@ -6241,12 +6247,17 @@ def _preflight_quantization_report(
         qtype_name = (
             quant_spec.name if quant_spec is not None else str(getattr(qtype, "name", qtype))
         )
-        source_bytes = int(tensor.n_bytes)
+        is_tencent_q1_0_tensor = tencent_q1_0 and qtype_name == "Q1_0"
+        source_bytes = (
+            tencent_q1_0_source_nbytes(tensor)
+            if is_tencent_q1_0_tensor
+            else int(tensor.n_bytes)
+        )
         source_qtypes.append((qtype_name, source_bytes))
         if include_tensor is not None and not include_tensor(tensor.name):
             continue
         hf_name = name_mapper(tensor.name, gguf_arch)
-        if hf_name is None or not hf_name.endswith(".weight"):
+        if hf_name is None:
             continue
         shape = tuple(int(dim) for dim in reversed(tensor.shape))
         module_hf_name = target_name_mapper(hf_name) if target_name_mapper else hf_name
@@ -6321,7 +6332,6 @@ def _preflight_quantization_report(
                 module_stem in float_stems
                 or module_stem in embedding_stems
                 or module_hf_name in parameter_names
-                or len(shape) < 2
             ):
                 role = TensorRole.NON_MATMUL
             else:
@@ -6335,14 +6345,30 @@ def _preflight_quantization_report(
                 or module_stem in embedding_stems
                 or target_is_quantized
                 or known_float_route
-                or len(shape) < 2
             ):
-                route, exactness, reason = quant_import_decision(
-                    qtype,
-                    role,
-                    target_bits=target_bits,
-                    target_block_size=target_block_size,
-                )
+                if is_tencent_q1_0_tensor and role is not TensorRole.NON_MATMUL:
+                    selected_bits = tencent_q1_0_target_bits()
+                    if (target_bits, target_block_size) == (selected_bits, 128):
+                        route = QuantImportRoute.AFFINE_REPACK
+                        exactness = RepackExactness.EXACT
+                        reason = (
+                            "Tencent Q1_0 2-bit/512 blocks are exactly represented as "
+                            f"INT{selected_bits} affine block-128."
+                        )
+                    else:
+                        route = QuantImportRoute.REJECTED
+                        exactness = None
+                        reason = (
+                            "Tencent Q1_0 requires the selected exact "
+                            f"INT{selected_bits} affine block-128 target."
+                        )
+                else:
+                    route, exactness, reason = quant_import_decision(
+                        qtype,
+                        role,
+                        target_bits=target_bits,
+                        target_block_size=target_block_size,
+                    )
             is_kimi_reshaped_projection = gguf_arch in {
                 "kimi-linear",
                 "kimi-k3",
@@ -7025,7 +7051,6 @@ def _load_quantized_state_dict(
     from mobius.components import (
         BlockQuantizedLinear,
         Embedding,
-        Linear,
         QuantizedEmbedding,
         QuantizedLinear,
     )
@@ -7061,7 +7086,6 @@ def _load_quantized_state_dict(
     quantized_output_sizes: dict[str, int] = {}
     native_block_stems: dict[str, str] = {}
     quantized_embedding_stems = set()
-    float_linear_stems = set()
     embedding_stems = set()
     for mod_name, mod in module.named_modules():
         if isinstance(mod, QuantizedLinear) or getattr(mod, "_gguf_quantized_linear", False):
@@ -7072,8 +7096,6 @@ def _load_quantized_state_dict(
         elif isinstance(mod, QuantizedEmbedding):
             quantized_embedding_stems.add(mod_name)
             embedding_stems.add(mod_name)
-        elif isinstance(mod, Linear):
-            float_linear_stems.add(mod_name)
         elif isinstance(mod, Embedding):
             embedding_stems.add(mod_name)
 
@@ -7214,7 +7236,7 @@ def _load_quantized_state_dict(
         module_stem = (
             module_hf_name[: -len(".weight")] if module_hf_name.endswith(".weight") else None
         )
-        is_tencent_q1_0_tensor = tencent_q1_0 and qtype == GGMLQuantizationType.Q1_0
+        is_tencent_q1_0_tensor = tencent_q1_0 and qtype_val == GGMLQuantizationType.Q1_0.value
         is_quantized_embedding = (
             module_stem is not None and module_stem in quantized_embedding_stems
         )
@@ -7232,6 +7254,11 @@ def _load_quantized_state_dict(
             np_shape,
             quantized_stems,
         )
+        if is_tencent_q1_0_tensor:
+            # Tencent tensors are ordinary rank-2 projections. Route them
+            # through the custom 130-byte-block parser below rather than the
+            # generic target-splitting path, which assumes mainline Q1_0 bytes.
+            affine_targets = []
         is_kimi_reshaped_projection = gguf_arch in {
             "kimi-linear",
             "kimi-k3",
@@ -7251,22 +7278,22 @@ def _load_quantized_state_dict(
             "bert",
             "modern-bert",
         }
+        is_float_embedding = is_embedding_tensor and not is_quantized_embedding
+        output_targets_quantized = module_stem is not None and (
+            module_stem in quantized_stems or module_stem in native_block_stems
+        )
         tensor_role = (
             TensorRole.EMBEDDING
             if is_embedding_tensor
             else TensorRole.EXPERT
             if len(np_shape) == 3 and ".experts." in hf_name
             else TensorRole.OUTPUT
-            if hf_name == "lm_head.weight"
+            if hf_name == "lm_head.weight" and output_targets_quantized
             else TensorRole.PROJECTION
             if fused_projection_targets
             or (
                 module_stem is not None
-                and (
-                    module_stem in quantized_stems
-                    or module_stem in native_block_stems
-                    or module_stem in float_linear_stems
-                )
+                and (module_stem in quantized_stems or module_stem in native_block_stems)
             )
             else TensorRole.NON_MATMUL
         )
@@ -7278,6 +7305,12 @@ def _load_quantized_state_dict(
                 target_bits=target_bits,
                 target_block_size=target_block_size,
             )
+            if is_tencent_q1_0_tensor and tensor_role is not TensorRole.NON_MATMUL:
+                route = QuantImportRoute.AFFINE_REPACK
+                reason = (
+                    "Tencent Q1_0 uses the selected exact "
+                    f"INT{target_bits} affine block-{target_block_size} representation."
+                )
             explicitly_dequantized = (
                 dequantize_float_linear_types is not None
                 and module_stem in dequantize_float_linear_types
@@ -7292,7 +7325,9 @@ def _load_quantized_state_dict(
                         "the stored format has no supported dequantization route."
                     )
                 route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
-            if is_encoder_embedding and quant_spec.dequantize is Support.SUPPORTED:
+            if (
+                is_encoder_embedding or is_float_embedding
+            ) and quant_spec.dequantize is Support.SUPPORTED:
                 route = QuantImportRoute.DEQUANTIZE_FLOAT
             if route is QuantImportRoute.REJECTED:
                 raise ValueError(
@@ -7538,6 +7573,15 @@ def _load_quantized_state_dict(
                     data_section_offset,
                     tensors_by_name[gguf_name],
                 )
+                if (repacked.bits, repacked.block_size) != (
+                    target_bits,
+                    target_block_size,
+                ):
+                    raise ValueError(
+                        f"Tencent Q1_0 parser produced INT{repacked.bits} "
+                        f"block-{repacked.block_size} for {hf_name}, but the graph "
+                        f"expects INT{target_bits} block-{target_block_size}."
+                    )
             elif is_kimi_reshaped_projection:
                 values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
                 if hf_name.endswith(".k_b_proj.weight"):

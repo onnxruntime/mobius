@@ -387,12 +387,74 @@ def _write_quantized_gguf(
             _add_q4_0("output.weight", vocab_size, hidden_size)
         elif output_quantization == "q8_0":
             _add_q8_0("output.weight", vocab_size, hidden_size)
+        elif output_quantization in {"q4_k", "q5_k", "q6_k"}:
+            _add_k_quant(
+                "output.weight",
+                vocab_size,
+                hidden_size,
+                output_quantization,
+            )
         else:
             add_float("output.weight", (vocab_size, hidden_size))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
+    writer.close()
+
+
+def _write_tencent_q1_0_gguf(path: Path) -> None:
+    """Write a tiny Llama file using Tencent's 130-byte Q1_0 blocks."""
+    from gguf import GGMLQuantizationType, GGUFWriter
+
+    hidden = intermediate = 512
+    vocab = 32
+    writer = GGUFWriter(str(path), "llama")
+    writer.add_context_length(32)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(intermediate)
+    writer.add_block_count(1)
+    writer.add_head_count(8)
+    writer.add_head_count_kv(2)
+    writer.add_rope_freq_base(10000.0)
+    writer.add_layer_norm_rms_eps(1e-5)
+    writer.add_vocab_size(vocab)
+
+    def add_float(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, np.ones(shape, dtype=np.float32))
+
+    def add_tencent_q1(name: str, n_out: int, k_in: int) -> None:
+        assert k_in % 512 == 0
+        blocks_per_row = k_in // 512
+        raw = np.zeros((n_out, blocks_per_row * 130), dtype=np.uint8)
+        raw.reshape(n_out, blocks_per_row, 130)[:, :, :2] = np.array(
+            [1.0], dtype=np.float16
+        ).view(np.uint8)
+        writer.add_tensor_info(
+            name,
+            (n_out, (k_in // 128) * 18),
+            raw.dtype,
+            raw.nbytes,
+            raw_dtype=GGMLQuantizationType.Q1_0,
+        )
+        writer.tensors[-1][name].tensor = raw
+
+    add_float("token_embd.weight", (vocab, hidden))
+    add_tencent_q1("blk.0.attn_q.weight", hidden, hidden)
+    add_tencent_q1("blk.0.attn_k.weight", hidden // 4, hidden)
+    add_tencent_q1("blk.0.attn_v.weight", hidden // 4, hidden)
+    add_tencent_q1("blk.0.attn_output.weight", hidden, hidden)
+    add_tencent_q1("blk.0.ffn_gate.weight", intermediate, hidden)
+    add_tencent_q1("blk.0.ffn_up.weight", intermediate, hidden)
+    add_tencent_q1("blk.0.ffn_down.weight", hidden, intermediate)
+    add_float("blk.0.attn_norm.weight", (hidden,))
+    add_float("blk.0.ffn_norm.weight", (hidden,))
+    add_float("output_norm.weight", (hidden,))
+    add_float("output.weight", (vocab, hidden))
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file(progress=False)
     writer.close()
 
 
@@ -4088,6 +4150,121 @@ class TestBuildQuantizedGguf:
         )
         assert "Q8_0:" in caplog.text
 
+    def test_quantized_source_float_output_head_dequantizes_consistently(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
+
+        path = tmp_path / "olmo2-q6-output.gguf"
+        _write_quantized_gguf(
+            path,
+            architecture="olmo2",
+            hidden_size=256,
+            intermediate_size=256,
+            vocab_size=256,
+            num_heads=8,
+            num_kv_heads=2,
+            projection_quantization="q4_k",
+            output_quantization="q6_k",
+        )
+
+        package = build_from_gguf(path, keep_quantized=True)
+        report_record = next(
+            record
+            for record in package.gguf_quantization_report.tensor_records
+            if record.name == "output.weight"
+        )
+        assert report_record.disposition is QuantizationDisposition.DEQUANTIZED_FLOAT
+        assert report_record.target_storage == "float"
+        head_initializers = [
+            value
+            for name, value in package["model"].graph.initializers.items()
+            if name.startswith("lm_head.weight")
+        ]
+        assert len(head_initializers) == 1
+        assert head_initializers[0].dtype == ir.DataType.FLOAT
+
+    @pytest.mark.parametrize(
+        ("native_2bit", "expected_bits"),
+        [(False, 4), (True, 2)],
+    )
+    def test_tencent_q1_0_preflight_uses_layout_and_exact_payload_bytes(
+        self,
+        tmp_path: Path,
+        native_2bit: bool,
+        expected_bits: int,
+    ) -> None:
+        from mobius._flags import override_flags
+        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
+
+        path = tmp_path / f"tencent-q1-{expected_bits}.gguf"
+        _write_tencent_q1_0_gguf(path)
+        with override_flags(tencent_q1_0_use_native_2bit=native_2bit):
+            package = build_from_gguf(path, keep_quantized=True)
+
+        report = package.gguf_quantization_report
+        q1_records = [record for record in report.tensor_records if record.qtype == "Q1_0"]
+        assert len(q1_records) == 7
+        assert sum(record.source_bytes for record in q1_records) == 2_816 * 130
+        assert {record.disposition for record in q1_records} == {
+            QuantizationDisposition.LOSSLESS_REPACK
+        }
+        assert {record.target_storage for record in q1_records} == {
+            f"INT{expected_bits} affine block-128"
+        }
+        assert any(node.op_type == "MatMulNBits" for node in package["model"].graph)
+
+    def test_preflight_records_mapped_bias_and_scale_parameters(self) -> None:
+        from gguf import GGMLQuantizationType
+        from onnxscript import nn
+
+        from mobius.integrations.gguf import QuantizationDisposition
+        from mobius.integrations.gguf._builder import _preflight_quantization_report
+
+        module = nn.Module()
+        module.bias = nn.Parameter([2])
+        module.scale = nn.Parameter([1])
+        tensors = [
+            SimpleNamespace(
+                name="source.bias",
+                tensor_type=GGMLQuantizationType.F32,
+                shape=(2,),
+                n_bytes=8,
+            ),
+            SimpleNamespace(
+                name="source.scale",
+                tensor_type=GGMLQuantizationType.F32,
+                shape=(1,),
+                n_bytes=4,
+            ),
+        ]
+        source = SimpleNamespace(
+            reader_tensors=lambda: iter(tensors),
+            _reader=None,
+        )
+        report = _preflight_quantization_report(
+            source,
+            "test",
+            module,
+            SimpleNamespace(),
+            preserve_quantization=True,
+            target_bits=4,
+            target_block_size=32,
+            execution_provider="default",
+            name_mapper=lambda name, _architecture: name.removeprefix("source."),
+        )
+
+        assert {record.name for record in report.tensor_records} == {
+            "source.bias",
+            "source.scale",
+        }
+        assert {record.disposition for record in report.tensor_records} == {
+            QuantizationDisposition.SOURCE_FLOAT
+        }
+        assert sum(record.source_bytes for record in report.tensor_records) == sum(
+            stat.source_bytes for stat in report.source_qtype_census
+        )
+
     def test_norms_are_float(self, q4_0_gguf: Path):
         """Norm weights remain float, not quantized."""
         import onnx_ir as ir
@@ -4845,6 +5022,26 @@ class TestEncoderGGUFBuild:
         expected = self._run(explicit_float, 5, masked=True)
         np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-2)
 
+    def test_report_includes_mapped_biases_and_reconciles_source_bytes(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
+
+        path = tmp_path / "bert-records.gguf"
+        _write_encoder_gguf(path, "bert", quantized=True)
+        report = build_from_gguf(path).gguf_quantization_report
+
+        bias_records = [
+            record for record in report.tensor_records if record.name.endswith(".bias")
+        ]
+        assert bias_records
+        assert {record.disposition for record in bias_records} == {
+            QuantizationDisposition.SOURCE_FLOAT
+        }
+        assert sum(record.source_bytes for record in report.tensor_records) == sum(
+            stat.source_bytes for stat in report.source_qtype_census
+        )
+
     def test_float_fused_bert_qkv_splits_losslessly_and_runs(self, tmp_path: Path) -> None:
         import torch
 
@@ -5501,18 +5698,25 @@ class TestHybridGGUFBuild:
         assert outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
         assert all(np.isfinite(output["logits"]).all() for output in outputs)
 
-    def test_lfm2_quantized_preservation_fails_closed_and_float_import_executes(
+    def test_lfm2_quantized_preservation_dequantizes_float_targets_and_executes(
         self, tmp_path: Path
     ) -> None:
-        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
 
         path = tmp_path / "lfm2-q4.gguf"
         _write_lfm2_gguf(path, quantized=True)
-        with pytest.raises(
-            ValueError,
-            match=r"Cannot keep Q4_0 projection .*MatMulNBits",
-        ):
-            build_from_gguf(path, keep_quantized=True)
+        preserved_package = build_from_gguf(path, keep_quantized=True)
+        preserved = preserved_package["model"]
+        assert "MatMulNBits" not in {node.op_type for node in preserved.graph}
+        assert preserved_package.gguf_quantization_report.storage_quantized is False
+        assert any(
+            record.disposition is QuantizationDisposition.DEQUANTIZED_FLOAT
+            for record in preserved_package.gguf_quantization_report.tensor_records
+        )
+        preserved_outputs = self._run_lfm2(preserved)
+        assert preserved_outputs[0]["present.0.conv_state"].shape == (1, 32, 2)
+        assert preserved_outputs[1]["present.1.key"].shape == (1, 2, 4, 8)
+        assert all(np.isfinite(output["logits"]).all() for output in preserved_outputs)
 
         explicit_float = build_from_gguf(path, keep_quantized=False)["model"]
 

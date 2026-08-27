@@ -176,6 +176,12 @@ def _validate_mtp_save_paths(
         os.path.islink(report_path) or not os.path.isfile(report_path)
     ):
         raise ValueError("ModelPackage quantization report output must be a real file.")
+    if package.gguf_quantization_report is None and os.path.isfile(report_path):
+        raise ValueError(
+            "ModelPackage output contains a stale quantization_report.json, but the "
+            "package being saved has no GGUF quantization report. Remove or clean the "
+            "output directory before saving."
+        )
     previous_sidecar_name = _read_mtp_sidecar_name(directory)
     selected = [name for name in package if components is None or components(name)]
     if len(selected) > 1:
@@ -431,8 +437,6 @@ class ModelPackage(UserDict[str, ir.Model]):
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
         if self.gguf_quantization_report is not None:
             self.gguf_quantization_report.write_json(quantization_report_path)
-        elif os.path.isfile(quantization_report_path):
-            os.remove(quantization_report_path)
         selected = {
             name: model
             for name, model in self.data.items()

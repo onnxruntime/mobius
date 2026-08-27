@@ -475,7 +475,7 @@ class TestBuildMtpHead:
         tied_output: bool,
         quantized: bool,
     ) -> None:
-        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf import QuantizationDisposition, build_from_gguf
         from mobius.integrations.gguf._reader import GGUFModel
 
         path = tmp_path / "mtp-tables.gguf"
@@ -487,14 +487,23 @@ class TestBuildMtpHead:
             dedicated_head=dedicated_head,
             tied_output=tied_output,
         )
-        preserve_quantization = quantized and not (dedicated_embedding or dedicated_head)
-        if quantized and not preserve_quantization:
-            with pytest.raises(
-                ValueError,
-                match=r"Cannot keep Q4_0 (?:embedding|output) .* quantized",
-            ):
-                build_from_gguf(path, keep_quantized=True)
+        preserve_quantization = quantized
         package = build_from_gguf(path, keep_quantized=preserve_quantization)
+        if quantized:
+            records = {
+                record.name: record
+                for record in package.gguf_quantization_report.tensor_records
+            }
+            if dedicated_embedding:
+                assert (
+                    records["blk.1.nextn.embed_tokens.weight"].disposition
+                    is QuantizationDisposition.DEQUANTIZED_FLOAT
+                )
+            if dedicated_head:
+                assert (
+                    records["blk.1.nextn.shared_head_head.weight"].disposition
+                    is QuantizationDisposition.DEQUANTIZED_FLOAT
+                )
         head = package.mtp_head
         assert head is not None
         target_initializers = package["model"].graph.initializers
