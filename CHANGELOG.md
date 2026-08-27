@@ -758,7 +758,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logging in `_config_resolver.py`, `_diffusers_builder.py`, and
   `__main__.py`.
 - Added dependency lower bounds: `onnxscript>=0.6.0`, `onnx_ir>=0.1.0`,
-  `numpy>=1.24.0`, `torch>=2.1.0`.
+  `numpy>=1.24.0`, `torch>=2.10.0`.
 - Lazy-import heavy dependencies (`torch`, `transformers`,
   `safetensors.torch`) in CLI for faster `list`/`info` subcommands.
 - Mllama cross-attention K/V now cached after first computation in
