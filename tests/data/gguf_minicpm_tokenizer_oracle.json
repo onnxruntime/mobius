@@ -1,13 +1,50 @@
 {
+  "generator": "scripts/generate_minicpm_tokenizer_oracle.py",
+  "generator_sha256": "d1ae3b3c0bd738544b4a052ee957297c6aa87bf34863cae09dd6feda866aeafd",
+  "serialization": "UTF-8 compact JSON arrays (ensure_ascii=false; separators=(',',':'))",
   "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
   "seed": 648,
   "random_count": 128,
+  "random_length_stop_exclusive": 97,
   "fixed_count": 20,
+  "fixed_inputs": [
+    "",
+    "a",
+    "Hello, world! 12345",
+    "Hello, 世界! 👩‍💻\n",
+    "你好，世界！",
+    "Привет мир",
+    "مرحبا بالعالم",
+    "नमस्ते दुनिया",
+    "বাংলা ভাষা",
+    "ภาษาไทย",
+    "한국어 테스트",
+    "日本語テスト",
+    "é café ﬁ Ａ",
+    "  leading\tand  repeated\nspaces  ",
+    "<s>literal</s>",
+    "<用户>问题<AI>",
+    "<|im_start|>user\n工具?<|im_end|>\n",
+    "can't CAN'T we'll I'D",
+    "1234567890 ١٢٣ १२३",
+    "👩‍💻🏳️‍🌈�"
+  ],
+  "random_alphabet": "abcXYZ  \t\n.,!?'-_0123456789你好世界用户工具测试éßΩЖمرحباनमस्तेภาษาไทย한국어日本語👩💻🚀",
   "random_alphabet_sha256": "0b41be99d8aab5768ed3118bf95f6c647f463966ec251255d143976d085891f8",
+  "corpus_sha256": "dd6d2aa959ab8b74111c704559252bc8ef02aa5ec13f40ef23d0b65e03233413",
   "modes": [
-    ["no-add", "no-parse-special"],
-    ["no-add", "parse-special"],
-    ["add-special", "parse-special"]
+    [
+      "no-add",
+      "no-parse-special"
+    ],
+    [
+      "no-add",
+      "parse-special"
+    ],
+    [
+      "add-special",
+      "parse-special"
+    ]
   ],
   "case_count_per_route": 444,
   "routes": [
@@ -19,12 +56,39 @@
       "ordered_results_sha256": "8959cbd62821def331adc77db30e8b351e8fad221547e74804dc7aecb188df1a",
       "source_results_sha256": "a61293d6ad6fb5637f4ceafe225ac822897482d5ef5333b87f63b0e40611e9c2",
       "mismatch_count": 18,
-      "mismatch_count_by_mode": [6, 6, 6],
+      "mismatch_count_by_mode": [
+        6,
+        6,
+        6
+      ],
+      "mismatch_input_indices": [
+        4,
+        5,
+        13,
+        19,
+        42,
+        64
+      ],
       "first_mismatch": {
-        "mode": ["no-add", "no-parse-special"],
+        "mode": [
+          "no-add",
+          "no-parse-special"
+        ],
         "text": "你好，世界！",
-        "llamacpp_ids": [29951, 95495, 65, 2925, 67],
-        "source_ids": [95320, 23523, 65, 2925, 67]
+        "llamacpp_ids": [
+          29951,
+          95495,
+          65,
+          2925,
+          67
+        ],
+        "source_ids": [
+          95320,
+          23523,
+          65,
+          2925,
+          67
+        ]
       }
     },
     {
@@ -35,12 +99,36 @@
       "ordered_results_sha256": "d55374a7956f5379448b802ac23888c91f22aeb5fb6814f5b73efe74058fd475",
       "source_results_sha256": "d6beee40e9257575b1333e43f67709920eda0cd6249fa74cfbd8a5eaa978b4af",
       "mismatch_count": 9,
-      "mismatch_count_by_mode": [3, 3, 3],
+      "mismatch_count_by_mode": [
+        3,
+        3,
+        3
+      ],
+      "mismatch_input_indices": [
+        4,
+        13,
+        42
+      ],
       "first_mismatch": {
-        "mode": ["no-add", "no-parse-special"],
+        "mode": [
+          "no-add",
+          "no-parse-special"
+        ],
         "text": "你好，世界！",
-        "llamacpp_ids": [29951, 59495, 65, 2925, 67],
-        "source_ids": [59320, 23523, 65, 2925, 67]
+        "llamacpp_ids": [
+          29951,
+          59495,
+          65,
+          2925,
+          67
+        ],
+        "source_ids": [
+          59320,
+          23523,
+          65,
+          2925,
+          67
+        ]
       }
     }
   ]

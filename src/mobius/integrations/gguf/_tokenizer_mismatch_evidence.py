@@ -219,7 +219,7 @@ _RECORDS = (
         oracle_mismatch_count_by_mode=(6, 6, 6),
         first_mismatch_mode=("no-add", "no-parse-special"),
         first_mismatch=(
-            "你好，世界！",
+            "\u4f60\u597d\uff0c\u4e16\u754c\uff01",
             (29951, 95495, 65, 2925, 67),
             (95320, 23523, 65, 2925, 67),
         ),
@@ -332,7 +332,7 @@ _RECORDS = (
         oracle_mismatch_count_by_mode=(3, 3, 3),
         first_mismatch_mode=("no-add", "no-parse-special"),
         first_mismatch=(
-            "你好，世界！",
+            "\u4f60\u597d\uff0c\u4e16\u754c\uff01",
             (29951, 59495, 65, 2925, 67),
             (59320, 23523, 65, 2925, 67),
         ),

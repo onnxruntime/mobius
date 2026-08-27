@@ -559,6 +559,12 @@ This does not claim graph or runtime support.
 
 {_tokenizer_blocker_evidence_table()}
 
+The compact fixture is reproducible with
+`python scripts/generate_minicpm_tokenizer_oracle.py --help`. The refresh command validates
+the immutable 16 MiB header slices and official tokenizer hashes, constructs temporary
+tokenizer-only GGUFs, invokes a tokenizer binary from the pinned llama.cpp checkout, and
+recomputes the complete ordered-result hashes and mismatch witnesses.
+
 ## Supported GGUF architectures
 
 Reason codes are concise user-facing categories; detailed architecture audits remain in

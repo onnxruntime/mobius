@@ -223,6 +223,15 @@ class TestInspectGgufTokenizer:
         with pytest.raises(ValueError, match="pre for non-BPE model"):
             inspect_gguf_tokenizer(metadata)
 
+    def test_legacy_default_pre_rejects_non_string_architecture_cleanly(self):
+        metadata = _metadata(pre="default")
+        metadata["general.architecture"] = ["minicpm"]
+        metadata["tokenizer.ggml.model"] = "llama"
+        metadata.pop("tokenizer.ggml.merges")
+
+        with pytest.raises(ValueError, match="pre for non-BPE model"):
+            inspect_gguf_tokenizer(metadata)
+
     def test_exact_embedded_json_is_copy_route(self):
         verdict = inspect_gguf_tokenizer(_metadata(embedded=True))
         assert verdict.route == "copy"

@@ -414,7 +414,12 @@ def inspect_gguf_tokenizer(
         # audits keep tokenizer materialization deferred below.
         architecture = metadata.get("general.architecture")
         legacy_default = pre_value == "default" and (
-            model == "plamo2" or (model == "llama" and architecture in {"minicpm", "minicpm3"})
+            model == "plamo2"
+            or (
+                model == "llama"
+                and isinstance(architecture, str)
+                and architecture in {"minicpm", "minicpm3"}
+            )
         )
         if not legacy_default:
             raise ValueError(
