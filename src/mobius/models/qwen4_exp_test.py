@@ -17,6 +17,9 @@ import onnx_ir as ir
 import pytest
 import safetensors.torch
 import torch
+from onnxruntime.capi.onnxruntime_pybind11_state import (
+    NotImplemented as OrtNotImplemented,
+)
 
 from mobius._builder import build_from_module
 from mobius._configs import Qwen4ExpConfig, VisionConfig
@@ -1639,7 +1642,21 @@ def test_fp8_qdq_preserves_storage_and_roundtrips_multishard(tmp_path):
     assert loaded_package.weight_loading_report["serializer_max_workers"] == 1
 
 
-def _ort_supports_bfloat16_fp8_dequantize() -> bool:
+_MISSING_FP8_DQ_KERNEL = re.compile(
+    r"^\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED : Could not find an "
+    r"implementation for DequantizeLinear\(24\) node with name '.+'$"
+)
+
+
+def _is_missing_bfloat16_fp8_dq_kernel(error: Exception) -> bool:
+    return type(error) is OrtNotImplemented and bool(
+        _MISSING_FP8_DQ_KERNEL.fullmatch(str(error))
+    )
+
+
+def _ort_supports_bfloat16_fp8_dequantize(
+    session_factory=OnnxModelSession,
+) -> bool:
     _builder, op, graph = create_test_builder()
     codes = ir.Value(
         name="codes",
@@ -1661,10 +1678,9 @@ def _ort_supports_bfloat16_fp8_dequantize() -> bool:
     model = ir.Model(graph, ir_version=11)
 
     try:
-        session = OnnxModelSession(model)
+        session = session_factory(model)
     except Exception as error:
-        message = str(error)
-        if "NOT_IMPLEMENTED" in message and "DequantizeLinear" in message:
+        if _is_missing_bfloat16_fp8_dq_kernel(error):
             return False
         raise
     try:
@@ -1676,6 +1692,56 @@ def _ort_supports_bfloat16_fp8_dequantize() -> bool:
         np.array([0.5, -1.0], dtype=np.float32),
     )
     return True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError(
+            "[ONNXRuntimeError] : 9 : NOT_IMPLEMENTED : Could not find an "
+            "implementation for DequantizeLinear(24) node with name 'probe'"
+        ),
+        OrtNotImplemented(
+            "[ONNXRuntimeError] : 9 : NOT_IMPLEMENTED : Could not find an "
+            "implementation for DequantizeLinear(23) node with name 'probe'"
+        ),
+        OrtNotImplemented("malformed NOT_IMPLEMENTED DequantizeLinear probe"),
+    ],
+)
+def test_fp8_dq_capability_probe_rethrows_near_matches(error):
+    def raise_error(_model):
+        raise error
+
+    with pytest.raises(type(error), match=re.escape(str(error))):
+        _ort_supports_bfloat16_fp8_dequantize(raise_error)
+
+
+def test_fp8_dq_capability_probe_rethrows_ort_subclass():
+    class DerivedOrtNotImplemented(OrtNotImplemented):
+        pass
+
+    error = DerivedOrtNotImplemented(
+        "[ONNXRuntimeError] : 9 : NOT_IMPLEMENTED : Could not find an "
+        "implementation for DequantizeLinear(24) node with name 'probe'"
+    )
+
+    def raise_error(_model):
+        raise error
+
+    with pytest.raises(DerivedOrtNotImplemented):
+        _ort_supports_bfloat16_fp8_dequantize(raise_error)
+
+
+def test_fp8_dq_capability_probe_accepts_only_canonical_ort_absence():
+    error = OrtNotImplemented(
+        "[ONNXRuntimeError] : 9 : NOT_IMPLEMENTED : Could not find an "
+        "implementation for DequantizeLinear(24) node with name 'probe'"
+    )
+
+    def raise_error(_model):
+        raise error
+
+    assert _ort_supports_bfloat16_fp8_dequantize(raise_error) is False
 
 
 def test_bfloat16_fp8_qdq_reaches_only_declared_ort_capability_gap(tmp_path):
