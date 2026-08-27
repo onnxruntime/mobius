@@ -49,7 +49,7 @@ __all__ = [
 
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -476,8 +476,8 @@ class GgufShardSet:
             raise KeyError(f"Tensor {name!r} not found in split set.")
         return shard.tensor_storage_range(name)
 
-    def _tensor_source(self, name: str) -> tuple[Path, int, Any]:
-        """Return the owning path, data-section offset, and reader record."""
+    def _tensor_source(self, name: str) -> tuple[Callable[[int, int], bytes], int, Any]:
+        """Return the owning pinned range reader, data offset, and tensor record."""
         shard = self._owner.get(name)
         if shard is None:
             raise KeyError(f"Tensor {name!r} not found in split set.")

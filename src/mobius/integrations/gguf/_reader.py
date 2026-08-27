@@ -31,7 +31,7 @@ import os
 import stat
 import threading
 from array import array
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
@@ -88,6 +88,19 @@ def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int, int]:
         source_stat.st_mtime_ns,
         _descriptor_change_time(descriptor, source_stat),
     )
+
+
+def _path_matches_source_identity(
+    path: Path,
+    expected_identity: tuple[int, int, int, int, int],
+    *,
+    follow_symlinks: bool,
+) -> bool:
+    try:
+        with _open_regular_descriptor(path, follow_symlinks=follow_symlinks) as descriptor:
+            return _descriptor_identity(descriptor) == expected_identity
+    except OSError:
+        return False
 
 
 @contextmanager
@@ -210,7 +223,7 @@ class GGUFModel:
         path: Path to the ``.gguf`` file.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, follow_symlinks: bool = True) -> None:
         try:
             from gguf import GGUFReader
         except ImportError as e:
@@ -220,7 +233,10 @@ class GGUFModel:
             ) from e
 
         self._path = Path(path)
-        with _open_regular_descriptor(self._path, follow_symlinks=True) as descriptor:
+        self._follow_source_symlinks = follow_symlinks
+        with _open_regular_descriptor(
+            self._path, follow_symlinks=follow_symlinks
+        ) as descriptor:
             source_stat = os.fstat(descriptor)
             if not stat.S_ISREG(source_stat.st_mode):
                 raise FileNotFoundError(f"GGUF file not found: {self._path}")
@@ -242,7 +258,10 @@ class GGUFModel:
                 header = stream.read(8)
             if _descriptor_identity(descriptor) != source_identity:
                 raise ValueError("GGUF source changed while the reader was opening it")
-            with _open_regular_descriptor(self._path, follow_symlinks=True) as path_descriptor:
+            with _open_regular_descriptor(
+                self._path,
+                follow_symlinks=follow_symlinks,
+            ) as path_descriptor:
                 if _descriptor_identity(path_descriptor) != source_identity:
                     raise ValueError(
                         "GGUF source path changed while the reader was opening it"
@@ -270,13 +289,17 @@ class GGUFModel:
         """GGUF container version parsed from the file header."""
         return self._format_version
 
-    def source_matches_path(self) -> bool:
+    def source_matches_path(self, path: str | Path | None = None) -> bool:
         """Return whether the path still names the exact file opened by this reader."""
         try:
             descriptor = self._source_descriptor
             if descriptor is None or _descriptor_identity(descriptor) != self._source_identity:
                 return False
-            with _open_regular_descriptor(self._path, follow_symlinks=True) as path_descriptor:
+            logical_path = self._path if path is None else Path(path)
+            with _open_regular_descriptor(
+                logical_path,
+                follow_symlinks=self._follow_source_symlinks,
+            ) as path_descriptor:
                 return _descriptor_identity(path_descriptor) == self._source_identity
         except OSError:
             return False
@@ -319,6 +342,26 @@ class GGUFModel:
             if _descriptor_identity(descriptor) != self._source_identity:
                 raise ValueError("GGUF source changed while its checksum was computed")
             return digest.hexdigest()
+
+    def read_source_range(self, offset: int, length: int) -> bytes:
+        """Read one exact byte range from the unchanged pinned source."""
+        if offset < 0 or length < 0:
+            raise ValueError("GGUF source range offset and length must be non-negative")
+        with self.open_source_descriptor() as descriptor:
+            if _descriptor_identity(descriptor) != self._source_identity:
+                raise ValueError("GGUF source changed after its reader was opened")
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = length
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if _descriptor_identity(descriptor) != self._source_identity:
+                raise ValueError("GGUF source changed while a tensor range was read")
+            return b"".join(chunks)
 
     def close(self) -> None:
         """Release the retained source descriptor."""
@@ -407,12 +450,12 @@ class GGUFModel:
         """
         return list(self._reader.tensors)
 
-    def _tensor_source(self, name: str) -> tuple[Path, int, Any]:
-        """Return the owning path, data-section offset, and reader record."""
+    def _tensor_source(self, name: str) -> tuple[Callable[[int, int], bytes], int, Any]:
+        """Return the pinned range reader, data-section offset, and tensor record."""
         if name not in self._tensor_index:
             raise KeyError(f"Tensor '{name}' not found in GGUF file.")
         return (
-            self._path,
+            self.read_source_range,
             int(self._reader.data_offset),
             self._reader.get_tensor(self._tensor_index[name]),
         )

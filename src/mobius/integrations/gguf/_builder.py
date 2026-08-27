@@ -6040,7 +6040,7 @@ def build_from_gguf(
             for name, tensor in state_dict.items()
             if id(tensor) in reuse_candidates_by_id
         }
-        attach_reused_initializers(pkg, gguf_path, final_candidates)
+        attach_reused_initializers(pkg, gguf_path, final_candidates, gguf_model)
 
     # 9b. Sparse-MoE fusion + honesty gate (final graph state).
     # Now that every native block carries its real packed bytes, collapse the
@@ -8166,11 +8166,11 @@ def _load_quantized_state_dict(
             n_repacked += num_experts
         elif should_repack:
             if is_tencent_q1_0_tensor:
-                gguf_path, data_section_offset, reader_tensor = gguf_model._tensor_source(
-                    gguf_name
+                read_source_range, data_section_offset, reader_tensor = (
+                    gguf_model._tensor_source(gguf_name)
                 )
                 repacked = parse_tencent_q1_0_tensor(
-                    str(gguf_path),
+                    read_source_range,
                     data_section_offset,
                     reader_tensor,
                 )

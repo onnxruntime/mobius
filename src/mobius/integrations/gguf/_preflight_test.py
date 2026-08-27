@@ -12,7 +12,9 @@ touching the network.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import re
 from pathlib import Path
 
@@ -28,6 +30,18 @@ from mobius.integrations.gguf._preflight import (
     preflight_gguf,
     preflight_local_gguf,
 )
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
 
 
 def _write_sharded_gguf(
@@ -284,19 +298,21 @@ def test_local_preflight_checksum_rejects_path_replacement(
 ):
     from mobius.integrations.gguf._reader import GGUFModel
 
-    path = _write_single_gguf(tmp_path / "source.gguf")
+    source = _write_single_gguf(tmp_path / "source.gguf")
     replacement = _write_single_gguf(tmp_path / "replacement.gguf", seed=1)
-    moved_source = tmp_path / "moved-source.gguf"
+    path = tmp_path / "logical.gguf"
+    _symlink_or_skip(path, source)
     source_sha256 = GGUFModel.source_sha256
 
     def replace_path_before_hash(model, **kwargs):
-        path.replace(moved_source)
-        replacement.replace(path)
-        return source_sha256(model, **kwargs)
+        digest = source_sha256(model, **kwargs)
+        path.unlink()
+        _symlink_or_skip(path, replacement)
+        return digest
 
     monkeypatch.setattr(GGUFModel, "source_sha256", replace_path_before_hash)
 
-    with pytest.raises(ValueError, match="source changed after its reader was opened"):
+    with pytest.raises(ValueError, match="preflight report was being built"):
         preflight_local_gguf(path, verify_checksums=True)
 
 

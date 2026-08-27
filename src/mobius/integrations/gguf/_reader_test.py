@@ -9,6 +9,7 @@ to avoid requiring model downloads.
 
 from __future__ import annotations
 
+import errno
 import os
 import struct
 import threading
@@ -30,6 +31,18 @@ from mobius.integrations.gguf._config_mapping import (
 from mobius.integrations.gguf._header import _gguf_architecture_from_header
 from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
 
 
 def _raw_gguf_string(value: bytes) -> bytes:
@@ -422,7 +435,7 @@ class TestGGUFModelReader:
         with pytest.raises(FileNotFoundError, match="not found"):
             GGUFModel(path)
 
-    def test_reader_fails_closed_when_source_moves_during_open(
+    def test_reader_uses_pinned_source_during_opening_time_symlink_aba(
         self,
         llama_gguf: Path,
         gemma4_gguf: Path,
@@ -432,17 +445,21 @@ class TestGGUFModelReader:
         import gguf
 
         original_reader = gguf.GGUFReader
-        moved_source = tmp_path / "moved-original.gguf"
+        logical = tmp_path / "source.gguf"
+        _symlink_or_skip(logical, llama_gguf)
 
         def replace_path_before_reader_opens(source):
-            llama_gguf.replace(moved_source)
-            gemma4_gguf.replace(llama_gguf)
+            logical.unlink()
+            _symlink_or_skip(logical, gemma4_gguf)
+            logical.unlink()
+            _symlink_or_skip(logical, llama_gguf)
             return original_reader(source)
 
         monkeypatch.setattr(gguf, "GGUFReader", replace_path_before_reader_opens)
 
-        with pytest.raises(ValueError, match="source changed while the reader was opening"):
-            GGUFModel(llama_gguf)
+        model = GGUFModel(logical)
+        assert model.architecture == "llama"
+        assert model.source_matches_path()
 
     def test_reader_fails_closed_when_symlink_is_retargeted_during_open(
         self,
@@ -454,12 +471,12 @@ class TestGGUFModelReader:
         import gguf
 
         path = tmp_path / "source.gguf"
-        path.symlink_to(llama_gguf)
+        _symlink_or_skip(path, llama_gguf)
         original_reader = gguf.GGUFReader
 
         def retarget_symlink_before_reader_opens(source):
             path.unlink()
-            path.symlink_to(gemma4_gguf)
+            _symlink_or_skip(path, gemma4_gguf)
             return original_reader(source)
 
         monkeypatch.setattr(gguf, "GGUFReader", retarget_symlink_before_reader_opens)

@@ -67,7 +67,7 @@ __all__ = [
 ]
 
 import math
-import os
+from collections.abc import Callable
 
 import numpy as np
 
@@ -158,7 +158,7 @@ def tencent_q1_0_target_bits() -> int:
 
 
 def parse_tencent_q1_0_tensor(
-    file_path: str | os.PathLike,
+    read_source_range: Callable[[int, int], bytes],
     data_section_offset: int,
     tensor,
 ) -> RepackedTensor:
@@ -174,7 +174,7 @@ def parse_tencent_q1_0_tensor(
       float ``zp=1.5``. Native 2 bpw but slow on CPU EP today.
 
     Args:
-        file_path: Path to the source ``.gguf`` file.
+        read_source_range: Pinned source reader accepting byte offset and length.
         data_section_offset: Absolute byte offset where the GGUF data
             section begins (``GGUFReader.data_offset``).
         tensor: ``gguf.ReaderTensor`` for the target weight. Must have
@@ -185,7 +185,7 @@ def parse_tencent_q1_0_tensor(
         The ``bits`` field is 2 or 4 depending on the flag.
     """
     native_scales, codes_2bit, ne1, n_native = _read_tencent_blocks(
-        file_path, data_section_offset, tensor
+        read_source_range, data_section_offset, tensor
     )
     if flags.tencent_q1_0_use_native_2bit:
         return _pack_native_2bit(native_scales, codes_2bit, ne1, n_native)
@@ -193,7 +193,7 @@ def parse_tencent_q1_0_tensor(
 
 
 def _read_tencent_blocks(
-    file_path: str | os.PathLike,
+    read_source_range: Callable[[int, int], bytes],
     data_section_offset: int,
     tensor,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
@@ -219,9 +219,7 @@ def _read_tencent_blocks(
     total_bytes = ne1 * bytes_per_row
 
     abs_offset = data_section_offset + _tensor_data_offset(tensor)
-    with open(file_path, "rb") as f:
-        f.seek(abs_offset)
-        blob = f.read(total_bytes)
+    blob = read_source_range(abs_offset, total_bytes)
     if len(blob) != total_bytes:
         raise OSError(
             f"Short read for {tensor.name!r}: got {len(blob)} bytes, expected {total_bytes}"

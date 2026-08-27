@@ -10,6 +10,7 @@ metadata only on the primary shard). No real weights are downloaded.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import tracemalloc
@@ -31,6 +32,18 @@ from mobius.integrations.gguf._shard_set import (
     open_gguf_model,
     parse_shard_filename,
 )
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if os.name == "nt" and (
+            getattr(error, "winerror", None) in {1, 50, 1314}
+            or error.errno in {errno.EPERM, errno.EACCES, errno.ENOSYS}
+        ):
+            pytest.skip(f"Windows runner cannot create test symlinks: {error}")
+        raise
 
 
 def _sha256(path: Path) -> str:
@@ -391,19 +404,26 @@ def test_checksum_rejects_shard_path_replacement_after_reader_open(
         split_max_tensors=3,
         seed=1,
     )
-    moved_source = tmp_path / "moved-source.gguf"
+    links_dir = tmp_path / "links"
+    links_dir.mkdir()
+    links = []
+    for shard in shards:
+        link = links_dir / shard.name
+        _symlink_or_skip(link, shard)
+        links.append(link)
     source_sha256 = GGUFModel.source_sha256
 
     def replace_path_before_hash(model, **kwargs):
-        if Path(model._path) == shards[0]:
-            shards[0].replace(moved_source)
-            replacements[0].replace(shards[0])
-        return source_sha256(model, **kwargs)
+        digest = source_sha256(model, **kwargs)
+        if Path(model._path) == links[0]:
+            links[0].unlink()
+            _symlink_or_skip(links[0], replacements[0])
+        return digest
 
     monkeypatch.setattr(GGUFModel, "source_sha256", replace_path_before_hash)
 
-    with pytest.raises(ValueError, match="source changed after its reader was opened"):
-        open_gguf_model(shards[0], verify_checksums=True)
+    with pytest.raises(GgufShardError, match="source changed while its manifest"):
+        open_gguf_model(links[0], verify_checksums=True)
 
 
 def test_manifest_rejects_swapped_continuation_shard(tmp_path):
@@ -1167,7 +1187,7 @@ def test_regular_file_identity_paths_resolve_local_symlinks(tmp_path):
     blob = tmp_path / "blob"
     blob.write_bytes(b"GGUF")
     shard = tmp_path / "model-00001-of-00002.gguf"
-    shard.symlink_to(blob)
+    _symlink_or_skip(shard, blob)
 
     assert builder._regular_file_identity_paths([shard]) == [blob]
     assert builder._regular_file_identity_paths([tmp_path / "missing.gguf"]) is None
@@ -1183,7 +1203,7 @@ def test_build_binds_local_symlinked_shards_to_regular_identity_paths(tmp_path):
     links = []
     for target in targets:
         link = links_dir / target.name
-        link.symlink_to(target)
+        _symlink_or_skip(link, target)
         links.append(link)
 
     class _ValidationReachedError(Exception):
@@ -1208,7 +1228,7 @@ def test_build_binds_local_symlinked_shards_to_regular_identity_paths(tmp_path):
         builder.build_from_gguf(links[0])
 
 
-def test_artifact_identity_rejects_retargeted_symlink_after_binding(tmp_path):
+def test_artifact_identity_hashes_pinned_source_after_logical_symlink_retarget(tmp_path):
     from mobius.integrations.gguf import _builder as builder
     from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
 
@@ -1219,7 +1239,7 @@ def test_artifact_identity_rejects_retargeted_symlink_after_binding(tmp_path):
     links = []
     for target in targets:
         link = links_dir / target.name
-        link.symlink_to(target)
+        _symlink_or_skip(link, target)
         links.append(link)
 
     captured = {}
@@ -1239,20 +1259,24 @@ def test_artifact_identity_rejects_retargeted_symlink_after_binding(tmp_path):
 
     model = captured["model"]
     bound_identity_path = model.identity_paths[0]
-    moved_original = tmp_path / "moved-original.gguf"
-    targets[0].rename(moved_original)
-    targets[0].write_bytes(replacements[0].read_bytes())
+    expected_identity = gguf_artifact_identity(
+        links[0],
+        model,
+        architecture=model.architecture,
+    )
     links[0].unlink()
-    links[0].symlink_to(moved_original)
+    _symlink_or_skip(links[0], replacements[0])
 
     assert bound_identity_path == targets[0]
     assert not model.source_matches_path()
-    with pytest.raises(ValueError, match="no longer matches the opened GGUF source identity"):
+    assert (
         gguf_artifact_identity(
             links[0],
             model,
             architecture=model.architecture,
         )
+        == expected_identity
+    )
 
 
 def test_artifact_identity_rejects_restored_in_place_mutation_after_binding(tmp_path):
@@ -1260,13 +1284,6 @@ def test_artifact_identity_rejects_restored_in_place_mutation_after_binding(tmp_
     from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
 
     targets = _write_sharded_gguf(tmp_path / "targets")
-    links_dir = tmp_path / "links"
-    links_dir.mkdir()
-    links = []
-    for target in targets:
-        link = links_dir / target.name
-        link.symlink_to(target)
-        links.append(link)
 
     captured = {}
 
@@ -1281,20 +1298,27 @@ def test_artifact_identity_rejects_restored_in_place_mutation_after_binding(tmp_
         mock.patch.object(builder, "_validate_gguf_model", side_effect=capture),
         pytest.raises(_ValidationReachedError),
     ):
-        builder.build_from_gguf(links[0])
+        builder.build_from_gguf(targets[0])
 
     model = captured["model"]
     source_stat = targets[0].stat()
     original_bytes = targets[0].read_bytes()
-    mutated = bytearray(original_bytes)
-    mutated[-1] ^= 0xFF
-    targets[0].write_bytes(mutated)
-    targets[0].write_bytes(original_bytes)
+    with targets[0].open("r+b") as stream:
+        stream.seek(-1, os.SEEK_END)
+        value = stream.read(1)
+        stream.seek(-1, os.SEEK_END)
+        stream.write(bytes([value[0] ^ 0xFF]))
+        stream.flush()
+        os.fsync(stream.fileno())
+        stream.seek(0)
+        stream.write(original_bytes)
+        stream.flush()
+        os.fsync(stream.fileno())
     os.utime(targets[0], ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
 
     with pytest.raises(ValueError, match="no longer matches the opened GGUF source identity"):
         gguf_artifact_identity(
-            links[0],
+            targets[0],
             model,
             architecture=model.architecture,
         )
