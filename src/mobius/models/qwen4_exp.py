@@ -83,7 +83,7 @@ def validate_qwen4_exp_fp8_header_contract(
         if weight_dtype != "F8_E4M3":
             raise ValueError(
                 f"Qwen4-Exp FP8 source '{weight_name}' has dtype {weight_dtype}; "
-                "the pinned checkpoint requires F8_E4M3"
+                "the supported checkpoint layout requires F8_E4M3"
             )
         if ".ple.ple_embedding.ngram_embedding.shard_" in weight_name:
             if len(weight_shape) != 2:
@@ -94,7 +94,7 @@ def validate_qwen4_exp_fp8_header_contract(
             if per_shard_scale in key_index:
                 raise ValueError(
                     f"Qwen4-Exp PLE source '{weight_name}' has forbidden per-shard "
-                    f"scale '{per_shard_scale}'; the pinned layout uses one shared scalar"
+                    f"scale '{per_shard_scale}'; the supported layout uses one shared scalar"
                 )
             ple_scale_name = _qwen4_exp_ple_scale_name(weight_name)
             ple_scale = key_index.get(ple_scale_name)
@@ -136,7 +136,7 @@ def validate_qwen4_exp_fp8_header_contract(
         if scale_dtype != "BF16":
             raise ValueError(
                 f"Qwen4-Exp FP8 source '{weight_name}' has scale dtype {scale_dtype}; "
-                "the pinned checkpoint requires BF16 inverse scales"
+                "the supported checkpoint layout requires BF16 inverse scales"
             )
         consumed_scales.add(scale_name)
         scaled += 1
@@ -1477,7 +1477,7 @@ class Qwen4ExpCausalLMModel(nn.Module):
             constants=constants,
             report={
                 "checkpoint_family": "Qwen3.8-Flash-Next-FP8",
-                "dense_dtype": "graph-declared (BF16 for the pinned checkpoint)",
+                "dense_dtype": "graph-declared (BF16 for the supported checkpoint layout)",
                 "native_fp8_reason": (
                     "No available ONNX Runtime MatMul/MoE ABI consumes F8_E4M3 "
                     "weights with BF16 128x128 inverse-scale grids exactly."

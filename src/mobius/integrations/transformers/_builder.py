@@ -28,10 +28,6 @@ from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
 
-_PINNED_CHECKPOINT_REVISIONS = {
-    "unsloth/Qwen3.8-Flash-Next-FP8": "41cc25fe32cc20053a59c89716196897580cddf6",
-}
-
 
 def _is_qwen4_exp_composite(config) -> bool:
     """Return whether *config* describes the multimodal Qwen4-Exp wrapper."""
@@ -203,16 +199,6 @@ def build_transformers_model(
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
     """
-    pinned_revision = _PINNED_CHECKPOINT_REVISIONS.get(model_id)
-    if pinned_revision is not None:
-        if revision is None:
-            revision = pinned_revision
-        elif revision != pinned_revision:
-            raise ValueError(
-                f"{model_id} is integrated only at immutable revision "
-                f"{pinned_revision}; got {revision}."
-            )
-
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,
@@ -293,7 +279,7 @@ def build_transformers_model(
             missing = sorted(expected_scale_layers - provided_scale_layers)
             extra = sorted(provided_scale_layers - expected_scale_layers)
             raise ValueError(
-                "fp8_kv_cache=True requires the pinned checkpoint's complete per-layer "
+                "fp8_kv_cache=True requires the checkpoint's complete per-layer "
                 "k_scale/v_scale map; partial maps would silently use unit scales. "
                 f"Missing layers: {missing}; unexpected layers: {extra}."
             )

@@ -483,13 +483,6 @@ def _gguf_header_info_from_header_prefix(
     )
 
 
-def _requires_strict_hub_header_preflight(repo_id: str) -> bool:
-    """Return whether this route must never fall back to payload download."""
-    from mobius.integrations.gguf._qwen4_exp import QWEN4EXP_GGUF_REPO
-
-    return repo_id == QWEN4EXP_GGUF_REPO
-
-
 def _validate_preflight_split_header(info: GGUFHeaderInfo, *, source: str) -> None:
     """Require complete, internally consistent split bookkeeping when present."""
     split_values = (info.split_no, info.split_count, info.split_tensors_count)
@@ -585,12 +578,6 @@ def _preflight_hf_gguf_file(
             with session.get(metadata.location, headers=headers, stream=True) as response:
                 chunks = read_response(response)
     except _HUB_PREFLIGHT_TRANSPORT_ERRORS as error:
-        if _requires_strict_hub_header_preflight(repo_id):
-            raise RuntimeError(
-                f"Cannot read the bounded GGUF header for {source!r}; refusing payload "
-                "download because Qwen4Exp route policy cannot be established. "
-                "No payload was downloaded."
-            ) from error
         logger.warning(
             "Bounded GGUF header range read failed for %s (%s); downloading the "
             "same immutable revision and validating its local header before dispatch.",
@@ -603,13 +590,7 @@ def _preflight_hf_gguf_file(
             b"".join(chunks),
             source=source,
         )
-    except GGUFHeaderTruncatedError as error:
-        if _requires_strict_hub_header_preflight(repo_id):
-            raise RuntimeError(
-                f"The selected GGUF metadata header for {source!r} exceeds the bounded "
-                "range; refusing payload download because Qwen4Exp route policy cannot "
-                "be established. No payload was downloaded."
-            ) from error
+    except GGUFHeaderTruncatedError:
         logger.warning(
             "The selected GGUF metadata header for %s exceeds the bounded range; "
             "downloading the same immutable revision for full local validation.",
@@ -646,9 +627,9 @@ def _preflight_hf_gguf_file(
             allow_preflight_only=True,
         )
     if architecture == "qwen4exp" and dispatch_architecture:
-        from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_hub_source
+        from mobius.integrations.gguf._qwen4_exp import reject_qwen4exp_payload
 
-        validate_qwen4exp_hub_source(repo_id=repo_id, revision=commit_hash)
+        reject_qwen4exp_payload()
     return _GGUFPreflightRevision(commit_hash, header_info)
 
 
@@ -5018,9 +4999,9 @@ def _select_hf_gguf_set_from_split_headers(
         allow_preflight_only=True,
     )
     if primary_architecture == "qwen4exp":
-        from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_hub_source
+        from mobius.integrations.gguf._qwen4_exp import reject_qwen4exp_payload
 
-        validate_qwen4exp_hub_source(repo_id=repo_id, revision=revision)
+        reject_qwen4exp_payload()
     mismatched_architectures = {
         name: architecture
         for name, architecture in declared_architectures.items()
@@ -5258,19 +5239,6 @@ def _resolve_gguf_path_impl(
         filename, selected_files = _select_complete_hf_gguf_set(pinned_files, filename)
 
     if len(selected_files) > 1:
-        from mobius.integrations.gguf._qwen4_exp import (
-            QWEN4EXP_GGUF_REPO,
-            validate_qwen4exp_hub_artifact,
-        )
-
-        if repo_id == QWEN4EXP_GGUF_REPO:
-            validate_qwen4exp_hub_artifact(
-                api,
-                repo_id=repo_id,
-                revision=resolved_revision,
-                shard_filenames=selected_files,
-                keep_quantized=keep_quantized,
-            )
         return _download_hf_gguf_shards(
             api,
             repo_id=repo_id,
