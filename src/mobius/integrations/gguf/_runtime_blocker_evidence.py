@@ -85,7 +85,9 @@ class GGUFRuntimeBlockerEvidence:
         if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in revisions):
             raise ValueError("GGUF runtime blocker evidence requires immutable revisions")
         if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in digests):
-            raise ValueError("GGUF runtime blocker evidence requires lowercase SHA-256 digests")
+            raise ValueError(
+                "GGUF runtime blocker evidence requires lowercase SHA-256 digests"
+            )
         positive = (
             self.size,
             self.tensor_count,
@@ -187,9 +189,7 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
     explicit_float16_bytes=63_155_880_576,
     explicit_float32_bytes=126_311_761_152,
     bounded_header_bytes=16_777_216,
-    bounded_header_sha256=(
-        "db14a1223f2f4cfaaa265eafd763b760702c83a5007c72e2f3f265b0e7439dff"
-    ),
+    bounded_header_sha256=("db14a1223f2f4cfaaa265eafd763b760702c83a5007c72e2f3f265b0e7439dff"),
     expert_count=128,
     experts_per_token=6,
     layer_counts=(("full_attention", 6), ("mamba2", 23), ("moe", 23)),
@@ -208,17 +208,25 @@ _NEMOTRON_H_MOE_30B_IQ2_XXS = GGUFRuntimeBlockerEvidence(
     runtime_version="0.15.2",
     runtime_schema_issue="https://github.com/onnxruntime/mobius/issues/605",
     blockers=(
-        "The smallest model GGUF in the pinned 29-file repository revision is "
-        "18,010,755,296 bytes, above the 16 GiB bounded-artifact policy; explicit "
-        "float16/float32 weights require 63,155,880,576/126,311,761,152 bytes.",
-        "Nemotron-H correction-biased sigmoid routing, unbiased sigmoid weights, ReLU2 "
-        "experts, shared expert, and optional latent projections cannot use "
-        "com.microsoft.MoE; the truthful production graph retains 40,167 nodes and "
-        "6,028 MatMul nodes.",
-        "ORT GenAI 0.15.2 cannot describe the 58 heterogeneous attention key/value and "
-        "Mamba2 convolution/recurrent state slots required for package replay and reorder.",
-        "The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is not "
-        "serialized; exact ORT tokenizer materialization is unavailable.",
+        (
+            "The smallest model GGUF in the pinned 29-file repository revision is "
+            "18,010,755,296 bytes, above the 16 GiB bounded-artifact policy; explicit "
+            "float16/float32 weights require 63,155,880,576/126,311,761,152 bytes."
+        ),
+        (
+            "Nemotron-H correction-biased sigmoid routing, unbiased sigmoid weights, ReLU2 "
+            "experts, shared expert, and optional latent projections cannot use "
+            "com.microsoft.MoE; the truthful production graph retains 40,167 nodes and "
+            "6,028 MatMul nodes."
+        ),
+        (
+            "ORT GenAI 0.15.2 cannot describe the 58 heterogeneous attention key/value and "
+            "Mamba2 convolution/recurrent state slots required for package replay and reorder."
+        ),
+        (
+            "The GGUF tokenizer declares pre=pixtral, whose compiled llama.cpp behavior is "
+            "not serialized; exact ORT tokenizer materialization is unavailable."
+        ),
     ),
     withheld_checks=(
         "cached decode and deterministic generation",
