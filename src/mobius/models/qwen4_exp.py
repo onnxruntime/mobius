@@ -85,6 +85,44 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
+def _qwen4_exp_ple_buffer_values(
+    config: Qwen4ExpConfig,
+    ple_layer_index: int,
+) -> tuple[dict[str, np.ndarray], int]:
+    """Return deterministic PLE buffers and the padded embedding vocabulary size."""
+    ngram_heads = (config.ngram_size - 1) * config.heads_per_ngram
+    head_vocab_sizes: list[int] = []
+    head_offsets: list[int] = []
+    total_vocab_size = 0
+    for head_idx in range(ngram_heads):
+        global_head_idx = ple_layer_index * ngram_heads + head_idx
+        size = _find_nth_prime_after(
+            config.ngram_vocab_size_base - 1,
+            global_head_idx + 1,
+        )
+        head_vocab_sizes.append(size)
+        head_offsets.append(total_vocab_size)
+        total_vocab_size += size
+    divisor = config.make_ngram_vocab_size_divisible_by
+    padded_vocab_size = math.ceil(total_vocab_size / divisor) * divisor
+    return (
+        {
+            "layer_multipliers": _build_layer_multipliers(
+                config.vocab_size,
+                config.ngram_size,
+                ple_layer_index,
+                config.seed,
+            ),
+            "ngram_heads_vocab_sizes": np.asarray(
+                head_vocab_sizes,
+                dtype=np.int64,
+            ),
+            "ngram_heads_offsets": np.asarray(head_offsets, dtype=np.int64),
+        },
+        padded_vocab_size,
+    )
+
+
 class Qwen4ExpOffsetRMSNorm(nn.Module):
     """Qwen4 offset RMSNorm with upstream float32 normalization/scaling."""
 
@@ -281,37 +319,26 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         assert self._eos_token_id is not None
 
-        head_vocab_sizes: list[int] = []
-        head_offsets: list[int] = []
-        total_vocab_size = 0
-        for head_idx in range(self._ngram_heads):
-            global_head_idx = ple_layer_index * self._ngram_heads + head_idx
-            size = _find_nth_prime_after(config.ngram_vocab_size_base - 1, global_head_idx + 1)
-            head_vocab_sizes.append(size)
-            head_offsets.append(total_vocab_size)
-            total_vocab_size += size
+        buffers, padded_vocab_size = _qwen4_exp_ple_buffer_values(
+            config,
+            ple_layer_index,
+        )
 
         self.layer_multipliers = nn.Parameter(
             [config.ngram_size],
             dtype=ir.DataType.INT64,
-            data=ir.tensor(
-                _build_layer_multipliers(
-                    config.vocab_size, config.ngram_size, ple_layer_index, config.seed
-                )
-            ),
+            data=ir.tensor(buffers["layer_multipliers"]),
         )
         self.ngram_heads_vocab_sizes = nn.Parameter(
             [self._ngram_heads],
             dtype=ir.DataType.INT64,
-            data=ir.tensor(np.asarray(head_vocab_sizes, dtype=np.int64)),
+            data=ir.tensor(buffers["ngram_heads_vocab_sizes"]),
         )
         self.ngram_heads_offsets = nn.Parameter(
             [self._ngram_heads],
             dtype=ir.DataType.INT64,
-            data=ir.tensor(np.asarray(head_offsets, dtype=np.int64)),
+            data=ir.tensor(buffers["ngram_heads_offsets"]),
         )
-        divisor = config.make_ngram_vocab_size_divisible_by
-        padded_vocab_size = math.ceil(total_vocab_size / divisor) * divisor
         self.ngram_embedding = Embedding(padded_vocab_size, embedding_dim // self._ngram_heads)
 
     def _shifted_tokens(self, op: OpBuilder, history: ir.Value, shift: int) -> ir.Value:
@@ -1343,8 +1370,8 @@ class Qwen4ExpVisionEncoderModel(Qwen3VLVisionEncoderModel):
         pixel_values: ir.Value,
         image_grid_thw: ir.Value,
     ):
-        # HF image/video processors always emit float32 packed patches. Cast
-        # once to the checkpoint dtype before the Conv3d patch projection.
+        # The HF image processor emits float32 packed patches. Cast once to
+        # the checkpoint dtype before the Conv3d patch projection.
         pixel_values = op.CastLike(pixel_values, self.visual.patch_embed.weight)
         return super().forward(op, pixel_values, image_grid_thw)
 
@@ -1375,6 +1402,11 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         super().__init__()
         if config.vision is None:
             raise ValueError("Qwen4-Exp multimodal export requires a vision config")
+        if config.video_token_id is not None:
+            raise ValueError(
+                "Qwen4-Exp video inputs are unsupported until the package "
+                "defines a video producer and preprocessing route"
+            )
         if config.deepstack_visual_indexes or config.vision.deepstack_visual_indexes:
             raise ValueError("Qwen4-Exp multimodal export does not support DeepStack")
         self.config = config

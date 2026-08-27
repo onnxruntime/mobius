@@ -6249,6 +6249,11 @@ def build_vlm_workflow_metadata(
     source: str | None = None,
 ) -> dict[str, Any]:
     """Build a vision/audio-encoder to embedding to decoder SSA workflow."""
+    if getattr(config, "model_type", None) in {"qwen4_exp", "qwen4_exp_text"}:
+        raise ValueError(
+            "onnx-genai cannot bind Qwen4-Exp ple_input_ids and four-axis "
+            "position state; use the decoder's mobius.state_manifest metadata"
+        )
     required = {"vision_encoder", "embedding", "decoder"}
     missing = sorted(required.difference(pkg.keys()))
     if missing:

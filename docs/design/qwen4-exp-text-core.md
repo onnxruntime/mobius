@@ -27,9 +27,11 @@ token selection, and PLE hashed n-gram embeddings with their dilated
 convolution and token-context states. The pinned BF16 checkpoint keeps
 DeltaNet recurrent math and recurrent cache state in float32, while convolution
 state, projections, sparse-attention caches, and logits remain in model dtype.
-Official safetensors are loaded through a bounded-memory transform: packed
-experts are sliced lazily and the PLE table is allocated once, then populated
-one checkpoint shard at a time.
+Official safetensors are loaded through a bounded-memory package transaction:
+decoder, embedding, and vision bindings are all validated from one shard index
+before any graph is mutated; parameter payloads remain lazy and no source state
+dict is retained. The PLE table is allocated once when serialized, then
+populated one checkpoint shard at a time.
 
 The flattened cache ABI is:
 
@@ -56,13 +58,12 @@ size 16, temporal patch size 2, spatial merge size 2, and 2304 learned position
 embeddings. Mobius reuses the Qwen3 vision implementation with DeepStack
 disabled and the merger projected to the decoder width of 2560.
 
-The embedding graph keeps image and video streams distinct. It scatters
-`image_features` at token 248056 and `video_features` at token 248057 while
-preserving the original token IDs for PLE. The processor contract is the pinned
-Qwen3 processor with vision start/end tokens 248053/248054. Direct video use
-requires the pinned `video_preprocessor_config.json` and routes its
-`pixel_values_videos`/`video_grid_thw` through the shared vision graph before
-feeding `embedding.video_features`.
+The embedding graph scatters `image_features` at token 248056 while preserving
+the original token IDs for PLE. The processor contract is the pinned Qwen3
+image processor with vision start/end tokens 248053/248054. This package is
+explicitly image-only: config extraction validates the checkpoint's video token
+but removes it from runtime metadata, the embedding graph exposes no video
+feature input, and direct configs that request video support fail closed.
 
 QSA uses standard ONNX operators to reproduce the selected-token mask, then
 runs ordinary dense attention under that mask. This is numerically faithful,
@@ -107,9 +108,10 @@ bounded single-tensor materialization policy. The exact header/config/mapping
 support is therefore a fail-closed foundation for future runtime ABI work, not
 a quantized execution claim.
 
-Released onnxruntime-genai cannot represent Qwen4-Exp's four-axis position
-state or heterogeneous per-layer PLE/QSA state membership. ORT GenAI export
-therefore fails closed instead of emitting unsupported semantic keys or lossy
-`%d` cache templates. The decoder graph carries a separate
+Released onnxruntime-genai and the current ONNX GenAI workflow schema cannot
+represent Qwen4-Exp's `ple_input_ids`, four-axis position state, and
+heterogeneous per-layer PLE/QSA membership. Both metadata exporters therefore
+fail closed instead of emitting missing bindings, unsupported semantic keys, or
+lossy `%d` cache templates. The decoder graph carries a separate
 `mobius.state_manifest` metadata document with explicit role-to-layer
 membership for direct ONNX Runtime orchestration.

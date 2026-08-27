@@ -332,17 +332,17 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type == "qwen4_exp_text":
+        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        if model_type == "qwen4_exp_text":
+        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
             from mobius.integrations.transformers._qwen4_exp_weights import (
-                stream_qwen4_exp_safetensors_to_model,
+                stream_qwen4_exp_safetensors_to_package,
             )
 
-            stream_qwen4_exp_safetensors_to_model(
-                package["model"],
+            stream_qwen4_exp_safetensors_to_package(
+                package,
                 model_id,
                 config,
                 revision=revision,

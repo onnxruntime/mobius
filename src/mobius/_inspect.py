@@ -86,13 +86,6 @@ def _resolve_task_model_type_and_config(
             ) from None
 
     model_type = hf_config.model_type
-    from mobius.integrations.transformers._builder import _is_qwen4_exp_composite
-
-    if _is_qwen4_exp_composite(hf_config):
-        raise ValueError(
-            "Qwen4-Exp multimodal component inspection is unavailable in the "
-            "text-core implementation; inspect qwen4_exp_text explicitly."
-        )
 
     # model_type adjustments that affect task selection (subset of build()):
     # Qwen3.5-MoE ships the same model_type for text-only and VL checkpoints.

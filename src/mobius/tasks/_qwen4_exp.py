@@ -16,6 +16,7 @@ from mobius.tasks._base import (
     ModelTask,
     _make_graph,
     _make_model,
+    build_embedding_from_features,
 )
 from mobius.tasks._cache_utils import _register_linear_attention_functions
 from mobius.tasks._vision_language_3model import QwenVLTask
@@ -265,7 +266,12 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
         models = {
             "decoder": self._build_decoder(module.decoder, config),
             "vision_encoder": self._build_vision(module.vision_encoder, config),
-            "embedding": self._build_embedding(module.embedding, config),
+            "embedding": build_embedding_from_features(
+                module.embedding,
+                config,
+                feature_name="image_features",
+                feature_dim=config.hidden_size,
+            ),
         }
         return ModelPackage(models, config=config)
 
@@ -322,34 +328,3 @@ class Qwen4ExpVisionLanguageTask(QwenVLTask):
             config,
             position_axes=["text", "temporal", "height", "width"],
         )
-
-    @staticmethod
-    def _build_embedding(embedding: nn.Module, config: Qwen4ExpConfig) -> ir.Model:
-        batch = ir.SymbolicDim("batch")
-        seq_len = ir.SymbolicDim("sequence_len")
-        num_image_tokens = ir.SymbolicDim("num_image_tokens")
-        num_video_tokens = ir.SymbolicDim("num_video_tokens")
-        graph, builder = _make_graph("qwen4_exp_embedding")
-        input_ids = builder.input(
-            "input_ids",
-            dtype=ir.DataType.INT64,
-            shape=[batch, seq_len],
-        )
-        image_features = builder.input(
-            "image_features",
-            dtype=config.dtype,
-            shape=[num_image_tokens, config.hidden_size],
-        )
-        video_features = builder.input(
-            "video_features",
-            dtype=config.dtype,
-            shape=[num_video_tokens, config.hidden_size],
-        )
-        inputs_embeds = embedding(
-            builder.op,
-            input_ids=input_ids,
-            image_features=image_features,
-            video_features=video_features,
-        )
-        builder.add_output(inputs_embeds, "inputs_embeds")
-        return _make_model(graph)

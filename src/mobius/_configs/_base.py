@@ -1726,6 +1726,11 @@ class Qwen4ExpConfig(CausalLMConfig):
                 raise ValueError(
                     "Qwen4-Exp multimodal export requires language_model_only=false"
                 )
+            if base.video_token_id != 248057:
+                raise ValueError(
+                    "Unsupported Qwen4-Exp video token contract: expected source "
+                    f"video_token_id 248057, got {base.video_token_id}"
+                )
             vision = base.vision
             if vision is None:
                 raise ValueError("Qwen4-Exp multimodal config requires vision_config")
@@ -1811,6 +1816,11 @@ class Qwen4ExpConfig(CausalLMConfig):
             mtp_num_hidden_layers=getattr(text, "mtp_num_hidden_layers", 0),
             mtp_use_dedicated_embeddings=getattr(text, "mtp_use_dedicated_embeddings", False),
         )
+        if is_multimodal:
+            # The current package is explicitly image-only. Preserve validation
+            # of the source token above, but do not publish runtime video support
+            # until a video producer/preprocessor route exists.
+            fields["video_token_id"] = None
         return cls(**fields)
 
 
