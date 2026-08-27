@@ -78,6 +78,61 @@ def test_text_only_resolution_ignores_multimodal_parent_architecture() -> None:
     assert model_type == "qwen4_exp_text"
 
 
+def test_qwen4_text_only_build_excludes_composite_config(monkeypatch) -> None:
+    text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
+    parent_config = type(
+        "Qwen4ExpParent",
+        (),
+        {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": text_config,
+            "vision_config": object(),
+        },
+    )()
+    config = make_config(model_type="qwen4_exp", vision=object())
+    model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (text_config, parent_config, "qwen4_exp"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (_DummyModule, "text-generation", "qwen4_exp_text"),
+    )
+
+    def config_from_hf(_config, *, parent_config, module_class):
+        assert parent_config is None
+        assert module_class is _DummyModule
+        return config
+
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", config_from_hf)
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda _module, built_config, *args, **kwargs: ModelPackage(
+            {"model": model},
+            config=built_config,
+        ),
+    )
+
+    package = transformers_builder.build_transformers_model(
+        "Qwen/Qwen3.8-Flash-Next",
+        text_only=True,
+        load_weights=False,
+    )
+    assert package.config.model_type == "qwen4_exp_text"
+    assert package.config.vision is None
+
+
 def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     monkeypatch,
 ) -> None:

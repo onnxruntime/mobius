@@ -244,9 +244,10 @@ def build_transformers_model(
         task,
         allow_parent_architecture_override=not text_only,
     )
+    config_parent = None if text_only and model_type == "qwen4_exp_text" else parent_config
     config = _config_from_hf(
         hf_config,
-        parent_config=parent_config,
+        parent_config=config_parent,
         module_class=module_class,
     )
     if (
