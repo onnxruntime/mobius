@@ -254,41 +254,44 @@ def test_hy_v3_reduced_precision_keeps_selection_bias_in_float32(
 
 
 def test_hy_v3_float32_bias_preserves_near_boundary_expert_selection() -> None:
-    builder, op, graph = create_test_builder()
-    hidden = create_test_input(builder, "hidden", [1, 1, 1], dtype=ir.DataType.FLOAT16)
-    gate = HyV3TopKGate(
-        1,
-        4,
-        2,
-        normalize=False,
-        normalization_floor=None,
-        normalization_epsilon=None,
-        routed_scaling_factor=1.0,
-    )
-    correction = nn.Parameter([4], dtype=ir.DataType.FLOAT)
-    correction._keep_float32 = True
-    correction.const_value = ir.tensor(np.array([1.0002, 1.0001, 1.0, -1.0], dtype=np.float32))
-    experts = gate(op, hidden, correction)[1]
-    experts.name = "experts"
-    graph.outputs.append(experts)
-    correction.name = "correction"
-    graph.register_initializer(correction)
-    model = ir.Model(graph, ir_version=10)
+    correction_values = np.array([1.0002, 1.0, 2.0, -1.0], dtype=np.float32)
+    router_logits = np.array([0.0, 0.0004, 0.0, 0.0], dtype=np.float32)
 
-    model.graph.initializers["weight"].const_value = ir.tensor(
-        np.zeros((4, 1), dtype=np.float32)
-    )
-    near_boundary = model.graph.initializers["correction"].const_value.numpy()
+    def run(correction_dtype: ir.DataType) -> set[int]:
+        builder, op, graph = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 1, 1], dtype=ir.DataType.FLOAT16)
+        gate = HyV3TopKGate(
+            1,
+            4,
+            2,
+            normalize=False,
+            normalization_floor=None,
+            normalization_epsilon=None,
+            routed_scaling_factor=1.0,
+        )
+        correction = nn.Parameter([4], dtype=correction_dtype)
+        correction.const_value = ir.tensor(
+            correction_values.astype(
+                np.float32 if correction_dtype is ir.DataType.FLOAT else np.float16
+            )
+        )
+        experts = gate(op, hidden, correction)[1]
+        experts.name = "experts"
+        graph.outputs.append(experts)
+        correction.name = "correction"
+        graph.register_initializer(correction)
+        model = ir.Model(graph, ir_version=10)
+        model.graph.initializers["weight"].const_value = ir.tensor(router_logits[:, None])
 
-    session = OnnxModelSession(model, device="cpu")
-    actual = session.run({"hidden": np.zeros((1, 1, 1), dtype=np.float16)})["experts"]
-    session.close()
+        session = OnnxModelSession(model, device="cpu")
+        actual = session.run({"hidden": np.ones((1, 1, 1), dtype=np.float16)})["experts"]
+        session.close()
+        return set(actual.reshape(-1).tolist())
 
-    expected = np.argpartition(np.full(4, 0.5, dtype=np.float32) + near_boundary, -2)[-2:]
-    assert set(actual.reshape(-1).tolist()) == set(expected.tolist()) == {0, 1}
-    rounded = near_boundary.astype(np.float16).astype(np.float32)
-    rounded_expected = np.argpartition(np.full(4, 0.5, dtype=np.float32) + rounded, -2)[-2:]
-    assert set(rounded_expected.tolist()) != {0, 1}
+    probabilities = 1.0 / (1.0 + np.exp(-router_logits))
+    expected = np.argpartition(probabilities + correction_values, -2)[-2:]
+    assert run(ir.DataType.FLOAT) == set(expected.tolist()) == {0, 2}
+    assert run(ir.DataType.FLOAT16) == {1, 2}
 
 
 def test_hy_v3_official_router_uses_additive_normalization_epsilon() -> None:
