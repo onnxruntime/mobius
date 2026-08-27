@@ -65,8 +65,15 @@ class GGUFTokenizerEvidence:
     representative_encodings: tuple[tuple[str, tuple[int, ...]], ...]
     representative_special_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
     reconstruct_gpt4o_from_gguf: bool = False
+    reconstruct_gemma4_from_gguf: bool = False
     source_disposition: str | None = None
     llamacpp_oracle: tuple[str, int, str] | None = None
+    user_defined_token_ids: tuple[tuple[str, int], ...] = ()
+    source_added_token_count: int = 0
+    ordered_source_added_tokens_sha256: str | None = None
+    pipeline_sha256: tuple[tuple[str, str], ...] = ()
+    chat_template_sha256: str | None = None
+    uses_model_pre_fallback: bool = False
 
     def __post_init__(self) -> None:
         revisions = (self.revision, self.tokenizer_revision)
@@ -189,14 +196,44 @@ class GGUFTokenizerEvidence:
             raise ValueError(
                 "GPT2_ADD_SEP evidence requires a representative special-token encoding"
             )
-        if self.reconstruct_gpt4o_from_gguf != (self.source_disposition is not None):
+        reconstructs = self.reconstruct_gpt4o_from_gguf or self.reconstruct_gemma4_from_gguf
+        if self.reconstruct_gpt4o_from_gguf and self.reconstruct_gemma4_from_gguf:
+            raise ValueError("Tokenizer evidence cannot select two reconstruction policies")
+        if reconstructs != (self.source_disposition is not None):
             raise ValueError(
                 "GGUF-native reconstruction requires an exact official-source disposition"
             )
         if self.reconstruct_gpt4o_from_gguf and witness.pre_type != "GPT4O":
             raise ValueError("GGUF-native reconstruction is supported only for GPT4O evidence")
-        if witness.pre_type == "GPT4O" and self.llamacpp_oracle is None:
-            raise ValueError("GPT4O evidence requires an exact pinned llama.cpp oracle")
+        if self.reconstruct_gemma4_from_gguf and witness.pre_type != "GEMMA4":
+            raise ValueError("Gemma4 reconstruction requires GEMMA4 evidence")
+        if self.uses_model_pre_fallback and (
+            self.architecture != "gemma4" or self.pre_identifier != "gemma4"
+        ):
+            raise ValueError("Model pre fallback evidence is supported only for Gemma4")
+        if witness.pre_type in {"GPT4O", "GEMMA4"} and self.llamacpp_oracle is None:
+            raise ValueError(
+                f"{witness.pre_type} evidence requires an exact pinned llama.cpp oracle"
+            )
+        if tuple(sorted(self.user_defined_token_ids)) != self.user_defined_token_ids:
+            raise ValueError("Tokenizer evidence user-defined token IDs must be sorted")
+        if self.source_added_token_count < 0 or (
+            (self.source_added_token_count == 0)
+            != (self.ordered_source_added_tokens_sha256 is None)
+        ):
+            raise ValueError("Tokenizer evidence source added-token count and digest disagree")
+        optional_digests = (
+            self.ordered_source_added_tokens_sha256,
+            self.chat_template_sha256,
+            *(digest for _, digest in self.pipeline_sha256),
+        )
+        if any(
+            digest is not None and re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for digest in optional_digests
+        ):
+            raise ValueError("Tokenizer evidence semantic digests must be lowercase SHA-256")
+        if tuple(sorted(self.pipeline_sha256)) != self.pipeline_sha256:
+            raise ValueError("Tokenizer evidence pipeline hashes must be sorted")
         if self.llamacpp_oracle is not None:
             commit, case_count, digest = self.llamacpp_oracle
             dispatch = tokenizer_alias_evidence().get(self.pre_identifier)
@@ -221,6 +258,7 @@ class GGUFTokenizerEvidence:
             self.representative_encodings,
             self.representative_special_encodings,
             self.reconstruct_gpt4o_from_gguf,
+            self.reconstruct_gemma4_from_gguf,
         )
 
 
@@ -849,6 +887,160 @@ _TALKIE_13B_Q4_TOKENIZER = GGUFTokenizerEvidence(
         444,
         "484246b629d6eec375ebac3672e4f4d4fb29646d3b331917ec4d2cfe385c3b6a",
     ),
+)
+
+_GEMMA4_E2B_IQ2_TOKENIZER = GGUFTokenizerEvidence(
+    evidence_id="gemma4-e2b-iq2-native-tokenizer",
+    architecture="gemma4",
+    pre_identifier="gemma4",
+    validated_identifiers=("gemma4",),
+    repository="unsloth/gemma-4-E2B-it-GGUF",
+    revision="0314792d7f1f7e229411f620751375812bb9faf2",
+    filename="gemma-4-E2B-it-UD-IQ2_M.gguf",
+    size=2_290_860_128,
+    lfs_sha256="3d95ada2a122c9c0b42803317239b64b262ac9226a307ff895b3d87eec0c2acd",
+    tensor_count=601,
+    tensor_qtypes=(
+        ("BF16", 1),
+        ("F32", 353),
+        ("IQ2_S", 116),
+        ("IQ3_S", 40),
+        ("IQ3_XXS", 15),
+        ("IQ4_XS", 4),
+        ("Q3_K", 1),
+        ("Q4_K", 71),
+    ),
+    tokenizer_repository="google/gemma-4-E2B-it",
+    tokenizer_revision="3e22461f65e89153144f8adb70e3b8c2cc9845a7",
+    source_config_asset=(
+        "config.json",
+        4_954,
+        "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+    ),
+    tokenizer_metadata_sha256="ba1926593b1ede5e53dd8a41a435cf2783a832cf68f05be90b019350ec60ab77",
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            18_569,
+            "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+        ),
+        (
+            "tokenizer.json",
+            32_169_626,
+            "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+        ),
+        (
+            "tokenizer_config.json",
+            3_082,
+            "9f4fec4b1dc6ecddf8f4a92e9caea5971c0e67d81309f3f9066a2bee8c362633",
+        ),
+    ),
+    token_count=262_144,
+    source_token_count=262_144,
+    embedding_vocabulary_size=262_144,
+    deterministic_padding_range=(262_144, 262_143),
+    ordered_vocabulary_sha256="7905cebbe55e92782d7179b7341d19a4968fdb69e76de970b2d9ede21f1b880d",
+    merge_count=514_906,
+    ordered_merges_sha256="930c8fe84d284f73233935b8dc5b1499a9810f59a8d64f580c1a5e9c123134de",
+    score_count=262_144,
+    ordered_scores_sha256="622375ce8bcfd30d4eb0b737b405825d696a66349a3535ed3630f0abd38fde27",
+    ordered_token_types_sha256=(
+        "987bc200faf7bd20738013daab9cda6a005b2a2842d4f8be9449458663e0bdf9"
+    ),
+    materialized_tokenizer_sha256=(
+        "c440114eceefe1e87a662a77b472ccfa733f4c7950271009dba324d54b7c3583"
+    ),
+    special_token_ids=(
+        ("<audio|>", 258_883),
+        ("<bos>", 2),
+        ("<image|>", 258_882),
+        ("<mask>", 4),
+        ("<pad>", 0),
+        ("<tool|>", 47),
+        ("<turn|>", 106),
+        ("<unk>", 3),
+        ("<|audio>", 256_000),
+        ("<|audio|>", 258_881),
+        ("<|image>", 255_999),
+        ("<|image|>", 258_880),
+        ("<|think|>", 98),
+        ("<|tool>", 46),
+        ("<|turn>", 105),
+        ("<|video|>", 258_884),
+    ),
+    representative_encodings=(
+        (
+            "Hello, world! 12345",
+            (9259, 236764, 1902, 236888, 236743, 236770, 236778, 236800, 236812, 236810),
+        ),
+        ("  spaced  text\n", (138, 169862, 138, 1005, 107)),
+        ("你好，世界！", (144626, 236900, 12811, 237354)),  # noqa: RUF001
+        (
+            "Café — κόσμος 🚀",
+            (160319, 236859, 2192, 150665, 148148, 236743, 242015),
+        ),
+        (
+            "<|channel>thought\nplan<channel|><|tool_call>call:f{}<tool_call|>",
+            (100, 45518, 107, 15081, 101, 48, 6639, 236787, 236760, 16454, 49),
+        ),
+    ),
+    representative_special_encodings=(
+        (
+            "Hello, world! 12345",
+            (
+                2,
+                9259,
+                236764,
+                1902,
+                236888,
+                236743,
+                236770,
+                236778,
+                236800,
+                236812,
+                236810,
+            ),
+        ),
+    ),
+    reconstruct_gemma4_from_gguf=True,
+    source_disposition=(
+        "official copy rejected: its seven tool/channel tokens are all special instead "
+        "of llama.cpp user-defined (with the tool-response EOG override), it omits GGUF "
+        "BOS insertion and cleanup decoding, names <eos> rather than <turn|> as EOS, and "
+        "its chat template hash differs from the GGUF-native template"
+    ),
+    llamacpp_oracle=(
+        "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+        480,
+        "1def4cb26eb2c9b671921869822490944998bd135f5d8acaeaf30161f2b80bb1",
+    ),
+    user_defined_token_ids=(
+        ("<channel|>", 101),
+        ("<tool_call|>", 49),
+        ("<tool_response|>", 51),
+        ('<|"|>', 52),
+        ("<|channel>", 100),
+        ("<|tool_call>", 48),
+        ("<|tool_response>", 50),
+    ),
+    source_added_token_count=24,
+    ordered_source_added_tokens_sha256=(
+        "d2197ea6f594928aa6479c7e27b5a1fd004710b8930784b0606d32966eebde94"
+    ),
+    pipeline_sha256=(
+        ("decoder", "78bc5c572c20213e27daca8fd5993992c1007941901a5fcceb5325362e21db23"),
+        ("normalizer", "bee32d134b0862217fbe58f6ab6ef6a6d89e0e0eb000a084f321aaca31c1929c"),
+        (
+            "post_processor",
+            "a443939c6288561c027ce2908243332dc594e122007588752fd052d928755b35",
+        ),
+        (
+            "pre_tokenizer",
+            "75caeae5a427c06d64010230e6a10b4f7a08253b5b5be3ab5ca4c15cdbf791f5",
+        ),
+    ),
+    chat_template_sha256="241c50d86bdfe5e43307da87f559cd2416aacd67a8de46c15acc0105ef2200b7",
+    uses_model_pre_fallback=True,
 )
 
 _JINA_V2_CODE_Q8_TOKENIZER = GGUFTokenizerEvidence(
@@ -1571,6 +1763,7 @@ _TOKENIZER_EVIDENCE = MappingProxyType(
         record.evidence_id: record
         for record in (
             _GPT2_Q4_TOKENIZER,
+            _GEMMA4_E2B_IQ2_TOKENIZER,
             _KANANA2_13B_Q8_TOKENIZER,
             _TALKIE_13B_Q4_TOKENIZER,
             _JINA_V2_CODE_Q8_TOKENIZER,
@@ -1644,11 +1837,14 @@ def matching_tokenizer_evidence(
     score_count, scores_sha256 = sequence_digest("tokenizer.ggml.scores")
     token_type_count, token_types_sha256 = sequence_digest("tokenizer.ggml.token_type")
     token_types = metadata.get("tokenizer.ggml.token_type")
+    effective_pre = metadata.get("tokenizer.ggml.pre")
+    if effective_pre is None and metadata.get("tokenizer.ggml.model") == "gemma4":
+        effective_pre = "gemma4"
     matches = [
         evidence
         for evidence in _TOKENIZER_EVIDENCE.values()
         if evidence.architecture == architecture
-        and evidence.pre_identifier == metadata.get("tokenizer.ggml.pre")
+        and evidence.pre_identifier == effective_pre
         and evidence.filename == identity.filename
         and evidence.size == identity.size
         and evidence.lfs_sha256 == identity.sha256
@@ -1671,6 +1867,13 @@ def matching_tokenizer_evidence(
             and isinstance(token_types, list)
             and token_types[token_id] in {2, 3}
             for token, token_id in evidence.special_token_ids
+        )
+        and all(
+            token_id < token_count
+            and metadata["tokenizer.ggml.tokens"][token_id] == token
+            and isinstance(token_types, list)
+            and token_types[token_id] == 4
+            for token, token_id in evidence.user_defined_token_ids
         )
     ]
     blockers = [

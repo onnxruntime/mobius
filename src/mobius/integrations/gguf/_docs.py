@@ -261,11 +261,19 @@ def _tokenizers() -> str:
             else f"`{record.blocker_category}`"
         )
         if record.candidate_disposition is not None:
+            route_identity = ""
+            if record.artifact_architecture is not None:
+                declared = record.declared_pre_identifier or "absent"
+                effective = record.effective_pre_identifier or "unresolved"
+                route_identity = (
+                    f"; architecture `{record.artifact_architecture}`, declared pre "
+                    f"`{declared}`, effective pre `{effective}`"
+                )
             disposition += (
                 f"; `{record.artifact_repository}@{record.artifact_revision}` / "
                 f"`{record.artifact_filename}` vs "
                 f"`{record.tokenizer_repository}@{record.tokenizer_revision}`: "
-                f"{record.candidate_disposition}"
+                f"{record.candidate_disposition}{route_identity}"
             )
         if record.identifier in alias_proofs:
             disposition += (
@@ -374,6 +382,9 @@ def _tokenizer_evidence_table() -> str:
         identity = (
             f"`{evidence.repository}@{evidence.revision}`<br>"
             f"`{evidence.filename}`<br>{evidence.size:,} B<br>`{evidence.lfs_sha256}`"
+            f"<br>architecture `{evidence.architecture}`; declared pre "
+            f"`{'absent' if evidence.uses_model_pre_fallback else evidence.pre_identifier}`; "
+            f"effective pre `{evidence.pre_identifier}`"
         )
         source = (
             f"`{evidence.tokenizer_repository}@{evidence.tokenizer_revision}`<br>"
@@ -383,7 +394,11 @@ def _tokenizer_evidence_table() -> str:
         reconstruction = (
             f"<br>GGUF-native GPT4O reconstruction; {evidence.source_disposition}"
             if evidence.reconstruct_gpt4o_from_gguf
-            else ""
+            else (
+                f"<br>GGUF-native Gemma4 reconstruction; {evidence.source_disposition}"
+                if evidence.reconstruct_gemma4_from_gguf
+                else ""
+            )
         )
         oracle = (
             f"<br>llama.cpp oracle `{evidence.llamacpp_oracle[0]}`: "
@@ -398,6 +413,11 @@ def _tokenizer_evidence_table() -> str:
             f"tokens {evidence.token_count:,} `{evidence.ordered_vocabulary_sha256}`<br>"
             f"merges {evidence.merge_count:,} `{evidence.ordered_merges_sha256}`<br>"
             f"types `{evidence.ordered_token_types_sha256}`; scores={evidence.score_count}<br>"
+            f"user-defined IDs `{list(evidence.user_defined_token_ids)}`; "
+            f"source added tokens={evidence.source_added_token_count} "
+            f"`{evidence.ordered_source_added_tokens_sha256}`<br>"
+            f"pipeline `{dict(evidence.pipeline_sha256)}`; "
+            f"chat `{evidence.chat_template_sha256}`<br>"
             f"source IDs `0..{evidence.source_token_count - 1}`; {padding}; "
             f"rows={evidence.embedding_vocabulary_size:,}<br>"
             f"materialized `{evidence.materialized_tokenizer_sha256}`<br>{encodings}"
@@ -528,10 +548,11 @@ def render_document() -> str:
     )
     tokenizer_refresh_note = " ".join(
         (
-            "The compact MiniCPM fixture is reproducible through",
-            "`scripts/generate_minicpm_tokenizer_oracle.py`, which validates immutable 16 MiB",
-            "header slices and official tokenizer hashes, builds tokenizer-only GGUFs and the",
-            "pinned llama.cpp tokenizer tool, then recomputes hashes and mismatch witnesses.",
+            "The MiniCPM and Gemma4 fixtures are reproducible through their",
+            "`scripts/generate_*_tokenizer_oracle.py` workflows, which validate immutable",
+            "bounded headers and official tokenizer hashes, build tokenizer-only GGUFs and the",
+            "pinned llama.cpp helper, then recompute exact outputs and mismatch witnesses.",
+            "The committed Gemma4 inputs also replay the current reconstruction network-free.",
         )
     )
     return f"""# `build_from_gguf()`

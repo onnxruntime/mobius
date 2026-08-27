@@ -144,6 +144,46 @@ _GPT4O_DECODER = {
     "trim_offsets": True,
     "use_regex": True,
 }
+_GEMMA4_NORMALIZER = {
+    "type": "Replace",
+    "pattern": {"String": " "},
+    "content": "▁",
+}
+_GEMMA4_PRE_TOKENIZER = {
+    "type": "Split",
+    "pattern": {"String": " "},
+    "behavior": "MergedWithPrevious",
+    "invert": False,
+}
+_GEMMA4_SOURCE_POST_PROCESSOR = {
+    "type": "TemplateProcessing",
+    "single": [{"Sequence": {"id": "A", "type_id": 0}}],
+    "pair": [
+        {"Sequence": {"id": "A", "type_id": 0}},
+        {"Sequence": {"id": "B", "type_id": 1}},
+    ],
+    "special_tokens": {},
+}
+_GEMMA4_SOURCE_DECODER = {
+    "type": "Sequence",
+    "decoders": [
+        {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+        {"type": "ByteFallback"},
+        {"type": "Fuse"},
+    ],
+}
+_GEMMA4_CLEANUP_REPLACEMENTS = (
+    (" ?", "?"),
+    (" !", "!"),
+    (" .", "."),
+    (" ,", ","),
+    (" ' ", "'"),
+    (" 's", "'s"),
+    (" 'm", "'m"),
+    (" 're", "'re"),
+    (" 've", "'ve"),
+)
+_GEMMA4_FORCED_CONTROL_TOKENS = frozenset({"<eos>", "<turn|>", "<|tool_response>"})
 
 # Audited against the pinned C++ loader. ``tokenizer.huggingface.json`` and
 # ``tokenizer.chat_templates`` are converter/extension fields; llama.cpp does
@@ -218,6 +258,7 @@ class GGUFTokenizerSource:
     representative_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
     representative_special_encodings: tuple[tuple[str, tuple[int, ...]], ...] = ()
     reconstruct_gpt4o_from_gguf: bool = False
+    reconstruct_gemma4_from_gguf: bool = False
 
     def __post_init__(self) -> None:
         if self.repository.count("/") != 1 or not all(self.repository.split("/")):
@@ -1105,11 +1146,151 @@ def _canonicalize_gpt4o_pipeline(
     model["ignore_merges"] = False
 
 
+def _gemma4_post_processor(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    bos_id = metadata.get("tokenizer.ggml.bos_token_id")
+    if (
+        not isinstance(tokens, list)
+        or type(bos_id) is not int
+        or not 0 <= bos_id < len(tokens)
+    ):
+        raise ValueError("GGUF Gemma4 reconstruction requires an exact BOS token")
+    bos = tokens[bos_id]
+    return {
+        "type": "TemplateProcessing",
+        "single": [
+            {"SpecialToken": {"id": bos, "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}},
+        ],
+        "pair": [
+            {"SpecialToken": {"id": bos, "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}},
+            {"SpecialToken": {"id": bos, "type_id": 1}},
+            {"Sequence": {"id": "B", "type_id": 1}},
+        ],
+        "special_tokens": {bos: {"id": bos, "ids": [bos_id], "tokens": [bos]}},
+    }
+
+
+def _canonicalize_gemma4_tokenizer(
+    tokenizer_json: dict[str, Any],
+    metadata: Mapping[str, Any],
+) -> None:
+    """Align official Gemma4 assets with the pinned llama.cpp GGUF semantics."""
+    model = tokenizer_json.get("model")
+    added_tokens = tokenizer_json.get("added_tokens")
+    token_types = metadata.get("tokenizer.ggml.token_type")
+    expected_tokens = metadata.get("tokenizer.ggml.tokens")
+    if (
+        not isinstance(model, dict)
+        or model.get("type") != "BPE"
+        or model.get("byte_fallback") is not True
+        or not isinstance(added_tokens, list)
+        or not isinstance(token_types, list)
+        or not isinstance(expected_tokens, list)
+        or len(token_types) != len(expected_tokens)
+    ):
+        raise ValueError("GGUF-native Gemma4 reconstruction requires exact BPE metadata")
+    if (
+        tokenizer_json.get("normalizer") != _GEMMA4_NORMALIZER
+        or tokenizer_json.get("pre_tokenizer") != _GEMMA4_PRE_TOKENIZER
+        or tokenizer_json.get("post_processor")
+        not in (_GEMMA4_SOURCE_POST_PROCESSOR, _gemma4_post_processor(metadata))
+        or tokenizer_json.get("decoder")
+        not in (
+            _GEMMA4_SOURCE_DECODER,
+            {
+                **_GEMMA4_SOURCE_DECODER,
+                "decoders": [
+                    *_GEMMA4_SOURCE_DECODER["decoders"],
+                    *(
+                        {
+                            "type": "Replace",
+                            "pattern": {"String": old},
+                            "content": new,
+                        }
+                        for old, new in _GEMMA4_CLEANUP_REPLACEMENTS
+                    ),
+                ],
+            },
+        )
+    ):
+        raise ValueError("Pinned tokenizer pipeline differs from GGUF pre 'gemma4'")
+
+    by_id: dict[int, dict[str, Any]] = {}
+    for value in added_tokens:
+        if (
+            not isinstance(value, dict)
+            or type(value.get("id")) is not int
+            or not 0 <= value["id"] < len(expected_tokens)
+            or value.get("content") != expected_tokens[value["id"]]
+        ):
+            raise ValueError("Pinned Gemma4 added-token inventory is invalid")
+        by_id[value["id"]] = value
+    required_added_ids = {
+        token_id for token_id, token_type in enumerate(token_types) if token_type in {3, 4}
+    }
+    required_added_ids.update(
+        token_id
+        for token_id, token in enumerate(expected_tokens)
+        if token in _GEMMA4_FORCED_CONTROL_TOKENS
+    )
+    if not required_added_ids.issubset(by_id):
+        raise ValueError("Pinned Gemma4 tokenizer omits a llama.cpp special token")
+
+    canonical_added = []
+    for token_id in sorted(required_added_ids):
+        value = dict(by_id[token_id])
+        value["special"] = (
+            token_types[token_id] == 3
+            or expected_tokens[token_id] in _GEMMA4_FORCED_CONTROL_TOKENS
+        )
+        canonical_added.append(value)
+    tokenizer_json["added_tokens"] = canonical_added
+    tokenizer_json["post_processor"] = _gemma4_post_processor(metadata)
+    tokenizer_json["decoder"] = {
+        **_GEMMA4_SOURCE_DECODER,
+        "decoders": [
+            *_GEMMA4_SOURCE_DECODER["decoders"],
+            *(
+                {"type": "Replace", "pattern": {"String": old}, "content": new}
+                for old, new in _GEMMA4_CLEANUP_REPLACEMENTS
+            ),
+        ],
+    }
+
+
+def _canonicalize_gemma4_tokenizer_config(
+    metadata: Mapping[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    tokens = metadata.get("tokenizer.ggml.tokens")
+    if not isinstance(tokens, list):
+        raise TypeError("GGUF Gemma4 reconstruction requires an exact vocabulary")
+    for gguf_name, config_name in (
+        ("bos_token_id", "bos_token"),
+        ("eos_token_id", "eos_token"),
+        ("unknown_token_id", "unk_token"),
+        ("padding_token_id", "pad_token"),
+        ("mask_token_id", "mask_token"),
+    ):
+        token_id = metadata.get(f"tokenizer.ggml.{gguf_name}")
+        if type(token_id) is int and 0 <= token_id < len(tokens):
+            config[config_name] = tokens[token_id]
+    config["add_bos_token"] = metadata.get("tokenizer.ggml.add_bos_token") is True
+    templates = _validate_chat_templates(metadata)
+    if set(templates) != {"default"}:
+        raise ValueError("GGUF Gemma4 reconstruction requires one default chat template")
+    config["chat_template"] = templates["default"]
+    return config
+
+
 def _validate_pinned_tokenizer(
     metadata: Mapping[str, Any],
     payloads: Mapping[str, bytes],
     *,
     reconstruct_gpt4o_from_gguf: bool = False,
+    reconstruct_gemma4_from_gguf: bool = False,
 ) -> tuple[str, bytes]:
     raw_tokenizer = payloads["tokenizer.json"]
     tokenizer_json = _json_object(raw_tokenizer, filename="tokenizer.json")
@@ -1125,13 +1306,29 @@ def _validate_pinned_tokenizer(
     if not isinstance(model, Mapping):
         raise TypeError("tokenizer.json must contain a model object")
     pre = metadata.get("tokenizer.ggml.pre")
+    if pre is None and metadata.get("tokenizer.ggml.model") == "gemma4":
+        pre = "gemma4"
     policy = tokenizer_pre_policies().get(pre)
     if reconstruct_gpt4o_from_gguf:
         if policy is None or policy.pre_type != "GPT4O" or not isinstance(model, dict):
             raise ValueError("GGUF-native reconstruction is supported only for GPT4O BPE")
         model["merges"] = metadata.get("tokenizer.ggml.merges")
         config = _canonicalize_gpt4o_tokenizer_config(metadata, config)
+    if reconstruct_gemma4_from_gguf:
+        if (
+            policy is None
+            or policy.pre_type != "GEMMA4"
+            or not isinstance(tokenizer_json, dict)
+        ):
+            raise ValueError("GGUF-native Gemma4 reconstruction requires GEMMA4 dispatch")
+        _canonicalize_gemma4_tokenizer(tokenizer_json, metadata)
+        config = _canonicalize_gemma4_tokenizer_config(metadata, config)
+        raw_tokenizer = json.dumps(
+            tokenizer_json, ensure_ascii=False, separators=(",", ":")
+        ).encode()
     if policy is not None and policy.pre_type == "GPT4O":
+        if not isinstance(pre, str):
+            raise TypeError("GPT4O tokenizer reconstruction requires a string pre identifier")
         _canonicalize_gpt4o_pipeline(tokenizer_json, metadata, pre=pre)
         raw_tokenizer = json.dumps(
             tokenizer_json, ensure_ascii=False, separators=(",", ":")
@@ -1209,13 +1406,23 @@ def _validate_pinned_tokenizer(
     ):
         raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
     if token_types is not None:
-        unsupported_types = sorted(set(token_types) - {1, 2, 3, 4, 5})
+        gemma4_forced_control_tokens = (
+            _GEMMA4_FORCED_CONTROL_TOKENS
+            if policy is not None and policy.pre_type == "GEMMA4"
+            else frozenset()
+        )
+        supported_types = {1, 2, 3, 4, 5}
+        if policy is not None and policy.pre_type == "GEMMA4":
+            supported_types.add(6)
+        unsupported_types = sorted(set(token_types) - supported_types)
         if unsupported_types:
             raise ValueError(
                 f"Pinned tokenizer identity cannot prove GGUF token types {unsupported_types}"
             )
         expected_non_special_added_ids = {
-            index for index, token_type in enumerate(token_types) if token_type == 4
+            index
+            for index, token_type in enumerate(token_types)
+            if token_type == 4 and expected_tokens[index] not in gemma4_forced_control_tokens
         }
         if any(
             index not in source_added_tokens
@@ -1230,7 +1437,11 @@ def _validate_pinned_tokenizer(
             for token in source_added_tokens.values()
             if token.get("special") is True
         }
-        if any(token_types[index] not in {2, 3} for index in source_special_ids):
+        if any(
+            token_types[index] not in {2, 3}
+            and expected_tokens[index] not in gemma4_forced_control_tokens
+            for index in source_special_ids
+        ):
             raise ValueError("Pinned tokenizer special-token inventory differs from GGUF")
 
     special_names = {
@@ -1302,7 +1513,7 @@ def _validate_pinned_tokenizer(
         )
 
     expected_prefix = metadata.get("tokenizer.ggml.add_space_prefix")
-    if expected_prefix is not None:
+    if expected_prefix is not None and policy is not None and policy.pre_type != "GEMMA4":
         pre_tokenizer = tokenizer_json.get("pre_tokenizer")
         queue = [pre_tokenizer]
         byte_level: list[Mapping[str, Any]] = []
@@ -1346,6 +1557,17 @@ def _validate_pinned_tokenizer(
         "tokenizer.chat_template",
         "tokenizer.chat_templates",
     }
+    scores = metadata.get("tokenizer.ggml.scores")
+    if (
+        policy is not None
+        and policy.pre_type == "GEMMA4"
+        and isinstance(scores, list)
+        and len(scores) == len(expected_tokens)
+        and set(scores) == {-1000.0}
+    ):
+        # llama.cpp ranks Gemma4 BPE merges from tokenizer.ggml.merges; the
+        # converter's uniform sentinel scores do not participate in BPE.
+        validated_metadata.add("tokenizer.ggml.scores")
     validated_metadata.update(
         key for key in metadata if key.startswith("tokenizer.chat_template.")
     )
@@ -1363,7 +1585,7 @@ def _validate_pinned_tokenizer(
 
     templates = _validate_chat_templates(metadata)
     source_template = config.get("chat_template")
-    if "chat_template.jinja" in payloads:
+    if "chat_template.jinja" in payloads and not reconstruct_gemma4_from_gguf:
         file_template = payloads["chat_template.jinja"].decode("utf-8")
         if source_template is not None and source_template != file_template:
             raise ValueError("Pinned tokenizer chat template assets contradict each other")
@@ -1466,6 +1688,7 @@ def materialize_gguf_tokenizer(
         metadata,
         payloads,
         reconstruct_gpt4o_from_gguf=source.reconstruct_gpt4o_from_gguf,
+        reconstruct_gemma4_from_gguf=source.reconstruct_gemma4_from_gguf,
     )
     if source.reconstruct_gpt4o_from_gguf:
         config = _json_object(
@@ -1477,6 +1700,17 @@ def materialize_gguf_tokenizer(
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode()
+    if source.reconstruct_gemma4_from_gguf:
+        config = _json_object(
+            payloads.get("tokenizer_config.json", b"{}"),
+            filename="tokenizer_config.json",
+        )
+        payloads["tokenizer_config.json"] = json.dumps(
+            _canonicalize_gemma4_tokenizer_config(metadata, config),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        payloads["chat_template.jinja"] = metadata["tokenizer.chat_template"].encode()
     if (
         source.materialized_tokenizer_sha256 is not None
         and tokenizer_sha256 != source.materialized_tokenizer_sha256

@@ -57,6 +57,7 @@ def test_qwen35_tokenizer_evidence_is_exact_and_runtime_independent() -> None:
 def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> None:
     records = iter_tokenizer_evidence()
     assert [(record.pre_identifier, record.architecture) for record in records] == [
+        ("gemma4", "gemma4"),
         ("gpt-2", "gpt2"),
         ("jina-v2-code", "jina-bert-v2"),
         ("kanana2", "qwen3"),
@@ -226,8 +227,8 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     }
     assert statuses == {
         "deferred-compiled-semantics": 45,
-        "deferred-pinned-artifact-evidence": 12,
-        "validated-pinned-source": 30,
+        "deferred-pinned-artifact-evidence": 11,
+        "validated-pinned-source": 31,
     }
     for record in census:
         assert (record.evidence_id is None) == (record.blocker_category is not None)
@@ -263,6 +264,23 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     assert gpt4o.tokenizer_revision == "7956d98f2a83b2751a98ea7136fdf7fe6cf54e69"
     assert gpt4o.candidate_disposition is not None
     assert "dispatches llama-bpe, not gpt-4o" in gpt4o.candidate_disposition
+
+    granite = next(
+        record for record in census if record.identifier == "granite-embed-multi-311m"
+    )
+    assert granite.blocker_category == "pinned-candidate-effective-pre-mismatch"
+    assert granite.artifact_architecture == "modern-bert"
+    assert granite.declared_pre_identifier is None
+    assert granite.effective_pre_identifier == "gemma4"
+    assert granite.evidence_id is None
+    assert granite.candidate_disposition is not None
+    assert "cannot prove the absent identifier" in granite.candidate_disposition
+
+    gemma4 = next(record for record in census if record.identifier == "gemma4")
+    assert gemma4.artifact_architecture == "gemma4"
+    assert gemma4.declared_pre_identifier is None
+    assert gemma4.effective_pre_identifier == "gemma4"
+    assert gemma4.evidence_id == "gemma4-e2b-iq2-native-tokenizer"
 
     llama4 = next(record for record in census if record.identifier == "llama4")
     assert llama4.blocker_category == "pinned-candidate-incomplete-shard"
@@ -442,6 +460,57 @@ def test_minicpm_mismatch_evidence_cannot_promote_generic_default() -> None:
     assert default.current_status == "deferred-compiled-semantics"
     assert default.evidence_id is None
     assert default.blocker_category == "compiled-llama.cpp-semantic-dependency"
+
+
+def test_gemma4_oracle_fixture_is_bound_to_native_evidence() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_gemma4_tokenizer_oracle.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    route = next(item for item in oracle["routes"] if item["name"] == "gemma4")
+    evidence = tokenizer_evidence("gemma4-e2b-iq2-native-tokenizer")
+    assert evidence is not None
+    assert evidence.validated_identifiers == ("gemma4",)
+    assert evidence.reconstruct_gemma4_from_gguf
+    assert evidence.uses_model_pre_fallback
+    assert evidence.llamacpp_oracle == (
+        oracle["llamacpp_commit"],
+        route["case_count"],
+        route["ordered_results_sha256"],
+    )
+    assert evidence.lfs_sha256 == route["artifact_sha256"]
+    assert route["native_tokenize_mismatch_count"] == 0
+    assert route["native_detokenize_mismatch_count"] == 0
+    assert route["official_copy_tokenize_mismatch_count"] == 167
+
+
+def test_granite_fallback_oracle_does_not_promote_exact_identifier() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_gemma4_tokenizer_oracle.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    route = next(item for item in oracle["routes"] if item["name"] == "granite-fallback")
+    record = next(
+        item
+        for item in tokenizer_route_census()
+        if item.identifier == route["requested_identifier"]
+    )
+    assert record.artifact_architecture == "modern-bert"
+    assert route["declared_pre_identifier"] is record.declared_pre_identifier is None
+    assert (
+        route["effective_fallback_pre_identifier"]
+        == record.effective_pre_identifier
+        == "gemma4"
+    )
+    assert route["native_tokenize_mismatch_count"] == 0
+    assert route["native_detokenize_mismatch_count"] == 0
+    assert [token_id for _, token_id in route["gguf_only_user_defined_tokens"]] == list(
+        range(262_145, 262_152)
+    )
+    assert route["forced_control_eog_ids"] == [262_149]
+    assert record.evidence_id is None
+    assert route["case_count"] == len(oracle["modes"]) * (
+        len(oracle["fixed_input_prefix"])
+        + len(oracle["route_fixed_inputs"]["granite-fallback"])
+        + len(oracle["fixed_input_suffix"])
+        + oracle["random_count"]
+    )
 
 
 def test_shared_evidence_requires_identical_pinned_dispatch_behavior() -> None:

@@ -759,6 +759,103 @@ def test_gpt4o_rejects_template_bos_when_gguf_disables_it() -> None:
         _tokenizer._validate_pinned_tokenizer(metadata, _gpt4o_payloads(metadata))
 
 
+def _gemma4_payloads(metadata: dict) -> dict[str, bytes]:
+    tokenizer = json.loads(_tokenizer_json(metadata["tokenizer.ggml.tokens"]))
+    tokenizer["model"]["byte_fallback"] = True
+    tokenizer["model"]["merges"] = [["h", "i"]]
+    tokenizer["normalizer"] = _tokenizer._GEMMA4_NORMALIZER
+    tokenizer["pre_tokenizer"] = _tokenizer._GEMMA4_PRE_TOKENIZER
+    tokenizer["post_processor"] = _tokenizer._GEMMA4_SOURCE_POST_PROCESSOR
+    tokenizer["decoder"] = _tokenizer._GEMMA4_SOURCE_DECODER
+    tokenizer["added_tokens"] = [
+        {
+            "id": token_id,
+            "content": token,
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": token_type == 3,
+        }
+        for token_id, (token, token_type) in enumerate(
+            zip(
+                metadata["tokenizer.ggml.tokens"],
+                metadata["tokenizer.ggml.token_type"],
+                strict=True,
+            )
+        )
+        if token_type in {3, 4}
+    ]
+    return {
+        "tokenizer.json": json.dumps(tokenizer).encode(),
+        "tokenizer_config.json": json.dumps(
+            {
+                "bos_token": "<bos>",
+                "eos_token": "<eos>",
+                "unk_token": "<unk>",
+                "pad_token": "<pad>",
+                "chat_template": "official template",
+            }
+        ).encode(),
+        "special_tokens_map.json": b"{}",
+        "chat_template.jinja": b"official template",
+    }
+
+
+def _gemma4_metadata() -> dict:
+    metadata = _metadata(pre="gemma4")
+    metadata.pop("tokenizer.ggml.pre")
+    metadata["tokenizer.ggml.model"] = "gemma4"
+    metadata["tokenizer.ggml.scores"] = [-1000.0] * 9
+    metadata["tokenizer.ggml.tokens"] += ["<turn|>", "<user>"]
+    metadata["tokenizer.ggml.token_type"] += [4, 4]
+    metadata["tokenizer.ggml.eos_token_id"] = 7
+    metadata["tokenizer.chat_template"] = "native template"
+    return metadata
+
+
+def test_gemma4_native_reconstruction_applies_llamacpp_semantics() -> None:
+    metadata = _gemma4_metadata()
+    _, materialized = _tokenizer._validate_pinned_tokenizer(
+        metadata,
+        _gemma4_payloads(metadata),
+        reconstruct_gemma4_from_gguf=True,
+    )
+
+    tokenizer = json.loads(materialized)
+    added = {token["id"]: token for token in tokenizer["added_tokens"]}
+    assert added[7]["special"] is True
+    assert added[8]["special"] is False
+    assert tokenizer["post_processor"] == _tokenizer._gemma4_post_processor(metadata)
+    assert tokenizer["decoder"]["decoders"][-1] == {
+        "type": "Replace",
+        "pattern": {"String": " 've"},
+        "content": "'ve",
+    }
+
+
+@pytest.mark.parametrize("mismatch", ["score", "pipeline", "added-token"])
+def test_gemma4_reconstruction_fails_closed_on_semantic_mismatch(mismatch: str) -> None:
+    metadata = _gemma4_metadata()
+    payloads = _gemma4_payloads(metadata)
+    if mismatch == "score":
+        metadata["tokenizer.ggml.scores"][-1] = 0.0
+    else:
+        tokenizer = json.loads(payloads["tokenizer.json"])
+        if mismatch == "pipeline":
+            tokenizer["normalizer"] = None
+        else:
+            tokenizer["added_tokens"][-1]["content"] = "different"
+        payloads["tokenizer.json"] = json.dumps(tokenizer).encode()
+
+    with pytest.raises(ValueError):
+        _tokenizer._validate_pinned_tokenizer(
+            metadata,
+            payloads,
+            reconstruct_gemma4_from_gguf=True,
+        )
+
+
 def test_pipeline_mismatch_leaves_no_partial_output(tmp_path: Path, monkeypatch) -> None:
     metadata = _metadata(pre="smollm")
     payloads = _pinned_payloads(metadata)
@@ -1065,6 +1162,30 @@ def test_malformed_deterministic_padding_rejects(
     ]
 
     with pytest.raises(ValueError, match=message):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
+def test_gemma4_forced_control_token_exception_is_not_global() -> None:
+    metadata = _metadata(pre="qwen2")
+    metadata["tokenizer.ggml.tokens"].append("<|tool_response>")
+    metadata["tokenizer.ggml.token_type"].append(4)
+    metadata["tokenizer.ggml.scores"].append(0.0)
+    payloads = _pinned_payloads(metadata)
+    tokenizer_json = json.loads(payloads["tokenizer.json"])
+    tokenizer_json["added_tokens"].append(
+        {
+            "id": 7,
+            "content": "<|tool_response>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    )
+    payloads["tokenizer.json"] = json.dumps(tokenizer_json).encode()
+
+    with pytest.raises(ValueError, match="user-defined/unused-token inventory"):
         _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
