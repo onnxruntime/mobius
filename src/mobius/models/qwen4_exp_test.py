@@ -420,29 +420,57 @@ def test_multimodal_embedding_preserves_global_image_order():
             np.full(config.hidden_size, 202.0, dtype=np.float32),
         ]
     )
-    session = OnnxModelSession(embedding)
-    try:
-        actual = session.run(
-            {
-                "input_ids": input_ids,
-                "image_features": image_features,
-            }
-        )["inputs_embeds"]
-        video_input_ids = input_ids.copy()
-        video_input_ids[0, 3] = config.unsupported_video_token_id
-        with pytest.raises(
-            ort.capi.onnxruntime_pybind11_state.InvalidArgument,
-            match="indices element out of data bounds",
-        ):
-            session.run(
+    guard_reshape = next(
+        node
+        for node in embedding.graph
+        if node.op_type == "Reshape"
+        and node.inputs[1] is not None
+        and node.inputs[1].producer() is not None
+        and node.inputs[1].producer().op_type == "Unsqueeze"
+        and node.inputs[1].producer().inputs[0].producer() is not None
+        and node.inputs[1].producer().inputs[0].producer().op_type == "Add"
+    )
+    assert (
+        guard_reshape.inputs[1].producer().inputs[0].producer().inputs[0].producer()
+        is not None
+    )
+
+    devices = ["cpu"]
+    if "CUDAExecutionProvider" in ort.get_available_providers():
+        devices.append("cuda")
+    actual = None
+    for device in devices:
+        session = OnnxModelSession(embedding, device=device)
+        try:
+            device_actual = session.run(
                 {
-                    "input_ids": video_input_ids,
+                    "input_ids": input_ids,
                     "image_features": image_features,
                 }
-            )
-    finally:
-        session.close()
+            )["inputs_embeds"]
+            if actual is None:
+                actual = device_actual
+            else:
+                np.testing.assert_array_equal(device_actual, actual)
+            video_input_ids = input_ids.copy()
+            video_input_ids[0, 3] = config.unsupported_video_token_id
+            with pytest.raises(
+                (
+                    ort.capi.onnxruntime_pybind11_state.Fail,
+                    ort.capi.onnxruntime_pybind11_state.RuntimeException,
+                ),
+                match=r"cannot be reshaped|input_shape_size",
+            ):
+                session.run(
+                    {
+                        "input_ids": video_input_ids,
+                        "image_features": image_features,
+                    }
+                )
+        finally:
+            session.close()
 
+    assert actual is not None
     np.testing.assert_array_equal(actual[0, 1], image_features[0])
     np.testing.assert_array_equal(actual[1, 2], image_features[1])
     np.testing.assert_array_equal(actual[0, 0], weight[input_ids[0, 0]].numpy())
@@ -771,8 +799,11 @@ def test_real_video_and_mixed_processor_outputs_have_no_export_route():
     session = OnnxModelSession(embedding)
     try:
         with pytest.raises(
-            ort.capi.onnxruntime_pybind11_state.InvalidArgument,
-            match="indices element out of data bounds",
+            (
+                ort.capi.onnxruntime_pybind11_state.Fail,
+                ort.capi.onnxruntime_pybind11_state.RuntimeException,
+            ),
+            match=r"cannot be reshaped|input_shape_size",
         ):
             session.run(
                 {

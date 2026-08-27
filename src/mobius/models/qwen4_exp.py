@@ -1422,18 +1422,25 @@ class Qwen4ExpImageOnlyEmbeddingModel(Qwen25VLEmbeddingModel):
             image_features,
         )
 
-        # Gather index 0 for image/text requests and index 1 for unsupported
-        # video requests. The one-element table makes video execution fail
-        # deterministically instead of treating <|video_pad|> as a text token.
+        # Reshape one zero element to [1] for image/text and [2] for video.
+        # ONNX Reshape requires equal input/output element counts, so every ORT
+        # EP rejects video before it can return sanitized embeddings. ORT CUDA
+        # calls the shared ReshapeHelper for this check
+        # (onnxruntime@b1f76d58, cuda/tensor/reshape.h); unlike out-of-range
+        # Gather, this cannot fail open by zero-filling on CUDA.
         video_present = op.ReduceMax(
             op.Cast(video_mask, to=ir.DataType.INT64),
             keepdims=False,
         )
-        guard = op.Gather(
-            op.CastLike(op.Constant(value_floats=[0.0]), inputs_embeds),
-            video_present,
+        guard_shape = op.Unsqueeze(
+            op.Add(video_present, op.Constant(value_int=1)),
+            [0],
         )
-        return op.Add(inputs_embeds, guard)
+        guard = op.Reshape(
+            op.CastLike(op.Constant(value_floats=[0.0]), inputs_embeds),
+            guard_shape,
+        )
+        return op.Add(inputs_embeds, op.ReduceSum(guard, keepdims=False))
 
 
 class Qwen4ExpForConditionalGeneration(nn.Module):

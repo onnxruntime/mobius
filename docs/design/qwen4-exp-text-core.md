@@ -65,9 +65,11 @@ explicitly image-only: config extraction validates the checkpoint's video token
 but removes it from runtime metadata, the embedding graph exposes no video
 feature input, and direct configs that request video support fail closed. The
 embedding graph also publishes `mobius.unsupported_token_ids` and carries a
-dynamic ONNX Gather guard: any source video token is sanitized before vocabulary
-lookup and then forces an out-of-range index error, so direct graph execution
-cannot silently treat `<|video_pad|>` as ordinary text.
+dynamic ONNX Reshape guard: any source video token is sanitized before
+vocabulary lookup and then requests two output elements from a one-element
+tensor. ONNX's element-count invariant is enforced before every ORT EP executes,
+so direct graph execution cannot silently treat `<|video_pad|>` as ordinary
+text. This deliberately avoids out-of-range Gather, which CUDA zero-fills.
 
 QSA uses standard ONNX operators to reproduce the selected-token mask, then
 runs ordinary dense attention under that mask. This is numerically faithful,
