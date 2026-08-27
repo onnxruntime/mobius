@@ -86,6 +86,18 @@ RECENT_PR_DEPENDENCIES: tuple[RecentPRDependency, ...] = (
         "merged",
         "follow-up hardening for sharded GGUF evidence edge cases after PR #656",
     ),
+    RecentPRDependency(
+        672,
+        "Prove Qwen3.5 MoE GGUF explicit-float runtime route",
+        "merged",
+        "Qwen3.5 MoE runtime evidence is complete; exclude it from follow-up evidence batches",
+    ),
+    RecentPRDependency(
+        674,
+        "Keep Nemotron-H GGUF runtime fail-closed with pinned evidence",
+        "merged",
+        "Nemotron-H MoE blocker evidence is complete; exclude it from follow-up evidence batches",
+    ),
 )
 
 # Reviewed dispositions for routes that cannot advance until Mobius owns a new

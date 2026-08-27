@@ -31,7 +31,15 @@ import pytest
 import torch
 import yaml
 from huggingface_hub import get_hf_file_metadata, hf_hub_download, hf_hub_url
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GPTBigCodeForCausalLM,
+    GPTNeoXForCausalLM,
+    MptConfig,
+    MptForCausalLM,
+)
 
 from mobius import ModelPackage, build_from_gguf
 from mobius.__main__ import main
@@ -47,6 +55,7 @@ from mobius.integrations.gguf._quantization_report import (
 )
 from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import (
+    GGUFRuntimeEvidence,
     gguf_graph_package_identity,
     runtime_evidence,
 )
@@ -239,6 +248,9 @@ class _PromotedRuntimeCase:
     prompt: str
     generated_tokens: tuple[int, ...]
     atol: float
+    cache_atol: float
+    execution_provider: str = "cpu"
+    reference_kind: str = "direct"
     dequantize: bool = False
     release: bool = False
     allow_dense_moe: bool = False
@@ -246,6 +258,192 @@ class _PromotedRuntimeCase:
 
 
 _PROMOTED_RUNTIME_CASES = (
+    _PromotedRuntimeCase(
+        name="gpt2-q2-k",
+        evidence_id="gpt2-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            262,
+            717,
+            284,
+            307,
+            262,
+            717,
+            284,
+            307,
+            262,
+            6342,
+            286,
+            262,
+            1578,
+            1829,
+            13,
+            198,
+            198,
+            464,
+            1578,
+            1829,
+        ),
+        atol=0.1,
+        cache_atol=1e-4,
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="pythia-70m-q2-k",
+        evidence_id="pythia-70m-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            253,
+            187,
+            2097,
+            273,
+            253,
+            987,
+            273,
+            697,
+            987,
+            273,
+            187,
+            187,
+            510,
+            187,
+            187,
+            187,
+            10,
+            187,
+            187,
+            187,
+        ),
+        atol=0.015,
+        cache_atol=0.012,
+        execution_provider="default",
+        reference_kind="gptneox",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-mpt-q2-k",
+        evidence_id="tiny-mpt-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            16322,
+            29093,
+            23684,
+            45373,
+            18311,
+            20725,
+            47672,
+            43521,
+            33057,
+            20725,
+            47672,
+            43521,
+            33057,
+            18888,
+            31622,
+            2306,
+            16644,
+            15903,
+            4251,
+            33057,
+        ),
+        atol=1e-5,
+        cache_atol=1e-6,
+        execution_provider="default",
+        reference_kind="mpt",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-olmo-q2-k",
+        evidence_id="tiny-olmo-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            34423,
+            35007,
+            32269,
+            13481,
+            30755,
+            16833,
+            3137,
+            4002,
+            34423,
+            25900,
+            31879,
+            15216,
+            4390,
+            33762,
+            4390,
+            33762,
+            4390,
+            4390,
+            4390,
+            4390,
+        ),
+        atol=1e-5,
+        cache_atol=2e-6,
+        reference_kind="olmo",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-starcoder-q2-k",
+        evidence_id="tiny-starcoder-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            225,
+            35,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+        ),
+        atol=5e-5,
+        cache_atol=3e-5,
+        reference_kind="starcoder",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-starcoder2-q2-k",
+        evidence_id="tiny-starcoder2-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            21284,
+            47755,
+            47755,
+            10004,
+            10004,
+            10004,
+            10004,
+            10004,
+            34798,
+            34798,
+            12046,
+            12046,
+            12046,
+            12046,
+            16273,
+            16273,
+            16273,
+            13231,
+            16273,
+            13231,
+        ),
+        atol=4e-4,
+        cache_atol=2e-6,
+        dequantize=True,
+    ),
     _PromotedRuntimeCase(
         name="qwen2.5-0.5b-instruct-q8",
         evidence_id="qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
@@ -273,6 +471,7 @@ _PROMOTED_RUNTIME_CASES = (
             5109,
         ),
         atol=4e-4,
+        cache_atol=4e-4,
     ),
     _PromotedRuntimeCase(
         name="lfm2-350m-f16",
@@ -301,6 +500,7 @@ _PROMOTED_RUNTIME_CASES = (
             4600,
         ),
         atol=3e-4,
+        cache_atol=3e-4,
     ),
     _PromotedRuntimeCase(
         name="qwen3.5-moe-0.87b-q2-k",
@@ -329,6 +529,7 @@ _PROMOTED_RUNTIME_CASES = (
             198,
         ),
         atol=0.35,
+        cache_atol=0.35,
         dequantize=True,
         release=True,
         allow_dense_moe=True,
@@ -499,6 +700,120 @@ def _load_qwen35moe_same_value_reference(
     missing, unexpected = reference.load_state_dict(state_dict, assign=True)
     assert not missing
     assert not unexpected
+    return reference.to(dtype=torch.float32).eval()
+
+
+def _load_low_cost_same_value_reference(
+    gguf_path: Path,
+    evidence: GGUFRuntimeEvidence,
+    reference_kind: str,
+) -> torch.nn.Module:
+    """Load the exact dequantized GGUF values into an independent Transformers graph."""
+    from mobius.integrations.gguf._builder import (
+        _load_dequantized_state_dict,
+        _normalize_gguf_weights,
+    )
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+    from mobius.integrations.gguf._tensor_processors import process_tensors
+
+    if reference_kind == "direct":
+        config = AutoConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+        return AutoModelForCausalLM.from_pretrained(
+            evidence.repository,
+            revision=evidence.revision,
+            gguf_file=evidence.filename,
+            config=config,
+            dtype=torch.float32,
+        ).eval()
+
+    gguf_model = GGUFModel(gguf_path)
+    config = gguf_to_config(gguf_model)
+    state = _normalize_gguf_weights(
+        process_tensors(
+            _load_dequantized_state_dict(gguf_model, evidence.architecture),
+            config,
+        ),
+        evidence.architecture,
+        config,
+    )
+    hf_config = (
+        MptConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+        if reference_kind == "mpt"
+        else AutoConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+    )
+    renamed: dict[str, torch.Tensor] = {}
+    for name, tensor in state.items():
+        value = torch.from_numpy(np.asarray(tensor)).float()
+        if reference_kind == "gptneox":
+            if ".self_attn.qkv_proj." in name:
+                q, k, v = value.chunk(3, dim=0)
+                heads = int(hf_config.num_attention_heads)
+                head_dim = q.shape[0] // heads
+                tail = q.shape[1:]
+                value = (
+                    torch.stack(
+                        (
+                            q.reshape(heads, head_dim, *tail),
+                            k.reshape(heads, head_dim, *tail),
+                            v.reshape(heads, head_dim, *tail),
+                        ),
+                        dim=1,
+                    )
+                    .reshape(value.shape)
+                    .contiguous()
+                )
+            name = name.replace("model.embed_tokens", "gpt_neox.embed_in")
+            name = name.replace("model.layers", "gpt_neox.layers")
+            name = name.replace(".self_attn.qkv_proj", ".attention.query_key_value")
+            name = name.replace(".self_attn.o_proj", ".attention.dense")
+            name = name.replace(".mlp.up_proj", ".mlp.dense_h_to_4h")
+            name = name.replace(".mlp.down_proj", ".mlp.dense_4h_to_h")
+            name = name.replace("model.norm", "gpt_neox.final_layer_norm")
+        elif reference_kind == "starcoder":
+            name = name.replace(".attn.o_proj", ".attn.c_proj")
+            name = name.replace(".mlp.up_proj", ".mlp.c_fc")
+            name = name.replace(".mlp.down_proj", ".mlp.c_proj")
+        elif reference_kind == "mpt":
+            name = name.replace("model.embed_tokens", "transformer.wte")
+            name = name.replace("model.layers", "transformer.blocks")
+            name = name.replace(".input_layernorm", ".norm_1")
+            name = name.replace(".self_attn.qkv_proj", ".attn.Wqkv")
+            name = name.replace(".self_attn.o_proj", ".attn.out_proj")
+            name = name.replace(".post_attention_layernorm", ".norm_2")
+            name = name.replace(".mlp.up_proj", ".ffn.up_proj")
+            name = name.replace(".mlp.down_proj", ".ffn.down_proj")
+            name = name.replace("model.norm", "transformer.norm_f")
+        renamed[name] = value
+
+    if reference_kind == "gptneox":
+        reference = GPTNeoXForCausalLM(hf_config)
+        reference.load_state_dict(renamed, strict=True)
+    elif reference_kind == "starcoder":
+        reference = GPTBigCodeForCausalLM(hf_config)
+        missing, unexpected = reference.load_state_dict(renamed, strict=False)
+        assert missing == ["lm_head.weight"]
+        assert not unexpected
+        reference.tie_weights()
+    elif reference_kind == "mpt":
+        reference = MptForCausalLM(hf_config)
+        missing, unexpected = reference.load_state_dict(renamed, strict=False)
+        assert missing == ["lm_head.weight"]
+        assert not unexpected
+        reference.tie_weights()
+    elif reference_kind == "olmo":
+        reference = AutoModelForCausalLM.from_config(hf_config)
+        reference.load_state_dict(renamed, strict=True)
+    else:
+        raise AssertionError(f"Unknown same-value reference kind: {reference_kind}")
     return reference.to(dtype=torch.float32).eval()
 
 
@@ -1164,7 +1479,7 @@ def test_promoted_gguf_full_runtime_evidence(
         "--dtype",
         "f32",
         "--execution-provider",
-        "cpu",
+        case.execution_provider,
         "--runtime",
         "ort-genai",
         "--runtime-version",
@@ -1228,6 +1543,13 @@ def test_promoted_gguf_full_runtime_evidence(
     packaged_tokenizer = AutoTokenizer.from_pretrained(output_dir, local_files_only=True)
     prompt_ids = tokenizer(case.prompt, return_tensors="pt").input_ids
     assert packaged_tokenizer(case.prompt).input_ids == prompt_ids.tolist()[0]
+    source_vocab = tokenizer.get_vocab()
+    packaged_vocab = packaged_tokenizer.get_vocab()
+    assert all(packaged_vocab[token] == token_id for token, token_id in source_vocab.items())
+    extra_vocab = packaged_vocab.keys() - source_vocab.keys()
+    assert all(token == f"[PAD{packaged_vocab[token]}]" for token in extra_vocab)
+    assert packaged_tokenizer.all_special_ids == tokenizer.all_special_ids
+    assert packaged_tokenizer.model_input_names == tokenizer.model_input_names
     if evidence.architecture == "qwen35moe":
         reference = _load_qwen35moe_same_value_reference(
             gguf_path,
@@ -1235,34 +1557,14 @@ def test_promoted_gguf_full_runtime_evidence(
             revision=evidence.config_revision,
         )
     else:
-        reference = AutoModelForCausalLM.from_pretrained(
-            evidence.repository,
-            revision=evidence.revision,
-            gguf_file=evidence.filename,
-            dtype=torch.float32,
-        ).eval()
+        reference = _load_low_cost_same_value_reference(
+            gguf_path,
+            evidence,
+            case.reference_kind,
+        )
     input_ids = prompt_ids.numpy()
-    reference_logits: list[np.ndarray] = []
     with torch.no_grad():
-        reference_output = reference(prompt_ids, use_cache=True)
-    reference_logits.append(reference_output.logits.numpy().copy())
-    reference_state = reference_output.past_key_values
-    reference_generated: list[int] = []
-    for _ in case.generated_tokens:
-        token = int(reference_output.logits[0, -1].argmax())
-        reference_generated.append(token)
-        token_ids = torch.tensor([[token]], dtype=torch.int64)
-        with torch.no_grad():
-            reference_output = reference(
-                token_ids,
-                past_key_values=reference_state,
-                use_cache=True,
-            )
-        reference_state = reference_output.past_key_values
-        reference_logits.append(reference_output.logits.numpy().copy())
-    assert reference_generated == list(case.generated_tokens)
-    del reference, reference_output, reference_state
-    gc.collect()
+        reference_logits = reference(prompt_ids, use_cache=False).logits.numpy()
 
     session = ort.InferenceSession(
         str(output_dir / "model.onnx"), providers=["CPUExecutionProvider"]
@@ -1275,29 +1577,52 @@ def test_promoted_gguf_full_runtime_evidence(
     )
     np.testing.assert_allclose(
         ort_output["logits"],
-        reference_logits[0],
+        reference_logits,
         rtol=1e-4,
         atol=case.atol,
     )
 
     state = _next_cache(ort_output)
     generated: list[int] = []
+    reference_generated: list[int] = []
+    full_ids = input_ids.copy()
     for step in range(len(case.generated_tokens)):
         token = int(ort_output["logits"][0, -1].argmax())
         generated.append(token)
+        reference_generated.append(int(reference_logits[0, -1].argmax()))
         token_ids = np.asarray([[token]], dtype=np.int64)
+        full_ids = np.concatenate((full_ids, token_ids), axis=1)
         ort_output = _run_promoted_ort(session, token_ids, state, input_ids.shape[1] + step)
         state = _next_cache(ort_output)
+        with torch.no_grad():
+            reference_logits = (
+                reference(torch.from_numpy(full_ids), use_cache=False)
+                .logits[:, -1:, :]
+                .numpy()
+            )
+        full_ort_logits = _run_promoted_ort(
+            session,
+            full_ids,
+            _empty_promoted_state(session, batch_size=1),
+            0,
+        )["logits"][:, -1:, :]
         np.testing.assert_allclose(
-            ort_output["logits"],
-            reference_logits[step + 1],
+            full_ort_logits,
+            reference_logits,
             rtol=1e-4,
             atol=case.atol,
         )
+        np.testing.assert_allclose(
+            ort_output["logits"],
+            full_ort_logits,
+            rtol=1e-4,
+            atol=case.cache_atol,
+        )
     assert len(generated) == len(case.generated_tokens)
     assert generated == list(case.generated_tokens)
+    assert reference_generated == list(case.generated_tokens)
     _assert_replay_rollback_and_reorder(session, input_ids)
-    del session, ort_output, state, reference_logits
+    del session, ort_output, state, reference, reference_logits
     gc.collect()
 
     compatibility = json.loads(

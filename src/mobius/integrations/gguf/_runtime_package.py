@@ -285,16 +285,21 @@ def write_gguf_runtime_package(
             from mobius.integrations.ort_genai import write_ort_genai_config
 
             execution_provider = getattr(pkg, "gguf_execution_provider", None)
-            if execution_provider not in {"cpu", "cuda", "dml"}:
+            if execution_provider not in {"default", "cpu", "cuda", "dml"}:
                 raise ValueError(
                     "ORT GenAI runtime packaging requires an explicit evidenced execution "
-                    "provider: cpu, cuda, or dml."
+                    "provider: default, cpu, cuda, or dml."
                 )
+            # The portable/default graph intentionally keeps standard ONNX operators.
+            # ORT GenAI still needs a concrete provider for session construction.
+            runtime_execution_provider = (
+                "cpu" if execution_provider == "default" else execution_provider
+            )
             artifacts.update(
                 write_ort_genai_config(
                     pkg,
                     str(stage),
-                    ep=execution_provider,
+                    ep=runtime_execution_provider,
                     runtime_version=runtime_version,
                 )
             )

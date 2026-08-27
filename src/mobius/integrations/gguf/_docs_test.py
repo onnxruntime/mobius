@@ -39,7 +39,7 @@ def test_document_is_exact_generator_output() -> None:
 
 def test_document_is_concise_and_reason_coded() -> None:
     document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
-    assert len(document.splitlines()) < 545
+    assert len(document.splitlines()) < 560
     assert "RUNTIME_EVIDENCE_PENDING" in document
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document
@@ -143,6 +143,12 @@ def test_runtime_support_requires_structured_evidence() -> None:
         ("qwen2", ("qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",)),
         ("lfm2", ("lfm2-350m-f16-ort-genai-0.15.2",)),
         ("qwen35moe", ("qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",)),
+        ("gpt2", ("gpt2-q2-k-ort-genai-0.15.2",)),
+        ("starcoder2", ("tiny-starcoder2-q2-k-ort-genai-0.15.2",)),
+        ("olmo", ("tiny-olmo-q2-k-ort-genai-0.15.2",)),
+        ("mpt", ("tiny-mpt-q2-k-ort-genai-0.15.2",)),
+        ("gptneox", ("pythia-70m-q2-k-ort-genai-0.15.2",)),
+        ("starcoder", ("tiny-starcoder-q2-k-ort-genai-0.15.2",)),
     ]
 
     pins = {pin.artifact_id for pin in MMPROJ_ARTIFACT_PINS}

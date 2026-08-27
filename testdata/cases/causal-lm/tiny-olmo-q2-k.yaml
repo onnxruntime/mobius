@@ -1,0 +1,47 @@
+model_id: "hyper-accel/tiny-random-olmo"
+model_type: "olmo"
+revision: "88675ef0caa5bd10ece810c0f2a79faa7724f536"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "tensorblock/tiny-random-olmo-GGUF"
+  revision: "d0ee9498d082d6dc3e730b9765e6e87a9bb5d995"
+  filename: "tiny-random-olmo-Q2_K.gguf"
+  size: 33860576
+  lfs_sha256: "be1c5a22ac0e75cd5874467ffd80bcd2c8500609d3bf7ccdb5b269373e4d6da4"
+  tensor_count: 16
+  tensor_qtypes: {IQ4_NL: 2, Q2_K: 9, Q3_K: 4, Q6_K: 1}
+  execution_provider: "cpu"
+  config_sha256: "c9c78c440503e25fbc21ccab096099de5af2c9edcd0fe677ef6cda14b4db8785"
+  preserve_quantization: false
+  tokenizer:
+    repository: "hyper-accel/tiny-random-olmo"
+    revision: "88675ef0caa5bd10ece810c0f2a79faa7724f536"
+    metadata_sha256: "25efe0090ffe5a6deb777743917fe572548a0f23357f74d8bd9e969cc911fd73"
+    identity_status: "exact"
+    assets:
+      - {filename: "special_tokens_map.json", size: 293, sha256: "a6188c1e366f8ed715e60ff39c46a8c500fc33508e2affeb23e8c547c5853193"}
+      - {filename: "tokenizer.json", size: 2115417, sha256: "a094266ac6c4982efba277bc251349a5a6d6ad37efb39a2a90f53d8be2a40a40"}
+      - {filename: "tokenizer_config.json", size: 5372, sha256: "78a839c7851f14f9fb30e664c2b46166dc0628f2900679e5ec160656f702edff"}
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "tiny-olmo-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 37000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts: ["The capital of France is"]
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Independent same-value Transformers reference; explicit-float runtime evidence only."

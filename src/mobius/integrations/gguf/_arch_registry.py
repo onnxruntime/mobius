@@ -659,7 +659,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
     GGUFArchitectureSpec(
         gguf_arch="qwen3",
         model_type="qwen3",
-        tensor_map_recipe=("llama",),
+        tensor_map_recipe=("llama", "moe_qk_norm_extras"),
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),
@@ -1042,11 +1042,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="gpt2",
         tensor_map_recipe=("gpt2",),
         tensor_processor="gpt2",
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("gpt2-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " Quantization preservation is rejected because canonical GPT-2 GGUF "
+            "Runtime support is restricted to the exact evidenced GPT-2 Q2_K artifact, "
+            "explicit-float CPU import route, pinned tokenizer, and ORT GenAI 0.15.2. "
+            "Quantization preservation is rejected because canonical GPT-2 GGUF "
             "projections must be transposed into graph order, and the current packed "
             "route cannot transpose values together with their scales and zero-points. "
             "Use keep_quantized=False for explicit float import."
@@ -1610,8 +1612,12 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="starcoder2",
         model_type="starcoder2",
         tensor_map_recipe=("llama",),
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-starcoder2-q2-k-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the exact evidenced tiny StarCoder2 Q2_K "
+            "artifact, explicit-float CPU import route, pinned tokenizer, and ORT GenAI 0.15.2."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="stablelm",
@@ -1638,8 +1644,12 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         required_metadata=("attention.layer_norm_epsilon",),
         tensor_processor="llama",
         llama_qk_permute=True,
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-olmo-q2-k-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the exact evidenced tiny OLMo Q2_K artifact, "
+            "explicit-float CPU import route, pinned tokenizer, and ORT GenAI 0.15.2."
+        ),
     ),
     GGUFArchitectureSpec(
         gguf_arch="olmo2",
@@ -2174,11 +2184,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("legacy_layernorm",),
         config_postprocessor="exact_legacy_gguf",
         required_metadata=("attention.layer_norm_epsilon", "attention.max_alibi_bias"),
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-mpt-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " The admitted subset rejects learned positions, Q/K norms, KQV clipping, "
+            "Runtime support is restricted to the exact evidenced tiny MPT Q2_K artifact, "
+            "explicit-float portable graph, pinned tokenizer, and ORT GenAI 0.15.2. "
+            "The admitted subset rejects learned positions, Q/K norms, KQV clipping, "
             "AWQ activation scales, and inconsistent optional bias families. Quantization "
             "preservation is rejected because fused QKV must be split."
         ),
@@ -2190,11 +2202,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("legacy_layernorm",),
         config_postprocessor="exact_legacy_gguf",
         required_metadata=("attention.layer_norm_epsilon", "use_parallel_residual"),
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("pythia-70m-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " The admitted subset requires parallel residual MHA. Quantization "
+            "Runtime support is restricted to the exact evidenced Pythia-70M Q2_K artifact, "
+            "explicit-float portable graph, pinned tokenizer, and ORT GenAI 0.15.2. "
+            "The admitted subset requires parallel residual MHA. Quantization "
             "preservation is rejected because fused QKV rows must be split."
         ),
     ),
@@ -2336,11 +2350,13 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         tensor_map_recipe=("starcoder",),
         config_postprocessor="conventional_legacy",
         required_metadata=("attention.layer_norm_epsilon",),
-        runtime=Support.DEFERRED,
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("tiny-starcoder-q2-k-ort-genai-0.15.2",),
         quantized_import=Support.REJECTED,
         reason=(
-            _RUNTIME_VALIDATION_PENDING
-            + " Quantization preservation is rejected because StarCoder stores one fused "
+            "Runtime support is restricted to the exact evidenced tiny StarCoder Q2_K "
+            "artifact, explicit-float CPU import route, pinned tokenizer, and ORT GenAI "
+            "0.15.2. Quantization preservation is rejected because StarCoder stores one fused "
             "biased MQA projection that must be split for the graph."
         ),
     ),

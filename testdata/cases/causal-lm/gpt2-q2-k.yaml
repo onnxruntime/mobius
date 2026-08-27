@@ -1,0 +1,47 @@
+model_id: "openai-community/gpt2"
+model_type: "gpt2"
+revision: "607a30d783dfa663caf39e06633721c8d4cfcd7e"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "tensorblock/gpt2-GGUF"
+  revision: "5b01870b15c4b2e43695d7f3f3bfb5b26106f23b"
+  filename: "gpt2-Q2_K.gguf"
+  size: 81196544
+  lfs_sha256: "4234545f917ec1df10dab4d926796a83422b68e9010d85a4c111b8b541f32892"
+  tensor_count: 149
+  tensor_qtypes: {F32: 99, Q2_K: 25, Q3_K: 24, Q6_K: 1}
+  execution_provider: "cpu"
+  config_sha256: "b2685ddd8da924d44c53cfb2e7e4f9115659da3b4ed801ecdb08f06f19e0530b"
+  preserve_quantization: false
+  tokenizer:
+    repository: "Xenova/gpt2"
+    revision: "bf2c7f02e0b826c60d03af341171bde20893da66"
+    metadata_sha256: "b2417176025f8500d864004b0bf93b1403dc3c52238f6628f82fb0e3c498977e"
+    identity_status: "exact"
+    assets:
+      - {filename: "special_tokens_map.json", size: 99, sha256: "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad"}
+      - {filename: "tokenizer.json", size: 2107653, sha256: "cda20b8ca044949aa07ac4078420c80d1a57139d5f9f33700e46fb2d891e7c66"}
+      - {filename: "tokenizer_config.json", size: 234, sha256: "551e26ec611d8d0c8edc3ef72e518a38418cb71f40de1347dd486a595e1557d7"}
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "gpt2-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 84000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts: ["The capital of France is"]
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Exact explicit-float GGUF evidence; no native/source-faithful quantized runtime claim."

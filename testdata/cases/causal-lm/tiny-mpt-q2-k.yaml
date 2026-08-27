@@ -1,0 +1,47 @@
+model_id: "echarlaix/tiny-mpt-random-remote-code"
+model_type: "mpt"
+revision: "85e64794e74a6fb2e71e7055c7e0188ccdd32905"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "tensorblock/tiny-mpt-random-remote-code-GGUF"
+  revision: "c151eb3f349485ee8ae72841d7d90b9121d5baa2"
+  filename: "tiny-mpt-random-remote-code-Q2_K.gguf"
+  size: 8734304
+  lfs_sha256: "5627dcb0ff18f6f7200f83c0aed2056a6a7c86b5f2d865833e1b5f00b00e4daa"
+  tensor_count: 8
+  tensor_qtypes: {F32: 3, IQ4_NL: 3, Q3_K: 1, Q8_0: 1}
+  execution_provider: "default"
+  config_sha256: "4933f8f8a982696a9838977476d09c0cbac9dd4107233cd58109cdf43863c1e5"
+  preserve_quantization: false
+  tokenizer:
+    repository: "echarlaix/tiny-mpt-random-remote-code"
+    revision: "85e64794e74a6fb2e71e7055c7e0188ccdd32905"
+    metadata_sha256: "f15522d34f33354bc96d36a73ad4619925240328342d84a156855251c20d43af"
+    identity_status: "exact"
+    assets:
+      - {filename: "special_tokens_map.json", size: 99, sha256: "6f50ab5a5a509a1c309d6171f339b196a900dc9c99ad0408ff23bb615fdae7ad"}
+      - {filename: "tokenizer.json", size: 2113738, sha256: "3cf430678137c8491ca82fb7092ee49e44ad38857fffe1e4a4a5ed860139a5b8"}
+      - {filename: "tokenizer_config.json", size: 237, sha256: "7671fbb5b3d610e6e11d4f5fc78d3a7716e8846112ac7e0f72124caedf887570"}
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "tiny-mpt-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 11000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts: ["The capital of France is"]
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Portable standard-ONNX graph packaged for ORT GenAI CPU; explicit-float only."

@@ -916,7 +916,7 @@ _MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_down_shexp": ("model.layers.{bid}.mlp.shared_expert.down_proj"),
 }
 
-# Per-head/full-projection Q/K norms used by Qwen3-MoE and OLMoE. The
+# Per-head/full-projection Q/K norms used by dense Qwen3, Qwen3-MoE, and OLMoE. The
 # ArchitectureConfig selects the logical width; the GGUF tensor family is the
 # same for both representations.
 _MOE_QK_NORM_EXTRAS: dict[str, str] = {
