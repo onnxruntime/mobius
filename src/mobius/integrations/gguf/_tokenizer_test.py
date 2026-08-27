@@ -1165,6 +1165,30 @@ def test_malformed_deterministic_padding_rejects(
         _tokenizer._validate_pinned_tokenizer(metadata, payloads)
 
 
+def test_gemma4_forced_control_token_exception_is_not_global() -> None:
+    metadata = _metadata(pre="qwen2")
+    metadata["tokenizer.ggml.tokens"].append("<|tool_response>")
+    metadata["tokenizer.ggml.token_type"].append(4)
+    metadata["tokenizer.ggml.scores"].append(0.0)
+    payloads = _pinned_payloads(metadata)
+    tokenizer_json = json.loads(payloads["tokenizer.json"])
+    tokenizer_json["added_tokens"].append(
+        {
+            "id": 7,
+            "content": "<|tool_response>",
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": True,
+        }
+    )
+    payloads["tokenizer.json"] = json.dumps(tokenizer_json).encode()
+
+    with pytest.raises(ValueError, match="user-defined/unused-token inventory"):
+        _tokenizer._validate_pinned_tokenizer(metadata, payloads)
+
+
 def test_post_processor_cannot_hide_matching_special_token_flags(
     tmp_path: Path, monkeypatch
 ) -> None:

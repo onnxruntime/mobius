@@ -548,10 +548,10 @@ def render_document() -> str:
     )
     tokenizer_refresh_note = " ".join(
         (
-            "The compact MiniCPM fixture is reproducible through",
-            "`scripts/generate_minicpm_tokenizer_oracle.py`, which validates immutable 16 MiB",
-            "header slices and official tokenizer hashes, builds tokenizer-only GGUFs and the",
-            "pinned llama.cpp tokenizer tool, then recomputes hashes and mismatch witnesses.",
+            "The MiniCPM and Gemma4 fixtures are reproducible through their",
+            "`scripts/generate_*_tokenizer_oracle.py` workflows, which validate immutable",
+            "bounded headers and official tokenizer hashes, build tokenizer-only GGUFs and the",
+            "pinned llama.cpp helper, then recompute exact outputs and mismatch witnesses.",
         )
     )
     return f"""# `build_from_gguf()`

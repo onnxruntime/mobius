@@ -463,8 +463,9 @@ def test_minicpm_mismatch_evidence_cannot_promote_generic_default() -> None:
 
 
 def test_gemma4_oracle_fixture_is_bound_to_native_evidence() -> None:
-    path = Path(__file__).parents[4] / "tests/data/gguf_gemma4_oracle.json"
+    path = Path(__file__).parents[4] / "tests/data/gguf_gemma4_tokenizer_oracle.json"
     oracle = json.loads(path.read_text(encoding="utf-8"))
+    route = next(item for item in oracle["routes"] if item["name"] == "gemma4")
     evidence = tokenizer_evidence("gemma4-e2b-iq2-native-tokenizer")
     assert evidence is not None
     assert evidence.validated_identifiers == ("gemma4",)
@@ -472,40 +473,43 @@ def test_gemma4_oracle_fixture_is_bound_to_native_evidence() -> None:
     assert evidence.uses_model_pre_fallback
     assert evidence.llamacpp_oracle == (
         oracle["llamacpp_commit"],
-        oracle["case_count"],
-        oracle["ordered_results_sha256"],
+        route["case_count"],
+        route["ordered_results_sha256"],
     )
-    assert evidence.lfs_sha256 == oracle["artifact_sha256"]
-    assert oracle["native_tokenize_mismatch_count"] == 0
-    assert oracle["native_detokenize_mismatch_count"] == 0
-    assert oracle["official_copy_mismatch_count"] == 167
+    assert evidence.lfs_sha256 == route["artifact_sha256"]
+    assert route["native_tokenize_mismatch_count"] == 0
+    assert route["native_detokenize_mismatch_count"] == 0
+    assert route["official_copy_tokenize_mismatch_count"] == 167
 
 
 def test_granite_fallback_oracle_does_not_promote_exact_identifier() -> None:
-    path = Path(__file__).parents[4] / "tests/data/gguf_granite_fallback_oracle.json"
+    path = Path(__file__).parents[4] / "tests/data/gguf_gemma4_tokenizer_oracle.json"
     oracle = json.loads(path.read_text(encoding="utf-8"))
+    route = next(item for item in oracle["routes"] if item["name"] == "granite-fallback")
     record = next(
         item
         for item in tokenizer_route_census()
-        if item.identifier == oracle["requested_identifier"]
+        if item.identifier == route["requested_identifier"]
     )
-    assert oracle["artifact_architecture"] == record.artifact_architecture == "modern-bert"
-    assert oracle["declared_pre_identifier"] is record.declared_pre_identifier is None
+    assert record.artifact_architecture == "modern-bert"
+    assert route["declared_pre_identifier"] is record.declared_pre_identifier is None
     assert (
-        oracle["effective_fallback_pre_identifier"]
+        route["effective_fallback_pre_identifier"]
         == record.effective_pre_identifier
         == "gemma4"
     )
-    assert oracle["fallback_native_tokenize_mismatch_count"] == 0
-    assert oracle["fallback_native_detokenize_mismatch_count"] == 0
-    assert [token_id for _, token_id in oracle["gguf_only_user_defined_tokens"]] == list(
+    assert route["native_tokenize_mismatch_count"] == 0
+    assert route["native_detokenize_mismatch_count"] == 0
+    assert [token_id for _, token_id in route["gguf_only_user_defined_tokens"]] == list(
         range(262_145, 262_152)
     )
-    assert oracle["forced_control_eog_ids"] == [262_149]
+    assert route["forced_control_eog_ids"] == [262_149]
     assert record.evidence_id is None
-    assert oracle["fixed_count"] == 32
-    assert oracle["case_count"] == len(oracle["modes"]) * (
-        oracle["fixed_count"] + oracle["random_count"]
+    assert route["case_count"] == len(oracle["modes"]) * (
+        len(oracle["fixed_input_prefix"])
+        + len(oracle["route_fixed_inputs"]["granite-fallback"])
+        + len(oracle["fixed_input_suffix"])
+        + oracle["random_count"]
     )
 
 

@@ -259,7 +259,6 @@ class GGUFTokenizerEvidence:
             self.representative_special_encodings,
             self.reconstruct_gpt4o_from_gguf,
             self.reconstruct_gemma4_from_gguf,
-            self.uses_model_pre_fallback,
         )
 
 

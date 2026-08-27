@@ -1327,6 +1327,8 @@ def _validate_pinned_tokenizer(
             tokenizer_json, ensure_ascii=False, separators=(",", ":")
         ).encode()
     if policy is not None and policy.pre_type == "GPT4O":
+        if not isinstance(pre, str):
+            raise TypeError("GPT4O tokenizer reconstruction requires a string pre identifier")
         _canonicalize_gpt4o_pipeline(tokenizer_json, metadata, pre=pre)
         raw_tokenizer = json.dumps(
             tokenizer_json, ensure_ascii=False, separators=(",", ":")
@@ -1404,6 +1406,11 @@ def _validate_pinned_tokenizer(
     ):
         raise ValueError(f"Pinned tokenizer pipeline differs from GGUF pre {pre!r}")
     if token_types is not None:
+        gemma4_forced_control_tokens = (
+            _GEMMA4_FORCED_CONTROL_TOKENS
+            if policy is not None and policy.pre_type == "GEMMA4"
+            else frozenset()
+        )
         supported_types = {1, 2, 3, 4, 5}
         if policy is not None and policy.pre_type == "GEMMA4":
             supported_types.add(6)
@@ -1415,7 +1422,7 @@ def _validate_pinned_tokenizer(
         expected_non_special_added_ids = {
             index
             for index, token_type in enumerate(token_types)
-            if token_type == 4 and expected_tokens[index] not in _GEMMA4_FORCED_CONTROL_TOKENS
+            if token_type == 4 and expected_tokens[index] not in gemma4_forced_control_tokens
         }
         if any(
             index not in source_added_tokens
@@ -1432,7 +1439,7 @@ def _validate_pinned_tokenizer(
         }
         if any(
             token_types[index] not in {2, 3}
-            and expected_tokens[index] not in _GEMMA4_FORCED_CONTROL_TOKENS
+            and expected_tokens[index] not in gemma4_forced_control_tokens
             for index in source_special_ids
         ):
             raise ValueError("Pinned tokenizer special-token inventory differs from GGUF")

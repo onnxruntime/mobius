@@ -58,16 +58,16 @@ def test_every_route_has_one_actionable_classification() -> None:
     assert Counter(item.kind for item in items) == {
         "architecture": 144,
         "projector": 60,
-        "tokenizer": 57,
+        "tokenizer": 56,
         "mtp": 22,
         "draft": 2,
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-runtime-abi-blocked": 101,
-        "evidence-only": 94,
+        "evidence-only": 92,
         "immediately-implementable": 67,
         "intentionally-rejected": 19,
-        "artifact-unavailable": 4,
+        "artifact-unavailable": 5,
     }
 
 
