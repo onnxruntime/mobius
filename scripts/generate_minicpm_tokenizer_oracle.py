@@ -24,9 +24,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from mobius.integrations.gguf._tokenizer_mismatch_evidence import (
-    GGUFTokenizerMismatchEvidence,
-    tokenizer_mismatch_evidence,
+from mobius.integrations.gguf._tokenizer_evidence import (
+    GGUFTokenizerBlockerEvidence,
+    tokenizer_blocker_evidence,
 )
 from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT
 
@@ -189,9 +189,9 @@ class _HeaderReader:
         return self.unpack(value_format)
 
 
-def _read_bounded_header(
-    path: Path, evidence: GGUFTokenizerMismatchEvidence
-) -> dict[str, Any]:
+def _read_bounded_header(path: Path, evidence: GGUFTokenizerBlockerEvidence) -> dict[str, Any]:
+    if evidence.bounded_header_bytes is None or evidence.bounded_header_sha256 is None:
+        raise ValueError(f"{evidence.evidence_id!r} has no bounded-header evidence")
     with path.open("rb") as stream:
         data = stream.read(evidence.bounded_header_bytes + 1)
     if len(data) != evidence.bounded_header_bytes:
@@ -317,7 +317,9 @@ def _run_llama(
         if not outputs:
             raise ValueError("llama-tokenize emitted no Python-parseable ID list")
         token_ids = json.loads(outputs[-1])
-        if not isinstance(token_ids, list) or any(type(value) is not int for value in token_ids):
+        if not isinstance(token_ids, list) or any(
+            type(value) is not int for value in token_ids
+        ):
             raise ValueError("llama-tokenize emitted a malformed ID list")
         return token_ids
 
@@ -342,7 +344,7 @@ def _source_results(path: Path, corpus: Sequence[str]) -> list[list[int]]:
 
 
 def _route_fixture(
-    evidence: GGUFTokenizerMismatchEvidence,
+    evidence: GGUFTokenizerBlockerEvidence,
     *,
     header: Path,
     tokenizer_json: Path,
@@ -360,7 +362,9 @@ def _route_fixture(
     ):
         raise ValueError(f"{tokenizer_json} differs from pinned official tokenizer.json")
     metadata = _read_bounded_header(header, evidence)
-    with tempfile.TemporaryDirectory(prefix=f"{evidence.architecture}-tokenizer-oracle-") as temp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"{evidence.architecture}-tokenizer-oracle-"
+    ) as temp:
         tokenizer_only = Path(temp) / "tokenizer-only.gguf"
         _write_tokenizer_only_gguf(
             tokenizer_only,
@@ -469,7 +473,7 @@ def main() -> None:
             jobs=args.jobs,
         )
         for evidence_id, header, tokenizer_json in route_inputs:
-            evidence = tokenizer_mismatch_evidence(evidence_id)
+            evidence = tokenizer_blocker_evidence(evidence_id)
             if evidence is None:
                 raise ValueError(f"Missing mismatch evidence {evidence_id!r}")
             routes.append(

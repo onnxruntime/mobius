@@ -47,9 +47,10 @@ def test_committed_fixture_binds_exact_generator_and_corpus() -> None:
     assert fixture["fixed_count"] == len(FIXED_INPUTS)
     assert fixture["fixed_inputs"] == list(FIXED_INPUTS)
     assert fixture["random_alphabet"] == "".join(RANDOM_ALPHABET)
-    assert fixture["random_alphabet_sha256"] == hashlib.sha256(
-        "".join(RANDOM_ALPHABET).encode()
-    ).hexdigest()
+    assert (
+        fixture["random_alphabet_sha256"]
+        == hashlib.sha256("".join(RANDOM_ALPHABET).encode()).hexdigest()
+    )
     assert fixture["corpus_sha256"] == hashlib.sha256(_json_bytes(corpus)).hexdigest()
     assert fixture["modes"] == [list(mode) for mode in MODES]
     assert fixture["case_count_per_route"] == len(MODES) * len(corpus)

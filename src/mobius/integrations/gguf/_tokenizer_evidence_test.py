@@ -28,10 +28,6 @@ from mobius.integrations.gguf._tokenizer_evidence import (
     tokenizer_blocker_evidence,
     tokenizer_evidence,
 )
-from mobius.integrations.gguf._tokenizer_mismatch_evidence import (
-    iter_tokenizer_mismatch_evidence,
-    tokenizer_mismatch_evidence,
-)
 from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT
 
 
@@ -85,9 +81,12 @@ def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> Non
 def test_plm_tokenizer_blocker_is_exact_and_architecture_scoped() -> None:
     blockers = iter_tokenizer_blocker_evidence()
     assert [record.evidence_id for record in blockers] == [
-        "plm-1.8b-instruct-q4-k-m-tokenizer-blocker"
+        "minicpm-2b-q2-k-tokenizer-mismatch",
+        "minicpm3-4b-q4-k-m-tokenizer-mismatch",
+        "plm-1.8b-instruct-q4-k-m-tokenizer-blocker",
     ]
-    blocker = blockers[0]
+    blocker = tokenizer_blocker_evidence("plm-1.8b-instruct-q4-k-m-tokenizer-blocker")
+    assert blocker is not None
     assert blocker.architecture == "plm"
     assert blocker.pre_identifier == "qwen2"
     assert blocker.revision == "7bec6546983bcf0d99526c943580bd49e2237445"
@@ -132,6 +131,16 @@ def test_plm_llamacpp_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
     assert oracle["source_normalizer"] == "NFC"
     assert oracle["default_add_bos_matches_no_add"]
     assert not oracle["scores_present"]
+
+
+def test_tokenizer_blocker_requires_complete_sorted_qtype_inventory() -> None:
+    blocker = tokenizer_blocker_evidence("minicpm-2b-q2-k-tokenizer-mismatch")
+    assert blocker is not None
+
+    with pytest.raises(ValueError, match="qtypes must be sorted and cover every tensor"):
+        dataclasses.replace(blocker, tensor_qtypes=tuple(reversed(blocker.tensor_qtypes)))
+    with pytest.raises(ValueError, match="qtypes must be sorted and cover every tensor"):
+        dataclasses.replace(blocker, tensor_qtypes=(("F32", 1),))
 
 
 def test_plm_llamacpp_oracle_hashes_are_derived_from_committed_cases() -> None:
@@ -368,7 +377,11 @@ def test_gpt4o_kanana2_oracle_fixture_is_bound_to_evidence() -> None:
 def test_minicpm_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
     path = Path(__file__).parents[4] / "tests/data/gguf_minicpm_tokenizer_oracle.json"
     oracle = json.loads(path.read_text(encoding="utf-8"))
-    records = iter_tokenizer_mismatch_evidence()
+    records = tuple(
+        record
+        for record in iter_tokenizer_blocker_evidence()
+        if record.architecture in {"minicpm", "minicpm3"}
+    )
 
     assert oracle["llamacpp_commit"] == UPSTREAM_COMMIT
     assert oracle["seed"] == 648
@@ -383,7 +396,7 @@ def test_minicpm_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
     assert len(records) == len(oracle["routes"]) == 2
 
     for fixture in oracle["routes"]:
-        evidence = tokenizer_mismatch_evidence(fixture["evidence_id"])
+        evidence = tokenizer_blocker_evidence(fixture["evidence_id"])
         assert evidence is not None
         assert evidence.llamacpp_oracle == (
             oracle["llamacpp_commit"],
@@ -400,7 +413,7 @@ def test_minicpm_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
         )
         first = fixture["first_mismatch"]
         assert evidence.first_mismatch_mode == tuple(first["mode"])
-        assert evidence.first_mismatch == (
+        assert evidence.mismatch == (
             first["text"],
             tuple(first["llamacpp_ids"]),
             tuple(first["source_ids"]),
@@ -409,7 +422,11 @@ def test_minicpm_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
 
 def test_minicpm_mismatch_evidence_cannot_promote_generic_default() -> None:
     exact = iter_tokenizer_evidence()
-    mismatches = iter_tokenizer_mismatch_evidence()
+    mismatches = tuple(
+        record
+        for record in iter_tokenizer_blocker_evidence()
+        if record.architecture in {"minicpm", "minicpm3"}
+    )
     default = next(
         record for record in tokenizer_route_census() if record.identifier == "default"
     )
@@ -418,7 +435,7 @@ def test_minicpm_mismatch_evidence_cannot_promote_generic_default() -> None:
     assert {record.pre_identifier for record in mismatches} == {"default"}
     assert all(record.oracle_mismatch_count > 0 for record in mismatches)
     assert all(
-        record.gguf_chat_template_sha256 != record.source_chat_template_sha256
+        record.chat_template_sha256 != record.source_chat_template_sha256
         for record in mismatches
     )
     assert not any(record.pre_identifier == "default" for record in exact)
@@ -629,6 +646,7 @@ def test_matching_plm_blocker_reports_exact_normalizer_mismatch(tmp_path, monkey
     model = SimpleNamespace(
         architecture="plm",
         metadata={
+            "tokenizer.ggml.model": "gpt2",
             "tokenizer.ggml.pre": "qwen2",
             "tokenizer.ggml.tokens": ["a", "<special>"],
             "tokenizer.ggml.merges": ["a <special>"],
