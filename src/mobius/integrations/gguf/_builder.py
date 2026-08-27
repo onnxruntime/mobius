@@ -6668,9 +6668,7 @@ _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
     "attention_clamp": frozenset({"dbrx"}),
     "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
-    "routing_weight_normalization_floor": frozenset(
-        {"dots1", "ernie4_5-moe", "smallthinker"}
-    ),
+    "routing_weight_normalization_floor": frozenset({"dots1", "ernie4_5-moe", "smallthinker"}),
 }
 
 

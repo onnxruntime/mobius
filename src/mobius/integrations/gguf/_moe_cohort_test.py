@@ -122,11 +122,15 @@ def test_cohort_route_fingerprint_includes_only_consumed_new_fields(
     )
     fields = _graph_config_fields_for_fingerprint(config, architecture)
 
-    assert included == {
-        "attention_clamp",
-        "moe_layer_frequency",
-        "routing_weight_normalization_floor",
-    } & fields.keys()
+    assert (
+        included
+        == {
+            "attention_clamp",
+            "moe_layer_frequency",
+            "routing_weight_normalization_floor",
+        }
+        & fields.keys()
+    )
 
 
 class _FakeGGUF:
