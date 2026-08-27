@@ -1743,6 +1743,32 @@ def test_fp8_qdq_rejects_unclassified_source_before_graph_mutation(tmp_path):
     assert _graph_mutation_snapshot(model) == snapshot_before
 
 
+def test_fp8_dense_rejects_unclassified_source_before_graph_mutation(tmp_path):
+    config = _fp8_config()
+    module = Qwen4ExpCausalLMModel(config)
+    model = build_from_module(
+        module,
+        config,
+        task="qwen4-exp-text-generation",
+    )["model"]
+    source, _dense_targets = _reduced_fp8_checkpoint(module)
+    source["model.language_model.unclassified.weight"] = torch.ones(
+        (1, 1),
+        dtype=torch.bfloat16,
+    )
+    safetensors.torch.save_file(source, str(tmp_path / "model.safetensors"))
+    snapshot_before = _graph_mutation_snapshot(model)
+
+    with pytest.raises(ValueError, match="unclassified by the streaming plan"):
+        stream_preprocessed_safetensors_to_model(
+            model,
+            str(tmp_path),
+            module.build_fp8_streaming_plan,
+        )
+
+    assert _graph_mutation_snapshot(model) == snapshot_before
+
+
 def test_fp8_streaming_plan_rejects_unscaled_projection():
     config = _fp8_config()
     module = Qwen4ExpCausalLMModel(config)

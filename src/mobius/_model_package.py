@@ -187,6 +187,11 @@ def _validate_mtp_save_paths(
             "package being saved has no GGUF quantization report. Remove or clean the "
             "output directory before saving."
         )
+    weight_report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
+    if os.path.lexists(weight_report_path) and (
+        os.path.islink(weight_report_path) or not os.path.isfile(weight_report_path)
+    ):
+        raise ValueError("ModelPackage weight-loading report output must be a real file.")
     previous_sidecar_name = _read_mtp_sidecar_name(directory)
     selected = [name for name in package if components is None or components(name)]
     if len(selected) > 1:

@@ -708,6 +708,13 @@ def stream_preprocessed_safetensors_to_model(
 
     consumed = set(plan.ignored) | set(plan.constants)
     assigned: set[str] = set()
+    bindings: list[
+        tuple[
+            ir.Value,
+            StreamingWeightSource | StreamingExpertBankSource,
+            str,
+        ]
+    ] = []
     validated_scalar_scales: dict[str, float] = {}
     largest_source_tensor_bytes = 0
     largest_reconstruction_working_set_bytes = 0
@@ -810,7 +817,6 @@ def stream_preprocessed_safetensors_to_model(
                 largest_reconstruction_working_set_bytes,
                 source_bytes + bf16_bytes + cast_bytes + scale_bytes,
             )
-            _assign_lazy_preprocessed(initializer, source, key_index, target_name)
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
                 raise ValueError(
@@ -857,7 +863,7 @@ def stream_preprocessed_safetensors_to_model(
                 largest_reconstruction_working_set_bytes,
                 target_bytes + max_transient_bytes,
             )
-            _assign_lazy_expert_bank(initializer, source, key_index, target_name)
+        bindings.append((initializer, source, target_name))
         assigned.add(target_name)
 
     for source_name, expected in plan.constants.items():
@@ -890,6 +896,12 @@ def stream_preprocessed_safetensors_to_model(
             f"{len(unclassified)} checkpoint tensor(s) are unclassified by the "
             f"streaming plan (e.g. {unclassified[:5]})"
         )
+
+    for initializer, source, target_name in bindings:
+        if isinstance(source, StreamingWeightSource):
+            _assign_lazy_preprocessed(initializer, source, key_index, target_name)
+        else:
+            _assign_lazy_expert_bank(initializer, source, key_index, target_name)
 
     report = {
         "format": "mobius.weight-loading-report.v1",

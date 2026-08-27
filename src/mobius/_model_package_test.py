@@ -197,6 +197,24 @@ class TestWeightLoadingReport:
         with pytest.raises(ValueError, match="Invalid weight-loading report"):
             ModelPackage.load(str(tmp_path))
 
+    def test_report_path_is_validated_before_model_serialization(self, tmp_path):
+        external = tmp_path / "external-report"
+        external.write_text("unchanged")
+        (tmp_path / "weight-loading-report.json").symlink_to(external)
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.weight_loading_report = {
+            "format": "mobius.weight-loading-report.v1",
+            "native_fp8": False,
+            "output_weight_format": "fp8_qdq",
+            "streaming_external_data": True,
+        }
+
+        with pytest.raises(ValueError, match="weight-loading report output"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert external.read_text() == "unchanged"
+        assert not (tmp_path / "model.onnx").exists()
+
 
 class TestOnnxShardedSave:
     def test_onnx_external_data_is_sharded(self, tmp_path):
