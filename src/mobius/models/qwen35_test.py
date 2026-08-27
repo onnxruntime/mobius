@@ -480,6 +480,35 @@ class TestQwen35MoEQMoEExport:
 
 
 class TestQwen35MoEVL3ModelQMoEExport:
+    def test_plan_only_quantization_keeps_graph_and_qmoe_weights_aligned(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=_BLK,
+            quant_method="olive",
+            sym=False,
+        )
+        config = dataclasses.replace(
+            _moe_vl_config(None),
+            component_quantization={"decoder": quantization},
+        )
+        model = Qwen35MoEVL3ModelCausalLMModel(config)
+
+        block = model.decoder.model.layers[0].mlp
+        assert block.experts is None
+        assert hasattr(block, "fc1_experts_weights")
+
+        result = model.preprocess_weights(_olive_expert_state_dict())
+        prefix = "decoder.model.layers.0.mlp."
+        parameter_names = {name for name, _ in model.named_parameters()}
+        for suffix in (
+            "fc1_experts_weights",
+            "fc1_scales",
+            "fc2_experts_weights",
+            "fc2_scales",
+        ):
+            assert prefix + suffix in result
+            assert prefix + suffix in parameter_names
+
     def test_olive_preprocess_packs_qmoe_and_binds(self):
         config = _moe_vl_config(
             QuantizationConfig(bits=4, group_size=_BLK, quant_method="olive", sym=False)

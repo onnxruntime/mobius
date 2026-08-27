@@ -8,6 +8,7 @@ from __future__ import annotations
 __all__ = [
     "configure_component_quantization",
     "normalize_component_quantized_weights",
+    "validate_quantized_component_bindings",
 ]
 
 from collections.abc import Iterable, Mapping
@@ -127,15 +128,61 @@ def _float_embedding(module: QuantizedEmbedding) -> Embedding:
     )
 
 
+def _linear_layout_matches(
+    module: QuantizedLinear,
+    quantization: QuantizationConfig,
+) -> bool:
+    expected_zero_point_dtype = (
+        module.scales.dtype if quantization.float_zero_point else ir.DataType.UINT8
+    )
+    return (
+        module._bits == quantization.bits
+        and module._block_size == quantization.group_size
+        and (module.zero_points is None) is quantization.sym
+        and (
+            module.zero_points is None or module.zero_points.dtype == expected_zero_point_dtype
+        )
+    )
+
+
+def _embedding_layout_matches(
+    module: QuantizedEmbedding,
+    quantization: QuantizationConfig,
+) -> bool:
+    return (
+        quantization.quantize_embeddings
+        and module._bits == quantization.bits
+        and module._block_size == quantization.group_size
+        and (module.zero_points is None) is quantization.sym
+    )
+
+
 def _effective_module_quantization(
     component_quantization: QuantizationConfig | None,
     descriptor: ComponentDescriptor,
     local_module_path: str,
+    *,
+    source_module_names: tuple[str, ...] | None = None,
 ) -> QuantizationConfig | None:
     if component_quantization is None or component_quantization.quant_method == "none":
         return None
-    source_names = descriptor.source_module_names(local_module_path)
+    source_names = (
+        source_module_names
+        if source_module_names is not None
+        else descriptor.source_module_names(local_module_path)
+    )
     return component_quantization.for_module(source_names)
+
+
+def _source_module_names(
+    descriptor: ComponentDescriptor,
+    local_module_path: str,
+    module: nn.Module,
+) -> tuple[str, ...]:
+    names = descriptor.source_module_names(local_module_path)
+    if isinstance(module, (ClippableLinear, ClippableQuantizedLinear)):
+        names = (*names, *(f"{name}.linear" for name in names))
+    return tuple(dict.fromkeys(names))
 
 
 def _configure_component_module(
@@ -159,6 +206,11 @@ def _configure_component_module(
             component_quantization,
             descriptor,
             local_path,
+            source_module_names=_source_module_names(
+                descriptor,
+                local_path,
+                child,
+            ),
         )
         is_lm_head = local_path == "lm_head" or local_path.endswith(".lm_head")
         if quantization is not None and is_lm_head and not quantization.quantize_lm_head:
@@ -190,6 +242,11 @@ def _configure_component_module(
 
         if isinstance(child, QuantizedLinear):
             if type(child).forward is not QuantizedLinear.forward:
+                if quantization is not None and _linear_layout_matches(
+                    child,
+                    quantization,
+                ):
+                    continue
                 raise TypeError(
                     f"Component plan cannot rewrite specialized quantized "
                     f"module {local_path!r} ({type(child).__name__}); provide "
@@ -209,6 +266,11 @@ def _configure_component_module(
 
         if isinstance(child, QuantizedEmbedding):
             if type(child).forward is not QuantizedEmbedding.forward:
+                if quantization is not None and _embedding_layout_matches(
+                    child,
+                    quantization,
+                ):
+                    continue
                 raise TypeError(
                     f"Component plan cannot rewrite specialized quantized "
                     f"embedding {local_path!r} ({type(child).__name__}); "
@@ -522,10 +584,22 @@ def normalize_component_quantized_weights(
                     "component-specific tied-weight adapter."
                 )
             local_path = _local_weight_module_path(record.name, descriptor)
+            component_module = _resolve_module(module, descriptor.module_path)
+            local_module = (
+                _resolve_module(component_module, local_path)
+                if component_module is not None
+                else None
+            )
+            source_names = (
+                _source_module_names(descriptor, local_path, local_module)
+                if local_module is not None
+                else descriptor.source_module_names(local_path)
+            )
             quantization = _effective_module_quantization(
                 component_quantization,
                 descriptor,
                 local_path,
+                source_module_names=source_names,
             )
             if quantization is None:
                 raise ValueError(
@@ -552,3 +626,35 @@ def normalize_component_quantized_weights(
             "ModelPackage component"
         )
     return result
+
+
+def validate_quantized_component_bindings(
+    models: Mapping[str, ir.Model],
+    config: BaseModelConfig,
+) -> None:
+    """Require every affine quantized op input to carry a bound value."""
+    if getattr(config, "component_quantization", None) is None:
+        return
+
+    quantized_input_slots = {
+        "MatMulNBits": (1, 2, 3),
+        "GatherBlockQuantized": (0, 2, 3),
+    }
+    for component, model in models.items():
+        if _component_quantization(config, component) is None:
+            continue
+        for node in ir.traversal.RecursiveGraphIterator(model.graph):
+            slots = quantized_input_slots.get(node.op_type)
+            if slots is None:
+                continue
+            for index in slots:
+                if index >= len(node.inputs):
+                    continue
+                value = node.inputs[index]
+                if value is None or value.producer() is not None:
+                    continue
+                if value.const_value is None:
+                    raise ValueError(
+                        f"Quantized component {component!r} has unbound "
+                        f"{node.op_type} parameter {value.name!r}"
+                    )

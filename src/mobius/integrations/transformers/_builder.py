@@ -13,11 +13,15 @@ import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._builder import build_from_module, resolve_dtype
-from mobius._component_quantization import normalize_component_quantized_weights
+from mobius._component_quantization import (
+    normalize_component_quantized_weights,
+    validate_quantized_component_bindings,
+)
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import _download_weights
 from mobius.tasks import ModelTask
+from mobius.weights import adapt_model_weights
 
 logger = logging.getLogger(__name__)
 
@@ -287,8 +291,12 @@ def build_transformers_model(
 
     if load_weights:
         state_dict = _download_weights(model_id, revision=revision)
-        if hasattr(model_module, "preprocess_weights"):
-            state_dict = model_module.preprocess_weights(state_dict)
+        state_dict = adapt_model_weights(
+            model_module,
+            state_dict,
+            config=config,
+            manifest=component_manifest,
+        )
         state_dict = normalize_component_quantized_weights(
             state_dict,
             model_module,
@@ -301,6 +309,7 @@ def build_transformers_model(
             state_dict,
             prefix_map=getattr(model_module, "weight_prefix_map", None),
         )
+        validate_quantized_component_bindings(package, config)
     return package
 
 

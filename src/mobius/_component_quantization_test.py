@@ -14,6 +14,7 @@ from onnxscript import nn
 from mobius._component_quantization import (
     configure_component_quantization,
     normalize_component_quantized_weights,
+    validate_quantized_component_bindings,
 )
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._model_package import ModelPackage
@@ -266,3 +267,34 @@ def test_canonical_quantized_embedding_is_not_treated_as_raw_sidecars():
     assert result["embed_tokens.scales"] is state_dict["embed_tokens.scales"]
     assert result["proj.weight"] is state_dict["proj.weight"]
     assert result["proj.scales"] is state_dict["proj.scales"]
+
+
+def test_binding_validator_rejects_unfilled_quantized_parameters():
+    from mobius._testing import create_test_builder, create_test_input
+    from mobius.tasks._base import _make_model
+
+    linear = QuantizedLinear(
+        64,
+        32,
+        bits=4,
+        block_size=16,
+        has_zero_point=False,
+    )
+    builder, op, graph = create_test_builder()
+    x = create_test_input(builder, "x", [1, 64])
+    output = linear(op, x)
+    builder._adapt_outputs([output], "")
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+    )
+
+    with pytest.raises(ValueError, match="unbound MatMulNBits parameter"):
+        validate_quantized_component_bindings(
+            {"model": _make_model(graph)},
+            ArchitectureConfig(
+                quantization=quantization,
+                component_quantization={"model": quantization},
+            ),
+        )

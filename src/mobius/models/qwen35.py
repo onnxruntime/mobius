@@ -9,7 +9,7 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._weight_utils import (
     preprocess_quantized_weights,
     supported_qmoe_quantization,
@@ -42,6 +42,14 @@ from mobius.models.qwen_vl import (
 # ---------------------------------------------------------------------------
 
 
+def _decoder_quantization(
+    config: ArchitectureConfig,
+) -> QuantizationConfig | None:
+    if config.component_quantization is not None:
+        return config.quantization_for("decoder")
+    return config.quantization
+
+
 def _linear_factory(config: ArchitectureConfig) -> type | None:
     """Build a quantized-linear factory from ``config.quantization``, or None.
 
@@ -53,7 +61,7 @@ def _linear_factory(config: ArchitectureConfig) -> type | None:
     A few modules opt out of this factory for specific quantizers — see
     :data:`_FLOAT_MODULE_QUANT_METHODS`.
     """
-    quantization = config.quantization
+    quantization = _decoder_quantization(config)
     if quantization is None or quantization.quant_method == "none":
         return None
     zero_point_dtype = config.dtype if quantization.float_zero_point else ir.DataType.UINT8
@@ -85,7 +93,7 @@ _FLOAT_MODULE_QUANT_METHODS = frozenset({"olive"})
 
 def _keeps_modules_float(config: ArchitectureConfig) -> bool:
     """True when the checkpoint's quantizer leaves the opt-out modules float."""
-    quantization = config.quantization
+    quantization = _decoder_quantization(config)
     return (
         quantization is not None and quantization.quant_method in _FLOAT_MODULE_QUANT_METHODS
     )
@@ -149,7 +157,7 @@ class Qwen35DecoderLayer(nn.Module):
         ``MatMulNBits`` initializers the checkpoint never contains); otherwise
         the same factory used for the rest of the layer.
         """
-        quantization = config.quantization
+        quantization = _decoder_quantization(config)
         method = quantization.quant_method if quantization is not None else None
         if method in cls.float_linear_attn_quant_methods:
             return None
@@ -504,7 +512,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
         # fused expert-major tensors and route them through the QMoE repacker
         # instead of un-fusing into per-expert MLPs. Uses the same predicate
         # as MoELayer so the weights and the emitted graph never disagree.
-        use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None
+        use_qmoe = supported_qmoe_quantization(_decoder_quantization(self.config)) is not None
         cleaned: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith(("mtp_", "mtp.")):
@@ -554,7 +562,7 @@ class Qwen35MoECausalLMModel(CausalLMModel):
 
         return preprocess_quantized_weights(
             cleaned,
-            self.config.quantization,
+            _decoder_quantization(self.config),
             tie_embeddings=effective_tie_word_embeddings(self.config),
             qmoe_target_path=".mlp",
             qmoe_quant_methods=("gptq", "awq", "olive"),
@@ -652,7 +660,7 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             elif stripped.startswith("language_model."):
                 suffix = stripped[len("language_model.") :]
                 renamed[f"decoder.model.{suffix}"] = value
-        quantization = self.config.quantization
+        quantization = _decoder_quantization(self.config)
         tie = effective_tie_word_embeddings(self.config)
         # Preserve the old VL partial-state-dict behavior: tying is a no-op
         # when neither decoder table is present. Production builds pass the
@@ -661,15 +669,33 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
             key in renamed
             for key in ("decoder.model.embed_tokens.weight", "decoder.lm_head.weight")
         )
-        result = preprocess_quantized_weights(
-            renamed,
-            quantization,
-            tie_embeddings=apply_tie,
-            embed_key="decoder.model.embed_tokens.weight",
-            head_key="decoder.lm_head.weight",
-            qmoe_target_path=None,
-            reject_quantized_embeddings_lm_head=True,
-        )
+        if self.config.component_quantization is not None:
+            decoder_weights = {
+                key: value for key, value in renamed.items() if key.startswith("decoder.")
+            }
+            other_weights = {
+                key: value for key, value in renamed.items() if not key.startswith("decoder.")
+            }
+            result = preprocess_quantized_weights(
+                decoder_weights,
+                self.config.quantization_for("decoder"),
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=None,
+                reject_quantized_embeddings_lm_head=True,
+            )
+            result.update(other_weights)
+        else:
+            result = preprocess_quantized_weights(
+                renamed,
+                quantization,
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=None,
+                reject_quantized_embeddings_lm_head=True,
+            )
         if tie:
             if (
                 "decoder.model.embed_tokens.weight" not in result
@@ -854,7 +880,7 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
         native QMoE ABI, they instead remain expert-major, are renamed from
         Olive's suffix convention, and are packed into QMoE parameters.
         """
-        quantization = self.config.quantization
+        quantization = _decoder_quantization(self.config)
         use_qmoe = supported_qmoe_quantization(quantization) is not None
 
         tie = effective_tie_word_embeddings(self.config)
@@ -906,16 +932,35 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
             key in renamed
             for key in ("decoder.model.embed_tokens.weight", "decoder.lm_head.weight")
         )
-        result = preprocess_quantized_weights(
-            renamed,
-            quantization,
-            tie_embeddings=apply_tie,
-            embed_key="decoder.model.embed_tokens.weight",
-            head_key="decoder.lm_head.weight",
-            qmoe_target_path=".mlp",
-            qmoe_quant_methods=("olive",),
-            reject_quantized_embeddings_lm_head=True,
-        )
+        if self.config.component_quantization is not None:
+            decoder_weights = {
+                key: value for key, value in renamed.items() if key.startswith("decoder.")
+            }
+            other_weights = {
+                key: value for key, value in renamed.items() if not key.startswith("decoder.")
+            }
+            result = preprocess_quantized_weights(
+                decoder_weights,
+                self.config.quantization_for("decoder"),
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+                reject_quantized_embeddings_lm_head=True,
+            )
+            result.update(other_weights)
+        else:
+            result = preprocess_quantized_weights(
+                renamed,
+                quantization,
+                tie_embeddings=apply_tie,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+                reject_quantized_embeddings_lm_head=True,
+            )
         if tie:
             if (
                 "decoder.model.embed_tokens.weight" not in result

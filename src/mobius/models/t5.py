@@ -14,6 +14,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import preprocess_quantized_weights
+from mobius._weight_utils import tie_word_embeddings as tie_weight_tensors
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, Linear
 from mobius.components._encoder_decoder_attention import (
@@ -554,6 +555,20 @@ class T5ForConditionalGeneration(nn.Module):
             embed = new_state_dict.get("encoder.embed_tokens.weight")
             if embed is not None:
                 new_state_dict["decoder.lm_head.weight"] = embed
+        if self.config.component_quantization is not None:
+            tie_weight_tensors(
+                new_state_dict,
+                embed_key="encoder.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
+            if (
+                "encoder.embed_tokens.weight" in new_state_dict
+                and "decoder.embed_tokens.weight" not in new_state_dict
+            ):
+                new_state_dict["decoder.embed_tokens.weight"] = new_state_dict[
+                    "encoder.embed_tokens.weight"
+                ]
+            return new_state_dict
         return preprocess_quantized_weights(
             new_state_dict,
             self.config.quantization,
