@@ -225,7 +225,7 @@ def test_jina_v3_rejects_unknown_rope_scaling_type() -> None:
         gguf_to_config(_FakeGGUF("jina-bert-v3", metadata, _jina_v3_tensors()))
 
 
-def _write_tiny_jina_v3(path: Path) -> None:
+def _write_tiny_jina_v3(path: Path, *, pooling_type: int = 0) -> None:
     from gguf import GGUFWriter
 
     arch = "jina-bert-v3"
@@ -241,7 +241,7 @@ def _write_tiny_jina_v3(path: Path) -> None:
     writer.add_rope_dimension_count(4)
     writer.add_bool(f"{arch}.attention.causal", False)
     writer.add_float32(f"{arch}.attention.layer_norm_epsilon", 1e-5)
-    writer.add_uint32(f"{arch}.pooling_type", 0)
+    writer.add_uint32(f"{arch}.pooling_type", pooling_type)
     writer.add_uint32("tokenizer.ggml.token_type_count", 2)
     for name, shape in _jina_v3_tensors(fused_qkv=True).items():
         writer.add_tensor(name, np.zeros(shape, dtype=np.float32))
@@ -390,6 +390,21 @@ def test_jina_v3_builder_rejects_cache_and_incompatible_task_before_dispatch(
         build_from_gguf(path, static_cache=True)
     with pytest.raises(ValueError, match="only supports task='feature-extraction'"):
         build_from_gguf(path, task="text-generation")
+
+
+def test_jina_v3_explicit_feature_extraction_preserves_pooled_output_abi(
+    tmp_path: Path,
+) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    path = tmp_path / "jina-v3-pooled.gguf"
+    _write_tiny_jina_v3(path, pooling_type=1)
+
+    default = build_from_gguf(path)["model"].graph
+    explicit = build_from_gguf(path, task="feature-extraction")["model"].graph
+
+    assert [value.name for value in default.outputs] == ["sentence_embedding"]
+    assert [value.name for value in explicit.outputs] == ["sentence_embedding"]
 
 
 def test_jina_v3_exact_tensor_mapping_and_singleton_token_type_transform() -> None:

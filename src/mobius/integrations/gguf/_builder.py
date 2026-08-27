@@ -3399,6 +3399,7 @@ def _raise_for_invalid_moe_cohort_tensor_contract(gguf_model) -> None:
         if (
             min(hidden, intermediate, layers, heads, kv_heads, experts, top_k, vocab) <= 0
             or hidden % heads
+            or heads % kv_heads
             or top_k > experts
         ):
             raise ValueError(f"{architecture} GGUF has invalid MoE geometry")

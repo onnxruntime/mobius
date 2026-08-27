@@ -572,6 +572,14 @@ def test_cohort_tensor_contract_rejects_mutations(architecture: str, mutation: s
         _raise_for_invalid_moe_cohort_tensor_contract(source)
 
 
+def test_dbrx_tensor_contract_rejects_non_grouped_kv_heads() -> None:
+    source = _fixture("dbrx")
+    source.metadata["dbrx.attention.head_count_kv"] = 3
+
+    with pytest.raises(ValueError, match="invalid MoE geometry"):
+        _raise_for_invalid_moe_cohort_tensor_contract(source)
+
+
 def test_cohort_config_preserves_routing_and_schedule_semantics() -> None:
     arctic = gguf_to_config(_fixture("arctic"))
     assert arctic.norm_topk_prob
