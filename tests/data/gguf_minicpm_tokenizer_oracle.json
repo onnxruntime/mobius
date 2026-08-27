@@ -1,6 +1,6 @@
 {
   "generator": "scripts/generate_minicpm_tokenizer_oracle.py",
-  "generator_sha256": "d5beab3d8012b9370fac72904fa948b0f43c5d190986710eef3c91030f71dde2",
+  "generator_sha256": "0aad8a9d152f8899b0af0bb82e28fd0e63d58b8657c7f33cc5051bcd66674d02",
   "serialization": "UTF-8 compact JSON arrays (ensure_ascii=false; separators=(',',':'))",
   "llamacpp_commit": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
   "seed": 648,

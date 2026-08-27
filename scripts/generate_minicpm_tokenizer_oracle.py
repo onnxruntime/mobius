@@ -96,6 +96,28 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _canonical_utf8_source_bytes(path: Path) -> bytes:
+    """Read source text as UTF-8 and canonicalize checkout line endings to LF."""
+    text = path.read_text(encoding="utf-8")
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+
+
+def _generator_sha256(path: Path) -> str:
+    return _sha256(_canonical_utf8_source_bytes(path))
+
+
+def _render_fixture(payload: object) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _write_or_check_fixture(path: Path, rendered: bytes, *, check: bool) -> None:
+    if check:
+        if path.read_bytes() != rendered:
+            raise SystemExit(f"{path} is stale; regenerate without --check")
+    else:
+        path.write_bytes(rendered)
+
+
 def build_corpus() -> tuple[str, ...]:
     """Return the exact fixed-plus-seeded corpus in oracle execution order."""
     generator = random.Random(SEED)
@@ -489,7 +511,7 @@ def main() -> None:
 
     payload = {
         "generator": "scripts/generate_minicpm_tokenizer_oracle.py",
-        "generator_sha256": _sha256(Path(__file__).read_bytes()),
+        "generator_sha256": _generator_sha256(Path(__file__)),
         "serialization": "UTF-8 compact JSON arrays (ensure_ascii=false; separators=(',',':'))",
         "llamacpp_commit": UPSTREAM_COMMIT,
         "seed": SEED,
@@ -504,12 +526,7 @@ def main() -> None:
         "case_count_per_route": len(MODES) * len(corpus),
         "routes": routes,
     }
-    rendered = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    if args.check:
-        if args.output.read_text(encoding="utf-8") != rendered:
-            raise SystemExit(f"{args.output} is stale; regenerate without --check")
-    else:
-        args.output.write_text(rendered, encoding="utf-8")
+    _write_or_check_fixture(args.output, _render_fixture(payload), check=args.check)
 
 
 if __name__ == "__main__":
