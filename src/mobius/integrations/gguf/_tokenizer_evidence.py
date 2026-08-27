@@ -259,6 +259,7 @@ class GGUFTokenizerBlockerEvidence:
     chat_template_sha256: str
     source_normalizer: str
     special_token_ids: tuple[tuple[str, int], ...]
+    oracle_corpus_sha256: str
     llamacpp_oracle: tuple[str, int, str]
     mismatch: tuple[str, tuple[int, ...], tuple[int, ...]]
     disposition: str
@@ -275,6 +276,7 @@ class GGUFTokenizerBlockerEvidence:
             self.source_added_tokens_sha256,
             self.source_pipeline_sha256,
             self.chat_template_sha256,
+            self.oracle_corpus_sha256,
             self.llamacpp_oracle[2],
         )
         if any(
@@ -1186,6 +1188,7 @@ _PLM_18B_Q4_K_M_TOKENIZER_BLOCKER = GGUFTokenizerBlockerEvidence(
         ("<|im_end|>", 151645),
         ("<|im_start|>", 151644),
     ),
+    oracle_corpus_sha256="0f3c77d24208f2ac0833668128cb2a00adcb7e6b4b4eedc6e4783e3ec7b41f5a",
     llamacpp_oracle=(
         "8d9af256337d1a501250f9bbf4c0859a654bddd6",
         72,

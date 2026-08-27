@@ -421,6 +421,7 @@ def _tokenizer_blocker_evidence_table() -> str:
             f"{evidence.disposition}<br>"
             f"`{text.encode('unicode_escape').decode()}`: llama.cpp `{list(llamacpp_ids)}` "
             f"vs source `{list(source_ids)}`<br>"
+            f"corpus `{evidence.oracle_corpus_sha256}`; "
             f"llama.cpp oracle `{evidence.llamacpp_oracle[0]}`: "
             f"{evidence.llamacpp_oracle[1]} cases `{evidence.llamacpp_oracle[2]}`"
         )

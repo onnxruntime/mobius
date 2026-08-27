@@ -111,6 +111,7 @@ def test_plm_llamacpp_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
         oracle["case_count"],
         oracle["ordered_results_sha256"],
     )
+    assert blocker.oracle_corpus_sha256 == oracle["corpus_sha256"]
     assert blocker.lfs_sha256 == oracle["artifact_sha256"]
     assert blocker.tokenizer_revision == oracle["tokenizer_revision"]
     assert oracle["case_count"] == len(oracle["modes"]) * len(oracle["fixed_inputs"])
@@ -126,6 +127,48 @@ def test_plm_llamacpp_oracle_fixture_is_bound_to_fail_closed_evidence() -> None:
     assert oracle["source_normalizer"] == "NFC"
     assert oracle["default_add_bos_matches_no_add"]
     assert not oracle["scores_present"]
+
+
+def test_plm_llamacpp_oracle_hashes_are_derived_from_committed_cases() -> None:
+    path = Path(__file__).parents[4] / "tests/data/gguf_plm_qwen2_tokenizer_blocker.json"
+    oracle = json.loads(path.read_text(encoding="utf-8"))
+    assert list(oracle["results"]) == oracle["modes"]
+    assert all(
+        len(oracle["results"][mode]) == len(oracle["fixed_inputs"]) for mode in oracle["modes"]
+    )
+    results = [
+        [mode, text, token_ids]
+        for mode in oracle["modes"]
+        for text, token_ids in zip(
+            oracle["fixed_inputs"], oracle["results"][mode], strict=True
+        )
+    ]
+    assert oracle["case_count"] == len(results)
+    assert oracle["corpus_sha256"] == _digest([oracle["modes"], oracle["fixed_inputs"]])
+    assert oracle["ordered_results_sha256"] == _digest(results)
+    assert oracle["mode_results_sha256"] == {
+        mode: _digest([result for result in results if result[0] == mode])
+        for mode in oracle["modes"]
+    }
+    assert all(
+        isinstance(token_id, int) and token_id >= 0
+        for _, _, token_ids in results
+        for token_id in token_ids
+    )
+
+    results_by_case = {(mode, text): tuple(token_ids) for mode, text, token_ids in results}
+    mismatch = oracle["mismatch"]
+    for mode in mismatch["modes"]:
+        assert results_by_case[mode, mismatch["text"]] == tuple(mismatch["llamacpp_ids"])
+    for text in oracle["fixed_inputs"]:
+        assert (
+            results_by_case["add-special/parse-special", text]
+            == results_by_case["no-add/parse-special", text]
+        )
+    assert (
+        results_by_case["no-add/no-parse-special", "<|im_start|>user\nHello<|im_end|>\n"]
+        != results_by_case["no-add/parse-special", "<|im_start|>user\nHello<|im_end|>\n"]
+    )
 
 
 def test_evidence_schema_accepts_scores_instead_of_bpe_merges() -> None:
@@ -351,7 +394,7 @@ def test_existing_qwen25_runtime_tokenizer_evidence_remains_pinned() -> None:
     )
 
 
-def _digest(values: list[object]) -> str:
+def _digest(values: object) -> str:
     payload = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()
     return hashlib.sha256(payload).hexdigest()
 
