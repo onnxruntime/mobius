@@ -50,6 +50,11 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
     overrides: dict[str, Any] = {"model_type": model_type}
     for name in (
         "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+        "unsupported_video_token_id",
+        "deepstack_visual_indexes",
         "use_bidirectional_attention",
         "audio_token_id",
         "boa_token_id",
@@ -262,10 +267,9 @@ def build_transformers_model(
         task,
         allow_parent_architecture_override=not text_only,
     )
-    config_parent = None if text_only and model_type == "qwen4_exp_text" else parent_config
     config = _config_from_hf(
         hf_config,
-        parent_config=config_parent,
+        parent_config=parent_config,
         module_class=module_class,
     )
     if (
