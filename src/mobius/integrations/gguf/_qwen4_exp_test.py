@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,21 +11,32 @@ import numpy as np
 import pytest
 
 from mobius._configs import Qwen4ExpConfig
-from mobius.integrations.gguf import _qwen4_exp as qwen4exp_gguf
 from mobius.integrations.gguf._config_mapping import gguf_to_config
 from mobius.integrations.gguf._qwen4_exp import (
-    QWEN4EXP_GGUF_REPO,
-    QWEN4EXP_GGUF_REVISION,
-    QWEN4EXP_GGUF_SHARDS,
     Qwen4ExpGGUFImportError,
     _expected_qtypes,
     _expected_shapes,
-    validate_qwen4exp_hub_artifact,
-    validate_qwen4exp_hub_source,
     validate_qwen4exp_tensor_contract,
 )
 from mobius.integrations.gguf._tensor_mapping import map_gguf_to_hf_names
 from mobius.models.qwen4_exp import _build_layer_multipliers, _find_nth_prime_after
+
+_EVIDENCE_REPO = "unsloth/Qwen3.8-Flash-Next-GGUF"
+_EVIDENCE_REVISION = "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249"
+_EVIDENCE_SHARDS = (
+    SimpleNamespace(
+        filename="UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
+        tensor_count=0,
+    ),
+    SimpleNamespace(
+        filename="UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
+        tensor_count=595,
+    ),
+    SimpleNamespace(
+        filename="UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf",
+        tensor_count=629,
+    ),
+)
 
 
 def _metadata() -> dict[str, object]:
@@ -104,8 +116,7 @@ class _HeaderFixture:
         self.manifest = SimpleNamespace(
             split_count=3,
             shards=[
-                SimpleNamespace(tensor_count=shard.tensor_count)
-                for shard in QWEN4EXP_GGUF_SHARDS
+                SimpleNamespace(tensor_count=shard.tensor_count) for shard in _EVIDENCE_SHARDS
             ],
         )
         self.qtype_overrides = qtype_overrides or {}
@@ -205,7 +216,7 @@ def test_qwen4exp_exact_tensor_mapping(gguf_name: str, hf_name: str):
     assert map_gguf_to_hf_names(gguf_name, "qwen4exp") == hf_name
 
 
-def test_qwen4exp_header_fixture_proves_exact_three_shard_closure():
+def test_qwen4exp_header_fixture_matches_pinned_evidence():
     fixture = _HeaderFixture()
 
     _validate_fixture(fixture)
@@ -221,7 +232,11 @@ def test_qwen4exp_header_fixture_proves_exact_three_shard_closure():
         (name, tuple(shape), qtype.name)
         for name, _raw, qtype, shape in fixture.tensor_items_raw()
     ]
-    assert qwen4exp_gguf._tensor_manifest_sha256(entries) == (
+    lines = [
+        f"{name}|{','.join(str(dim) for dim in shape)}|{qtype}"
+        for name, shape, qtype in sorted(entries)
+    ]
+    assert hashlib.sha256("\n".join(lines).encode()).hexdigest() == (
         "25a1e6a2073caf19d3a3835dd23702a19fa09cc651506e11a13de7b48076359d"
     )
 
@@ -241,112 +256,57 @@ def test_qwen4exp_payload_modes_fail_closed_before_raw_payload_access(
         _validate_fixture(_HeaderFixture(), keep_quantized=keep_quantized)
 
 
-def test_qwen4exp_complete_manifest_digest_rejects_any_unpinned_qtype():
+def test_qwen4exp_content_contract_rejects_unsupported_qtype():
     changed = _HeaderFixture({"blk.0.hc_attn_down.weight": "Q5_K"})
 
-    with pytest.raises(ValueError, match="complete tensor manifest mismatch"):
+    with pytest.raises(ValueError, match="qtype mismatch"):
         validate_qwen4exp_tensor_contract(changed, source="changed-header")
 
 
-def _path_infos():
-    return [
-        SimpleNamespace(
-            path=shard.filename,
-            size=shard.size,
-            lfs={"sha256": shard.lfs_sha256},
-        )
-        for shard in QWEN4EXP_GGUF_SHARDS
-    ]
-
-
-def test_qwen4exp_hub_identity_is_pinned_before_payload_download():
-    api = mock.MagicMock()
-    api.get_paths_info.return_value = _path_infos()
-
-    with pytest.raises(Qwen4ExpGGUFImportError, match="intentionally fail-closed"):
-        validate_qwen4exp_hub_artifact(
-            api,
-            repo_id=QWEN4EXP_GGUF_REPO,
-            revision=QWEN4EXP_GGUF_REVISION,
-            shard_filenames=[shard.filename for shard in QWEN4EXP_GGUF_SHARDS],
-            keep_quantized=True,
-        )
-
-    api.get_paths_info.assert_called_once_with(
-        QWEN4EXP_GGUF_REPO,
-        [shard.filename for shard in QWEN4EXP_GGUF_SHARDS],
-        revision=QWEN4EXP_GGUF_REVISION,
-        expand=True,
-    )
-
-
-@pytest.mark.parametrize(
-    ("repo_id", "revision", "message"),
-    [
-        ("other/Qwen4Exp-GGUF", QWEN4EXP_GGUF_REVISION, "not the pinned repository"),
-        (QWEN4EXP_GGUF_REPO, "a" * 40, "not the pinned revision"),
-    ],
-)
-def test_qwen4exp_unpinned_hub_source_fails_before_payload(
-    repo_id: str,
-    revision: str,
-    message: str,
-):
-    with pytest.raises(Qwen4ExpGGUFImportError, match=message):
-        validate_qwen4exp_hub_source(repo_id=repo_id, revision=revision)
-
-
-def test_hub_preflight_range_failure_never_falls_through_to_payload(monkeypatch):
+def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monkeypatch):
     from mobius.integrations.gguf import _builder
 
+    hub_url = mock.Mock(return_value="https://huggingface.co/exact-file")
     monkeypatch.setattr(
         _builder,
         "hf_hub_url",
-        lambda *_args, **_kwargs: "https://huggingface.co/exact-file",
+        hub_url,
     )
     monkeypatch.setattr(
         _builder,
         "get_hf_file_metadata",
         lambda _url: SimpleNamespace(
-            commit_hash=QWEN4EXP_GGUF_REVISION,
+            commit_hash="a" * 40,
             location="https://cdn.example/model.gguf",
         ),
     )
+    response = mock.MagicMock()
+    response.iter_bytes.return_value = [b"header"]
+    response_context = mock.MagicMock()
+    response_context.__enter__.return_value = response
     session = mock.MagicMock()
-    session.stream.side_effect = OSError("range unavailable")
+    session.stream.return_value = response_context
     monkeypatch.setattr(_builder, "get_session", lambda: session)
-
-    with pytest.raises(RuntimeError, match=r"bounded GGUF header.*No payload"):
-        _builder._preflight_hf_gguf_file(
-            QWEN4EXP_GGUF_REPO,
-            QWEN4EXP_GGUF_SHARDS[0].filename,
-            revision=QWEN4EXP_GGUF_REVISION,
-        )
-
-
-def test_qwen4exp_resolver_never_starts_hub_payload_download(monkeypatch):
-    from mobius.integrations.gguf import _builder
-
-    api = mock.MagicMock()
-    filenames = [shard.filename for shard in QWEN4EXP_GGUF_SHARDS]
-    api.list_repo_files.return_value = filenames
-    api.get_paths_info.return_value = _path_infos()
-    monkeypatch.setattr(_builder, "HfApi", lambda: api)
     monkeypatch.setattr(
         _builder,
-        "_preflight_hf_gguf_file",
-        lambda *_args, **_kwargs: QWEN4EXP_GGUF_REVISION,
+        "_gguf_header_info_from_header_prefix",
+        lambda *_args, **_kwargs: _builder.GGUFHeaderInfo(
+            architecture="qwen4exp",
+            tensor_count=0,
+            split_no=0,
+            split_count=3,
+            split_tensors_count=1224,
+        ),
     )
-    download = mock.MagicMock(side_effect=AssertionError("payload download attempted"))
-    monkeypatch.setattr(_builder, "hf_hub_download", download)
 
-    source = (
-        f"{QWEN4EXP_GGUF_REPO}@{QWEN4EXP_GGUF_REVISION}:{QWEN4EXP_GGUF_SHARDS[0].filename}"
+    with pytest.raises(Qwen4ExpGGUFImportError, match="intentionally fail-closed"):
+        _builder._preflight_hf_gguf_file(
+            "other/Qwen4Exp-GGUF",
+            "renamed-00001-of-00003.gguf",
+            revision="feature/revision",
+        )
+    hub_url.assert_called_once_with(
+        "other/Qwen4Exp-GGUF",
+        "renamed-00001-of-00003.gguf",
+        revision="feature/revision",
     )
-    with pytest.raises(
-        Qwen4ExpGGUFImportError,
-        match="No GGUF tensor payload was downloaded",
-    ):
-        _builder._resolve_gguf_path(source)
-
-    download.assert_not_called()

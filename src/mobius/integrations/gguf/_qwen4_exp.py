@@ -5,80 +5,28 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 __all__ = [
-    "QWEN4EXP_GGUF_REPO",
-    "QWEN4EXP_GGUF_REVISION",
-    "QWEN4EXP_GGUF_SHARDS",
     "Qwen4ExpGGUFImportError",
-    "validate_qwen4exp_hub_artifact",
-    "validate_qwen4exp_hub_source",
+    "reject_qwen4exp_payload",
     "validate_qwen4exp_tensor_contract",
 ]
 
-QWEN4EXP_GGUF_REPO = "unsloth/Qwen3.8-Flash-Next-GGUF"
-QWEN4EXP_GGUF_REVISION = "d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249"
-
-
-@dataclass(frozen=True, slots=True)
-class _PinnedShard:
-    filename: str
-    size: int
-    lfs_sha256: str
-    tensor_count: int
-
-
-QWEN4EXP_GGUF_SHARDS = (
-    _PinnedShard(
-        "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
-        10_946_624,
-        "88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd",
-        0,
-    ),
-    _PinnedShard(
-        "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
-        49_990_818_368,
-        "3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6",
-        595,
-    ),
-    _PinnedShard(
-        "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf",
-        22_544_696_352,
-        "0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a",
-        629,
-    ),
-)
 _EXPECTED_TENSOR_COUNT = 1224
-_PINNED_TENSOR_MANIFEST_SHA256 = (
-    "25a1e6a2073caf19d3a3835dd23702a19fa09cc651506e11a13de7b48076359d"
-)
 _MAX_DEQUANTIZED_SINGLE_TENSOR_BYTES = 8 << 30
 _IQ2_EXPERT_LAYERS = frozenset({1, 2, 4, 14, 16, 25, 30, 32, 37, 39, 42, 45, 46, 47})
 
 
 class Qwen4ExpGGUFImportError(NotImplementedError):
-    """The pinned Qwen4Exp payload has no truthful executable import route."""
+    """A Qwen4Exp payload has no truthful executable import route."""
 
 
-def _lfs_sha256(info: Any) -> str | None:
-    lfs = getattr(info, "lfs", None)
-    if isinstance(lfs, dict):
-        value = lfs.get("sha256") or lfs.get("oid")
-    else:
-        value = getattr(lfs, "sha256", None) or getattr(lfs, "oid", None)
-    if isinstance(value, str) and value.startswith("sha256:"):
-        value = value.removeprefix("sha256:")
-    return value if isinstance(value, str) else None
-
-
-def _payload_blocker(*, keep_quantized: bool) -> Qwen4ExpGGUFImportError:
-    if keep_quantized:
+def _payload_blocker(*, keep_quantized: bool | None) -> Qwen4ExpGGUFImportError:
+    if keep_quantized is True:
         detail = (
             "per_layer_token_embd.weight is an IQ4_NL embedding with no matching "
             "GatherBlockQuantized ABI, and the rank-3 routed experts mix IQ1_S "
@@ -86,7 +34,7 @@ def _payload_blocker(*, keep_quantized: bool) -> Qwen4ExpGGUFImportError:
             "rank-2 projection ABI, while the released BlockQuantizedMoE path has "
             "no mixed-format expert-bank ABI or real-weight runtime evidence."
         )
-    else:
+    elif keep_quantized is False:
         detail = (
             "per_layer_token_embd.weight expands to roughly 191 GiB as float32 "
             "(about 95 GiB at its source BF16 logical width) by itself, "
@@ -94,6 +42,12 @@ def _payload_blocker(*, keep_quantized: bool) -> Qwen4ExpGGUFImportError:
             "single-tensor materialization limit before the expert banks are "
             "included. The current importer materializes a complete torch tensor, "
             "so dequantization is not a bounded-memory route."
+        )
+    else:
+        detail = (
+            "The quantized tensors require unsupported embedding and mixed-format "
+            "expert-bank ABIs, while dense materialization exceeds the bounded-memory "
+            "import route."
         )
     return Qwen4ExpGGUFImportError(
         "Qwen3.8 Flash-Next GGUF payload import is intentionally fail-closed. "
@@ -103,70 +57,13 @@ def _payload_blocker(*, keep_quantized: bool) -> Qwen4ExpGGUFImportError:
     )
 
 
-def validate_qwen4exp_hub_artifact(
-    api: Any,
-    *,
-    repo_id: str,
-    revision: str,
-    shard_filenames: list[str],
-    keep_quantized: bool,
-) -> None:
-    """Verify the only published artifact identity, then reject before download."""
-    validate_qwen4exp_hub_source(repo_id=repo_id, revision=revision)
-    expected_names = [shard.filename for shard in QWEN4EXP_GGUF_SHARDS]
-    if shard_filenames != expected_names:
-        raise Qwen4ExpGGUFImportError(
-            "Qwen4Exp GGUF shard set does not match the pinned three-file route: "
-            f"expected {expected_names}, got {shard_filenames}. No payload was downloaded."
-        )
-
-    infos = api.get_paths_info(
-        repo_id,
-        shard_filenames,
-        revision=revision,
-        expand=True,
-    )
-    by_path = {getattr(info, "path", None): info for info in infos}
-    for shard in QWEN4EXP_GGUF_SHARDS:
-        info = by_path.get(shard.filename)
-        actual_size = int(getattr(info, "size", 0) or 0)
-        actual_sha256 = _lfs_sha256(info)
-        if actual_size != shard.size or actual_sha256 != shard.lfs_sha256:
-            raise Qwen4ExpGGUFImportError(
-                f"Pinned Qwen4Exp shard identity mismatch for {shard.filename!r}: "
-                f"expected size/SHA-256 {shard.size}/{shard.lfs_sha256}, got "
-                f"{actual_size}/{actual_sha256}. No payload was downloaded."
-            )
+def reject_qwen4exp_payload(*, keep_quantized: bool | None = None) -> None:
+    """Reject a header-identified Qwen4Exp payload before materializing tensors."""
     raise _payload_blocker(keep_quantized=keep_quantized)
-
-
-def validate_qwen4exp_hub_source(*, repo_id: str, revision: str) -> None:
-    """Reject unpinned Qwen4Exp repositories and revisions before payload access."""
-    if repo_id != QWEN4EXP_GGUF_REPO:
-        raise Qwen4ExpGGUFImportError(
-            f"Qwen4Exp Hub GGUF source {repo_id!r} is not the pinned repository "
-            f"{QWEN4EXP_GGUF_REPO!r}; refusing an unverified payload before download."
-        )
-    if revision != QWEN4EXP_GGUF_REVISION:
-        raise Qwen4ExpGGUFImportError(
-            f"Qwen4Exp Hub GGUF revision {revision!r} is not the pinned revision "
-            f"{QWEN4EXP_GGUF_REVISION}; refusing mutable or unverified payloads."
-        )
 
 
 def _qtype_name(qtype: Any) -> str:
     return str(getattr(qtype, "name", qtype)).upper()
-
-
-def _tensor_manifest_sha256(
-    entries: list[tuple[str, tuple[int, ...], str]],
-) -> str:
-    """Hash all header-owned names, logical shapes, and GGML qtypes."""
-    lines = [
-        f"{name}|{','.join(str(dim) for dim in shape)}|{qtype}"
-        for name, shape, qtype in sorted(entries)
-    ]
-    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
 def _expected_shapes(metadata: dict[str, Any]) -> dict[str, tuple[int, ...]]:
@@ -290,7 +187,7 @@ def _expected_shapes(metadata: dict[str, Any]) -> dict[str, tuple[int, ...]]:
 
 
 def _expected_qtypes(metadata: dict[str, Any]) -> dict[str, str]:
-    """Return the complete dynamic-quantization assignment from pinned headers."""
+    """Return the supported dynamic-quantization assignment."""
     layers = int(metadata["qwen4exp.block_count"])
     ratios = [int(value) for value in metadata["qwen4exp.attention.compress_ratios"]]
     ple_layers = {int(value) for value in metadata["qwen4exp.ple.layers"]}
@@ -377,7 +274,7 @@ def validate_qwen4exp_tensor_contract(
     source: str,
     keep_quantized: bool | None = None,
 ) -> None:
-    """Validate the exact 1,224-tensor pinned header without touching payloads."""
+    """Validate the supported Qwen4Exp metadata and tensor layout without payloads."""
     if model.architecture != "qwen4exp":
         return
     metadata = model.metadata
@@ -470,11 +367,11 @@ def validate_qwen4exp_tensor_contract(
     if "qwen4exp.feed_forward_length" in metadata:
         mismatches["qwen4exp.feed_forward_length"] = (
             metadata["qwen4exp.feed_forward_length"],
-            "absent in the pinned MoE-only header",
+            "absent in the supported MoE-only layout",
         )
     if mismatches:
         raise ValueError(
-            f"Qwen4Exp GGUF metadata does not match the pinned source contract: {mismatches}"
+            f"Qwen4Exp GGUF metadata does not match the supported contract: {mismatches}"
         )
 
     expected_shapes = _expected_shapes(metadata)
@@ -493,7 +390,6 @@ def validate_qwen4exp_tensor_contract(
         )
 
     qtypes: dict[str, str] = {}
-    manifest_entries: list[tuple[str, tuple[int, ...], str]] = []
     shape_errors: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {}
     for name, _raw, qtype, shape in model.tensor_items_raw():
         actual_shape = tuple(int(dim) for dim in shape)
@@ -501,16 +397,8 @@ def validate_qwen4exp_tensor_contract(
         if actual_shape != expected_shape:
             shape_errors[name] = (actual_shape, expected_shape)
         qtypes[name] = _qtype_name(qtype)
-        manifest_entries.append((name, actual_shape, qtypes[name]))
     if shape_errors:
         raise ValueError(f"Qwen4Exp GGUF tensor shape mismatch: {shape_errors}")
-    manifest_sha256 = _tensor_manifest_sha256(manifest_entries)
-    if manifest_sha256 != _PINNED_TENSOR_MANIFEST_SHA256:
-        raise ValueError(
-            "Qwen4Exp GGUF complete tensor manifest mismatch: expected SHA-256 "
-            f"{_PINNED_TENSOR_MANIFEST_SHA256}, got {manifest_sha256}. The digest "
-            "covers all 1,224 names, logical shapes, and GGML qtypes."
-        )
 
     expected_qtypes = _expected_qtypes(metadata)
     qtype_errors = {
@@ -519,17 +407,6 @@ def validate_qwen4exp_tensor_contract(
         if qtypes.get(name) != expected
     }
     if qtype_errors:
-        raise ValueError(f"Qwen4Exp GGUF pinned qtype mismatch: {qtype_errors}")
-
-    manifest = getattr(model, "manifest", None)
-    if manifest is None:
-        raise ValueError("Qwen4Exp GGUF requires the pinned complete three-shard set")
-    shard_counts = [int(shard.tensor_count) for shard in manifest.shards]
-    if manifest.split_count != 3 or shard_counts != [0, 595, 629]:
-        raise ValueError(
-            "Qwen4Exp GGUF shard closure must be metadata-only shard 0 plus "
-            f"0+595+629=1224 tensors, got split_count={manifest.split_count}, "
-            f"counts={shard_counts}"
-        )
+        raise ValueError(f"Qwen4Exp GGUF qtype mismatch: {qtype_errors}")
     if keep_quantized is not None:
         raise _payload_blocker(keep_quantized=keep_quantized)

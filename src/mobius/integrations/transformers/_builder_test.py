@@ -58,13 +58,18 @@ def test_qwen38_fp8_selects_storage_or_dense_loader(
     )
     model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
     package = ModelPackage({"model": model})
-    calls = []
+    config_calls = []
+    loader_calls = []
     built_configs = []
+
+    def load_config(model_id, **kwargs):
+        config_calls.append((model_id, kwargs))
+        return expected_parent, False
 
     monkeypatch.setattr(
         transformers_builder,
         "_load_transformers_config",
-        lambda *args, **kwargs: (expected_parent, False),
+        load_config,
     )
     monkeypatch.setattr(
         transformers_builder,
@@ -103,11 +108,11 @@ def test_qwen38_fp8_selects_storage_or_dense_loader(
     monkeypatch.setattr(transformers_builder, "build_from_module", build_module)
 
     def qdq(*args, **kwargs):
-        calls.append("qdq")
+        loader_calls.append(("qdq", args, kwargs))
         return {"format": "mobius.weight-loading-report.v1"}
 
     def dense(*args, **kwargs):
-        calls.append("dense")
+        loader_calls.append(("dense", args, kwargs))
         return {"format": "mobius.weight-loading-report.v1"}
 
     monkeypatch.setattr(transformers_builder, "stream_qdq_safetensors_to_model", qdq)
@@ -119,12 +124,23 @@ def test_qwen38_fp8_selects_storage_or_dense_loader(
 
     result = transformers_builder.build_transformers_model(
         "unsloth/Qwen3.8-Flash-Next-FP8",
+        revision="feature/revision",
         keep_quantized=keep_quantized,
         text_only=True,
     )
 
     assert result is package
-    assert calls == [expected_loader]
+    assert config_calls == [
+        (
+            "unsloth/Qwen3.8-Flash-Next-FP8",
+            {"revision": "feature/revision", "trust_remote_code": False},
+        )
+    ]
+    assert len(loader_calls) == 1
+    loader_name, loader_args, loader_kwargs = loader_calls[0]
+    assert loader_name == expected_loader
+    assert loader_args[1] == "unsloth/Qwen3.8-Flash-Next-FP8"
+    assert loader_kwargs["revision"] == "feature/revision"
     assert built_configs[0].block_quant_scheme is not None
     assert built_configs[0].model_type == "qwen4_exp_text"
     assert built_configs[0].vision is None
@@ -193,7 +209,7 @@ def test_qwen38_multimodal_config_keeps_parent_fields(monkeypatch) -> None:
     assert built_configs[0].image_token_id == 248056
 
 
-def test_qwen38_fp8_defaults_to_immutable_integrated_revision(monkeypatch) -> None:
+def test_qwen38_fp8_none_revision_uses_hugging_face_default(monkeypatch) -> None:
     calls = []
 
     def stop_after_config(model_id, **kwargs):
@@ -216,20 +232,37 @@ def test_qwen38_fp8_defaults_to_immutable_integrated_revision(monkeypatch) -> No
         (
             "unsloth/Qwen3.8-Flash-Next-FP8",
             {
-                "revision": "41cc25fe32cc20053a59c89716196897580cddf6",
+                "revision": None,
                 "trust_remote_code": False,
             },
         )
     ]
 
 
-def test_qwen38_fp8_rejects_other_revision() -> None:
-    with pytest.raises(ValueError, match="integrated only at immutable revision"):
-        transformers_builder.build_transformers_model(
-            "unsloth/Qwen3.8-Flash-Next-FP8",
-            revision="main",
-            load_weights=False,
-        )
+@pytest.mark.parametrize("revision", [None, "feature/revision"])
+def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revision) -> None:
+    import transformers
+
+    calls = []
+    config = SimpleNamespace(model_type="qwen2")
+
+    def from_pretrained(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        return config
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", from_pretrained)
+
+    result = transformers_builder._load_transformers_config(
+        "unsloth/Qwen3.8-Flash-Next-FP8",
+        revision=revision,
+        trust_remote_code=False,
+    )
+
+    assert result == (config, False)
+    expected_kwargs = {"trust_remote_code": False}
+    if revision is not None:
+        expected_kwargs["revision"] = revision
+    assert calls == [("unsloth/Qwen3.8-Flash-Next-FP8", expected_kwargs)]
 
 
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:

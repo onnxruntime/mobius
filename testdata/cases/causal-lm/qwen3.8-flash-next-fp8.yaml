@@ -15,7 +15,7 @@ generation:
   do_sample: false
 
 skip_reason: >
-  The pinned checkpoint payload is 185.5 GB and includes a roughly 95 GiB PLE
+  The evidenced checkpoint payload is 185.5 GB and includes a roughly 95 GiB PLE
   table, so full-checkpoint L4/L5 generation exceeds CI resources. Immutable
   all-header validation, independent reduced FP8 ORT parity, and pinned
   Transformers reduced-model full-logit parity provide the committed evidence.

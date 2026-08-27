@@ -2070,7 +2070,7 @@ def test_fp8_streaming_plan_rejects_e5m2_ple_storage():
     path, shape, _dtype = index[weight_name]
     index[weight_name] = (path, shape, "F8_E5M2")
 
-    with pytest.raises(ValueError, match="pinned checkpoint requires F8_E4M3"):
+    with pytest.raises(ValueError, match="supported checkpoint layout requires F8_E4M3"):
         module.build_fp8_streaming_plan(index, model.graph.initializers)
 
 

@@ -6,14 +6,14 @@ Mobius implements both the `qwen4_exp_text` decoder and the
 `decoder`, `vision_encoder`, and `embedding`. `text_only=True` selects the same
 decoder without the vision stages.
 
-The implementation is pinned to:
+The implementation evidence was collected from:
 
 - `Qwen/Qwen3.8-Flash-Next@f5d08274bafd880402bd16f5e3e6c514136ec06c`
 - `unsloth/Qwen3.8-Flash-Next-FP8@41cc25fe32cc20053a59c89716196897580cddf6`
 - `unsloth/Qwen3.8-Flash-Next-GGUF@d3bc75ee6ccef3efc1e228ec00a6cc2cdb1e2249`
 - `huggingface/transformers@598d8ba8baaec7fec5a22da0e2844c7bf4ea20e1`
 
-Exported models record that pin as `mobius.semantic_reference_revision` and
+Exported models record the semantic reference as `mobius.semantic_reference_revision` and
 record the caller's requested checkpoint revision separately as
 `mobius.source_revision` (`unpinned` when no revision was supplied).
 
@@ -24,7 +24,7 @@ schedule, full-kernel Gated-DeltaNet convolution state, recurrent delta-rule
 state, four-stream gated residual hyper-connections, exact softmax-first
 top-k routed MoE plus the sigmoid-gated shared expert, QSA block pooling and
 token selection, and PLE hashed n-gram embeddings with their dilated
-convolution and token-context states. The pinned BF16 checkpoint keeps
+convolution and token-context states. The evidenced BF16 checkpoint keeps
 DeltaNet recurrent math and recurrent cache state in float32, while convolution
 state, projections, sparse-attention caches, and logits remain in model dtype.
 Official safetensors are loaded through a bounded-memory package transaction:
@@ -59,7 +59,7 @@ embeddings. Mobius reuses the Qwen3 vision implementation with DeepStack
 disabled and the merger projected to the decoder width of 2560.
 
 The embedding graph scatters `image_features` at token 248056 while preserving
-the original token IDs for PLE. The processor contract is the pinned Qwen3
+the original token IDs for PLE. The processor contract follows the evidenced Qwen3
 image processor with vision start/end tokens 248053/248054. This package is
 explicitly image-only: config extraction validates the checkpoint's video token
 but removes it from runtime metadata, the embedding graph exposes no video
@@ -78,7 +78,7 @@ of a dedicated sparse-attention runtime kernel.
 
 ## Guarded features
 
-The pinned ordinary Transformers forward preserves MTP metadata but does not
+The evidenced ordinary Transformers forward preserves MTP metadata but does not
 execute its `mtp.*` sidecar. Mobius mirrors that next-token route and does not
 publish an MTP task. Dedicated MTP embeddings fail closed because no flattened
 NextN cache ABI exists. Alternative vision geometries and nonempty DeepStack
@@ -86,7 +86,7 @@ configurations also fail closed.
 
 ## GGUF header support and payload guard
 
-The pinned GGUF is a text-only `general.architecture=qwen4exp` split set:
+The GGUF evidence artifact is a text-only `general.architecture=qwen4exp` split set:
 
 | Shard | Tensors | Bytes | LFS SHA-256 |
 |---|---:|---:|---|
@@ -94,12 +94,13 @@ The pinned GGUF is a text-only `general.architecture=qwen4exp` split set:
 | `UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf` | 595 | 49,990,818,368 | `3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6` |
 | `UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf` | 629 | 22,544,696,352 | `0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a` |
 
-Shard 0 owns all model/tokenizer metadata and no tensors. The importer
-inherits that metadata across the complete set and requires the exact
-`0 + 595 + 629 = 1224` closure. Header validation covers every
-hyper-connection, PLE, QSA/indexer, DeltaNet, routed/shared expert, and final
-output mixer tensor. GGUF's split indexer query/key matrices are concatenated
-row-wise into Hugging Face's fused `index_qk_proj`; they are not Q/K-permuted.
+Shard 0 owns all model/tokenizer metadata and no tensors in that evidence set.
+Production routing is not bound to its repository, revision, filenames, byte
+sizes, hashes, or shard distribution. Bounded header inspection identifies
+`general.architecture=qwen4exp`, while validation uses the model metadata and
+complete 1,224-name tensor shape/qtype contract. GGUF's split indexer query/key
+matrices are concatenated row-wise into Hugging Face's fused `index_qk_proj`;
+they are not Q/K-permuted.
 
 Payload conversion deliberately fails before Hub download. The combined PLE
 table is an enormous IQ4_NL embedding for which the graph has no compatible
@@ -120,13 +121,15 @@ lossy `%d` cache templates. The decoder graph carries a separate
 `mobius.state_manifest` metadata document with explicit role-to-layer
 membership for direct ONNX Runtime orchestration.
 
-## Pinned FP8 checkpoint
+## FP8 checkpoint evidence
 
-`unsloth/Qwen3.8-Flash-Next-FP8` is accepted only at immutable revision
-`41cc25fe32cc20053a59c89716196897580cddf6`. Its 131 safetensors headers were
-range-read without downloading the 185.5 GB tensor payload. The committed
-schema evidence records the config/index hashes, complete tensor census, and
-canonical header-schema hash.
+The committed evidence for `unsloth/Qwen3.8-Flash-Next-FP8` was collected at
+immutable revision `41cc25fe32cc20053a59c89716196897580cddf6`. Library builds do
+not lock to that revision: omitting `revision` follows the Hugging Face default,
+and an explicit branch, tag, or SHA is forwarded unchanged to config and weight
+loading. Its 131 safetensors headers were range-read without downloading the
+185.5 GB tensor payload. The schema evidence records the config/index hashes,
+complete tensor census, and canonical header-schema hash.
 
 The checkpoint uses three text-weight paths:
 
@@ -134,14 +137,14 @@ The checkpoint uses three text-weight paths:
   grids. Every grid is validated as exactly
   `[ceil(rows / 128), ceil(cols / 128)]`.
 - 128 PLE embedding shards use `F8_E4M3` storage and one shared BF16
-  `ngram_embedding.weight_scale` scalar. Its pinned payload is BF16 bits
+  `ngram_embedding.weight_scale` scalar. The evidenced payload is BF16 bits
   `0x3951` (`0.00019931793212890625` as float32). Mobius requires that exact
   scalar and reconstructs each shard lazily as
   `shard.astype(target_dtype) * weight_scale`. The shards remain separate in
   the ONNX graph instead of concatenating a roughly 95 GiB dense table during
   export.
 - Remaining text weights are ordinary BF16 tensors. The 943-entry
-  `modules_to_not_convert` list resolves completely against the pinned header.
+  `modules_to_not_convert` list resolves completely against the evidenced header.
 
 By default Mobius preserves every FP8 code tensor and BF16 scale tensor as an
 external-data initializer. Standard ONNX QDQ reconstructs the logical weights:
