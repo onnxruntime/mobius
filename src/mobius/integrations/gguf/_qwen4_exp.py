@@ -10,6 +10,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 __all__ = [
     "QWEN4EXP_GGUF_REPO",
     "QWEN4EXP_GGUF_REVISION",
@@ -392,7 +394,7 @@ def validate_qwen4exp_tensor_contract(
         "qwen4exp.attention.head_count_kv": 2,
         "qwen4exp.attention.key_length": 256,
         "qwen4exp.attention.value_length": 256,
-        "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen4exp.attention.layer_norm_rms_epsilon": float(np.float32(1e-6)),
         "qwen4exp.rope.dimension_count": 64,
         "qwen4exp.rope.freq_base": 10_000_000.0,
         "qwen4exp.full_attention_interval": 4,

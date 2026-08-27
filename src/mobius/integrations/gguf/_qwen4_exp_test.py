@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 
 from mobius._configs import Qwen4ExpConfig
@@ -53,7 +54,7 @@ def _metadata() -> dict[str, object]:
         "qwen4exp.attention.head_count_kv": 2,
         "qwen4exp.attention.key_length": 256,
         "qwen4exp.attention.value_length": 256,
-        "qwen4exp.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen4exp.attention.layer_norm_rms_epsilon": float(np.float32(1e-6)),
         "qwen4exp.rope.dimension_count": 64,
         "qwen4exp.rope.dimension_sections": [11, 11, 10],
         "qwen4exp.rope.freq_base": 10_000_000.0,
@@ -209,6 +210,10 @@ def test_qwen4exp_header_fixture_proves_exact_three_shard_closure():
 
     _validate_fixture(fixture)
 
+    assert (
+        float(fixture.metadata["qwen4exp.attention.layer_norm_rms_epsilon"]).hex()
+        == float(np.float32(1e-6)).hex()
+    )
     assert len(fixture.tensor_names) == 1224
     assert [shard.tensor_count for shard in fixture.manifest.shards] == [0, 595, 629]
     assert sum(shard.tensor_count for shard in fixture.manifest.shards) == 1224
