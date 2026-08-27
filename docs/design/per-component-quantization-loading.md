@@ -43,6 +43,8 @@ This proposal separates those concerns through four reusable abstractions:
 ## Goals
 
 - Represent one quantization configuration per `ModelPackage` component.
+- Allow an authoritative component configuration to keep selected modules
+  floating point through exact or regex exclusions.
 - Determine component configuration before component module construction.
 - Route checkpoint weights with one canonical component manifest.
 - Preserve packed `qweight`, scale, and zero-point tensors as one logical
@@ -132,6 +134,8 @@ class ComponentDescriptor:
     role: str
     source_paths: tuple[str, ...]
 
+    def source_module_names(self, local_module_path: str) -> tuple[str, ...]: ...
+
 
 @dataclasses.dataclass(frozen=True)
 class ComponentManifest:
@@ -158,6 +162,23 @@ Every consumer uses the same manifest:
 An unresolved component is a typed error. Consumers must not independently
 guess aliases or state-dict prefixes.
 
+### Mapping local module paths to HuggingFace names
+
+Quantizer metadata names runtime HuggingFace modules, while graph construction
+walks paths inside a Mobius component. For example:
+
+```text
+HF:     model.language_model.layers.0.per_layer_input_gate
+Mobius: model.layers.0.per_layer_input_gate
+```
+
+`ComponentDescriptor.source_module_names()` derives candidate HuggingFace names
+by anchoring the local path at each declared source root. The shared matcher
+then applies the producer's exact/regex semantics to those candidates.
+Architectures whose names cannot be aligned structurally declare explicit path
+aliases on their component descriptor; individual loaders must not invent
+their own mapping.
+
 ## 2. Component quantization manifest
 
 The parsed architecture config keeps legacy compatibility while exposing an
@@ -180,8 +201,22 @@ Accepted metadata forms can include:
 - a legacy model-wide configuration converted at the parser boundary.
 
 Missing entries mean floating-point storage. A component entry must describe
-one uniform affine layout. Partial module overrides inside the same exported
-ONNX component are not silently collapsed into a component configuration.
+one affine layout for its quantized projections, but may include an
+authoritative selection policy:
+
+```python
+@dataclasses.dataclass(frozen=True)
+class ComponentQuantizationPlan:
+    layout: QuantizationConfig
+    modules_to_not_convert: tuple[str, ...]
+    overrides: Mapping[str, QuantizationOverride]
+```
+
+`modules_to_not_convert` is evaluated for each candidate HuggingFace module
+name while the component is constructed. A matching module remains a normal
+`Linear`; other eligible projections use the component's packed layout.
+Different packed layouts inside one component require per-module overrides and
+must be represented explicitly rather than inferred from a root plan.
 
 ## 3. Component-specific construction
 
@@ -191,6 +226,20 @@ The component configuration is selected before creating its parameters:
 decoder = DecoderModel(config.for_component("decoder"))
 vision = VisionModel(config.for_component("vision_encoder"))
 ```
+
+Each projection additionally asks the component plan whether its source module
+is quantized:
+
+```python
+linear_class = component_plan.linear_class_for(
+    local_module_path="model.layers.0.per_layer_input_gate",
+    descriptor=decoder_descriptor,
+)
+```
+
+This keeps `per_layer_input_gate`, `per_layer_projection`, and other explicit
+float exceptions as ordinary `Linear` modules without weakening the rest of a
+quantized decoder.
 
 This replaces post-construction scanning that tries to swap `Linear` instances
 after a model has already encoded architecture-specific choices.
@@ -399,6 +448,8 @@ PRs. Removal occurs only after model migrations and parity coverage.
 - sidecar grouping for Olive/GPTQ/AWQ;
 - partial sidecar rejection;
 - component routing with module path differing from package name;
+- exact and regex float exclusions mapped from HuggingFace names to local
+  component module paths;
 - codec shape and packing validation;
 - binder completeness and leftover-record rejection.
 
@@ -415,6 +466,8 @@ For every registered multi-component configuration:
 
 - T5 encoder INT8 plus decoder INT4;
 - VLM decoder INT4 plus vision INT8 plus float embedding;
+- decoder INT4 with float `per_layer_input_gate` and
+  `per_layer_projection`;
 - speech decoder INT4 plus audio INT8;
 - component path differing from package name;
 - tied embedding/head behavior;
@@ -441,4 +494,3 @@ The migration is complete when:
 - Mobius never converts float weights into quantized weights;
 - per-component real-weight parity is demonstrated;
 - legacy global-config tests remain unchanged.
-
