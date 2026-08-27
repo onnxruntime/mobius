@@ -495,12 +495,11 @@ def _load_qwen35moe_same_value_reference(
     state_dict = {name: value.float() for name, value in state_dict.items()}
 
     hf_config = AutoConfig.from_pretrained(repository, revision=revision)
-    hf_config.dtype = torch.float32
     reference = AutoModelForCausalLM.from_config(hf_config)
     missing, unexpected = reference.load_state_dict(state_dict, assign=True)
     assert not missing
     assert not unexpected
-    return reference.eval()
+    return reference.to(dtype=torch.float32).eval()
 
 
 def _run_promoted_ort(
