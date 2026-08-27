@@ -379,16 +379,7 @@ _WAVTOKENIZER_DEC_REASON = (
     "runtime packaging is refused before graph construction."
 )
 
-_ENCODER_GRAPH_MISMATCH = {
-    "jina-bert-v3": (
-        "JinaBERT v3 uses RoPE and may alternate dense GELU and routed MoE layers. "
-        "BertModel has absolute positions and no MoE path."
-    ),
-    "nomic-bert-moe": (
-        "NomicBERT-MoE alternates dense and routed-expert FFNs according to "
-        "moe_every_n_layers. Mobius has no encoder MoE graph with that schedule."
-    ),
-}
+_ENCODER_GRAPH_MISMATCH: dict[str, str] = {}
 
 _FINAL_CENSUS_DEFERRED_REASONS = {
     # Dense / legacy / embedding.
@@ -480,17 +471,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "ERNIE 4.5 requires exact fused-QKV and fused-gate/up converter splits plus an "
         "optional attention-output bias and ERNIE-specific position metadata. Similarity "
         "to Qwen/Llama is not a suffix-exact tensor or graph contract."
-    ),
-    "granite": (
-        "The granite architecture is a conditional dense-or-MoE union with residual, "
-        "embedding, attention, and inverse-logit scales, optional biases/RoPE factors, "
-        "shared experts, and optional deep-stack inputs. It is not the GraniteMoE or "
-        "GraniteHybrid GGUF contract."
-    ),
-    "ernie4_5-moe": (
-        "ERNIE 4.5 MoE selects periodic expert blocks after a dense prefix, permits an "
-        "optional gate-expert matrix, and uses normalized routing with optional shared "
-        "experts. Mobius has no matching per-layer schedule or converter transform."
     ),
     "granite_swa": (
         "Granite SWA requires attention sinks, a complete interleaved sliding-window "

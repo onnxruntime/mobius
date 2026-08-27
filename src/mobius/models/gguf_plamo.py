@@ -144,7 +144,10 @@ class _PlamoTextModel(nn.Module):
             [_PlamoDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = initialize_rope(config)
+        rotary_emb = initialize_rope(config)
+        if rotary_emb is None:
+            raise ValueError("PLaMo requires rotary position embeddings")
+        self.rotary_emb = rotary_emb
 
     def forward(
         self,
@@ -162,9 +165,13 @@ class _PlamoTextModel(nn.Module):
             attention_mask=attention_mask,
             dtype=self._dtype,
         )
-        past_key_values = past_key_values or [None] * len(self.layers)
+        past_kvs: list[tuple[ir.Value, ir.Value] | None]
+        if past_key_values is None:
+            past_kvs = [None] * len(self.layers)
+        else:
+            past_kvs = list(past_key_values)
         present_key_values = []
-        for layer, past_key_value in zip(self.layers, past_key_values):
+        for layer, past_key_value in zip(self.layers, past_kvs):
             hidden_states, present_key_value = layer(
                 op,
                 hidden_states,

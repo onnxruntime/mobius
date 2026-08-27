@@ -57,7 +57,9 @@ class GraniteTextModel(nn.Module):
         # Apply embedding multiplier
         hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
 
-        position_embeddings = self.rotary_emb(op, position_ids)
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
         attention_bias = create_attention_bias(
             op,
             input_ids=input_ids,
@@ -163,7 +165,9 @@ class GraniteMoETextModel(nn.Module):
         # Apply Granite embedding multiplier
         hidden_states = op.Mul(hidden_states, self.embedding_multiplier)
 
-        position_embeddings = self.rotary_emb(op, position_ids)
+        position_embeddings = (
+            self.rotary_emb(op, position_ids) if self.rotary_emb is not None else None
+        )
         if attention_mask is not None:
             attention_bias = create_attention_bias(
                 op,

@@ -179,6 +179,7 @@ def _write_tiny_granite(
     moe: bool,
     fused_qkv: bool,
     quantized: bool,
+    no_rope: bool = False,
 ) -> None:
     from gguf import GGMLQuantizationType, GGUFWriter
 
@@ -197,6 +198,8 @@ def _write_tiny_granite(
     writer.add_embedding_scale(12.0)
     writer.add_residual_scale(0.5)
     writer.add_attention_scale(0.125)
+    if no_rope:
+        writer.add_bool("granite.rope.scaling.finetuned", False)
     if moe:
         writer.add_expert_count(_EXPERTS)
         writer.add_expert_used_count(_TOP_K)
@@ -452,3 +455,19 @@ def test_granite_tiny_gguf_builds_complete_graph(
     else:
         assert any(".mlp.gate_proj.weight" in name for name in names)
         assert not any(".mlp.experts." in name for name in names)
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_granite_no_rope_gguf_builds_complete_graph(tmp_path: Path, moe: bool) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    path = tmp_path / f"granite-{'moe' if moe else 'dense'}-no-rope.gguf"
+    _write_tiny_granite(
+        path,
+        moe=moe,
+        fused_qkv=False,
+        quantized=False,
+        no_rope=True,
+    )
+    package = build_from_gguf(path, keep_quantized=False)
+    assert "model" in package

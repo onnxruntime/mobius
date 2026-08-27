@@ -155,7 +155,10 @@ class MaincoderTextModel(nn.Module):
             [MaincoderDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = initialize_rope(config)
+        rotary_emb = initialize_rope(config)
+        if rotary_emb is None:
+            raise ValueError("Maincoder requires rotary position embeddings")
+        self.rotary_emb = rotary_emb
 
     def forward(
         self,

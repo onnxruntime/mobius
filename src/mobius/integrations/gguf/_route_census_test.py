@@ -64,8 +64,8 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-runtime-abi-blocked": 102,
-        "evidence-only": 100,
-        "immediately-implementable": 58,
+        "evidence-only": 105,
+        "immediately-implementable": 53,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }
