@@ -10424,8 +10424,23 @@ def _stft_preprocess_component(
     }
 
 
+def _validate_reuse_rate_selection(config: Any) -> tuple[int | None, int | None]:
+    """Validate the mutually exclusive native-rate and BWE selections."""
+    input_rate = getattr(config, "input_sampling_rate", None)
+    bwe_rate = getattr(config, "bwe_sampling_rate", None)
+    for name, value in (("input_sampling_rate", input_rate), ("bwe_sampling_rate", bwe_rate)):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer when provided")
+    if input_rate is not None and bwe_rate is not None:
+        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
+    return input_rate, bwe_rate
+
+
 def _reuse_stft_geometry(config: Any) -> dict[str, Any] | None:
     """Resolve native-dynamic, fixed-native, or explicit-BWE STFT geometry."""
+    input_rate, bwe_rate = _validate_reuse_rate_selection(config)
     raw_reference = {
         "sample_rate": getattr(config, "sampling_rate", None),
         "n_fft": getattr(config, "n_fft", None),
@@ -10435,14 +10450,6 @@ def _reuse_stft_geometry(config: Any) -> dict[str, Any] | None:
     if any(not isinstance(value, int) or value <= 0 for value in raw_reference.values()):
         return None
     reference = {name: int(value) for name, value in raw_reference.items()}
-
-    input_rate = getattr(config, "input_sampling_rate", None)
-    bwe_rate = getattr(config, "bwe_sampling_rate", None)
-    for name, value in (("input_sampling_rate", input_rate), ("bwe_sampling_rate", bwe_rate)):
-        if value is not None and (not isinstance(value, int) or value <= 0):
-            raise ValueError(f"{name} must be a positive integer when provided")
-    if input_rate is not None and bwe_rate is not None:
-        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
     selected_rate = bwe_rate or input_rate
     if selected_rate is None:
@@ -10638,6 +10645,7 @@ def build_speech_enhancement_workflow_metadata(
         A metadata document with a ``speech_enhancement`` profile and a pure,
         single-request ``pipeline.workflow``.
     """
+    _validate_reuse_rate_selection(config)
     if "model" not in pkg:
         raise ValueError("speech enhancement workflow requires a 'model' component")
     model = pkg["model"]
@@ -10914,6 +10922,7 @@ def write_speech_enhancement_workflow_metadata(
     config: Any = None,
 ) -> str:
     """Write one-file speech-enhancement metadata into *output_dir*."""
+    _validate_reuse_rate_selection(config)
     os.makedirs(output_dir, exist_ok=True)
     metadata = build_speech_enhancement_workflow_metadata(pkg, config)
     path = os.path.join(output_dir, "inference_metadata.yaml")

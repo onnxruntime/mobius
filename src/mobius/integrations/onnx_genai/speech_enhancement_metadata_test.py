@@ -365,6 +365,64 @@ class TestMetadata:
         with pytest.raises(ValueError, match="mutually exclusive"):
             build_speech_enhancement_workflow_metadata(pkg, config)
 
+    @pytest.mark.parametrize(
+        "missing_field", ["sampling_rate", "n_fft", "hop_size", "win_size"]
+    )
+    @pytest.mark.parametrize("bwe_sampling_rate", [16_000, 48_000])
+    def test_rejects_dual_rates_before_incomplete_geometry(
+        self, missing_field, bwe_sampling_rate
+    ):
+        pkg, config = _package()
+        setattr(config, missing_field, None)
+        config.input_sampling_rate = 16_000
+        config.bwe_sampling_rate = bwe_sampling_rate
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build_speech_enhancement_workflow_metadata(pkg, config)
+
+    @pytest.mark.parametrize("rate_name", ["input_sampling_rate", "bwe_sampling_rate"])
+    @pytest.mark.parametrize("value", ["16000", 16_000.0, True, False, 0, -1])
+    def test_rejects_invalid_rate_before_incomplete_geometry(self, rate_name, value):
+        pkg, config = _package()
+        config.sampling_rate = None  # type: ignore[assignment]
+        setattr(config, rate_name, value)
+
+        with pytest.raises(ValueError, match=f"{rate_name} must be a positive integer"):
+            build_speech_enhancement_workflow_metadata(pkg, config)
+
+    @pytest.mark.parametrize(
+        ("rate_name", "rate_value"),
+        [(None, None), ("input_sampling_rate", 16_000), ("bwe_sampling_rate", 48_000)],
+    )
+    @pytest.mark.parametrize(
+        "missing_field", ["sampling_rate", "n_fft", "hop_size", "win_size"]
+    )
+    def test_valid_rates_with_incomplete_geometry_use_spectrum_inputs(
+        self, missing_field, rate_name, rate_value
+    ):
+        pkg, config = _package()
+        setattr(config, missing_field, None)
+        if rate_name is not None:
+            setattr(config, rate_name, rate_value)
+
+        metadata = build_speech_enhancement_workflow_metadata(pkg, config)
+
+        assert "preprocessing" not in metadata
+        assert set(metadata["pipeline"]["workflow"]["inputs"]) == {
+            "request.noisy_mag",
+            "request.noisy_pha",
+        }
+
+    @pytest.mark.parametrize("bwe_sampling_rate", [16_000, 48_000])
+    def test_builder_validates_rates_before_graph_inspection(self, bwe_sampling_rate):
+        _, config = _package()
+        config.sampling_rate = None  # type: ignore[assignment]
+        config.input_sampling_rate = 16_000
+        config.bwe_sampling_rate = bwe_sampling_rate
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build_speech_enhancement_workflow_metadata({}, config)
+
     def test_postprocess_declares_inverse_and_reference_length_contract(self):
         pkg, config = _package()
 
@@ -472,6 +530,18 @@ class TestAutoExport:
             document = yaml.safe_load(handle)
         assert document["schema_version"] == "v1"
         assert "speech_enhancement" in document["profiles"]
+
+    def test_writer_validates_rates_before_output_or_graph_inspection(self, tmp_path):
+        _, config = _package()
+        config.n_fft = None  # type: ignore[assignment]
+        config.input_sampling_rate = 16_000
+        config.bwe_sampling_rate = 48_000
+        output_dir = tmp_path / "metadata"
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            write_speech_enhancement_workflow_metadata({}, str(output_dir), config)
+
+        assert not output_dir.exists()
 
 
 class TestSchema:
