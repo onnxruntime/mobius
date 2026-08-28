@@ -312,6 +312,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
+    if args.model == "nvidia/RE-USE" and revision is None:
+        # Pin every Hub probe, including the early Diffusers detector. A
+        # mutable model_index.json on Hub main must not reroute this checkpoint
+        # before the bespoke builder applies its immutable default.
+        from mobius.models.reuse import REUSE_REVISION
+
+        revision = REUSE_REVISION
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -326,6 +333,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if args.model and not args.config and not args.text_only:
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
+            if input_sampling_rate is not None or bwe_sampling_rate is not None:
+                raise SystemExit(
+                    "Error: --input-sample-rate and --bwe-sample-rate are only "
+                    "supported for RE-USE speech-enhancement checkpoints."
+                )
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
             )
@@ -1410,6 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample_rate_group = build_parser.add_mutually_exclusive_group()
     sample_rate_group.add_argument(
         "--input-sample-rate",
+        dest="input_sampling_rate",
         type=int,
         default=None,
         metavar="HZ",
@@ -1420,6 +1433,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sample_rate_group.add_argument(
         "--bwe-sample-rate",
+        dest="bwe_sampling_rate",
         type=int,
         default=None,
         metavar="HZ",
