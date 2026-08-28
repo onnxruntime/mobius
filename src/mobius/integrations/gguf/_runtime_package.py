@@ -32,6 +32,7 @@ from typing import Any, Literal
 
 from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._runtime_evidence import (
+    FINAL_RUNTIME_PACKAGE_SCHEMA,
     RuntimeEvidenceUnavailableError,
     gguf_artifact_identity,
     gguf_graph_package_identity,
@@ -433,9 +434,12 @@ def write_gguf_runtime_package(
             "The GGUF tokenizer metadata no longer matches the identity captured during "
             "graph construction; refusing to pair the graph with a replaced tokenizer source."
         )
-    if getattr(built_verdict, "blocker_category", None) is not None:
-        # Exact runtime evidence cannot override a tokenizer route that the
-        # authoritative tokenizer census has explicitly withheld.
+    if (
+        getattr(built_verdict, "blocker_category", None) is not None
+        and getattr(evidence, "runtime_package_schema", None) != FINAL_RUNTIME_PACKAGE_SCHEMA
+    ):
+        # Identifier-level blockers remain authoritative unless a final-package
+        # record proves this exact artifact through the strict checks below.
         evidence = None
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -452,7 +456,14 @@ def write_gguf_runtime_package(
                 "The GGUF source changed while target/MTP graphs were being serialized; "
                 "refusing package publication."
             )
-        graph_identity = gguf_graph_package_identity(stage)
+        graph_files = tuple(
+            sorted(
+                path.relative_to(stage).as_posix()
+                for path in stage.rglob("*")
+                if path.is_file() and path.name != "export_report.json"
+            )
+        )
+        graph_identity = gguf_graph_package_identity(stage, files=graph_files)
         validation_warnings: list[str] = []
         if evidence_warning is not None:
             validation_warnings.append(evidence_warning)

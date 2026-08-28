@@ -582,9 +582,10 @@ _APERTUS_15B_BF16_ORT_GENAI = GGUFRuntimeEvidence(
     graph_sha256="4bb91bade19d41559cb524e28692453851fe67274cc58109787ee968df3e0fe5",
     runtime_package_files=(
         "chat_template.jinja",
+        "export_report.json",
         *_LOW_COST_RUNTIME_PACKAGE_FILES,
     ),
-    runtime_package_sha256="23ddcfe528db36e9846d09706d0913a344df4ede7ecbac7594110b056cbee5da",
+    runtime_package_sha256="37c8a587eaeda7dc31bd1a4a6b7611a8aae5e91b7d7bbeb1a106e3a7a2441f08",
     parity_test=("test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]"),
     parity_kind="full-logit",
     deterministic_test=(

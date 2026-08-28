@@ -478,6 +478,10 @@ class TestWriteGgufRuntimePackage:
 
     def test_exact_runtime_evidence_marks_package_validated(self, tmp_path):
         pkg = _FakePackage()
+        pkg.gguf_tokenizer_verdict = SimpleNamespace(
+            metadata_sha256="f" * 64,
+            blocker_category="compiled-llama.cpp-semantic-dependency",
+        )
         out = tmp_path / "out"
         evidence = SimpleNamespace(
             evidence_id="test-evidence",
@@ -489,6 +493,7 @@ class TestWriteGgufRuntimePackage:
                 "tokenizer.json",
             ),
             runtime_package_sha256="c" * 64,
+            runtime_package_schema=_runtime_package.FINAL_RUNTIME_PACKAGE_SCHEMA,
             tokenizer_repository=_TOKENIZER_REPOSITORY,
             tokenizer_revision=_TOKENIZER_REVISION,
             tokenizer_metadata_sha256="f" * 64,
@@ -509,10 +514,11 @@ class TestWriteGgufRuntimePackage:
                         sha256=evidence.runtime_package_sha256,
                     ),
                 ),
-            ),
+            ) as package_identity,
         ):
             _write_runtime(pkg, tmp_path / "m.gguf", out, runtime_version="0.15.2")
 
+        assert package_identity.call_args_list[0].kwargs["files"] == ("model.onnx",)
         assert pkg.export_report is not None
         assert pkg.export_report.export_status == "complete"
         assert pkg.export_report.runtime_validation_status == "validated"

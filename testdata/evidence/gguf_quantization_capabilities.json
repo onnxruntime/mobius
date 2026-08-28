@@ -3033,7 +3033,7 @@
           "parity_kind": "full-logit",
           "parity_test": "test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]",
           "result": "passed",
-          "runtime_package_sha256": "23ddcfe528db36e9846d09706d0913a344df4ede7ecbac7594110b056cbee5da",
+          "runtime_package_sha256": "37c8a587eaeda7dc31bd1a4a6b7611a8aae5e91b7d7bbeb1a106e3a7a2441f08",
           "source_fidelity": true,
           "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
           "storage_quantized": false,
