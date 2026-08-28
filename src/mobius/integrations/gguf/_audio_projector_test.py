@@ -123,6 +123,25 @@ def test_audio_weight_loader_rejects_invalid_attention_dimensions(
         _mmproj_audio_projector_to_onnx(sidecar, "ultravox")
 
 
+def test_public_audio_builder_rejects_invalid_attention_dimensions_before_graph(
+    monkeypatch,
+):
+    from mobius.integrations.gguf import _builder, _mmproj
+
+    sidecar = _standalone_sidecar("ultravox")
+    sidecar.metadata["clip.audio.attention.head_count"] = 3
+    monkeypatch.setattr(_mmproj, "_resolve_mmproj_companion_path", lambda path: path)
+    monkeypatch.setattr(_builder, "_validate_gguf_model", lambda *args, **kwargs: None)
+
+    with pytest.raises(ValueError, match="positive and evenly divisible"):
+        _mmproj.build_audio_projector_from_gguf(
+            "synthetic.gguf",
+            projector_type="ultravox",
+            target_architecture="llama",
+            _mmproj_gguf_model=sidecar,
+        )
+
+
 def test_audio_projector_evidence_is_test_only_immutable_and_bounded():
     evidence = json.loads(
         (Path("tests") / "data" / "gguf_audio_projector_evidence.json").read_text()

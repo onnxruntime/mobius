@@ -3216,6 +3216,17 @@ def _interleaved_rope_rows(values: np.ndarray, head_dim: int) -> np.ndarray:
     return reshaped[:, order, :].reshape(values.shape)
 
 
+def _audio_head_dim(metadata: dict[str, Any]) -> int:
+    head_count = int(metadata["clip.audio.attention.head_count"])
+    hidden_size = int(metadata["clip.audio.embedding_length"])
+    if head_count <= 0 or hidden_size <= 0 or hidden_size % head_count:
+        raise ValueError(
+            "clip.audio.embedding_length must be positive and evenly divisible by "
+            "the positive clip.audio.attention.head_count."
+        )
+    return hidden_size // head_count
+
+
 def _mmproj_audio_projector_to_onnx(
     mmproj_gguf: Any,
     projector_type: str,
@@ -3226,14 +3237,7 @@ def _mmproj_audio_projector_to_onnx(
         map_mmproj_audio_projector_to_onnx,
     )
 
-    head_count = int(mmproj_gguf.metadata["clip.audio.attention.head_count"])
-    hidden_size = int(mmproj_gguf.metadata["clip.audio.embedding_length"])
-    if head_count <= 0 or hidden_size <= 0 or hidden_size % head_count:
-        raise ValueError(
-            "clip.audio.embedding_length must be positive and evenly divisible by "
-            "the positive clip.audio.attention.head_count."
-        )
-    head_dim = hidden_size // head_count
+    head_dim = _audio_head_dim(mmproj_gguf.metadata)
     state_dict: dict[str, torch.Tensor] = {}
     for name in mmproj_gguf.tensor_names:
         mapped = map_mmproj_audio_projector_to_onnx(name, projector_type)
@@ -3317,6 +3321,7 @@ def build_audio_projector_from_gguf(
     )
     hidden_size = int(mmproj_gguf.metadata["clip.audio.embedding_length"])
     num_heads = int(mmproj_gguf.metadata["clip.audio.attention.head_count"])
+    head_dim = _audio_head_dim(mmproj_gguf.metadata)
     config = ArchitectureConfig(
         model_type=f"gguf_{projector_type}",
         vocab_size=1,
@@ -3325,7 +3330,7 @@ def build_audio_projector_from_gguf(
         num_hidden_layers=int(mmproj_gguf.metadata["clip.audio.block_count"]),
         num_attention_heads=num_heads,
         num_key_value_heads=num_heads,
-        head_dim=hidden_size // num_heads,
+        head_dim=head_dim,
         max_position_embeddings=65_536,
         hidden_act="gelu",
     )
