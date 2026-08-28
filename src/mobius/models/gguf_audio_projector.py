@@ -10,7 +10,6 @@ import math
 from collections.abc import Mapping
 
 import numpy as np
-import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
 from mobius.components import MeralionAudioSidecar

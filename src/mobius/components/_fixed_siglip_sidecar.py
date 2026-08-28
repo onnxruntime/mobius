@@ -65,7 +65,7 @@ class FixedResolutionSiglipEmbeddings(nn.Module):
         super().__init__()
         self.patch_embedding = patch_embedding
         self.position_embedding = position_embedding
-        self._num_positions = int(position_embedding.weight.shape[0])
+        self._num_positions = int(position_embedding.weight.shape[0])  # type: ignore[attr-defined]
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         patch_states = self.patch_embedding(op, pixel_values)
@@ -89,7 +89,7 @@ class FixedResolutionSiglipMLPSidecar(nn.Module):
         output_hidden_size: int | None = None,
     ):
         super().__init__()
-        embeddings = vision_tower.embeddings
+        embeddings = vision_tower.embeddings  # type: ignore[attr-defined]
         vision_tower.embeddings = FixedResolutionSiglipEmbeddings(
             embeddings.patch_embedding,
             embeddings.position_embedding,
@@ -105,7 +105,7 @@ class FixedResolutionSiglipMLPSidecar(nn.Module):
         # (B, C, H, W) -> (B, (H/P)*(W/P), Dv) -> (B, patches, Dt).
         pixel_values = op.CastLike(
             pixel_values,
-            self.vision_tower.embeddings.patch_embedding.projection.weight,
+            self.vision_tower.embeddings.patch_embedding.projection.weight,  # type: ignore[attr-defined]
         )
         patch_states = self.vision_tower(op, pixel_values)
         return self.projector(op, patch_states)

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
@@ -27,7 +26,7 @@ class GGUFAudioProjectorTask(ModelTask):
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
-        audio_encoder = module.audio_encoder
+        audio_encoder = module.audio_encoder  # type: ignore[attr-defined]
         input_schema = getattr(audio_encoder, "input_schema", None)
         if not isinstance(input_schema, tuple) or not input_schema:
             raise TypeError("GGUF audio encoder must declare a non-empty input_schema")

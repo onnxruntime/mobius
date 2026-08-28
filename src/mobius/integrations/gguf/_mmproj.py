@@ -561,8 +561,6 @@ def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
         raise ValueError("clip.has_audio_encoder must be boolean true for gemma4a.")
     positive_integer_keys = (
         "clip.audio.embedding_length",
-        "clip.audio.feed_forward_length",
-        "clip.audio.block_count",
         "clip.audio.projection_dim",
         "clip.audio.attention.head_count",
         "clip.audio.num_mel_bins",
@@ -571,6 +569,10 @@ def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
         value = metadata[key]
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
             raise ValueError(f"{key} must be a positive integer, got {value!r}.")
+    for key in ("clip.audio.feed_forward_length", "clip.audio.block_count"):
+        value = metadata[key]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer, got {value!r}.")
     epsilon = metadata["clip.audio.attention.layer_norm_epsilon"]
     if (
         isinstance(epsilon, bool)

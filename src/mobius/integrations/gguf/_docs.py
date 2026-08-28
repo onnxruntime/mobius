@@ -25,6 +25,7 @@ from mobius.integrations.gguf._artifact_blocker_evidence import (
     iter_artifact_blocker_evidence,
 )
 from mobius.integrations.gguf._mmproj_registry import (
+    LLAMA_CPP_MMPROJ_SHA,
     MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
     iter_projector_source_evidence,
@@ -888,7 +889,7 @@ def update_document(path: Path = DOC_PATH) -> str:
             flags=re.IGNORECASE,
         )
     )
-    if pins - {UPSTREAM_COMMIT}:
+    if pins - {UPSTREAM_COMMIT, LLAMA_CPP_MMPROJ_SHA}:
         raise ValueError(f"Stale llama.cpp pins outside generated blocks: {sorted(pins)}")
     return render_document()
 
