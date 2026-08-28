@@ -82,20 +82,25 @@ def _empty_cache(session: Any) -> dict[str, np.ndarray]:
     for value in session.get_inputs():
         if not value.name.startswith("past_key_values."):
             continue
-        dtype = {
-            "tensor(float)": np.float32,
-            "tensor(float16)": np.float16,
-        }[value.type]
+        dtype = _input_dtype(session, value.name)
         shape = [
-            dimension
-            if isinstance(dimension, int)
-            else (0 if "past" in str(dimension) else 1)
+            dimension if isinstance(dimension, int) else (0 if "past" in str(dimension) else 1)
             for dimension in value.shape
         ]
         cache[value.name] = np.empty(shape, dtype=dtype)
     if not cache or len(cache) % 2:
         raise AssertionError("model has no complete dynamic KV cache")
     return cache
+
+
+def _input_dtype(session: Any, name: str) -> np.dtype[Any]:
+    value = next(value for value in session.get_inputs() if value.name == name)
+    return np.dtype(
+        {
+            "tensor(float)": np.float32,
+            "tensor(float16)": np.float16,
+        }[value.type]
+    )
 
 
 def _outputs(session: Any, feeds: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -116,7 +121,9 @@ def _raw_contract(draft_gguf: Path) -> dict[str, Any]:
 
     reader = GGUFReader(draft_gguf, "r")
     architecture = str(reader.fields["general.architecture"].contents())
-    raw_layers = [int(value) for value in reader.fields[f"{architecture}.target_layers"].contents()]
+    raw_layers = [
+        int(value) for value in reader.fields[f"{architecture}.target_layers"].contents()
+    ]
     layers = [index - 1 for index in raw_layers]
     d2t = next(
         (
@@ -203,9 +210,9 @@ class IndependentDraftOracle:
         if "attention_mask" in names:
             feeds["attention_mask"] = np.ones((1, past + tokens.shape[1]), dtype=np.int64)
         if "position_ids" in names:
-            feeds["position_ids"] = np.arange(
-                past, past + tokens.shape[1], dtype=np.int64
-            )[None, :]
+            feeds["position_ids"] = np.arange(past, past + tokens.shape[1], dtype=np.int64)[
+                None, :
+            ]
         outputs = _outputs(self.target, feeds)
         return outputs, _present(outputs, len(cache) // 2)
 
@@ -342,7 +349,7 @@ class IndependentDraftOracle:
         mask_id = self.contract["mask_token_id"]
         block_size = self.contract["block_size"]
         if not isinstance(mask_id, int) or not isinstance(block_size, int):
-            raise AssertionError("DFlash raw GGUF contract is incomplete")
+            raise TypeError("DFlash raw GGUF contract is incomplete")
         rounds = []
         while len(generated) < count:
             start = input_ids.shape[1] + len(generated) - 1
@@ -377,9 +384,7 @@ class IndependentDraftOracle:
             accepted = next(
                 (
                     index
-                    for index, (proposal, token) in enumerate(
-                        zip(proposals, posterior[:-1])
-                    )
+                    for index, (proposal, token) in enumerate(zip(proposals, posterior[:-1]))
                     if proposal != int(token)
                 ),
                 len(proposals),
@@ -457,9 +462,9 @@ class IndependentDraftOracle:
             if self.embedding is None:
                 raise AssertionError("shared EAGLE embedding component missing")
             token_feed = {
-                "inputs_embeds": _outputs(
-                    self.embedding, {"input_ids": tokens}
-                )["inputs_embeds"]
+                "inputs_embeds": _outputs(self.embedding, {"input_ids": tokens})[
+                    "inputs_embeds"
+                ]
             }
         past = _cache_length(cache)
         feeds = {
@@ -471,9 +476,9 @@ class IndependentDraftOracle:
         if "attention_mask" in names:
             feeds["attention_mask"] = np.ones((1, past + tokens.shape[1]), dtype=np.int64)
         if "position_ids" in names:
-            feeds["position_ids"] = np.arange(
-                past, past + tokens.shape[1], dtype=np.int64
-            )[None, :]
+            feeds["position_ids"] = np.arange(past, past + tokens.shape[1], dtype=np.int64)[
+                None, :
+            ]
         outputs = _outputs(self.draft, feeds)
         return outputs, _present(outputs, len(cache) // 2)
 
@@ -488,11 +493,12 @@ class IndependentDraftOracle:
             for value in self.draft.get_inputs()
             if value.name == "recycled_hidden"
         )
+        draft_dtype = _input_dtype(self.draft, "fused_hidden")
         if input_ids.shape[1] > 1:
             _, draft_cache = self._run_eagle_step(
                 input_ids[:, 1:],
                 all_features[:, :-1],
-                np.zeros((1, input_ids.shape[1] - 1, hidden), dtype=np.float32),
+                np.zeros((1, input_ids.shape[1] - 1, hidden), dtype=draft_dtype),
                 draft_cache,
             )
         pending = all_features[:, -1:]
@@ -503,13 +509,13 @@ class IndependentDraftOracle:
             draft_before = draft_cache
             proposals, proposal_ids, proposal_logits_rows = [], [], []
             tentative = draft_before
-            recycled = np.zeros((1, 1, hidden), dtype=np.float32)
+            recycled = np.zeros((1, 1, hidden), dtype=draft_dtype)
             token = generated[-1]
             for step in range(4):
                 features = (
                     pending
                     if step == 0
-                    else np.zeros((1, 1, pending.shape[-1]), dtype=np.float32)
+                    else np.zeros((1, 1, pending.shape[-1]), dtype=draft_dtype)
                 )
                 draft_outputs, tentative = self._run_eagle_step(
                     [[token]], features, recycled, tentative
@@ -530,9 +536,7 @@ class IndependentDraftOracle:
             accepted = next(
                 (
                     index
-                    for index, (proposal, token) in enumerate(
-                        zip(proposals, posterior[:-1])
-                    )
+                    for index, (proposal, token) in enumerate(zip(proposals, posterior[:-1]))
                     if proposal != int(token)
                 ),
                 len(proposals),
@@ -555,13 +559,13 @@ class IndependentDraftOracle:
             _, draft_committed = self._run_eagle_step(
                 np.array(committed_inputs, dtype=np.int64),
                 accepted_features,
-                np.zeros((1, accepted + 1, hidden), dtype=np.float32),
+                np.zeros((1, accepted + 1, hidden), dtype=draft_dtype),
                 draft_before,
             )
             _, draft_replay = self._run_eagle_step(
                 np.array(committed_inputs, dtype=np.int64),
                 accepted_features,
-                np.zeros((1, accepted + 1, hidden), dtype=np.float32),
+                np.zeros((1, accepted + 1, hidden), dtype=draft_dtype),
                 draft_before,
             )
             _assert_cache_equal(draft_committed, draft_replay)
@@ -616,9 +620,7 @@ class IndependentDraftOracle:
                 "rounds": len(rounds),
                 "proposed": sum(len(record["proposal_tokens"]) for record in rounds),
                 "accepted": sum(record["accepted_prefix"] for record in rounds),
-                "multi_token_rounds": sum(
-                    record["accepted_prefix"] > 1 for record in rounds
-                ),
+                "multi_token_rounds": sum(record["accepted_prefix"] > 1 for record in rounds),
                 "rejections": sum(
                     record["accepted_prefix"] < len(record["proposal_tokens"])
                     for record in rounds
@@ -645,7 +647,7 @@ def assert_trace_matches(actual: dict[str, Any], expected: dict[str, Any]) -> No
     def compare(left: Any, right: Any, path: str) -> None:
         if isinstance(right, dict):
             if not isinstance(left, dict):
-                raise AssertionError(f"{path}: expected object")
+                raise AssertionError(f"{path}: expected object")  # noqa: TRY004
             for key, value in right.items():
                 if key not in left:
                     raise AssertionError(f"{path}.{key}: missing")
