@@ -117,6 +117,11 @@ def test_audio_projector_evidence_is_test_only_immutable_and_bounded():
         "ultravox",
         "voxtral",
     }
+    assert set(evidence["converter_paths"]) == set(routes)
+    assert all(
+        path.startswith("conversion/") and path.endswith(".py")
+        for path in evidence["converter_paths"].values()
+    )
     total_bytes = 0
     for route in routes.values():
         source = route["source"]
@@ -276,3 +281,63 @@ def test_pockettts_generator_namespace_is_quarantined_not_promoted():
 
     assert [role.value for role in spec.model_roles] == ["speaker_encoder"]
     assert get_projector_spec("pockettts_gen").is_importable is False
+    generator_role = next(
+        role
+        for prefix, role in spec.tensor_roles
+        if "a.gen.flow.input_proj.weight".startswith(prefix)
+    )
+    assert generator_role.value == "generated_audio"
+
+
+def test_vision_companion_quarantine_never_hides_unknown_audio_projector_tensor():
+    sidecar = _standalone_sidecar("mimo_audio")
+    sidecar.metadata["clip.has_vision_encoder"] = True
+    sidecar.metadata["clip.vision.projector_type"] = "mimovl"
+    sidecar.tensor_names = (
+        *sidecar.tensor_names,
+        "v.patch_embd.weight",
+        "mm.vision.weight",
+        "mm.a.future.weight",
+    )
+    tensor_types = {name: SimpleNamespace(name="F32") for name in sidecar.tensor_names}
+    sidecar.get_tensor_type = tensor_types.__getitem__
+
+    with pytest.raises(ValueError, match=r"mm\.a\.future\.weight"):
+        _preflight_standalone_mmproj(
+            sidecar,
+            projector_type="mimo_audio",
+            target_architecture="mimo2",
+        )
+
+
+@pytest.mark.parametrize(
+    ("projector_type", "target_architecture", "role"),
+    [
+        ("ultravox", "llama", "audio_encoder"),
+        ("pockettts_spkenc", "pockettts", "speaker_encoder"),
+    ],
+)
+def test_public_standalone_dispatch_enforces_declared_model_role(
+    monkeypatch,
+    projector_type: str,
+    target_architecture: str,
+    role: str,
+):
+    from mobius.integrations.gguf import _builder, _mmproj
+
+    sidecar = _standalone_sidecar(projector_type)
+    monkeypatch.setattr(_builder, "_validate_gguf_model", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        _mmproj,
+        "build_audio_projector_from_gguf",
+        lambda *args, **kwargs: {role: object()},
+    )
+
+    package = _mmproj.build_mmproj_from_gguf(
+        "synthetic.gguf",
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+        _mmproj_gguf_model=sidecar,
+    )
+
+    assert set(package) == {role}

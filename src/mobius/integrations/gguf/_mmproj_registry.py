@@ -3146,8 +3146,8 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         tensor_roles=(
             ("a.speaker_proj.", MMProjTensorRole.PROJECTOR),
-            ("a.", MMProjTensorRole.ENCODER),
             ("a.gen.", MMProjTensorRole.GENERATED_AUDIO),
+            ("a.", MMProjTensorRole.ENCODER),
         ),
         source_evidence_ids=("pockettts-speaker-source",),
     ),

@@ -1,5 +1,15 @@
 {
   "llama_cpp_revision": "8d9af256337d1a501250f9bbf4c0859a654bddd6",
+  "converter_paths": {
+    "granite_speech": "conversion/granite.py",
+    "lfm2a": "conversion/lfm2.py",
+    "mimo_audio": "conversion/mimo.py",
+    "musicflamingo": "conversion/ultravox.py",
+    "parakeet": "conversion/nemotron.py",
+    "pockettts_spkenc": "conversion/pockettts.py",
+    "ultravox": "conversion/ultravox.py",
+    "voxtral": "conversion/ultravox.py"
+  },
   "routes": {
     "granite_speech": {
       "role": "audio_encoder",
@@ -52,6 +62,7 @@
       "target_architecture": "mimo2",
       "artifact": null,
       "evidence_status": "no public llama.cpp-compatible mmproj; pinned source component evidence",
+      "source_evidence_id": "mimo-v2.5-audio-source",
       "evidence_bytes": 652622472,
       "source": {
         "repository": "XiaomiMiMo/MiMo-V2.5",
@@ -92,6 +103,7 @@
       "target_architecture": "nemotron_h",
       "artifact": null,
       "evidence_status": "published dual-modality candidate predates audio tensors; pinned source and converter evidence",
+      "source_evidence_id": "nemotron-v2-parakeet-source",
       "evidence_bytes": 0,
       "source": {
         "repository": "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
@@ -112,6 +124,7 @@
       "target_architecture": "pockettts",
       "artifact": null,
       "evidence_status": "no public llama.cpp-compatible mmproj; gated pinned source evidence",
+      "source_evidence_id": "pockettts-speaker-source",
       "evidence_bytes": 219029196,
       "source": {
         "repository": "kyutai/pocket-tts",
@@ -164,6 +177,7 @@
         },
         "storage_disposition": "fail-closed-packed"
       },
+      "source_evidence_id": "voxtral-mini-3b-source-and-q8-availability",
       "source": {
         "repository": "mistralai/Voxtral-Mini-3B-2507",
         "revision": "3060fe34b35ba5d44202ce9ff3c097642914f8f3",

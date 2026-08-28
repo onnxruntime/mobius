@@ -14,6 +14,10 @@ from onnxscript import OpBuilder, nn
 
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
+from mobius.integrations.gguf._mmproj_mapping import (
+    map_mmproj_audio_projector_to_onnx,
+)
+from mobius.integrations.gguf._mmproj_registry import get_projector_spec
 from mobius.models.gguf_audio_projector import (
     AUDIO_PROCESSOR_ABIS,
     GGUFAudioProjectorModel,
@@ -26,7 +30,11 @@ from mobius.models.gguf_audio_projector import (
     _UltravoxProjector,
     create_gguf_audio_projector,
 )
-from mobius.tasks import GGUFAudioProjectorTask
+from mobius.tasks import (
+    GGUFAudioProjectorTask,
+    GGUFSpeakerProjectorModel,
+    GGUFSpeakerProjectorTask,
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,7 @@ def _lfm2a_case() -> _RouteCase:
         "a.conv1d.0.weight": (4, 1, 3, 3),
         "a.blk.0.ffn_up.weight": (32, 16),
         "a.blk.0.conv_dw.weight": (16, 5),
+        "a.position_embd.weight": (64, 20),
         "mm.a.mlp.1.weight": (24, 16),
         "mm.a.mlp.3.weight": (20, 24),
     }
@@ -211,6 +220,20 @@ def _mimo_case() -> _RouteCase:
     for layer in range(3):
         for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
             shapes[f"a.blk.{layer}.{stem}.weight"] = (8, 8)
+        for stem in ("attn_q", "attn_v", "attn_out"):
+            shapes[f"a.blk.{layer}.{stem}.bias"] = (8,)
+    for stem in ("attn_q", "attn_k", "attn_v"):
+        shapes[f"mm.a.local_blk.0.{stem}.weight"] = (8, 8)
+        shapes[f"mm.a.local_blk.0.{stem}.bias"] = (8,)
+    shapes.update(
+        {
+            "mm.a.local_blk.0.attn_out.weight": (8, 8),
+            "mm.a.local_blk.0.ffn_gate.weight": (12, 8),
+            "mm.a.local_blk.0.ffn_down.weight": (8, 12),
+            "mm.a.local_blk.0.ln1.weight": (8,),
+            "mm.a.local_blk.0.ln2.weight": (8,),
+        }
+    )
     return _RouteCase(
         metadata,
         shapes,
@@ -278,7 +301,11 @@ def _case(projector_type: str) -> _RouteCase:
     }[projector_type]()
 
 
-def _build(projector_type: str):
+def _build(
+    projector_type: str,
+    *,
+    dtype: ir.DataType = ir.DataType.FLOAT,
+):
     case = _case(projector_type)
     module = create_gguf_audio_projector(
         projector_type,
@@ -300,12 +327,21 @@ def _build(projector_type: str):
         num_key_value_heads=heads,
         head_dim=hidden // heads,
         max_position_embeddings=65_536,
+        dtype=dtype,
     )
-    return case, build_from_module(
-        module,
-        config,
-        task=GGUFAudioProjectorTask(),
-    )["audio_encoder"]
+    if projector_type == "pockettts_spkenc":
+        speaker_module = GGUFSpeakerProjectorModel(
+            module.audio_encoder,
+            output_name="speaker_features",
+        )
+        return case, build_from_module(
+            speaker_module,
+            config,
+            task=GGUFSpeakerProjectorTask(),
+        )["speaker_encoder"]
+    return case, build_from_module(module, config, task=GGUFAudioProjectorTask())[
+        "audio_encoder"
+    ]
 
 
 _PROJECTOR_TYPES = (
@@ -326,8 +362,69 @@ def test_audio_projector_graph_builds_with_route_specific_abi(projector_type: st
 
     assert [value.name for value in model.graph.inputs] == list(case.inputs)
     assert model.graph.inputs[0].dtype == ir.DataType.FLOAT
-    assert [value.name for value in model.graph.outputs] == ["audio_features"]
+    output_name = (
+        "speaker_features" if projector_type == "pockettts_spkenc" else "audio_features"
+    )
+    assert [value.name for value in model.graph.outputs] == [output_name]
     assert model.graph.outputs[0].dtype == ir.DataType.FLOAT
+
+
+@pytest.mark.parametrize("projector_type", _PROJECTOR_TYPES)
+def test_reduced_precision_graph_keeps_float32_processor_boundary(
+    projector_type: str,
+):
+    _, model = _build(projector_type, dtype=ir.DataType.FLOAT16)
+
+    assert model.graph.inputs[0].dtype == ir.DataType.FLOAT
+    parameter_dtypes = {
+        initializer.dtype
+        for name, initializer in model.graph.initializers.items()
+        if name.startswith(("audio_encoder.", "speaker_encoder."))
+        and not name.endswith(("cos_cache", "sin_cache"))
+    }
+    assert parameter_dtypes == {ir.DataType.FLOAT16}
+
+
+@pytest.mark.parametrize("projector_type", _PROJECTOR_TYPES)
+def test_audio_projector_tensor_map_covers_every_graph_parameter(projector_type: str):
+    case = _case(projector_type)
+    module = create_gguf_audio_projector(
+        projector_type,
+        case.metadata,
+        case.shapes,
+    )
+    if projector_type == "pockettts_spkenc":
+        mapped_module: nn.Module = GGUFSpeakerProjectorModel(module.audio_encoder)
+    else:
+        mapped_module = module
+    parameters = {
+        name
+        for name, _ in mapped_module.named_parameters()
+        if not name.endswith(("rotary_emb.cos_cache", "rotary_emb.sin_cache"))
+    }
+    spec = get_projector_spec(projector_type)
+    source_names = set(spec.required_top_tensors)
+    source_names.update(name for name in spec.optional_top_tensors if name in case.shapes)
+    source_names.update(
+        f"{spec.block_prefix}{layer}.{suffix}"
+        for layer in range(int(case.metadata["clip.audio.block_count"]))
+        for suffix in spec.block_suffixes
+    )
+    if projector_type == "mimo_audio":
+        source_names.update(name for name in case.shapes if name.startswith("mm.a.local_blk."))
+    mapped = {
+        target
+        for name in source_names
+        if (
+            target := map_mmproj_audio_projector_to_onnx(
+                name,
+                projector_type,
+            )
+        )
+        is not None
+    }
+
+    assert mapped == parameters
 
 
 @pytest.mark.parametrize("projector_type", _PROJECTOR_TYPES)
@@ -389,6 +486,43 @@ def test_audio_processor_abis_preserve_sample_channel_and_frame_contracts():
     assert AUDIO_PROCESSOR_ABIS["mimo_audio"].sample_rate == 24_000
     assert AUDIO_PROCESSOR_ABIS["pockettts_spkenc"].frame_multiple == 1_920
     assert AUDIO_PROCESSOR_ABIS["pockettts_spkenc"].max_seconds == 30
+    with pytest.raises(TypeError):
+        AUDIO_PROCESSOR_ABIS["ultravox"] = AUDIO_PROCESSOR_ABIS["voxtral"]  # type: ignore[index]
+
+
+def test_granite_feature_capture_precedes_midpoint_ctc_injection():
+    case = _granite_case()
+    case.metadata["clip.audio.feature_layer"] = [1]
+    module = create_gguf_audio_projector(
+        "granite_speech",
+        case.metadata,
+        case.shapes,
+    )
+    config = ArchitectureConfig(
+        model_type="gguf_granite_feature_capture_test",
+        vocab_size=1,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        max_position_embeddings=32,
+    )
+    graph = build_from_module(
+        module,
+        config,
+        task=GGUFAudioProjectorTask(),
+    )["audio_encoder"].graph
+    feature_concat = next(
+        node
+        for node in graph
+        if node.op_type == "Concat"
+        and node.attributes["axis"].value == -1
+        and any("output_norm" in value.name for value in node.inputs)
+    )
+
+    assert "layers.0.output_norm" in feature_concat.inputs[0].name
 
 
 class _ComponentEncoder(nn.Module):

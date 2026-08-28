@@ -14,7 +14,8 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import onnx_ir as ir
@@ -54,111 +55,117 @@ class GGUFAudioProcessorABI:
     hop_length: int | None = None
     chunk_seconds: int | None = None
     frame_multiple: int | None = None
+    max_frames: int | None = None
     max_seconds: int | None = None
 
     @property
     def feature_contract(self) -> str:
-        """Compatibility alias used by the merged generic audio task."""
         return self.preprocessing
 
 
-AUDIO_PROCESSOR_ABIS: Mapping[str, GGUFAudioProcessorABI] = {
-    "ultravox": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[frames,128]",
-        "Whisper log10 mel, right-padded to 3000 frames",
-        n_fft=400,
-        window_length=400,
-        hop_length=160,
-        chunk_seconds=30,
-    ),
-    "voxtral": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[frames,128]",
-        "Whisper log10 mel, right-padded to 3000 frames",
-        n_fft=400,
-        window_length=400,
-        hop_length=160,
-        chunk_seconds=30,
-    ),
-    "musicflamingo": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[frames,128]",
-        "Whisper log10 mel, right-padded to 3000 frames",
-        n_fft=400,
-        window_length=400,
-        hop_length=160,
-        chunk_seconds=30,
-    ),
-    "lfm2a": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[frames,128]",
-        "centered pre-emphasized natural-log mel with per-feature normalization",
-        n_fft=512,
-        window_length=400,
-        hop_length=160,
-        chunk_seconds=1,
-    ),
-    "granite_speech": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[stacked_frames,160]",
-        "centered half-mel filterbank, clamp/scale, then concatenate frame pairs",
-        n_fft=512,
-        window_length=400,
-        hop_length=160,
-    ),
-    "parakeet": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[frames,mel_bins]",
-        "centered pre-emphasized power mel with stored window/filterbank and normalization",
-        n_fft=512,
-        window_length=400,
-        hop_length=160,
-    ),
-    "mimo_audio": GGUFAudioProcessorABI(
-        24_000,
-        1,
-        "input_features",
-        "float32[frames,128]",
-        "centered HTK magnitude mel followed by natural log",
-        n_fft=960,
-        window_length=960,
-        hop_length=240,
-    ),
-    "pockettts_spkenc": GGUFAudioProcessorABI(
-        24_000,
-        1,
-        "input_values",
-        "float32[samples]",
-        "raw mono PCM, zero-padded to complete 1920-sample conditioning frames",
-        frame_multiple=1_920,
-        max_seconds=30,
-    ),
-    "meralion": GGUFAudioProcessorABI(
-        16_000,
-        1,
-        "input_features",
-        "float32[3000,128]",
-        "Whisper log10 mel for one right-padded 30-second chunk",
-        n_fft=400,
-        window_length=400,
-        hop_length=160,
-        chunk_seconds=30,
-        max_seconds=300,
-    ),
-}
+AUDIO_PROCESSOR_ABIS: Mapping[str, GGUFAudioProcessorABI] = MappingProxyType(
+    {
+        "ultravox": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[frames,128]",
+            "Whisper log10 mel, right-padded to 3000 frames",
+            n_fft=400,
+            window_length=400,
+            hop_length=160,
+            chunk_seconds=30,
+            max_frames=3_000,
+        ),
+        "voxtral": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[frames,128]",
+            "Whisper log10 mel, right-padded to 3000 frames",
+            n_fft=400,
+            window_length=400,
+            hop_length=160,
+            chunk_seconds=30,
+            max_frames=3_000,
+        ),
+        "musicflamingo": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[frames,128]",
+            "Whisper log10 mel, right-padded to 3000 frames",
+            n_fft=400,
+            window_length=400,
+            hop_length=160,
+            chunk_seconds=30,
+            max_frames=3_000,
+        ),
+        "lfm2a": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[frames,128]",
+            "centered pre-emphasized natural-log mel with per-feature normalization",
+            n_fft=512,
+            window_length=400,
+            hop_length=160,
+            chunk_seconds=1,
+        ),
+        "granite_speech": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[stacked_frames,160]",
+            "centered half-mel filterbank, clamp/scale, then concatenate frame pairs",
+            n_fft=512,
+            window_length=400,
+            hop_length=160,
+        ),
+        "parakeet": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[frames,mel_bins]",
+            "centered pre-emphasized power mel with stored window/filterbank and normalization",
+            n_fft=512,
+            window_length=400,
+            hop_length=160,
+            max_frames=65_536,
+        ),
+        "mimo_audio": GGUFAudioProcessorABI(
+            24_000,
+            1,
+            "input_features",
+            "float32[frames,128]",
+            "centered HTK magnitude mel followed by natural log",
+            n_fft=960,
+            window_length=960,
+            hop_length=240,
+        ),
+        "pockettts_spkenc": GGUFAudioProcessorABI(
+            24_000,
+            1,
+            "input_values",
+            "float32[samples]",
+            "raw mono PCM, zero-padded to complete 1920-sample conditioning frames",
+            frame_multiple=1_920,
+            max_seconds=30,
+        ),
+        "meralion": GGUFAudioProcessorABI(
+            16_000,
+            1,
+            "input_features",
+            "float32[3000,128]",
+            "Whisper log10 mel for one right-padded 30-second chunk",
+            n_fft=400,
+            window_length=400,
+            hop_length=160,
+            chunk_seconds=30,
+            max_seconds=300,
+        ),
+    }
+)
 
 
 def _shape(shapes: TensorShapes, name: str, rank: int | None = None) -> tuple[int, ...]:
@@ -376,6 +383,7 @@ class GGUFWhisperAudioProjector(nn.Module):
         self.post_layernorm = LayerNorm(hidden_size, eps=eps)
         self._hidden_size = hidden_size
         self._max_positions = position_shape[0]
+        self._max_input_frames = self._max_positions * 2
         self._stack_factor = (
             _metadata_int(metadata, "clip.audio.projector.stack_factor")
             if projector_type in {"ultravox", "voxtral"}
@@ -407,9 +415,21 @@ class GGUFWhisperAudioProjector(nn.Module):
                 first_bias="mm.a.mlp.1.bias" in shapes,
                 second_bias="mm.a.mlp.2.bias" in shapes,
             )
+        self.output_size = second_shape[0]
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
         # Processor boundary: (frames, mel) -> Whisper Conv1d (1, mel, frames).
+        frames = op.Shape(input_features, start=0, end=1)
+        input_features = _guard_false(
+            op,
+            op.Squeeze(
+                op.Greater(
+                    frames,
+                    op.Constant(value_ints=[self._max_input_frames]),
+                )
+            ),
+            input_features,
+        )
         hidden_states = op.Transpose(input_features, perm=[1, 0])
         hidden_states = op.Unsqueeze(hidden_states, [0])
         hidden_states = _cast_boundary(op, hidden_states, self.conv1.weight)
@@ -531,13 +551,25 @@ class GGUFParakeetAudioProjector(nn.Module):
             first_bias="mm.a.mlp.1.bias" in shapes,
             second_bias="mm.a.mlp.2.bias" in shapes,
         )
+        self.output_size = second_shape[0]
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
+        frames = op.Shape(input_features, start=0, end=1)
+        input_features = _guard_false(
+            op,
+            op.Squeeze(
+                op.Greater(
+                    frames,
+                    op.Constant(value_ints=[65_536]),
+                )
+            ),
+            input_features,
+        )
         hidden_states = op.Unsqueeze(input_features, [0])
         hidden_states = _cast_boundary(
             op,
             hidden_states,
-            self.encoder.subsampling.layers[0].weight,
+            cast(Conv2d, self.encoder.subsampling.layers[0]).weight,
         )
         frames = op.Shape(hidden_states, start=1, end=2)
         mask_shape = op.Concat(op.Constant(value_ints=[1]), frames, axis=0)
@@ -898,6 +930,8 @@ class GGUFLFM2AudioProjector(nn.Module):
             conv_channels,
             kernel_size=first_conv[-1],
         )
+        position_shape = _shape(shapes, "a.position_embd.weight", 2)
+        self._max_positions = position_shape[0]
         self.position_encoding = _RelativePositionEncoding(hidden_size)
         depthwise_shape = _shape(shapes, "a.blk.0.conv_dw.weight")
         kernel_size = depthwise_shape[-1]
@@ -925,14 +959,31 @@ class GGUFLFM2AudioProjector(nn.Module):
             second_projector[0],
             eps,
         )
+        self.output_size = second_projector[0]
+        if position_shape[1] != self.output_size:
+            raise ValueError(
+                f"LFM2A compatibility position table width {position_shape[1]} "
+                f"does not match projector output {self.output_size}."
+            )
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
         hidden_states = _cast_boundary(
             op,
             input_features,
-            self.pre_encode.layers[0].weight,
+            cast(Conv2d, self.pre_encode.layers[0]).weight,
         )
         hidden_states = self.pre_encode(op, hidden_states)
+        time = op.Shape(hidden_states, start=1, end=2)
+        hidden_states = _guard_false(
+            op,
+            op.Squeeze(
+                op.Greater(
+                    time,
+                    op.Constant(value_ints=[self._max_positions]),
+                )
+            ),
+            hidden_states,
+        )
         position_embeddings = self.position_encoding(op, hidden_states)
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, position_embeddings)
@@ -1309,10 +1360,11 @@ class GGUFGraniteSpeechProjector(nn.Module):
             query_shape[2],
             projector_heads,
             projector_intermediate,
-            query_shape,
+            cast(tuple[int, int, int], query_shape),
             projector_layers,
             output_size,
         )
+        self.output_size = output_size
         self._projector_window = projector_window
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
@@ -1327,11 +1379,13 @@ class GGUFGraniteSpeechProjector(nn.Module):
             captured.append(hidden_states)
         for index, layer in enumerate(self.layers, start=1):
             hidden_states = layer(op, hidden_states)
+            if index in self._feature_layers:
+                # GraniteSpeechPlus snapshots the conformer layer output before
+                # the midpoint CTC residual is injected into the main stream.
+                captured.append(hidden_states)
             if index == self._ctc_layer:
                 ctc = op.Softmax(self.ctc_out(op, hidden_states), axis=-1)
                 hidden_states = op.Add(hidden_states, self.ctc_mid(op, ctc))
-            if index in self._feature_layers:
-                captured.append(hidden_states)
         captured.append(hidden_states)
         hidden_states = op.Concat(*captured, axis=-1) if len(captured) > 1 else captured[0]
 
@@ -1547,13 +1601,21 @@ class _MimoLocalLayer(nn.Module):
     ):
         super().__init__()
         prefix = f"mm.a.local_blk.{index}."
+        for stem in ("attn_q", "attn_k", "attn_v"):
+            _shape(shapes, prefix + stem + ".weight", 2)
+            _shape(shapes, prefix + stem + ".bias", 1)
+        _shape(shapes, prefix + "attn_out.weight", 2)
+        for stem in ("ffn_gate", "ffn_up", "ffn_down"):
+            _shape(shapes, prefix + stem + ".weight", 2)
+        for stem in ("ln1", "ln2"):
+            _shape(shapes, prefix + stem + ".weight", 1)
         self.norm1 = RMSNorm(hidden_size, eps=eps)
         self.self_attn = _MimoAttention(
             hidden_size,
             num_heads,
-            q_bias=prefix + "attn_q.bias" in shapes,
-            k_bias=prefix + "attn_k.bias" in shapes,
-            v_bias=prefix + "attn_v.bias" in shapes,
+            q_bias=True,
+            k_bias=True,
+            v_bias=True,
             out_bias=False,
             rope_theta=640_000.0,
         )
@@ -1751,8 +1813,8 @@ class GGUFMimoAudioProjector(nn.Module):
         ):
             raise ValueError("MiMo RVQ codebook sizes exceed the serialized tensors.")
         self.rvq = _MimoRVQBridge(
-            codebook_shape,
-            code_embedding_shape,
+            cast(tuple[int, int, int], codebook_shape),
+            cast(tuple[int, int, int], code_embedding_shape),
             codebook_sizes,
         )
 
@@ -1785,6 +1847,7 @@ class GGUFMimoAudioProjector(nn.Module):
             first_bias=False,
             second_bias=False,
         )
+        self.output_size = second_projection[0]
 
     def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
         hidden_states = op.Transpose(input_features, perm=[1, 0])
@@ -1966,16 +2029,23 @@ class _PocketSEANetEncoder(nn.Module):
             _shape(shapes, "a.seanet.conv_in.weight", 3),
             bias="a.seanet.conv_in.bias" in shapes,
         )
-        stages = []
+        stages: list[nn.Module] = []
+        ratios: list[int] = []
         index = 0
         while f"a.seanet.blk.{index}.scale_conv.weight" in shapes:
+            scale_shape = _shape(
+                shapes,
+                f"a.seanet.blk.{index}.scale_conv.weight",
+                3,
+            )
             stages.append(
                 _PocketSEANetStage(
                     _shape(shapes, f"a.seanet.blk.{index}.res_conv1.weight", 3),
                     _shape(shapes, f"a.seanet.blk.{index}.res_conv2.weight", 3),
-                    _shape(shapes, f"a.seanet.blk.{index}.scale_conv.weight", 3),
+                    scale_shape,
                 )
             )
+            ratios.append(scale_shape[-1] // 2)
             index += 1
         if not stages:
             raise ValueError("PocketTTS sidecar has no SEANet encoder stages.")
@@ -1984,7 +2054,7 @@ class _PocketSEANetEncoder(nn.Module):
             _shape(shapes, "a.seanet.conv_out.weight", 3),
             bias="a.seanet.conv_out.bias" in shapes,
         )
-        self.frame_hop = math.prod(stage.scale._stride for stage in stages)
+        self.frame_hop = math.prod(ratios)
 
     def forward(self, op: OpBuilder, waveform: ir.Value) -> ir.Value:
         hidden_states = self.conv_in(op, waveform)
@@ -2055,6 +2125,7 @@ class GGUFPocketTTSSpeakerEncoder(nn.Module):
             speaker_shape[0],
             bias=False,
         )
+        self.output_size = speaker_shape[0]
         self._frame_hop = self.seanet.frame_hop * 16
         self._max_samples = 30 * 24_000
         if self._frame_hop != 1_920:
