@@ -46,6 +46,7 @@ from mobius.integrations.gguf._tokenizer import (
     materialize_gguf_tokenizer,
     write_gguf_tokenizer_json,
 )
+from mobius.integrations.gguf._tokenizer_evidence import tokenizer_evidence
 
 __all__ = ["write_gguf_runtime_package"]
 
@@ -412,8 +413,22 @@ def write_gguf_runtime_package(
         source=str(source_path),
         require_complete=False,
     )
+    from mobius.integrations.gguf._component_export import resolve_tokenizer_export_verdict
+
+    verdict = resolve_tokenizer_export_verdict(
+        source_model,
+        source_path,
+        verdict=verdict,
+        artifact_identity=built_identity,
+    )
     built_verdict = getattr(pkg, "gguf_tokenizer_verdict", None)
-    if built_verdict is None or built_verdict.metadata_sha256 != verdict.metadata_sha256:
+    if (
+        built_verdict is None
+        or built_verdict.metadata_sha256 != verdict.metadata_sha256
+        or built_verdict.route != verdict.route
+        or built_verdict.evidence_id != verdict.evidence_id
+        or built_verdict.tokenizer_sha256 != verdict.tokenizer_sha256
+    ):
         raise ValueError(
             "The GGUF tokenizer metadata no longer matches the identity captured during "
             "graph construction; refusing to pair the graph with a replaced tokenizer source."
@@ -462,7 +477,28 @@ def write_gguf_runtime_package(
 
         tokenizer_exported = False
         tokenizer_warning: str | None = None
-        if evidence is not None:
+        tokenizer_route_evidence = (
+            tokenizer_evidence(verdict.evidence_id)
+            if verdict.route == "pinned-source" and verdict.evidence_id is not None
+            else None
+        )
+        if verdict.route == "pinned-source":
+            if tokenizer_route_evidence is None:
+                raise ValueError(
+                    "Pinned-source tokenizer verdict references missing exact evidence "
+                    f"{verdict.evidence_id!r}."
+                )
+            tokenizer_path = materialize_gguf_tokenizer(
+                source_path,
+                stage,
+                source=tokenizer_route_evidence.source,
+                metadata=source_metadata,
+                source_identity=(f"sha256:{built_identity.sha256}/{built_identity.filename}"),
+                local_files_only=local_files_only,
+            )
+            artifacts["tokenizer"] = tokenizer_path
+            tokenizer_exported = True
+        elif evidence is not None:
             tokenizer_source = GGUFTokenizerSource(
                 repository=evidence.tokenizer_repository,
                 revision=evidence.tokenizer_revision,
@@ -482,7 +518,7 @@ def write_gguf_runtime_package(
             )
             artifacts["tokenizer"] = tokenizer_path
             tokenizer_exported = True
-        elif verdict.materialized:
+        elif verdict.route == "copy":
             artifacts["tokenizer"] = write_gguf_tokenizer_json(
                 source_path,
                 stage,

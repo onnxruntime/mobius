@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -54,9 +55,12 @@ class _FakePackage:
 def _materialized():
     return SimpleNamespace(
         materialized=True,
+        route="copy",
         route_identifier="embedded",
         reason="exact embedded tokenizer",
+        tokenizer_sha256="e" * 64,
         metadata_sha256="f" * 64,
+        evidence_id=None,
     )
 
 
@@ -177,6 +181,80 @@ def _runtime_supported():
 
 
 class TestWriteGgufRuntimePackage:
+    def test_exact_tokenizer_evidence_exports_without_runtime_evidence(self, tmp_path):
+        pkg = _FakePackage()
+        pinned = GGUFTokenizerVerdict(
+            route="pinned-source",
+            model="gpt2",
+            pre="qwen2",
+            canonical_pre="qwen2",
+            reason="exact tokenizer evidence",
+            token_count=2,
+            tokenizer_sha256="a" * 64,
+            metadata_sha256="f" * 64,
+            audit_status="validated-pinned-source",
+            evidence_id="tokenizer-only-evidence",
+        )
+        pkg.gguf_tokenizer_verdict = pinned
+        tokenizer_source = object()
+        out = tmp_path / "out"
+        with (
+            _successful_runtime_dependencies(),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
+                return_value=None,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._component_export.resolve_tokenizer_export_verdict",
+                return_value=pinned,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.tokenizer_evidence",
+                return_value=SimpleNamespace(source=tokenizer_source),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.materialize_gguf_tokenizer",
+                side_effect=_write_tokenizer,
+            ) as materialize,
+        ):
+            artifacts = _write_runtime(pkg, tmp_path / "m.gguf", out)
+
+        assert Path(artifacts["tokenizer"]).is_file()
+        assert pkg.export_report.component("tokenizer").output == "exported"
+        assert (
+            pkg.export_report.component("runtime").runtime_validation_status == "unvalidated"
+        )
+        assert materialize.call_args.kwargs["source"] is tokenizer_source
+
+    def test_changed_pinned_tokenizer_digest_rejects_before_package_save(self, tmp_path):
+        pkg = _FakePackage()
+        built = GGUFTokenizerVerdict(
+            route="pinned-source",
+            model="gpt2",
+            pre="qwen2",
+            canonical_pre="qwen2",
+            reason="exact tokenizer evidence",
+            token_count=2,
+            tokenizer_sha256="a" * 64,
+            metadata_sha256="f" * 64,
+            audit_status="validated-pinned-source",
+            evidence_id="tokenizer-only-evidence",
+        )
+        current = dataclasses.replace(built, tokenizer_sha256="b" * 64)
+        pkg.gguf_tokenizer_verdict = built
+        with (
+            _successful_runtime_dependencies(),
+            mock.patch(
+                "mobius.integrations.gguf._component_export.resolve_tokenizer_export_verdict",
+                return_value=current,
+            ),
+            pytest.raises(ValueError, match="replaced tokenizer source"),
+        ):
+            _write_runtime(pkg, tmp_path / "m.gguf", tmp_path / "out")
+
+        assert pkg.saved_to is None
+        assert not (tmp_path / "out").exists()
+
     def test_runtime_disposition_is_replaced_when_runtime_changes(self):
         from mobius.integrations.gguf._component_export import (
             attach_runtime_unvalidated_report,

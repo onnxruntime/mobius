@@ -59,13 +59,14 @@ def resolve_tokenizer_export_verdict(
     verdict: GGUFTokenizerVerdict | None = None,
     artifact_identity: Any | None = None,
 ) -> GGUFTokenizerVerdict:
-    """Add an exact artifact blocker to an otherwise validated tokenizer verdict."""
+    """Apply exact artifact evidence to promote or block a tokenizer verdict."""
     if verdict is None:
         verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(source_path))
     if verdict.materialized or verdict.metadata_sha256 is None:
         return verdict
 
     from mobius.integrations.gguf._tokenizer_evidence import (
+        find_matching_tokenizer_evidence,
         matching_tokenizer_blocker_evidence,
     )
 
@@ -76,7 +77,26 @@ def resolve_tokenizer_export_verdict(
         artifact_identity=artifact_identity,
     )
     if blocker is None:
-        return verdict
+        evidence = find_matching_tokenizer_evidence(
+            Path(source_path),
+            gguf_model,
+            metadata_sha256=verdict.metadata_sha256,
+            artifact_identity=artifact_identity,
+        )
+        if evidence is None:
+            return verdict
+        return dataclasses.replace(
+            verdict,
+            route="pinned-source",
+            reason=(
+                "complete immutable GGUF identity matches independently validated tokenizer "
+                f"evidence {evidence.evidence_id!r}"
+            ),
+            tokenizer_sha256=evidence.materialized_tokenizer_sha256,
+            audit_status="validated-pinned-source",
+            blocker_category=None,
+            evidence_id=evidence.evidence_id,
+        )
     return dataclasses.replace(
         verdict,
         reason=blocker.disposition,
