@@ -28,8 +28,6 @@ from mobius.components import (
 )
 from mobius.integrations.gguf._mmproj_mapping import map_ocr_projector_to_onnx
 from mobius.tasks import (
-    GGUFAudioProjectorModel,
-    GGUFAudioProjectorTask,
     GGUFVisionAudioProjectorModel,
     GGUFVisionAudioProjectorTask,
     GGUFVisionProjectorModel,
@@ -327,15 +325,6 @@ def build_ocr_projector_from_gguf(
         audio = _dots_audio(mmproj)
         module = GGUFVisionAudioProjectorModel(vision, audio)
         task = GGUFVisionAudioProjectorTask()
-    elif projector_type == "dots3note_a":
-        # Kept for defensive completeness if a future audio-only sidecar is admitted.
-        audio = _dots_audio(mmproj)
-        config = _standalone_config(
-            int(mmproj.metadata["clip.audio.projection_dim"]),
-            dtype=dtype,
-        )
-        module = GGUFAudioProjectorModel(audio)
-        task = GGUFAudioProjectorTask()
     else:
         vision, config = _vision_module(mmproj, projector_type, dtype=dtype)
         module = GGUFVisionProjectorModel(vision)
