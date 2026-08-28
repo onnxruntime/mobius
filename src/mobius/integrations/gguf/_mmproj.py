@@ -3142,7 +3142,6 @@ _VLM_BUILDERS: dict[str, str] = {
     "qwen_vl": "build_qwen_vlm_from_gguf",
 }
 
-
 #: Standalone sidecar graph entry points selected by
 #: :attr:`ProjectorSpec.sidecar_builder`. Unlike ``_VLM_BUILDERS``, these
 #: functions never create or silently omit a paired text decoder.
