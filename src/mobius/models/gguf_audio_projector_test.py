@@ -16,6 +16,7 @@ from onnxscript import OpBuilder, nn
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
+from mobius.components import Conv1d
 from mobius.integrations.gguf._mmproj_mapping import (
     map_mmproj_audio_projector_to_onnx,
 )
@@ -29,6 +30,8 @@ from mobius.models.gguf_audio_projector import (
     _LFM2AudioAdapter,
     _MimoRVQBridge,
     _PocketCausalConv1d,
+    _repeat_last_mimo_group_row,
+    _right_pad_mimo_downsample,
     _SquaredReLUProjector,
     _UltravoxProjector,
     create_gguf_audio_projector,
@@ -654,6 +657,38 @@ class _BatchedComponentEncoder(_ComponentEncoder):
         return op.Squeeze(output, [0])
 
 
+class _MimoDownsampleProbe(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_schema = (
+            ("input_features", ir.DataType.FLOAT, (ir.SymbolicDim("frames"), 1)),
+        )
+        self.conv = Conv1d(1, 1, 2, stride=2, padding=0, bias=False)
+
+    def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
+        hidden_states = op.Unsqueeze(op.Transpose(input_features, perm=[1, 0]), [0])
+        hidden_states = _right_pad_mimo_downsample(op, hidden_states, 2)
+        return op.Squeeze(self.conv(op, hidden_states), [0, 1])
+
+
+class _MimoGroupPaddingProbe(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_schema = (
+            ("input_features", ir.DataType.FLOAT, (ir.SymbolicDim("frames"), 2)),
+        )
+
+    def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
+        hidden_states = op.Unsqueeze(input_features, [0])
+        time = op.Shape(hidden_states, start=1, end=2)
+        groups = op.Div(op.Add(time, op.Constant(value_ints=[1])), 2)
+        padded_time = op.Mul(groups, 2)
+        return op.Squeeze(
+            _repeat_last_mimo_group_row(op, hidden_states, time, padded_time),
+            [0],
+        )
+
+
 class _WaveConvEncoder(nn.Module):
     def __init__(self, component: nn.Module):
         super().__init__()
@@ -693,11 +728,10 @@ def _run_component(
         config,
         task=GGUFAudioProjectorTask(),
     )["audio_encoder"]
-    prefix = "audio_encoder.component."
     for name, initializer in graph_model.graph.initializers.items():
         if initializer.const_value is not None:
             continue
-        local_name = name.removeprefix(prefix)
+        local_name = name.removeprefix("audio_encoder.").removeprefix("component.")
         if local_name not in weights:
             raise AssertionError(f"Missing independent test weight for {name}")
         initializer.const_value = ir.tensor(weights[local_name].astype(np.float32))
@@ -706,6 +740,53 @@ def _run_component(
         providers=["CPUExecutionProvider"],
     )
     return session.run(None, feeds)[0]
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ([1.0, 2.0, 3.0, 4.0], [3.0, 7.0]),
+        ([1.0, 2.0, 3.0], [3.0, 3.0]),
+    ],
+)
+def test_mimo_downsample_right_pads_odd_frames_before_stride_two_convolution(
+    values: list[float],
+    expected: list[float],
+):
+    actual = _run_component(
+        _MimoDownsampleProbe(),
+        {"input_features": np.asarray(values, dtype=np.float32)[:, None]},
+        {"conv.weight": np.ones((1, 1, 2), dtype=np.float32)},
+    )
+
+    np.testing.assert_array_equal(actual, np.asarray(expected, dtype=np.float32))
+
+
+def test_mimo_partial_local_group_repeats_distinguishable_final_code_row():
+    values = np.asarray([[1.0, 10.0], [2.0, 20.0], [7.0, 70.0]], dtype=np.float32)
+
+    actual = _run_component(
+        _MimoGroupPaddingProbe(),
+        {"input_features": values},
+        {},
+    )
+
+    np.testing.assert_array_equal(
+        actual,
+        np.asarray(
+            [[1.0, 10.0], [2.0, 20.0], [7.0, 70.0], [7.0, 70.0]],
+            dtype=np.float32,
+        ),
+    )
+
+
+def test_mimo_empty_local_group_fails_closed():
+    with pytest.raises(_ORT_INPUT_ERRORS, match="indices element out of data bounds"):
+        _run_component(
+            _MimoGroupPaddingProbe(),
+            {"input_features": np.empty((0, 2), dtype=np.float32)},
+            {},
+        )
 
 
 def _rms_norm(value: np.ndarray, weight: np.ndarray, eps: float = 1e-6) -> np.ndarray:

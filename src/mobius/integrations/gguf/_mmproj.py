@@ -1182,7 +1182,12 @@ def _preflight_standalone_mmproj(
     selected_modalities = []
     for modality in spec.modalities:
         presence_key = f"clip.has_{modality.value.replace('.', '_')}_encoder"
-        if not bool(mmproj_gguf.metadata.get(presence_key)):
+        presence = mmproj_gguf.metadata.get(presence_key)
+        if modality is spec.primary_modality and presence is not True:
+            raise ValueError(
+                f"{presence_key} must be the literal boolean true for {projector_type!r}."
+            )
+        if presence is not True:
             continue
         if projector_type_for_modality(mmproj_gguf.metadata, modality) == projector_type:
             selected_modalities.append(modality)

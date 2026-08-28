@@ -1783,11 +1783,17 @@ class GGUFMimoAudioProjector(nn.Module):
         )
         self.post_layernorm = LayerNorm(hidden_size, eps=eps)
         downsample_shape = _shape(shapes, "a.downsample.conv.weight", 3)
+        self._downsample_factor = downsample_shape[-1]
+        if self._downsample_factor != 2:
+            raise ValueError(
+                "MiMo audio downsample convolution must preserve the pinned avg_pooler=2 "
+                f"contract, got kernel width {self._downsample_factor}."
+            )
         self.downsample_conv = Conv1d(
             hidden_size,
             hidden_size,
-            downsample_shape[-1],
-            stride=2,
+            self._downsample_factor,
+            stride=self._downsample_factor,
             padding=0,
             bias=False,
         )
@@ -1883,6 +1889,11 @@ class GGUFMimoAudioProjector(nn.Module):
         hidden_states = self.post_layernorm(op, op.Add(hidden_states, skip_hidden))
 
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
+        hidden_states = _right_pad_mimo_downsample(
+            op,
+            hidden_states,
+            self._downsample_factor,
+        )
         hidden_states = op.Gelu(self.downsample_conv(op, hidden_states))
         hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1])
         hidden_states = self.downsample_norm(op, hidden_states)
@@ -1895,14 +1906,11 @@ class GGUFMimoAudioProjector(nn.Module):
             group,
         )
         padded_time = op.Mul(groups, group)
-        hidden_states = op.Pad(
+        hidden_states = _repeat_last_mimo_group_row(
+            op,
             hidden_states,
-            op.Concat(
-                op.Constant(value_ints=[0, 0, 0, 0]),
-                op.Sub(padded_time, time),
-                op.Constant(value_ints=[0]),
-                axis=0,
-            ),
+            time,
+            padded_time,
         )
         positions = op.Range(op.Constant(value_int=0), op.Squeeze(padded_time), 1)
         position_ids = op.Unsqueeze(op.Mod(positions, self._group_size), [0])
@@ -1932,6 +1940,47 @@ class GGUFMimoAudioProjector(nn.Module):
             ),
         )
         return op.Squeeze(self.projector(op, hidden_states), [0])
+
+
+def _right_pad_mimo_downsample(
+    op: OpBuilder,
+    hidden_states: ir.Value,
+    multiple: int,
+) -> ir.Value:
+    """Zero-pad [B, H, T] so stride-k convolution preserves ceil(T / k) rows."""
+    time = op.Shape(hidden_states, start=2, end=3)
+    remainder = op.Mod(time, multiple)
+    pad_time = op.Mod(op.Sub(multiple, remainder), multiple)
+    pads = op.Concat(
+        op.Constant(value_ints=[0, 0, 0, 0, 0]),
+        pad_time,
+        axis=0,
+    )
+    return op.Pad(hidden_states, pads)
+
+
+def _repeat_last_mimo_group_row(
+    op: OpBuilder,
+    hidden_states: ir.Value,
+    time: ir.Value,
+    padded_time: ir.Value,
+) -> ir.Value:
+    """Repeat the final RVQ/code embedding to complete a local-transformer group."""
+    empty = op.Equal(time, op.Constant(value_ints=[0]))
+    hidden_states = _guard_false(op, op.Squeeze(empty), hidden_states)
+    last = op.Slice(
+        hidden_states,
+        op.Sub(time, op.Constant(value_ints=[1])),
+        time,
+        op.Constant(value_ints=[1]),
+    )
+    pad_time = op.Sub(padded_time, time)
+    hidden = op.Shape(hidden_states, start=2, end=3)
+    repeated = op.Expand(
+        last,
+        op.Concat(op.Constant(value_ints=[1]), pad_time, hidden, axis=0),
+    )
+    return op.Concat(hidden_states, repeated, axis=1)
 
 
 class _PocketCausalConv1d(nn.Module):

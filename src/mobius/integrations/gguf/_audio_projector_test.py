@@ -250,6 +250,22 @@ def test_audio_projector_preflight_closes_every_promoted_route(projector_type: s
     assert spec.sidecar_builder == "audio_projector"
 
 
+@pytest.mark.parametrize("presence", [1, "true", False, None])
+def test_audio_projector_preflight_requires_literal_true_presence(presence: object):
+    sidecar = _standalone_sidecar("ultravox")
+    if presence is None:
+        sidecar.metadata.pop("clip.has_audio_encoder")
+    else:
+        sidecar.metadata["clip.has_audio_encoder"] = presence
+
+    with pytest.raises(ValueError, match="must be the literal boolean true"):
+        _preflight_standalone_mmproj(
+            sidecar,
+            projector_type="ultravox",
+            target_architecture="llama",
+        )
+
+
 def test_audio_projector_preflight_rejects_packed_graph_tensor():
     sidecar = _standalone_sidecar("voxtral", qtype="Q8_0")
 
