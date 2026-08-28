@@ -83,6 +83,7 @@ __all__ = [
     "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
     "GrokGGUFCausalLMModel",
+    "GGUFAudioProjectorModel",
     "GroveMoEGGUFCausalLMModel",
     "HunyuanMoEGGUFCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
@@ -279,6 +280,7 @@ from mobius.models.gemma4 import (
 )
 from mobius.models.gemma4_assistant import Gemma4AssistantCausalLMModel
 from mobius.models.gguf_embeddings import GemmaEmbeddingGGUFModel, LlamaEmbedGGUFModel
+from mobius.models.gguf_audio_projector import GGUFAudioProjectorModel
 from mobius.models.gguf_encoders import (
     EuroBertGGUFModel,
     JinaBertV2GGUFModel,

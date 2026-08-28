@@ -53,9 +53,7 @@ def test_bounded_header_evidence_is_isolated_below_the_payload_budget() -> None:
 
 def test_minicpm_mislabeled_f16_alias_is_not_used_as_evidence() -> None:
     pin = next(
-        pin
-        for pin in MMPROJ_ARTIFACT_PINS
-        if pin.artifact_id == "minicpm-v4-6-bf16-header"
+        pin for pin in MMPROJ_ARTIFACT_PINS if pin.artifact_id == "minicpm-v4-6-bf16-header"
     )
     assert pin.filename == "MiniCPM-V-4.6.mmproj-bf16.gguf"
     assert pin.tensor_qtypes == (("BF16", 170), ("F32", 289))

@@ -146,8 +146,7 @@ def test_cogvlm_sidecar_matches_post_norm_swiglu_reference():
     stem = "v.blk.0"
     x = x + _layer_norm(_attention(x, state, stem), state, f"{stem}.ln1", 1e-6)
     up = _linear(x, state, f"{stem}.ffn_up", bias=True)
-    gate = torch_functional.silu(_linear(x, state, f"{stem}.ffn_gate", bias=True))
-    ffn = _linear(up * gate, state, f"{stem}.ffn_down", bias=True)
+    ffn = _linear(up * torch.sigmoid(1.702 * up), state, f"{stem}.ffn_down", bias=True)
     x = x + _layer_norm(ffn, state, f"{stem}.ln2", 1e-6)
 
     # The appended CLS row is removed before the linear/LN/GELU projector.

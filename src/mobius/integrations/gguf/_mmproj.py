@@ -30,11 +30,13 @@ package with ``include_audio=False``.
 from __future__ import annotations
 
 __all__ = [
+    "build_audio_projector_from_gguf",
     "build_generic_projector_vlm_from_gguf",
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
     "build_mmproj_from_gguf",
     "build_qwen_glm_projector_from_gguf",
+    "build_remaining_vision_projector_from_gguf",
     "build_qwen_vlm_from_gguf",
     "build_vlm_from_gguf",
     "build_muse_glimmer_vlm_from_gguf",
@@ -47,6 +49,7 @@ __all__ = [
 ]
 
 import dataclasses
+import json
 import logging
 import math
 import re
@@ -719,7 +722,10 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
                 "an F16, BF16, or F32 mmproj so every role is explicitly dequantized."
             )
 
-    _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    if spec.primary_modality is MMProjModality.VISION:
+        _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    elif spec.primary_modality is MMProjModality.AUDIO:
+        _validate_gemma4_audio_metadata(mmproj_gguf.metadata)
     for companion in active_companions:
         if companion.projector_type == "gemma4a":
             _validate_gemma4_audio_companion_shapes(mmproj_gguf, companion)
@@ -813,6 +819,13 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         )
 
         validate_qwen_glm_projector_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.sidecar_builder == "remaining_vision_projector":
+        from mobius.integrations.gguf._remaining_projectors import (
+            validate_remaining_projector_shapes,
+        )
+
+        validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
         return
     if spec.primary_modality is not MMProjModality.VISION:
         raise RuntimeError(
@@ -3165,6 +3178,204 @@ def build_qwen_glm_projector_from_gguf(
     )
 
 
+def _mmproj_audio_projector_to_onnx(
+    mmproj_gguf: Any,
+    projector_type: str,
+) -> dict[str, Any]:
+    import torch
+
+    from mobius.integrations.gguf._mmproj_mapping import (
+        map_mmproj_audio_projector_to_onnx,
+    )
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for name in mmproj_gguf.tensor_names:
+        mapped = map_mmproj_audio_projector_to_onnx(name, projector_type)
+        if mapped is None:
+            continue
+        values = np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32)
+        state_dict[mapped] = torch.from_numpy(values.copy())
+    return state_dict
+
+
+def build_audio_projector_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build the standalone MERaLiON audio encoder/projector sidecar."""
+    from mobius._builder import build_from_module, resolve_dtype
+    from mobius._configs import ArchitectureConfig
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.models.gguf_audio_projector import (
+        AUDIO_PROCESSOR_ABIS,
+        create_gguf_audio_projector,
+    )
+    from mobius.tasks import GGUFAudioProjectorTask
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    spec = _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    hidden_size = int(mmproj_gguf.metadata["clip.audio.embedding_length"])
+    num_heads = int(mmproj_gguf.metadata["clip.audio.attention.head_count"])
+    config = ArchitectureConfig(
+        model_type=f"gguf_{projector_type}",
+        vocab_size=1,
+        hidden_size=hidden_size,
+        intermediate_size=int(mmproj_gguf.metadata["clip.audio.feed_forward_length"]),
+        num_hidden_layers=int(mmproj_gguf.metadata["clip.audio.block_count"]),
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        head_dim=hidden_size // num_heads,
+        max_position_embeddings=65_536,
+        hidden_act="gelu",
+    )
+    if dtype is not None:
+        resolved_dtype = resolve_dtype(dtype)
+        if resolved_dtype is not None:
+            config = dataclasses.replace(config, dtype=resolved_dtype)
+    tensor_shapes = {
+        name: tuple(int(dim) for dim in mmproj_gguf.get_tensor_shape(name))
+        for name in mmproj_gguf.tensor_names
+    }
+    module = create_gguf_audio_projector(
+        spec.projector_type,
+        mmproj_gguf.metadata,
+        tensor_shapes,
+    )
+    package = build_from_module(
+        module,
+        config,
+        task=GGUFAudioProjectorTask(),
+        execution_provider=execution_provider,
+    )
+    package.apply_weights(_mmproj_audio_projector_to_onnx(mmproj_gguf, projector_type))
+    processor_abi = AUDIO_PROCESSOR_ABIS[projector_type]
+    serialized_processor_abi = json.dumps(
+        dataclasses.asdict(processor_abi),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    for model in package.values():
+        model.metadata_props["mobius.gguf_projector_type"] = projector_type
+        model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
+        model.metadata_props["mobius.gguf_audio_processor_abi"] = serialized_processor_abi
+        model.metadata_props["mobius.runtime_support"] = (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
+    package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
+    package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    package.gguf_audio_processor_abi = processor_abi  # type: ignore[attr-defined]
+    package.gguf_runtime_warning = (  # type: ignore[attr-defined]
+        "Standalone projector graph only; paired text insertion and downstream "
+        "multimodal runtime execution are not validated."
+    )
+    logger.warning("%s", package.gguf_runtime_warning)
+    return package
+
+
+def build_remaining_vision_projector_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build one exact standalone vision encoder/projector sidecar."""
+    from mobius._builder import build_from_module, resolve_dtype
+    from mobius._configs import ArchitectureConfig
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._reader import GGUFModel
+    from mobius.integrations.gguf._remaining_projectors import (
+        create_remaining_vision_projector,
+        remaining_projector_state_dict,
+    )
+    from mobius.tasks import GGUFVisionProjectorModel, GGUFVisionProjectorTask
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    hidden_size = int(mmproj_gguf.metadata["clip.vision.embedding_length"])
+    num_heads = int(mmproj_gguf.metadata["clip.vision.attention.head_count"])
+    config = ArchitectureConfig(
+        model_type=f"gguf_{projector_type}",
+        vocab_size=1,
+        hidden_size=hidden_size,
+        intermediate_size=int(mmproj_gguf.metadata["clip.vision.feed_forward_length"]),
+        num_hidden_layers=int(mmproj_gguf.metadata["clip.vision.block_count"]),
+        num_attention_heads=num_heads,
+        num_key_value_heads=int(
+            mmproj_gguf.metadata.get("clip.vision.attention.head_count_kv", num_heads)
+        ),
+        head_dim=hidden_size // num_heads,
+        max_position_embeddings=65_536,
+        hidden_act="gelu",
+    )
+    if dtype is not None:
+        resolved_dtype = resolve_dtype(dtype)
+        if resolved_dtype is not None:
+            config = dataclasses.replace(config, dtype=resolved_dtype)
+    tensor_shapes = {
+        name: tuple(int(dim) for dim in mmproj_gguf.get_tensor_shape(name))
+        for name in mmproj_gguf.tensor_names
+    }
+    vision_encoder = create_remaining_vision_projector(
+        projector_type,
+        mmproj_gguf.metadata,
+        tensor_shapes,
+    )
+    package = build_from_module(
+        GGUFVisionProjectorModel(vision_encoder),
+        config,
+        task=GGUFVisionProjectorTask(),
+        execution_provider=execution_provider,
+    )
+    for model in package.values():
+        model.metadata_props["mobius.gguf_projector_type"] = projector_type
+        model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
+        model.metadata_props["mobius.runtime_support"] = (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
+    package.apply_weights(remaining_projector_state_dict(mmproj_gguf, projector_type))
+    package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
+    package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    package.gguf_runtime_warning = (  # type: ignore[attr-defined]
+        "Standalone projector graph only; paired text insertion and downstream "
+        "multimodal runtime execution are not validated."
+    )
+    logger.warning("%s", package.gguf_runtime_warning)
+    return package
+
+
 def build_vlm_from_gguf(
     text_gguf_path: str | Path,
     mmproj_gguf_path: str | Path,
@@ -3244,6 +3455,8 @@ def _build_core_vlm_projector_mmproj(*args, **kwargs) -> ModelPackage:
 _MMPROJ_BUILDERS: dict[str, str] = {
     "core_vlm_projector": "_build_core_vlm_projector_mmproj",
     "qwen_glm_projector": "build_qwen_glm_projector_from_gguf",
+    "audio_projector": "build_audio_projector_from_gguf",
+    "remaining_vision_projector": "build_remaining_vision_projector_from_gguf",
 }
 
 

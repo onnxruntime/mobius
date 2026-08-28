@@ -1,0 +1,164 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import onnx_ir as ir
+
+from mobius._configs import ArchitectureConfig
+from mobius._testing.ort_inference import OnnxModelSession
+from mobius.integrations.gguf._mmproj import build_mmproj_from_gguf
+from mobius.integrations.gguf._mmproj_mapping import (
+    map_mmproj_audio_projector_to_onnx,
+)
+from mobius.integrations.gguf._remaining_projectors import (
+    create_remaining_vision_projector,
+)
+from mobius.models.gguf_audio_projector import create_gguf_audio_projector
+from mobius.tasks import GGUFVisionProjectorModel, GGUFVisionProjectorTask
+
+
+def _write_tiny_janus(path: Path) -> None:
+    from gguf import GGUFWriter
+
+    rng = np.random.default_rng(17)
+    hidden, intermediate, output = 8, 16, 6
+    writer = GGUFWriter(str(path), "clip")
+    writer.add_string("general.type", "mmproj")
+    writer.add_bool("clip.has_vision_encoder", True)
+    writer.add_string("clip.projector_type", "janus_pro")
+    writer.add_bool("clip.use_gelu", True)
+    writer.add_uint32("clip.vision.embedding_length", hidden)
+    writer.add_uint32("clip.vision.feed_forward_length", intermediate)
+    writer.add_uint32("clip.vision.block_count", 1)
+    writer.add_uint32("clip.vision.projection_dim", output)
+    writer.add_uint32("clip.vision.attention.head_count", 2)
+    writer.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+    writer.add_uint32("clip.vision.image_size", 4)
+    writer.add_uint32("clip.vision.patch_size", 2)
+    writer.add_array("clip.vision.image_mean", [0.5, 0.5, 0.5])
+    writer.add_array("clip.vision.image_std", [0.5, 0.5, 0.5])
+
+    def add(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, rng.normal(0.0, 0.2, shape).astype(np.float32))
+
+    add("v.patch_embd.weight", (hidden, 3, 2, 2))
+    add("v.patch_embd.bias", (hidden,))
+    add("v.position_embd.weight", (4, hidden))
+    add("v.post_ln.weight", (hidden,))
+    add("v.post_ln.bias", (hidden,))
+    add("mm.0.weight", (output, hidden))
+    add("mm.0.bias", (output,))
+    add("mm.1.weight", (output, output))
+    add("mm.1.bias", (output,))
+    prefix = "v.blk.0."
+    for norm in ("ln1", "ln2"):
+        add(prefix + norm + ".weight", (hidden,))
+        add(prefix + norm + ".bias", (hidden,))
+    for projection in ("attn_q", "attn_k", "attn_v", "attn_out"):
+        add(prefix + projection + ".weight", (hidden, hidden))
+        add(prefix + projection + ".bias", (hidden,))
+    add(prefix + "ffn_up.weight", (intermediate, hidden))
+    add(prefix + "ffn_up.bias", (intermediate,))
+    add(prefix + "ffn_down.weight", (hidden, intermediate))
+    add(prefix + "ffn_down.bias", (hidden,))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def test_public_standalone_dispatch_builds_and_runs_janus(tmp_path: Path) -> None:
+    path = tmp_path / "janus.gguf"
+    _write_tiny_janus(path)
+    package = build_mmproj_from_gguf(
+        path,
+        projector_type="janus_pro",
+        target_architecture="llama",
+        dtype="f32",
+    )
+    assert set(package) == {"vision_encoder"}
+    assert package.gguf_projector_type == "janus_pro"
+    assert "not validated" in package.gguf_runtime_warning
+    assert package["vision_encoder"].metadata_props["mobius.runtime_support"] == (
+        "standalone-sidecar-only; paired multimodal runtime unvalidated"
+    )
+
+    session = OnnxModelSession(package["vision_encoder"])
+    output = session.run(
+        {"pixel_values": np.random.default_rng(3).normal(size=(1, 3, 4, 4)).astype(np.float32)}
+    )["image_features"]
+    session.close()
+    assert output.shape == (4, 6)
+    assert np.isfinite(output).all()
+
+
+def test_source_only_minimax_component_builds_with_explicit_positions() -> None:
+    metadata = {
+        "clip.vision.embedding_length": 160,
+        "clip.vision.feed_forward_length": 320,
+        "clip.vision.block_count": 1,
+        "clip.vision.attention.head_count": 2,
+        "clip.vision.attention.layer_norm_epsilon": 1e-5,
+        "clip.vision.image_size": 4,
+        "clip.vision.patch_size": 2,
+        "clip.vision.spatial_merge_size": 2,
+        "clip.vision.projection_dim": 64,
+    }
+    shapes = {
+        "v.patch_embd.weight": (160, 3, 2, 2),
+        "v.patch_embd.weight.1": (160, 3, 2, 2),
+        "mm.1.weight": (192, 160),
+        "mm.1.bias": (192,),
+        "mm.2.weight": (160, 192),
+        "mm.2.bias": (160,),
+        "mm.merger.fc1.weight": (256, 640),
+        "mm.merger.fc1.bias": (256,),
+        "mm.merger.fc2.weight": (64, 256),
+        "mm.merger.fc2.bias": (64,),
+    }
+    module = create_remaining_vision_projector("minimax_m3", metadata, shapes)
+    config = ArchitectureConfig(
+        model_type="gguf_minimax_m3",
+        vocab_size=1,
+        hidden_size=160,
+        intermediate_size=320,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=80,
+        max_position_embeddings=1,
+    )
+    package = GGUFVisionProjectorTask().build(GGUFVisionProjectorModel(module), config)
+    assert set(package) == {"vision_encoder"}
+    assert package["vision_encoder"].graph.num_nodes() > 0
+
+
+def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> None:
+    metadata = {
+        "clip.audio.embedding_length": 4,
+        "clip.audio.feed_forward_length": 8,
+        "clip.audio.block_count": 1,
+        "clip.audio.attention.head_count": 1,
+        "clip.audio.attention.layer_norm_epsilon": 1e-5,
+        "clip.audio.num_mel_bins": 8,
+        "clip.audio.projector.stack_factor": 3,
+    }
+    shapes = {
+        "a.position_embd.weight": (6, 4),
+        "mm.a.mlp.0.weight": (9, 12),
+        "mm.a.mlp.1.weight": (9, 9),
+        "mm.a.mlp.2.weight": (9, 9),
+        "mm.a.mlp.3.weight": (5, 9),
+    }
+    module = create_gguf_audio_projector("meralion", metadata, shapes)
+    assert module.audio_encoder.input_schema == (
+        ("input_features", ir.DataType.FLOAT, (ir.SymbolicDim("frames"), 8)),
+    )
+    assert (
+        map_mmproj_audio_projector_to_onnx("mm.a.mlp.3.bias", "meralion")
+        == "audio_encoder.projector.linear3.bias"
+    )

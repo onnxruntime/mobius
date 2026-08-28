@@ -21,15 +21,14 @@ from mobius.components._rms_norm import RMSNorm
 
 
 class _PatchEmbedding(nn.Module):
-    def __init__(
-        self, channels: int, hidden_size: int, patch_size: int, *, bias: bool = True
-    ):
+    def __init__(self, channels: int, hidden_size: int, patch_size: int, *, bias: bool = True):
         super().__init__()
         conv_type = Conv2d if bias else Conv2dNoBias
         self.proj = conv_type(channels, hidden_size, patch_size, patch_size)
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         # BCHW -> BC(hw) -> B(hw)C, matching clip_graph::build_inp.
+        pixel_values = op.CastLike(pixel_values, self.proj.weight)
         hidden_states = self.proj(op, pixel_values)
         batch = op.Shape(hidden_states, start=0, end=1)
         channels = op.Shape(hidden_states, start=1, end=2)
@@ -163,6 +162,7 @@ class HunyuanVLClipSidecar(nn.Module):
         self.post_projector_norm = RMSNorm(output_size, eps)
         self._grid_height = grid_height
         self._grid_width = grid_width
+        self._projector_channels = projector_hidden_size * 2
         self._output_size = output_size
 
     def forward(
@@ -195,7 +195,7 @@ class HunyuanVLClipSidecar(nn.Module):
         # Append newline along width before flattening: row-major
         # [patch(0,0), ..., patch(0,W-1), newline, patch(1,0), ...].
         out_height = self._grid_height // self.projector_conv1._strides[0]
-        channels = self.projector_conv2.weight.shape[0]
+        channels = self._projector_channels
         newline = op.Reshape(self.image_newline, [1, 1, 1, channels])
         newline = op.Expand(
             newline,
@@ -378,6 +378,8 @@ class Step3VLClipSidecar(nn.Module):
         self._grid_height = grid_height
         self._grid_width = grid_width
         self._position_grid_size = position_grid_size
+        self._vision_hidden_size = vision_hidden_size
+        self._projector_channels = downsample_hidden_size * 2
 
     def _resize_positions(self, op: OpBuilder) -> ir.Value:
         # [S*S,C] -> [1,C,S,S] -> bilinear/antialiased [1,C,H,W] -> [1,HW,C].
@@ -386,7 +388,7 @@ class Step3VLClipSidecar(nn.Module):
             [
                 self._position_grid_size,
                 self._position_grid_size,
-                self.position_embedding.shape[1],
+                self._vision_hidden_size,
             ],
         )
         positions = op.Transpose(positions, perm=[2, 0, 1])
@@ -395,7 +397,7 @@ class Step3VLClipSidecar(nn.Module):
             positions,
             None,
             None,
-            [1, self.position_embedding.shape[1], self._grid_height, self._grid_width],
+            [1, self._vision_hidden_size, self._grid_height, self._grid_width],
             mode="linear",
             coordinate_transformation_mode="half_pixel",
             antialias=1,
@@ -403,7 +405,7 @@ class Step3VLClipSidecar(nn.Module):
         positions = op.Transpose(positions, perm=[0, 2, 3, 1])
         return op.Reshape(
             positions,
-            [1, self._grid_height * self._grid_width, self.position_embedding.shape[1]],
+            [1, self._grid_height * self._grid_width, self._vision_hidden_size],
         )
 
     def forward(
@@ -437,7 +439,7 @@ class Step3VLClipSidecar(nn.Module):
             hidden_states,
             op.Concat(
                 batch,
-                op.Constant(value_ints=[-1, self.projector.weight.shape[1]]),
+                op.Constant(value_ints=[-1, self._projector_channels]),
                 axis=0,
             ),
         )

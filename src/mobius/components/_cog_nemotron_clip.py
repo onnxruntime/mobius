@@ -72,7 +72,7 @@ class _ClipPatchEmbedding(_PatchEmbeddingBase):
 
     def _conv(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         return op.Conv(
-            pixel_values,
+            op.CastLike(pixel_values, self.weight),
             self.weight,
             self.bias,
             kernel_shape=[self._patch_size, self._patch_size],
@@ -83,7 +83,7 @@ class _ClipPatchEmbedding(_PatchEmbeddingBase):
 class _RadioPatchEmbedding(_PatchEmbeddingBase):
     def _conv(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         return op.Conv(
-            pixel_values,
+            op.CastLike(pixel_values, self.weight),
             self.weight,
             kernel_shape=[self._patch_size, self._patch_size],
             strides=[self._patch_size, self._patch_size],
@@ -140,15 +140,12 @@ class _CogVLMFeedForward(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, stem: str):
         super().__init__()
         self.up = _NamedLinear(hidden_size, intermediate_size, f"{stem}.ffn_up")
-        self.gate = _NamedLinear(hidden_size, intermediate_size, f"{stem}.ffn_gate")
         self.down = _NamedLinear(intermediate_size, hidden_size, f"{stem}.ffn_down")
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
-        gate = self.gate(op, hidden_states)
-        return self.down(
-            op,
-            op.Mul(self.up(op, hidden_states), op.Mul(gate, op.Sigmoid(gate))),
-        )
+        hidden_states = self.up(op, hidden_states)
+        hidden_states = op.Mul(hidden_states, op.Sigmoid(op.Mul(1.702, hidden_states)))
+        return self.down(op, hidden_states)
 
 
 class CogVLMClipBlock(nn.Module):

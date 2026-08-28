@@ -44,6 +44,7 @@ class DualTemporalPatchEmbedding(nn.Module):
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         p = self._patch_size
+        pixel_values = op.CastLike(pixel_values, self.weight_0)
         # (N, C*2*P*P) -> (N, 2, C, P, P), preserving processor flatten order.
         patches = op.Reshape(pixel_values, [-1, 2, self._in_channels, p, p])
         first = op.Squeeze(op.Gather(patches, [0], axis=1), [1])
@@ -69,7 +70,7 @@ class SplitVisionRotaryEmbedding(nn.Module):
         axis_dim = head_dim // 2
         inv_freq = 1.0 / (theta ** (np.arange(0, axis_dim, 2, dtype=np.float32) / axis_dim))
         self.inv_freq = nn.Parameter([head_dim // 4], data=ir.tensor(inv_freq))
-        self.inv_freq._keep_float32 = True
+        self.inv_freq._keep_float32 = True  # type: ignore[attr-defined]
 
     def forward(self, op: OpBuilder, position_ids: ir.Value):
         positions = op.Cast(position_ids, to=ir.DataType.FLOAT)
@@ -457,6 +458,7 @@ class SpatialPatchEmbedding(nn.Module):
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         p = self._patch_size
+        pixel_values = op.CastLike(pixel_values, self.proj)
         hidden_states = op.Conv(
             pixel_values, self.proj, self.bias, kernel_shape=[p, p], strides=[p, p]
         )
@@ -475,6 +477,14 @@ def _position_ids(op: OpBuilder, height: ir.Value, width: ir.Value) -> ir.Value:
 
 
 class _KimiVisionSidecar(nn.Module):
+    _patch_size: int
+    patch_embed: nn.Module
+    position_embedding: nn.Module
+    rotary_embedding: nn.Module
+    layers: nn.ModuleList
+    final_layernorm: nn.Module
+    projector: nn.Module
+
     def _forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         image_height = op.Squeeze(op.Shape(pixel_values, start=2, end=3), [0])
         image_width = op.Squeeze(op.Shape(pixel_values, start=3, end=4), [0])
@@ -637,12 +647,11 @@ class ExaonePatchMerger(nn.Module):
         self.post_layernorm = RMSNorm(hidden_size, eps=norm_eps)
         self.linear_1 = Linear(hidden_size * 4, intermediate_size, bias=True)
         self.linear_2 = Linear(intermediate_size, output_size, bias=True)
+        self._hidden_size = hidden_size
 
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         hidden_states = self.post_layernorm(op, hidden_states)
-        hidden_states = op.Reshape(
-            hidden_states, [-1, 4 * int(self.post_layernorm.weight.shape[0])]
-        )
+        hidden_states = op.Reshape(hidden_states, [-1, 4 * self._hidden_size])
         return self.linear_2(op, op.Gelu(self.linear_1(op, hidden_states)))
 
 
@@ -671,7 +680,9 @@ class Exaone45VisionSidecar(Qwen25VLVisionModel):
         self._patch_size = patch_size
         self._hidden_size = hidden_size
         self._vit_merger_window_size = window_size // 2 // patch_size
-        self.patch_embed = DualTemporalPatchEmbedding(hidden_size, in_channels, patch_size)
+        self.patch_embed = DualTemporalPatchEmbedding(  # type: ignore[assignment]
+            hidden_size, in_channels, patch_size
+        )
         # llama.cpp serializes this as four-section vision MRoPE; the equivalent
         # processor-facing graph is Qwen2.5's tested [h,w] frequency layout.
         self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(hidden_size // num_heads // 2)
@@ -687,4 +698,9 @@ class Exaone45VisionSidecar(Qwen25VLVisionModel):
                 for _ in range(depth)
             ]
         )
-        self.merger = ExaonePatchMerger(hidden_size, hidden_size * 4, output_size, norm_eps)
+        self.merger = ExaonePatchMerger(  # type: ignore[assignment]
+            hidden_size,
+            hidden_size * 4,
+            output_size,
+            norm_eps,
+        )

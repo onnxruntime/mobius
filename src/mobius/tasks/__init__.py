@@ -44,6 +44,7 @@ __all__ = [
     "GGUFAudioProjectorTask",
     "GGUFEmbeddingFeatureExtractionTask",
     "GGUFProjectorVisionLanguageTask",
+    "GGUFAudioProjectorTask",
     "GGUFSpeakerProjectorModel",
     "GGUFSpeakerProjectorTask",
     "GGUFVisionProjectorModel",
@@ -142,6 +143,7 @@ from mobius.tasks._feature_extraction import (
     GGUFEncoderFeatureExtractionTask,
 )
 from mobius.tasks._fun_asr_speech_language import FunASRSpeechLanguageTask
+from mobius.tasks._gguf_audio_projector import GGUFAudioProjectorTask
 from mobius.tasks._gemma3n import Gemma3nTask
 from mobius.tasks._gemma4 import (
     Gemma4Task,

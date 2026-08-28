@@ -198,12 +198,18 @@ def test_meralion_audio_sidecar_builds_exact_mel_to_tokens_shape():
         stack_factor=3,
     )
     builder, op, graph = create_test_builder()
-    mel = create_test_input(builder, "mel", [2, 8, 12], dtype=ir.DataType.FLOAT)
-    output = sidecar(op, mel)
+    input_features = create_test_input(
+        builder,
+        "input_features",
+        [12, 8],
+        dtype=ir.DataType.FLOAT,
+    )
+    output = sidecar(op, input_features)
     builder._adapt_outputs([output], "")
 
     assert len(graph) > 0
-    assert list(output.shape) == [2, 2, 5]
+    assert list(output.shape) == [2, 5]
+    assert sidecar.input_schema[0][0] == "input_features"
     names = {name for name, _ in sidecar.named_parameters()}
     assert "conv1.weight" in names
     assert "layers.0.self_attn.q_proj.weight" in names

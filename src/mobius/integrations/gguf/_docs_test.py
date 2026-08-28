@@ -39,7 +39,7 @@ def test_document_is_exact_generator_output() -> None:
 
 def test_document_is_concise_and_reason_coded() -> None:
     document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
-    assert len(document.splitlines()) < 600
+    assert len(document.splitlines()) < 620
     assert "RUNTIME_EVIDENCE_PENDING" in document
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document

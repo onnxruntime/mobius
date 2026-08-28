@@ -52,6 +52,7 @@ class DualTemporalPatchEmbedding(nn.Module):
 
     def forward(self, op: OpBuilder, pixel_patches: ir.Value) -> ir.Value:
         # Flat temporal patches are [t0(C,P,P), t1(C,P,P)].
+        pixel_patches = op.CastLike(pixel_patches, self.weight_0)
         first = op.Slice(pixel_patches, [0], [self._half], [1])
         second = op.Slice(pixel_patches, [self._half], [2 * self._half], [1])
         shape = [-1, self._in_channels, self._patch_size, self._patch_size]
@@ -323,11 +324,11 @@ class MiMoVLBlock(nn.Module):
 
 
 class MiMoVLProjector(nn.Module):
-    """Post-LayerNorm, merge-four, two-layer GELU projector."""
+    """Post-RMSNorm, merge-four, two-layer GELU projector."""
 
     def __init__(self, hidden_size: int, intermediate_size: int, output_size: int):
         super().__init__()
-        self.post_ln = LayerNorm(hidden_size, eps=1e-6)
+        self.post_ln = RMSNorm(hidden_size, eps=1e-6)
         self.fc1 = F32AccumulationLinear(hidden_size * 4, intermediate_size, bias=False)
         self.fc2 = F32AccumulationLinear(intermediate_size, output_size, bias=False)
         self._merged = hidden_size * 4
@@ -335,6 +336,69 @@ class MiMoVLProjector(nn.Module):
     def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
         merged = op.Reshape(self.post_ln(op, hidden_states), [-1, self._merged])
         return self.fc2(op, op.Gelu(self.fc1(op, merged)))
+
+
+class MiMoVLVisionSidecar(nn.Module):
+    """Complete MiMoVL packed-patch tower with explicit window metadata inputs."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        patch_size: int,
+        window_modes: list[int],
+        projector_hidden_size: int,
+        output_size: int,
+        merge_size: int = 2,
+    ):
+        super().__init__()
+        self.patch_embed = DualTemporalPatchEmbedding(3, hidden_size, patch_size)
+        self.blocks = nn.ModuleList(
+            [
+                MiMoVLBlock(
+                    hidden_size,
+                    intermediate_size,
+                    num_query_heads,
+                    num_kv_heads,
+                    head_dim,
+                    window_mode=mode,
+                    merge_size=merge_size,
+                )
+                for mode in window_modes
+            ]
+        )
+        self.projector = MiMoVLProjector(
+            hidden_size,
+            projector_hidden_size,
+            output_size,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        row_position_ids: ir.Value,
+        column_position_ids: ir.Value,
+        window_bias: ir.Value,
+        column_indices: ir.Value,
+        inverse_column_indices: ir.Value,
+    ) -> ir.Value:
+        hidden_states = self.patch_embed(op, pixel_values)
+        for block in self.blocks:
+            hidden_states = block(
+                op,
+                hidden_states,
+                row_position_ids,
+                column_position_ids,
+                window_bias,
+                column_indices,
+                inverse_column_indices,
+            )
+        return self.projector(op, hidden_states)
 
 
 def minimax_m3_qk_permutation(head_dim: int) -> list[int]:
@@ -532,3 +596,64 @@ class MiniMaxM3Projector(nn.Module):
         hidden_states = self.patch_mlp(op, hidden_states)
         hidden_states = op.Reshape(hidden_states, [-1, self._merged_size])
         return self.merger_mlp(op, hidden_states)
+
+
+class MiniMaxM3VisionSidecar(nn.Module):
+    """Complete MiniMax-M3 packed-patch tower with explicit spatial positions."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        num_layers: int,
+        patch_size: int,
+        grid_height: int,
+        grid_width: int,
+        patch_mlp_size: int,
+        projected_size: int,
+        merger_mlp_size: int,
+        output_size: int,
+        merge_size: int = 2,
+        norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+        self.patch_embed = DualTemporalPatchEmbedding(3, hidden_size, patch_size)
+        self.pre_vit_merge = SpatialMergeOrder(
+            grid_height,
+            grid_width,
+            hidden_size,
+            merge_size,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                MiniMaxM3VisionBlock(
+                    hidden_size,
+                    intermediate_size,
+                    num_heads,
+                    norm_eps,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.projector = MiniMaxM3Projector(
+            hidden_size,
+            patch_mlp_size,
+            projected_size,
+            merger_mlp_size,
+            output_size,
+            merge_size,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        pixel_values: ir.Value,
+        position_h: ir.Value,
+        position_w: ir.Value,
+    ) -> ir.Value:
+        hidden_states = self.pre_vit_merge(op, self.patch_embed(op, pixel_values))
+        for block in self.blocks:
+            hidden_states = block(op, hidden_states, position_h, position_w)
+        return self.projector(op, hidden_states)

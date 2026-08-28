@@ -308,7 +308,7 @@ REMAINING_MMPROJ_ARTIFACT_RECORDS: tuple[dict[str, Any], ...] = (
         "processor_files": ("config.json", "preprocessor_config.json"),
         "processor_class": "Qwen2VLImageProcessor",
         "processor_contract": (
-            ("pixel_values", "float32[total_patches,768]"),
+            ("pixel_values", "float32[total_patches,1536]"),
             ("grid_thw", "int64[num_images,3]"),
             ("window_modes", "28 entries in {-1,0,1}"),
         ),
@@ -470,7 +470,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/cogvlm.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/cogvlm.py"),
-            ("zai-org/cogvlm-chat-hf", "e29dc3ba206d524bf8efbfc60d80fc4556ab0e3c", "config.json"),
+            (
+                "zai-org/cogvlm-chat-hf",
+                "e29dc3ba206d524bf8efbfc60d80fc4556ab0e3c",
+                "config.json",
+            ),
         ),
         "finding": "Dedicated fused-QKV CLIP tower, gated projector, and BOI/EOI rows.",
     },
@@ -479,7 +483,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/exaone4_5.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/exaone.py"),
-            ("LGAI-EXAONE/EXAONE-4.5-33B", "570aa4b15a4f45ba1133072b45f50198f6e3b4fd", "config.json"),
+            (
+                "LGAI-EXAONE/EXAONE-4.5-33B",
+                "570aa4b15a4f45ba1133072b45f50198f6e3b4fd",
+                "config.json",
+            ),
         ),
         "finding": "Qwen-style vision tower with GQA and exact windowed spatial merger.",
     },
@@ -497,7 +505,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/siglip.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/januspro.py"),
-            ("deepseek-community/Janus-Pro-1B", "1655280bb75959cc1cb85529a2a8b26e7016072e", "config.json"),
+            (
+                "deepseek-community/Janus-Pro-1B",
+                "1655280bb75959cc1cb85529a2a8b26e7016072e",
+                "config.json",
+            ),
         ),
         "finding": "Fixed SigLIP tower followed by a two-layer exact-GELU aligner.",
     },
@@ -506,7 +518,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/kimik25.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/kimivl.py"),
-            ("moonshotai/Kimi-K2.5", "4d01dfe0332d63057c186e0b262165819efb6611", "config.json"),
+            (
+                "moonshotai/Kimi-K2.5",
+                "4d01dfe0332d63057c186e0b262165819efb6611",
+                "config.json",
+            ),
         ),
         "finding": "Bicubic 3D learned positions, converted 2D RoPE, merge, norm, and MLP.",
     },
@@ -515,7 +531,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/kimivl.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/kimivl.py"),
-            ("moonshotai/Kimi-VL-A3B-Thinking-2506", "aa1730989e7558695b44ee493623e03bd325a994", "config.json"),
+            (
+                "moonshotai/Kimi-VL-A3B-Thinking-2506",
+                "aa1730989e7558695b44ee493623e03bd325a994",
+                "config.json",
+            ),
         ),
         "finding": "Learned 2D RoPE ViT followed by patch merge, LayerNorm, and GELU MLP.",
     },
@@ -523,7 +543,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "evidence_id": "lfm2-pinned-graph-source",
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/siglip.cpp"),
-            ("LiquidAI/LFM2.5-VL-1.6B", "919fde3d022e3f90a4716006f993938ee8c2eb97", "config.json"),
+            (
+                "LiquidAI/LFM2.5-VL-1.6B",
+                "919fde3d022e3f90a4716006f993938ee8c2eb97",
+                "config.json",
+            ),
         ),
         "finding": "Dynamic SigLIP positions, 2x2 pixel unshuffle, LayerNorm, and GELU MLP.",
     },
@@ -532,7 +556,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/whisper-enc.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/ultravox.py"),
-            ("MERaLiON/MERaLiON-2-3B", "a03e40e9ae4f45fb3d575ed7f67bd9fd5304920d", "modeling_meralion2.py"),
+            (
+                "MERaLiON/MERaLiON-2-3B",
+                "a03e40e9ae4f45fb3d575ed7f67bd9fd5304920d",
+                "modeling_meralion2.py",
+            ),
         ),
         "finding": "Whisper encoder, stack-15, stacked LayerNorm, and four-linear gated adapter.",
     },
@@ -540,7 +568,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "evidence_id": "mimovl-pinned-graph-source",
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/mimovl.cpp"),
-            ("XiaomiMiMo/MiMo-V2.5", "63651580ca774f8504f676040460aed3e1244ac1", "config.json"),
+            (
+                "XiaomiMiMo/MiMo-V2.5",
+                "63651580ca774f8504f676040460aed3e1244ac1",
+                "config.json",
+            ),
         ),
         "finding": "GQA vision tower with row/column windows, sinks, and F32 down projection.",
     },
@@ -548,7 +580,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "evidence_id": "minicpmv4-6-pinned-graph-source",
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/minicpmv.cpp"),
-            ("openbmb/MiniCPM-V-4.6", "36f34a661a4bd35d0dc2294cb044d2584646c7d3", "config.json"),
+            (
+                "openbmb/MiniCPM-V-4.6",
+                "36f34a661a4bd35d0dc2294cb044d2584646c7d3",
+                "config.json",
+            ),
         ),
         "finding": "Bucketed positions, inserted local-attention merger, and final merger.",
     },
@@ -557,16 +593,28 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/minimax-m3.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/minimax.py"),
-            ("MiniMaxAI/MiniMax-M3", "f0e1c1e04d40177e4673a22097036854f536e9c0", "config.json"),
+            (
+                "MiniMaxAI/MiniMax-M3",
+                "f0e1c1e04d40177e4673a22097036854f536e9c0",
+                "config.json",
+            ),
         ),
         "finding": "Partial two-axis RoPE ViT with two distinct spatial MLP mergers.",
     },
     {
         "evidence_id": "nemotron-v2-vl-pinned-graph-source",
         "sources": (
-            ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/nemotron-v2-vl.cpp"),
+            (
+                "ggml-org/llama.cpp",
+                LLAMA_CPP_MMPROJ_SHA,
+                "tools/mtmd/models/nemotron-v2-vl.cpp",
+            ),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/nemotron.py"),
-            ("nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16", "ca9543b126e8bf3176916d3d305ccc415f89fd4d", "config.json"),
+            (
+                "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16",
+                "ca9543b126e8bf3176916d3d305ccc415f89fd4d",
+                "config.json",
+            ),
         ),
         "finding": "RADIO registers, fixed positions, patch merge, RMSNorm, and ReLU-squared MLP.",
     },
@@ -575,7 +623,11 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/step3vl.cpp"),
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "conversion/step3.py"),
-            ("stepfun-ai/Step3-VL-10B", "5026053b0c2f5dfaa08fc2d149384162c3c8bca1", "config.json"),
+            (
+                "stepfun-ai/Step3-VL-10B",
+                "5026053b0c2f5dfaa08fc2d149384162c3c8bca1",
+                "config.json",
+            ),
         ),
         "finding": "Absolute plus axial positions and two convolutional downsamplers.",
     },
@@ -583,8 +635,16 @@ REMAINING_MMPROJ_SOURCE_RECORDS: tuple[dict[str, Any], ...] = (
         "evidence_id": "yasa2-pinned-graph-source",
         "sources": (
             ("ggml-org/llama.cpp", LLAMA_CPP_MMPROJ_SHA, "tools/mtmd/models/yasa2.cpp"),
-            ("RekaAI/reka-edge-2603", "492c81c225fbf5f3263a8245b00827721b119a13", "convert_reka_vlm_to_gguf.py"),
-            ("RekaAI/reka-edge-2603", "492c81c225fbf5f3263a8245b00827721b119a13", "config.json"),
+            (
+                "RekaAI/reka-edge-2603",
+                "492c81c225fbf5f3263a8245b00827721b119a13",
+                "convert_reka_vlm_to_gguf.py",
+            ),
+            (
+                "RekaAI/reka-edge-2603",
+                "492c81c225fbf5f3263a8245b00827721b119a13",
+                "config.json",
+            ),
         ),
         "finding": "ConvNeXtV2, pre-pool positions, fixed 8x8 pooling, and GELU MLP.",
     },

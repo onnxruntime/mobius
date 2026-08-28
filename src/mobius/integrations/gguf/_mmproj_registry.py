@@ -833,6 +833,42 @@ _COMMON_REQUIRED_AUDIO_METADATA = (
     "clip.audio.attention.layer_norm_epsilon",
     "clip.audio.num_mel_bins",
 )
+_STANDALONE_AUDIO_METADATA = (
+    "clip.has_audio_encoder",
+    "clip.audio.embedding_length",
+    "clip.audio.feed_forward_length",
+    "clip.audio.block_count",
+    "clip.audio.projection_dim",
+    "clip.audio.attention.head_count",
+    "clip.audio.attention.layer_norm_epsilon",
+    "clip.audio.num_mel_bins",
+)
+_WHISPER_AUDIO_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln1.bias",
+    "attn_q.weight",
+    "attn_q.bias",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_v.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ln2.weight",
+    "ln2.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+)
+_WHISPER_AUDIO_TOP = (
+    "a.conv1d.1.weight",
+    "a.conv1d.1.bias",
+    "a.conv1d.2.weight",
+    "a.conv1d.2.bias",
+    "a.position_embd.weight",
+    "a.post_ln.weight",
+    "a.post_ln.bias",
+)
 
 
 def _deferred(
@@ -902,6 +938,40 @@ _GENERIC_BLOCK_SUFFIXES = (
     "ffn_up.weight",
     "ffn_up.bias",
 )
+_FUSED_GELU_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln1.bias",
+    "ln2.weight",
+    "ln2.bias",
+    "attn_qkv.weight",
+    "attn_qkv.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+)
+_FUSED_GATED_RMS_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln2.weight",
+    "attn_qkv.weight",
+    "attn_qkv.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ffn_gate.weight",
+    "ffn_gate.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+)
+_STEP3VL_BLOCK_SUFFIXES = (
+    *_FUSED_GELU_BLOCK_SUFFIXES,
+    "ls1.weight",
+    "ls2.weight",
+)
+_MIMOVL_BLOCK_SUFFIXES = _FUSED_GATED_RMS_BLOCK_SUFFIXES
 _LDP_TOP = [
     "mm.model.mlp.1.weight",
     "mm.model.mlp.1.bias",
@@ -1188,11 +1258,47 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         real_artifact_ids=("qwen3-vl-projector-f16",),
     ),
-    _deferred(
-        "step3vl",
-        "PROJECTOR_TYPE_STEP3VL",
-        _VISION_BASE,
-        "Step3-VL vision and projector graph are not implemented.",
+    ProjectorSpec(
+        projector_type="step3vl",
+        enum_name="PROJECTOR_TYPE_STEP3VL",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"qwen3"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact absolute-plus-axial position tower, layer scales, two "
+            "convolutional downsamplers, processor inputs, and independent numerical "
+            "parity are covered; paired multimodal runtime insertion is unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.preproc_image_size",
+            "clip.vision.projector.scale_factor",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.position_embd.weight",
+            "v.pre_ln.weight",
+            "v.pre_ln.bias",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.1.weight",
+            "mm.1.bias",
+            "mm.model.fc.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_STEP3VL_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("step3-vl-10b-f16-header",),
+        source_evidence_ids=("step3vl-pinned-graph-source",),
     ),
     ProjectorSpec(
         projector_type="gemma3",
@@ -1767,11 +1873,42 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _AUDIO_BASE,
         "Voxtral Whisper encoder/projector is not implemented.",
     ),
-    _deferred(
-        "meralion",
-        "PROJECTOR_TYPE_MERALION",
-        _AUDIO_BASE,
-        "Meralion audio projector is not implemented.",
+    ProjectorSpec(
+        projector_type="meralion",
+        enum_name="PROJECTOR_TYPE_MERALION",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"gemma2"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact Whisper encoder, stack-before-normalization gated adapter, "
+            "single-chunk processor ABI, tensor closure, and independent numerical "
+            "parity are covered. Paired text extraction and multi-chunk runtime "
+            "equivalence remain explicitly unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_STANDALONE_AUDIO_METADATA,
+            "clip.projector_type",
+            "clip.audio.projector.stack_factor",
+        ),
+        required_top_tensors=(
+            *_WHISPER_AUDIO_TOP,
+            "mm.a.norm_pre.weight",
+            "mm.a.norm_pre.bias",
+            *(f"mm.a.mlp.{index}.{kind}" for index in range(4) for kind in ("weight", "bias")),
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("meralion-pinned-graph-source",),
     ),
     _deferred(
         "musicflamingo",
@@ -1779,17 +1916,91 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _AUDIO_BASE,
         "Music Flamingo audio projector is not implemented.",
     ),
-    _deferred(
-        "lfm2",
-        "PROJECTOR_TYPE_LFM2",
-        _VISION_BASE,
-        "The existing LFM2-VL HF graph has no pinned mmproj tensor closure or component parity.",
+    ProjectorSpec(
+        projector_type="lfm2",
+        enum_name="PROJECTOR_TYPE_LFM2",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"lfm2"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact dynamic SigLIP position resize, pixel-unshuffle projector, "
+            "processor-native NaFlex inputs, tensor closure, and independent parity "
+            "are covered; paired multimodal runtime insertion is unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.projector.scale_factor",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.input_norm.weight",
+            "mm.input_norm.bias",
+            "mm.1.weight",
+            "mm.1.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("lfm2-vl-1-6b-f16-header",),
+        source_evidence_ids=("lfm2-pinned-graph-source",),
     ),
-    _deferred(
-        "kimivl",
-        "PROJECTOR_TYPE_KIMIVL",
-        _VISION_BASE,
-        "Kimi-VL vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="kimivl",
+        enum_name="PROJECTOR_TYPE_KIMIVL",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"deepseek2"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact learned-position, adjacent-pair 2D-RoPE tower, spatial "
+            "merger, tensor closure, and independent parity are covered; upstream "
+            "processor bounds and paired runtime remain explicitly unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.projector.scale_factor",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.input_norm.weight",
+            "mm.input_norm.bias",
+            "mm.1.weight",
+            "mm.1.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("kimi-vl-a3b-f16-header",),
+        source_evidence_ids=("kimivl-pinned-graph-source",),
     ),
     _deferred(
         "paddleocr",
@@ -1804,18 +2015,78 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _VISION_BASE,
         "LightOnOCR Pixtral variant has no exact tensor mapping.",
     ),
-    _deferred(
-        "cogvlm",
-        "PROJECTOR_TYPE_COGVLM",
-        _VISION_BASE,
-        "CogVLM feature output differs from LLaVA and is not implemented.",
+    ProjectorSpec(
+        projector_type="cogvlm",
+        enum_name="PROJECTOR_TYPE_COGVLM",
+        modalities=_VISION_BASE,
         target_architectures=frozenset({"cogvlm"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact appended-CLS vision tower, split-to-fused QKV transform, "
+            "post-normalized blocks, gated projector, and BOI/EOI token order are "
+            "covered; the paired visual-expert text runtime remains unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.class_embd",
+            "v.position_embd.weight",
+            "mm.model.fc.weight",
+            "mm.post_fc_norm.weight",
+            "mm.post_fc_norm.bias",
+            "mm.up.weight",
+            "mm.gate.weight",
+            "mm.down.weight",
+            "v.boi",
+            "v.eoi",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("cogvlm-chat-v1.1-f16-header",),
+        source_evidence_ids=("cogvlm-pinned-graph-source",),
     ),
-    _deferred(
-        "janus_pro",
-        "PROJECTOR_TYPE_JANUS_PRO",
-        _VISION_BASE,
-        "Janus-Pro vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="janus_pro",
+        enum_name="PROJECTOR_TYPE_JANUS_PRO",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"llama"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact fixed SigLIP tower, two-layer erf-GELU aligner, processor "
+            "geometry, tensor closure, and independent parity are covered; paired "
+            "multimodal runtime insertion is unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            *_SIGLIP_TOP,
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.1.weight",
+            "mm.1.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("janus-pro-1b-f16-header",),
+        source_evidence_ids=("janus-pro-pinned-graph-source",),
     ),
     _deferred(
         "dots_ocr",
@@ -1910,42 +2181,288 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _VISION_BASE,
         "YouTu-VL vision/projector graph is not implemented.",
     ),
-    _deferred(
-        "yasa2",
-        "PROJECTOR_TYPE_YASA2",
-        _VISION_BASE,
-        "YASA2 vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="yasa2",
+        enum_name="PROJECTOR_TYPE_YASA2",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"llama"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact ConvNeXtV2 stages, float32 GRN, pre-pool positions, fixed "
+            "8x8 pooling, single-tile processor contract, and parity are covered; "
+            "multi-tile composition and paired runtime remain unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(*_COMMON_REQUIRED_VISION_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.patch_ln.weight",
+            "v.patch_ln.bias",
+            "v.backbone_ln.weight",
+            "v.backbone_ln.bias",
+            "v.vision_pos_embed",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        auxiliary_tensor_patterns=(
+            r"v\.stage\.\d+\.blk\.\d+\.(dw|ln|pw1|grn|pw2)\.(weight|bias)",
+            r"v\.stage\.[1-9]\d*\.down\.(ln|conv)\.(weight|bias)",
+        ),
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("yasa2-reka-edge-f16-header",),
+        source_evidence_ids=("yasa2-pinned-graph-source",),
     ),
-    _deferred(
-        "kimik25",
-        "PROJECTOR_TYPE_KIMIK25",
-        _VISION_BASE,
-        "Kimi K2.5 vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="kimik25",
+        enum_name="PROJECTOR_TYPE_KIMIK25",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"deepseek2"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact bicubic learned-position tower, converter-permuted 2D RoPE, "
+            "patch merger, tensor closure, and independent parity are covered; the "
+            "oversized paired text runtime is not claimed."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.projector.scale_factor",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.input_norm.weight",
+            "mm.input_norm.bias",
+            "mm.1.weight",
+            "mm.1.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_FUSED_GELU_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("kimi-k2-5-f16-header",),
+        source_evidence_ids=("kimik25-pinned-graph-source",),
     ),
-    _deferred(
-        "nemotron_v2_vl",
-        "PROJECTOR_TYPE_NEMOTRON_V2_VL",
-        _VISION_BASE,
-        "Nemotron V2 VL vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="nemotron_v2_vl",
+        enum_name="PROJECTOR_TYPE_NEMOTRON_V2_VL",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"nemotron_h"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact RADIO register-token tower, fixed position table, patch "
+            "merge, RMSNorm, ReLU-squared projector, and parity are covered; the "
+            "Parakeet companion and paired runtime remain separate unvalidated roles."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.projector.scale_factor",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.class_embd",
+            "v.position_embd.weight",
+            "mm.model.mlp.0.weight",
+            "mm.model.mlp.1.weight",
+            "mm.model.mlp.3.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_FUSED_GELU_BLOCK_SUFFIXES,
+        deferred_companions=(
+            DeferredCompanionSpec(
+                modality=MMProjModality.AUDIO,
+                projector_type="parakeet",
+                tensor_prefixes=("a.", "mm.a."),
+                reason=(
+                    "The co-resident Parakeet encoder is a separate audio role and "
+                    "is quarantined from the vision graph."
+                ),
+            ),
+        ),
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("nemotron-nano-v2-vl-bf16-header",),
+        source_evidence_ids=("nemotron-v2-vl-pinned-graph-source",),
     ),
-    _deferred(
-        "exaone4_5",
-        "PROJECTOR_TYPE_EXAONE4_5",
-        _VISION_BASE,
-        "EXAONE 4.5 vision merger is not implemented.",
+    ProjectorSpec(
+        projector_type="exaone4_5",
+        enum_name="PROJECTOR_TYPE_EXAONE4_5",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"exaone4"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact GQA dual-temporal vision tower, window schedule, spatial "
+            "merger, processor inputs, tensor closure, and parity are covered; the "
+            "oversized paired text runtime is not claimed."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.attention.head_count_kv",
+            "clip.vision.image_min_pixels",
+            "clip.vision.image_max_pixels",
+            "clip.vision.n_wa_pattern",
+            "clip.vision.window_size",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.post_ln.weight",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_FUSED_GATED_RMS_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("exaone4-5-33b-f16-header",),
+        source_evidence_ids=("exaone4-5-pinned-graph-source",),
     ),
-    _deferred(
-        "hunyuanvl",
-        "PROJECTOR_TYPE_HUNYUANVL",
-        _VISION_BASE,
-        "HunyuanVL vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="hunyuanvl",
+        enum_name="PROJECTOR_TYPE_HUNYUANVL",
+        modalities=_VISION_BASE,
         target_architectures=frozenset({"hunyuan_vl"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact external-position ViT, convolutional perceiver, newline "
+            "layout, boundary rows, tensor closure, and parity are covered; XD-RoPE "
+            "text positioning and paired runtime remain unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.spatial_merge_size",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "mm.pre_norm.weight",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+            "v.image_newline",
+            "mm.model.fc.weight",
+            "mm.model.fc.bias",
+            "mm.image_begin",
+            "mm.image_end",
+            "mm.post_norm.weight",
+        ),
+        optional_top_tensors=("v.view_seperator",),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("hunyuanocr-bf16-header",),
+        source_evidence_ids=("hunyuanvl-pinned-graph-source",),
     ),
-    _deferred(
-        "minicpmv4_6",
-        "PROJECTOR_TYPE_MINICPMV4_6",
-        _VISION_BASE,
-        "MiniCPM-V 4.6 SAM/resampler graph is not implemented.",
+    ProjectorSpec(
+        projector_type="minicpmv4_6",
+        enum_name="PROJECTOR_TYPE_MINICPMV4_6",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"qwen35"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact bucketed positions, inserted window-attention merger, final "
+            "downsample MLP, packed processor inputs, tensor closure, and parity are "
+            "covered; paired hybrid-runtime insertion remains unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.projector.scale_factor",
+            "clip.vision.wa_layer_indexes",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "v.vit_merger.ln1.weight",
+            "v.vit_merger.ln1.bias",
+            "v.vit_merger.attn_q.weight",
+            "v.vit_merger.attn_q.bias",
+            "v.vit_merger.attn_k.weight",
+            "v.vit_merger.attn_k.bias",
+            "v.vit_merger.attn_v.weight",
+            "v.vit_merger.attn_v.bias",
+            "v.vit_merger.attn_out.weight",
+            "v.vit_merger.attn_out.bias",
+            "v.vit_merger.ds_ln.weight",
+            "v.vit_merger.ds_ln.bias",
+            "v.vit_merger.ds_ffn_up.weight",
+            "v.vit_merger.ds_ffn_up.bias",
+            "v.vit_merger.ds_ffn_down.weight",
+            "v.vit_merger.ds_ffn_down.bias",
+            "mm.input_norm.weight",
+            "mm.input_norm.bias",
+            "mm.up.weight",
+            "mm.up.bias",
+            "mm.down.weight",
+            "mm.down.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("minicpm-v4-6-bf16-header",),
+        source_evidence_ids=("minicpmv4-6-pinned-graph-source",),
     ),
     _deferred(
         "granite_speech",
@@ -1953,17 +2470,97 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _AUDIO_BASE,
         "Granite Speech audio encoder/projector is not implemented.",
     ),
-    _deferred(
-        "mimovl",
-        "PROJECTOR_TYPE_MIMOVL",
-        _VISION_BASE,
-        "MiMo-VL vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="mimovl",
+        enum_name="PROJECTOR_TYPE_MIMOVL",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"mimo2"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact GQA row/column-window tower, attention sinks, float32 "
+            "down-projection, merger, tensor closure, and parity are covered; the "
+            "co-resident audio role and oversized paired text runtime are unvalidated."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.attention.head_count_kv",
+            "clip.vision.wa_pattern_mode",
+            "clip.vision.window_size",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.post_ln.weight",
+            "mm.0.weight",
+            "mm.2.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_MIMOVL_BLOCK_SUFFIXES,
+        auxiliary_tensor_patterns=(r"v\.blk\.\d+\.attn_sinks",),
+        deferred_companions=(
+            DeferredCompanionSpec(
+                modality=MMProjModality.AUDIO,
+                projector_type="mimo_audio",
+                tensor_prefixes=("a.", "mm.a."),
+                reason=(
+                    "The co-resident MiMo audio encoder is a separate role and is "
+                    "quarantined from the vision graph."
+                ),
+            ),
+        ),
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("mimo-v2-5-f16-header",),
+        source_evidence_ids=("mimovl-pinned-graph-source",),
     ),
-    _deferred(
-        "minimax_m3",
-        "PROJECTOR_TYPE_MINIMAX_M3",
-        _VISION_BASE,
-        "MiniMax M3 vision/projector graph is not implemented.",
+    ProjectorSpec(
+        projector_type="minimax_m3",
+        enum_name="PROJECTOR_TYPE_MINIMAX_M3",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"minimax-m3"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Pinned source proves the exact dual-temporal patch embed, partial "
+            "two-axis RoPE, and two-stage merger graph with independent synthetic "
+            "parity. No bounded standalone sidecar or paired runtime is claimed."
+        ),
+        sidecar_builder="remaining_vision_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.spatial_merge_size",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "mm.1.weight",
+            "mm.1.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+            "mm.merger.fc1.weight",
+            "mm.merger.fc1.bias",
+            "mm.merger.fc2.weight",
+            "mm.merger.fc2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_GENERIC_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("minimax-m3-pinned-graph-source",),
     ),
     _deferred(
         "granite4_vision",

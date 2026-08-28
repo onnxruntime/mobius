@@ -103,6 +103,10 @@ class FixedResolutionSiglipMLPSidecar(nn.Module):
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # (B, C, H, W) -> (B, (H/P)*(W/P), Dv) -> (B, patches, Dt).
+        pixel_values = op.CastLike(
+            pixel_values,
+            self.vision_tower.embeddings.patch_embedding.projection.weight,
+        )
         patch_states = self.vision_tower(op, pixel_values)
         return self.projector(op, patch_states)
 

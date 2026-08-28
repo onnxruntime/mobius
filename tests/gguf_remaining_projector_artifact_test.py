@@ -12,6 +12,7 @@ from collections import Counter
 import pytest
 from huggingface_hub import HfApi, hf_hub_url
 
+from mobius.integrations.gguf._mmproj import _preflight_standalone_mmproj
 from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_PINS,
     MMProjArtifactPin,
@@ -25,7 +26,9 @@ _HEADER_PINS = tuple(
 
 @pytest.mark.integration
 @pytest.mark.parametrize("pin", _HEADER_PINS, ids=lambda pin: pin.projector_types[0])
-def test_projector_header_identity_and_tensor_inventory(pin: MMProjArtifactPin, tmp_path) -> None:
+def test_projector_header_identity_and_tensor_inventory(
+    pin: MMProjArtifactPin, tmp_path
+) -> None:
     """Verify one immutable sidecar without retaining or downloading its payload."""
     (record,) = HfApi().get_paths_info(
         pin.repository,
@@ -45,7 +48,7 @@ def test_projector_header_identity_and_tensor_inventory(pin: MMProjArtifactPin, 
     header_path = tmp_path / "header.bin"
     sparse_path = tmp_path / "sparse.gguf"
     try:
-        with urllib.request.urlopen(request) as response:  # noqa: S310
+        with urllib.request.urlopen(request) as response:
             header = response.read(pin.bounded_header_bytes + 1)
         assert len(header) == pin.bounded_header_bytes
         assert hashlib.sha256(header).hexdigest() == pin.bounded_header_sha256
@@ -60,11 +63,17 @@ def test_projector_header_identity_and_tensor_inventory(pin: MMProjArtifactPin, 
             assert model.architecture == "clip"
             assert model.metadata["clip.projector_type"] == pin.projector_types[0]
             assert len(model.tensor_names) == pin.tensor_count
-            assert Counter(model.get_tensor_type(name).name for name in model.tensor_names) == dict(
-                pin.tensor_qtypes
-            )
+            assert Counter(
+                model.get_tensor_type(name).name for name in model.tensor_names
+            ) == dict(pin.tensor_qtypes)
             for key, expected in pin.metadata:
                 assert model.metadata[key] == expected
+            spec = _preflight_standalone_mmproj(
+                model,
+                projector_type=pin.projector_types[0],
+                target_architecture=pin.paired_text_architecture,
+            )
+            assert spec.is_importable
         finally:
             model.close()
     finally:

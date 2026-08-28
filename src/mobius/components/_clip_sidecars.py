@@ -149,6 +149,7 @@ class Yasa2VisionSidecar(nn.Module):
         self._pool_kernel = final_grid // 8
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
+        pixel_values = op.CastLike(pixel_values, self.patch_embedding.weight)
         x = self.patch_layer_norm(op, self.patch_embedding(op, pixel_values))
         for stage in self.stages:
             x = stage(op, x)
@@ -243,6 +244,13 @@ class MeralionAudioSidecar(nn.Module):
         super().__init__()
         if max_source_positions % stack_factor:
             raise ValueError("max_source_positions must be divisible by stack_factor")
+        self.input_schema = (
+            (
+                "input_features",
+                ir.DataType.FLOAT,
+                (ir.SymbolicDim("frames"), num_mel_bins),
+            ),
+        )
         self.conv1 = Conv1d(num_mel_bins, d_model, kernel_size=3, padding=1)
         self.conv2 = Conv1d(d_model, d_model, kernel_size=3, stride=2, padding=1)
         self.position_embeddings = nn.Parameter([max_source_positions, d_model])
@@ -261,11 +269,14 @@ class MeralionAudioSidecar(nn.Module):
             eps=eps,
         )
 
-    def forward(self, op: OpBuilder, mel: ir.Value) -> ir.Value:
-        x = op.Gelu(self.conv1(op, mel))
+    def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
+        # Processor boundary is (frames, mel); Conv1d consumes (1, mel, frames).
+        x = op.Unsqueeze(op.Transpose(input_features, perm=[1, 0]), [0])
+        x = op.CastLike(x, self.conv1.weight)
+        x = op.Gelu(self.conv1(op, x))
         x = op.Gelu(self.conv2(op, x))
         x = op.Transpose(x, perm=[0, 2, 1])
         x = op.Add(x, op.CastLike(self.position_embeddings, x))
         for layer in self.layers:
             x = layer(op, x)
-        return self.projector(op, self.layer_norm(op, x))
+        return op.Squeeze(self.projector(op, self.layer_norm(op, x)), [0])

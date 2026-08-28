@@ -41,11 +41,7 @@ def _conv(x, state, stem, stride, padding):
     return functional.conv2d(
         x,
         torch.from_numpy(state[f"{stem}.weight"]),
-        (
-            torch.from_numpy(state[f"{stem}.bias"])
-            if f"{stem}.bias" in state
-            else None
-        ),
+        (torch.from_numpy(state[f"{stem}.bias"]) if f"{stem}.bias" in state else None),
         stride=stride,
         padding=padding,
     )
