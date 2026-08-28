@@ -197,6 +197,7 @@ class HunyuanVLClipSidecar(nn.Module):
             mode="linear",
             coordinate_transformation_mode="half_pixel",
             antialias=1,
+            exclude_outside=1,
         )
         return op.Reshape(
             op.Transpose(positions, perm=[0, 2, 3, 1]), [1, -1, self._vision_hidden_size]

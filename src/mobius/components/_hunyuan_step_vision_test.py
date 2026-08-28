@@ -320,6 +320,45 @@ def test_hunyuanvl_runtime_grid_controls_newline_token_count():
         assert actual.shape == (1, (w // 2 + 1) * (h // 2) + 2, 3)
 
 
+def test_hunyuanvl_position_downsampling_matches_torch_antialias():
+    class _PositionResizeProbe(HunyuanVLClipSidecar):
+        def forward(self, op):
+            return self._resize_positions(
+                op,
+                op.Constant(value_int=2),
+                op.Constant(value_int=2),
+            )
+
+    component = _PositionResizeProbe(
+        vision_hidden_size=4,
+        intermediate_size=7,
+        num_heads=1,
+        num_layers=0,
+        patch_size=1,
+        grid_height=4,
+        grid_width=4,
+        position_grid_size=4,
+        projector_hidden_size=5,
+        output_size=3,
+    )
+    _, op, graph = create_test_builder()
+    output = component(op)
+    output.name = "positions"
+    graph.outputs.append(output)
+    state, session = _state_and_session(component, graph, 43)
+
+    source = torch.from_numpy(state["position_embedding"]).reshape(1, 4, 4, 4)
+    expected = functional.interpolate(
+        source.permute(0, 3, 1, 2),
+        size=(2, 2),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    ).permute(0, 2, 3, 1)
+    actual = session.run(None, {})[0]
+    np.testing.assert_allclose(actual, expected.reshape(1, 4, 4).numpy(), rtol=1e-6)
+
+
 def test_step3vl_runtime_grid_controls_position_resize_and_downsampling():
     component = Step3VLClipSidecar(
         vision_hidden_size=8,
