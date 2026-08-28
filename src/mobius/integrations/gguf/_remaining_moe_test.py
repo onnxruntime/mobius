@@ -536,7 +536,7 @@ def test_metadata_defaults_match_pinned_loaders() -> None:
     assert grok.logit_output_scale == pytest.approx(0.5773502691896257)
     assert grok.attn_logit_softcapping == pytest.approx(30.0)
     assert grok.router_logit_softcapping == pytest.approx(30.0)
-    assert grok.final_logit_softcapping == 0.0
+    assert grok.final_logit_softcapping == pytest.approx(0.0)
 
     grove_source = _fixture("grovemoe")
     del grove_source.metadata["grovemoe.expert_chunk_feed_forward_length"]
