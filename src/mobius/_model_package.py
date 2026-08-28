@@ -26,10 +26,12 @@ import logging
 import math
 import os
 import shutil
+import tempfile
 import threading
 from collections import UserDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import onnx_ir as ir
@@ -49,8 +51,6 @@ from mobius.integrations._weight_loading import _assign_weight
 
 if TYPE_CHECKING:
     from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
-    from mobius.integrations.gguf._runtime_evidence import GGUFArtifactIdentity
-    from mobius.integrations.gguf._tokenizer import GGUFTokenizerVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +210,7 @@ def _validate_mtp_save_paths(
         )
     if (
         package.export_report is not None
+        and package.gguf_reuse_plan is None
         and (
             package.export_report.status == "partial"
             or package.export_report.runtime_validation_status == "unvalidated"
@@ -353,13 +354,13 @@ class ModelPackage(UserDict[str, ir.Model]):
         self.config = config
         self.gguf_quantization_report: GGUFQuantizationReport | None = None
         self.gguf_architecture = ""
-        self.gguf_artifact_identity: GGUFArtifactIdentity | None = None
+        self.gguf_artifact_identity: Any = None
         self.gguf_execution_provider = ""
         self.gguf_import_route = ""
         self.gguf_source_filename = ""
         self.gguf_source_identity: object | None = None
         self.gguf_source_path = ""
-        self.gguf_tokenizer_verdict: GGUFTokenizerVerdict | None = None
+        self.gguf_tokenizer_verdict: Any = None
         self.export_report: ComponentExportReport | None = None
         self.quantization_report: object | None = None
         self.weight_loading_report: dict[str, object] | None = None
@@ -407,6 +408,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         check_weights: bool = True,
         include_policy_components: bool = True,
         include_adapter_artifacts: bool = True,
+        _atomic_export_report: bool = True,
     ) -> None:
         """Save all component models to a directory.
 
@@ -488,6 +490,46 @@ class ModelPackage(UserDict[str, ir.Model]):
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
         reuse_plan = getattr(self, "gguf_reuse_plan", None)
+        if self.export_report is not None and _atomic_export_report and reuse_plan is None:
+            destination = os.path.abspath(directory)
+            if os.path.lexists(destination):
+                raise FileExistsError(
+                    "Component-report package destination already exists; refusing "
+                    "non-atomic replacement."
+                )
+            parent = os.path.dirname(destination)
+            os.makedirs(parent, exist_ok=True)
+            stage = tempfile.mkdtemp(
+                prefix=f".{os.path.basename(destination)}.",
+                suffix=".tmp",
+                dir=parent,
+            )
+            try:
+                self.save(
+                    stage,
+                    external_data=external_data,
+                    max_shard_size_bytes=max_shard_size_bytes,
+                    max_workers=max_workers,
+                    components=components,
+                    progress_bar=progress_bar,
+                    check_weights=check_weights,
+                    include_policy_components=include_policy_components,
+                    include_adapter_artifacts=include_adapter_artifacts,
+                    _atomic_export_report=False,
+                )
+                if self.draft_manifest is not None:
+                    from mobius.integrations.gguf._draft import write_draft_manifest
+
+                    write_draft_manifest(self.draft_manifest, stage)
+                from mobius.integrations.gguf._runtime_package import (
+                    _publish_directory_no_replace,
+                )
+
+                _publish_directory_no_replace(Path(stage), Path(destination))
+            finally:
+                if os.path.isdir(stage):
+                    shutil.rmtree(stage)
+            return
         if reuse_plan is not None:
             if external_data != "onnx":
                 raise ValueError(
@@ -579,11 +621,21 @@ class ModelPackage(UserDict[str, ir.Model]):
                 if reuse_plan is not None:
                     from mobius.integrations.gguf._reuse import save_reuse_package
 
+                    package_metadata: dict[str, bytes] = {}
+                    if self.export_report is not None:
+                        package_metadata[_EXPORT_REPORT] = (
+                            self.export_report.to_json().encode()
+                        )
+                    if self.draft_manifest is not None:
+                        package_metadata["draft_manifest.json"] = (
+                            json.dumps(self.draft_manifest, indent=2, sort_keys=True) + "\n"
+                        ).encode()
                     save_reuse_package(
                         saved_model,
                         path,
                         reuse_plan,
                         callback=callback,
+                        package_metadata=package_metadata,
                     )
                 elif external_data == "safetensors":
                     ir.save_safetensors(
@@ -666,7 +718,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                 and not os.path.islink(previous_sidecar)
             ):
                 shutil.rmtree(previous_sidecar)
-        if self.export_report is not None:
+        if self.export_report is not None and reuse_plan is None:
             if os.path.islink(export_report_path):
                 raise ValueError("Component export report must not be a symlink.")
             self.export_report.write_json(export_report_path)

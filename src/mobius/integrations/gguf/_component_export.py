@@ -200,8 +200,13 @@ def attach_runtime_unvalidated_report(
         runtime_component = existing.component("runtime")
         if (
             runtime_component is not None
+            and runtime_component.route == runtime
+            and runtime_component.support == support_status
             and runtime_component.runtime_validation_status == runtime_validation_status
             and runtime_component.output == runtime_output
+            and runtime_component.blocker_category == blocker_category
+            and runtime_component.reason == reason
+            and runtime_component.evidence_id == evidence_id
         ):
             return False
 

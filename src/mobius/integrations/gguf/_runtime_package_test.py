@@ -177,6 +177,59 @@ def _runtime_supported():
 
 
 class TestWriteGgufRuntimePackage:
+    def test_runtime_disposition_is_replaced_when_runtime_changes(self):
+        from mobius.integrations.gguf._component_export import (
+            attach_runtime_unvalidated_report,
+        )
+
+        pkg = _FakePackage()
+        attach_runtime_unvalidated_report(
+            pkg,
+            "onnx-genai",
+            blocker_category="first-category",
+            reason="first reason",
+            tokenizer_exported=True,
+            emit_warning=False,
+        )
+        attach_runtime_unvalidated_report(
+            pkg,
+            "ort-genai",
+            blocker_category="second-category",
+            reason="second reason",
+            tokenizer_exported=True,
+            emit_warning=False,
+        )
+
+        runtime = pkg.export_report.component("runtime")
+        assert runtime.route == "ort-genai"
+        assert runtime.blocker_category == "second-category"
+        assert runtime.reason == "second reason"
+
+    def test_every_runtime_evidence_record_rejects_final_package_mutation(self):
+        from mobius.integrations.gguf._runtime_evidence import iter_runtime_evidence
+
+        for evidence in iter_runtime_evidence():
+            exact = SimpleNamespace(
+                files=evidence.runtime_package_files,
+                sha256=evidence.runtime_package_sha256,
+            )
+            mutated_hash = SimpleNamespace(
+                files=evidence.runtime_package_files,
+                sha256="0" * 64,
+            )
+            mutated_files = SimpleNamespace(
+                files=(*evidence.runtime_package_files, "unexpected.json"),
+                sha256=evidence.runtime_package_sha256,
+            )
+
+            assert _runtime_package._runtime_package_matches_evidence(evidence, exact)
+            assert not _runtime_package._runtime_package_matches_evidence(
+                evidence, mutated_hash
+            )
+            assert not _runtime_package._runtime_package_matches_evidence(
+                evidence, mutated_files
+            )
+
     def test_atomic_publication_refuses_concurrent_destination(self, tmp_path):
         stage = tmp_path / "stage"
         stage.mkdir()
@@ -338,7 +391,7 @@ class TestWriteGgufRuntimePackage:
         assert Path(artifacts["inference_metadata"]) == out / "inference_metadata.yaml"
         compatibility = json.loads((out / "runtime_compatibility.json").read_text())
         assert compatibility["runtime_validation_status"] == "unvalidated"
-        assert "completed runtime package" in compatibility["warnings"][-1]
+        assert "final staged runtime package" in compatibility["warnings"][-1]
         assert pkg.export_report is not None
         assert pkg.export_report.component("runtime").output == "exported"
         assert pkg.export_report.component("tokenizer").output == "exported"

@@ -679,7 +679,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     output_dir = args.output_dir
     target_config = getattr(args, "target_config", None)
     runtime = getattr(args, "runtime", None)
-    tokenizer_component_partial = False
 
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -705,9 +704,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             _resolve_gguf_path,
             _validate_gguf_model,
         )
-        from mobius.integrations.gguf._component_export import (
-            resolve_tokenizer_export_verdict,
-        )
         from mobius.integrations.gguf._shard_set import open_gguf_model
 
         # Resolve and validate the exact selected source before graph construction.
@@ -716,11 +712,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         resolved_gguf_path = _resolve_gguf_path(gguf_path)
         gguf_model = open_gguf_model(resolved_gguf_path)
         _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
-        tokenizer_verdict = resolve_tokenizer_export_verdict(
-            gguf_model,
-            str(resolved_gguf_path),
-        )
-        tokenizer_component_partial = tokenizer_verdict.blocker_category is not None
         if tokenizer_repository is not None and (
             tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/"))
         ):
@@ -753,15 +744,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         for model in pkg.values():
             strip_debug_metadata(model)
 
-    from mobius.integrations.gguf._component_export import tokenizer_export_is_partial
-
-    partial_tokenizer_export = tokenizer_export_is_partial(pkg)
-    if runtime is not None and tokenizer_component_partial != partial_tokenizer_export:
-        raise RuntimeError(
-            "GGUF tokenizer disposition changed between runtime preflight and graph export."
-        )
     if runtime is None:
-        os.makedirs(output_dir, exist_ok=True)
+        if getattr(pkg, "export_report", None) is None:
+            os.makedirs(output_dir, exist_ok=True)
         pkg.save(
             output_dir,
             external_data=args.external_data,
@@ -785,9 +770,12 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
 
         draft_manifest = getattr(pkg, "draft_manifest", None)
         if draft_manifest is not None:
-            from mobius.integrations.gguf._draft import write_draft_manifest
+            if getattr(pkg, "export_report", None) is None:
+                from mobius.integrations.gguf._draft import write_draft_manifest
 
-            manifest_path = write_draft_manifest(draft_manifest, output_dir)
+                manifest_path = write_draft_manifest(draft_manifest, output_dir)
+            else:
+                manifest_path = os.path.join(output_dir, "draft_manifest.json")
             print(f"Saved draft pairing manifest to {manifest_path}")
 
     if runtime in ("onnx-genai", "ort-genai"):

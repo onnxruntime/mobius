@@ -425,6 +425,25 @@ def _deferred_route_diagnostics(
     )
 
 
+def _incomplete_tokenizer_verdict(
+    *,
+    model: str | None,
+    reason: str,
+    token_count: int,
+) -> GGUFTokenizerVerdict:
+    """Return an authoritative deferred verdict for incomplete serialized metadata."""
+    return GGUFTokenizerVerdict(
+        "deferred",
+        model,
+        None,
+        None,
+        reason,
+        token_count,
+        audit_status="deferred-incomplete-pipeline",
+        blocker_category="serialized-tokenizer-pipeline-incomplete",
+    )
+
+
 def inspect_gguf_tokenizer(
     metadata: Mapping[str, Any],
     *,
@@ -434,25 +453,22 @@ def inspect_gguf_tokenizer(
     """Validate embedded tokenizer metadata and return an exact route verdict."""
     tokenizer_keys = [key for key in metadata if key.startswith("tokenizer.")]
     if not tokenizer_keys:
-        return GGUFTokenizerVerdict(
-            "deferred",
-            None,
-            None,
-            None,
-            f"{source} contains no tokenizer metadata",
-            0,
+        return _incomplete_tokenizer_verdict(
+            model=None,
+            reason=f"{source} contains no tokenizer metadata",
+            token_count=0,
         )
 
     model = metadata.get("tokenizer.ggml.model")
     if not isinstance(model, str) or not model:
         if not require_complete:
-            return GGUFTokenizerVerdict(
-                "deferred",
-                None,
-                None,
-                None,
-                f"{source} contains partial tokenizer metadata without tokenizer.ggml.model",
-                len(metadata.get("tokenizer.ggml.tokens", ())),
+            return _incomplete_tokenizer_verdict(
+                model=None,
+                reason=(
+                    f"{source} contains partial tokenizer metadata without "
+                    "tokenizer.ggml.model"
+                ),
+                token_count=len(metadata.get("tokenizer.ggml.tokens", ())),
             )
         raise ValueError(f"{source} tokenizer.ggml.model must be a non-empty string")
     if model not in _KNOWN_MODELS:
@@ -461,13 +477,10 @@ def inspect_gguf_tokenizer(
     tokens_raw = _require_list(metadata, "tokenizer.ggml.tokens")
     if not tokens_raw:
         if not require_complete:
-            return GGUFTokenizerVerdict(
-                "deferred",
-                model,
-                None,
-                None,
-                f"{source} contains no complete tokenizer token table",
-                0,
+            return _incomplete_tokenizer_verdict(
+                model=model,
+                reason=f"{source} contains no complete tokenizer token table",
+                token_count=0,
             )
         raise ValueError(f"{source} tokenizer.ggml.tokens must be a non-empty string array")
     if any(not isinstance(token, str) for token in tokens_raw):

@@ -253,6 +253,14 @@ def _write_mtp_runtime_status(
     return str(path)
 
 
+def _runtime_package_matches_evidence(evidence: Any, identity: Any) -> bool:
+    """Whether the complete final package bytes match one runtime evidence record."""
+    return (
+        identity.files == evidence.runtime_package_files
+        and identity.sha256 == evidence.runtime_package_sha256
+    )
+
+
 def write_gguf_runtime_package(
     pkg: Any,
     gguf_path: str | Path,
@@ -423,7 +431,7 @@ def write_gguf_runtime_package(
     published = False
     try:
         artifacts: dict[str, str] = {}
-        pkg.save(str(stage), **save_kwargs)
+        pkg.save(str(stage), _atomic_export_report=False, **save_kwargs)
         if not source_model.source_matches_path():
             raise ValueError(
                 "The GGUF source changed while target/MTP graphs were being serialized; "
@@ -573,106 +581,103 @@ def write_gguf_runtime_package(
             )
             if speculator_path is not None:
                 artifacts["speculator"] = str(speculator_path)
-        runtime_identity = gguf_graph_package_identity(stage)
-        if evidence is not None and (
-            runtime_identity.files != evidence.runtime_package_files
-            or runtime_identity.sha256 != evidence.runtime_package_sha256
-        ):
-            validation_warnings.append(
-                "The completed runtime package does not match the recorded runtime-evidence "
-                "identity."
-            )
-            evidence = None
         compatibility_path = stage / "runtime_compatibility.json"
         compatibility = (
             json.loads(compatibility_path.read_text(encoding="utf-8"))
             if compatibility_path.exists()
             else {"runtime": runtime}
         )
+        compatibility_warnings = list(compatibility.get("warnings", []))
         existing_status = compatibility.get("runtime_validation_status")
-        if evidence is not None:
-            validation_status = "validated"
-        elif existing_status == "unsupported-by-tested-runtime":
-            validation_status = existing_status
-        else:
-            validation_status = "unvalidated"
-        runtime_support: Literal["supported", "deferred", "blocked"]
-        blocker_category: str | None
-        runtime_reason: str | None
-        report_validation_status: Literal["validated", "unvalidated"]
-        if evidence is not None:
-            runtime_support = "supported"
-            blocker_category = None
-            runtime_reason = None
-            report_validation_status = "validated"
-        elif existing_status == "unsupported-by-tested-runtime":
-            runtime_support = "blocked"
-            blocker_category = "runtime-unsupported-by-tested-runtime"
-            runtime_reason = "; ".join(validation_warnings)
-            report_validation_status = "unvalidated"
-        elif architecture_spec.runtime is Support.REJECTED:
-            runtime_support = "blocked"
-            blocker_category = "runtime-route-rejected"
-            runtime_reason = "; ".join(validation_warnings)
-            report_validation_status = "unvalidated"
-        elif architecture_spec.runtime is Support.DEFERRED:
-            runtime_support = "deferred"
-            blocker_category = "runtime-route-deferred"
-            runtime_reason = "; ".join(validation_warnings)
-            report_validation_status = "unvalidated"
-        else:
-            runtime_support = "deferred"
-            blocker_category = "runtime-validation-unavailable"
-            runtime_reason = (
-                "; ".join(validation_warnings)
-                or "No exact end-to-end runtime validation is claimed for the emitted package."
-            )
-            report_validation_status = "unvalidated"
         from mobius.integrations.gguf._component_export import (
             attach_runtime_unvalidated_report,
         )
 
-        attach_runtime_unvalidated_report(
-            pkg,
-            runtime,
-            blocker_category=blocker_category,
-            reason=runtime_reason,
-            evidence_id=(evidence.evidence_id if evidence is not None else None),
-            support_status=runtime_support,
-            runtime_output="exported",
-            runtime_validation_status=report_validation_status,
-            tokenizer_exported=tokenizer_exported,
-            emit_warning=False,
-        )
-        assert pkg.export_report is not None
         export_report_path = stage / "export_report.json"
-        pkg.export_report.write_json(export_report_path)
         artifacts["export_report"] = str(export_report_path)
-        compatibility.update(
-            {
-                "runtime_validation_status": validation_status,
-                "gguf_architecture": architecture,
-                "execution_provider": getattr(pkg, "gguf_execution_provider", None),
-                "gguf_graph_identity": {
-                    "files": list(graph_identity.files),
-                    "sha256": str(graph_identity.sha256),
-                },
-                "runtime_evidence_id": (
-                    evidence.evidence_id if evidence is not None else None
-                ),
-                "warnings": [
-                    *compatibility.get("warnings", []),
-                    *validation_warnings,
-                ],
-            }
-        )
-        compatibility_path.write_text(
-            json.dumps(compatibility, indent=2) + "\n", encoding="utf-8"
-        )
         artifacts["runtime_compatibility"] = str(compatibility_path)
-        if mtp_head is not None:
+
+        def write_final_metadata() -> None:
+            if evidence is not None:
+                validation_status = "validated"
+                runtime_support: Literal["supported", "deferred", "blocked"] = "supported"
+                blocker_category = None
+                runtime_reason = None
+                report_validation_status: Literal["validated", "unvalidated"] = "validated"
+            elif existing_status == "unsupported-by-tested-runtime":
+                validation_status = existing_status
+                runtime_support = "blocked"
+                blocker_category = "runtime-unsupported-by-tested-runtime"
+                runtime_reason = "; ".join(validation_warnings)
+                report_validation_status = "unvalidated"
+            elif architecture_spec.runtime is Support.REJECTED:
+                validation_status = "unvalidated"
+                runtime_support = "blocked"
+                blocker_category = "runtime-route-rejected"
+                runtime_reason = "; ".join(validation_warnings)
+                report_validation_status = "unvalidated"
+            elif architecture_spec.runtime is Support.DEFERRED:
+                validation_status = "unvalidated"
+                runtime_support = "deferred"
+                blocker_category = "runtime-route-deferred"
+                runtime_reason = "; ".join(validation_warnings)
+                report_validation_status = "unvalidated"
+            else:
+                validation_status = "unvalidated"
+                runtime_support = "deferred"
+                blocker_category = "runtime-validation-unavailable"
+                runtime_reason = (
+                    "; ".join(validation_warnings)
+                    or "No exact end-to-end runtime validation is claimed for the "
+                    "emitted package."
+                )
+                report_validation_status = "unvalidated"
+
+            attach_runtime_unvalidated_report(
+                pkg,
+                runtime,
+                blocker_category=blocker_category,
+                reason=runtime_reason,
+                evidence_id=(evidence.evidence_id if evidence is not None else None),
+                support_status=runtime_support,
+                runtime_output="exported",
+                runtime_validation_status=report_validation_status,
+                tokenizer_exported=tokenizer_exported,
+                emit_warning=False,
+            )
+            assert pkg.export_report is not None
+            pkg.export_report.write_json(export_report_path)
+            compatibility.update(
+                {
+                    "runtime_validation_status": validation_status,
+                    "gguf_architecture": architecture,
+                    "execution_provider": getattr(pkg, "gguf_execution_provider", None),
+                    "gguf_graph_identity": {
+                        "files": list(graph_identity.files),
+                        "sha256": str(graph_identity.sha256),
+                    },
+                    "runtime_evidence_id": (
+                        evidence.evidence_id if evidence is not None else None
+                    ),
+                    "warnings": [
+                        *compatibility_warnings,
+                        *validation_warnings,
+                    ],
+                }
+            )
+            compatibility_path.write_text(
+                json.dumps(compatibility, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        def write_mtp_status() -> None:
+            if mtp_head is None:
+                return
+            status_path = stage / "mtp_runtime_status.json"
+            if status_path.exists():
+                status_path.unlink()
             runtime_payload_identity = gguf_graph_package_identity(stage)
-            status_path = _write_mtp_runtime_status(
+            artifacts["mtp_runtime_status"] = _write_mtp_runtime_status(
                 stage,
                 pkg=pkg,
                 built_identity=built_identity,
@@ -684,7 +689,20 @@ def write_gguf_runtime_package(
                 tokenizer_revision=tokenizer_revision,
                 tokenizer_metadata_sha256=verdict.metadata_sha256,
             )
-            artifacts["mtp_runtime_status"] = status_path
+
+        write_final_metadata()
+        write_mtp_status()
+        final_identity = gguf_graph_package_identity(stage)
+        if evidence is not None and not _runtime_package_matches_evidence(
+            evidence, final_identity
+        ):
+            validation_warnings.append(
+                "The final staged runtime package, including export and compatibility "
+                "metadata, does not match the recorded runtime-evidence identity."
+            )
+            evidence = None
+            write_final_metadata()
+            write_mtp_status()
         if not source_model.source_matches_path():
             raise ValueError(
                 "The GGUF source changed while runtime metadata was being written; "

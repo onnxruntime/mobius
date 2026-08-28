@@ -184,6 +184,36 @@ class TestTokenizerPreCensus:
 
 
 class TestInspectGgufTokenizer:
+    @pytest.mark.parametrize(
+        ("metadata", "route", "reason"),
+        [
+            ({}, "absent", "contains no tokenizer metadata"),
+            (
+                {"tokenizer.ggml.tokens": ["token"]},
+                "absent",
+                "without tokenizer.ggml.model",
+            ),
+            (
+                {"tokenizer.ggml.model": "llama"},
+                "llama",
+                "no complete tokenizer token table",
+            ),
+        ],
+    )
+    def test_incomplete_metadata_has_authoritative_deferred_diagnostics(
+        self,
+        metadata: dict,
+        route: str,
+        reason: str,
+    ) -> None:
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.route_identifier == route
+        assert verdict.audit_status == "deferred-incomplete-pipeline"
+        assert verdict.blocker_category == "serialized-tokenizer-pipeline-incomplete"
+        assert reason in verdict.reason
+
     def test_known_pre_without_complete_pipeline_is_deferred(self):
         verdict = inspect_gguf_tokenizer(_metadata(pre="hunyuan-dense"))
         assert verdict.route == "deferred"

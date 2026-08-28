@@ -251,10 +251,11 @@ class TestComponentExportReport:
     def test_partial_report_roundtrips_deterministically(self, tmp_path):
         pkg = ModelPackage({"model": _make_simple_model()})
         pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
 
-        pkg.save(str(tmp_path), progress_bar=False)
-        report_bytes = (tmp_path / "export_report.json").read_bytes()
-        loaded = ModelPackage.load(str(tmp_path))
+        pkg.save(str(output), progress_bar=False)
+        report_bytes = (output / "export_report.json").read_bytes()
+        loaded = ModelPackage.load(str(output))
 
         assert loaded.export_report == pkg.export_report
         loaded_report = loaded.export_report
@@ -307,6 +308,96 @@ class TestComponentExportReport:
             pkg.save(str(tmp_path / "output"), progress_bar=False)
 
         assert not (tmp_path / "output" / "export_report.json").exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_report_write_failure_publishes_nothing(self, tmp_path, monkeypatch):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+
+        def fail_report(*_args, **_kwargs):
+            raise OSError("report disk full")
+
+        monkeypatch.setattr(ComponentExportReport, "write_json", fail_report)
+        with pytest.raises(OSError, match="report disk full"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_draft_manifest_failure_publishes_nothing(self, tmp_path, monkeypatch):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        pkg.draft_manifest = {"architecture": "eagle3"}
+        output = tmp_path / "output"
+
+        def fail_manifest(*_args, **_kwargs):
+            raise OSError("draft manifest disk full")
+
+        monkeypatch.setattr(
+            "mobius.integrations.gguf._draft.write_draft_manifest",
+            fail_manifest,
+        )
+        with pytest.raises(OSError, match="draft manifest disk full"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_report_save_refuses_existing_destination_without_mutation(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+        output.mkdir()
+        sentinel = output / "sentinel.bin"
+        sentinel.write_bytes(b"unchanged")
+
+        with pytest.raises(FileExistsError, match="omitted or unverified components"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert sentinel.read_bytes() == b"unchanged"
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_atomic_report_publish_failure_rolls_back_stage(self, tmp_path, monkeypatch):
+        from mobius.integrations.gguf import _runtime_package
+
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+
+        def fail_publish(*_args, **_kwargs):
+            raise PermissionError("destination permission denied")
+
+        monkeypatch.setattr(_runtime_package, "_publish_directory_no_replace", fail_publish)
+        with pytest.raises(PermissionError, match="permission denied"):
+            pkg.save(str(output), progress_bar=False)
+
+        assert not output.exists()
+        assert not list(tmp_path.glob(".output.*.tmp"))
+
+    def test_atomic_report_publish_refuses_concurrent_destination(self, tmp_path, monkeypatch):
+        from mobius.integrations.gguf import _runtime_package
+
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+        output = tmp_path / "output"
+        publish = _runtime_package._publish_directory_no_replace
+
+        def create_concurrent_destination(stage, destination):
+            destination.mkdir()
+            (destination / "sentinel.bin").write_bytes(b"concurrent")
+            publish(stage, destination)
+
+        monkeypatch.setattr(
+            _runtime_package,
+            "_publish_directory_no_replace",
+            create_concurrent_destination,
+        )
+        with pytest.raises(OSError):
+            pkg.save(str(output), progress_bar=False)
+
+        assert (output / "sentinel.bin").read_bytes() == b"concurrent"
+        assert not list(tmp_path.glob(".output.*.tmp"))
 
     def test_report_rejects_component_filtered_save(self, tmp_path):
         pkg = ModelPackage({"model": _make_simple_model()})

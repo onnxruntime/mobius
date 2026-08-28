@@ -2953,8 +2953,9 @@ class TestReuseGgufWeights:
         )
 
         loaded = ModelPackage.load(str(tmp_path))
-        loaded.save(str(tmp_path), progress_bar=False)
-        assert not (tmp_path / "gguf-reuse.json").exists()
+        ordinary_output = tmp_path / "ordinary-resave"
+        loaded.save(str(ordinary_output), progress_bar=False)
+        assert not (ordinary_output / "gguf-reuse.json").exists()
 
     def test_verifier_rejects_unmanifested_external_initializer(self, tmp_path: Path):
         from mobius.integrations.gguf import (

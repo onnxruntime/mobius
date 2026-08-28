@@ -26,6 +26,7 @@ from mobius.integrations.gguf._runtime_blocker_evidence import (
     runtime_blocker_evidence,
 )
 from mobius.integrations.gguf._runtime_evidence import (
+    FINAL_RUNTIME_PACKAGE_SCHEMA,
     GGUFRuntimeEvidence,
     gguf_artifact_identity,
     gguf_graph_package_identity,
@@ -118,6 +119,7 @@ def _record(payload: bytes) -> GGUFRuntimeEvidence:
         onnxruntime_version="1.29.0",
         runtime="onnx-genai",
         runtime_version="1.0.0",
+        runtime_package_schema=FINAL_RUNTIME_PACKAGE_SCHEMA,
     )
 
 
@@ -135,6 +137,16 @@ def _model():
 def test_runtime_evidence_rejects_non_hex_tokenizer_metadata_digest() -> None:
     with pytest.raises(ValueError, match="immutable 40-hex revisions and LFS SHA-256"):
         replace(_record(b"pinned-gguf"), tokenizer_metadata_sha256="g" * 64)
+
+
+def test_production_runtime_evidence_requires_final_package_regeneration() -> None:
+    from mobius.integrations.gguf._runtime_evidence import iter_runtime_evidence
+
+    records = iter_runtime_evidence()
+    assert records
+    assert all(
+        record.runtime_package_schema != FINAL_RUNTIME_PACKAGE_SCHEMA for record in records
+    )
 
 
 def test_low_cost_runtime_batch_manifest_is_closed_and_within_budget() -> None:

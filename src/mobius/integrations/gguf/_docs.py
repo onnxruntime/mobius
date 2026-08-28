@@ -769,7 +769,9 @@ tokenizer blockers become partial exports with exact reasons and no unverified a
 Downstream runtime, version, registry, or executor limitations preserve the accurate model
 package and record distinct `export_status` and `runtime_validation_status` fields instead of
 blocking export. Only exact artifact, graph, tokenizer, version, parity, and state evidence
-marks a complete runtime package validated and end-to-end runnable.
+covering the final directory bytes (including `export_report.json` and
+`runtime_compatibility.json`) marks a package validated and end-to-end runnable. Existing
+pre-report runtime evidence remains unvalidated until its final-package hashes are regenerated.
 
 Use `build_mmproj_from_gguf("mmproj.gguf", projector_type=..., target_architecture=...)`
 to export a registry-evidenced standalone `vision_encoder`, `audio_encoder`, or

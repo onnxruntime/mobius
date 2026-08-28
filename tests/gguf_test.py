@@ -574,6 +574,33 @@ class TestCLIBuildGGUF:
             "gguf_tokenizer_manifest.json",
         }.intersection(path.name for path in first.iterdir())
 
+    def test_missing_tokenizer_metadata_exports_model_with_one_structured_warning(
+        self, tmp_path, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = _create_tiny_gguf(tmp_path / "no-tokenizer.gguf")
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            package = build_from_gguf(path, keep_quantized=False)
+
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer.route == "absent"
+        assert tokenizer.support == "deferred"
+        assert tokenizer.output == "omitted"
+        assert tokenizer.blocker_category == "serialized-tokenizer-pipeline-incomplete"
+        assert tokenizer.reason.endswith("contains no tokenizer metadata")
+        assert "semantics are unverified" in tokenizer.remediation
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("GGUF PARTIAL EXPORT WARNING:")
+        ]
+        assert len(warnings) == 1
+        warning = json.loads(warnings[0].partition(": ")[2])
+        assert warning["route"] == "absent"
+        assert warning["blocker_category"] == ("serialized-tokenizer-pipeline-incomplete")
+        assert warning["reason"].endswith("contains no tokenizer metadata")
+
     def test_unexpected_tokenizer_disposition_error_still_fails(
         self, tmp_path, monkeypatch, caplog
     ):

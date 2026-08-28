@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "FINAL_RUNTIME_PACKAGE_SCHEMA",
     "GGUFArtifactIdentity",
     "GGUFGraphPackageIdentity",
     "GGUFRuntimeEvidence",
@@ -31,6 +32,9 @@ from types import MappingProxyType
 from typing import Any
 
 from mobius.integrations.gguf._reader import _descriptor_identity
+
+FINAL_RUNTIME_PACKAGE_SCHEMA = "mobius.gguf-runtime-package.v2"
+LEGACY_RUNTIME_PACKAGE_SCHEMA = "legacy-without-component-export-report"
 
 
 class RuntimeEvidenceUnavailableError(ValueError):
@@ -95,6 +99,7 @@ class GGUFRuntimeEvidence:
     runtime_version: str
     result: str = "passed"
     limitations: str | None = None
+    runtime_package_schema: str = LEGACY_RUNTIME_PACKAGE_SCHEMA
 
     def __post_init__(self) -> None:
         text_fields = (
@@ -123,6 +128,7 @@ class GGUFRuntimeEvidence:
             self.runtime,
             self.runtime_version,
             self.result,
+            self.runtime_package_schema,
         )
         if any(not value.strip() for value in text_fields):
             raise ValueError("GGUF runtime evidence fields must be non-empty")
@@ -998,7 +1004,9 @@ def find_matching_runtime_evidence(
     candidates = [
         _RUNTIME_EVIDENCE[evidence_id]
         for evidence_id in evidence_ids
-        if _RUNTIME_EVIDENCE[evidence_id].runtime == runtime
+        if _RUNTIME_EVIDENCE[evidence_id].runtime_package_schema
+        == FINAL_RUNTIME_PACKAGE_SCHEMA
+        and _RUNTIME_EVIDENCE[evidence_id].runtime == runtime
         and _RUNTIME_EVIDENCE[evidence_id].runtime_version == runtime_version
         and _RUNTIME_EVIDENCE[evidence_id].filename == identity.filename
         and _RUNTIME_EVIDENCE[evidence_id].size == identity.size
