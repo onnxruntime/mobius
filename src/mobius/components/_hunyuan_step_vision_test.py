@@ -322,7 +322,8 @@ def test_hunyuanvl_runtime_grid_controls_newline_token_count():
 
 def test_hunyuanvl_position_downsampling_matches_torch_antialias():
     class _PositionResizeProbe(HunyuanVLClipSidecar):
-        def forward(self, op):
+        def forward(self, op, pixel_values):
+            del pixel_values
             return self._resize_positions(
                 op,
                 op.Constant(value_int=2),
@@ -342,7 +343,7 @@ def test_hunyuanvl_position_downsampling_matches_torch_antialias():
         output_size=3,
     )
     _, op, graph = create_test_builder()
-    output = component(op)
+    output = component(op, op.Constant(value_float=0.0))
     output.name = "positions"
     graph.outputs.append(output)
     state, session = _state_and_session(component, graph, 43)
