@@ -306,10 +306,8 @@ class SequenceSelectiveScan(SelectiveScan):
             op.Constant(value_ints=[self.d_inner, self.d_state]),
             axis=0,
         )
-        initial_state = op.ConstantOfShape(
-            state_shape,
-            value=ir.tensor([0.0], dtype=ir.DataType.FLOAT),
-        )
+        # ONNX's ConstantOfShape defaults to a float32 zero.
+        initial_state = op.ConstantOfShape(state_shape)
 
         body = _build_sequence_scan_body()
 
