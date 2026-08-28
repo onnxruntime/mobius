@@ -10441,6 +10441,8 @@ def _reuse_stft_geometry(config: Any) -> dict[str, Any] | None:
     for name, value in (("input_sampling_rate", input_rate), ("bwe_sampling_rate", bwe_rate)):
         if value is not None and (not isinstance(value, int) or value <= 0):
             raise ValueError(f"{name} must be a positive integer when provided")
+    if input_rate is not None and bwe_rate is not None:
+        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
     selected_rate = bwe_rate or input_rate
     if selected_rate is None:

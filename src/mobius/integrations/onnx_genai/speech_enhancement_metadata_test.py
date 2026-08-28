@@ -356,6 +356,15 @@ class TestMetadata:
         assert by_op["spectrogram"]["hop_length"] == 24
         assert by_op["spectrogram"]["win_length"] == 192
 
+    @pytest.mark.parametrize("bwe_sampling_rate", [16_000, 48_000])
+    def test_rejects_native_and_bwe_rates_together(self, bwe_sampling_rate):
+        pkg, config = _package()
+        config.input_sampling_rate = 16_000
+        config.bwe_sampling_rate = bwe_sampling_rate
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build_speech_enhancement_workflow_metadata(pkg, config)
+
     def test_postprocess_declares_inverse_and_reference_length_contract(self):
         pkg, config = _package()
 
