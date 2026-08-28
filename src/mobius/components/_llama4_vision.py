@@ -76,7 +76,9 @@ class _Llama4VisionRoPE2D(nn.Module):
         )
         positions: np.ndarray = np.arange(grid_size + 1, dtype=np.float32)
         angles = np.outer(positions, inv_freq)
-        angles = np.concatenate((angles, angles), axis=-1).astype(np.float32)
+        # llama.cpp rotates adjacent complex pairs within each spatial-axis
+        # half, so each frequency is repeated for its even/odd pair.
+        angles = np.repeat(angles, 2, axis=-1).astype(np.float32)
         self.cos_cache = nn.Parameter(
             list(angles.shape),
             name="cos_cache",
@@ -144,11 +146,11 @@ class _Llama4VisionAttention(nn.Module):
         end: int,
     ) -> ir.Value:
         half = end - start
-        quarter = half // 2
         part = op.Slice(hidden_states, [start], [end], [3])
-        lower = op.Slice(part, [0], [quarter], [3])
-        upper = op.Slice(part, [quarter], [half], [3])
-        rotated = op.Concat(op.Neg(upper), lower, axis=3)
+        pairs = op.Reshape(part, [0, 0, 0, half // 2, 2])
+        even = op.Slice(pairs, [0], [1], [4])
+        odd = op.Slice(pairs, [1], [2], [4])
+        rotated = op.Reshape(op.Concat(op.Neg(odd), even, axis=4), [0, 0, 0, half])
         cos, sin = position
         return op.Add(op.Mul(part, cos), op.Mul(rotated, sin))
 

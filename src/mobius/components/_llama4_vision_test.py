@@ -17,8 +17,8 @@ from mobius.components._llama4_vision import Llama4VisionTower
 def _tiny_tower() -> Llama4VisionTower:
     return Llama4VisionTower(
         VisionConfig(
-            hidden_size=8,
-            intermediate_size=16,
+            hidden_size=16,
+            intermediate_size=32,
             num_hidden_layers=1,
             num_attention_heads=2,
             image_size=4,
@@ -68,7 +68,7 @@ def test_tiny_tower_executes_nonzero_pixels() -> None:
         {"pixel_values": np.linspace(-1, 1, 48, dtype=np.float32).reshape(1, 3, 4, 4)},
     )
 
-    assert actual.shape == (1, 4, 8)
+    assert actual.shape == (1, 4, 16)
     assert np.isfinite(actual).all()
     assert np.any(actual != 0)
 
@@ -119,7 +119,7 @@ def test_tiny_tower_matches_independent_torch_reference() -> None:
 
     hidden = torch_functional.conv2d(
         torch.from_numpy(pixels),
-        torch.from_numpy(state["embeddings.patch_embedding"]).reshape(8, 3, 2, 2),
+        torch.from_numpy(state["embeddings.patch_embedding"]).reshape(16, 3, 2, 2),
         stride=2,
     )
     hidden = hidden.flatten(2).transpose(1, 2)
@@ -130,27 +130,30 @@ def test_tiny_tower_matches_independent_torch_reference() -> None:
 
     residual = hidden
     normed = layer_norm(hidden, "encoder.0.ln1")
-    q = linear(normed, "encoder.0.attn.q_proj").reshape(1, 5, 2, 4)
-    k = linear(normed, "encoder.0.attn.k_proj").reshape(1, 5, 2, 4)
-    v = linear(normed, "encoder.0.attn.v_proj").reshape(1, 5, 2, 4)
+    q = linear(normed, "encoder.0.attn.q_proj").reshape(1, 5, 2, 8)
+    k = linear(normed, "encoder.0.attn.k_proj").reshape(1, 5, 2, 8)
+    v = linear(normed, "encoder.0.attn.v_proj").reshape(1, 5, 2, 8)
 
     pos_w = torch.tensor([1, 2, 1, 2, 0], dtype=torch.float32)
     pos_h = torch.tensor([1, 1, 2, 2, 0], dtype=torch.float32)
 
     def rope_half(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        part_0, part_1 = x[..., :1], x[..., 1:2]
-        cos = torch.cos(positions)[:, None, None]
-        sin = torch.sin(positions)[:, None, None]
-        return x * cos + torch.cat((-part_1, part_0), dim=-1) * sin
+        inv_freq = 1.0 / (10_000.0 ** (torch.arange(0, x.shape[-1], 2) / float(x.shape[-1])))
+        angles = positions[:, None] * inv_freq[None]
+        cos = torch.cos(angles).repeat_interleave(2, dim=-1)[:, None]
+        sin = torch.sin(angles).repeat_interleave(2, dim=-1)[:, None]
+        pairs = x.reshape(*x.shape[:-1], -1, 2)
+        rotated = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+        return x * cos + rotated * sin
 
-    q = torch.cat((rope_half(q[..., :2], pos_w), rope_half(q[..., 2:], pos_h)), dim=-1)
-    k = torch.cat((rope_half(k[..., :2], pos_w), rope_half(k[..., 2:], pos_h)), dim=-1)
+    q = torch.cat((rope_half(q[..., :4], pos_w), rope_half(q[..., 4:], pos_h)), dim=-1)
+    k = torch.cat((rope_half(k[..., :4], pos_w), rope_half(k[..., 4:], pos_h)), dim=-1)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
-    scores = torch.matmul(q, k.transpose(-1, -2)) / np.sqrt(4.0)
+    scores = torch.matmul(q, k.transpose(-1, -2)) / np.sqrt(8.0)
     attended = torch.matmul(torch.softmax(scores, dim=-1), v)
-    attended = attended.transpose(1, 2).reshape(1, 5, 8)
+    attended = attended.transpose(1, 2).reshape(1, 5, 16)
     hidden = residual + linear(attended, "encoder.0.attn.out_proj")
 
     residual = hidden
