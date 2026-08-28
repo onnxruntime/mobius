@@ -22,6 +22,7 @@ from mobius.integrations.gguf._core_vlm_projector import (
     core_vlm_projector_fingerprint,
     map_core_vlm_projector_tensor,
     read_core_vlm_projector_config,
+    validate_core_vlm_projector_shapes,
 )
 from mobius.models.gguf_core_projector import CoreVLMProjectorModel
 from mobius.tasks._gguf_core_projector import CoreVLMProjectorTask
@@ -260,6 +261,82 @@ def test_similar_projectors_do_not_alias_tensor_families():
     assert map_core_vlm_projector_tensor("v.blk.0.attn_q.weight", "llama4")
     assert map_core_vlm_projector_tensor("v.blk.0.attn_q.weight", "pixtral")
     assert map_core_vlm_projector_tensor("v.blk.0.attn_q.bias", "pixtral") is None
+
+
+@pytest.mark.parametrize(
+    ("projector_type", "missing_role"),
+    [
+        ("gemma3nv", "clip.has_audio_encoder"),
+        ("gemma3na", "clip.has_vision_encoder"),
+    ],
+)
+def test_gemma3n_pair_requires_both_encoder_presence_flags(projector_type, missing_role):
+    metadata = {
+        "clip.has_vision_encoder": True,
+        "clip.has_audio_encoder": True,
+        "clip.vision.projector_type": "gemma3nv",
+        "clip.audio.projector_type": "gemma3na",
+    }
+    metadata[missing_role] = False
+
+    with pytest.raises(ValueError, match="requires both co-resident encoder roles"):
+        validate_core_vlm_projector_shapes(_Sidecar(metadata, {}), projector_type)
+
+
+@pytest.mark.parametrize(
+    ("shapes", "error"),
+    [
+        (
+            {"v.conv_stem.conv.weight": (1,)},
+            "missing=",
+        ),
+        (
+            {
+                "v.conv_stem.conv.weight": (1,),
+                "a.conv1d.0.weight": (1,),
+                "a.blk.0.unknown.weight": (1,),
+            },
+            "unmapped_sources=",
+        ),
+    ],
+)
+def test_gemma3n_pair_requires_exact_companion_tensor_closure(
+    monkeypatch,
+    shapes,
+    error,
+):
+    class _Parameter:
+        shape = (1,)
+        const_value = None
+
+    class _PairRole:
+        def __init__(self, _config, projector_type, **_kwargs):
+            self.projector_type = projector_type
+
+        def named_parameters(self):
+            if self.projector_type == "gemma3nv":
+                name = "vision_encoder.encoder.conv_stem.conv.weight"
+            else:
+                name = "audio_encoder.encoder.subsample_conv_projection.conv_0.conv.weight"
+            return ((name, _Parameter()),)
+
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._core_vlm_projector.read_core_vlm_projector_config",
+        lambda _sidecar, _projector_type: object(),
+    )
+    monkeypatch.setattr(
+        "mobius.models.gguf_core_projector.CoreVLMProjectorModel",
+        _PairRole,
+    )
+    metadata = {
+        "clip.has_vision_encoder": True,
+        "clip.has_audio_encoder": True,
+        "clip.vision.projector_type": "gemma3nv",
+        "clip.audio.projector_type": "gemma3na",
+    }
+
+    with pytest.raises(ValueError, match=error):
+        validate_core_vlm_projector_shapes(_Sidecar(metadata, shapes), "gemma3nv")
 
 
 def test_gemma3n_audio_loader_reverses_baked_softplus():

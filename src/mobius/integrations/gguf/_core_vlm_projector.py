@@ -629,6 +629,75 @@ def _static_parameter_shape(parameter: Any) -> tuple[int, ...]:
     return tuple(shape)
 
 
+def _validate_mapped_shape_closure(
+    projector_type: str,
+    expected: dict[str, tuple[int, ...]],
+    mapped: dict[str, tuple[int, ...]],
+    *,
+    unmapped_sources: tuple[str, ...] = (),
+) -> None:
+    missing = sorted(expected.keys() - mapped.keys())
+    unexpected = sorted(mapped.keys() - expected.keys())
+    mismatched = {
+        name: (mapped[name], expected[name])
+        for name in expected.keys() & mapped.keys()
+        if mapped[name] != expected[name]
+    }
+    if missing or unexpected or mismatched or unmapped_sources:
+        raise ValueError(
+            f"{projector_type} tensor-to-graph closure mismatch: missing={missing}, "
+            f"unexpected={unexpected}, unmapped_sources={sorted(unmapped_sources)}, "
+            f"shapes={mismatched}."
+        )
+
+
+def _validate_gemma3n_pair_shapes(mmproj_gguf: Any) -> None:
+    """Validate every tensor in the inseparable Gemma3n vision/audio sidecar."""
+    from mobius.models.gguf_core_projector import CoreVLMProjectorModel
+
+    projector_types = ("gemma3nv", "gemma3na")
+    expected: dict[str, tuple[int, ...]] = {}
+    for projector_type in projector_types:
+        config = read_core_vlm_projector_config(mmproj_gguf, projector_type)
+        module = CoreVLMProjectorModel(config, projector_type)
+        for name, parameter in module.named_parameters():
+            if parameter.const_value is not None:
+                continue
+            if name in expected:
+                raise RuntimeError(f"Gemma3n pair has duplicate graph parameter {name!r}.")
+            expected[name] = _static_parameter_shape(parameter)
+
+    mapped: dict[str, tuple[int, ...]] = {}
+    unmapped_sources: list[str] = []
+    for name in mmproj_gguf.tensor_names:
+        candidates = [
+            (projector_type, target)
+            for projector_type in projector_types
+            if (target := map_core_vlm_projector_tensor(name, projector_type)) is not None
+        ]
+        if not candidates:
+            unmapped_sources.append(name)
+            continue
+        if len(candidates) != 1:
+            raise ValueError(f"Gemma3n tensor {name!r} maps to multiple encoder roles.")
+        projector_type, target = candidates[0]
+        shape = tuple(int(dim) for dim in mmproj_gguf.get_tensor_shape(name))
+        if projector_type == "gemma3nv" and (
+            name == "v.conv_stem.conv.bias" or name.endswith(".layer_scale.gamma")
+        ):
+            shape = tuple(dim for dim in shape if dim != 1)
+        if target in mapped:
+            raise ValueError(f"Gemma3n pair maps multiple tensors to {target!r}.")
+        mapped[target] = shape
+
+    _validate_mapped_shape_closure(
+        "gemma3n",
+        expected,
+        mapped,
+        unmapped_sources=tuple(unmapped_sources),
+    )
+
+
 def validate_core_vlm_projector_shapes(mmproj_gguf: Any, projector_type: str) -> None:
     """Validate source shapes against every learned parameter of the role graph."""
     from mobius.models.gguf_core_projector import CoreVLMProjectorModel
@@ -643,6 +712,16 @@ def validate_core_vlm_projector_shapes(mmproj_gguf: Any, projector_type: str) ->
     else:
         expected_pair = None
     if expected_pair is not None:
+        missing_roles = [
+            key
+            for key in ("clip.has_vision_encoder", "clip.has_audio_encoder")
+            if md.get(key) is not True
+        ]
+        if missing_roles:
+            raise ValueError(
+                f"{projector_type} requires both co-resident encoder roles; "
+                f"expected boolean true for {missing_roles}."
+            )
         actual_pair = (
             md.get("clip.vision.projector_type"),
             md.get("clip.audio.projector_type"),
@@ -652,6 +731,10 @@ def validate_core_vlm_projector_shapes(mmproj_gguf: Any, projector_type: str) ->
                 f"{projector_type} requires co-resident projector pair "
                 f"{expected_pair}, got {actual_pair}."
             )
+
+    if projector_type in {"gemma3nv", "gemma3na"}:
+        _validate_gemma3n_pair_shapes(mmproj_gguf)
+        return
 
     if projector_type in {"idefics3", "internvl", "llama4"}:
         if md.get("clip.use_gelu") is not True or bool(md.get("clip.use_silu", False)):
@@ -726,18 +809,7 @@ def validate_core_vlm_projector_shapes(mmproj_gguf: Any, projector_type: str) ->
         mapped["vision_encoder.pos_emb_x.weight"] = (position[1], position[2])
         mapped["vision_encoder.pos_emb_y.weight"] = (position[1], position[2])
 
-    missing = sorted(expected.keys() - mapped.keys())
-    unexpected = sorted(mapped.keys() - expected.keys())
-    mismatched = {
-        name: (mapped[name], expected[name])
-        for name in expected.keys() & mapped.keys()
-        if mapped[name] != expected[name]
-    }
-    if missing or unexpected or mismatched:
-        raise ValueError(
-            f"{projector_type} tensor-to-graph closure mismatch: missing={missing}, "
-            f"unexpected={unexpected}, shapes={mismatched}."
-        )
+    _validate_mapped_shape_closure(projector_type, expected, mapped)
 
 
 def _load_core_vlm_projector_weights(mmproj_gguf: Any, projector_type: str) -> dict:
