@@ -1064,15 +1064,21 @@ class TestCopyTokenizerFiles:
         (fake_src / "chat_template.jinja").write_text("{{ messages }}")
 
         with mock.patch("huggingface_hub.hf_hub_download") as mock_dl:
-            mock_dl.side_effect = lambda model_id, filename: (
+            from huggingface_hub.utils import LocalEntryNotFoundError
+
+            mock_dl.side_effect = lambda model_id, filename, **_kwargs: (
                 str(fake_src / filename)
                 if (fake_src / filename).exists()
-                else (_ for _ in ()).throw(OSError("not found"))
+                else (_ for _ in ()).throw(LocalEntryNotFoundError("not cached"))
             )
 
             dst = tmp_path / "output"
             dst.mkdir()
-            copied = _copy_tokenizer_files("fake/model", str(dst))
+            copied = _copy_tokenizer_files(
+                "fake/model",
+                str(dst),
+                local_files_only=True,
+            )
 
         assert "tokenizer.json" in copied
         assert (dst / "tokenizer.json").exists()
@@ -1094,6 +1100,97 @@ class TestCopyTokenizerFiles:
 
         assert copied == []
         assert not list(tmp_path.iterdir())
+
+    def test_online_cache_miss_propagates(self, tmp_path):
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        with (
+            mock.patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=LocalEntryNotFoundError("unexpected online miss"),
+            ),
+            pytest.raises(LocalEntryNotFoundError, match="unexpected online miss"),
+        ):
+            _copy_tokenizer_files("fake/model", str(tmp_path))
+
+    def test_online_missing_optional_file_is_skipped(self, tmp_path):
+        from huggingface_hub import errors as hub_errors
+
+        remote_entry_not_found = getattr(
+            hub_errors,
+            "RemoteEntryNotFoundError",
+            None,
+        )
+        if remote_entry_not_found is None:
+            pytest.skip("RemoteEntryNotFoundError is available in huggingface_hub >= 1.0")
+
+        response = mock.Mock()
+        response.status_code = 404
+        response.headers = {}
+        with mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=remote_entry_not_found(
+                "optional file absent",
+                response=response,
+            ),
+        ):
+            copied = _copy_tokenizer_files("fake/model", str(tmp_path))
+
+        assert copied == []
+
+    def test_hub_zero_x_remote_missing_falls_back_to_entry_not_found(
+        self, tmp_path, monkeypatch
+    ):
+        from huggingface_hub import errors as hub_errors
+        from huggingface_hub.utils import EntryNotFoundError
+
+        monkeypatch.delattr(hub_errors, "RemoteEntryNotFoundError")
+        with mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=EntryNotFoundError("optional file absent"),
+        ):
+            copied = _copy_tokenizer_files("fake/model", str(tmp_path))
+
+        assert copied == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            PermissionError("denied"),
+            OSError("disk full"),
+            RuntimeError("network failure"),
+        ],
+    )
+    def test_operational_failures_propagate(self, tmp_path, error):
+        with (
+            mock.patch("huggingface_hub.hf_hub_download", side_effect=error),
+            pytest.raises(type(error), match=str(error)),
+        ):
+            _copy_tokenizer_files(
+                "fake/model",
+                str(tmp_path),
+                local_files_only=True,
+            )
+
+    def test_destination_write_failure_propagates(self, tmp_path):
+        source = tmp_path / "tokenizer.json"
+        source.write_text("{}")
+        with (
+            mock.patch(
+                "huggingface_hub.hf_hub_download",
+                return_value=str(source),
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export.shutil.copy2",
+                side_effect=PermissionError("destination denied"),
+            ),
+            pytest.raises(PermissionError, match="destination denied"),
+        ):
+            _copy_tokenizer_files(
+                "fake/model",
+                str(tmp_path),
+                local_files_only=True,
+            )
 
 
 class TestCopyTokenizerFilesFromLocal:
@@ -3730,6 +3827,7 @@ def test_lfm2_runtime_compatibility_is_pinned_to_released_probe(tmp_path):
 
 def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_path):
     pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config.num_nextn_predict_layers = 1
     pkg["mtp"] = _mock_model(inputs=["hidden_states"], outputs=["draft_logits"])
 
     result = write_ort_genai_config(pkg, str(tmp_path))
@@ -3763,6 +3861,7 @@ def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path)
         },
         config=types.SimpleNamespace(
             num_hidden_layers=1,
+            num_nextn_predict_layers=1,
             use_dedicated_embeddings=False,
             use_dedicated_lm_head=False,
         ),
@@ -3817,6 +3916,93 @@ def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path)
     assert compatibility["runtime_validation_status"] == "unvalidated"
     assert compatibility["tested_versions"] == ["0.15.2"]
     assert compatibility["graph_contract"] is not None
+
+
+def test_gguf_mtp_count_overrides_architecture_config_default_zero(tmp_path):
+    from mobius._model_package import ModelPackage
+    from mobius._testing import make_config
+
+    config = make_config(num_nextn_predict_layers=0)
+    config._gguf_nextn_predict_layers = 1
+    pkg = ModelPackage(
+        {"model": _mock_decoder_model(layer_indices=(0,))},
+        config=config,
+    )
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=make_config(num_nextn_predict_layers=0),
+    )
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+
+    assert mtp["num_nextn_predict_layers"] == 1
+
+
+@pytest.mark.parametrize(
+    ("authoritative", "error"),
+    [
+        (0, "requires positive"),
+        (-1, "requires positive"),
+        (None, "must be an integer"),
+        ("one", "must be an integer"),
+    ],
+)
+def test_attached_mtp_rejects_invalid_authoritative_gguf_count(tmp_path, authoritative, error):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config._gguf_nextn_predict_layers = authoritative
+    pkg.config.num_nextn_predict_layers = 1
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=types.SimpleNamespace(num_nextn_predict_layers=1),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        write_ort_genai_config(pkg, str(tmp_path))
+
+
+def test_explicit_target_mtp_count_precedes_proposer_declaration(tmp_path):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config.num_nextn_predict_layers = 2
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=types.SimpleNamespace(num_nextn_predict_layers=1),
+    )
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+
+    assert mtp["num_nextn_predict_layers"] == 2
+
+
+@pytest.mark.parametrize(
+    ("target_count", "proposer_count", "error"),
+    [
+        (0, 0, "explicit positive"),
+        (-1, 1, "must be positive"),
+        (0, "one", "must be an integer"),
+    ],
+)
+def test_attached_mtp_requires_valid_positive_prediction_count(
+    tmp_path, target_count, proposer_count, error
+):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg.config.num_nextn_predict_layers = target_count
+    pkg.mtp_head = ModelPackage(
+        {"model": _mock_model(inputs=["hidden_states"], outputs=["mtp_hidden"])},
+        config=types.SimpleNamespace(num_nextn_predict_layers=proposer_count),
+    )
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        write_ort_genai_config(pkg, str(tmp_path))
 
 
 @pytest.mark.parametrize("order", ["config-before-save", "save-before-config"])

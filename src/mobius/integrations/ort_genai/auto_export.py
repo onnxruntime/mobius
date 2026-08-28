@@ -675,8 +675,15 @@ def _copy_tokenizer_files(
 
     Returns list of copied filenames.
     """
+    from huggingface_hub import errors as hub_errors
     from huggingface_hub import hf_hub_download
     from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+
+    remote_entry_not_found = getattr(
+        hub_errors,
+        "RemoteEntryNotFoundError",
+        EntryNotFoundError,
+    )
 
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
@@ -692,7 +699,13 @@ def _copy_tokenizer_files(
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
-        except (EntryNotFoundError, LocalEntryNotFoundError, OSError):
+        except LocalEntryNotFoundError:
+            if local_files_only:
+                continue
+            raise
+        except remote_entry_not_found:
+            # Tokenizer formats are alternatives; a repository is not expected
+            # to contain every filename in _TOKENIZER_FILES.
             continue
     return copied
 
@@ -1991,6 +2004,49 @@ def _mtp_sidecar_model(pkg: ModelPackage) -> tuple[Any, str, Any] | None:
     return None
 
 
+def _mtp_prediction_count(pkg: ModelPackage, proposer_config: Any) -> int:
+    """Resolve an explicit MTP prediction count without inferring model depth."""
+    missing = object()
+    target_config = getattr(pkg, "config", None)
+    authoritative = getattr(target_config, "_gguf_nextn_predict_layers", missing)
+    if authoritative is missing:
+        authoritative = getattr(
+            proposer_config,
+            "_gguf_nextn_predict_layers",
+            missing,
+        )
+    if authoritative is not missing:
+        if isinstance(authoritative, bool) or not isinstance(authoritative, int):
+            raise TypeError(
+                f"_gguf_nextn_predict_layers must be an integer, got {authoritative!r}"
+            )
+        if authoritative <= 0:
+            raise ValueError(
+                "An attached MTP sidecar requires positive _gguf_nextn_predict_layers metadata"
+            )
+        return authoritative
+
+    for config, field in (
+        (target_config, "target num_nextn_predict_layers"),
+        (proposer_config, "proposer num_nextn_predict_layers"),
+    ):
+        if config is None or not hasattr(config, "num_nextn_predict_layers"):
+            continue
+        value = config.num_nextn_predict_layers
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{field} must be an integer, got {value!r}")
+        # Zero is the dataclass default and therefore does not prove explicit
+        # MTP width. Keep looking for a positive declaration on the proposer.
+        if value > 0:
+            return value
+        if value < 0:
+            raise ValueError(f"{field} must be positive, got {value}")
+    raise ValueError(
+        "An attached MTP sidecar requires an explicit positive "
+        "num_nextn_predict_layers declaration"
+    )
+
+
 def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
     """Write the external target/MTP coordination contract without claiming OGA support."""
     resolved = _mtp_sidecar_model(pkg)
@@ -2024,17 +2080,7 @@ def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
                 "ports": _mtp_state_ports(mtp_model),
             },
         },
-        "num_nextn_predict_layers": int(
-            getattr(
-                getattr(pkg, "config", None),
-                "num_nextn_predict_layers",
-                getattr(
-                    proposer_config,
-                    "num_nextn_predict_layers",
-                    getattr(proposer_config, "num_hidden_layers", 1),
-                ),
-            )
-        ),
+        "num_nextn_predict_layers": _mtp_prediction_count(pkg, proposer_config),
         "shared_embedding": None if dedicated_embeddings else "model.embed_tokens",
         "shared_lm_head": None if dedicated_lm_head else "lm_head",
         "runtime_orchestration": "external",
