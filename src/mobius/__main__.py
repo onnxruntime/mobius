@@ -844,10 +844,16 @@ def _print_gguf_export_status(
         component.name for component in report.components if component.output == "omitted"
     )
     if report.export_status == "partial":
-        print(
-            "Export status: PARTIAL - proven model files were saved, but one or more "
-            "components were omitted."
-        )
+        if omitted:
+            print(
+                "Export status: PARTIAL - proven model files were saved, but one or more "
+                "components were omitted."
+            )
+        else:
+            print(
+                "Export status: PARTIAL - all requested components were exported, but "
+                "one or more support dispositions remain deferred or blocked."
+            )
     else:
         print("Export status: COMPLETE - the accurate model package was saved.")
     if report.runtime_validation_status == "unvalidated":

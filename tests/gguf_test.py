@@ -478,6 +478,62 @@ class TestGGUFTensorProcessors:
 class TestCLIBuildGGUF:
     """Test the build-gguf CLI subcommand."""
 
+    def test_partial_cli_status_distinguishes_deferred_support_from_omission(
+        self, tmp_path, capsys
+    ):
+        from types import SimpleNamespace
+
+        from mobius.__main__ import _print_gguf_export_status
+        from mobius._export_report import (
+            ComponentExportDisposition,
+            ComponentExportReport,
+        )
+
+        report = ComponentExportReport.create(
+            (
+                ComponentExportDisposition(
+                    name="model",
+                    route="llama",
+                    requested=True,
+                    discovered=True,
+                    support="supported",
+                    output="exported",
+                ),
+                ComponentExportDisposition(
+                    name="runtime",
+                    route="ort-genai",
+                    requested=True,
+                    discovered=True,
+                    support="deferred",
+                    output="exported",
+                    runtime_validation_status="unvalidated",
+                    blocker_category="runtime-validation-unavailable",
+                    reason="runtime evidence is pending",
+                    impact="execution is unvalidated",
+                    remediation="validate before production use",
+                ),
+                ComponentExportDisposition(
+                    name="tokenizer",
+                    route="embedded",
+                    requested=True,
+                    discovered=True,
+                    support="supported",
+                    output="exported",
+                ),
+            ),
+            end_to_end_runnable=False,
+        )
+
+        _print_gguf_export_status(
+            SimpleNamespace(export_report=report),
+            str(tmp_path),
+            runtime="ort-genai",
+        )
+
+        output = capsys.readouterr().out
+        assert "all requested components were exported" in output
+        assert "components were omitted" not in output
+
     def test_help_text(self, capsys):
         """build-gguf subcommand shows in help."""
         from mobius.__main__ import main
