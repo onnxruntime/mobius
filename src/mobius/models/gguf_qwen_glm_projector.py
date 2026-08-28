@@ -363,6 +363,7 @@ class GGUFQwen3AudioProjector(nn.Module):
         if config.audio is None:
             raise ValueError("Qwen3 audio sidecar requires an audio configuration")
         self.audio_tower = Qwen3ASRAudioEncoder(config)
+        self.output_names = ("audio_features", "audio_feature_lengths")
         self.input_schema = (
             (
                 "input_features",
@@ -373,14 +374,23 @@ class GGUFQwen3AudioProjector(nn.Module):
                     ir.SymbolicDim("audio_frames_multiple_of_100"),
                 ),
             ),
+            (
+                "feature_attention_mask",
+                ir.DataType.INT64,
+                (1, ir.SymbolicDim("audio_frames_multiple_of_100")),
+            ),
         )
 
-    def forward(self, op: OpBuilder, input_features: ir.Value) -> ir.Value:
+    def forward(
+        self,
+        op: OpBuilder,
+        input_features: ir.Value,
+        feature_attention_mask: ir.Value,
+    ) -> tuple[ir.Value, ir.Value]:
         input_features = op.CastLike(
             input_features,
             self.audio_tower.conv2d1.weight,
         )
-        batch = op.Shape(input_features, start=0, end=1)
         frames = op.Shape(input_features, start=2, end=3)
         frame_count = op.Squeeze(frames, [0])
         invalid_frames = op.Cast(
@@ -392,13 +402,63 @@ class GGUFQwen3AudioProjector(nn.Module):
         )
         guard = op.Gather(op.Constant(value_ints=[0]), invalid_frames, axis=0)
         input_features = op.Add(input_features, op.CastLike(guard, input_features))
-        mask_shape = op.Concat(batch, frames, axis=0)
-        feature_mask = op.Expand(
-            op.Constant(value_int=1),
-            mask_shape,
+
+        # The encoder derives output cardinality from a binary right-padded
+        # processor mask. Reject malformed masks rather than treating holes or
+        # non-binary values as valid audio.
+        mask_bool = op.Cast(feature_attention_mask, to=ir.DataType.BOOL)
+        binary = op.Equal(
+            feature_attention_mask,
+            op.Cast(mask_bool, to=ir.DataType.INT64),
         )
-        audio_features, _ = self.audio_tower(op, input_features, feature_mask)
-        return op.Squeeze(audio_features, [0])
+        valid_frames = op.ReduceSum(
+            feature_attention_mask,
+            op.Constant(value_ints=[1]),
+            keepdims=0,
+        )
+        positions = op.Range(
+            op.Constant(value_int=0),
+            frame_count,
+            op.Constant(value_int=1),
+        )
+        expected_mask = op.Less(
+            op.Unsqueeze(positions, [0]),
+            op.Unsqueeze(valid_frames, [1]),
+        )
+        valid_mask = op.And(binary, op.Equal(mask_bool, expected_mask))
+        all_valid = op.ReduceMin(
+            op.Cast(valid_mask, to=ir.DataType.INT64),
+            keepdims=0,
+        )
+        invalid_mask = op.Or(
+            op.Equal(all_valid, op.Constant(value_int=0)),
+            op.LessOrEqual(
+                op.Squeeze(valid_frames, [0]),
+                op.Constant(value_int=0),
+            ),
+        )
+        mask_guard = op.Gather(
+            op.Constant(value_ints=[0]),
+            op.Cast(invalid_mask, to=ir.DataType.INT64),
+            axis=0,
+        )
+        feature_attention_mask = op.Add(feature_attention_mask, mask_guard)
+
+        audio_features, audio_feature_lengths = self.audio_tower(
+            op,
+            input_features,
+            feature_attention_mask,
+        )
+        # The standalone ABI has batch=1. Compact padding-derived tail rows and
+        # still publish the exact valid cardinality for downstream prompt assembly.
+        audio_features = op.Squeeze(audio_features, [0])
+        audio_features = op.Slice(
+            audio_features,
+            op.Constant(value_ints=[0]),
+            audio_feature_lengths,
+            op.Constant(value_ints=[0]),
+        )
+        return audio_features, audio_feature_lengths
 
 
 class GGUFQwen3TTSSpeakerProjector(nn.Module):

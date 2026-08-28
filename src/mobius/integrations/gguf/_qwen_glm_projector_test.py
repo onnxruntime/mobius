@@ -18,6 +18,7 @@ from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations.gguf._mmproj import build_mmproj_from_gguf
 from mobius.integrations.gguf._qwen_glm_projector import (
     qwen3vl_decoder_mrope_positions,
+    validate_qwen_glm_projector_metadata,
 )
 
 
@@ -530,6 +531,188 @@ def test_every_route_builds_only_its_declared_components(projector_type: str) ->
     )
 
 
+@pytest.mark.parametrize("projector_type", tuple(_ROUTES))
+@pytest.mark.parametrize(
+    "invalid",
+    [0, -1, float("nan"), float("inf"), "1e-5", True],
+    ids=["zero", "negative", "nan", "inf", "string", "bool"],
+)
+def test_route_metadata_rejects_invalid_epsilon_before_tensors(
+    projector_type: str,
+    invalid: object,
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    modality = "vision" if projector_type in {"glm4v", "qwen3vl_merger"} else "audio"
+    if projector_type == "qwen2.5o":
+        modality = "vision"
+    sidecar.metadata[f"clip.{modality}.attention.layer_norm_epsilon"] = invalid
+
+    with pytest.raises(ValueError, match="positive finite number"):
+        validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+@pytest.mark.parametrize("projector_type", tuple(_ROUTES))
+@pytest.mark.parametrize(
+    "invalid",
+    [0, -1, float("nan"), float("inf"), "8", True, 1.5],
+    ids=["zero", "negative", "nan", "inf", "string", "bool", "float"],
+)
+def test_route_metadata_rejects_invalid_dimensions(
+    projector_type: str,
+    invalid: object,
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    modality = "vision" if projector_type in {"glm4v", "qwen3vl_merger"} else "audio"
+    if projector_type == "qwen2.5o":
+        modality = "vision"
+    sidecar.metadata[f"clip.{modality}.embedding_length"] = invalid
+
+    with pytest.raises(ValueError, match="positive integer"):
+        validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+@pytest.mark.parametrize("projector_type", tuple(_ROUTES))
+@pytest.mark.parametrize("invalid", [0, 1, "true"], ids=["zero", "one", "string"])
+def test_route_metadata_requires_boolean_presence(
+    projector_type: str,
+    invalid: object,
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    modality = "vision" if projector_type in {"glm4v", "qwen3vl_merger"} else "audio"
+    if projector_type == "qwen2.5o":
+        modality = "vision"
+    sidecar.metadata[f"clip.has_{modality}_encoder"] = invalid
+
+    with pytest.raises(ValueError, match="must be boolean True"):
+        validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+@pytest.mark.parametrize("projector_type", tuple(_ROUTES))
+def test_route_metadata_requires_exact_projector_enum(projector_type: str) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    type_key = (
+        "clip.audio.projector_type"
+        if projector_type in {"qwen3a", "qwen3tts_spkenc"}
+        else "clip.projector_type"
+    )
+    sidecar.metadata[type_key] = 7
+
+    with pytest.raises(ValueError, match="must equal"):
+        validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+@pytest.mark.parametrize(
+    ("projector_type", "updates"),
+    [
+        (
+            "glm4v",
+            {
+                "clip.vision.attention.head_count": 8,
+                "clip.vision.image_size": 2,
+                "clip.vision.spatial_merge_size": 2,
+            },
+        ),
+        (
+            "glma",
+            {"clip.audio.attention.head_count": 8, "clip.audio.projector.stack_factor": 1},
+        ),
+        (
+            "qwen2.5o",
+            {
+                "clip.vision.attention.head_count": 8,
+                "clip.vision.image_size": 2,
+                "clip.vision.n_wa_pattern": 1,
+                "clip.audio.attention.head_count": 8,
+            },
+        ),
+        ("qwen2a", {"clip.audio.attention.head_count": 8}),
+        (
+            "qwen3a",
+            {
+                "clip.audio.attention.head_count": 8,
+                "clip.audio.projector.window_size": 100,
+            },
+        ),
+        (
+            "qwen3vl_merger",
+            {
+                "clip.vision.attention.head_count": 8,
+                "clip.vision.image_size": 2,
+                "clip.vision.spatial_merge_size": 2,
+            },
+        ),
+        ("qwen3tts_spkenc", {"clip.audio.attention.head_count": 24}),
+    ],
+)
+def test_route_metadata_accepts_exact_valid_boundaries(
+    projector_type: str,
+    updates: dict[str, object],
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    sidecar.metadata.update(updates)
+
+    validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+@pytest.mark.parametrize(
+    ("projector_type", "key", "invalid", "message"),
+    [
+        ("glm4v", "clip.vision.spatial_merge_size", 1, "spatial_merge_size=2"),
+        ("glma", "clip.audio.projector.stack_factor", 0, "positive integer"),
+        ("qwen2.5o", "clip.vision.n_wa_pattern", 2, "cannot exceed"),
+        ("qwen2a", "clip.audio.attention.head_count", 3, "divide by"),
+        ("qwen3a", "clip.audio.projector.window_size", 150, "multiple of 100"),
+        (
+            "qwen3vl_merger",
+            "clip.vision.is_deepstack_layers",
+            [1],
+            "one boolean",
+        ),
+        ("qwen3tts_spkenc", "clip.audio.block_count", 2, "exactly three"),
+    ],
+)
+def test_route_metadata_rejects_route_specific_geometry(
+    projector_type: str,
+    key: str,
+    invalid: object,
+    message: str,
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    sidecar.metadata[key] = invalid
+
+    with pytest.raises(ValueError, match=message):
+        validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+def test_standalone_metadata_validation_precedes_tensor_closure() -> None:
+    sidecar = _qwen2a_sidecar()
+    sidecar.metadata["clip.audio.attention.layer_norm_epsilon"] = 0.0
+    with (
+        mock.patch(
+            "mobius.integrations.gguf._mmproj._resolve_mmproj_companion_path",
+            return_value="synthetic.gguf",
+        ),
+        mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+        mock.patch(
+            "mobius.integrations.gguf._mmproj._validate_mmproj_tensor_closure"
+        ) as closure,
+        pytest.raises(ValueError, match="positive finite number"),
+    ):
+        build_mmproj_from_gguf(
+            "synthetic.gguf",
+            projector_type="qwen2a",
+            target_architecture="qwen2",
+            _mmproj_gguf_model=sidecar,
+        )
+    closure.assert_not_called()
+
+
 def _run_component(package, component: str, feeds: dict[str, np.ndarray]) -> np.ndarray:
     session = OnnxModelSession(package[component])
     try:
@@ -710,9 +893,98 @@ def test_qwen3a_projector_matches_transformers() -> None:
     actual = _run_component(
         package,
         "audio_encoder",
-        {"input_features": features},
+        {
+            "input_features": features,
+            "feature_attention_mask": np.ones((1, 100), dtype=np.int64),
+        },
     )
     np.testing.assert_allclose(actual, expected, rtol=3e-4, atol=3e-4)
+
+    padded = np.concatenate(
+        [features, np.linspace(1.0, 2.0, 800, dtype=np.float32).reshape(1, 8, 100)],
+        axis=2,
+    )
+    padded_mask = np.concatenate(
+        [np.ones((1, 100), dtype=np.int64), np.zeros((1, 100), dtype=np.int64)],
+        axis=1,
+    )
+    session = OnnxModelSession(package["audio_encoder"])
+    try:
+        padded_outputs = session.run(
+            {
+                "input_features": padded,
+                "feature_attention_mask": padded_mask,
+            }
+        )
+    finally:
+        session.close()
+    np.testing.assert_allclose(
+        padded_outputs["audio_features"],
+        expected,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+    np.testing.assert_allclose(
+        padded_outputs["audio_features"],
+        actual,
+        rtol=3e-4,
+        atol=3e-4,
+    )
+    np.testing.assert_array_equal(
+        padded_outputs["audio_feature_lengths"],
+        np.array([13], dtype=np.int64),
+    )
+
+
+def test_qwen3a_graph_io_and_processor_metadata_publish_lengths() -> None:
+    _, package = _build_package("qwen3a")
+    graph = package["audio_encoder"].graph
+
+    assert [value.name for value in graph.inputs] == [
+        "input_features",
+        "feature_attention_mask",
+    ]
+    assert [value.name for value in graph.outputs] == [
+        "audio_features",
+        "audio_feature_lengths",
+    ]
+    assert package.gguf_processor_abi["feature_attention_mask"] == (
+        "int64[1,frames], binary and right-padded"
+    )
+    assert "audio_feature_lengths" in package.gguf_processor_abi["output"]
+
+
+@pytest.mark.parametrize(
+    "feature_attention_mask",
+    [
+        np.zeros((1, 100), dtype=np.int64),
+        np.array([[1] * 49 + [0] + [1] * 50], dtype=np.int64),
+        np.array([[1] * 99 + [2]], dtype=np.int64),
+    ],
+    ids=["empty", "not-right-padded", "non-binary"],
+)
+def test_qwen3a_processor_mask_fails_closed(
+    feature_attention_mask: np.ndarray,
+) -> None:
+    _, package = _build_package("qwen3a")
+    features = np.zeros((1, 8, 100), dtype=np.float32)
+
+    with pytest.raises(
+        (
+            ort.capi.onnxruntime_pybind11_state.Fail,
+            ort.capi.onnxruntime_pybind11_state.InvalidArgument,
+            ort.capi.onnxruntime_pybind11_state.RuntimeException,
+        ),
+        match="indices element out of data bounds",
+    ):
+        _run_component(
+            package,
+            "audio_encoder",
+            {
+                "input_features": features,
+                "feature_attention_mask": feature_attention_mask,
+            },
+        )
 
 
 def _qwen3vl_hf_state(sidecar: _FakeSidecar) -> dict[str, torch.Tensor]:
@@ -1380,11 +1652,10 @@ def test_reduced_precision_audio_casts_float_processor_input(
         frames,
     )
 
-    actual = _run_component(
-        package,
-        "audio_encoder",
-        {"input_features": features},
-    )
+    feeds = {"input_features": features}
+    if projector_type == "qwen3a":
+        feeds["feature_attention_mask"] = np.ones((1, frames), dtype=np.int64)
+    actual = _run_component(package, "audio_encoder", feeds)
 
     assert actual.dtype == np.float16
     assert np.isfinite(actual).all()

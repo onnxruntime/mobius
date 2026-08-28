@@ -62,8 +62,9 @@ QWEN_GLM_PROCESSOR_ABIS: dict[str, dict[str, str | int]] = {
     "qwen3a": {
         "sample_rate": 16_000,
         "input_features": "float32[1,128,frames_multiple_of_100]",
-        "output": "13 * (frames / 100) audio rows",
-        "preprocessing": "Qwen3 Whisper mel; <=800-frame windows padded to 100",
+        "feature_attention_mask": "int64[1,frames], binary and right-padded",
+        "output": "valid audio rows plus int64[1] audio_feature_lengths",
+        "preprocessing": "Qwen3 Whisper mel; 100-frame chunks with right padding",
         "empty_media": "do not invoke the audio graph",
     },
     "glma": {
@@ -169,6 +170,154 @@ def _expect_shape(model: Any, name: str, expected: tuple[int, ...]) -> None:
     actual = _shape(model, name)
     if actual != expected:
         raise ValueError(f"mmproj tensor {name!r} has shape {actual}, expected {expected}.")
+
+
+def _positive_integer(metadata: dict[str, Any], key: str) -> int:
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise ValueError(f"{key} must be a positive integer, got {value!r}.")
+    return int(value)
+
+
+def _positive_finite_number(metadata: dict[str, Any], key: str) -> float:
+    value = metadata[key]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise ValueError(f"{key} must be a positive finite number, got {value!r}.")
+    return float(value)
+
+
+def _validate_bool(
+    metadata: dict[str, Any], key: str, *, expected: bool | None = None
+) -> None:
+    value = metadata[key]
+    if not isinstance(value, bool) or (expected is not None and value is not expected):
+        expectation = f" boolean {expected!r}" if expected is not None else " a boolean"
+        raise ValueError(f"{key} must be{expectation}, got {value!r}.")
+
+
+def _validate_float_vector(
+    metadata: dict[str, Any],
+    key: str,
+    *,
+    positive: bool,
+) -> None:
+    value = metadata[key]
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"{key} must be a three-element numeric sequence, got {value!r}.")
+    for item in value:
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, (int, float, np.integer, np.floating))
+            or not math.isfinite(float(item))
+            or (positive and item <= 0)
+        ):
+            qualifier = "positive finite" if positive else "finite"
+            raise ValueError(f"{key} values must be {qualifier} numbers, got {value!r}.")
+
+
+def validate_qwen_glm_projector_metadata(model: Any, projector_type: str) -> None:
+    """Reject malformed route metadata before inspecting the tensor closure."""
+    metadata = model.metadata
+    vision_routes = {"glm4v", "qwen2.5o", "qwen3vl_merger"}
+    audio_routes = {"glma", "qwen2.5o", "qwen2a", "qwen3a", "qwen3tts_spkenc"}
+
+    if projector_type in vision_routes:
+        _validate_bool(metadata, "clip.has_vision_encoder", expected=True)
+        vision_keys = (
+            "clip.vision.embedding_length",
+            "clip.vision.feed_forward_length",
+            "clip.vision.block_count",
+            "clip.vision.projection_dim",
+            "clip.vision.attention.head_count",
+            "clip.vision.image_size",
+            "clip.vision.patch_size",
+        )
+        vision_values = {key: _positive_integer(metadata, key) for key in vision_keys}
+        _positive_finite_number(metadata, "clip.vision.attention.layer_norm_epsilon")
+        _validate_float_vector(metadata, "clip.vision.image_mean", positive=False)
+        _validate_float_vector(metadata, "clip.vision.image_std", positive=True)
+        hidden = vision_values["clip.vision.embedding_length"]
+        heads = vision_values["clip.vision.attention.head_count"]
+        image_size = vision_values["clip.vision.image_size"]
+        patch_size = vision_values["clip.vision.patch_size"]
+        if hidden % heads:
+            raise ValueError("clip.vision.embedding_length must divide by head_count")
+        if image_size % patch_size:
+            raise ValueError("clip.vision.image_size must be divisible by patch_size")
+
+    if projector_type in audio_routes:
+        _validate_bool(metadata, "clip.has_audio_encoder", expected=True)
+        audio_keys = (
+            "clip.audio.embedding_length",
+            "clip.audio.feed_forward_length",
+            "clip.audio.block_count",
+            "clip.audio.projection_dim",
+            "clip.audio.attention.head_count",
+            "clip.audio.num_mel_bins",
+        )
+        audio_values = {key: _positive_integer(metadata, key) for key in audio_keys}
+        _positive_finite_number(metadata, "clip.audio.attention.layer_norm_epsilon")
+        if (
+            audio_values["clip.audio.embedding_length"]
+            % audio_values["clip.audio.attention.head_count"]
+        ):
+            raise ValueError("clip.audio.embedding_length must divide by head_count")
+
+    type_key = (
+        "clip.audio.projector_type"
+        if projector_type in {"qwen3a", "qwen3tts_spkenc"}
+        else "clip.projector_type"
+    )
+    actual_type = metadata[type_key]
+    if not isinstance(actual_type, str) or actual_type != projector_type:
+        raise ValueError(f"{type_key} must equal {projector_type!r}, got {actual_type!r}.")
+
+    if "clip.use_silu" in metadata:
+        _validate_bool(metadata, "clip.use_silu")
+    if projector_type in {"glm4v", "qwen3vl_merger"}:
+        merge = metadata.get("clip.vision.spatial_merge_size", 2)
+        if isinstance(merge, bool) or not isinstance(merge, (int, np.integer)) or merge != 2:
+            raise ValueError("clip.vision.spatial_merge_size=2 is required")
+    if (
+        projector_type == "qwen3vl_merger"
+        and (declared := metadata.get("clip.vision.is_deepstack_layers")) is not None
+    ):
+        layers = _positive_integer(metadata, "clip.vision.block_count")
+        if (
+            not isinstance(declared, list)
+            or len(declared) != layers
+            or any(not isinstance(enabled, bool) for enabled in declared)
+        ):
+            raise ValueError(
+                "clip.vision.is_deepstack_layers must contain one boolean per vision block"
+            )
+    if projector_type == "qwen2.5o":
+        pattern = _positive_integer(metadata, "clip.vision.n_wa_pattern")
+        layers = _positive_integer(metadata, "clip.vision.block_count")
+        if pattern > layers:
+            raise ValueError("clip.vision.n_wa_pattern cannot exceed block_count")
+    if projector_type == "qwen3a":
+        window = metadata.get("clip.audio.projector.window_size", 800)
+        if (
+            isinstance(window, bool)
+            or not isinstance(window, (int, np.integer))
+            or window <= 0
+            or window % 100
+        ):
+            raise ValueError(
+                "clip.audio.projector.window_size must be a positive multiple of 100"
+            )
+    if projector_type == "glma":
+        _positive_integer(metadata, "clip.audio.projector.stack_factor")
+    if projector_type == "qwen3tts_spkenc" and (
+        _positive_integer(metadata, "clip.audio.block_count") != 3
+    ):
+        raise ValueError("qwen3tts_spkenc requires exactly three SE-Res2Net blocks")
 
 
 def read_qwen3vl_sidecar_config(model: Any, *, dtype: ir.DataType) -> ArchitectureConfig:
@@ -309,9 +458,10 @@ def read_qwen25o_vision_config(
         window_size=112,
         hidden_act="silu",
     )
+    assert vision.out_hidden_size is not None
     return _base_config(
         model_type="gguf_qwen25o_vision",
-        hidden_size=int(vision.out_hidden_size or 0),
+        hidden_size=int(vision.out_hidden_size),
         dtype=dtype,
         vision=vision,
     )
@@ -334,9 +484,10 @@ def _audio_config(model: Any) -> AudioConfig:
 
 def read_qwen2a_sidecar_config(model: Any, *, dtype: ir.DataType) -> ArchitectureConfig:
     audio = _audio_config(model)
+    assert audio.output_dim is not None
     return _base_config(
         model_type="gguf_qwen2a",
-        hidden_size=int(audio.output_dim or 0),
+        hidden_size=int(audio.output_dim),
         dtype=dtype,
         audio=audio,
     )
@@ -349,9 +500,10 @@ def read_qwen3a_sidecar_config(model: Any, *, dtype: ir.DataType) -> Architectur
         n_window=50,
         n_window_infer=int(model.metadata.get("clip.audio.projector.window_size", 800)),
     )
+    assert audio.output_dim is not None
     return _base_config(
         model_type="gguf_qwen3a",
-        hidden_size=int(audio.output_dim or 0),
+        hidden_size=int(audio.output_dim),
         dtype=dtype,
         audio=audio,
     )
@@ -359,9 +511,10 @@ def read_qwen3a_sidecar_config(model: Any, *, dtype: ir.DataType) -> Architectur
 
 def read_glma_sidecar_config(model: Any, *, dtype: ir.DataType) -> ArchitectureConfig:
     audio = _audio_config(model)
+    assert audio.output_dim is not None
     return _base_config(
         model_type="gguf_glma",
-        hidden_size=int(audio.output_dim or 0),
+        hidden_size=int(audio.output_dim),
         dtype=dtype,
         audio=audio,
     )
@@ -417,15 +570,23 @@ def create_qwen_glm_projector(
         config = read_qwen2a_sidecar_config(model, dtype=dtype)
         audio = config.audio
         assert audio is not None
+        assert audio.num_mel_bins is not None
+        assert audio.d_model is not None
+        assert audio.encoder_ffn_dim is not None
+        assert audio.encoder_layers is not None
+        assert audio.encoder_attention_heads is not None
+        assert audio.max_source_positions is not None
+        assert audio.output_dim is not None
+        assert audio.encoder_layer_norm_eps is not None
         component = GGUFQwen2AudioProjector(
-            num_mel_bins=int(audio.num_mel_bins or 0),
-            hidden_size=int(audio.d_model or 0),
-            intermediate_size=int(audio.encoder_ffn_dim or 0),
-            num_hidden_layers=int(audio.encoder_layers or 0),
-            num_attention_heads=int(audio.encoder_attention_heads or 0),
-            max_source_positions=int(audio.max_source_positions or 0),
-            output_size=int(audio.output_dim or 0),
-            norm_eps=float(audio.encoder_layer_norm_eps or 1e-5),
+            num_mel_bins=int(audio.num_mel_bins),
+            hidden_size=int(audio.d_model),
+            intermediate_size=int(audio.encoder_ffn_dim),
+            num_hidden_layers=int(audio.encoder_layers),
+            num_attention_heads=int(audio.encoder_attention_heads),
+            max_source_positions=int(audio.max_source_positions),
+            output_size=int(audio.output_dim),
+            norm_eps=float(audio.encoder_layer_norm_eps),
         )
         return component, config
     if projector_type == "qwen3a":
@@ -435,18 +596,26 @@ def create_qwen_glm_projector(
         config = read_glma_sidecar_config(model, dtype=dtype)
         audio = config.audio
         assert audio is not None
+        assert audio.num_mel_bins is not None
+        assert audio.d_model is not None
+        assert audio.encoder_ffn_dim is not None
+        assert audio.encoder_layers is not None
+        assert audio.encoder_attention_heads is not None
+        assert audio.max_source_positions is not None
+        assert audio.output_dim is not None
+        assert audio.encoder_layer_norm_eps is not None
         stack_factor = int(model.metadata["clip.audio.projector.stack_factor"])
         component = GGUFLegacyGlmAudioProjector(
-            num_mel_bins=int(audio.num_mel_bins or 0),
-            hidden_size=int(audio.d_model or 0),
-            intermediate_size=int(audio.encoder_ffn_dim or 0),
-            num_hidden_layers=int(audio.encoder_layers or 0),
-            num_attention_heads=int(audio.encoder_attention_heads or 0),
-            max_source_positions=int(audio.max_source_positions or 0),
+            num_mel_bins=int(audio.num_mel_bins),
+            hidden_size=int(audio.d_model),
+            intermediate_size=int(audio.encoder_ffn_dim),
+            num_hidden_layers=int(audio.encoder_layers),
+            num_attention_heads=int(audio.encoder_attention_heads),
+            max_source_positions=int(audio.max_source_positions),
             stack_factor=stack_factor,
             projector_intermediate_size=_shape(model, "mm.a.mlp.1.weight")[0],
-            output_size=int(audio.output_dim or 0),
-            norm_eps=float(audio.encoder_layer_norm_eps or 1e-5),
+            output_size=int(audio.output_dim),
+            norm_eps=float(audio.encoder_layer_norm_eps),
             activation="silu" if bool(model.metadata.get("clip.use_silu")) else "gelu",
         )
         return component, config

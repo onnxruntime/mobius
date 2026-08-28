@@ -51,8 +51,15 @@ class GGUFAudioProjectorTask(ModelTask):
             name: builder.input(name, dtype=dtype, shape=list(shape))
             for name, dtype, shape in input_schema
         }
-        audio_features = audio_encoder(builder.op, **inputs)
-        builder.add_output(audio_features, "audio_features")
+        outputs = audio_encoder(builder.op, **inputs)
+        output_names = getattr(audio_encoder, "output_names", ("audio_features",))
+        if not isinstance(output_names, tuple) or not output_names:
+            raise TypeError("GGUF audio encoder output_names must be a non-empty tuple")
+        output_values = outputs if isinstance(outputs, tuple) else (outputs,)
+        if len(output_values) != len(output_names):
+            raise ValueError("GGUF audio encoder output count does not match output_names")
+        for value, name in zip(output_values, output_names):
+            builder.add_output(value, name)
         return ModelPackage({"audio_encoder": _make_model(graph)}, config=config)
 
 

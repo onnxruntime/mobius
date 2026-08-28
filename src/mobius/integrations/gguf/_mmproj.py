@@ -1069,6 +1069,15 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         _generic_projector_dimensions(mmproj_gguf, spec.projector_type, vision)
 
 
+def _validate_supported_mmproj_metadata(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    if spec.sidecar_builder == "qwen_glm_projector":
+        from mobius.integrations.gguf._qwen_glm_projector import (
+            validate_qwen_glm_projector_metadata,
+        )
+
+        validate_qwen_glm_projector_metadata(mmproj_gguf, spec.projector_type)
+
+
 def _preflight_mmproj_pair(
     text_gguf: Any,
     mmproj_gguf: Any,
@@ -1109,6 +1118,7 @@ def _preflight_mmproj_pair(
             raise ValueError(
                 f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
             )
+        _validate_supported_mmproj_metadata(mmproj_gguf, spec)
         _validate_mmproj_tensor_closure(mmproj_gguf, spec)
         if not spec.is_importable:
             blocked = ", ".join(
@@ -1167,6 +1177,7 @@ def _preflight_standalone_mmproj(
         raise ValueError(
             f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
         )
+    _validate_supported_mmproj_metadata(mmproj_gguf, spec)
     _validate_mmproj_tensor_closure(mmproj_gguf, spec)
     if not spec.is_importable or spec.sidecar_builder is None:
         blocked = ", ".join(
