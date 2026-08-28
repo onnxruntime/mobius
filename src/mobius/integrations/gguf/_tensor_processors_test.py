@@ -61,6 +61,33 @@ class TestProcessTensorsKimiLinear:
             )
 
 
+class TestProcessTensorsGlmDsa:
+    def test_restores_split_mla_projection_layouts(self) -> None:
+        heads, rank, nope, value_dim = 2, 3, 4, 5
+        key_hf = torch.arange(heads * nope * rank, dtype=torch.float32).reshape(
+            heads, nope, rank
+        )
+        value_hf = torch.arange(heads * value_dim * rank, dtype=torch.float32).reshape(
+            heads, value_dim, rank
+        )
+        state = {
+            "model.layers.0.self_attn.k_b_proj.weight": key_hf.transpose(1, 2),
+            "model.layers.0.self_attn.v_b_proj.weight": value_hf,
+        }
+        config = SimpleNamespace(model_type="glm_moe_dsa", _gguf_arch="glm-dsa")
+
+        result = process_tensors(state, config)
+
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.k_b_proj.weight"],
+            key_hf.reshape(heads * nope, rank),
+        )
+        torch.testing.assert_close(
+            result["model.layers.0.self_attn.v_b_proj.weight"],
+            value_hf.reshape(heads * value_dim, rank),
+        )
+
+
 class TestProcessTensorsKimiK3:
     def test_restores_collapsed_conv_and_decay(self) -> None:
         config = SimpleNamespace(model_type="kimi_k3", _gguf_arch="kimi-k3")

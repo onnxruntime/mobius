@@ -7760,7 +7760,7 @@ def _replace_native_block_linears(
         hf_name = name_mapper(gguf_name, gguf_arch)
         if hf_name is None:
             continue
-        if gguf_arch in {"kimi-linear", "kimi-k3"} and hf_name.endswith(
+        if gguf_arch in {"glm-dsa", "kimi-linear", "kimi-k3"} and hf_name.endswith(
             (".k_b_proj.weight", ".v_b_proj.weight")
         ):
             continue
@@ -8409,11 +8409,12 @@ def _preflight_quantization_report(
                         target_bits=target_bits,
                         target_block_size=target_block_size,
                     )
-            is_kimi_reshaped_projection = gguf_arch in {
+            is_reshaped_mla_projection = gguf_arch in {
+                "glm-dsa",
                 "kimi-linear",
                 "kimi-k3",
             } and module_hf_name.endswith((".k_b_proj.weight", ".v_b_proj.weight"))
-            if is_kimi_reshaped_projection and route is not QuantImportRoute.REJECTED:
+            if is_reshaped_mla_projection and route is not QuantImportRoute.REJECTED:
                 if quant_spec.dequantize is not Support.SUPPORTED:
                     route = QuantImportRoute.REJECTED
                     exactness = None
@@ -8422,7 +8423,7 @@ def _preflight_quantization_report(
                     route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
                     exactness = RepackExactness.LOSSY
                     reason = (
-                        "The Kimi MLA layout transform changes affine block groups and "
+                        "The MLA layout transform changes affine block groups and "
                         "requires lossy dequantization/requantization."
                     )
             disposition = disposition_for_import_route(route, exactness)
@@ -9301,11 +9302,12 @@ def _load_quantized_state_dict(
             # through the custom 130-byte-block parser below rather than the
             # generic target-splitting path, which assumes mainline Q1_0 bytes.
             affine_targets = []
-        is_kimi_reshaped_projection = gguf_arch in {
+        is_reshaped_mla_projection = gguf_arch in {
+            "glm-dsa",
             "kimi-linear",
             "kimi-k3",
         } and module_hf_name.endswith((".k_b_proj.weight", ".v_b_proj.weight"))
-        if is_kimi_reshaped_projection:
+        if is_reshaped_mla_projection:
             # These tensors are rank-3 in GGUF. They target one flattened
             # projection rather than an expert-major collection.
             affine_targets = []
@@ -9360,7 +9362,7 @@ def _load_quantized_state_dict(
             )
             if explicitly_dequantized and quant_spec.dequantize is Support.SUPPORTED:
                 route = QuantImportRoute.DEQUANTIZE_FLOAT
-            if is_kimi_reshaped_projection:
+            if is_reshaped_mla_projection:
                 if quant_spec.dequantize is not Support.SUPPORTED:
                     raise ValueError(
                         f"Cannot reshape quantized {quant_spec.name} tensor {hf_name}: "
@@ -9627,7 +9629,7 @@ def _load_quantized_state_dict(
                         f"block-{repacked.block_size} for {hf_name}, but the graph "
                         f"expects INT{target_bits} block-{target_block_size}."
                     )
-            elif is_kimi_reshaped_projection:
+            elif is_reshaped_mla_projection:
                 values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
                 if hf_name.endswith(".k_b_proj.weight"):
                     values = values.transpose(0, 2, 1).reshape(

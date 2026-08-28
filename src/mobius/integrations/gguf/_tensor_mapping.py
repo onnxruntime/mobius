@@ -1192,6 +1192,37 @@ _KIMI_K3_MAPPING: dict[str, str] = {
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_a"]
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_b"]
 
+_GLM_DSA_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_k_b": "model.layers.{bid}.self_attn.k_b_proj",
+    "blk.{bid}.attn_v_b": "model.layers.{bid}.self_attn.v_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias@",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
+    "blk.{bid}.indexer.attn_k": "model.layers.{bid}.self_attn.indexer.wk",
+    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
+    "blk.{bid}.indexer.k_norm": "model.layers.{bid}.self_attn.indexer.k_norm",
+    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
+}
+
 _MINICPM3_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
     "output": "lm_head",
@@ -1322,6 +1353,7 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "minimax": _MINIMAX_MAPPING,
         "kimi_linear": _KIMI_LINEAR_MAPPING,
         "kimi_k3": _KIMI_K3_MAPPING,
+        "glm_dsa": _GLM_DSA_MAPPING,
         "minicpm3": _MINICPM3_MAPPING,
     }
 )

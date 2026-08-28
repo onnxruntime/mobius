@@ -136,10 +136,11 @@ _MUSE_GLIMMER_KEY_MAP = {
 # extracted config matches what GlmMoeDsaCausalLMModel (a DeepSeek-V3 subclass)
 # consumes. Both spellings of the architecture string are accepted.
 _GLM_DSA_KEY_MAP = {
-    "attention.key_length": "head_dim",
+    "attention.key_length_mla": "head_dim",
     "rope.dimension_count": "qk_rope_head_dim",
     "attention.q_lora_rank": "q_lora_rank",
     "attention.kv_lora_rank": "kv_lora_rank",
+    "attention.value_length_mla": "v_head_dim",
     "attention.sliding_window": "sliding_window",
     "expert_count": "num_local_experts",
     "expert_used_count": "num_experts_per_tok",
@@ -147,6 +148,9 @@ _GLM_DSA_KEY_MAP = {
     "expert_shared_count": "n_shared_experts",
     "expert_weights_scale": "routed_scaling_factor",
     "expert_weights_norm": "norm_topk_prob",
+    "expert_group_count": "n_group",
+    "expert_group_used_count": "topk_group",
+    "leading_dense_block_count": "first_k_dense_replace",
     "attention.indexer.head_count": "index_n_heads",
     "attention.indexer.key_length": "index_head_dim",
     "attention.indexer.top_k": "index_topk",
@@ -3920,6 +3924,76 @@ def _kimi_linear_postprocess(
     return KimiLinearConfig(**fields)
 
 
+def _glm_dsa_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the exact pinned GLM-5.2 MLA, DSA, and routed-MoE config."""
+    arch = model.architecture
+    raw_gating = metadata.get(f"{arch}.expert_gating_func")
+    gating = int(raw_gating) if raw_gating is not None else None
+    if gating not in {None, 2}:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    nope_dim = qk_dim - rope_dim
+    value_dim = int(metadata[f"{arch}.attention.value_length_mla"])
+    raw_kv_rank = metadata.get(f"{arch}.attention.kv_lora_rank")
+    kv_rank = int(raw_kv_rank) if raw_kv_rank is not None else None
+    compressed_key_dim = int(metadata[f"{arch}.attention.key_length"])
+    if min(nope_dim, rope_dim, value_dim) <= 0 or (kv_rank is not None and kv_rank <= 0):
+        raise ValueError("GLM-5.2 requires positive NoPE, RoPE, value, and KV-LoRA dimensions")
+    if kv_rank is not None and compressed_key_dim != kv_rank + rope_dim:
+        raise ValueError(
+            f"{arch}.attention.key_length must equal kv_lora_rank + rope.dimension_count "
+            f"({kv_rank + rope_dim}), got {compressed_key_dim}"
+        )
+
+    dense_prefix = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if not 0 <= dense_prefix <= config.num_hidden_layers:
+        raise ValueError(
+            f"{arch}.leading_dense_block_count must be in [0, "
+            f"{config.num_hidden_layers}], got {dense_prefix}"
+        )
+
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="glm_moe_dsa",
+        num_key_value_heads=config.num_attention_heads,
+        head_dim=nope_dim,
+        q_lora_rank=(
+            int(metadata[f"{arch}.attention.q_lora_rank"])
+            if f"{arch}.attention.q_lora_rank" in metadata
+            else None
+        ),
+        kv_lora_rank=kv_rank,
+        qk_nope_head_dim=nope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=value_dim,
+        intermediate_size=int(metadata[f"{arch}.feed_forward_length"]),
+        moe_intermediate_size=config.moe_intermediate_size,
+        n_shared_experts=config.n_shared_experts,
+        first_k_dense_replace=dense_prefix,
+        n_group=int(metadata.get(f"{arch}.expert_group_count", 1)),
+        topk_group=int(metadata.get(f"{arch}.expert_group_used_count", 1)),
+        routed_scaling_factor=float(metadata.get(f"{arch}.expert_weights_scale", 1.0)),
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm", True)),
+        hidden_act="silu",
+        scoring_func="sigmoid" if gating == 2 else config.scoring_func,
+        topk_method="noaux_tc",
+        use_expert_bias=True,
+        disable_qmoe=True,
+        rope_interleave=True,
+        indexer_rope_interleave=True,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        partial_rotary_factor=None,
+    )
+    return ArchitectureConfig(**fields)
+
+
 def _kimi_k3_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -4745,6 +4819,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "maincoder": _maincoder_postprocess,
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
+    "glm_dsa": _glm_dsa_postprocess,
     "kimi_linear": _kimi_linear_postprocess,
     "kimi_k3": _kimi_k3_postprocess,
     "minicpm": _minicpm_postprocess,
@@ -4876,6 +4951,11 @@ def assert_glm_moe_dsa_resolvable(
         reasons.append(f"hidden_size must be > 0 (got {config.hidden_size!r})")
 
     # MoE expert stack.
+    if config.scoring_func != "sigmoid":
+        reasons.append(
+            "missing SIGMOID expert gate (GGUF '<arch>.expert_gating_func'=2); "
+            f"scoring_func={config.scoring_func!r}"
+        )
     if not _positive(config.num_local_experts):
         reasons.append(
             "missing routed-expert count (GGUF '<arch>.expert_count'); "
