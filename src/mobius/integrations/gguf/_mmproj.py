@@ -1468,7 +1468,7 @@ def _validate_lightonocr_shapes(mmproj_gguf: Any) -> None:
     patch = int(md["clip.vision.patch_size"])
     projection = int(md["clip.vision.projection_dim"])
     merge = int(md["clip.vision.spatial_merge_size"])
-    if hidden <= 0 or heads <= 0 or hidden % heads:
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
         raise ValueError("lightonocr has invalid hidden/head dimensions.")
     _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
     _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
@@ -1515,7 +1515,7 @@ def _validate_youtuvl_shapes(mmproj_gguf: Any) -> None:
     merge = int(md["clip.vision.spatial_merge_size"])
     window = int(md["clip.vision.window_size"])
     indexes = md["clip.vision.wa_layer_indexes"]
-    if hidden <= 0 or heads <= 0 or hidden % heads:
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
         raise ValueError("youtuvl has invalid hidden/head dimensions.")
     if (
         not isinstance(indexes, list)
