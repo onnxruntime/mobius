@@ -3282,11 +3282,12 @@ def build_audio_projector_from_gguf(
     package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
     package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
     package.gguf_audio_processor_abi = processor_abi  # type: ignore[attr-defined]
-    package.gguf_runtime_warning = (  # type: ignore[attr-defined]
+    runtime_warning = (
         "Standalone projector graph only; paired text insertion and downstream "
         "multimodal runtime execution are not validated."
     )
-    logger.warning("%s", package.gguf_runtime_warning)
+    package.gguf_runtime_warning = runtime_warning  # type: ignore[attr-defined]
+    logger.warning("%s", runtime_warning)
     return package
 
 
@@ -3353,6 +3354,15 @@ def build_remaining_vision_projector_from_gguf(
         mmproj_gguf.metadata,
         tensor_shapes,
     )
+    vision_input_schema = cast(Any, vision_encoder).input_schema
+    input_schema = [
+        {
+            "name": name,
+            "dtype": str(dtype),
+            "shape": [str(dim) for dim in shape],
+        }
+        for name, dtype, shape in vision_input_schema
+    ]
     package = build_from_module(
         GGUFVisionProjectorModel(vision_encoder),
         config,
@@ -3362,17 +3372,24 @@ def build_remaining_vision_projector_from_gguf(
     for model in package.values():
         model.metadata_props["mobius.gguf_projector_type"] = projector_type
         model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
+        model.metadata_props["mobius.gguf_input_schema"] = json.dumps(
+            input_schema,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         model.metadata_props["mobius.runtime_support"] = (
             "standalone-sidecar-only; paired multimodal runtime unvalidated"
         )
     package.apply_weights(remaining_projector_state_dict(mmproj_gguf, projector_type))
     package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
     package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
-    package.gguf_runtime_warning = (  # type: ignore[attr-defined]
+    package.gguf_input_schema = input_schema  # type: ignore[attr-defined]
+    runtime_warning = (
         "Standalone projector graph only; paired text insertion and downstream "
         "multimodal runtime execution are not validated."
     )
-    logger.warning("%s", package.gguf_runtime_warning)
+    package.gguf_runtime_warning = runtime_warning  # type: ignore[attr-defined]
+    logger.warning("%s", runtime_warning)
     return package
 
 

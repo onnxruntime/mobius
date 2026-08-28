@@ -309,8 +309,16 @@ REMAINING_MMPROJ_ARTIFACT_RECORDS: tuple[dict[str, Any], ...] = (
         "processor_class": "Qwen2VLImageProcessor",
         "processor_contract": (
             ("pixel_values", "float32[total_patches,1536]"),
-            ("grid_thw", "int64[num_images,3]"),
             ("window_modes", "28 entries in {-1,0,1}"),
+            ("row_position_ids", "int64[total_patches,2]"),
+            ("column_position_ids", "int64[total_patches,2]"),
+            ("window_bias", "float32[total_patches,total_patches]"),
+            ("column_indices", "int64[merged_patches]"),
+            ("inverse_column_indices", "int64[merged_patches]"),
+            (
+                "adapter",
+                "derive position, window, and column-order tensors from processor grid_thw",
+            ),
         ),
     },
     {

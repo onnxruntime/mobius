@@ -19,7 +19,12 @@ from mobius.integrations.gguf._remaining_projectors import (
     create_remaining_vision_projector,
 )
 from mobius.models.gguf_audio_projector import create_gguf_audio_projector
-from mobius.tasks import GGUFVisionProjectorModel, GGUFVisionProjectorTask
+from mobius.tasks import (
+    GGUFAudioProjectorTask,
+    GGUFVisionProjectorModel,
+    GGUFVisionProjectorTask,
+    get_task,
+)
 
 
 def _write_tiny_janus(path: Path) -> None:
@@ -141,6 +146,10 @@ def test_public_standalone_dispatch_builds_and_runs_janus(tmp_path: Path) -> Non
     assert package["vision_encoder"].metadata_props["mobius.runtime_support"] == (
         "standalone-sidecar-only; paired multimodal runtime unvalidated"
     )
+    input_schema = json.loads(
+        package["vision_encoder"].metadata_props["mobius.gguf_input_schema"]
+    )
+    assert [entry["name"] for entry in input_schema] == ["pixel_values"]
 
     session = OnnxModelSession(package["vision_encoder"])
     output = session.run(
@@ -216,6 +225,10 @@ def test_public_meralion_package_persists_processor_contract(tmp_path: Path) -> 
     session.close()
     assert output.shape == (2, 5)
     assert np.isfinite(output).all()
+
+
+def test_meralion_default_task_is_registered() -> None:
+    assert isinstance(get_task("gguf-audio-projector"), GGUFAudioProjectorTask)
 
 
 def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> None:
