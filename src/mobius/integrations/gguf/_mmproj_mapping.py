@@ -482,6 +482,8 @@ def map_ocr_projector_to_onnx(name: str, projector_type: str) -> str | None:
             "mm.model.fc.bias": "projector.bias",
         }
         if projector_type == "deepseekocr":
+            # The converter also serializes v.patch_embd.weight, but the pinned
+            # graph begins at SAM pixels and feeds SAM output directly to CLIP.
             common.update(
                 {
                     "mm.model.fc.weight": "projector.linear.weight",
@@ -603,6 +605,8 @@ def map_ocr_projector_to_onnx(name: str, projector_type: str) -> str | None:
         projector = _map_granite_projector(name)
         if projector is not None:
             return projector
+        # v.post_ln is source-identity compatibility data: the pinned hand-written
+        # Granite graph consumes selected pre-post-norm layer outputs instead.
         return {
             "v.patch_embd.weight": "patch_embedding.weight",
             "v.patch_embd.bias": "patch_embedding.bias",

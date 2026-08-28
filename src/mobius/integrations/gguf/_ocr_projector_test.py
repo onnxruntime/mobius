@@ -25,6 +25,7 @@ from mobius.integrations.gguf._mmproj_mapping import map_ocr_projector_to_onnx
 from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_PINS,
     MMProjModelRole,
+    MMProjTensorRole,
     get_projector_spec,
 )
 
@@ -234,6 +235,24 @@ def test_dots_mixed_sidecar_emits_both_executable_roles():
     )
     assert get_projector_spec("dots3note_v").model_roles == expected
     assert get_projector_spec("dots3note_a").model_roles == expected
+
+
+def test_every_real_tensor_has_an_unambiguous_role_prefix():
+    evidence = _evidence()
+    for projector_type, header_name in _ROUTE_HEADERS.items():
+        spec = get_projector_spec(projector_type)
+        for tensor in evidence[header_name]["tensors"]:
+            matches = [
+                (prefix, role)
+                for prefix, role in spec.tensor_roles
+                if tensor["name"].startswith(prefix)
+            ]
+            assert matches, (projector_type, tensor["name"])
+            prefix, role = max(matches, key=lambda item: len(item[0]))
+            assert prefix
+            assert role in {MMProjTensorRole.ENCODER, MMProjTensorRole.PROJECTOR}
+            if tensor["name"].startswith("mm.a."):
+                assert role is MMProjTensorRole.PROJECTOR
 
 
 def test_every_real_tensor_is_mapped_or_an_explicit_upstream_compatibility_tensor():
