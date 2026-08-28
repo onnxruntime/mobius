@@ -622,7 +622,7 @@ def _looks_like_speech_to_text(pkg: Any) -> bool:
         names = set(pkg.keys())
     except AttributeError:
         return False
-    if not {"encoder", "decoder"} <= names:
+    if names != {"encoder", "decoder"}:
         return False
     decoder = pkg["decoder"]
     try:
@@ -700,7 +700,7 @@ def _looks_like_audio_codec(pkg: Any) -> bool:
         names = set(pkg.keys())
     except AttributeError:
         return False
-    if not {"encoder", "decoder"} <= names:
+    if names != {"encoder", "decoder"}:
         return False
     try:
         encoder_outputs = {value.name for value in pkg["encoder"].graph.outputs}

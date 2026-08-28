@@ -1278,6 +1278,50 @@ def test_dispatch_audio_codec_pipeline(tmp_path):
     assert workflow["outputs"]["waveform"]["stage"] == "post_adapter"
 
 
+@pytest.mark.parametrize("package_kind", ["codec", "speech-to-text"])
+def test_recognized_topology_superset_exports_advisory_contract(tmp_path, package_kind):
+    if package_kind == "codec":
+        encoder = _model(
+            "encoder",
+            [_value("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
+            [("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
+        )
+        decoder = _model(
+            "decoder",
+            [_value("codes", ir.DataType.INT64, ["batch", 16, "frames"])],
+            [("waveform", ir.DataType.FLOAT, ["batch", 1, "audio_samples"])],
+        )
+        pkg = _EncoderDecoderPkg({"encoder": encoder, "decoder": decoder})
+    else:
+        pkg = _EncoderDecoderPkg(dict(_speech_package()))
+    pkg["auxiliary"] = _FakeModel(["aux_input"], ["aux_output"])
+
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    compatibility = json.loads(
+        Path(artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
+    )
+
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert set(compatibility["components"]) == {"encoder", "decoder", "auxiliary"}
+
+
+@pytest.mark.parametrize("package_kind", ["codec", "speech-to-text"])
+def test_recognized_topology_superset_with_malformed_component_fails(tmp_path, package_kind):
+    if package_kind == "codec":
+        pkg = _EncoderDecoderPkg(
+            {
+                "encoder": _FakeModel(["waveform"], ["codes"]),
+                "decoder": _FakeModel(["codes"], ["waveform"]),
+            }
+        )
+    else:
+        pkg = _EncoderDecoderPkg(dict(_speech_package()))
+    pkg["auxiliary"] = object()
+
+    with pytest.raises(ValueError, match=r"auxiliary.*no graph contract"):
+        write_onnx_genai_config(pkg, str(tmp_path))
+
+
 def test_multi_decoder_tts_without_pre_embedder_raises_precise_not_implemented(tmp_path):
     # A nested multi-decoder TTS stack lacking the talker_step_embedder
     # pre-embedder cannot yet be mapped and must fail with a precise error.
