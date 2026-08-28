@@ -411,7 +411,7 @@ def test_minimax_full_sidecar_uses_runtime_grid_geometry():
         hidden_size=12,
         intermediate_size=16,
         num_heads=1,
-        num_layers=1,
+        num_layers=0,
         patch_size=1,
         grid_height=2,
         grid_width=2,
@@ -436,12 +436,32 @@ def test_minimax_full_sidecar_uses_runtime_grid_geometry():
         providers=["CPUExecutionProvider"],
     )
 
+    pixel_values = np.random.default_rng(62).normal(size=(8, 6)).astype(np.float32)
     actual = session.run(
         None,
         {
-            "pixel_values": np.random.default_rng(62).normal(size=(8, 6)).astype(np.float32),
+            "pixel_values": pixel_values,
             "grid_size": np.array([2, 4], dtype=np.int64),
         },
     )[0]
+    pixels = torch.from_numpy(pixel_values)
+    first_weight = torch.from_numpy(state["patch_embed.weight_0"])[:, :, 0, 0]
+    second_weight = torch.from_numpy(state["patch_embed.weight_1"])[:, :, 0, 0]
+    expected = torch_functional.linear(pixels[:, :3], first_weight)
+    expected += torch_functional.linear(pixels[:, 3:], second_weight)
+    expected = _torch_linear(expected, state, "projector.patch_mlp.fc1")
+    expected = _torch_linear(
+        torch_functional.gelu(expected, approximate="none"),
+        state,
+        "projector.patch_mlp.fc2",
+    )
+    expected = expected.reshape(2, 48)
+    expected = _torch_linear(expected, state, "projector.merger_mlp.fc1")
+    expected = _torch_linear(
+        torch_functional.gelu(expected, approximate="none"),
+        state,
+        "projector.merger_mlp.fc2",
+    )
     assert actual.shape == (2, 8)
     assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, expected.numpy(), rtol=1e-5, atol=1e-6)

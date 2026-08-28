@@ -622,7 +622,6 @@ class MiniMaxM3VisionSidecar(nn.Module):
         self.patch_embed = DualTemporalPatchEmbedding(3, hidden_size, patch_size)
         if grid_height % merge_size or grid_width % merge_size:
             raise ValueError("reference patch grid must be divisible by merge_size")
-        self._hidden_size = hidden_size
         self._merge_size = merge_size
         self.blocks = nn.ModuleList(
             [
@@ -655,18 +654,9 @@ class MiniMaxM3VisionSidecar(nn.Module):
         grid_width = op.Gather(grid_size, 1)
         merged_height = op.Div(grid_height, self._merge_size)
         merged_width = op.Div(grid_width, self._merge_size)
-        hidden_states = op.Reshape(
-            hidden_states,
-            op.Concat(
-                op.Reshape(merged_height, [1]),
-                [self._merge_size],
-                op.Reshape(merged_width, [1]),
-                [self._merge_size, self._hidden_size],
-                axis=0,
-            ),
-        )
-        hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1, 3, 4])
-        hidden_states = op.Reshape(hidden_states, [-1, self._hidden_size])
+        # The processor already emits patches in 2x2 merge-unit order. llama.cpp
+        # performs this permutation because its graph starts from a raw image;
+        # repeating it here would scramble processor-native packed patches.
         indices = op.Range(0, op.Mul(grid_height, grid_width), 1)
         position_h = op.Div(indices, grid_width)
         position_w = op.Mod(indices, grid_width)
