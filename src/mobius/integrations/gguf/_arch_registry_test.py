@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 102
+_EXPECTED_SUPPORTED_COUNT = 105
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -85,6 +85,8 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "gemma-embedding",
         "llama-embed",
         "maincoder",
+        "minimax-m2",
+        "mistral4",
         "starcoder",
         "xverse",
     }
@@ -328,6 +330,8 @@ class TestCapabilityClosure:
             "mamba",
             "mamba2",
             "maincoder",
+            "minimax-m2",
+            "mistral4",
             "nemotron_h",
             "nemotron_h_moe",
             "neo-bert",
@@ -343,6 +347,7 @@ class TestCapabilityClosure:
             "grok",
             "grovemoe",
             "hunyuan-moe",
+            "glm-dsa",
             "hy_v3",
             "jais",
             "mpt",

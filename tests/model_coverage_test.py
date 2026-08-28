@@ -211,6 +211,12 @@ _COVERAGE_SKIP: dict[str, str] = {
     "smallthinker_gguf": "GGUF-only SmallThinker route whose routing and SWA/NoPE schedules "
     "are restored by GGUF metadata postprocessing, not the native HF config path; dedicated "
     "config/graph/synthetic execution tests cover it while real-weight L4/L5 is deferred.",
+    "minimax_m2_gguf": "GGUF-only MiniMax-M2 route with dedicated config, tensor closure, "
+    "full-vector Q/K norm, partial-RoPE, routing, and cache execution tests; the smallest "
+    "immutable public GGUF is 46,514,882,176 bytes, above the 16 GiB evidence budget.",
+    "mistral4_gguf": "GGUF-only Mistral4 latent-cache route with dedicated config, tensor "
+    "closure, and prefill/cached-decode execution tests; the smallest immutable public GGUF "
+    "is 32,306,941,632 bytes, above the 16 GiB evidence budget.",
     "arctic_gguf": "GGUF-only Arctic route whose residual-MoE tensor layout is reconstructed "
     "from GGUF metadata; dedicated exact closure, graph, and synthetic execution tests cover "
     "it while real-weight L2/L4/L5 remains deferred.",

@@ -45,6 +45,7 @@ class DeepSeekMLA(nn.Module):
         config: ArchitectureConfig,
         scale: float | None = None,
         linear_class: type | None = None,
+        split_kv_b: bool = False,
     ):
         super().__init__()
         if linear_class is None:
@@ -82,12 +83,25 @@ class DeepSeekMLA(nn.Module):
             bias=False,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        # Decompresses latent KV into per-head k_nope + v
-        self.kv_b_proj = linear_class(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
+        self._split_kv_b = split_kv_b
+        if split_kv_b:
+            self.k_b_proj = linear_class(
+                self.kv_lora_rank,
+                self.num_heads * self.qk_nope_head_dim,
+                bias=False,
+            )
+            self.v_b_proj = linear_class(
+                self.kv_lora_rank,
+                self.num_heads * self.v_head_dim,
+                bias=False,
+            )
+        else:
+            # Decompresses latent KV into per-head k_nope + v
+            self.kv_b_proj = linear_class(
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=False,
+            )
 
         self.o_proj = linear_class(
             self.num_heads * self.v_head_dim,
@@ -154,18 +168,28 @@ class DeepSeekMLA(nn.Module):
 
         # Decompress latent KV → per-head k_nope + v
         k_pass = self.kv_a_layernorm(op, k_pass)
-        kv_decompressed = self.kv_b_proj(op, k_pass)
-        # (B, S, num_heads * (nope + v_dim)) → (B, S, num_heads, nope + v_dim)
-        kv_decompressed = op.Reshape(
-            kv_decompressed,
-            [0, 0, self.num_heads, self.qk_nope_head_dim + self.v_head_dim],
-        )
-        k_nope, value_states = op.Split(
-            kv_decompressed,
-            [self.qk_nope_head_dim, self.v_head_dim],
-            axis=-1,
-            _outputs=2,
-        )
+        if self._split_kv_b:
+            k_nope = op.Reshape(
+                self.k_b_proj(op, k_pass),
+                [0, 0, self.num_heads, self.qk_nope_head_dim],
+            )
+            value_states = op.Reshape(
+                self.v_b_proj(op, k_pass),
+                [0, 0, self.num_heads, self.v_head_dim],
+            )
+        else:
+            kv_decompressed = self.kv_b_proj(op, k_pass)
+            # (B, S, num_heads * (nope + v_dim)) → (B, S, num_heads, nope + v_dim)
+            kv_decompressed = op.Reshape(
+                kv_decompressed,
+                [0, 0, self.num_heads, self.qk_nope_head_dim + self.v_head_dim],
+            )
+            k_nope, value_states = op.Split(
+                kv_decompressed,
+                [self.qk_nope_head_dim, self.v_head_dim],
+                axis=-1,
+                _outputs=2,
+            )
         # k_nope: (B, S, H, nope_dim) → (B, S, H*nope_dim)... not needed yet
         # value_states: (B, S, H, v_dim) → (B, S, H*v_dim) for Attention op
         value_states = op.Reshape(value_states, [0, 0, -1])

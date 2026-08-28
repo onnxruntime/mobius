@@ -6072,6 +6072,8 @@ class TestBuildJambaGraph:
 _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     # Internal GGUF-only graph covered by _exact_legacy_decoder_test.py.
     "gguf_legacy",
+    # Mistral4 owns a K-only latent cache, covered by _remaining_dense_test.py.
+    "mistral4_gguf",
     # T5 encoder-only hidden-state contract (co-located models/t5_test.py).
     "t5encoder",
     # LLaDA masked-diffusion LM (co-located src/mobius/models/llada_test.py):

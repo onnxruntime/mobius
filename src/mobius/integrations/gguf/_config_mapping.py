@@ -61,6 +61,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MISTRAL4_YARN_LOG_MULTIPLIER_UNIT = float(np.float32(0.1))
+
 
 # Map GGUF architecture names → our registry model_type strings.
 #
@@ -138,10 +140,11 @@ _MUSE_GLIMMER_KEY_MAP = {
 # extracted config matches what GlmMoeDsaCausalLMModel (a DeepSeek-V3 subclass)
 # consumes. Both spellings of the architecture string are accepted.
 _GLM_DSA_KEY_MAP = {
-    "attention.key_length": "head_dim",
+    "attention.key_length_mla": "head_dim",
     "rope.dimension_count": "qk_rope_head_dim",
     "attention.q_lora_rank": "q_lora_rank",
     "attention.kv_lora_rank": "kv_lora_rank",
+    "attention.value_length_mla": "v_head_dim",
     "attention.sliding_window": "sliding_window",
     "expert_count": "num_local_experts",
     "expert_used_count": "num_experts_per_tok",
@@ -149,9 +152,25 @@ _GLM_DSA_KEY_MAP = {
     "expert_shared_count": "n_shared_experts",
     "expert_weights_scale": "routed_scaling_factor",
     "expert_weights_norm": "norm_topk_prob",
+    "expert_group_count": "n_group",
+    "expert_group_used_count": "topk_group",
+    "leading_dense_block_count": "first_k_dense_replace",
     "attention.indexer.head_count": "index_n_heads",
     "attention.indexer.key_length": "index_head_dim",
     "attention.indexer.top_k": "index_topk",
+}
+
+_MINIMAX_M2_KEY_MAP = {
+    "attention.key_length": "head_dim",
+    "expert_feed_forward_length": "moe_intermediate_size",
+}
+
+_MISTRAL4_KEY_MAP = {
+    "attention.key_length_mla": "head_dim",
+    "attention.q_lora_rank": "q_lora_rank",
+    "attention.kv_lora_rank": "kv_lora_rank",
+    "expert_feed_forward_length": "moe_intermediate_size",
+    "leading_dense_block_count": "first_k_dense_replace",
 }
 
 _MAMBA_KEY_MAP = {
@@ -307,6 +326,8 @@ _KEY_MAP_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "draft": _DRAFT_KEY_MAP,
         "muse_glimmer": _MUSE_GLIMMER_KEY_MAP,
         "glm_dsa": _GLM_DSA_KEY_MAP,
+        "minimax_m2": _MINIMAX_M2_KEY_MAP,
+        "mistral4": _MISTRAL4_KEY_MAP,
         "mamba": _MAMBA_KEY_MAP,
         "falcon_h1": _FALCON_H1_KEY_MAP,
         "plamo2": _PLAMO2_KEY_MAP,
@@ -4134,6 +4155,338 @@ def _kimi_linear_postprocess(
     return KimiLinearConfig(**fields)
 
 
+def _glm_dsa_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the exact pinned GLM-5.2 MLA, DSA, and routed-MoE config."""
+    arch = model.architecture
+    _validate_closed_rope_scaling_metadata(metadata, arch)
+    raw_gating = metadata.get(f"{arch}.expert_gating_func")
+    gating = int(raw_gating) if raw_gating is not None else 2
+    if gating != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+
+    qk_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    nope_dim = qk_dim - rope_dim
+    value_dim = int(metadata[f"{arch}.attention.value_length_mla"])
+    raw_kv_rank = metadata.get(f"{arch}.attention.kv_lora_rank")
+    kv_rank = int(raw_kv_rank) if raw_kv_rank is not None else None
+    compressed_key_dim = int(metadata[f"{arch}.attention.key_length"])
+    if min(nope_dim, rope_dim, value_dim) <= 0 or (kv_rank is not None and kv_rank <= 0):
+        raise ValueError("GLM-5.2 requires positive NoPE, RoPE, value, and KV-LoRA dimensions")
+    if kv_rank is not None and compressed_key_dim != kv_rank + rope_dim:
+        raise ValueError(
+            f"{arch}.attention.key_length must equal kv_lora_rank + rope.dimension_count "
+            f"({kv_rank + rope_dim}), got {compressed_key_dim}"
+        )
+
+    dense_prefix = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if not 0 <= dense_prefix <= config.num_hidden_layers:
+        raise ValueError(
+            f"{arch}.leading_dense_block_count must be in [0, "
+            f"{config.num_hidden_layers}], got {dense_prefix}"
+        )
+
+    indexer_types = _glm_dsa_indexer_types(config, metadata, arch=arch)
+    names = set(model.tensor_names)
+    routed_layers = set(range(dense_prefix, config.num_hidden_layers))
+    bias_layers = {
+        layer for layer in routed_layers if f"blk.{layer}.exp_probs_b.bias" in names
+    }
+    if bias_layers and bias_layers != routed_layers:
+        raise ValueError(
+            f"{arch} correction bias must be present for every routed layer or none; "
+            f"found {sorted(bias_layers)}, expected {sorted(routed_layers)}"
+        )
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 0.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError(f"{arch}.expert_weights_scale must resolve to a positive value")
+
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="glm_moe_dsa",
+        num_key_value_heads=config.num_attention_heads,
+        head_dim=nope_dim,
+        q_lora_rank=(
+            int(metadata[f"{arch}.attention.q_lora_rank"])
+            if f"{arch}.attention.q_lora_rank" in metadata
+            else None
+        ),
+        kv_lora_rank=kv_rank,
+        qk_nope_head_dim=nope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=value_dim,
+        intermediate_size=int(metadata[f"{arch}.feed_forward_length"]),
+        moe_intermediate_size=config.moe_intermediate_size,
+        n_shared_experts=config.n_shared_experts,
+        first_k_dense_replace=dense_prefix,
+        n_group=int(metadata.get(f"{arch}.expert_group_count", 1)),
+        topk_group=int(metadata.get(f"{arch}.expert_group_used_count", 1)),
+        routed_scaling_factor=route_scale,
+        norm_topk_prob=bool(metadata.get(f"{arch}.expert_weights_norm")),
+        routing_weight_normalization_floor=(
+            6.103515625e-5 if bool(metadata.get(f"{arch}.expert_weights_norm")) else None
+        ),
+        hidden_act="silu",
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        use_expert_bias=bool(bias_layers),
+        disable_qmoe=True,
+        rope_interleave=True,
+        indexer_rope_interleave=True,
+        indexer_types=indexer_types,
+        index_topk_freq=4 if config.max_position_embeddings >= 1_048_576 else 1,
+        index_skip_topk_offset=3 if config.max_position_embeddings >= 1_048_576 else 0,
+        partial_rotary_factor=1.0,
+    )
+    return ArchitectureConfig(**fields)
+
+
+def _glm_dsa_indexer_types(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    *,
+    arch: str = "glm-dsa",
+) -> list[str]:
+    """Resolve the raw-prefix bool/scalar schedule without model-ID heuristics."""
+    layers = config.num_hidden_layers
+    raw = metadata.get(f"{arch}.attention.indexer.types")
+    if raw is None:
+        if config.max_position_embeddings < 1_048_576:
+            result = ["full"] * layers
+        else:
+            if layers > 78:
+                raise ValueError(
+                    "glm-dsa models with more than 78 trunk layers must serialize "
+                    "attention.indexer.types"
+                )
+            result = [
+                "full" if index < 3 or (index - 2) % 4 == 0 else "shared"
+                for index in range(layers)
+            ]
+    elif isinstance(raw, (list, tuple, np.ndarray)):
+        if len(raw) != layers:
+            raise ValueError(
+                f"{arch}.attention.indexer.types has wrong array length; "
+                f"expected {layers}, got {len(raw)}"
+            )
+        if any(value not in (0, 1, False, True) for value in raw):
+            raise ValueError(f"{arch}.attention.indexer.types entries must be bool or 0/1")
+        result = ["full" if bool(value) else "shared" for value in raw]
+    else:
+        if raw not in (0, 1, False, True):
+            raise ValueError(f"{arch}.attention.indexer.types scalar must be bool or 0/1")
+        result = ["full" if bool(raw) else "shared"] * layers
+    if not result or result[0] != "full":
+        raise ValueError("glm-dsa layer 0 must own a full indexer")
+    return result
+
+
+def _minimax_m2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore MiniMax-M2's full-vector Q/K norms and exact sigmoid router."""
+    arch = model.architecture
+    _validate_closed_rope_scaling_metadata(metadata, arch)
+    gating = metadata[f"{arch}.expert_gating_func"]
+    if isinstance(gating, bool) or not isinstance(gating, (int, np.integer)):
+        raise TypeError(f"{arch}.expert_gating_func must be the integer SIGMOID enum")
+    if int(gating) != 2:
+        raise ValueError(f"{arch}.expert_gating_func must be SIGMOID (2), got {gating}")
+
+    head_dim = int(metadata[f"{arch}.attention.key_length"])
+    value_dim = int(metadata[f"{arch}.attention.value_length"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    intermediate = int(metadata[f"{arch}.feed_forward_length"])
+    expert_intermediate = int(metadata[f"{arch}.expert_feed_forward_length"])
+    if value_dim != head_dim:
+        raise ValueError(f"{arch}.attention.value_length must equal key_length")
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2:
+        raise ValueError(
+            f"{arch}.rope.dimension_count must be positive, even, and <= head_dim"
+        )
+    if expert_intermediate != intermediate:
+        raise ValueError(
+            f"{arch}.expert_feed_forward_length must equal feed_forward_length "
+            f"({intermediate}), got {expert_intermediate}"
+        )
+    if int(metadata.get(f"{arch}.expert_shared_count", 0)):
+        raise ValueError("MiniMax-M2 does not support shared experts")
+    if int(metadata.get(f"{arch}.leading_dense_block_count", 0)):
+        raise ValueError("MiniMax-M2 uses routed experts in every layer")
+    if int(metadata.get(f"{arch}.attention.sliding_window", 0)):
+        raise ValueError("MiniMax-M2 does not use sliding-window attention")
+    if int(metadata.get(f"{arch}.expert_group_count", 0)) not in (0, 1):
+        raise ValueError("MiniMax-M2 does not use grouped expert selection")
+    if int(metadata.get(f"{arch}.nextn_predict_layers", 0)):
+        raise ValueError("MiniMax-M2 GGUF does not define an executable NextN graph")
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 0.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError("MiniMax-M2 expert_weights_scale must resolve to a positive value")
+
+    return dataclasses.replace(
+        config,
+        model_type="minimax_m2_gguf",
+        head_dim=head_dim,
+        intermediate_size=intermediate,
+        moe_intermediate_size=intermediate,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        attn_qk_norm=True,
+        attn_qk_norm_full=True,
+        rope_type="default",
+        rope_interleave=False,
+        partial_rotary_factor=rope_dim / head_dim,
+        n_group=1,
+        topk_group=1,
+        norm_topk_prob=True,
+        routed_scaling_factor=route_scale,
+        routing_weight_normalization_floor=6.103515625e-5,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        use_expert_bias=True,
+        disable_qmoe=True,
+    )
+
+
+def _mistral4_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore the pinned DeepSeek-V2 MLA/MoE contract serialized as Mistral4."""
+    arch = model.architecture
+    _validate_conventional_moe_rope_scaling(metadata, arch)
+    q_lora_rank = int(metadata[f"{arch}.attention.q_lora_rank"])
+    kv_lora_rank = int(metadata[f"{arch}.attention.kv_lora_rank"])
+    qk_head_dim = int(metadata[f"{arch}.attention.key_length_mla"])
+    rope_dim = int(metadata[f"{arch}.rope.dimension_count"])
+    nope_dim = qk_head_dim - rope_dim
+    value_dim = int(metadata[f"{arch}.attention.value_length_mla"])
+    serialized_key = int(metadata[f"{arch}.attention.key_length"])
+    serialized_value = int(metadata[f"{arch}.attention.value_length"])
+    if min(q_lora_rank, kv_lora_rank, nope_dim, rope_dim, value_dim) <= 0:
+        raise ValueError("Mistral4 requires positive Q/KV-LoRA and MLA head dimensions")
+    if serialized_key != kv_lora_rank + rope_dim or serialized_value != kv_lora_rank:
+        raise ValueError(
+            "Mistral4 compressed cache geometry must satisfy "
+            "key_length=kv_lora_rank+rope_dim and value_length=kv_lora_rank"
+        )
+    if int(config.num_key_value_heads) != 1:
+        raise ValueError("Mistral4 GGUF must serialize attention.head_count_kv=1")
+    if int(metadata.get(f"{arch}.nextn_predict_layers", 0)):
+        raise ValueError("Mistral4's pinned graph does not execute a NextN sidecar")
+    temperature_scale = float(metadata.get(f"{arch}.attention.temperature_scale", 0.0))
+    if not math.isclose(temperature_scale, 0.0):
+        raise ValueError(
+            "Mistral4 attention.temperature_scale is loader-optional but is not emitted "
+            "by the pinned converter; nonzero temperature scaling is outside this route"
+        )
+
+    layers = config.num_hidden_layers
+    dense_prefix = int(metadata.get(f"{arch}.leading_dense_block_count", 0))
+    if not 0 <= dense_prefix < layers:
+        raise ValueError("Mistral4 requires a valid dense prefix and at least one MoE layer")
+    experts = int(config.num_local_experts or 0)
+    top_k = int(config.num_experts_per_tok or 0)
+    shared = int(config.n_shared_experts or 0)
+    n_group = int(metadata.get(f"{arch}.expert_group_count", 1))
+    topk_group = int(metadata.get(f"{arch}.expert_group_used_count", 1))
+    if min(experts, top_k, shared) <= 0 or top_k > experts:
+        raise ValueError("Mistral4 requires routed experts, top-k, and shared experts")
+    if n_group != 1 or topk_group != 1:
+        raise ValueError("Mistral4's proven route requires one expert group")
+
+    raw_gating = metadata.get(f"{arch}.expert_gating_func", 1)
+    if isinstance(raw_gating, bool) or not isinstance(raw_gating, (int, np.integer)):
+        raise TypeError(f"{arch}.expert_gating_func must be an integer enum")
+    gating = int(raw_gating)
+    if gating not in (1, 2):
+        raise ValueError(f"{arch}.expert_gating_func must be SOFTMAX (1) or SIGMOID (2)")
+
+    routed_layers = set(range(dense_prefix, layers))
+    names = set(model.tensor_names)
+    bias_layers = {
+        layer for layer in routed_layers if f"blk.{layer}.exp_probs_b.bias" in names
+    }
+    if bias_layers and bias_layers != routed_layers:
+        raise ValueError(
+            f"Mistral4 correction bias must be present in every routed layer or none; "
+            f"found {sorted(bias_layers)}, expected {sorted(routed_layers)}"
+        )
+    route_scale = float(metadata.get(f"{arch}.expert_weights_scale", 0.0))
+    if math.isclose(route_scale, 0.0):
+        route_scale = 1.0
+    if not math.isfinite(route_scale) or route_scale <= 0:
+        raise ValueError("Mistral4 expert_weights_scale must resolve to a positive value")
+    norm_topk_prob = bool(metadata.get(f"{arch}.expert_weights_norm"))
+
+    rope_scaling = None if config.rope_scaling is None else dict(config.rope_scaling)
+    yarn_log_multiplier = metadata.get(f"{arch}.rope.scaling.yarn_log_multiplier")
+    if yarn_log_multiplier is not None:
+        if rope_scaling is None or config.rope_type != "yarn":
+            raise ValueError("Mistral4 yarn_log_multiplier requires YaRN rope metadata")
+        if isinstance(yarn_log_multiplier, bool) or not isinstance(
+            yarn_log_multiplier,
+            (int, float, np.integer, np.floating),
+        ):
+            raise TypeError("Mistral4 yarn_log_multiplier must be a numeric scalar")
+        yarn_log_multiplier = float(yarn_log_multiplier)
+        if (
+            not math.isfinite(yarn_log_multiplier)
+            or not 0.0 <= yarn_log_multiplier <= _MISTRAL4_YARN_LOG_MULTIPLIER_UNIT
+        ):
+            raise ValueError(
+                "Mistral4 yarn_log_multiplier must be finite and within [0.0, 0.1]"
+            )
+        rope_scaling["mscale"] = 1.0
+        rope_scaling["mscale_all_dim"] = (
+            yarn_log_multiplier / _MISTRAL4_YARN_LOG_MULTIPLIER_UNIT
+        )
+
+    return dataclasses.replace(
+        config,
+        model_type="mistral4_gguf",
+        head_dim=qk_head_dim,
+        num_key_value_heads=1,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=nope_dim,
+        qk_rope_head_dim=rope_dim,
+        v_head_dim=value_dim,
+        first_k_dense_replace=dense_prefix,
+        hidden_act="silu",
+        attn_qkv_bias=False,
+        attn_o_bias=False,
+        mlp_bias=False,
+        rope_scaling=rope_scaling,
+        rope_interleave=True,
+        partial_rotary_factor=None,
+        scoring_func="softmax" if gating == 1 else "sigmoid",
+        topk_method="greedy",
+        n_group=n_group,
+        topk_group=topk_group,
+        use_expert_bias=bool(bias_layers),
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=route_scale,
+        routing_weight_normalization_floor=(6.103515625e-5 if norm_topk_prob else None),
+        disable_qmoe=True,
+        num_nextn_predict_layers=0,
+    )
+
+
 def _kimi_k3_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -4964,6 +5317,9 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "maincoder": _maincoder_postprocess,
     "t5": _t5_postprocess,
     "minimax": _minimax_postprocess,
+    "minimax_m2": _minimax_m2_postprocess,
+    "mistral4": _mistral4_postprocess,
+    "glm_dsa": _glm_dsa_postprocess,
     "kimi_linear": _kimi_linear_postprocess,
     "kimi_k3": _kimi_k3_postprocess,
     "minicpm": _minicpm_postprocess,
@@ -5097,6 +5453,11 @@ def assert_glm_moe_dsa_resolvable(
         reasons.append(f"hidden_size must be > 0 (got {config.hidden_size!r})")
 
     # MoE expert stack.
+    if config.scoring_func != "sigmoid":
+        reasons.append(
+            "missing SIGMOID expert gate (GGUF '<arch>.expert_gating_func'=2); "
+            f"scoring_func={config.scoring_func!r}"
+        )
     if not _positive(config.num_local_experts):
         reasons.append(
             "missing routed-expert count (GGUF '<arch>.expert_count'); "

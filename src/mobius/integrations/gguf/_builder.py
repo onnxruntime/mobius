@@ -713,6 +713,11 @@ def _validate_gguf_model(
     )
 
     validate_remaining_moe_tensor_contract(gguf_model)
+    from mobius.integrations.gguf._remaining_dense import (
+        validate_remaining_dense_tensor_contract,
+    )
+
+    validate_remaining_dense_tensor_contract(gguf_model)
     from mobius.integrations.gguf._hy_v3 import validate_hy_v3_tensor_contract
 
     validate_hy_v3_tensor_contract(gguf_model)
@@ -6679,7 +6684,15 @@ _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
     "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
     "routing_weight_normalization_floor": frozenset(
-        {"dots1", "ernie4_5-moe", "hy_v3", "smallthinker"}
+        {
+            "dots1",
+            "ernie4_5-moe",
+            "glm-dsa",
+            "hy_v3",
+            "minimax-m2",
+            "mistral4",
+            "smallthinker",
+        }
     ),
     "router_logit_softcapping": frozenset(),
 }
@@ -7105,6 +7118,35 @@ def build_from_gguf(
                 "smallthinker GGUF only supports the dedicated "
                 "'smallthinker-gguf-text-generation' task"
             )
+    if spec.gguf_arch == "glm-dsa":
+        from mobius.tasks import GlmMoeDsaTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for GLM-DSA GGUF; "
+                "dsa_kv_cache_specs() describes a per-layer-varying packed dynamic cache"
+            )
+        if task is not None and task != "glm-moe-dsa" and not isinstance(task, GlmMoeDsaTask):
+            raise ValueError("glm-dsa GGUF only supports the dedicated 'glm-moe-dsa' task")
+        if task is None:
+            task = GlmMoeDsaTask()
+    if gguf_arch == "mistral4":
+        from mobius.tasks import Mistral4GGUFCausalLMTask
+
+        if static_cache:
+            raise ValueError(
+                "static_cache=True is not supported for Mistral4 GGUF; "
+                "the dedicated graph owns a dynamic latent K-only cache"
+            )
+        if (
+            task is not None
+            and task != "mistral4-gguf-text-generation"
+            and not isinstance(task, Mistral4GGUFCausalLMTask)
+        ):
+            raise ValueError(
+                "mistral4 GGUF only supports the dedicated "
+                "'mistral4-gguf-text-generation' task"
+            )
     if gguf_arch == "qwen4exp":
         from mobius.tasks import Qwen4ExpCausalLMTask
 
@@ -7308,7 +7350,7 @@ def build_from_gguf(
     # ``_gguf_arch`` matters most: it is the key ``process_tensors`` dispatches
     # on, so losing it here would silently demote every non-float32 and every
     # quantized import to the ``model_type`` fallback.
-    config._gguf_arch = gguf_arch
+    config._gguf_arch = spec.gguf_arch
     config._gguf_model_type = model_type
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices
@@ -8417,11 +8459,11 @@ def _preflight_quantization_report(
                         target_bits=target_bits,
                         target_block_size=target_block_size,
                     )
-            is_kimi_reshaped_projection = gguf_arch in {
+            is_reshaped_mla_projection = gguf_arch in {
                 "kimi-linear",
                 "kimi-k3",
             } and module_hf_name.endswith((".k_b_proj.weight", ".v_b_proj.weight"))
-            if is_kimi_reshaped_projection and route is not QuantImportRoute.REJECTED:
+            if is_reshaped_mla_projection and route is not QuantImportRoute.REJECTED:
                 if quant_spec.dequantize is not Support.SUPPORTED:
                     route = QuantImportRoute.REJECTED
                     exactness = None
@@ -8430,7 +8472,7 @@ def _preflight_quantization_report(
                     route = QuantImportRoute.DEQUANTIZE_REQUANTIZE
                     exactness = RepackExactness.LOSSY
                     reason = (
-                        "The Kimi MLA layout transform changes affine block groups and "
+                        "The MLA layout transform changes affine block groups and "
                         "requires lossy dequantization/requantization."
                     )
             disposition = disposition_for_import_route(route, exactness)
@@ -9309,11 +9351,11 @@ def _load_quantized_state_dict(
             # through the custom 130-byte-block parser below rather than the
             # generic target-splitting path, which assumes mainline Q1_0 bytes.
             affine_targets = []
-        is_kimi_reshaped_projection = gguf_arch in {
+        is_reshaped_mla_projection = gguf_arch in {
             "kimi-linear",
             "kimi-k3",
         } and module_hf_name.endswith((".k_b_proj.weight", ".v_b_proj.weight"))
-        if is_kimi_reshaped_projection:
+        if is_reshaped_mla_projection:
             # These tensors are rank-3 in GGUF. They target one flattened
             # projection rather than an expert-major collection.
             affine_targets = []
@@ -9368,7 +9410,7 @@ def _load_quantized_state_dict(
             )
             if explicitly_dequantized and quant_spec.dequantize is Support.SUPPORTED:
                 route = QuantImportRoute.DEQUANTIZE_FLOAT
-            if is_kimi_reshaped_projection:
+            if is_reshaped_mla_projection:
                 if quant_spec.dequantize is not Support.SUPPORTED:
                     raise ValueError(
                         f"Cannot reshape quantized {quant_spec.name} tensor {hf_name}: "
@@ -9635,7 +9677,7 @@ def _load_quantized_state_dict(
                         f"block-{repacked.block_size} for {hf_name}, but the graph "
                         f"expects INT{target_bits} block-{target_block_size}."
                     )
-            elif is_kimi_reshaped_projection:
+            elif is_reshaped_mla_projection:
                 values = gguf_model.dequantize_raw_tensor(raw, qtype, np_shape)
                 if hf_name.endswith(".k_b_proj.weight"):
                     values = values.transpose(0, 2, 1).reshape(

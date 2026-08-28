@@ -180,6 +180,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 "--static-cache cannot represent Falcon-H1's per-layer K, V, "
                 "convolution, and SSM states"
             )
+        if model_type == "glm_moe_dsa":
+            raise ValueError(
+                "--static-cache cannot represent GLM-DSA's per-layer-varying packed DSA cache"
+            )
+        if model_type == "mistral4_gguf":
+            raise ValueError(
+                "--static-cache is not implemented for Mistral4's latent K-only cache"
+            )
         if model_type == "gemma4":
             from mobius.tasks._gemma4 import Gemma4Task
 

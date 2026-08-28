@@ -71,6 +71,8 @@ __all__ = [
     "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
     "GemmaEmbeddingGGUFModel",
+    "MiniMaxM2GGUFCausalLMModel",
+    "Mistral4GGUFCausalLMModel",
     "Glm4CausalLMModel",
     "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
@@ -286,6 +288,8 @@ from mobius.models.gguf_encoders import (
     NomicBertMoEGGUFModel,
 )
 from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
+from mobius.models.gguf_minimax_m2 import MiniMaxM2GGUFCausalLMModel
+from mobius.models.gguf_mistral4 import Mistral4GGUFCausalLMModel
 from mobius.models.gguf_plamo import PlamoGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
