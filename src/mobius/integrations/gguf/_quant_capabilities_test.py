@@ -167,10 +167,10 @@ def test_selected_real_artifacts_stay_within_global_budget() -> None:
     assert isinstance(policy, dict)
     assert isinstance(artifacts, list)
     assert isinstance(lossy, list)
-    assert len(artifacts) == 4
+    assert len(artifacts) == 10
     assert len(lossy) == 1
     selected = sum(int(record["size"]) for record in [*artifacts, *lossy])
-    assert selected == 2_390_132_320
+    assert selected == 2_724_371_296
     assert selected == policy["selected_artifact_bytes"]
     assert selected <= policy["max_selected_artifact_bytes"]
     assert lossy[0]["lfs_sha256"] == (

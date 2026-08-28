@@ -170,6 +170,42 @@ class TestWriteGgufRuntimePackage:
         assert Path(artifacts["inference_metadata"]) == out / "inference_metadata.yaml"
         assert not list(tmp_path.glob(".out.*.tmp"))
 
+    def test_portable_graph_targets_ort_genai_cpu(self, tmp_path):
+        pkg = _FakePackage()
+        pkg.gguf_execution_provider = "default"
+        out = tmp_path / "out"
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model",
+                return_value=SimpleNamespace(
+                    metadata={},
+                    architecture="llama",
+                    source_matches_path=lambda: True,
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
+                return_value=_materialized(),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.materialize_gguf_tokenizer",
+                side_effect=_write_tokenizer,
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.write_ort_genai_config",
+                side_effect=_write_config,
+            ) as write_config,
+        ):
+            _write_runtime(
+                pkg,
+                tmp_path / "m.gguf",
+                out,
+                runtime="ort-genai",
+                runtime_version="0.15.2",
+            )
+
+        assert write_config.call_args.kwargs["ep"] == "cpu"
+
     def test_failure_after_graph_save_removes_staging_and_publishes_nothing(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"

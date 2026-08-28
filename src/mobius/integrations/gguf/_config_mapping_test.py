@@ -1382,17 +1382,65 @@ class TestDefaultActivation:
 
         assert _default_activation(model_type) == "gelu_pytorch_tanh"
 
-    @pytest.mark.parametrize("model_type", ["gpt2", "bloom", "starcoder2", "t5"])
+    @pytest.mark.parametrize("model_type", ["bloom", "t5"])
     def test_gelu_models(self, model_type: str) -> None:
         from mobius.integrations.gguf._config_mapping import _default_activation
 
         assert _default_activation(model_type) == "gelu"
+
+    @pytest.mark.parametrize("model_type", ["gpt2", "starcoder2"])
+    def test_architecture_default_uses_tanh_approximate_gelu(self, model_type: str) -> None:
+        from mobius.integrations.gguf._config_mapping import _default_activation
+
+        assert _default_activation(model_type) == "gelu_pytorch_tanh"
 
     @pytest.mark.parametrize("model_type", ["llama", "qwen2", "mistral"])
     def test_silu_default(self, model_type: str) -> None:
         from mobius.integrations.gguf._config_mapping import _default_activation
 
         assert _default_activation(model_type) == "silu"
+
+
+def test_qwen3_qk_norm_weights_have_graph_consumers() -> None:
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+    tensor_names = [
+        "token_embd.weight",
+        "output.weight",
+        *[
+            f"blk.{layer}.{name}.weight"
+            for layer in range(2)
+            for name in ("attn_q_norm", "attn_k_norm")
+        ],
+    ]
+    config = gguf_to_config(_FakeDenseGGUF("qwen3", _dense_metadata("qwen3"), tensor_names))
+
+    assert config.attn_qk_norm is True
+    assert config.attn_qk_norm_full is False
+    module = registry.get(config.model_type)(config)
+    for layer in module.model.layers:
+        assert layer.self_attn.q_norm is not None
+        assert layer.self_attn.k_norm is not None
+
+
+@pytest.mark.parametrize(
+    ("metadata_window", "expected_window"),
+    [(None, 4096), (2048, 2048)],
+)
+def test_starcoder2_restores_architecture_sliding_window(
+    metadata_window: int | None,
+    expected_window: int,
+) -> None:
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+    metadata = _dense_metadata("starcoder2")
+    if metadata_window is not None:
+        metadata["starcoder2.attention.sliding_window"] = metadata_window
+    config = gguf_to_config(_FakeDenseGGUF("starcoder2", metadata, []))
+
+    assert config.sliding_window == expected_window
+    module = registry.get(config.model_type)(config)
+    assert module.model._sliding_window == expected_window
 
 
 class TestQwen35MtpBlockExclusion:

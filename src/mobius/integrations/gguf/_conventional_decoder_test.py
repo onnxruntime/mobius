@@ -199,7 +199,10 @@ def test_conventional_decoder_support_and_runtime_verdicts_are_explicit() -> Non
     for architecture in _ARCHITECTURES:
         spec = get_arch_spec(architecture)
         assert spec.is_importable
-        assert spec.runtime is Support.DEFERRED
+        expected_runtime = (
+            Support.SUPPORTED if architecture == "starcoder" else Support.DEFERRED
+        )
+        assert spec.runtime is expected_runtime
         expected = (
             Support.SUPPORTED if architecture in supported_quantized else Support.REJECTED
         )

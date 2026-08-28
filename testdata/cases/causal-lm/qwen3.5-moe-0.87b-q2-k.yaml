@@ -19,7 +19,7 @@ gguf:
     Q6_K: 1
     Q8_0: 12
   execution_provider: "cpu"
-  config_sha256: "f61aa39910c1b2ef27b9f8c707ef17dc7d16eff6fd97fae33d3a2eb367bf76f9"
+  config_sha256: "48019eea50654171acb6b87074d3c3a212bdf156aa6045c221067732bf25af91"
   preserve_quantization: false
   keep_quantized: false
   tokenizer:

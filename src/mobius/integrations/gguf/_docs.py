@@ -647,6 +647,12 @@ Processor-owned `image_token_id` overrides are forwarded unchanged for `mmproj=`
 
 ## Runtime evidence
 
+The first low-cost architecture batch promotes GPT-2, GPT-NeoX/Pythia, MPT, OLMo,
+StarCoder, and StarCoder2 using 334,238,976 bytes of GGUF payload and 346,825,051
+download bytes including tokenizer assets. Every route is explicit-float only. The
+network-free selection, budget, exclusions, and fail-closed candidate reasons are recorded in
+`testdata/evidence/gguf_low_cost_runtime_batch.json`.
+
 {_runtime_evidence_table()}
 
 Runtime support above is independent from tokenizer materialization support below.

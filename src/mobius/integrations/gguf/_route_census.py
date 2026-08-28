@@ -86,6 +86,42 @@ RECENT_PR_DEPENDENCIES: tuple[RecentPRDependency, ...] = (
         "merged",
         "follow-up hardening for sharded GGUF evidence edge cases after PR #656",
     ),
+    RecentPRDependency(
+        672,
+        "Prove Qwen3.5 MoE GGUF explicit-float runtime route",
+        "merged",
+        "Qwen3.5 MoE runtime evidence is complete; exclude it from follow-up evidence batches",
+    ),
+    RecentPRDependency(
+        674,
+        "Keep Nemotron-H GGUF runtime fail-closed with pinned evidence",
+        "merged",
+        "Nemotron-H MoE blocker evidence is complete; exclude it from follow-up evidence batches",
+    ),
+    RecentPRDependency(
+        677,
+        "Promote first GGUF text architecture cohort",
+        "merged",
+        "the text architecture cohort is merged into the authoritative graph-route census",
+    ),
+    RecentPRDependency(
+        678,
+        "Promote generic GGUF projector cohort",
+        "merged",
+        "the generic projector cohort is merged into the authoritative projector census",
+    ),
+    RecentPRDependency(
+        679,
+        "Add exact Hunyuan V3 GGUF graph support",
+        "merged",
+        "Hunyuan V3 graph and MTP routes are merged into the authoritative route census",
+    ),
+    RecentPRDependency(
+        680,
+        "Promote first GGUF MoE architecture cohort",
+        "merged",
+        "the MoE architecture cohort is merged into the authoritative graph-route census",
+    ),
 )
 
 # Reviewed dispositions for routes that cannot advance until Mobius owns a new

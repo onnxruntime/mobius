@@ -145,7 +145,6 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
 # described by the ordinary decoder graph ABI. All other compatible, single-
 # model decoder packages use ORT GenAI's released generic DecoderOnly_Model.
 _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
-    "gpt2": "gpt2",
     "lfm2": "lfm2",
     "lfm2_vl": "lfm2",
 }
@@ -295,7 +294,9 @@ def _select_ort_model_type(
     retained only for LongRoPE cache recomputation after the short-context
     threshold. Standalone Qwen3.5 text configs also normalize to ``decoder``:
     their specialized names dispatch to the same ``DecoderOnly_Model`` and are
-    not available in the latest released ORT GenAI.
+    not available in the latest released ORT GenAI. Mobius GPT-2 graphs also
+    normalize to ``decoder`` because they expose the generic separate-key/value
+    cache ABI rather than ``Gpt_Model``'s rank-5 combined cache.
 
     Multimodal and encoder-decoder packages retain their architecture-specific
     type because those values select distinct runtime pipelines and position-ID

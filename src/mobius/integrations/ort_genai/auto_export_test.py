@@ -259,13 +259,12 @@ class TestSelectOrtModelType:
 
     def test_decoder_only_preserves_specialized_hf_fallback(self):
         assert (
-            _select_ort_model_type("not_a_real_type", "gpt2", is_decoder_only=True) == "gpt2"
+            _select_ort_model_type("not_a_real_type", "lfm2", is_decoder_only=True) == "lfm2"
         )
 
     @pytest.mark.parametrize(
         ("model_type", "expected"),
         [
-            ("gpt2", "gpt2"),
             ("lfm2", "lfm2"),
             ("lfm2_vl", "lfm2"),
         ],
@@ -3732,10 +3731,10 @@ def test_generic_decoder_rejects_pre_014_runtime(tmp_path):
     assert not (tmp_path / "genai_config.json").exists()
 
 
-def test_gpt2_specialized_runtime_rejects_separate_cache_graph(tmp_path):
-    with pytest.raises(ValueError, match="rank-5 combined KV-cache"):
-        write_ort_genai_config(_make_fake_llm_pkg("gpt2"), str(tmp_path))
-    assert not (tmp_path / "genai_config.json").exists()
+def test_gpt2_separate_cache_graph_uses_generic_decoder(tmp_path):
+    write_ort_genai_config(_make_fake_llm_pkg("gpt2"), str(tmp_path))
+    generated = json.loads((tmp_path / "genai_config.json").read_text())
+    assert generated["model"]["type"] == "decoder"
 
 
 @pytest.mark.parametrize("model_type", ["phi3", "phi3small", "phimoe"])

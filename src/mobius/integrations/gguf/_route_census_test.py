@@ -56,7 +56,7 @@ def test_every_route_has_one_actionable_classification() -> None:
     assert {item.category for item in items} == allowed
     assert all(item.batch and item.dependencies and item.reason.strip() for item in items)
     assert Counter(item.kind for item in items) == {
-        "architecture": 144,
+        "architecture": 138,
         "projector": 60,
         "tokenizer": 56,
         "mtp": 22,
@@ -64,7 +64,7 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-runtime-abi-blocked": 100,
-        "evidence-only": 107,
+        "evidence-only": 101,
         "immediately-implementable": 53,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
@@ -118,6 +118,12 @@ def test_recent_pr_reconciliation_is_explicit() -> None:
         (652, "closed"),
         (656, "merged"),
         (675, "merged"),
+        (672, "merged"),
+        (674, "merged"),
+        (677, "merged"),
+        (678, "merged"),
+        (679, "merged"),
+        (680, "merged"),
     ]
 
 

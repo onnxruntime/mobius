@@ -170,10 +170,10 @@ and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
 architecture names do not need a runtime registry entry.
 
 Architecture-specific types remain only where the runtime selects different
-behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` selects
-`Gpt_Model`, but Mobius's separate rank-4 key/value cache ABI does not match that
-runtime's rank-5 combined-cache contract, so config generation currently fails
-closed. `phi3`, `phimoe`, and `phi3small` retain their names only when their config selects
+behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` uses the
+generic decoder because Mobius exports separate rank-4 key/value caches rather than
+the specialized `Gpt_Model` rank-5 combined-cache contract. `phi3`, `phimoe`, and
+`phi3small` retain their names only when their config selects
 LongRoPE, because the released generator uses those names to recompute caches when
 generation crosses the short-context threshold. Ordinary Phi-3-family graphs use
 `decoder`. Multimodal, audio, encoder-decoder, special-position-ID,
@@ -197,10 +197,11 @@ dense cache. The deferred state-manifest work is tracked by
 Each export also writes `runtime_compatibility.json`. Generic decoder metadata
 records the minimum runtime version and the latest stable release exercised by
 Mobius (0.15.2); it never emits the unreleased `decoder.state_groups` field.
-Generic config availability does not promote a GGUF runtime verdict: the only
-runtime-supported GGUF route remains the exact pinned SmolLM F16/CPU package, while
-SmolLM2 remains rejected because its GGUF padding-token metadata conflicts with the
-official pinned tokenizer.
+Generic config availability does not promote a GGUF runtime verdict. Runtime
+admission is restricted to exact artifacts named by the generated GGUF evidence
+matrix, which now includes GPT-2 and other independently verified decoder routes in
+addition to SmolLM. SmolLM2 remains rejected because its GGUF padding-token metadata
+conflicts with the official pinned tokenizer.
 
 #### Example
 

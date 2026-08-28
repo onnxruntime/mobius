@@ -1533,6 +1533,27 @@ def _moe_postprocess(
     return dataclasses.replace(config, **updates)
 
 
+def _qwen3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Apply Qwen3's per-head Q/K normalization omitted by GGUF metadata."""
+    return dataclasses.replace(config, attn_qk_norm=True, attn_qk_norm_full=False)
+
+
+def _starcoder2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Restore StarCoder2's architecture-owned uniform sliding window."""
+    del metadata, model
+    if config.sliding_window is not None:
+        return config
+    return dataclasses.replace(config, sliding_window=4096)
+
+
 def _dbrx_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -4716,6 +4737,8 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "phimoe": _phimoe_postprocess,
     "pangu_embedded": _pangu_embedded_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
+    "qwen3": _qwen3_postprocess,
+    "starcoder2": _starcoder2_postprocess,
     "gemma2": _gemma2_postprocess,
     "baichuan": _baichuan_postprocess,
     "chatglm": _chatglm_postprocess,
@@ -4764,15 +4787,17 @@ def _default_activation(model_type: str) -> str:
     # Most modern models use SiLU/Swish
     if model_type == "arcee":
         return "relu2"
+    if model_type in {"gpt2", "starcoder2"}:
+        # These architectures use tanh-approximate GELU by default. Their GGUF
+        # metadata omits that architecture-owned choice, so exact GELU is not equivalent.
+        return "gelu_pytorch_tanh"
     gelu_models = {
         "bert",
         "bloom",
-        "gpt2",
         "gpt_bigcode",
         "jais2",
         "kclgpt",
         "modernbert",
-        "starcoder2",
         "t5",
     }
     if model_type in gelu_models:
