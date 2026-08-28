@@ -263,6 +263,9 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "exaone",  # real HF type is exaone4
         "phi3small",  # real HF type is phi3
         "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        "grok_gguf",
+        "grovemoe_gguf",
+        "hunyuan_moe_gguf",
         # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
         # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
         # registered with AutoModelForCausalLM, so a reference model cannot be

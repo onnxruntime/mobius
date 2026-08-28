@@ -220,6 +220,15 @@ _COVERAGE_SKIP: dict[str, str] = {
     "ernie4_5_moe_gguf": "GGUF-only ERNIE MoE route whose dense/MoE schedule and shared "
     "experts are restored from GGUF metadata; dedicated exact closure, graph, and synthetic "
     "execution tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "grok_gguf": "GGUF-only Grok route whose scaling, sandwich norms, and dense-plus-routed "
+    "expert topology are restored from GGUF metadata; dedicated exact closure, graph, and "
+    "synthetic parity tests cover it while real-weight L2/L4/L5 remains deferred.",
+    "grovemoe_gguf": "GGUF-only GroveMoE route whose primary and chunk expert banks are "
+    "restored from GGUF metadata; dedicated exact closure, graph, and synthetic parity tests "
+    "cover it while real-weight L2/L4/L5 remains deferred.",
+    "hunyuan_moe_gguf": "GGUF-only Hunyuan-MoE route whose post-RoPE Q/K norms and parallel "
+    "shared expert are restored from GGUF metadata; dedicated exact closure, graph, and "
+    "synthetic parity tests cover it while real-weight L2/L4/L5 remains deferred.",
     "nomic_bert_moe_gguf": "GGUF-only NomicBERT-MoE encoder route whose alternating MoE "
     "schedule and fused QKV layout are restored from GGUF metadata; dedicated exact closure, "
     "graph, and synthetic execution tests cover it while real-weight L2/L4/L5 remains deferred.",

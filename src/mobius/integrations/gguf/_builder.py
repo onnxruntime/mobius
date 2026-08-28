@@ -708,6 +708,11 @@ def _validate_gguf_model(
     _raise_for_invalid_smallthinker_tensor_contract(gguf_model)
     _raise_for_invalid_conventional_moe_tensor_contract(gguf_model)
     _raise_for_invalid_moe_cohort_tensor_contract(gguf_model)
+    from mobius.integrations.gguf._remaining_moe import (
+        validate_remaining_moe_tensor_contract,
+    )
+
+    validate_remaining_moe_tensor_contract(gguf_model)
     from mobius.integrations.gguf._hy_v3 import validate_hy_v3_tensor_contract
 
     validate_hy_v3_tensor_contract(gguf_model)
@@ -6669,12 +6674,14 @@ _SPECIALIZED_ENCODER_FINGERPRINT_FIELDS = (
     "encoder_fused_qkv",
 )
 _ARCHITECTURE_CONFIG_FINGERPRINT_FIELDS = {
+    "attention_temperature_length": frozenset(),
     "attention_clamp": frozenset({"dbrx"}),
     "encoder_fused_qkv": frozenset({"jina-bert-v3"}),
     "moe_layer_frequency": frozenset({"ernie4_5-moe", "nomic-bert-moe"}),
     "routing_weight_normalization_floor": frozenset(
         {"dots1", "ernie4_5-moe", "hy_v3", "smallthinker"}
     ),
+    "router_logit_softcapping": frozenset(),
 }
 
 
@@ -7955,6 +7962,7 @@ def _normalize_gguf_weights(
         unpacked = False
         expert_containers = [
             ".mlp.experts",
+            ".mlp.chunk_experts",
             ".feed_forward.experts",
             ".block_sparse_moe.moe.experts",
         ]

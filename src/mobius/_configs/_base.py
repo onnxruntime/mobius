@@ -1549,6 +1549,31 @@ class CausalLMConfig(ArchitectureConfig):
 
 
 @dataclasses.dataclass
+class GrokGGUFConfig(CausalLMConfig):
+    """GGUF-only Grok graph settings loaded by the pinned llama.cpp implementation."""
+
+    embedding_scale: float = 78.38367176906169
+    attention_output_scale: float = 0.08838834764831845
+    logit_output_scale: float = 0.5773502691896257
+    attn_logit_softcapping: float = 30.0
+    router_logit_softcapping: float = 30.0
+    final_logit_softcapping: float = 0.0
+    attention_temperature_length: int = 0
+    has_dense_ffn: bool = False
+    has_gated_dense_ffn: bool = False
+    has_gated_experts: bool = True
+
+
+@dataclasses.dataclass
+class GroveMoEGGUFConfig(CausalLMConfig):
+    """GGUF-only GroveMoE chunk-expert routing settings."""
+
+    chunk_expert_intermediate_size: int = DEFAULT_INT
+    experts_per_group: int = DEFAULT_INT
+    expert_group_scale: float = 0.05
+
+
+@dataclasses.dataclass
 class Qwen4ExpConfig(CausalLMConfig):
     """Exact configuration for experimental Qwen4/Qwen3.8 Flash-Next."""
 
