@@ -16,6 +16,7 @@ from onnxscript import nn
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._configs._sub_configs import VisionConfig
+from mobius._pipeline_contract import component_presence
 from mobius._testing import create_test_builder, create_test_input
 from mobius.components._ocr_encoders import (
     DeepSeekOCR2FullImageEncoder,
@@ -35,6 +36,8 @@ from mobius.components._sam_vision import SAMVisionEncoder
 from mobius.tasks import (
     GGUFAudioProjectorModel,
     GGUFAudioProjectorTask,
+    GGUFVisionAudioProjectorModel,
+    GGUFVisionAudioProjectorTask,
     GGUFVisionProjectorModel,
     GGUFVisionProjectorTask,
 )
@@ -1076,6 +1079,35 @@ class _FeatureStub(nn.Module):
             ),
             to=ir.DataType.FLOAT,
         )
+
+
+class _PresenceStub(nn.Module):
+    input_schema = (("features", ir.DataType.FLOAT, (1, 1)),)
+
+    def forward(self, op, features):
+        return op.Identity(features)
+
+
+def test_mixed_projector_graphs_declare_independent_media_presence():
+    config = ArchitectureConfig(
+        vocab_size=1,
+        hidden_size=1,
+        intermediate_size=1,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=1,
+        max_position_embeddings=1,
+        hidden_act="silu",
+    )
+    package = build_from_module(
+        GGUFVisionAudioProjectorModel(_PresenceStub(), _PresenceStub()),
+        config,
+        task=GGUFVisionAudioProjectorTask(),
+    )
+
+    assert component_presence(package["vision_encoder"].graph) == "image"
+    assert component_presence(package["audio_encoder"].graph) == "audio"
 
 
 def test_deepseek_v1_full_media_order_and_newlines():

@@ -150,6 +150,7 @@ class GGUFVisionAudioProjectorTask(ModelTask):
         *,
         graph_name: str,
         output_name: str,
+        presence: str,
     ) -> ir.Model:
         input_schema = getattr(component, "input_schema", None)
         if not isinstance(input_schema, tuple) or not input_schema:
@@ -161,6 +162,7 @@ class GGUFVisionAudioProjectorTask(ModelTask):
         }
         output = component(builder.op, **inputs)
         builder.add_output(output, output_name)
+        declare_component_presence(graph, presence)
         return _make_model(graph)
 
     def build(
@@ -175,11 +177,13 @@ class GGUFVisionAudioProjectorTask(ModelTask):
                     cast(_VisionProjectorModule, module).vision_encoder,
                     graph_name="vision_encoder",
                     output_name="image_features",
+                    presence="image",
                 ),
                 "audio_encoder": self._build_component(
                     cast(_AudioProjectorModule, module).audio_encoder,
                     graph_name="audio_encoder",
                     output_name="audio_features",
+                    presence="audio",
                 ),
             },
             config=config,
