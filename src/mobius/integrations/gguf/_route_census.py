@@ -305,6 +305,13 @@ def _tokenizer_items() -> list[GGUFRouteWorkItem]:
             category: RouteCategory = "dependency-or-runtime-abi-blocked"
             batch = "tokenizer-compiled-semantics"
             dependencies = ("compiled pinned llama.cpp oracle", "dispatch-equivalence fixture")
+        elif record.blocker_category == "pinned-candidate-source-semantic-mismatch":
+            category = "dependency-or-runtime-abi-blocked"
+            batch = "tokenizer-compiled-semantics"
+            dependencies = (
+                "upstream tokenizer semantic parity",
+                "independently proven replacement reconstruction",
+            )
         elif record.blocker_category == "pinned-artifact-source-parity-pending":
             category = "evidence-only"
             batch = "tokenizer-artifact-evidence"
