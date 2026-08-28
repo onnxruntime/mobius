@@ -1079,6 +1079,22 @@ class TestCopyTokenizerFiles:
         assert "chat_template.jinja" in copied
         assert (dst / "chat_template.jinja").exists()
 
+    def test_local_cache_miss_is_best_effort(self, tmp_path):
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        with mock.patch(
+            "huggingface_hub.hf_hub_download",
+            side_effect=LocalEntryNotFoundError("not cached"),
+        ):
+            copied = _copy_tokenizer_files(
+                "fake/model",
+                str(tmp_path),
+                local_files_only=True,
+            )
+
+        assert copied == []
+        assert not list(tmp_path.iterdir())
+
 
 class TestCopyTokenizerFilesFromLocal:
     """Tests for _copy_tokenizer_files_from_local."""
@@ -3801,6 +3817,69 @@ def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path)
     assert compatibility["runtime_validation_status"] == "unvalidated"
     assert compatibility["tested_versions"] == ["0.15.2"]
     assert compatibility["graph_contract"] is not None
+
+
+@pytest.mark.parametrize("order", ["config-before-save", "save-before-config"])
+@pytest.mark.parametrize("stale_layout", ["same", "different", "extra"])
+def test_attached_mtp_uses_current_package_sidecar_despite_stale_manifest(
+    tmp_path, order, stale_layout
+):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg["model"] = _mock_decoder_model(layer_indices=(0,))
+    pkg.mtp_head = ModelPackage(
+        {
+            "model": _mock_model(
+                inputs=[
+                    "hidden_states",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                ],
+                outputs=["mtp_hidden", "present.0.key", "present.0.value"],
+            )
+        },
+        config=types.SimpleNamespace(
+            num_hidden_layers=9,
+            num_nextn_predict_layers=1,
+            use_dedicated_embeddings=False,
+            use_dedicated_lm_head=False,
+        ),
+    )
+    stale_name = ".mobius-mtp" if stale_layout == "same" else ".stale-mtp"
+    (tmp_path / ".mobius-package.json").write_text(
+        json.dumps(
+            {
+                "format": "mobius.model-package.v1",
+                "mtp_head": stale_name,
+            }
+        )
+    )
+    (tmp_path / stale_name).mkdir()
+    (tmp_path / stale_name / "stale.txt").write_text("stale")
+    if stale_layout == "extra":
+        (tmp_path / ".mobius-mtp").mkdir()
+        (tmp_path / ".mobius-mtp" / "orphan.txt").write_text("orphan")
+
+    if order == "config-before-save":
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        pkg.save(str(tmp_path), progress_bar=False, check_weights=False)
+    else:
+        pkg.save(str(tmp_path), progress_bar=False, check_weights=False)
+        result = write_ort_genai_config(pkg, str(tmp_path))
+
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+    with open(tmp_path / ".mobius-package.json", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    assert manifest["mtp_head"] == ".mobius-mtp"
+    assert mtp["model"]["filename"] == ".mobius-mtp/model.onnx"
+    assert mtp["num_nextn_predict_layers"] == 1
+    assert (tmp_path / ".mobius-mtp" / "model.onnx").is_file()
+    assert not (tmp_path / ".mobius-mtp" / "stale.txt").exists()
+    assert not (tmp_path / ".mobius-mtp" / "orphan.txt").exists()
+    assert not (tmp_path / ".stale-mtp").exists()
 
 
 @pytest.mark.parametrize(

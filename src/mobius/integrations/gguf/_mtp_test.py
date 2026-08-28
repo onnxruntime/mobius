@@ -641,8 +641,6 @@ class TestBuildMtpHead:
     def test_gguf_ort_package_emits_hashes_and_mtp_contract_without_allowlist(
         self, qwen35_mtp_gguf: Path, tmp_path: Path
     ):
-        import json
-
         from mobius.integrations.gguf import (
             build_from_gguf,
             write_gguf_runtime_package,

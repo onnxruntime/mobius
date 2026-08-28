@@ -676,7 +676,7 @@ def _copy_tokenizer_files(
     Returns list of copied filenames.
     """
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
 
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
@@ -692,7 +692,7 @@ def _copy_tokenizer_files(
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
-        except (EntryNotFoundError, OSError):
+        except (EntryNotFoundError, LocalEntryNotFoundError, OSError):
             continue
     return copied
 
@@ -1972,19 +1972,19 @@ def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
     return sorted(pairs, key=lambda pair: pair["input"])
 
 
-def _mtp_sidecar_model(pkg: ModelPackage, directory: str) -> tuple[Any, str, Any] | None:
-    """Resolve an attached or legacy component MTP graph and its saved path."""
+def _mtp_sidecar_model(pkg: ModelPackage) -> tuple[Any, str, Any] | None:
+    """Resolve an attached or legacy component MTP graph and its canonical saved path."""
     attached = getattr(pkg, "mtp_head", None)
     if attached is not None:
         if set(attached) != {"model"}:
             raise ValueError(
                 "ORT GenAI MTP metadata requires one sidecar component named 'model'"
             )
-        from mobius._model_package import _mtp_sidecar_name, _read_mtp_sidecar_name
+        from mobius._model_package import _mtp_sidecar_name
 
-        sidecar_name = _read_mtp_sidecar_name(directory)
-        if sidecar_name is None:
-            sidecar_name = _mtp_sidecar_name(pkg)
+        # ModelPackage.save() uses this same in-memory selector. An existing
+        # destination manifest may describe an older package and is never authoritative.
+        sidecar_name = _mtp_sidecar_name(pkg)
         return attached["model"], f"{sidecar_name}/model.onnx", attached.config
     if "mtp" in pkg:
         return pkg["mtp"], "mtp/model.onnx", getattr(pkg, "config", None)
@@ -1993,7 +1993,7 @@ def _mtp_sidecar_model(pkg: ModelPackage, directory: str) -> tuple[Any, str, Any
 
 def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
     """Write the external target/MTP coordination contract without claiming OGA support."""
-    resolved = _mtp_sidecar_model(pkg, directory)
+    resolved = _mtp_sidecar_model(pkg)
     if resolved is None:
         return None
     mtp_model, model_filename, proposer_config = resolved
@@ -2028,7 +2028,11 @@ def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
             getattr(
                 getattr(pkg, "config", None),
                 "num_nextn_predict_layers",
-                getattr(proposer_config, "num_hidden_layers", 1),
+                getattr(
+                    proposer_config,
+                    "num_nextn_predict_layers",
+                    getattr(proposer_config, "num_hidden_layers", 1),
+                ),
             )
         ),
         "shared_embedding": None if dedicated_embeddings else "model.embed_tokens",
