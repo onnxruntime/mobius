@@ -1581,7 +1581,7 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
             name="encode_local",
         )
         else_branch = op.builder.subgraph(
-            lambda branch_op: self._empty_local(branch_op),
+            self._empty_local,
             inputs=[],
             outputs=[ir.Value(name="empty_local_features")],
             name="skip_local",
@@ -2012,7 +2012,7 @@ class DeepSeekOCR2FullImageEncoder(nn.Module):
             name="encode_local",
         )
         else_branch = op.builder.subgraph(
-            lambda branch_op: self._empty_local(branch_op),
+            self._empty_local,
             inputs=[],
             outputs=[ir.Value(name="empty_local_features")],
             name="skip_local",
