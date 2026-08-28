@@ -207,15 +207,24 @@ def build_transformers_model(
         _default_task_for_model,
     )
 
+    detection_revision = revision
+    if model_id == "nvidia/RE-USE" and detection_revision is None:
+        # Pin the very first AutoConfig/raw-JSON probe, not only the later
+        # bespoke loader. Otherwise mutable Hub main could change dispatch
+        # before RE-USE's pinned default ever takes effect.
+        from mobius.models.reuse import REUSE_REVISION
+
+        detection_revision = REUSE_REVISION
+
     hf_config, loaded_from_raw_json = _load_transformers_config(
         model_id,
-        revision=revision,
+        revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
         from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
 
-        if module_class is None and _is_reuse_checkpoint(model_id, revision):
+        if module_class is None and _is_reuse_checkpoint(model_id, detection_revision):
             from mobius.tasks import SpeechEnhancementTask
 
             if task not in (None, "speech-enhancement") and not isinstance(
@@ -239,7 +248,7 @@ def build_transformers_model(
                 )
             return build_reuse(
                 model_id,
-                revision=revision,
+                revision=detection_revision,
                 dtype=dtype,
                 execution_provider=execution_provider,
                 load_weights=load_weights,
@@ -269,6 +278,12 @@ def build_transformers_model(
             dtype=dtype,
             load_weights=load_weights,
             execution_provider=execution_provider,
+        )
+
+    if input_sampling_rate is not None or bwe_sampling_rate is not None:
+        raise ValueError(
+            "input_sampling_rate and bwe_sampling_rate are only supported "
+            "for RE-USE speech-enhancement checkpoints"
         )
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)

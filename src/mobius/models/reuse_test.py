@@ -508,6 +508,39 @@ class TestBuildReUse:
         assert pkg.config.input_sampling_rate == 16_000
         assert pkg["model"].graph.inputs[0].shape[1] == 33
 
+    def test_canonical_detection_is_pinned_before_auto_config(self, monkeypatch):
+        from mobius.integrations.transformers import _builder
+
+        observed = {}
+
+        def _capture_probe(_model_id, *, revision, trust_remote_code):
+            observed["revision"] = revision
+            raise RuntimeError("stop after first probe")
+
+        monkeypatch.setattr(_builder, "_load_transformers_config", _capture_probe)
+
+        with pytest.raises(RuntimeError, match="stop after first probe"):
+            build("nvidia/RE-USE", load_weights=False)
+        assert observed["revision"] == REUSE_REVISION
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"input_sampling_rate": 16_000}, {"bwe_sampling_rate": 48_000}],
+    )
+    def test_rate_selection_is_rejected_for_transformers_models(self, monkeypatch, kwargs):
+        import types
+
+        from mobius.integrations.transformers import _builder
+
+        monkeypatch.setattr(
+            _builder,
+            "_load_transformers_config",
+            lambda *_args, **_kwargs: (types.SimpleNamespace(model_type="llama"), False),
+        )
+
+        with pytest.raises(ValueError, match="only supported for RE-USE"):
+            _builder.build_transformers_model("example/llama", load_weights=False, **kwargs)
+
     def test_public_build_accepts_task_object(self, tmp_path):
         pytest.importorskip("safetensors")
         checkpoint = self._checkpoint_dir(tmp_path)
