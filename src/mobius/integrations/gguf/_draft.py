@@ -17,6 +17,7 @@ from typing import Any
 from mobius._configs import DFlashConfig, Eagle3Config
 
 _DRAFT_ARCHITECTURES = frozenset({"dflash", "eagle3"})
+_DIRECT_DRAFT_RUNTIME_ARCHITECTURES = frozenset({"dflash", "eagle3"})
 _MAX_CONFIG_JSON_BYTES = 4 * 1024 * 1024
 _MAX_TOKENIZER_JSON_BYTES = 64 * 1024 * 1024
 _MAX_TOKENIZER_VOCAB_SIZE = 2_000_000
@@ -28,7 +29,7 @@ def is_draft_architecture(architecture: str) -> bool:
 
 def has_direct_draft_runtime(architecture: str) -> bool:
     """Return whether Mobius ships a target-paired direct ORT coordinator."""
-    return architecture in _DRAFT_ARCHITECTURES
+    return architecture in _DIRECT_DRAFT_RUNTIME_ARCHITECTURES
 
 
 def _ordered_tokenizer_vocab(

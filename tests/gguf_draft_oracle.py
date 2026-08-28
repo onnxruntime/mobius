@@ -350,6 +350,7 @@ class IndependentDraftOracle:
         block_size = self.contract["block_size"]
         if not isinstance(mask_id, int) or not isinstance(block_size, int):
             raise TypeError("DFlash raw GGUF contract is incomplete")
+        draft_history: list[tuple[dict[str, np.ndarray], int]] = []
         rounds = []
         while len(generated) < count:
             start = input_ids.shape[1] + len(generated) - 1
@@ -362,16 +363,13 @@ class IndependentDraftOracle:
             noise = _outputs(self.embedding, {"input_ids": block})["inputs_embeds"]
             past = _cache_length(draft_before)
             positions = np.arange(past, start + block_size, dtype=np.int64)[None, :]
-            draft_outputs = _outputs(
-                self.draft,
-                {
-                    "noise_embedding": noise,
-                    "target_hidden": target_hidden,
-                    "position_ids": positions,
-                    "q_position_ids": positions[:, -block_size:],
-                    **draft_before,
-                },
-            )
+            draft_feeds = {
+                "noise_embedding": noise,
+                "target_hidden": target_hidden,
+                "position_ids": positions,
+                "q_position_ids": positions[:, -block_size:],
+            }
+            draft_outputs = _outputs(self.draft, {**draft_feeds, **draft_before})
             draft_tentative = _present(draft_outputs, len(draft_before) // 2)
             proposal_logits = self._draft_logits(draft_outputs)[:, -block_size + 1 :]
             proposal_ids = np.argmax(proposal_logits, axis=-1).astype(np.int64)[0]
@@ -400,20 +398,17 @@ class IndependentDraftOracle:
                 start + accepted + 1,
             )
             draft_committed = _crop(draft_tentative, start)
-            replay_draft_outputs = _outputs(
-                self.draft,
-                {
-                    "noise_embedding": noise,
-                    "target_hidden": target_hidden,
-                    "position_ids": positions,
-                    "q_position_ids": positions[:, -block_size:],
-                    **draft_before,
-                },
-            )
-            draft_replay = _crop(
-                _present(replay_draft_outputs, len(draft_before) // 2),
-                start,
-            )
+            draft_history.append((draft_feeds, start))
+            draft_replay = _empty_cache(self.draft)
+            for historical_feeds, committed_length in draft_history:
+                replay_draft_outputs = _outputs(
+                    self.draft,
+                    {**historical_feeds, **draft_replay},
+                )
+                draft_replay = _crop(
+                    _present(replay_draft_outputs, len(draft_replay) // 2),
+                    committed_length,
+                )
             _assert_cache_equal(draft_committed, draft_replay)
             replay_tokens = (
                 np.argmax(replay_outputs["logits"], axis=-1).astype(np.int64)[0].tolist()
@@ -494,13 +489,21 @@ class IndependentDraftOracle:
             if value.name == "recycled_hidden"
         )
         draft_dtype = _input_dtype(self.draft, "fused_hidden")
+        draft_history: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         if input_ids.shape[1] > 1:
+            prefill_tokens = input_ids[:, 1:]
+            prefill_features = all_features[:, :-1]
+            prefill_recycled = np.zeros(
+                (1, input_ids.shape[1] - 1, hidden),
+                dtype=draft_dtype,
+            )
             _, draft_cache = self._run_eagle_step(
-                input_ids[:, 1:],
-                all_features[:, :-1],
-                np.zeros((1, input_ids.shape[1] - 1, hidden), dtype=draft_dtype),
+                prefill_tokens,
+                prefill_features,
+                prefill_recycled,
                 draft_cache,
             )
+            draft_history.append((prefill_tokens, prefill_features, prefill_recycled))
         pending = all_features[:, -1:]
         rounds = []
         while len(generated) < count:
@@ -556,18 +559,26 @@ class IndependentDraftOracle:
                 if accepted
                 else pending
             )
+            committed_tokens = np.array(committed_inputs, dtype=np.int64)
+            committed_recycled = np.zeros(
+                (1, accepted + 1, hidden),
+                dtype=draft_dtype,
+            )
             _, draft_committed = self._run_eagle_step(
-                np.array(committed_inputs, dtype=np.int64),
+                committed_tokens,
                 accepted_features,
-                np.zeros((1, accepted + 1, hidden), dtype=draft_dtype),
+                committed_recycled,
                 draft_before,
             )
-            _, draft_replay = self._run_eagle_step(
-                np.array(committed_inputs, dtype=np.int64),
-                accepted_features,
-                np.zeros((1, accepted + 1, hidden), dtype=draft_dtype),
-                draft_before,
-            )
+            draft_history.append((committed_tokens, accepted_features, committed_recycled))
+            draft_replay = _empty_cache(self.draft)
+            for replay_tokens, replay_features, replay_recycled in draft_history:
+                _, draft_replay = self._run_eagle_step(
+                    replay_tokens,
+                    replay_features,
+                    replay_recycled,
+                    draft_replay,
+                )
             _assert_cache_equal(draft_committed, draft_replay)
             replay_tokens = (
                 np.argmax(replay_outputs["logits"], axis=-1).astype(np.int64)[0].tolist()
