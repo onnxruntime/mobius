@@ -840,7 +840,9 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
                 "an F16, BF16, or F32 mmproj so every role is explicitly dequantized."
             )
 
-    if spec.primary_modality is MMProjModality.VISION:
+    if spec.projector_type == "dots3note_a":
+        _validate_supported_mmproj_shapes(mmproj_gguf, spec)
+    elif spec.primary_modality is MMProjModality.VISION:
         _validate_supported_mmproj_shapes(mmproj_gguf, spec)
     elif spec.primary_modality is MMProjModality.AUDIO:
         _validate_gemma4_audio_metadata(mmproj_gguf.metadata)
@@ -1670,6 +1672,7 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         from mobius.integrations.gguf._remaining_projectors import (
             validate_remaining_projector_shapes,
         )
+
         validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
         validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
     if spec.projector_type == "dots3note_a":

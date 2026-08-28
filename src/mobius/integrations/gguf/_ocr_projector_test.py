@@ -278,7 +278,7 @@ def test_real_header_requires_exact_boolean_presence(projector_type: str):
     modality = get_projector_spec(projector_type).primary_modality.value
     source.metadata[f"clip.has_{modality}_encoder"] = 1
 
-    with pytest.raises(ValueError, match=r"requires .*true"):
+    with pytest.raises(ValueError, match=r"requires .*true|must be boolean true"):
         _validate_mmproj_tensor_closure(source, get_projector_spec(projector_type))
 
 
