@@ -31,6 +31,15 @@ _COMPONENT_ATTRIBUTE_ALIASES = {
     "audio": "audio_encoder",
     "speech": "speech_encoder",
 }
+_TOKEN_EMBEDDING_NAMES = frozenset(
+    {
+        "embed_in",
+        "embed_tokens",
+        "shared",
+        "word_embeddings",
+        "wte",
+    }
+)
 _KNOWN_COMPONENT_NAMES = frozenset(
     {
         "model",
@@ -179,6 +188,18 @@ def _float_embedding(module: QuantizedEmbedding) -> Embedding:
     )
 
 
+def _embedding_layout_matches(
+    module: QuantizedEmbedding,
+    quantization: QuantizationConfig,
+) -> bool:
+    return (
+        quantization.quantize_embeddings
+        and module._bits == quantization.bits
+        and module._block_size == quantization.group_size
+        and (module.zero_points is None) is quantization.sym
+    )
+
+
 def _configure_component_module(
     component_module: nn.Module,
     config: BaseModelConfig,
@@ -233,6 +254,27 @@ def _configure_component_module(
         if isinstance(child, QuantizedEmbedding):
             if quantization is None or not quantization.quantize_embeddings:
                 replacements.append((name, _float_embedding(child)))
+            elif type(child).forward is not QuantizedEmbedding.forward:
+                if not _embedding_layout_matches(child, quantization):
+                    raise TypeError(
+                        f"Component plan cannot retarget specialized quantized "
+                        f"embedding {name!r} ({type(child).__name__}) to "
+                        f"{quantization.bits}-bit/group-{quantization.group_size}."
+                    )
+            elif not _embedding_layout_matches(child, quantization):
+                replacements.append(
+                    (
+                        name,
+                        QuantizedEmbedding(
+                            int(child.qweight.shape[0]),
+                            child._embedding_dim,
+                            bits=quantization.bits,
+                            block_size=quantization.group_size,
+                            has_zero_point=not quantization.sym,
+                            padding_idx=child.padding_idx,
+                        ),
+                    )
+                )
             continue
 
         if quantization is None:
@@ -241,7 +283,11 @@ def _configure_component_module(
             continue
         if name.split(".")[-1] in {"router", "shared_expert_gate"}:
             continue
-        if isinstance(child, Embedding) and type(child).forward is Embedding.forward:
+        if (
+            isinstance(child, Embedding)
+            and type(child).forward is Embedding.forward
+            and name.rsplit(".", 1)[-1] in _TOKEN_EMBEDDING_NAMES
+        ):
             if (
                 quantization.quantize_embeddings
                 and int(child.weight.shape[1]) % quantization.group_size == 0
@@ -343,8 +389,14 @@ def configure_component_quantization(
         )
 
 
-def _has_raw_packed_weight(names: Iterable[str]) -> bool:
-    return any(name.endswith(("_qweight", ".qweight")) for name in names)
+def _has_raw_packed_weight(
+    names: Iterable[str],
+    parameter_names: frozenset[str],
+) -> bool:
+    return any(
+        name.endswith(("_qweight", ".qweight")) and name not in parameter_names
+        for name in names
+    )
 
 
 def preprocess_component_quantized_state_dict(
@@ -361,6 +413,7 @@ def preprocess_component_quantized_state_dict(
     resolved_task = get_task(task)
     component_paths = _component_module_paths(module, resolved_task)
     component_names = tuple(component_names)
+    parameter_names = frozenset(name for name, _ in module.named_parameters())
     routing_prefixes = {
         component: {prefix for prefix in (component, component_paths.get(component)) if prefix}
         for component in component_names
@@ -395,7 +448,10 @@ def preprocess_component_quantized_state_dict(
                 for key, value in result.items()
                 if routed_component(key) == component
             }
-        if not component_weights or not _has_raw_packed_weight(component_weights):
+        if not component_weights or not _has_raw_packed_weight(
+            component_weights,
+            parameter_names,
+        ):
             continue
 
         quantization = _effective_component_quantization(module, config, component)
@@ -467,7 +523,11 @@ def preprocess_component_quantized_state_dict(
                 result.pop(key, None)
             result.update(converted)
     remaining_packed_key = next(
-        (key for key in result if key.endswith(("_qweight", ".qweight"))),
+        (
+            key
+            for key in result
+            if key.endswith(("_qweight", ".qweight")) and key not in parameter_names
+        ),
         None,
     )
     if remaining_packed_key is not None:

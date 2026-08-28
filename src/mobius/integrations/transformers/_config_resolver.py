@@ -16,7 +16,6 @@ __all__ = [
     "_try_load_config_json",
 ]
 
-import dataclasses
 import logging
 
 from mobius._configs import (
@@ -71,33 +70,6 @@ def _config_from_hf(hf_config, parent_config=None, module_class=None) -> BaseMod
     else:
         resolved = config_cls.from_transformers(hf_config)
 
-    quantization = resolved.quantization
-    if (
-        module_class is not None
-        and resolved.component_quantization is None
-        and quantization is not None
-        and quantization.has_module_plan
-    ):
-        source_config = parent_config or hf_config
-        model_type = getattr(source_config, "model_type", getattr(hf_config, "model_type", ""))
-        source_resolver = getattr(module_class, "get_hf_component_sources", None)
-        if source_resolver is not None:
-            component_sources = source_resolver(
-                model_type=model_type,
-                hf_config=source_config,
-            )
-        else:
-            component_sources = getattr(module_class, "HF_COMPONENT_SOURCES", {})
-        if component_sources:
-            component_quantization = quantization.for_components(component_sources)
-            resolved = dataclasses.replace(
-                resolved,
-                quantization=component_quantization.get(
-                    "decoder",
-                    component_quantization.get("model"),
-                ),
-                component_quantization=component_quantization,
-            )
     return resolved
 
 

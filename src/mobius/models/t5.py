@@ -13,7 +13,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import preprocess_quantized_weights
+from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, Linear
 from mobius.components._encoder_decoder_attention import (
@@ -543,12 +543,15 @@ class T5ForConditionalGeneration(nn.Module):
             new_name = _rename_t5_weight(name, is_gated_act=self.config.is_gated_act)
             if new_name is not None:
                 new_state_dict[new_name] = tensor
-        # Shared embeddings: encoder and decoder use the same embedding
-        if "encoder.embed_tokens.weight" not in new_state_dict:
-            shared = new_state_dict.get("shared.weight")
-            if shared is not None:
-                new_state_dict["encoder.embed_tokens.weight"] = shared
-                new_state_dict["decoder.embed_tokens.weight"] = shared
+        # Shared embedding float weights and packed sidecars belong to both
+        # component graphs. Keep each logical sidecar intact for the generic
+        # component-specific normalizer.
+        for name, tensor in list(new_state_dict.items()):
+            if not name.startswith("shared."):
+                continue
+            suffix = name[len("shared.") :]
+            new_state_dict.setdefault(f"encoder.embed_tokens.{suffix}", tensor)
+            new_state_dict.setdefault(f"decoder.embed_tokens.{suffix}", tensor)
         # Tied lm_head
         if "decoder.lm_head.weight" not in new_state_dict:
             embed = new_state_dict.get("encoder.embed_tokens.weight")
@@ -650,8 +653,12 @@ def _rename_t5_weight(name: str, *, is_gated_act: bool = False) -> str | None:
     # Keep shared embedding as-is for now (handled by preprocess_weights)
     if name == "shared.weight":
         return "shared.weight"
+    if name.startswith("shared.") and is_packed_quant_key(name):
+        return name
     if name == "lm_head.weight":
         return "decoder.lm_head.weight"
+    if name.startswith("lm_head.") and is_packed_quant_key(name):
+        return f"decoder.{name}"
 
     # encoder.block.{i}.layer.X.{...} or decoder.block.{i}.layer.X.{...}
     for prefix in ("encoder.", "decoder."):

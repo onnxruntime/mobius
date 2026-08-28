@@ -482,6 +482,85 @@ def test_qwen4_multimodal_build_streams_entire_package_without_eager_loader(
     }
 
 
+def test_qwen4_affine_component_plan_fails_before_weight_loading(
+    monkeypatch,
+) -> None:
+    text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
+    parent_config = type(
+        "Qwen4ExpParent",
+        (),
+        {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": text_config,
+            "vision_config": object(),
+            "quantization_config": None,
+        },
+    )()
+    decoder_quantization = QuantizationConfig(
+        bits=4,
+        group_size=32,
+        quant_method="olive",
+    )
+    config = make_config(
+        model_type="qwen4_exp",
+        quantization=decoder_quantization,
+        component_quantization={"decoder": decoder_quantization},
+    )
+    package = ModelPackage(
+        {
+            name: ir.Model(ir.Graph([], [], nodes=[], name=name), ir_version=11)
+            for name in ("decoder", "vision_encoder", "embedding")
+        },
+        config=config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (text_config, parent_config, "qwen4_exp"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            _DummyModule,
+            "qwen4-exp-vision-language",
+            "qwen4_exp",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda *args, **kwargs: package,
+    )
+    download = mock.Mock()
+    monkeypatch.setattr(transformers_builder, "_download_weights", download)
+
+    with (
+        mock.patch(
+            "mobius.integrations.transformers._qwen4_exp_weights."
+            "stream_qwen4_exp_safetensors_to_package"
+        ) as stream,
+        pytest.raises(NotImplementedError, match="packed expert"),
+    ):
+        transformers_builder.build_transformers_model(
+            "Qwen/Qwen3.8-Flash-Next",
+        )
+
+    stream.assert_not_called()
+    download.assert_not_called()
+
+
 def test_transformers_build_routes_compressed_tensors_to_streaming_loader(
     monkeypatch,
 ) -> None:

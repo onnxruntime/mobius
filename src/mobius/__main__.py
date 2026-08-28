@@ -389,7 +389,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
         compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
-        config = _config_from_hf(hf_config, parent_config=parent_config)
+        module_class = registry.get(model_type)
+        config = _config_from_hf(
+            hf_config,
+            parent_config=parent_config,
+            module_class=module_class,
+        )
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
         elif compressed_tensors_config is not None and keep_quantized:
@@ -425,7 +430,6 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
             task = _default_task_for_model(model_type)
-        module_class = registry.get(model_type)
         model_module = module_class(config)
         pkg = build_from_module(
             model_module,

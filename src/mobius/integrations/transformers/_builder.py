@@ -30,6 +30,20 @@ from mobius.tasks import ModelTask
 logger = logging.getLogger(__name__)
 
 
+def _uses_affine_checkpoint_loader(config: object) -> bool:
+    """Whether config requires the generic Olive/GPTQ/AWQ packed loader."""
+    component_quantization = getattr(config, "component_quantization", None)
+    quantizations = (
+        component_quantization.values()
+        if component_quantization is not None
+        else (getattr(config, "quantization", None),)
+    )
+    return any(
+        quantization is not None and quantization.quant_method in {"olive", "gptq", "awq"}
+        for quantization in quantizations
+    )
+
+
 def _is_qwen4_exp_composite(config) -> bool:
     """Return whether *config* describes the multimodal Qwen4-Exp wrapper."""
     return getattr(config, "model_type", None) == "qwen4_exp" or (
@@ -346,6 +360,16 @@ def build_transformers_model(
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
+        if model_type in {
+            "qwen4_exp",
+            "qwen4_exp_text",
+        } and _uses_affine_checkpoint_loader(config):
+            raise NotImplementedError(
+                "Affine per-component Qwen4-Exp loading is blocked until its "
+                "packed expert, fused indexer, and split-embedding adapters "
+                "are implemented. Use the unquantized BF16 checkpoint or the "
+                "supported block-FP8/QDQ route."
+            )
         if config.block_quant_scheme is not None and hasattr(
             model_module, "build_fp8_streaming_plan"
         ):

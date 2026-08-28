@@ -10,6 +10,10 @@ import dataclasses
 import torch
 
 from mobius._builder import build_from_module
+from mobius._component_quantization import (
+    configure_component_quantization,
+    preprocess_component_quantized_state_dict,
+)
 from mobius._configs import ArchitectureConfig, QuantizationConfig, VisionConfig
 from mobius.models.qwen_vl import (
     Qwen3VL3ModelCausalLMModel,
@@ -155,6 +159,49 @@ class TestQwen25VLCausalLMModelTiedWeights:
             and node.attributes["block_size"].as_int() == 16
             for node in package["embedding"].graph
         )
+
+    def test_packed_embedding_routes_only_to_embedding_component(self):
+        decoder = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            sym=True,
+        )
+        config = dataclasses.replace(
+            _BASE_CONFIG,
+            tie_word_embeddings=False,
+            quantization=decoder,
+            component_quantization={
+                "decoder": decoder,
+                "embedding": QuantizationConfig(
+                    bits=2,
+                    group_size=16,
+                    quant_method="olive",
+                    sym=True,
+                    quantize_embeddings=True,
+                ),
+            },
+        )
+        model = Qwen25VLCausalLMModel(config)
+        configure_component_quantization(model, config, "qwen-vl")
+        renamed = model.preprocess_weights(
+            {
+                "model.embed_tokens.weight_qweight": torch.zeros(100, 16, dtype=torch.uint8),
+                "model.embed_tokens.weight_scales": torch.ones(100, 4),
+            }
+        )
+
+        assert not any(key.startswith("decoder.") for key in renamed)
+        result = preprocess_component_quantized_state_dict(
+            renamed,
+            model,
+            config,
+            "qwen-vl",
+            ("decoder", "vision_encoder", "embedding"),
+        )
+
+        assert result["embedding.embed_tokens.qweight"].shape == (100, 16)
+        assert result["embedding.embed_tokens.scales"].shape == (100, 4)
 
 
 class TestQwen25VLDecoderModelTiedWeights:

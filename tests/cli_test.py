@@ -249,6 +249,47 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_local_config_resolves_model_config_with_module_class(self, tmp_path):
+        from mobius._model_package import ModelPackage
+        from mobius._registry import registry
+        from mobius._testing import make_config
+
+        hf_config = SimpleNamespace(model_type="qwen2")
+        output_dir = tmp_path / "output"
+
+        def resolve_config(config, *, parent_config, module_class):
+            assert config is hf_config
+            assert parent_config is hf_config
+            assert module_class is registry.get("qwen2")
+            return make_config(model_type="qwen2")
+
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=hf_config,
+            ),
+            mock.patch(
+                "mobius.__main__._config_from_hf",
+                side_effect=resolve_config,
+            ) as resolve,
+            mock.patch(
+                "mobius.__main__.build_from_module",
+                return_value=ModelPackage({}),
+            ),
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(output_dir),
+                    "--no-weights",
+                ]
+            )
+
+        resolve.assert_called_once()
+
     def test_text_only_with_component_errors(self):
         """The text-only feature is rejected when combined with --component."""
         with (

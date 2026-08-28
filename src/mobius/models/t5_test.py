@@ -55,6 +55,7 @@ def test_t5_encoder_and_decoder_use_independent_quantization():
         group_size=16,
         quant_method="olive",
         sym=True,
+        quantize_embeddings=True,
     )
     config = ArchitectureConfig(
         hidden_size=64,
@@ -76,6 +77,7 @@ def test_t5_encoder_and_decoder_use_independent_quantization():
                 group_size=32,
                 quant_method="olive",
                 sym=True,
+                quantize_embeddings=True,
             ),
             "decoder": decoder,
         },
@@ -99,6 +101,64 @@ def test_t5_encoder_and_decoder_use_independent_quantization():
 
     assert layouts("encoder") == {(8, 32)}
     assert layouts("decoder") == {(4, 16)}
+
+    def embedding_layout(component: str) -> tuple[int, int]:
+        node = next(
+            node for node in package[component].graph if node.op_type == "GatherBlockQuantized"
+        )
+        return (
+            node.attributes["bits"].as_int(),
+            node.attributes["block_size"].as_int(),
+        )
+
+    assert embedding_layout("encoder") == (8, 32)
+    assert embedding_layout("decoder") == (4, 16)
+
+
+def test_t5_component_preprocess_preserves_packed_shared_and_head_sidecars():
+    from mobius._configs import ArchitectureConfig, QuantizationConfig
+    from mobius.models.t5 import T5ForConditionalGeneration
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+    )
+    config = ArchitectureConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_decoder_layers=1,
+        vocab_size=256,
+        hidden_act="gelu",
+        quantization=quantization,
+        component_quantization={
+            "encoder": quantization,
+            "decoder": quantization,
+        },
+    )
+    qweight = torch.zeros(256, 32, dtype=torch.uint8)
+    scales = torch.ones(256, 4)
+
+    result = T5ForConditionalGeneration(config).preprocess_weights(
+        {
+            "shared.weight_qweight": qweight,
+            "shared.weight_scales": scales,
+            "lm_head.weight_qweight": qweight,
+            "lm_head.weight_scales": scales,
+        }
+    )
+
+    assert result["encoder.embed_tokens.weight_qweight"] is qweight
+    assert result["encoder.embed_tokens.weight_scales"] is scales
+    assert result["decoder.embed_tokens.weight_qweight"] is qweight
+    assert result["decoder.embed_tokens.weight_scales"] is scales
+    assert result["decoder.lm_head.weight_qweight"] is qweight
+    assert result["decoder.lm_head.weight_scales"] is scales
 
 
 def test_t5_encoder_is_public_and_consumes_attention_mask():

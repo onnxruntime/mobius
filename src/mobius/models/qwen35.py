@@ -34,6 +34,7 @@ from mobius.models.qwen_vl import (
     Qwen3VLEmbeddingModel,
     Qwen3VLVisionEncoderModel,
     _QwenVLTextMixin,
+    _route_split_embedding_weight,
     split_per_layer_inputs,
 )
 
@@ -643,8 +644,14 @@ class Qwen35VL3ModelCausalLMModel(nn.Module):
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
                 suffix = stripped[len("language_model.") :]
-                renamed[f"decoder.model.{suffix}"] = value
-                renamed[f"embedding.{suffix}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.model.{suffix}",
+                    embedding_name=f"embedding.{suffix}",
+                    config=self.config,
+                )
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("lm_head."):
@@ -890,8 +897,14 @@ class Qwen35MoEVL3ModelCausalLMModel(nn.Module):
                 renamed[f"vision_encoder.{stripped}"] = value
             elif stripped.startswith("language_model.embed_tokens."):
                 suffix = stripped[len("language_model.") :]
-                renamed[f"decoder.model.{suffix}"] = value
-                renamed[f"embedding.{suffix}"] = value
+                _route_split_embedding_weight(
+                    renamed,
+                    key,
+                    value,
+                    decoder_name=f"decoder.model.{suffix}",
+                    embedding_name=f"embedding.{suffix}",
+                    config=self.config,
+                )
             elif stripped.startswith("language_model.lm_head."):
                 renamed[f"decoder.{stripped[len('language_model.') :]}"] = value
             elif stripped.startswith("lm_head."):

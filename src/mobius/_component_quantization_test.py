@@ -16,7 +16,13 @@ from mobius._component_quantization import (
 )
 from mobius._configs import ArchitectureConfig, QuantizationConfig
 from mobius._model_package import ModelPackage
-from mobius.components import Linear, QuantizedLinear, make_quantized_linear_factory
+from mobius.components import (
+    Embedding,
+    Linear,
+    QuantizedEmbedding,
+    QuantizedLinear,
+    make_quantized_linear_factory,
+)
 from mobius.tasks import ComponentSpec, ModelTask
 
 
@@ -169,3 +175,28 @@ def test_single_graph_uses_decoder_layout_and_ignores_split_metadata():
 
     assert isinstance(module.proj, QuantizedLinear)
     assert (module.proj._bits, module.proj._block_size) == (4, 16)
+
+
+def test_quantize_embeddings_only_rewrites_input_token_table():
+    class _EmbeddingModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = Embedding(256, 64)
+            self.embed_positions = Embedding(128, 64)
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        quantize_embeddings=True,
+    )
+    config = ArchitectureConfig(
+        quantization=quantization,
+        component_quantization={"model": quantization},
+    )
+    module = _EmbeddingModule()
+
+    configure_component_quantization(module, config, _SingleTask())
+
+    assert isinstance(module.embed_tokens, QuantizedEmbedding)
+    assert type(module.embed_positions) is Embedding
