@@ -681,6 +681,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     target_gguf = getattr(args, "target_gguf", None)
     runtime = getattr(args, "runtime", None)
     draft_pair = target_gguf is not None
+    requested_pair_runtime = runtime if draft_pair else None
 
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -782,7 +783,13 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         if draft_pair:
             from mobius.integrations.gguf import write_draft_pair_package
 
-            artifacts = write_draft_pair_package(pkg, output_dir, **save_kwargs)
+            artifacts = write_draft_pair_package(
+                pkg,
+                output_dir,
+                requested_runtime=requested_pair_runtime,
+                runtime_version=getattr(args, "runtime_version", None),
+                **save_kwargs,
+            )
         else:
             if getattr(pkg, "export_report", None) is None:
                 os.makedirs(output_dir, exist_ok=True)

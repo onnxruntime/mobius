@@ -207,8 +207,7 @@
           "model.onnx.data",
           "quantization_report.json"
         ],
-        "draft_sha256": "bc75c475debeef5258de42e8039717472b1c8832a8d7278b8b957c007a9648b4",
-        "direct_runner_package_sha256": "fda1bb9ece19ef378ed09d122ef82169c49a28062519f5a03b1ec79aa2938f8f"
+        "draft_sha256": "bc75c475debeef5258de42e8039717472b1c8832a8d7278b8b957c007a9648b4"
       },
       "direct_ort_result": {
         "generated_token_count": 32,

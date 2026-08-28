@@ -116,7 +116,7 @@ def _installed_version(distribution: str) -> str | None:
         return None
 
 
-def _mtp_cache_ports(model: Any) -> list[dict[str, str]]:
+def _cache_ports(model: Any) -> list[dict[str, str]]:
     output_names = {value.name for value in model.graph.outputs if value.name is not None}
     pairs: list[dict[str, str]] = []
     for value in model.graph.inputs:
@@ -216,12 +216,12 @@ def _write_mtp_runtime_status(
         "cache_namespaces": {
             "target": {
                 "namespace": "target",
-                "ports": _mtp_cache_ports(pkg["model"]),
+                "ports": _cache_ports(pkg["model"]),
             },
             "mtp": {
                 "namespace": "mtp",
                 "model": f"{sidecar_name}/model.onnx",
-                "ports": _mtp_cache_ports(pkg.mtp_head["model"]),
+                "ports": _cache_ports(pkg.mtp_head["model"]),
             },
         },
         "runtime": {

@@ -895,6 +895,10 @@ def test_cli_exposes_explicit_target_config() -> None:
             "target/config.json",
             "--target-gguf",
             "target.gguf",
+            "--runtime",
+            "ort-genai",
+            "--runtime-version",
+            "0.15.2",
             "--output",
             "out",
         ]
@@ -944,6 +948,10 @@ def test_cli_target_pair_uses_hashed_pair_writer(tmp_path: Path, monkeypatch) ->
             "target-config",
             "--target-gguf",
             "target.gguf",
+            "--runtime",
+            "ort-genai",
+            "--runtime-version",
+            "0.15.2",
             "--output",
             str(output),
         ]
@@ -952,6 +960,8 @@ def test_cli_target_pair_uses_hashed_pair_writer(tmp_path: Path, monkeypatch) ->
     assert captured["package"] is package
     assert captured["output"] == output
     assert captured["kwargs"]["external_data"] == "onnx"
+    assert captured["kwargs"]["requested_runtime"] == "ort-genai"
+    assert captured["kwargs"]["runtime_version"] == "0.15.2"
 
 
 @pytest.mark.parametrize("existing_output", [False, True])

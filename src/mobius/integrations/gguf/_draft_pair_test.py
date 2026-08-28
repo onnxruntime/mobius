@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,7 +19,11 @@ from mobius.integrations.gguf._draft_pair import (
     write_draft_pair_package,
 )
 from mobius.integrations.gguf._draft_runtime import DraftPairRunner
-from mobius.integrations.gguf._runtime_evidence import gguf_graph_package_identity
+from mobius.integrations.gguf._runtime_evidence import (
+    GGUFArtifactIdentity,
+    gguf_graph_package_identity,
+)
+from mobius.integrations.gguf._runtime_package import _sha256_file
 
 
 def _empty_model(name: str) -> ir.Model:
@@ -41,6 +46,50 @@ def _external_data_model(name: str) -> ir.Model:
         opset_imports={"": 24},
     )
     return ir.Model(graph, ir_version=11)
+
+
+def _pair_manifest() -> dict:
+    return {
+        "format_version": 1,
+        "kind": "speculative-draft",
+        "architecture": "eagle3",
+        "artifacts": {
+            "target": {"sha256": "a" * 64},
+            "draft": {"sha256": "b" * 64},
+        },
+        "components": {
+            "target": {"artifact": "target/model.onnx"},
+            "draft": {"artifact": "draft/model.onnx"},
+        },
+        "cache_namespaces": {
+            "target": {"namespace": "target", "ports": []},
+            "draft": {"namespace": "draft", "ports": []},
+        },
+    }
+
+
+@pytest.fixture(autouse=True)
+def _stable_pair_sources(monkeypatch):
+    source = SimpleNamespace(source_matches_path=lambda: True)
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._draft_pair._validate_pair_sources",
+        lambda _package: (source, source),
+    )
+
+
+def _refresh_runtime_status(output: Path) -> None:
+    manifest_path = output / "draft_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    status_path = output / "draft_runtime_status.json"
+    status = json.loads(status_path.read_text())
+    runtime_files = tuple(status["runtime_payload"]["files"])
+    status["runtime_payload"]["sha256"] = gguf_graph_package_identity(
+        output,
+        files=runtime_files,
+    ).sha256
+    status["graph_package"] = manifest["graph_package"]
+    status["config_sha256"]["draft_manifest.json"] = _sha256_file(manifest_path)
+    status_path.write_text(json.dumps(status))
 
 
 def test_target_artifact_validation_binds_config_and_tokenizer() -> None:
@@ -82,13 +131,103 @@ def test_draft_pair_rejects_unfeedable_bfloat16_before_build() -> None:
         )
 
 
+def test_draft_pair_reuses_preflighted_source_models(monkeypatch) -> None:
+    tokens = ["a", "b", "c"]
+    target_source = SimpleNamespace(
+        architecture="qwen3",
+        metadata={"tokenizer.ggml.tokens": tokens},
+        source_matches_path=lambda: True,
+    )
+    draft_source = SimpleNamespace(
+        architecture="eagle3",
+        source_matches_path=lambda: True,
+    )
+    draft = ModelPackage({"model": _empty_model("draft")})
+    draft.config = SimpleNamespace()
+    draft.gguf_source_path = "draft-resolved.gguf"
+    draft.draft_manifest = {
+        "target": {
+            "model_type": "qwen3",
+            "hidden_size": 8,
+            "num_hidden_layers": 2,
+            "vocab_size": 3,
+            "target_layers": [0],
+            "tokenizer_tokens_sha256": _tokenizer_digest(tokens),
+        },
+        "orchestration": {
+            "embedding_source": "target",
+            "lm_head_source": "target",
+        },
+    }
+    target = ModelPackage(
+        {
+            "model": _empty_model("target"),
+            "embedding": _empty_model("embedding"),
+            "lm_head": _empty_model("lm_head"),
+        }
+    )
+    target.config = SimpleNamespace(
+        model_type="qwen3",
+        hidden_size=8,
+        num_hidden_layers=2,
+        vocab_size=3,
+        bos_token_id=None,
+        eos_token_id=None,
+        pad_token_id=None,
+    )
+    target.gguf_source_path = "target-resolved.gguf"
+    builds = []
+
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._draft_pair._resolve_gguf_path",
+        lambda path, _keep: f"{path}-resolved.gguf",
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._draft_pair.open_gguf_model",
+        lambda path: target_source if str(path).startswith("target") else draft_source,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._draft_pair._require_single_file_model",
+        lambda model, **_kwargs: model,
+    )
+
+    def build(path, **kwargs):
+        builds.append((str(path), kwargs))
+        return target if str(path).startswith("target") else draft
+
+    monkeypatch.setattr("mobius.integrations.gguf._draft_pair.build_from_gguf", build)
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._draft_pair.gguf_artifact_identity",
+        lambda path, model, architecture: GGUFArtifactIdentity(
+            architecture=architecture,
+            filename=Path(path).name,
+            size=1,
+            sha256=("a" if architecture == "qwen3" else "b") * 64,
+            tensor_count=1,
+            tensor_qtypes=(("F32", 1),),
+        ),
+    )
+
+    package = build_draft_pair_from_gguf(
+        "target",
+        "draft",
+        target_config="target-config",
+    )
+
+    assert builds[0][1]["_gguf_model"] is draft_source
+    assert builds[1][1]["_gguf_model"] is target_source
+    assert set(package) == {
+        "target",
+        "draft",
+        "target_embedding",
+        "target_lm_head",
+    }
+    assert set(package.draft_manifest["cache_namespaces"]) == {"target", "draft"}
+
+
 def test_write_draft_pair_package_persists_manifest(tmp_path) -> None:
     package = ModelPackage({"target": _empty_model("target"), "draft": _empty_model("draft")})
-    package.draft_manifest = {
-        "format_version": 1,
-        "kind": "speculative-draft",
-        "architecture": "eagle3",
-    }
+    package.draft_manifest = _pair_manifest()
     output = tmp_path / "package"
 
     result = write_draft_pair_package(
@@ -104,19 +243,17 @@ def test_write_draft_pair_package_persists_manifest(tmp_path) -> None:
     assert len(package.draft_manifest["graph_package"]["sha256"]) == 64
     assert (output / "target" / "model.onnx").is_file()
     assert (output / "draft" / "model.onnx").is_file()
+    status = json.loads((output / "draft_runtime_status.json").read_text())
+    assert status["status"] == "runtime_unvalidated"
+    assert status["graph_package"] == package.draft_manifest["graph_package"]
+    assert status["runtime_payload"]["excludes"] == "draft_runtime_status.json"
+    assert set(status["cache_namespaces"]) == {"target", "draft"}
+    assert result["draft_runtime_status"] == str(output / "draft_runtime_status.json")
 
 
 def test_runner_rejects_component_outside_verified_file_set(tmp_path) -> None:
     package = ModelPackage({"target": _empty_model("target"), "draft": _empty_model("draft")})
-    package.draft_manifest = {
-        "format_version": 1,
-        "kind": "speculative-draft",
-        "architecture": "eagle3",
-        "components": {
-            "target": {"artifact": "target/model.onnx"},
-            "draft": {"artifact": "draft/model.onnx"},
-        },
-    }
+    package.draft_manifest = _pair_manifest()
     output = tmp_path / "package"
     write_draft_pair_package(
         package,
@@ -128,8 +265,28 @@ def test_runner_rejects_component_outside_verified_file_set(tmp_path) -> None:
     manifest = json.loads(manifest_path.read_text())
     manifest["components"]["target"]["artifact"] = "unverified.onnx"
     manifest_path.write_text(json.dumps(manifest))
+    _refresh_runtime_status(output)
 
     with pytest.raises(ValueError, match="outside the verified graph package"):
+        DraftPairRunner(output)
+
+
+def test_runner_rejects_manifest_tampering_outside_status_hash(tmp_path) -> None:
+    package = ModelPackage({"target": _empty_model("target"), "draft": _empty_model("draft")})
+    package.draft_manifest = _pair_manifest()
+    output = tmp_path / "package"
+    write_draft_pair_package(
+        package,
+        output,
+        progress_bar=False,
+        check_weights=False,
+    )
+    manifest_path = output / "draft_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["draft_to_target"] = [1, 0]
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="identity mismatch"):
         DraftPairRunner(output)
 
 
@@ -140,15 +297,7 @@ def test_runner_rejects_unverified_external_data(tmp_path) -> None:
             "draft": _empty_model("draft"),
         }
     )
-    package.draft_manifest = {
-        "format_version": 1,
-        "kind": "speculative-draft",
-        "architecture": "eagle3",
-        "components": {
-            "target": {"artifact": "target/model.onnx"},
-            "draft": {"artifact": "draft/model.onnx"},
-        },
-    }
+    package.draft_manifest = _pair_manifest()
     output = tmp_path / "package"
     write_draft_pair_package(package, output, progress_bar=False)
     manifest_path = output / "draft_manifest.json"
@@ -162,6 +311,7 @@ def test_runner_rejects_unverified_external_data(tmp_path) -> None:
         "sha256": identity.sha256,
     }
     manifest_path.write_text(json.dumps(manifest))
+    _refresh_runtime_status(output)
 
     with pytest.raises(ValueError, match="external data is outside"):
         DraftPairRunner(output)

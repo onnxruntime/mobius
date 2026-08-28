@@ -383,6 +383,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         self.draft_config: object | None = None
         self.draft_pair_quantization_reports: dict[str, GGUFQuantizationReport | None] = {}
         self.gguf_architecture: str | None = None
+        self.gguf_execution_provider: str | None = None
         self.gguf_source_path: str | None = None
         self.gguf_target_source_path: str | None = None
         self.policy_components = dict(policy_components or {})

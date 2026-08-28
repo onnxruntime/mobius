@@ -9,6 +9,8 @@ __all__ = ["build_draft_pair_from_gguf", "write_draft_pair_package"]
 
 import copy
 import dataclasses
+import json
+import logging
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -20,8 +22,16 @@ from mobius.integrations.gguf._builder import _resolve_gguf_path, build_from_ggu
 from mobius.integrations.gguf._draft import _tokenizer_digest, _validate_special_ids
 from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+from mobius.integrations.gguf._runtime_package import (
+    _cache_ports,
+    _installed_version,
+    _publish_directory_no_replace,
+    _sha256_file,
+)
 from mobius.integrations.gguf._shard_set import open_gguf_model
 from mobius.tasks import DraftTargetCausalLMTask
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _require_single_file_model(model: Any, *, role: str) -> GGUFModel:
@@ -65,25 +75,6 @@ def _validate_target_artifact(
         raise ValueError(
             "target GGUF tokenizer does not match the exact tokenizer bound to the draft"
         )
-
-
-def _cache_contract(model: Any, *, namespace: str) -> dict[str, Any]:
-    inputs = [
-        value for value in model.graph.inputs if value.name.startswith("past_key_values.")
-    ]
-    outputs = [value for value in model.graph.outputs if value.name.startswith("present.")]
-    if len(inputs) != len(outputs) or len(inputs) % 2:
-        raise ValueError(f"{namespace} graph has an incomplete dynamic KV-cache contract")
-    return {
-        "namespace": namespace,
-        "layers": len(inputs) // 2,
-        "input_prefix": "past_key_values",
-        "output_prefix": "present",
-        "batch_axis": 0,
-        "sequence_axis": 2,
-        "rollback": "slice each present cache to the accepted sequence length",
-        "reorder": "permute every cache tensor on batch axis 0",
-    }
 
 
 def build_draft_pair_from_gguf(
@@ -194,8 +185,16 @@ def build_draft_pair_from_gguf(
             ),
             "components": component_manifest,
             "cache_namespaces": {
-                "target": _cache_contract(components["target"], namespace="target"),
-                "draft": _cache_contract(components["draft"], namespace="draft"),
+                "target": {
+                    "namespace": "target",
+                    "model": "target/model.onnx",
+                    "ports": _cache_ports(components["target"]),
+                },
+                "draft": {
+                    "namespace": "draft",
+                    "model": "draft/model.onnx",
+                    "ports": _cache_ports(components["draft"]),
+                },
             },
             "artifacts": {
                 "target": dataclasses.asdict(target_identity),
@@ -211,6 +210,7 @@ def build_draft_pair_from_gguf(
     package.draft_manifest = draft_manifest
     package.draft_config = draft_package.config
     package.gguf_architecture = draft_source.architecture
+    package.gguf_execution_provider = execution_provider
     if not target_source.source_matches_path() or not draft_source.source_matches_path():
         raise ValueError("target or draft GGUF changed while its pair identity was bound")
     package.gguf_source_path = str(Path(resolved_draft).resolve())
@@ -218,9 +218,98 @@ def build_draft_pair_from_gguf(
     return package
 
 
+def _write_draft_runtime_status(
+    stage: Path,
+    *,
+    package: ModelPackage,
+    graph_identity: Any,
+    runtime_payload_identity: Any,
+    requested_runtime: str | None,
+    runtime_version: str | None,
+) -> str:
+    manifest = package.draft_manifest
+    if manifest is None:
+        raise ValueError("Draft runtime status requires a pairing manifest")
+    payload = {
+        "schema_version": 1,
+        "status": "runtime_unvalidated",
+        "artifacts": manifest["artifacts"],
+        "graph_package": {
+            "files": list(graph_identity.files),
+            "sha256": graph_identity.sha256,
+        },
+        "runtime_payload": {
+            "files": list(runtime_payload_identity.files),
+            "sha256": runtime_payload_identity.sha256,
+            "excludes": "draft_runtime_status.json",
+        },
+        "config_sha256": {"draft_manifest.json": _sha256_file(stage / "draft_manifest.json")},
+        "cache_namespaces": manifest["cache_namespaces"],
+        "runtime": {
+            "name": requested_runtime or "onnxruntime",
+            "requested_version": runtime_version,
+            "direct_executor": "onnxruntime",
+            "installed_onnxruntime_version": _installed_version("onnxruntime"),
+            "installed_ort_genai_version": _installed_version("onnxruntime-genai"),
+            "execution_provider": package.gguf_execution_provider,
+            "orchestration": "external",
+            "higher_level_status": "runtime_unvalidated",
+        },
+        "validated_claims": {
+            "artifact_identity": True,
+            "graph_serialization": True,
+            "cache_namespace_separation": True,
+            "runtime_execution": False,
+            "source_value_fidelity": False,
+            "storage_fidelity": False,
+            "target_only_output_equality": False,
+        },
+    }
+    path = stage / "draft_runtime_status.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _LOGGER.warning(
+        "Published target and draft ONNX graphs with runtime_unvalidated higher-level "
+        "coordination metadata; direct ORT evidence remains artifact-scoped."
+    )
+    return str(path)
+
+
+def _validate_pair_sources(package: ModelPackage) -> tuple[GGUFModel, GGUFModel]:
+    manifest = package.draft_manifest
+    if manifest is None:
+        raise ValueError("Draft package source validation requires a pairing manifest")
+    paths = {
+        "target": package.gguf_target_source_path,
+        "draft": package.gguf_source_path,
+    }
+    models = {}
+    for role, source_path in paths.items():
+        if source_path is None:
+            raise ValueError(f"Draft package lost its {role} GGUF source path")
+        model = _require_single_file_model(open_gguf_model(source_path), role=role)
+        expected = manifest["artifacts"][role]
+        current = dataclasses.asdict(
+            gguf_artifact_identity(
+                Path(source_path),
+                model,
+                architecture=model.architecture,
+                filename=expected["filename"],
+            )
+        )
+        if current != expected:
+            raise ValueError(f"Draft package {role} GGUF no longer matches its build identity")
+        if not model.source_matches_path():
+            raise ValueError(f"Draft package {role} GGUF changed during validation")
+        models[role] = model
+    return models["target"], models["draft"]
+
+
 def write_draft_pair_package(
     package: ModelPackage,
     output_dir: str | Path,
+    *,
+    requested_runtime: str | None = None,
+    runtime_version: str | None = None,
     **save_kwargs: Any,
 ) -> dict[str, str]:
     """Serialize a draft pair and its required orchestration manifest."""
@@ -231,6 +320,7 @@ def write_draft_pair_package(
         raise FileExistsError(f"draft pair package already exists: {output}")
     if package.draft_manifest is None:
         raise ValueError("draft pair package has no draft_manifest")
+    target_source, draft_source = _validate_pair_sources(package)
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(
         tempfile.mkdtemp(
@@ -242,7 +332,11 @@ def write_draft_pair_package(
     report_names: dict[str, str] = {}
     published = False
     try:
+        if not target_source.source_matches_path() or not draft_source.source_matches_path():
+            raise ValueError("target or draft GGUF changed before package serialization")
         package.save(str(stage), **save_kwargs)
+        if not target_source.source_matches_path() or not draft_source.source_matches_path():
+            raise ValueError("target or draft GGUF changed during package serialization")
         for role, report in package.draft_pair_quantization_reports.items():
             if report is None:
                 continue
@@ -260,10 +354,17 @@ def write_draft_pair_package(
             "sha256": graph_identity.sha256,
         }
         write_draft_manifest(manifest, stage)
-        from mobius.integrations.gguf._runtime_package import (
-            _publish_directory_no_replace,
+        runtime_payload_identity = gguf_graph_package_identity(stage)
+        status_path = _write_draft_runtime_status(
+            stage,
+            package=package,
+            graph_identity=graph_identity,
+            runtime_payload_identity=runtime_payload_identity,
+            requested_runtime=requested_runtime,
+            runtime_version=runtime_version,
         )
-
+        if not target_source.source_matches_path() or not draft_source.source_matches_path():
+            raise ValueError("target or draft GGUF changed while runtime metadata was written")
         _publish_directory_no_replace(stage, output)
         published = True
     finally:
@@ -272,5 +373,6 @@ def write_draft_pair_package(
     return {
         "package": str(output),
         "manifest": str(output / "draft_manifest.json"),
+        "draft_runtime_status": str(output / Path(status_path).name),
         **{key: str(output / name) for key, name in report_names.items()},
     }

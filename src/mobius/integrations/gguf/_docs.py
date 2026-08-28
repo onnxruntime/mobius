@@ -778,7 +778,7 @@ a proven graph: the API returns the model, emits one structured warning, omits a
 and persists the exact component disposition in `export_report.json`. Lossy qtype
 conversion remains in `quantization_report.json`; use `keep_quantized=False` for float.
 
-For target-coupled DFlash/EAGLE3, use `build_draft_pair_from_gguf`, `write_draft_pair_package`, and `DraftPairRunner`; the package carries independent caches and required target bridges, while `runtime_unvalidated` warns about higher-level runtimes without gating direct ORT. CLI: `mobius build-gguf draft.gguf --target-gguf target.gguf --target-config target-config --output output`.
+For target-coupled DFlash/EAGLE3, use `build_draft_pair_from_gguf`, `write_draft_pair_package`, and `DraftPairRunner`; the package carries independent caches, required target bridges, and an MTP-aligned `draft_runtime_status.json`, while `runtime_unvalidated` warns about higher-level runtimes without gating direct ORT. CLI: `mobius build-gguf draft.gguf --target-gguf target.gguf --target-config target-config --output output`.
 
 Packed MatMulNBits storage may use a native op or portable nibble unpack,
 `DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.

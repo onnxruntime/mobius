@@ -45,24 +45,29 @@ class DraftGenerationResult:
     stats: DraftGenerationStats
 
 
-def _read_manifest(package_dir: Path) -> tuple[dict[str, Any], tuple[str, ...], str]:
+def _read_bounded_json(
+    package_dir: Path,
+    filename: str,
+    *,
+    limit: int,
+) -> dict[str, Any]:
     if package_dir.is_symlink() or not package_dir.is_dir():
         raise ValueError("draft package root must be a real directory")
-    path = package_dir / "draft_manifest.json"
+    path = package_dir / filename
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ValueError("draft package requires a regular draft_manifest.json") from error
+        raise ValueError(f"draft package requires a regular {filename}") from error
     try:
         before = _descriptor_identity(descriptor)
-        manifest_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(manifest_stat.st_mode):
-            raise ValueError("draft_manifest.json must be a regular file")
-        if manifest_stat.st_size > 8 * 1024 * 1024:
-            raise ValueError("draft_manifest.json exceeds the 8 MiB limit")
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"{filename} must be a regular file")
+        if file_stat.st_size > limit:
+            raise ValueError(f"{filename} exceeds its {limit}-byte limit")
         chunks = []
-        remaining = manifest_stat.st_size + 1
+        remaining = file_stat.st_size + 1
         while remaining:
             chunk = os.read(descriptor, remaining)
             if not chunk:
@@ -70,19 +75,30 @@ def _read_manifest(package_dir: Path) -> tuple[dict[str, Any], tuple[str, ...], 
             chunks.append(chunk)
             remaining -= len(chunk)
         payload = b"".join(chunks)
-        if len(payload) != manifest_stat.st_size:
-            raise ValueError("draft_manifest.json changed size while it was read")
+        if len(payload) != file_stat.st_size:
+            raise ValueError(f"{filename} changed size while it was read")
         if _descriptor_identity(descriptor) != before:
-            raise ValueError("draft_manifest.json changed while it was read")
+            raise ValueError(f"{filename} changed while it was read")
         current = os.open(path, flags)
         try:
             if _descriptor_identity(current) != before:
-                raise ValueError("draft_manifest.json was replaced while it was read")
+                raise ValueError(f"{filename} was replaced while it was read")
         finally:
             os.close(current)
     finally:
         os.close(descriptor)
     value = json.loads(payload)
+    if not isinstance(value, dict):
+        raise TypeError(f"{filename} root must be an object")
+    return value
+
+
+def _read_manifest(package_dir: Path) -> tuple[dict[str, Any], tuple[str, ...], str]:
+    value = _read_bounded_json(
+        package_dir,
+        "draft_manifest.json",
+        limit=8 * 1024 * 1024,
+    )
     if not isinstance(value, dict) or value.get("kind") != "speculative-draft":
         raise ValueError("draft_manifest.json is not a speculative-draft manifest")
     graph_package = value.get("graph_package")
@@ -101,6 +117,34 @@ def _read_manifest(package_dir: Path) -> tuple[dict[str, Any], tuple[str, ...], 
         raise ValueError("draft graph_package files must be sorted and unique")
     if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
         raise ValueError("draft graph_package SHA-256 must be lowercase hexadecimal")
+    return value, selected, sha256
+
+
+def _read_runtime_status(package_dir: Path) -> tuple[dict[str, Any], tuple[str, ...], str]:
+    value = _read_bounded_json(
+        package_dir,
+        "draft_runtime_status.json",
+        limit=1024 * 1024,
+    )
+    if value.get("schema_version") != 1 or value.get("status") != "runtime_unvalidated":
+        raise ValueError("draft_runtime_status.json has an invalid status contract")
+    runtime_payload = value.get("runtime_payload")
+    if not isinstance(runtime_payload, dict):
+        raise TypeError("draft runtime status has no runtime_payload identity")
+    files = runtime_payload.get("files")
+    sha256 = runtime_payload.get("sha256")
+    if (
+        not isinstance(files, list)
+        or any(not isinstance(name, str) for name in files)
+        or not isinstance(sha256, str)
+        or runtime_payload.get("excludes") != "draft_runtime_status.json"
+    ):
+        raise ValueError("draft runtime status has an invalid runtime_payload identity")
+    selected = tuple(files)
+    if selected != tuple(sorted(selected)) or len(selected) != len(set(selected)):
+        raise ValueError("draft runtime payload files must be sorted and unique")
+    if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+        raise ValueError("draft runtime payload SHA-256 must be lowercase hexadecimal")
     return value, selected, sha256
 
 
@@ -294,16 +338,42 @@ class DraftPairRunner:
         import onnxruntime as ort
 
         source_package_dir = Path(package_dir)
-        self.manifest, verified_files, expected_sha256 = _read_manifest(source_package_dir)
+        self.runtime_status, runtime_files, runtime_sha256 = _read_runtime_status(
+            source_package_dir
+        )
         self._snapshot = tempfile.TemporaryDirectory(prefix="mobius-draft-pair-")
         self.package_dir = Path(self._snapshot.name)
         _snapshot_graph_package(
             source_package_dir,
-            verified_files,
-            expected_sha256,
+            runtime_files,
+            runtime_sha256,
             self.package_dir,
         )
-        self._verified_files = frozenset(verified_files)
+        self.manifest, graph_files, graph_sha256 = _read_manifest(self.package_dir)
+        graph_package = {
+            "files": list(graph_files),
+            "sha256": graph_sha256,
+        }
+        if self.runtime_status.get("graph_package") != graph_package:
+            raise ValueError("draft manifest and runtime status graph identities disagree")
+        config_hashes = self.runtime_status.get("config_sha256")
+        if not isinstance(config_hashes, dict):
+            raise TypeError("draft runtime status has no config_sha256 map")
+        from mobius.integrations.gguf._runtime_evidence import (
+            gguf_graph_package_identity,
+        )
+        from mobius.integrations.gguf._runtime_package import _sha256_file
+
+        manifest_sha256 = _sha256_file(self.package_dir / "draft_manifest.json")
+        if config_hashes.get("draft_manifest.json") != manifest_sha256:
+            raise ValueError("draft manifest hash does not match runtime status")
+        graph_identity = gguf_graph_package_identity(
+            self.package_dir,
+            files=graph_files,
+        )
+        if graph_identity.sha256 != graph_sha256:
+            raise ValueError("draft graph package does not match its manifest identity")
+        self._verified_files = frozenset(graph_files)
         components = self.manifest.get("components")
         if not isinstance(components, dict):
             raise TypeError("draft manifest has no component map")
