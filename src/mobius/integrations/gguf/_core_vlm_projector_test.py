@@ -19,6 +19,7 @@ from mobius.components import Gemma4AudioEncoder
 from mobius.integrations.gguf._core_vlm_projector import (
     _Gemma4ProjectorConfig,
     _load_core_vlm_projector_weights,
+    _ProjectorConfig,
     core_vlm_projector_fingerprint,
     map_core_vlm_projector_tensor,
     read_core_vlm_projector_config,
@@ -400,6 +401,78 @@ def test_route_fingerprint_includes_projector_discriminator():
     assert core_vlm_projector_fingerprint(idefics, "idefics3") != (
         core_vlm_projector_fingerprint(internvl, "internvl")
     )
+
+
+def _tiled_vision_config(projector_type: str) -> _ProjectorConfig:
+    return _ProjectorConfig(
+        model_type=projector_type,
+        hidden_size=6,
+        vision=VisionConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            image_size=8,
+            patch_size=2,
+            norm_eps=1e-5,
+            mm_tokens_per_image=4,
+            model_type=projector_type,
+            head_dim=4,
+            rope_theta=10_000.0 if projector_type == "llama4" else None,
+            out_hidden_size=6,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            hidden_act="gelu" if projector_type != "idefics3" else "gelu_pytorch_tanh",
+            projector_intermediate_size=7 if projector_type == "llama4" else None,
+        ),
+    )
+
+
+@pytest.mark.parametrize("projector_type", ["idefics3", "internvl", "llama4"])
+@pytest.mark.parametrize("num_tiles", [1, 3])
+def test_tiled_vision_routes_preserve_processor_order_and_cardinality(
+    projector_type,
+    num_tiles,
+):
+    config = _tiled_vision_config(projector_type)
+    module = CoreVLMProjectorModel(config, projector_type)
+    package = build_from_module(
+        GGUFVisionProjectorModel(module.vision_encoder),
+        config,
+        task=GGUFVisionProjectorTask(),
+    )
+    model = package["vision_encoder"]
+    pixel_values = model.graph.inputs[0]
+    assert str(pixel_values.shape[0]) == "num_tiles"
+    assert len(model.graph.outputs[0].shape) == 2
+    assert model.graph.metadata_props["mobius.pipeline.when_present"] == "image"
+
+    rng = np.random.default_rng(100 + num_tiles)
+    for name, initializer in model.graph.initializers.items():
+        if initializer.const_value is not None:
+            continue
+        shape = tuple(int(dim) for dim in initializer.shape)
+        values = rng.normal(0.0, 0.05, shape).astype(np.float32)
+        if name.endswith(".weight") and ("norm" in name or ".ln" in name):
+            values += 1.0
+        initializer.const_value = ir.tensor(values)
+
+    session = ort.InferenceSession(
+        ir.serde.serialize_model(model).SerializeToString(),
+        providers=["CPUExecutionProvider"],
+    )
+    tiles = rng.normal(size=(num_tiles, 3, 8, 8)).astype(np.float32)
+    (actual,) = session.run(None, {"pixel_values": tiles})
+    independent = np.concatenate(
+        [
+            session.run(None, {"pixel_values": tiles[index : index + 1]})[0]
+            for index in range(num_tiles)
+        ],
+        axis=0,
+    )
+
+    assert actual.shape == (num_tiles * 4, 6)
+    np.testing.assert_allclose(actual, independent, rtol=2e-5, atol=2e-5)
 
 
 def _layer_norm(x, weight, bias, eps=1e-6):

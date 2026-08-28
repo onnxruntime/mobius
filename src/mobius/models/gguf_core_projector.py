@@ -46,8 +46,13 @@ class _Idefics3VisionEncoder(nn.Module):
             grid_size=grid,
             scale_factor=merge,
         )
+        self._output_hidden_size = config.hidden_size
         self.input_schema = (
-            ("pixel_values", ir.DataType.FLOAT, (1, 3, vision.image_size, vision.image_size)),
+            (
+                "pixel_values",
+                ir.DataType.FLOAT,
+                ("num_tiles", 3, vision.image_size, vision.image_size),
+            ),
         )
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
@@ -55,9 +60,11 @@ class _Idefics3VisionEncoder(nn.Module):
             pixel_values,
             self.vision_tower.embeddings.patch_embedding.projection.weight,
         )
-        return op.Squeeze(
+        # [tiles, rows_per_tile, hidden] -> [tiles * rows_per_tile, hidden].
+        # Reshape preserves processor tile order, then raster order within each tile.
+        return op.Reshape(
             self.projector(op, self.vision_tower(op, pixel_values)),
-            [0],
+            [-1, self._output_hidden_size],
         )
 
 
@@ -77,8 +84,13 @@ class _InternVLVisionEncoder(nn.Module):
             grid_size=grid,
             scale_factor=merge,
         )
+        self._output_hidden_size = config.hidden_size
         self.input_schema = (
-            ("pixel_values", ir.DataType.FLOAT, (1, 3, vision.image_size, vision.image_size)),
+            (
+                "pixel_values",
+                ir.DataType.FLOAT,
+                ("num_tiles", 3, vision.image_size, vision.image_size),
+            ),
         )
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
@@ -89,7 +101,12 @@ class _InternVLVisionEncoder(nn.Module):
         hidden_states = self.vision_tower(op, pixel_values)
         # llama.cpp drops the appended CLS row after the encoder.
         hidden_states = op.Slice(hidden_states, [0], [-1], [1])
-        return op.Squeeze(self.projector(op, hidden_states), [0])
+        # Flatten tiles without inserting separators: InternVL's processor
+        # already orders refined raster tiles before the overview tile.
+        return op.Reshape(
+            self.projector(op, hidden_states),
+            [-1, self._output_hidden_size],
+        )
 
 
 class _Llama4VisionEncoder(nn.Module):
@@ -109,8 +126,13 @@ class _Llama4VisionEncoder(nn.Module):
             grid_size=grid,
             scale_factor=merge,
         )
+        self._output_hidden_size = config.hidden_size
         self.input_schema = (
-            ("pixel_values", ir.DataType.FLOAT, (1, 3, vision.image_size, vision.image_size)),
+            (
+                "pixel_values",
+                ir.DataType.FLOAT,
+                ("num_tiles", 3, vision.image_size, vision.image_size),
+            ),
         )
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
@@ -118,9 +140,10 @@ class _Llama4VisionEncoder(nn.Module):
             pixel_values,
             self.vision_tower.embeddings.patch_embedding,
         )
-        return op.Squeeze(
+        # Tile-major flattening preserves the processor's exact crop/overview order.
+        return op.Reshape(
             self.projector(op, self.vision_tower(op, pixel_values)),
-            [0],
+            [-1, self._output_hidden_size],
         )
 
 

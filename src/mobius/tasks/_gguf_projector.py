@@ -11,6 +11,7 @@ from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
+from mobius._pipeline_contract import declare_component_presence
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 
 
@@ -50,6 +51,7 @@ class GGUFVisionProjectorTask(ModelTask):
         }
         image_features = vision_encoder(builder.op, **inputs)
         builder.add_output(image_features, "image_features")
+        declare_component_presence(graph, "image")
         return ModelPackage({"vision_encoder": _make_model(graph)}, config=config)
 
 
