@@ -59,7 +59,7 @@ def resolve_tokenizer_export_verdict(
     verdict: GGUFTokenizerVerdict | None = None,
     artifact_identity: Any | None = None,
 ) -> GGUFTokenizerVerdict:
-    """Add an exact artifact blocker to an otherwise validated tokenizer verdict."""
+    """Apply exact artifact evidence to promote or block a tokenizer verdict."""
     if verdict is None:
         verdict = inspect_gguf_tokenizer(gguf_model.metadata, source=str(source_path))
     if verdict.materialized or verdict.metadata_sha256 is None:

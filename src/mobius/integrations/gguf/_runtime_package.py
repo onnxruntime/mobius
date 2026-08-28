@@ -427,6 +427,7 @@ def write_gguf_runtime_package(
         or built_verdict.metadata_sha256 != verdict.metadata_sha256
         or built_verdict.route != verdict.route
         or built_verdict.evidence_id != verdict.evidence_id
+        or built_verdict.tokenizer_sha256 != verdict.tokenizer_sha256
     ):
         raise ValueError(
             "The GGUF tokenizer metadata no longer matches the identity captured during "
