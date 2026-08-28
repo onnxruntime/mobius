@@ -13,7 +13,7 @@ gguf:
   tensor_count: 16
   tensor_qtypes: {IQ4_NL: 2, Q2_K: 9, Q3_K: 4, Q6_K: 1}
   execution_provider: "cpu"
-  config_sha256: "c9c78c440503e25fbc21ccab096099de5af2c9edcd0fe677ef6cda14b4db8785"
+  config_sha256: "c02542bb6b7c076f641ff0724409471deefb0782eab37dff076e80746a59652f"
   preserve_quantization: false
   tokenizer:
     repository: "hyper-accel/tiny-random-olmo"

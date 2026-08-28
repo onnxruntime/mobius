@@ -1401,6 +1401,28 @@ class TestDefaultActivation:
         assert _default_activation(model_type) == "silu"
 
 
+def test_qwen3_qk_norm_weights_have_graph_consumers() -> None:
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+    tensor_names = [
+        "token_embd.weight",
+        "output.weight",
+        *[
+            f"blk.{layer}.{name}.weight"
+            for layer in range(2)
+            for name in ("attn_q_norm", "attn_k_norm")
+        ],
+    ]
+    config = gguf_to_config(_FakeDenseGGUF("qwen3", _dense_metadata("qwen3"), tensor_names))
+
+    assert config.attn_qk_norm is True
+    assert config.attn_qk_norm_full is False
+    module = registry.get(config.model_type)(config)
+    for layer in module.model.layers:
+        assert layer.self_attn.q_norm is not None
+        assert layer.self_attn.k_norm is not None
+
+
 class TestQwen35MtpBlockExclusion:
     """Qwen3.5/3.8 GGUF ``block_count`` includes trailing MTP (nextn) blocks.
 

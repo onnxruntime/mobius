@@ -660,6 +660,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="qwen3",
         model_type="qwen3",
         tensor_map_recipe=("llama", "moe_qk_norm_extras"),
+        config_postprocessor="qwen3",
         runtime=Support.DEFERRED,
         reason=_RUNTIME_VALIDATION_PENDING,
     ),

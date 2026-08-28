@@ -13,7 +13,7 @@ gguf:
   tensor_count: 149
   tensor_qtypes: {F32: 99, Q2_K: 25, Q3_K: 24, Q6_K: 1}
   execution_provider: "cpu"
-  config_sha256: "173924af09598a5e4b2e3b7cf3c3b365b2a2bcc4655ac834266ff0c9b5b1948b"
+  config_sha256: "1e0363dbc5f3427d873aeb46c27d5713ae0668f0e7cf695b5dde00bdd4d390a6"
   preserve_quantization: false
   tokenizer:
     repository: "Xenova/gpt2"

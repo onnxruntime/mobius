@@ -13,7 +13,7 @@ gguf:
   tensor_count: 8
   tensor_qtypes: {F32: 3, IQ4_NL: 3, Q3_K: 1, Q8_0: 1}
   execution_provider: "default"
-  config_sha256: "4933f8f8a982696a9838977476d09c0cbac9dd4107233cd58109cdf43863c1e5"
+  config_sha256: "7239b094edec93d3b29e2ffc53b08be450cb7c8536dd93120c4db618d47cd4f3"
   preserve_quantization: false
   tokenizer:
     repository: "echarlaix/tiny-mpt-random-remote-code"

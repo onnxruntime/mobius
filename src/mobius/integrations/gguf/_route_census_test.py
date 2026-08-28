@@ -120,6 +120,10 @@ def test_recent_pr_reconciliation_is_explicit() -> None:
         (675, "merged"),
         (672, "merged"),
         (674, "merged"),
+        (677, "merged"),
+        (678, "merged"),
+        (679, "merged"),
+        (680, "merged"),
     ]
 
 

@@ -1533,6 +1533,15 @@ def _moe_postprocess(
     return dataclasses.replace(config, **updates)
 
 
+def _qwen3_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Apply Qwen3's per-head Q/K normalization omitted by GGUF metadata."""
+    return dataclasses.replace(config, attn_qk_norm=True, attn_qk_norm_full=False)
+
+
 def _dbrx_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -4716,6 +4725,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "phimoe": _phimoe_postprocess,
     "pangu_embedded": _pangu_embedded_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
+    "qwen3": _qwen3_postprocess,
     "gemma2": _gemma2_postprocess,
     "baichuan": _baichuan_postprocess,
     "chatglm": _chatglm_postprocess,

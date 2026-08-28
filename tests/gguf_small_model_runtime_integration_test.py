@@ -96,7 +96,7 @@ _CASES = (
         reference_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
         prompt="Once upon a time,",
         tensor_qtypes={"F16": 211, "F32": 61},
-        config_sha256="d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886",
+        config_sha256="9f917f4a59c907325a069735b9a5d07177f3d665b5e812c10b626ecf1c94708e",
         generated_tokens=(
             665,
             436,
@@ -154,7 +154,7 @@ _CASES = (
         reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
         prompt="Here is my poem:",
         tensor_qtypes={"F16": 211, "F32": 61},
-        config_sha256="f9ceb816433d5aa32918761944be76ecdb090df8cce7cdb64d5d8f9186f7117f",
+        config_sha256="089d097c1394a74ee386c1d6e2651474bee77d38a8bc0b5d813594c1fede3054",
         generated_tokens=(
             198,
             198,
@@ -214,7 +214,7 @@ _Q4_K_M_CASE = _RuntimeCase(
     reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
     prompt="Here is my poem:",
     tensor_qtypes={"F32": 61, "Q4_K": 16, "Q5_0": 166, "Q6_K": 14, "Q8_0": 15},
-    config_sha256="f9ceb816433d5aa32918761944be76ecdb090df8cce7cdb64d5d8f9186f7117f",
+    config_sha256="089d097c1394a74ee386c1d6e2651474bee77d38a8bc0b5d813594c1fede3054",
     generated_tokens=(198, 198, 18, 504, 2388, 13685, 284, 5208, 28, 198),
     tokenizer_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
     tokenizer_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",

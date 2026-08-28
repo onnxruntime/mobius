@@ -13,7 +13,7 @@ gguf:
   tensor_count: 244
   tensor_qtypes: {F32: 163, Q2_K: 40, Q3_K: 40, Q6_K: 1}
   execution_provider: "cpu"
-  config_sha256: "000f66e571d4b349283fe1d8caafa0557b51074d0761b8c3dab2ce3ba25ed00b"
+  config_sha256: "45f95ad88af3f5378bdfacd633f1717012e1f3699bbe880af4f6d29fd79f2d4f"
   preserve_quantization: false
   tokenizer:
     repository: "bigcode/tiny_starcoder_py"

@@ -13,7 +13,7 @@ gguf:
   tensor_count: 76
   tensor_qtypes: {F32: 50, Q2_K: 13, Q3_K: 12, Q6_K: 1}
   execution_provider: "default"
-  config_sha256: "f2f74586b219624d24f5f929ed910a9660d16fe055b5d1239f28fdac39adc14f"
+  config_sha256: "19607e074d570fe92a572204c482e7fde81dd3f7d6d29758fd36dc4a89ba6153"
   preserve_quantization: false
   tokenizer:
     repository: "EleutherAI/pythia-70m"
