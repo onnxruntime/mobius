@@ -72,8 +72,7 @@ class _Llama4VisionRoPE2D(nn.Module):
             raise ValueError(f"Llama4 vision head_dim must be divisible by 4, got {head_dim}")
         spatial_dim = head_dim // 2
         inv_freq = 1.0 / (
-            rope_theta
-            ** (np.arange(0, spatial_dim, 2, dtype=np.float32) / float(spatial_dim))
+            rope_theta ** (np.arange(0, spatial_dim, 2, dtype=np.float32) / float(spatial_dim))
         )
         positions: np.ndarray = np.arange(grid_size + 1, dtype=np.float32)
         angles = np.outer(positions, inv_freq)

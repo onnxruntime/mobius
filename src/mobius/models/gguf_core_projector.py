@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
@@ -30,8 +30,6 @@ from mobius.models.gemma4 import (
 )
 from mobius.models.internvl import _InternVisionModel
 
-if TYPE_CHECKING:
-    import onnx_ir as ir
 
 class _Idefics3VisionEncoder(nn.Module):
     def __init__(self, config: ArchitectureConfig):
@@ -214,9 +212,7 @@ class CoreVLMProjectorModel(nn.Module):
         super().__init__()
         self.projector_type = projector_type
         if projector_type == "gemma3nv":
-            self.vision_encoder = _Gemma3nVisionSidecar(
-                cast(Gemma3nMultiModalConfig, config)
-            )
+            self.vision_encoder = _Gemma3nVisionSidecar(cast(Gemma3nMultiModalConfig, config))
         elif projector_type == "gemma3na":
             self.audio_encoder = _Gemma3nAudioEncoderModel(
                 cast(Gemma3nMultiModalConfig, config)
@@ -224,13 +220,9 @@ class CoreVLMProjectorModel(nn.Module):
         elif projector_type == "gemma4a":
             self.audio_encoder = _Gemma4AudioEncoderModel(cast(Gemma4Config, config))
         elif projector_type == "gemma4uv":
-            self.vision_encoder = _Gemma4UnifiedVisionSidecar(
-                cast(Gemma4Config, config)
-            )
+            self.vision_encoder = _Gemma4UnifiedVisionSidecar(cast(Gemma4Config, config))
         elif projector_type == "gemma4ua":
-            self.audio_encoder = _Gemma4UnifiedAudioEmbedderModel(
-                cast(Gemma4Config, config)
-            )
+            self.audio_encoder = _Gemma4UnifiedAudioEmbedderModel(cast(Gemma4Config, config))
         elif projector_type == "idefics3":
             self.vision_encoder = _Idefics3VisionEncoder(config)
         elif projector_type == "internvl":

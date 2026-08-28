@@ -31,7 +31,9 @@ class SpatialPixelUnshuffle(nn.Module):
     def __init__(self, grid_height: int, grid_width: int, scale_factor: int):
         super().__init__()
         if grid_height <= 0 or grid_width <= 0 or scale_factor <= 1:
-            raise ValueError("Pixel-unshuffle grid dimensions and scale factor must be positive")
+            raise ValueError(
+                "Pixel-unshuffle grid dimensions and scale factor must be positive"
+            )
         if grid_height % scale_factor or grid_width % scale_factor:
             raise ValueError(
                 f"{grid_height}x{grid_width} patch grid is not divisible by "

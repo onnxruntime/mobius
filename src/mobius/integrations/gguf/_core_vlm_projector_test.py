@@ -259,9 +259,7 @@ def test_similar_projectors_do_not_alias_tensor_families():
     assert map_core_vlm_projector_tensor("a.blk.0.attn_q.weight", "gemma4ua") is None
     assert map_core_vlm_projector_tensor("v.blk.0.attn_q.weight", "llama4")
     assert map_core_vlm_projector_tensor("v.blk.0.attn_q.weight", "pixtral")
-    assert (
-        map_core_vlm_projector_tensor("v.blk.0.attn_q.bias", "pixtral") is None
-    )
+    assert map_core_vlm_projector_tensor("v.blk.0.attn_q.bias", "pixtral") is None
 
 
 def test_gemma3n_audio_loader_reverses_baked_softplus():

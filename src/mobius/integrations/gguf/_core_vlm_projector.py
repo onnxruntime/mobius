@@ -63,7 +63,9 @@ _PIXTRAL_BLOCK_SUFFIXES = frozenset(
 class _ProjectorConfig(ArchitectureConfig):
     def validate(self) -> None:
         if self.hidden_size <= 0 or self.vision is None:
-            raise ValueError("Vision projector config requires positive output width and vision data.")
+            raise ValueError(
+                "Vision projector config requires positive output width and vision data."
+            )
 
 
 @dataclasses.dataclass
@@ -120,9 +122,7 @@ def _vision_config(mmproj_gguf: Any, *, projector_type: str):
 
     projector_intermediate = None
     if projector_type == "llama4":
-        projector_intermediate = int(
-            mmproj_gguf.get_tensor_shape("mm.model.mlp.1.weight")[0]
-        )
+        projector_intermediate = int(mmproj_gguf.get_tensor_shape("mm.model.mlp.1.weight")[0])
 
     return VisionConfig(
         hidden_size=hidden,
@@ -217,7 +217,9 @@ def _gemma4_audio_config(mmproj_gguf: Any, *, unified: bool):
                 "clip.audio.feed_forward_length",
             )
         ):
-            raise ValueError("gemma4ua is encoder-free and requires zero audio block/FFN counts.")
+            raise ValueError(
+                "gemma4ua is encoder-free and requires zero audio block/FFN counts."
+            )
         if int(md["clip.audio.num_mel_bins"]) != 128:
             raise ValueError("gemma4ua expects the converter's 128-bin metadata sentinel.")
         return Gemma4AudioConfig(
@@ -524,9 +526,7 @@ def map_core_vlm_projector_tensor(name: str, projector_type: str) -> str | None:
             suffix = suffix.replace("ls2.weight", "ls2")
             return f"vision_encoder.vision_tower.encoder.layers.{index}.{suffix}"
         return {
-            "v.class_embd": (
-                "vision_encoder.vision_tower.embeddings.class_embedding"
-            ),
+            "v.class_embd": ("vision_encoder.vision_tower.embeddings.class_embedding"),
             "v.patch_embd.weight": (
                 "vision_encoder.vision_tower.embeddings.patch_embedding.weight"
             ),
@@ -555,9 +555,7 @@ def map_core_vlm_projector_tensor(name: str, projector_type: str) -> str | None:
             suffix = suffix.replace("ffn_down.", "mlp.down_proj.")
             return f"vision_encoder.vision_tower.encoder.{index}.{suffix}"
         return {
-            "v.patch_embd.weight": (
-                "vision_encoder.vision_tower.embeddings.patch_embedding"
-            ),
+            "v.patch_embd.weight": ("vision_encoder.vision_tower.embeddings.patch_embedding"),
             "v.class_embd": "vision_encoder.vision_tower.embeddings.class_embedding",
             "v.position_embd.weight": (
                 "vision_encoder.vision_tower.embeddings.position_embedding"
@@ -626,7 +624,7 @@ def _static_parameter_shape(parameter: Any) -> tuple[int, ...]:
     shape = []
     for dim in parameter.shape:
         if not isinstance(dim, int):
-            raise ValueError("Core VLM projector parameter dimensions must be integers.")
+            raise TypeError("Core VLM projector parameter dimensions must be integers.")
         shape.append(dim)
     return tuple(shape)
 
@@ -682,8 +680,8 @@ def validate_core_vlm_projector_shapes(mmproj_gguf: Any, projector_type: str) ->
             if match is not None:
                 key = (int(match.group(1)), match.group(3))
                 parts = intern_qkv.setdefault(key, [None, None, None])
-                parts[{"q": 0, "k": 1, "v": 2}[match.group(2)]] = (
-                    mmproj_gguf.get_tensor_shape(name)
+                parts[{"q": 0, "k": 1, "v": 2}[match.group(2)]] = mmproj_gguf.get_tensor_shape(
+                    name
                 )
                 continue
 
@@ -716,14 +714,14 @@ def validate_core_vlm_projector_shapes(mmproj_gguf: Any, projector_type: str) ->
         assert first is not None
         if any(part[1:] != first[1:] for part in parts if part is not None):
             raise ValueError(f"InternVL layer {layer} QKV {kind} shapes disagree.")
-        mapped[
-            f"vision_encoder.vision_tower.encoder.layers.{layer}.attn.qkv.{kind}"
-        ] = (sum(part[0] for part in parts if part is not None), *first[1:])
+        mapped[f"vision_encoder.vision_tower.encoder.layers.{layer}.attn.qkv.{kind}"] = (
+            sum(part[0] for part in parts if part is not None),
+            *first[1:],
+        )
 
     if projector_type == "gemma4uv":
         position = tuple(
-            int(dim)
-            for dim in mmproj_gguf.get_tensor_shape("v.position_embd.weight")
+            int(dim) for dim in mmproj_gguf.get_tensor_shape("v.position_embd.weight")
         )
         mapped["vision_encoder.pos_emb_x.weight"] = (position[1], position[2])
         mapped["vision_encoder.pos_emb_y.weight"] = (position[1], position[2])
@@ -769,8 +767,8 @@ def _load_core_vlm_projector_weights(mmproj_gguf: Any, projector_type: str) -> d
             name == "v.conv_stem.conv.bias" or name.endswith(".layer_scale.gamma")
         ):
             values = values.reshape(-1)
-        elif projector_type in {"gemma3na", "gemma4a"} and (
-            name.endswith("per_dim_scale") or name.endswith("per_dim_scale.weight")
+        elif projector_type in {"gemma3na", "gemma4a"} and name.endswith(
+            ("per_dim_scale", "per_dim_scale.weight")
         ):
             # The converter stores softplus(raw); the ONNX components apply
             # softplus at runtime, so restore the trainable pre-softplus value.
@@ -799,12 +797,14 @@ def _load_core_vlm_projector_weights(mmproj_gguf: Any, projector_type: str) -> d
             if any(part is None for part in parts):
                 raise ValueError(f"InternVL layer {layer} has an incomplete fused QKV {kind}.")
             arrays = [part for part in parts if part is not None]
-            state[
-                f"vision_encoder.vision_tower.encoder.layers.{layer}.attn.qkv.{kind}"
-            ] = torch.from_numpy(np.concatenate(arrays, axis=0).copy())
+            state[f"vision_encoder.vision_tower.encoder.layers.{layer}.attn.qkv.{kind}"] = (
+                torch.from_numpy(np.concatenate(arrays, axis=0).copy())
+            )
 
     if projector_type == "gemma4uv":
-        position = np.array(mmproj_gguf.get_tensor("v.position_embd.weight")).astype(np.float32)
+        position = np.array(mmproj_gguf.get_tensor("v.position_embd.weight")).astype(
+            np.float32
+        )
         state["vision_encoder.pos_emb_x.weight"] = torch.from_numpy(position[0].copy())
         state["vision_encoder.pos_emb_y.weight"] = torch.from_numpy(position[1].copy())
     return state
@@ -835,9 +835,7 @@ def build_core_vlm_projector_mmproj(
     resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
     target_architecture = _canonical_text_architecture(target_architecture)
     mmproj_gguf = (
-        _mmproj_gguf_model
-        if _mmproj_gguf_model is not None
-        else GGUFModel(resolved_path)
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
     )
     config = read_core_vlm_projector_config(mmproj_gguf, projector_type)
     if dtype is not None:

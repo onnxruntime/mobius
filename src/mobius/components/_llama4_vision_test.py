@@ -87,9 +87,7 @@ def test_tiny_tower_matches_independent_torch_reference() -> None:
         if parameter.const_value is not None:
             continue
         shape = tuple(int(dim) for dim in parameter.shape)
-        if name.endswith(".weight") and (
-            "layernorm" in name or ".ln" in name
-        ):
+        if name.endswith(".weight") and ("layernorm" in name or ".ln" in name):
             values = (1.0 + rng.normal(0, 0.1, shape)).astype(np.float32)
         else:
             values = rng.normal(0, 0.1, shape).astype(np.float32)
