@@ -739,6 +739,9 @@ def render_document() -> str:
             "Each row is independently artifact-scoped and proves ordered tokenizer semantics,",
             "source assets, embedding alignment, and the final materialized hash.",
             "Shared rows also require identical pinned llama.cpp dispatch.",
+            "A matching complete immutable GGUF is automatically promoted to the pinned-source",
+            "route during model and runtime package export; identifier-only inspection remains",
+            "deferred because an identifier cannot prove artifact identity.",
             "This does not claim graph or runtime support.",
         )
     )
@@ -830,6 +833,8 @@ build_from_gguf(
 The function returns a `ModelPackage`. Mobius-side graph/semantic inability, corruption,
 identity, I/O, malformed tokenizer, and unexpected errors remain fail-closed. Authoritative
 tokenizer blockers become partial exports with exact reasons and no unverified assets.
+Exact tokenizer evidence is matched independently from runtime evidence, so a proven tokenizer
+is exported even when downstream runtime execution remains unvalidated.
 Downstream runtime, version, registry, or executor limitations preserve the accurate model
 package and record distinct `export_status` and `runtime_validation_status` fields instead of
 blocking export. Only exact artifact, graph, tokenizer, version, parity, and state evidence

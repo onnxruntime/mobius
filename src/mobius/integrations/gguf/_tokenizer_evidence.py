@@ -8,6 +8,7 @@ from __future__ import annotations
 __all__ = [
     "GGUFTokenizerBlockerEvidence",
     "GGUFTokenizerEvidence",
+    "find_matching_tokenizer_evidence",
     "iter_tokenizer_blocker_evidence",
     "iter_tokenizer_evidence",
     "matching_tokenizer_blocker_evidence",
@@ -2392,19 +2393,22 @@ def matching_tokenizer_blocker_evidence(
     return None
 
 
-def matching_tokenizer_evidence(
+def _matching_tokenizer_evidence_records(
     source_path: Path,
     gguf_model: Any,
     *,
     metadata_sha256: str | None,
-) -> GGUFTokenizerEvidence:
-    """Return the unique evidence record matching the complete artifact identity."""
+    artifact_identity: Any | None = None,
+) -> tuple[list[GGUFTokenizerEvidence], list[GGUFTokenizerBlockerEvidence], Any]:
+    """Return exact evidence candidates after complete artifact and tokenizer matching."""
     architecture = gguf_model.architecture
-    identity = gguf_artifact_identity(
-        source_path,
-        gguf_model,
-        architecture=architecture,
-    )
+    identity = artifact_identity
+    if identity is None:
+        identity = gguf_artifact_identity(
+            source_path,
+            gguf_model,
+            architecture=architecture,
+        )
     metadata = gguf_model.metadata
 
     token_count, vocabulary_sha256 = _sequence_digest(metadata, "tokenizer.ggml.tokens")
@@ -2458,6 +2462,50 @@ def matching_tokenizer_evidence(
         gguf_model,
         metadata_sha256=metadata_sha256,
     )
+    return matches, blockers, identity
+
+
+def find_matching_tokenizer_evidence(
+    source_path: Path,
+    gguf_model: Any,
+    *,
+    metadata_sha256: str | None,
+    artifact_identity: Any | None = None,
+) -> GGUFTokenizerEvidence | None:
+    """Return exact tokenizer evidence when this complete artifact is allowlisted."""
+    matches, blockers, _ = _matching_tokenizer_evidence_records(
+        source_path,
+        gguf_model,
+        metadata_sha256=metadata_sha256,
+        artifact_identity=artifact_identity,
+    )
+    if len(blockers) == 1:
+        blocker = blockers[0]
+        raise ValueError(
+            f"Tokenizer materialization is explicitly blocked by {blocker.evidence_id!r}: "
+            f"{blocker.disposition}"
+        )
+    if blockers:
+        raise RuntimeError("Tokenizer blocker evidence contains duplicate artifact identities")
+    if len(matches) > 1:
+        raise RuntimeError("Tokenizer evidence contains duplicate artifact identities")
+    return matches[0] if matches else None
+
+
+def matching_tokenizer_evidence(
+    source_path: Path,
+    gguf_model: Any,
+    *,
+    metadata_sha256: str | None,
+    artifact_identity: Any | None = None,
+) -> GGUFTokenizerEvidence:
+    """Return the unique evidence record matching the complete artifact identity."""
+    matches, blockers, identity = _matching_tokenizer_evidence_records(
+        source_path,
+        gguf_model,
+        metadata_sha256=metadata_sha256,
+        artifact_identity=artifact_identity,
+    )
     if len(blockers) == 1:
         blocker = blockers[0]
         raise ValueError(
@@ -2469,7 +2517,7 @@ def matching_tokenizer_evidence(
     if len(matches) != 1:
         raise ValueError(
             "No unique exact tokenizer evidence matches "
-            f"architecture={architecture!r}, artifact={identity!r}, "
+            f"architecture={gguf_model.architecture!r}, artifact={identity!r}, "
             f"metadata_sha256={metadata_sha256!r}."
         )
     return matches[0]

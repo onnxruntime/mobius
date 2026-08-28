@@ -1396,6 +1396,40 @@ def test_evidenced_materializer_atomically_publishes_complete_directory(
     assert not list(tmp_path.glob(".output.*.tmp"))
 
 
+def test_exact_artifact_evidence_promotes_deferred_identifier_to_pinned_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mobius.integrations.gguf._component_export import resolve_tokenizer_export_verdict
+
+    verdict = inspect_gguf_tokenizer(_metadata(pre="qwen2"))
+    evidence = SimpleNamespace(
+        evidence_id="exact-tokenizer-evidence",
+        materialized_tokenizer_sha256="a" * 64,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_blocker_evidence",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "mobius.integrations.gguf._tokenizer_evidence.find_matching_tokenizer_evidence",
+        lambda *_a, **_k: evidence,
+    )
+
+    promoted = resolve_tokenizer_export_verdict(
+        SimpleNamespace(metadata=_metadata(pre="qwen2")),
+        tmp_path / "model.gguf",
+        verdict=verdict,
+        artifact_identity=object(),
+    )
+
+    assert promoted.route == "pinned-source"
+    assert promoted.materialized
+    assert promoted.audit_status == "validated-pinned-source"
+    assert promoted.evidence_id == evidence.evidence_id
+    assert promoted.tokenizer_sha256 == evidence.materialized_tokenizer_sha256
+    assert promoted.blocker_category is None
+
+
 @pytest.mark.parametrize(
     ("token", "token_type", "message"),
     [
