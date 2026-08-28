@@ -741,6 +741,7 @@ Packed MatMulNBits storage may use a native op or portable nibble unpack,
 `DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
 Use `mmproj=` only for evidenced sidecars; CLI: `mobius build model.gguf -o output`.
 Split shards validate siblings and ownership; Hub references reject partial downloads.
+Standalone projector graphs persist their processor ABI, output width, and runtime warning.
 
 ## API
 

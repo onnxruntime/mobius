@@ -920,6 +920,15 @@ def write_onnx_genai_config(
             "are exported without claiming runtime validation."
         )
         return _write_advisory_component_contract(pkg, output_dir, warning=warning)
+    component_names = set(pkg)
+    if component_names in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
+        pkg, "gguf_projector_type", None
+    ):
+        warning = (
+            "The tested onnx-genai runtime has no standalone GGUF audio/speaker "
+            "sidecar orchestrator; exact component and processor contracts are advisory."
+        )
+        return _write_advisory_component_contract(pkg, output_dir, warning=warning)
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
         resolved_config = config if config is not None else getattr(pkg, "config", None)

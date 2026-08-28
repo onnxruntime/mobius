@@ -111,9 +111,15 @@ class GGUFVisionProjectorTask(ModelTask):
 class GGUFSpeakerProjectorModel(nn.Module):
     """Container exposing one speaker-conditioning encoder sidecar."""
 
-    def __init__(self, speaker_encoder: nn.Module) -> None:
+    def __init__(
+        self,
+        speaker_encoder: nn.Module,
+        *,
+        output_name: str = "speaker_embedding",
+    ) -> None:
         super().__init__()
         self.speaker_encoder = speaker_encoder
+        self.output_name = output_name
 
     def forward(self, op, **kwargs):
         del op, kwargs
@@ -145,5 +151,5 @@ class GGUFSpeakerProjectorTask(ModelTask):
             for name, dtype, shape in input_schema
         }
         speaker_embedding = speaker_encoder(builder.op, **inputs)
-        builder.add_output(speaker_embedding, "speaker_embedding")
+        builder.add_output(speaker_embedding, module.output_name)
         return ModelPackage({"speaker_encoder": _make_model(graph)}, config=config)
