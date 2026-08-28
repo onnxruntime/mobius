@@ -314,6 +314,17 @@ class GGUFTokenizerBlockerEvidence:
     oracle_mismatch_count: int | None = None
     oracle_mismatch_count_by_mode: tuple[int, ...] = ()
     first_mismatch_mode: tuple[str, str] | None = None
+    blocked_identifiers: tuple[str, ...] = ()
+    materialized_tokenizer_sha256: str | None = None
+    materialized_oracle_sha256: str | None = None
+    source_tokenizer_config_sha256: str | None = None
+    source_pipeline_component_sha256: tuple[tuple[str, str], ...] = ()
+    source_added_token_type_mismatch_count: int | None = None
+    dispatch_oracles: tuple[tuple[str, str], ...] = ()
+    dispatch_discriminator: tuple[str, int, str] | None = None
+    oracle_detokenize_mismatch_count: int | None = None
+    oracle_detokenize_mismatch_count_by_mode: tuple[int, ...] = ()
+    first_detokenize_mismatch: tuple[str, str, str] | None = None
 
     def __post_init__(self) -> None:
         digests = (
@@ -335,6 +346,12 @@ class GGUFTokenizerBlockerEvidence:
             self.bounded_header_sha256,
             self.source_chat_template_sha256,
             self.source_oracle_sha256,
+            self.materialized_tokenizer_sha256,
+            self.materialized_oracle_sha256,
+            self.source_tokenizer_config_sha256,
+            *(digest for _, digest in self.source_pipeline_component_sha256),
+            *(digest for _, digest in self.dispatch_oracles),
+            *(self.dispatch_discriminator[2:3] if self.dispatch_discriminator else ()),
         )
         if any(
             re.fullmatch(r"[0-9a-f]{40}", revision) is None
@@ -453,6 +470,106 @@ class GGUFTokenizerBlockerEvidence:
             or self.source_oracle_sha256 is not None
         ):
             raise ValueError("Tokenizer blocker oracle-divergence fields must be complete")
+        if tuple(sorted(self.source_pipeline_component_sha256)) != (
+            self.source_pipeline_component_sha256
+        ):
+            raise ValueError("Tokenizer blocker pipeline hashes must be sorted")
+        if self.source_added_token_type_mismatch_count is not None and (
+            self.source_added_token_type_mismatch_count < 0
+        ):
+            raise ValueError("Tokenizer blocker added-token type mismatch count is invalid")
+        if self.oracle_detokenize_mismatch_count is None:
+            if (
+                self.oracle_detokenize_mismatch_count_by_mode
+                or self.first_detokenize_mismatch is not None
+            ):
+                raise ValueError(
+                    "Tokenizer blocker detokenization-divergence fields must be complete"
+                )
+        else:
+            if (
+                self.oracle_detokenize_mismatch_count < 0
+                or sum(self.oracle_detokenize_mismatch_count_by_mode)
+                != self.oracle_detokenize_mismatch_count
+            ):
+                raise ValueError("Tokenizer blocker detokenization mismatch counts disagree")
+            if (self.oracle_detokenize_mismatch_count == 0) != (
+                self.first_detokenize_mismatch is None
+            ):
+                raise ValueError("Tokenizer blocker detokenization witness and count disagree")
+            if self.first_detokenize_mismatch is not None:
+                text, llamacpp_hex, source_hex = self.first_detokenize_mismatch
+                if not text or not llamacpp_hex or llamacpp_hex == source_hex:
+                    raise ValueError("Tokenizer blocker detokenization witness is invalid")
+                try:
+                    bytes.fromhex(llamacpp_hex)
+                    bytes.fromhex(source_hex)
+                except ValueError as error:
+                    raise ValueError(
+                        "Tokenizer blocker detokenization witness must be hexadecimal"
+                    ) from error
+        if self.blocked_identifiers:
+            if (
+                self.materialized_tokenizer_sha256 is None
+                or self.materialized_oracle_sha256 is None
+                or self.source_tokenizer_config_sha256 is None
+                or not self.source_pipeline_component_sha256
+                or self.source_added_token_type_mismatch_count is None
+                or self.oracle_detokenize_mismatch_count is None
+            ):
+                raise ValueError(
+                    "Tokenizer alias blocker requires complete materialized and semantic evidence"
+                )
+            policies = tokenizer_pre_policies()
+            if (
+                tuple(sorted(set(self.blocked_identifiers))) != self.blocked_identifiers
+                or self.pre_identifier not in self.blocked_identifiers
+            ):
+                raise ValueError(
+                    "Tokenizer blocker identifiers must be sorted, unique, and include pre"
+                )
+            try:
+                witness = policies[self.pre_identifier]
+                aliases = tuple(
+                    policies[identifier] for identifier in self.blocked_identifiers
+                )
+            except KeyError as error:
+                raise ValueError(
+                    f"Tokenizer blocker contains an unknown identifier: {error.args[0]}"
+                ) from error
+            if any(
+                alias.canonical != witness.canonical or alias.pre_type != witness.pre_type
+                for alias in aliases
+            ):
+                raise ValueError(
+                    "Tokenizer blocker aliases must share one pinned semantic group"
+                )
+            proofs = tokenizer_alias_evidence()
+            if any(
+                identifier not in proofs
+                or proofs[identifier].flag_overrides
+                != proofs[self.pre_identifier].flag_overrides
+                for identifier in self.blocked_identifiers
+            ):
+                raise ValueError("Tokenizer blocker aliases lack exact dispatch proof")
+            if tuple(
+                identifier for identifier, _ in self.dispatch_oracles
+            ) != self.blocked_identifiers or any(
+                digest != self.llamacpp_oracle[2] for _, digest in self.dispatch_oracles
+            ):
+                raise ValueError("Tokenizer blocker alias oracle identities disagree")
+            if self.dispatch_discriminator is None:
+                raise ValueError("Tokenizer blocker aliases require a route discriminator")
+            discriminator, mismatch_count, digest = self.dispatch_discriminator
+            if (
+                discriminator not in policies
+                or policies[discriminator].canonical == witness.canonical
+                or mismatch_count <= 0
+                or digest == self.llamacpp_oracle[2]
+            ):
+                raise ValueError("Tokenizer blocker route discriminator is invalid")
+        elif self.dispatch_oracles or self.dispatch_discriminator is not None:
+            raise ValueError("Tokenizer blocker dispatch evidence lacks route identifiers")
         if (
             self.source_chat_template_sha256 is not None
             and self.source_chat_template_sha256 == self.chat_template_sha256
@@ -1758,6 +1875,383 @@ _MINICPM3_4B_Q4_K_M_TOKENIZER_BLOCKER = GGUFTokenizerBlockerEvidence(
     first_mismatch_mode=("no-add", "no-parse-special"),
 )
 
+_LLADA_MOE_IQ1_S_TOKENIZER_BLOCKER = GGUFTokenizerBlockerEvidence(
+    evidence_id="llada-moe-iq1-s-tokenizer-semantic-blocker",
+    architecture="llada-moe",
+    pre_identifier="llada-moe",
+    repository="mradermacher/LLaDA-MoE-7B-A1B-Instruct-i1-GGUF",
+    revision="2ec29fbe69f07f382a864f93b40c4eecb45e6a0a",
+    filename="LLaDA-MoE-7B-A1B-Instruct.i1-IQ1_S.gguf",
+    size=1_717_318_112,
+    lfs_sha256="d711df4b4f819d9abd0e107469dd525eb12d3bc05ec173b6a8438c172f70f3de",
+    tensor_count=195,
+    tensor_qtypes=(
+        ("F32", 81),
+        ("IQ1_S", 78),
+        ("IQ2_XXS", 16),
+        ("Q2_K", 3),
+        ("Q4_K", 16),
+        ("Q5_K", 1),
+    ),
+    tokenizer_repository="inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
+    tokenizer_revision="67004f662901b09f729994d4b3c04201283941ba",
+    source_config_asset=(
+        "config.json",
+        1_424,
+        "59b6b803a1bf500b45249cb553b3fa0425e4f1a431ba9e7028ef6bda33c97586",
+    ),
+    tokenizer_assets=(
+        (
+            "special_tokens_map.json",
+            153,
+            "f1fa4f8b8c24126a0c2a5d9b2de0fee32abbddf22f48c068e5cf42bc0a9b68ab",
+        ),
+        (
+            "tokenizer.json",
+            7_663_358,
+            "4dd5931b0a63e3f61cfc1bcde132cd0c314de2f8a011ac9dbf2ff5efc40d0cbd",
+        ),
+        (
+            "tokenizer_config.json",
+            4_593,
+            "ac03e164668db350d26b13bee7bc65fd7c4bc74595ac1fc3952ebd707b0b44a5",
+        ),
+    ),
+    tokenizer_metadata_sha256="e9b0281345bf2e3b859539f83f1738aab6552202285c437f36eee0539bc26d19",
+    token_count=157_184,
+    source_token_count=157_153,
+    embedding_vocabulary_size=157_184,
+    deterministic_padding_range=(157_153, 157_183),
+    ordered_vocabulary_sha256="a31a2b2abd450d5750f4f28f507ff4d95efc1371b01a992b2374f9bb5fb59b53",
+    source_vocabulary_sha256="8d89e7856d4a2b466cf0aee3ace415097cf77451c7e3a6a1f1b2fb2795485ad1",
+    merge_count=156_635,
+    ordered_merges_sha256="0f44f5b5ed306c1f3617fbe217c8b3b3d382deb6129453fe3550e7dbf5453fac",
+    source_merges_sha256="0f44f5b5ed306c1f3617fbe217c8b3b3d382deb6129453fe3550e7dbf5453fac",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "d6c379584304b9fe9ea5177810690cc6dd988960a224ca34f38d6ed08a6da10a"
+    ),
+    source_added_tokens_sha256=(
+        "b65b415bd2707c17ee6e3e2e47b5be31c9e4972536482f4953f275e616f8beb4"
+    ),
+    source_pipeline_sha256="5401b80eb39f381efb73445a78a80b51652d34a05fca4d1fb3568b5fc473a0dd",
+    chat_template_sha256="a503d55b21709d881b07ee2e9d8ce29505fa95d9f758379a9fc4ccc94272734a",
+    source_normalizer="NFC",
+    special_token_ids=(
+        ("<|endoftext|>", 156_892),
+        ("<|mask|>", 156_895),
+        ("<|startoftext|>", 156_891),
+    ),
+    oracle_corpus_sha256="456ea43ace0bf9d548c6f5efdc7cc723832d3dd3fa7ad1d29f25d7dbf1aa210b",
+    llamacpp_oracle=(
+        UPSTREAM_COMMIT,
+        465,
+        "a84708473c6afa75eb4b69fceb0f65c21e9fb57c8aea44a15cc227f8d565223d",
+    ),
+    mismatch=("e\u0301", (68, 150_766), (2_900,)),
+    disposition=(
+        "fail-closed: the exact GGUF and official source agree on ordered vocabulary "
+        "prefix, merges, token types, added/special tokens, deterministic padding, config, "
+        "and chat template, but the official NFC normalizer encodes decomposed e-acute as "
+        "token 2900 while pinned BAILINGMOE preserves tokens 68 and 150766"
+    ),
+    bounded_header_bytes=6_492_640,
+    bounded_header_sha256="1d1fe0fcc1660d86157e99bc015910f14387a24029b9ba77820c674abdc9fc85",
+    source_oracle_sha256="d30e15e4e8edfe0b51a9508081bb230fb58c1ad08b00b292396e7d4c719ace47",
+    oracle_mismatch_count=6,
+    oracle_mismatch_count_by_mode=(2, 2, 2),
+    first_mismatch_mode=("no-add", "no-parse-special"),
+    blocked_identifiers=("bailingmoe", "bailingmoe2", "llada-moe"),
+    materialized_tokenizer_sha256=(
+        "702fd877edf627b1e01567071f161ceb96810cdd01afcf5e530b367547e757c9"
+    ),
+    materialized_oracle_sha256=(
+        "d30e15e4e8edfe0b51a9508081bb230fb58c1ad08b00b292396e7d4c719ace47"
+    ),
+    source_tokenizer_config_sha256=(
+        "7b2b10ad497301177b1a0ab47bbcf938b17ca5e4b843cf45f62f01efda1851b7"
+    ),
+    source_pipeline_component_sha256=(
+        ("decoder", "1d64d97add535d9ad91561aabea254849cf7f2ea4b924cc61c17152f1dd6e672"),
+        ("normalizer", "5628358406a1a2864e0f9e853618fc4d47d359acf10253558d0c18886de3f06e"),
+        (
+            "post_processor",
+            "18e6a4825c46b5a700a630cf00cb9329241348ac3b9e5eeb15b6b6936c165ffb",
+        ),
+        (
+            "pre_tokenizer",
+            "5e0cc01d5556750c556c081e65f2c0f9d9bbf8fa70dd98790cc9bfc5aafc7682",
+        ),
+    ),
+    source_added_token_type_mismatch_count=0,
+    dispatch_oracles=(
+        ("bailingmoe", "a84708473c6afa75eb4b69fceb0f65c21e9fb57c8aea44a15cc227f8d565223d"),
+        ("bailingmoe2", "a84708473c6afa75eb4b69fceb0f65c21e9fb57c8aea44a15cc227f8d565223d"),
+        ("llada-moe", "a84708473c6afa75eb4b69fceb0f65c21e9fb57c8aea44a15cc227f8d565223d"),
+    ),
+    dispatch_discriminator=(
+        "glm4",
+        30,
+        "dec7509bc51a36ee3f60cbbaf03c08bb71b3cb15cbce167d87c9e163dbdbf6c1",
+    ),
+    oracle_detokenize_mismatch_count=6,
+    oracle_detokenize_mismatch_count_by_mode=(2, 2, 2),
+    first_detokenize_mismatch=("e\u0301", "65cc81", "c3a9"),
+)
+
+_GLM4_7_FLASH_IQ2_XXS_TOKENIZER_BLOCKER = GGUFTokenizerBlockerEvidence(
+    evidence_id="glm4-7-flash-iq2-xxs-tokenizer-semantic-blocker",
+    architecture="deepseek2",
+    pre_identifier="glm4",
+    repository="bartowski/zai-org_GLM-4.7-Flash-GGUF",
+    revision="464d07505b441959737cd04d900f047469614c8d",
+    filename="zai-org_GLM-4.7-Flash-IQ2_XXS.gguf",
+    size=7_622_864_768,
+    lfs_sha256="b1f25d90e0da65587a5a8e359b40a9183c5a31b4908b3ee5ff370e05cc5e2ba4",
+    tensor_count=844,
+    tensor_qtypes=(
+        ("F32", 281),
+        ("IQ1_M", 108),
+        ("IQ2_XS", 30),
+        ("IQ2_XXS", 119),
+        ("IQ4_NL", 47),
+        ("Q2_K", 48),
+        ("Q4_K", 143),
+        ("Q5_K", 1),
+        ("Q6_K", 67),
+    ),
+    tokenizer_repository="zai-org/GLM-4.7-Flash",
+    tokenizer_revision="a9308079ef95921451a690cd2d16cb572e564642",
+    source_config_asset=(
+        "config.json",
+        1_070,
+        "dc9b97c7c9bed726a2e6939da4234d5c43abb3edec8812068c9a1af1dbc13acb",
+    ),
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            3_120,
+            "d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375",
+        ),
+        (
+            "tokenizer.json",
+            20_217_442,
+            "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+        ),
+        (
+            "tokenizer_config.json",
+            7_226,
+            "31a173e2797ddc8b72ac996803513e627fc28d7aad02cfcce321a431d865c86d",
+        ),
+    ),
+    tokenizer_metadata_sha256="79115e0fa1bf5a8273b46eefb0e332e2b1e8957716311e8914fa76f7674d54ed",
+    token_count=154_880,
+    source_token_count=154_856,
+    embedding_vocabulary_size=154_880,
+    deterministic_padding_range=(154_856, 154_879),
+    ordered_vocabulary_sha256="ba346b1893686f05f8e02b9a3657d4727b5bc8a2cecbd085bbe102c85fd683fe",
+    source_vocabulary_sha256="6758484fa28bf2376d0eb319c51f0f5650b03156c3258b715ff031c9bc9f25f6",
+    merge_count=321_649,
+    ordered_merges_sha256="7de84a5e88d436d1780d416b7c7c622800a556d691ff3c65b72c7aafcba3c47e",
+    source_merges_sha256="7de84a5e88d436d1780d416b7c7c622800a556d691ff3c65b72c7aafcba3c47e",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "5bd4e8a8434ea2e20e413eb0484d1c3b93284bc05be3f3561331f621762b4e75"
+    ),
+    source_added_tokens_sha256=(
+        "5284ad77c6affe20bd12e85e475c3906bcad5d0c02738de923cc0c4eba547cdb"
+    ),
+    source_pipeline_sha256="3c411b92af43f855284604c30bd7bb39f89ff83452f7f94c2a173f5c7c44c1f2",
+    chat_template_sha256="d63ad536c3c81880043e22ec7fd08db42b4d8fb7c89c7138bc562bfa25281375",
+    source_normalizer="none",
+    special_token_ids=(
+        ("<|endoftext|>", 154_820),
+        ("<|observation|>", 154_829),
+        ("<|user|>", 154_827),
+        ("[gMASK]", 154_822),
+    ),
+    oracle_corpus_sha256="4faf579ec80bff972046aa122be302fa1357e7ec6135fa94825b386493dfd09f",
+    llamacpp_oracle=(
+        UPSTREAM_COMMIT,
+        465,
+        "2a821830ebc16fb14d8f1393002c0c17b84c3aa5af9e55765eeaec879dd6ab5f",
+    ),
+    mismatch=("' \u597d", (6, 4_891, 98, 121), (6, 106_992)),
+    disposition=(
+        "fail-closed: ordered vocabulary, merges, deterministic padding, config, and chat "
+        "template are pinned, but seven source added-token flags disagree with GGUF types; "
+        "pinned CHATGLM4 splits apostrophe-space-CJK differently and detokenizes token 659 "
+        "without the official leading space"
+    ),
+    bounded_header_bytes=9_475_456,
+    bounded_header_sha256="803a3d88b31f81b5ac0fc541758af3c233d9d4a8e1abe7a601f2abaa52c5b382",
+    source_oracle_sha256="47d585793ea7cb663f36ff8ec48c2b474721e287044331bfe95a9eb50a0da3c2",
+    oracle_mismatch_count=6,
+    oracle_mismatch_count_by_mode=(2, 2, 2),
+    first_mismatch_mode=("no-add", "no-parse-special"),
+    blocked_identifiers=("chatglm-bpe", "glm4"),
+    materialized_tokenizer_sha256=(
+        "4ddc2c399cbef5431b5b1392a6e7417339b0ef7d096dcf2ba7658ef9327d333c"
+    ),
+    materialized_oracle_sha256=(
+        "47d585793ea7cb663f36ff8ec48c2b474721e287044331bfe95a9eb50a0da3c2"
+    ),
+    source_tokenizer_config_sha256=(
+        "d43221510295eff7c4afad3dfdbc8a0005e8a833fd543af4876458e2807fb132"
+    ),
+    source_pipeline_component_sha256=(
+        ("decoder", "1d64d97add535d9ad91561aabea254849cf7f2ea4b924cc61c17152f1dd6e672"),
+        ("normalizer", "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"),
+        (
+            "post_processor",
+            "18e6a4825c46b5a700a630cf00cb9329241348ac3b9e5eeb15b6b6936c165ffb",
+        ),
+        (
+            "pre_tokenizer",
+            "65e1fe6fbe22e0df7a3877257a5e19e7b0336324a8678a75de61b6fc0df0e147",
+        ),
+    ),
+    source_added_token_type_mismatch_count=7,
+    dispatch_oracles=(
+        ("chatglm-bpe", "2a821830ebc16fb14d8f1393002c0c17b84c3aa5af9e55765eeaec879dd6ab5f"),
+        ("glm4", "2a821830ebc16fb14d8f1393002c0c17b84c3aa5af9e55765eeaec879dd6ab5f"),
+    ),
+    dispatch_discriminator=(
+        "bailingmoe",
+        222,
+        "e7eaafadd6db83e5e8e33a418526181687797249baff65dace781dbb5bdbd7bb",
+    ),
+    oracle_detokenize_mismatch_count=33,
+    oracle_detokenize_mismatch_count_by_mode=(11, 11, 11),
+    first_detokenize_mismatch=(" .", "2e", "202e"),
+)
+
+_NORTH_MINI_CODE_IQ1_S_TOKENIZER_BLOCKER = GGUFTokenizerBlockerEvidence(
+    evidence_id="north-mini-code-iq1-s-tokenizer-semantic-blocker",
+    architecture="cohere2moe",
+    pre_identifier="cohere2moe",
+    repository="mradermacher/North-Mini-Code-1.0-i1-GGUF",
+    revision="94d8eb17eaeb728f907639ee0eff457e3e274667",
+    filename="North-Mini-Code-1.0.i1-IQ1_S.gguf",
+    size=6_455_984_128,
+    lfs_sha256="660792f0dd77ef2e39e92549bd88bbb0f91734371a3763816648fe77f23fb4dc",
+    tensor_count=442,
+    tensor_qtypes=(
+        ("F32", 98),
+        ("IQ1_S", 239),
+        ("IQ2_XXS", 49),
+        ("Q2_K", 6),
+        ("Q4_K", 49),
+        ("Q5_K", 1),
+    ),
+    tokenizer_repository="CohereLabs/North-Mini-Code-1.0",
+    tokenizer_revision="d11e61a842617a22dc328552fa5bb86231ee4f37",
+    source_config_asset=(
+        "config.json",
+        2_342,
+        "0c987a88193e90c89a88a9dbeaba6844f5f24d00b728683338e2ace1476509a7",
+    ),
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            12_397,
+            "d8366efb9f07c571da620ce6a924594fc52c80273a0fbb46a38b643972df95fd",
+        ),
+        (
+            "tokenizer.json",
+            28_217_141,
+            "14bd1c49d7d11874921d324986713df4be21cd06060530c497dacef99919b7a5",
+        ),
+        (
+            "tokenizer_config.json",
+            8_954,
+            "1f45bd13ca86efccb5f74bf51a78c5e06f9066a5d4211499c7f81890f31d1da2",
+        ),
+    ),
+    tokenizer_metadata_sha256="f164bb71b8a23b6fc0ca47163aa5effb62a6c7d3e92c1767590568ad0af7cbda",
+    token_count=262_144,
+    source_token_count=255_032,
+    embedding_vocabulary_size=262_144,
+    deterministic_padding_range=(255_032, 262_143),
+    ordered_vocabulary_sha256="0d3ced2dd51c9cf8301847cf4204a7aa01d49fe23f83dca528f6736466d1b277",
+    source_vocabulary_sha256="7ba11060fa3a8e3c527f75c69fed607660884a6d0ddafeba886dbae7695b538f",
+    merge_count=254_739,
+    ordered_merges_sha256="79d571d309587b881fa56c5970d5de74ad6f3b4fde1af8a6356215ffc80d0fd6",
+    source_merges_sha256="79d571d309587b881fa56c5970d5de74ad6f3b4fde1af8a6356215ffc80d0fd6",
+    score_count=0,
+    ordered_scores_sha256=None,
+    ordered_token_types_sha256=(
+        "1c9ddca34d7f702a00b1f1795ebac3000980eb1104391e187243a49dc0cc4ead"
+    ),
+    source_added_tokens_sha256=(
+        "62d98ff38dd8063a41e4d83a0282505044a654de200af9d020dce0422b386deb"
+    ),
+    source_pipeline_sha256="68557134f65a45f8f2bb7e6dd6d74b6850a5ed3d1efdfa43c1d2f6c56500d329",
+    chat_template_sha256="d8366efb9f07c571da620ce6a924594fc52c80273a0fbb46a38b643972df95fd",
+    source_normalizer="none",
+    special_token_ids=(
+        ("<BOS_TOKEN>", 2),
+        ("<PAD>", 0),
+        ("<UNK>", 4),
+        ("<|END_OF_TURN_TOKEN|>", 255_001),
+    ),
+    oracle_corpus_sha256="ebd7b4f412ebf503c1ba171cdcd2aef3b9e5a4a28e3fd7a8e6f391be57df54f5",
+    llamacpp_oracle=(
+        UPSTREAM_COMMIT,
+        465,
+        "c4736b65ca7e9b609b269068990842fa3538f2fc76081db010e464fe0cdb7c86",
+    ),
+    mismatch=("\t 9", (202, 225, 29), (13_396, 29)),
+    disposition=(
+        "fail-closed: ordered vocabulary, merges, deterministic padding, config, and chat "
+        "template are pinned, but 23 source added-token flags disagree with GGUF types and "
+        "pinned TINY_AYA splits tab-space differently from the official North tokenizer"
+    ),
+    bounded_header_bytes=10_428_416,
+    bounded_header_sha256="9f38c617b8cd6fb3481cb1d73981cbbbd112e0e745b7cbd2e29c568ec11e76bb",
+    source_oracle_sha256="c56b02c040f04640c56f0821b2beb694d4570005e42ba4ceb47502ef38ac717f",
+    oracle_mismatch_count=14,
+    oracle_mismatch_count_by_mode=(6, 4, 4),
+    first_mismatch_mode=("no-add", "no-parse-special"),
+    blocked_identifiers=("cohere2moe", "tiny_aya"),
+    materialized_tokenizer_sha256=(
+        "aa959ea5a543284ab7184a854c7f634223d3dfba40d2677f1078f8539303224b"
+    ),
+    materialized_oracle_sha256=(
+        "c56b02c040f04640c56f0821b2beb694d4570005e42ba4ceb47502ef38ac717f"
+    ),
+    source_tokenizer_config_sha256=(
+        "d33b45ace16bf59557c1e2b9b43d4bceb27d9f616304dfe59557abe7b0192e27"
+    ),
+    source_pipeline_component_sha256=(
+        ("decoder", "1d64d97add535d9ad91561aabea254849cf7f2ea4b924cc61c17152f1dd6e672"),
+        ("normalizer", "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"),
+        (
+            "post_processor",
+            "78dd5da36e83b02e49ef646d6bf6fcbba0f9dbd68cb9a4885929efd1725664cb",
+        ),
+        (
+            "pre_tokenizer",
+            "2778061f55c126b60e47da281317473fb373737f22ffe90419ed8efd7c9406cb",
+        ),
+    ),
+    source_added_token_type_mismatch_count=23,
+    dispatch_oracles=(
+        ("cohere2moe", "c4736b65ca7e9b609b269068990842fa3538f2fc76081db010e464fe0cdb7c86"),
+        ("tiny_aya", "c4736b65ca7e9b609b269068990842fa3538f2fc76081db010e464fe0cdb7c86"),
+    ),
+    dispatch_discriminator=(
+        "glm4",
+        69,
+        "814ab562958b77eaa6dbffc4e8ae2883c5ffd259f96c411ca2912c60574ab5cc",
+    ),
+    oracle_detokenize_mismatch_count=0,
+    oracle_detokenize_mismatch_count_by_mode=(0, 0, 0),
+    first_detokenize_mismatch=None,
+)
+
 _TOKENIZER_EVIDENCE = MappingProxyType(
     {
         record.evidence_id: record
@@ -1782,6 +2276,9 @@ _TOKENIZER_BLOCKER_EVIDENCE = MappingProxyType(
         for record in (
             _MINICPM_2B_Q2_K_TOKENIZER_BLOCKER,
             _MINICPM3_4B_Q4_K_M_TOKENIZER_BLOCKER,
+            _GLM4_7_FLASH_IQ2_XXS_TOKENIZER_BLOCKER,
+            _LLADA_MOE_IQ1_S_TOKENIZER_BLOCKER,
+            _NORTH_MINI_CODE_IQ1_S_TOKENIZER_BLOCKER,
             _PLM_18B_Q4_K_M_TOKENIZER_BLOCKER,
         )
     }

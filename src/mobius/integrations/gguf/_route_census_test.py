@@ -63,8 +63,8 @@ def test_every_route_has_one_actionable_classification() -> None:
         "draft": 2,
     }
     assert Counter(item.category for item in items) == {
-        "dependency-or-runtime-abi-blocked": 100,
-        "evidence-only": 101,
+        "dependency-or-runtime-abi-blocked": 107,
+        "evidence-only": 94,
         "immediately-implementable": 53,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
@@ -106,6 +106,18 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
     assert by_id["projector:qwen3tts_gen"].category == "intentionally-rejected"
     assert by_id["tokenizer:llama4"].category == "artifact-unavailable"
     assert "PR #652" not in by_id["tokenizer:llama4"].dependencies
+    for identifier in (
+        "bailingmoe",
+        "bailingmoe2",
+        "chatglm-bpe",
+        "cohere2moe",
+        "glm4",
+        "llada-moe",
+        "tiny_aya",
+    ):
+        item = by_id[f"tokenizer:{identifier}"]
+        assert item.category == "dependency-or-runtime-abi-blocked"
+        assert item.batch == "tokenizer-compiled-semantics"
     assert by_id["mtp:qwen35"].category == "evidence-only"
     assert by_id["mtp:deepseek2"].category == "dependency-or-runtime-abi-blocked"
     assert by_id["mtp:exaone4"].category == "intentionally-rejected"

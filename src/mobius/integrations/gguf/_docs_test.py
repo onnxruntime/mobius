@@ -44,6 +44,7 @@ def test_document_is_concise_and_reason_coded() -> None:
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document
     assert "deferred-compiled-semantics" in document
+    assert "deferred-pinned-artifact-mismatch" in document
     assert "does not claim graph or runtime support." in " ".join(document.split())
 
 

@@ -258,7 +258,14 @@ def _tokenizers() -> str:
         disposition = (
             f"`{record.evidence_id}`"
             if record.evidence_id is not None
-            else f"`{record.blocker_category}`"
+            else (
+                f"`{record.blocker_category}`"
+                + (
+                    f" (`{record.blocker_evidence_id}`)"
+                    if record.blocker_evidence_id is not None
+                    else ""
+                )
+            )
         )
         if record.candidate_disposition is not None:
             route_identity = ""
@@ -483,6 +490,15 @@ def _tokenizer_blocker_evidence_table() -> str:
                 f"GGUF chat `{evidence.chat_template_sha256}` vs source "
                 f"`{evidence.source_chat_template_sha256}`"
             )
+        if evidence.blocked_identifiers:
+            closure += (
+                f"<br>exact aliases={list(evidence.blocked_identifiers)}; "
+                f"materialized `{evidence.materialized_tokenizer_sha256}`; "
+                f"config `{evidence.source_tokenizer_config_sha256}`<br>"
+                f"pipeline components={dict(evidence.source_pipeline_component_sha256)}; "
+                f"added-token type mismatches="
+                f"{evidence.source_added_token_type_mismatch_count}"
+            )
         witness = (
             f"{evidence.disposition}<br>"
             f"`{text.encode('unicode_escape').decode()}`: llama.cpp `{list(llamacpp_ids)}` "
@@ -497,6 +513,19 @@ def _tokenizer_blocker_evidence_table() -> str:
                 f"{list(evidence.oracle_mismatch_count_by_mode)} by mode; "
                 f"source oracle `{evidence.source_oracle_sha256}`"
             )
+        if evidence.blocked_identifiers:
+            witness += (
+                f"<br>dispatch oracles={dict(evidence.dispatch_oracles)}; "
+                f"discriminator={evidence.dispatch_discriminator}; "
+                f"detokenize mismatches={evidence.oracle_detokenize_mismatch_count} "
+                f"{list(evidence.oracle_detokenize_mismatch_count_by_mode)} by mode"
+            )
+            if evidence.first_detokenize_mismatch is not None:
+                detokenize_text, llamacpp_hex, source_hex = evidence.first_detokenize_mismatch
+                witness += (
+                    f"; `{detokenize_text.encode('unicode_escape').decode()}`: "
+                    f"llama.cpp hex `{llamacpp_hex}` vs source hex `{source_hex}`"
+                )
         rows.append(
             f"- `{evidence.evidence_id}` — **GGUF/source:** {_cell(identity)}; "
             f"**closure:** {_cell(closure)}; **witness:** {_cell(witness)}"
@@ -580,11 +609,12 @@ def render_document() -> str:
     )
     tokenizer_refresh_note = " ".join(
         (
-            "The MiniCPM and Gemma4 fixtures are reproducible through their",
-            "`scripts/generate_*_tokenizer_oracle.py` workflows, which validate immutable",
-            "bounded headers and official tokenizer hashes, build tokenizer-only GGUFs and the",
-            "pinned llama.cpp helper, then recompute exact outputs and mismatch witnesses.",
-            "The committed Gemma4 inputs also replay the current reconstruction network-free.",
+            "The MiniCPM, Gemma4, and final alias-group fixtures are reproducible through",
+            "`scripts/generate_*tokenizer*.py`, which validates immutable bounded headers",
+            "and official tokenizer hashes, builds tokenizer-only GGUFs and the pinned",
+            "llama.cpp helper, then recomputes exact outputs and mismatch witnesses.",
+            "Committed Gemma4 and alias-group inputs replay materialized identities",
+            "network-free; the alias oracle never calls the production reconstruction.",
         )
     )
     return f"""# `build_from_gguf()`
