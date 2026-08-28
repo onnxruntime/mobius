@@ -38,6 +38,7 @@ def _create_tiny_gguf(
     ffn_size: int | None = None,
     float_type: str = "f32",
     tokenizer_pre: str | None = None,
+    unknown_tokenizer_field: bool = False,
 ) -> str:
     """Create a minimal GGUF file with fp32 weights for testing.
 
@@ -62,6 +63,8 @@ def _create_tiny_gguf(
         writer.add_string("tokenizer.ggml.pre", tokenizer_pre)
         writer.add_token_list(tokens)
         writer.add_token_merges([f"{tokens[0]} {tokens[1]}"])
+    if unknown_tokenizer_field:
+        writer.add_string("tokenizer.ggml.future_semantics", "opaque")
 
     # Tensors — unquantized random weights
     rng = np.random.default_rng(42)
@@ -656,6 +659,24 @@ class TestCLIBuildGGUF:
         assert warning["route"] == "absent"
         assert warning["blocker_category"] == ("serialized-tokenizer-pipeline-incomplete")
         assert warning["reason"].endswith("contains no tokenizer metadata")
+
+    def test_unknown_tokenizer_field_exports_model_with_explicit_diagnostics(
+        self, tmp_path, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = _create_tiny_gguf(
+            tmp_path / "unknown-tokenizer-field.gguf",
+            unknown_tokenizer_field=True,
+        )
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            package = build_from_gguf(path, keep_quantized=False)
+
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert tokenizer.output == "omitted"
+        assert "tokenizer.ggml.future_semantics" in tokenizer.reason
+        assert caplog.text.count("GGUF PARTIAL EXPORT WARNING:") == 1
 
     def test_unexpected_tokenizer_disposition_error_still_fails(
         self, tmp_path, monkeypatch, caplog

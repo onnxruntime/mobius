@@ -444,6 +444,44 @@ def _incomplete_tokenizer_verdict(
     )
 
 
+def _unsupported_tokenizer_fields(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return tokenizer fields outside the pinned loader/converter closure."""
+    known = LOADER_CONSUMED_TOKENIZER_FIELDS | CONVERTER_OR_EXTENSION_TOKENIZER_FIELDS
+    return tuple(
+        sorted(
+            key
+            for key in metadata
+            if key.startswith("tokenizer.")
+            and key not in known
+            and not key.startswith("tokenizer.chat_template.")
+        )
+    )
+
+
+def _unsupported_fields_verdict(
+    *,
+    metadata: Mapping[str, Any],
+    model: str | None,
+    pre: str | None,
+    canonical_pre: str | None,
+    token_count: int,
+    unsupported: tuple[str, ...],
+) -> GGUFTokenizerVerdict:
+    """Defer tokenizer publication when serialized semantics are outside closure."""
+    return GGUFTokenizerVerdict(
+        "deferred",
+        model,
+        pre,
+        canonical_pre,
+        f"unsupported tokenizer metadata fields are outside the pinned loader/converter "
+        f"closure: {list(unsupported)}",
+        token_count,
+        metadata_sha256=_tokenizer_metadata_sha256(metadata),
+        audit_status="deferred-unsupported-metadata-fields",
+        blocker_category="unsupported-tokenizer-metadata-fields",
+    )
+
+
 def _validate_incomplete_tokenizer_fields(
     metadata: Mapping[str, Any],
     *,
@@ -573,11 +611,6 @@ def _validate_incomplete_tokenizer_fields(
         type(value) is not int or value < -128 or value > 255 for value in charsmap
     ):
         raise ValueError("tokenizer.ggml.precompiled_charsmap must contain byte values")
-    if "tokenizer.ggml.byte_fallback" in metadata:
-        raise ValueError(
-            "tokenizer.ggml.byte_fallback is not a pinned GGUF key; byte-fallback semantics "
-            "cannot be inferred from it"
-        )
     _validate_chat_templates(metadata)
     return len(tokens)
 
@@ -607,6 +640,16 @@ def inspect_gguf_tokenizer(
                 source=source,
                 model=None,
             )
+            unsupported = _unsupported_tokenizer_fields(metadata)
+            if unsupported:
+                return _unsupported_fields_verdict(
+                    metadata=metadata,
+                    model=None,
+                    pre=metadata.get("tokenizer.ggml.pre"),
+                    canonical_pre=None,
+                    token_count=token_count,
+                    unsupported=unsupported,
+                )
             return _incomplete_tokenizer_verdict(
                 model=None,
                 reason=(
@@ -627,6 +670,18 @@ def inspect_gguf_tokenizer(
                 source=source,
                 model=model,
             )
+            unsupported = _unsupported_tokenizer_fields(metadata)
+            if unsupported:
+                pre = metadata.get("tokenizer.ggml.pre")
+                policy = tokenizer_pre_policies().get(pre) if isinstance(pre, str) else None
+                return _unsupported_fields_verdict(
+                    metadata=metadata,
+                    model=model,
+                    pre=pre,
+                    canonical_pre=policy.canonical if policy else None,
+                    token_count=token_count,
+                    unsupported=unsupported,
+                )
             return _incomplete_tokenizer_verdict(
                 model=model,
                 reason=f"{source} contains no complete tokenizer token table",
@@ -740,18 +795,30 @@ def inspect_gguf_tokenizer(
         type(value) is not int or value < -128 or value > 255 for value in charsmap
     ):
         raise ValueError("tokenizer.ggml.precompiled_charsmap must contain byte values")
-    if "tokenizer.ggml.byte_fallback" in metadata:
-        raise ValueError(
-            "tokenizer.ggml.byte_fallback is not a pinned GGUF key; byte-fallback semantics "
-            "cannot be inferred from it"
-        )
     _validate_chat_templates(metadata)
 
+    rwkv_world = metadata.get("tokenizer.rwkv.world")
+    if rwkv_world is not None and not isinstance(rwkv_world, str):
+        raise ValueError("tokenizer.rwkv.world must be a string")
     embedded = metadata.get("tokenizer.huggingface.json")
+    embedded_digest = None
     if embedded is not None:
         if not isinstance(embedded, str):
             raise ValueError("tokenizer.huggingface.json must be a string")
-        digest = _validate_embedded_tokenizer_json(embedded, tokens)
+        embedded_digest = _validate_embedded_tokenizer_json(embedded, tokens)
+
+    unsupported = _unsupported_tokenizer_fields(metadata)
+    if unsupported:
+        return _unsupported_fields_verdict(
+            metadata=metadata,
+            model=model,
+            pre=pre_value,
+            canonical_pre=policy.canonical if policy else None,
+            token_count=len(tokens),
+            unsupported=unsupported,
+        )
+
+    if embedded_digest is not None:
         return GGUFTokenizerVerdict(
             "copy",
             model,
@@ -760,7 +827,7 @@ def inspect_gguf_tokenizer(
             "embedded tokenizers JSON is copied verbatim and its ordered vocabulary "
             "matches GGUF; pipeline execution is delegated to that artifact",
             len(tokens),
-            digest,
+            embedded_digest,
             _tokenizer_metadata_sha256(metadata),
         )
 

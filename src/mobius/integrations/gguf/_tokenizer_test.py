@@ -16,6 +16,7 @@ import pytest
 
 from mobius.integrations.gguf import _tokenizer
 from mobius.integrations.gguf._tokenizer import (
+    LOADER_CONSUMED_TOKENIZER_FIELDS,
     GGUFTokenizerAsset,
     GGUFTokenizerSource,
     inspect_gguf_tokenizer,
@@ -295,6 +296,90 @@ class TestInspectGgufTokenizer:
         with pytest.raises((TypeError, ValueError), match=message):
             inspect_gguf_tokenizer(metadata)
 
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"tokenizer.ggml.future_semantics": "opaque"},
+            {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.future_semantics": "opaque",
+            },
+            {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.chat_templates.tool": "near-miss",
+            },
+            {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.byte_fallback": True,
+            },
+        ],
+    )
+    def test_incomplete_unknown_fields_are_authoritatively_deferred(
+        self, metadata: dict
+    ) -> None:
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.audit_status == "deferred-unsupported-metadata-fields"
+        assert verdict.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert "outside the pinned loader/converter closure" in verdict.reason
+        assert next(
+            key for key in metadata if key not in LOADER_CONSUMED_TOKENIZER_FIELDS
+        ) in (verdict.reason)
+
+    def test_complete_unknown_field_prevents_embedded_tokenizer_copy(self) -> None:
+        metadata = _metadata(embedded=True)
+        metadata["tokenizer.ggml.future_semantics"] = "opaque"
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert verdict.tokenizer_sha256 is None
+        assert "tokenizer.ggml.future_semantics" in verdict.reason
+
+    @pytest.mark.parametrize(
+        "field",
+        ["tokenizer.ggml.byte_fallback", "tokenizer.ggml.future_semantics"],
+    )
+    def test_complete_unknown_semantic_field_is_deferred(self, field: str) -> None:
+        metadata = _metadata()
+        metadata[field] = True
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert field in verdict.reason
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("tokenizer.huggingface.json", 42, "must be a string"),
+            ("tokenizer.rwkv.world", 42, "must be a string"),
+        ],
+    )
+    def test_malformed_known_extension_stays_fatal_with_unknown_field(
+        self, field: str, value: object, message: str
+    ) -> None:
+        metadata = _metadata()
+        metadata["tokenizer.ggml.future_semantics"] = "opaque"
+        metadata[field] = value
+
+        with pytest.raises(ValueError, match=message):
+            inspect_gguf_tokenizer(metadata)
+
+    @pytest.mark.parametrize("complete", [False, True])
+    def test_named_chat_template_namespace_is_inside_field_closure(
+        self, complete: bool
+    ) -> None:
+        metadata = _metadata(embedded=True) if complete else {"tokenizer.ggml.model": "llama"}
+        metadata["tokenizer.chat_template.tool_use"] = "tool-template"
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.blocker_category != "unsupported-tokenizer-metadata-fields"
+        assert verdict.route == ("copy" if complete else "deferred")
+
     def test_known_pre_without_complete_pipeline_is_deferred(self):
         verdict = inspect_gguf_tokenizer(_metadata(pre="hunyuan-dense"))
         assert verdict.route == "deferred"
@@ -422,10 +507,6 @@ class TestInspectGgufTokenizer:
                     "tokenizer.ggml.precompiled_charsmap", [0, 256]
                 ),
                 "byte values",
-            ),
-            (
-                lambda value: value.__setitem__("tokenizer.ggml.byte_fallback", True),
-                "not a pinned GGUF key",
             ),
             (
                 lambda value: value.__setitem__("tokenizer.ggml.suppress_tokens", [0, 0]),
