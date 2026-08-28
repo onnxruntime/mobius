@@ -40,6 +40,8 @@ __all__ = [
     "DiarizationTask",
     "FeatureExtractionTask",
     "GGUFEncoderFeatureExtractionTask",
+    "GGUFAudioProjectorModel",
+    "GGUFAudioProjectorTask",
     "GGUFEmbeddingFeatureExtractionTask",
     "GGUFProjectorVisionLanguageTask",
     "GGUFSpeakerProjectorModel",
@@ -148,6 +150,8 @@ from mobius.tasks._gemma4 import (
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
 from mobius.tasks._gguf_projector import (
+    GGUFAudioProjectorModel,
+    GGUFAudioProjectorTask,
     GGUFSpeakerProjectorModel,
     GGUFSpeakerProjectorTask,
     GGUFVisionProjectorModel,

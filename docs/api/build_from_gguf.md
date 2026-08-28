@@ -11,7 +11,7 @@ Support is capability-specific: graph import does not imply runtime packaging.
 |---|---:|---|
 | Architectures | 148 | graph verdicts: {'deferred': 41, 'rejected': 2, 'supported': 105}; importable: 105; quantized import: {'rejected': 47, 'supported': 101}; runtime: {'deferred': 136, 'rejected': 2, 'supported': 10} |
 | Active stored qtypes | 25 | 24 have an import route; 1 are explicitly deferred with no route |
-| Serialized projector strings | 60 | {'graph-importable': 18, 'runtime-evidenced': 0} |
+| Serialized projector strings | 60 | {'graph-importable': 25, 'runtime-evidenced': 0} |
 | Tokenizer pre identifiers | 87 | 56 semantic groups; route dispositions: {'deferred-compiled-semantics': 45, 'deferred-pinned-artifact-evidence': 4, 'deferred-pinned-artifact-mismatch': 7, 'validated-pinned-source': 31} |
 
 `SUPPORTED` means the named capability is implemented and mechanically tested. `DEFERRED` means it is intentionally unavailable pending the stated work. `REJECTED` means the input or route is invalid by policy. Graph support controls export. The separate runtime verdict records pinned real-artifact validation, independent parity, and deterministic generation or stateful semantics; it never gates export of a faithfully represented graph and package contract. Tokenizer `copy` requires embedded ordered-vocabulary identity; `pinned-source` also binds the complete GGUF artifact, immutable Hub assets, reconstruction policy, semantic hashes, and representative token-ID vectors.
@@ -65,6 +65,11 @@ artifact, graph, tokenizer, runtime version, parity proof, and deterministic sta
 evidence match.
 Processor-owned `image_token_id` overrides are forwarded unchanged for `mmproj=` packages.
 
+Use `build_mmproj_from_gguf("mmproj.gguf", projector_type=..., target_architecture=...)`
+to export a registry-evidenced standalone `vision_encoder`, `audio_encoder`, or
+`speaker_encoder`. It never invents decoder, media-mixing, or generated-audio roles and
+warns while downstream runtime orchestration remains unvalidated.
+
 ## Runtime evidence
 
 The first low-cost architecture batch promotes GPT-2, GPT-NeoX/Pythia, MPT, OLMo,
@@ -115,8 +120,8 @@ remain machine-readable in `_route_census.py`; this table groups only shared nex
 | `evidence-only` | `architecture-runtime-evidence` | `architecture:apertus`, `architecture:arcee`, `architecture:arctic`, `architecture:baichuan`, `architecture:bailingmoe`, `architecture:bert`, `architecture:bitnet`, `architecture:bloom`, `architecture:chatglm`, `architecture:codeshell`, `architecture:cohere2`, `architecture:command-r`, `architecture:dbrx`, `architecture:deci`, `architecture:deepseek`, `architecture:dflash`, `architecture:dots1`, `architecture:dream`, `architecture:eagle3`, `architecture:ernie4_5`, `architecture:ernie4_5-moe`, `architecture:eurobert`, `architecture:exaone`, `architecture:falcon`, `architecture:falcon-h1`, `architecture:gemma`, `architecture:gemma-embedding`, `architecture:gemma2`, `architecture:gemma3`, `architecture:gemma4`, `architecture:glm-dsa`, `architecture:granite`, `architecture:granitehybrid`, `architecture:granitemoe`, `architecture:grok`, `architecture:grovemoe`, `architecture:hunyuan-dense`, `architecture:hunyuan-moe`, `architecture:hy_v3`, `architecture:internlm2`, `architecture:jais`, `architecture:jais2`, `architecture:jamba`, `architecture:jina-bert-v2`, `architecture:jina-bert-v3`, `architecture:kimi-k3`, `architecture:kimi-linear`, `architecture:lfm2moe`, `architecture:llada`, `architecture:llada-moe`, `architecture:llama-embed`, `architecture:maincoder`, `architecture:mamba`, `architecture:mamba2`, `architecture:minicpm`, `architecture:minicpm3`, `architecture:minimax-01`, `architecture:minimax-m2`, `architecture:mistral4`, `architecture:modern-bert`, `architecture:muse-glimmer`, `architecture:nemotron`, `architecture:nemotron_h`, `architecture:nemotron_h_moe`, `architecture:neo-bert`, `architecture:nomic-bert`, `architecture:nomic-bert-moe`, `architecture:olmo2`, `architecture:olmoe`, `architecture:openelm`, `architecture:orion`, `architecture:pangu-embedded`, `architecture:phi2`, `architecture:phi3`, `architecture:phimoe`, `architecture:plamo`, `architecture:plamo2`, `architecture:plm`, `architecture:qwen`, `architecture:qwen2moe`, `architecture:qwen2vl`, `architecture:qwen3`, `architecture:qwen35`, `architecture:qwen3moe`, `architecture:qwen3next`, `architecture:refact`, `architecture:rnd1`, `architecture:seed_oss`, `architecture:smallthinker`, `architecture:smollm3`, `architecture:stablelm`, `architecture:t5`, `architecture:t5encoder`, `architecture:talkie`, `architecture:xverse` | immutable representative GGUF; full-logit prefill and cached-decode parity; deterministic generation/state evidence |
 | `evidence-only` | `draft-runtime-evidence` | `draft:dflash`, `draft:eagle3` | target acceptance loop; draft cache orchestration; deterministic speedup parity |
 | `evidence-only` | `mtp-runtime-evidence` | `mtp:hy_v3`, `mtp:qwen35` | target acceptance loop; cache-threaded draft/target parity |
-| `evidence-only` | `projector-runtime-evidence` | `projector:adapter`, `projector:gemma3`, `projector:gemma3na`, `projector:gemma3nv`, `projector:gemma4a`, `projector:gemma4ua`, `projector:gemma4uv`, `projector:gemma4v`, `projector:idefics3`, `projector:internvl`, `projector:ldp`, `projector:ldpv2`, `projector:llama4`, `projector:mlp`, `projector:muse-glimmer`, `projector:pixtral`, `projector:qwen2.5vl_merger`, `projector:qwen2vl_merger` | paired text target; processor boundary; deterministic multimodal package execution |
-| `immediately-implementable` | `projector-implementation` | `projector:cogvlm`, `projector:deepseekocr`, `projector:deepseekocr2`, `projector:dots3note_a`, `projector:dots3note_v`, `projector:dots_ocr`, `projector:exaone4_5`, `projector:glm4v`, `projector:glma`, `projector:granite4_vision`, `projector:granite_speech`, `projector:hunyuanvl`, `projector:janus_pro`, `projector:kimik25`, `projector:kimivl`, `projector:lfm2`, `projector:lfm2a`, `projector:lightonocr`, `projector:meralion`, `projector:mimo_audio`, `projector:mimovl`, `projector:minicpmv4_6`, `projector:minimax_m3`, `projector:musicflamingo`, `projector:nemotron_v2_vl`, `projector:paddleocr`, `projector:parakeet`, `projector:pockettts_spkenc`, `projector:qwen2.5o`, `projector:qwen2a`, `projector:qwen3a`, `projector:qwen3tts_spkenc`, `projector:qwen3vl_merger`, `projector:step3vl`, `projector:ultravox`, `projector:voxtral`, `projector:yasa2`, `projector:youtuvl` | metadata schema; tensor closure; component graph parity |
+| `evidence-only` | `projector-runtime-evidence` | `projector:adapter`, `projector:gemma3`, `projector:gemma3na`, `projector:gemma3nv`, `projector:gemma4a`, `projector:gemma4ua`, `projector:gemma4uv`, `projector:gemma4v`, `projector:glm4v`, `projector:glma`, `projector:idefics3`, `projector:internvl`, `projector:ldp`, `projector:ldpv2`, `projector:llama4`, `projector:mlp`, `projector:muse-glimmer`, `projector:pixtral`, `projector:qwen2.5o`, `projector:qwen2.5vl_merger`, `projector:qwen2a`, `projector:qwen2vl_merger`, `projector:qwen3a`, `projector:qwen3tts_spkenc`, `projector:qwen3vl_merger` | paired text target; processor boundary; deterministic multimodal package execution |
+| `immediately-implementable` | `projector-implementation` | `projector:cogvlm`, `projector:deepseekocr`, `projector:deepseekocr2`, `projector:dots3note_a`, `projector:dots3note_v`, `projector:dots_ocr`, `projector:exaone4_5`, `projector:granite4_vision`, `projector:granite_speech`, `projector:hunyuanvl`, `projector:janus_pro`, `projector:kimik25`, `projector:kimivl`, `projector:lfm2`, `projector:lfm2a`, `projector:lightonocr`, `projector:meralion`, `projector:mimo_audio`, `projector:mimovl`, `projector:minicpmv4_6`, `projector:minimax_m3`, `projector:musicflamingo`, `projector:nemotron_v2_vl`, `projector:paddleocr`, `projector:parakeet`, `projector:pockettts_spkenc`, `projector:step3vl`, `projector:ultravox`, `projector:voxtral`, `projector:yasa2`, `projector:youtuvl` | metadata schema; tensor closure; component graph parity |
 | `intentionally-rejected` | `policy-rejections` | `architecture:bailingmoe2`, `architecture:clip`, `architecture:dots3note`, `architecture:exaone-moe`, `architecture:exaone4`, `architecture:glm4`, `architecture:glm4moe`, `architecture:gptj` | policy change plus independent correctness proof |
 | `intentionally-rejected` | `policy-rejections` | `projector:pockettts_gen`, `projector:qwen3tts_gen` | sidecar role must become a valid projector contract |
 | `intentionally-rejected` | `policy-rejections` | `mtp:bailingmoe2`, `mtp:dots3note`, `mtp:exaone-moe`, `mtp:exaone4`, `mtp:gemma4-assistant`, `mtp:glm4`, `mtp:glm4moe`, `mtp:graniteswitch`, `mtp:nemotron_h` | upstream executable ownership change |
@@ -376,6 +381,11 @@ operator ABI for every tensor role, and treats dequantize/requantize as non-pres
 | `gemma3-4b-f16` | `ggml-org/gemma-3-4b-it-GGUF@ab31416aceb30cd095cb34cc27eea120940964e4`<br>`mmproj-model-f16.gguf` | 851,251,104 | `8c0fb064b019a6972856aaae2c7e4792858af3ca4561be2dbf649123ba6c40cb` | `gemma3` | `gemma-3-4b-it-Q4_K_M.gguf` | `google/gemma-3-4b-it@093f9f388b31de276ce2de164bdc2081324b9767` |
 | `gemma4-e2b-f16` | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2`<br>`mmproj-F16.gguf` | 985,654,080 | `337ee849e80b6169ce9d1d573d424fc1653bcafa5f0cb0cbb901beba54f4b41c` | `gemma4v`, `gemma4a` | `unsloth/gemma-4-E2B-it-GGUF@0314792d7f1f7e229411f620751375812bb9faf2`<br>`gemma-4-E2B-it-Q4_K_M.gguf`<br>3,106,738,272 bytes | `google/gemma-4-E2B-it@3e22461f65e89153144f8adb70e3b8c2cc9845a7` |
 | `muse-glimmer-30b-bf16` | `unsloth/Muse-Glimmer-30B-GGUF@faa5b025c584459c13febfa5c59883516710ae39`<br>`mmproj-Muse-Glimmer-30B-BF16.gguf` | 3,849,173,728 | `7aa788cfe25ae5e4bf4837511f64df22cabe595e58223708274a67b3136f53ab` | `muse-glimmer` | `Muse-Glimmer-30B-UD-Q4_K_XL.gguf` | — |
+| `qwen3-vl-projector-f16` | `bartowski/Qwen_Qwen3-VL-2B-Instruct-GGUF@e84f8ae7ffee8b04793a4ed771609e2b61d3f3cf`<br>`mmproj-Qwen_Qwen3-VL-2B-Instruct-f16.gguf` | 819,394,848 | `8c3f6a56979a1ce7056b9a20be6cf6b6f6ad4837aa3da532b5afcfcfd1faa38b` | `qwen3vl_merger` | `Qwen_Qwen3-VL-2B-Instruct-Q4_K_M.gguf` | `Qwen/Qwen3-VL-2B-Instruct@89644892e4d85e24eaac8bacfd4f463576704203` |
+| `qwen3-audio-projector-bf16` | `ggml-org/Qwen3-ASR-0.6B-GGUF@928ab958557df9aa2ef1c93e0e83c7ad0933fae2`<br>`mmproj-Qwen3-ASR-0.6B-bf16.gguf` | 378,575,520 | `dae36c855f9a82a8916bea2238b24bda69a39d8da8b2f46dee7c103775656039` | `qwen3a` | `Qwen3-ASR-0.6B-bf16.gguf` | `Qwen/Qwen3-ASR-0.6B@5eb144179a02acc5e5ba31e748d22b0cf3e303b0` |
+| `qwen2-audio-projector-f16` | `mradermacher/Qwen2-Audio-7B-Instruct-GGUF@e1e68850ba33e38eafbc3817919c318d9c7e757b`<br>`Qwen2-Audio-7B-Instruct.mmproj-f16.gguf` | 1,289,301,536 | `b52435dead2956f1fc113818c3b5ceb42a940cb487e59163cb1ffc69cae69347` | `qwen2a` | `Qwen2-Audio-7B-Instruct.Q4_K_M.gguf` | `Qwen/Qwen2-Audio-7B-Instruct@0a095220c30b7b31434169c3086508ef3ea5bf0a` |
+| `qwen25-omni-projector-f16` | `ggml-org/Qwen2.5-Omni-3B-GGUF@75f1b73b657a50f5092502799457ccb4a4a1f9df`<br>`mmproj-Qwen2.5-Omni-3B-f16.gguf` | 2,623,983,328 | `f6d9276e9fa4f060c7abdbe886786cf31a8911b62770f8a54b7581b7b99fa27e` | `qwen2.5o`, `qwen2.5vl_merger`, `qwen2a` | `Qwen2.5-Omni-3B-Q4_K_M.gguf` | `Qwen/Qwen2.5-Omni-3B@f75b40e3da2003cdd6e1829b1f420ca70797c34e` |
+| `glm4v-projector-f16` | `mradermacher/GLM-OCR-GGUF@3c1e642c0fa5df64831f0b04f3c674b57ce341af`<br>`GLM-OCR.mmproj-f16.gguf` | 869,018,080 | `fe5805b3b70f3174d25a912b8d197569eaa8e1e3e6d9777a385b8cc4c622af6c` | `glm4v` | `GLM-OCR.Q4_K_M.gguf` | `zai-org/GLM-OCR@ca5d8b3e287e52589e37c28385d9655ee4372f9d` |
 
 The five generic projector evidence pairs total **10,672,691,328 bytes** (sidecars plus paired text GGUFs), below the 16 GiB evidence budget. Runtime remains deferred; four routes have independent nonzero-weight graph parity, while MiniCPM resampler remains component-only and graph-deferred.
 
@@ -390,68 +400,68 @@ implementation work until tensor mapping and component parity are independently 
 
 <!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->
 
-| Projector string | Modality | Paired text architecture | Metadata/tensor/graph/runtime | Exactness/evidence |
-|---|---|---|---|---|
-| `adapter` | vision | `chatglm` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`glm-edge-v-2b-adapter-f16` |
-| `cogvlm` | vision | `cogvlm` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `deepseekocr` | vision | `deepseek2-ocr` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `deepseekocr2` | vision | `deepseek2-ocr` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `dots3note_a` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `dots3note_v` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `dots_ocr` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `exaone4_5` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `gemma3` | vision | `gemma3` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3-4b-f16` |
-| `gemma3na` | audio | `gemma3n` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3n-e4b-f16` |
-| `gemma3nv` | vision | `gemma3n` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3n-e4b-f16` |
-| `gemma4a` | audio | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-e2b-f16` |
-| `gemma4ua` | audio | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-unified-12b-f16` |
-| `gemma4uv` | vision | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-unified-12b-f16` |
-| `gemma4v` | vision | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-e2b-f16` |
-| `glm4v` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `glma` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `granite4_vision` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `granite_speech` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `hunyuanvl` | vision | `hunyuan_vl` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `idefics3` | vision | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`smolvlm-256m-idefics3-f16` |
-| `internvl` | vision | `qwen2` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`internvl25-1b-f16` |
-| `janus_pro` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `kimik25` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `kimivl` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `ldp` | vision | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`mobilevlm-1.7b-ldp-f16` |
-| `ldpv2` | vision | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`mobilevlm-v2-1.7b-ldpv2-f16` |
-| `lfm2` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `lfm2a` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `lightonocr` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `llama4` | vision | `llama4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`llama4-scout-f16` |
-| `meralion` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `mimo_audio` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `mimovl` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `minicpmv4_6` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `minimax_m3` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `mlp` | vision | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`llava-llama3-8b-mlp-f16` |
-| `muse-glimmer` | vision | `muse-glimmer` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`muse-glimmer-30b-bf16` |
-| `musicflamingo` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `nemotron_v2_vl` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `paddleocr` | vision | `paddleocr` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `parakeet` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `phi4` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `pixtral` | vision | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`pixtral-12b-f16` |
-| `pockettts_gen` | gen.audio | — | metadata=rejected; tensor_map=rejected; graph=rejected; runtime=rejected | CONFIG_REJECTED — The serialized architecture contract is deliberately refused. |
-| `pockettts_spkenc` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `qwen2.5o` | audio, vision | `qwen2vl` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `qwen2.5vl_merger` | vision | `qwen2vl` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen25-vl-3b-f16` |
-| `qwen2a` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `qwen2vl_merger` | vision | `qwen2vl` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen2-vl-2b-f16` |
-| `qwen3a` | audio | `qwen3vl`, `qwen3vlmoe` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `qwen3tts_gen` | gen.audio | — | metadata=rejected; tensor_map=rejected; graph=rejected; runtime=rejected | CONFIG_REJECTED — The serialized architecture contract is deliberately refused. |
-| `qwen3tts_spkenc` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `qwen3vl_merger` | vision | `qwen35`, `qwen35moe`, `qwen3vl`, `qwen3vlmoe` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `resampler` | vision | `minicpm` | metadata=supported; tensor_map=supported; graph=deferred; runtime=deferred | artifact pins=`minicpm-v2-resampler-f16` |
-| `step3vl` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `ultravox` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `voxtral` | audio | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `yasa2` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
-| `youtuvl` | vision | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| Projector string | Modality | Graph role / route | Paired text architecture | Metadata/tensor/graph/runtime | Exactness/evidence |
+|---|---|---|---|---|---|
+| `adapter` | vision | paired package via `generic_projector` | `chatglm` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`glm-edge-v-2b-adapter-f16` |
+| `cogvlm` | vision | — | `cogvlm` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `deepseekocr` | vision | — | `deepseek2-ocr` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `deepseekocr2` | vision | — | `deepseek2-ocr` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `dots3note_a` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `dots3note_v` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `dots_ocr` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `exaone4_5` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `gemma3` | vision | paired package via `gemma3` | `gemma3` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3-4b-f16` |
+| `gemma3na` | audio | audio_encoder via `core_vlm_projector` | `gemma3n` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3n-e4b-f16` |
+| `gemma3nv` | vision | vision_encoder via `core_vlm_projector` | `gemma3n` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma3n-e4b-f16` |
+| `gemma4a` | audio | audio_encoder via `core_vlm_projector` | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-e2b-f16` |
+| `gemma4ua` | audio | audio_encoder via `core_vlm_projector` | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-unified-12b-f16` |
+| `gemma4uv` | vision | vision_encoder via `core_vlm_projector` | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-unified-12b-f16` |
+| `gemma4v` | vision | paired package via `gemma4` | `gemma4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`gemma4-e2b-f16` |
+| `glm4v` | vision | vision_encoder via `qwen_glm_projector` | `glm4`, `glm4moe` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`glm4v-projector-f16` |
+| `glma` | audio | audio_encoder via `qwen_glm_projector` | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | source evidence=`glma-converter-checkpoint-drift` |
+| `granite4_vision` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `granite_speech` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `hunyuanvl` | vision | — | `hunyuan_vl` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `idefics3` | vision | vision_encoder via `core_vlm_projector` | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`smolvlm-256m-idefics3-f16` |
+| `internvl` | vision | vision_encoder via `core_vlm_projector` | `qwen2` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`internvl25-1b-f16` |
+| `janus_pro` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `kimik25` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `kimivl` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `ldp` | vision | paired package via `generic_projector` | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`mobilevlm-1.7b-ldp-f16` |
+| `ldpv2` | vision | paired package via `generic_projector` | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`mobilevlm-v2-1.7b-ldpv2-f16` |
+| `lfm2` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `lfm2a` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `lightonocr` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `llama4` | vision | vision_encoder via `core_vlm_projector` | `llama4` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`llama4-scout-f16` |
+| `meralion` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `mimo_audio` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `mimovl` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `minicpmv4_6` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `minimax_m3` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `mlp` | vision | paired package via `generic_projector` | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`llava-llama3-8b-mlp-f16` |
+| `muse-glimmer` | vision | paired package via `muse_glimmer` | `muse-glimmer` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`muse-glimmer-30b-bf16` |
+| `musicflamingo` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `nemotron_v2_vl` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `paddleocr` | vision | — | `paddleocr` | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `parakeet` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `phi4` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `pixtral` | vision | vision_encoder via `core_vlm_projector` | `llama` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`pixtral-12b-f16` |
+| `pockettts_gen` | gen.audio | — | — | metadata=rejected; tensor_map=rejected; graph=rejected; runtime=rejected | CONFIG_REJECTED — The serialized architecture contract is deliberately refused. |
+| `pockettts_spkenc` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `qwen2.5o` | audio, vision | vision_encoder, audio_encoder via `qwen_glm_projector` | `qwen2vl` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen25-omni-projector-f16` |
+| `qwen2.5vl_merger` | vision | paired package via `qwen_vl` | `qwen2vl` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen25-vl-3b-f16` |
+| `qwen2a` | audio | audio_encoder via `qwen_glm_projector` | `qwen2` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen2-audio-projector-f16` |
+| `qwen2vl_merger` | vision | paired package via `qwen_vl` | `qwen2vl` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen2-vl-2b-f16` |
+| `qwen3a` | audio | audio_encoder via `qwen_glm_projector` | `qwen3vl`, `qwen3vlmoe` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen3-audio-projector-bf16` |
+| `qwen3tts_gen` | gen.audio | — | — | metadata=rejected; tensor_map=rejected; graph=rejected; runtime=rejected | CONFIG_REJECTED — The serialized architecture contract is deliberately refused. |
+| `qwen3tts_spkenc` | audio | speaker_encoder via `qwen_glm_projector` | `qwen3tts` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | source evidence=`qwen3tts-speaker-runtime-boundary` |
+| `qwen3vl_merger` | vision | vision_encoder via `qwen_glm_projector` | `qwen35`, `qwen35moe`, `qwen3vl`, `qwen3vlmoe` | metadata=supported; tensor_map=supported; graph=supported; runtime=deferred | artifact pins=`qwen3-vl-projector-f16` |
+| `resampler` | vision | paired package via `generic_projector` | `minicpm` | metadata=supported; tensor_map=supported; graph=deferred; runtime=deferred | artifact pins=`minicpm-v2-resampler-f16` |
+| `step3vl` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `ultravox` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `voxtral` | audio | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `yasa2` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
+| `youtuvl` | vision | — | — | metadata=deferred; tensor_map=deferred; graph=deferred; runtime=deferred | CONFIG_DEFERRED — Exact configuration ownership is not implemented. |
 
 <!-- END GGUF MMPROJ SUPPORT MATRIX -->
 

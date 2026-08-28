@@ -21,6 +21,7 @@ __all__ = [
     "LLAMA_CPP_MMPROJ_SHA",
     "MMPROJ_ARTIFACT_AVAILABILITY_PINS",
     "MMPROJ_ARTIFACT_PINS",
+    "MMPROJ_SOURCE_EVIDENCE",
     "ClipMetadataField",
     "CompanionTensorSpec",
     "DeferredCompanionSpec",
@@ -45,7 +46,7 @@ from typing import Any
 
 from mobius.integrations.gguf._spec import Support
 
-LLAMA_CPP_MMPROJ_SHA = "8d9af256337d1a501250f9bbf4c0859a654bddd6"
+LLAMA_CPP_MMPROJ_SHA = "86632248188c106d749fad34a1dcd237c95863d4"
 
 
 class MMProjModality(enum.Enum):
@@ -129,6 +130,7 @@ class ProjectorSpec:
     optional_top_tensors: tuple[str, ...] = ()
     block_prefix: str | None = None
     block_suffixes: tuple[str, ...] = ()
+    block_suffix_variants: tuple[tuple[str, ...], ...] = ()
     auxiliary_tensor_patterns: tuple[str, ...] = ()
     companion_tensors: tuple[CompanionTensorSpec, ...] = ()
     deferred_companions: tuple[DeferredCompanionSpec, ...] = ()
@@ -150,6 +152,7 @@ class ProjectorSpec:
                 self.optional_top_tensors,
                 self.block_prefix,
                 self.block_suffixes,
+                self.block_suffix_variants,
                 self.auxiliary_tensor_patterns,
                 self.companion_tensors,
                 self.deferred_companions,
@@ -362,6 +365,7 @@ CLIP_METADATA_SCHEMA: tuple[ClipMetadataField, ...] = (
     ClipMetadataField("clip.vision.image_grid_pinpoints", default=()),
     ClipMetadataField("clip.vision.n_wa_pattern"),
     ClipMetadataField("clip.vision.wa_layer_indexes"),
+    ClipMetadataField("clip.vision.is_deepstack_layers"),
     ClipMetadataField("clip.vision.wa_pattern_mode"),
     ClipMetadataField("clip.vision.window_size"),
     ClipMetadataField("clip.minicpmv_version"),
@@ -638,6 +642,152 @@ _QWEN25VL_BLOCK_SUFFIXES = (
         for kind in ("weight", "bias")
     ),
 )
+
+_QWEN3VL_BLOCK_SUFFIXES = tuple(
+    f"{stem}.{kind}"
+    for stem in (
+        "ln1",
+        "ln2",
+        "attn_qkv",
+        "attn_out",
+        "ffn_up",
+        "ffn_down",
+    )
+    for kind in ("weight", "bias")
+)
+
+_GLM4V_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln2.weight",
+    "attn_qkv.weight",
+    "attn_out.weight",
+    "ffn_gate.weight",
+    "ffn_up.weight",
+    "ffn_down.weight",
+)
+
+_GLMOCR_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln2.weight",
+    "attn_qkv.weight",
+    "attn_qkv.bias",
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ffn_gate.weight",
+    "ffn_gate.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+)
+
+_WHISPER_AUDIO_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln1.bias",
+    "ln2.weight",
+    "ln2.bias",
+    "attn_q.weight",
+    "attn_q.bias",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_v.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+)
+
+_QWEN3A_BLOCK_SUFFIXES = (
+    *_WHISPER_AUDIO_BLOCK_SUFFIXES,
+    "attn_k.bias",
+)
+
+_COMMON_AUDIO_BODY_METADATA = (
+    "clip.has_audio_encoder",
+    "clip.audio.embedding_length",
+    "clip.audio.feed_forward_length",
+    "clip.audio.block_count",
+    "clip.audio.projection_dim",
+    "clip.audio.attention.head_count",
+    "clip.audio.attention.layer_norm_epsilon",
+    "clip.audio.num_mel_bins",
+)
+
+_QWEN2A_TOP_TENSORS = (
+    "a.conv1d.1.weight",
+    "a.conv1d.1.bias",
+    "a.conv1d.2.weight",
+    "a.conv1d.2.bias",
+    "a.position_embd.weight",
+    "a.post_ln.weight",
+    "a.post_ln.bias",
+    "mm.a.fc.weight",
+    "mm.a.fc.bias",
+)
+
+_QWEN3A_TOP_TENSORS = (
+    "a.conv2d.1.weight",
+    "a.conv2d.1.bias",
+    "a.conv2d.2.weight",
+    "a.conv2d.2.bias",
+    "a.conv2d.3.weight",
+    "a.conv2d.3.bias",
+    "a.conv_out.weight",
+    "a.position_embd.weight",
+    "a.post_ln.weight",
+    "a.post_ln.bias",
+    "mm.a.mlp.1.weight",
+    "mm.a.mlp.1.bias",
+    "mm.a.mlp.2.weight",
+    "mm.a.mlp.2.bias",
+)
+
+_GLMA_TOP_TENSORS = (
+    "a.conv1d.1.weight",
+    "a.conv1d.1.bias",
+    "a.conv1d.2.weight",
+    "a.conv1d.2.bias",
+    "a.position_embd.weight",
+    "a.post_ln.weight",
+    "a.post_ln.bias",
+    "mm.a.mlp.1.weight",
+    "mm.a.mlp.1.bias",
+    "mm.a.mlp.2.weight",
+    "mm.a.mlp.2.bias",
+    "mm.a.norm_pre.weight",
+    "mm.a.norm_pre.bias",
+    "v.boi",
+    "v.eoi",
+)
+
+_QWEN3TTS_SPEAKER_TOP_TENSOR_LIST = [
+    "a.conv1d.0.weight",
+    "a.conv1d.0.bias",
+    "a.conv_out.weight",
+    "a.conv_out.bias",
+    "a.asp_attn.weight",
+    "a.asp_attn.bias",
+    "a.asp_tdnn.weight",
+    "a.asp_tdnn.bias",
+    "mm.a.fc.weight",
+    "mm.a.fc.bias",
+]
+for _speaker_block in range(1, 4):
+    for _speaker_stem in ("conv_pw1", "conv_pw2", "se_conv1", "se_conv2"):
+        for _speaker_kind in ("weight", "bias"):
+            _QWEN3TTS_SPEAKER_TOP_TENSOR_LIST.append(
+                f"a.blk.{_speaker_block}.{_speaker_stem}.{_speaker_kind}"
+            )
+    for _speaker_branch in range(7):
+        for _speaker_kind in ("weight", "bias"):
+            _QWEN3TTS_SPEAKER_TOP_TENSOR_LIST.append(
+                f"a.blk.{_speaker_block}.res2.{_speaker_branch}.{_speaker_kind}"
+            )
+_QWEN3TTS_SPEAKER_TOP_TENSORS = tuple(_QWEN3TTS_SPEAKER_TOP_TENSOR_LIST)
 
 _COMMON_REQUIRED_VISION_METADATA = (
     "clip.has_vision_encoder",
@@ -975,12 +1125,49 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         real_artifact_ids=("qwen25-vl-3b-f16",),
     ),
-    _deferred(
-        "qwen3vl_merger",
-        "PROJECTOR_TYPE_QWEN3VL",
-        _VISION_BASE,
-        "The Qwen3-VL merger/window ordering has no GGUF tensor-closure parity test.",
+    ProjectorSpec(
+        projector_type="qwen3vl_merger",
+        enum_name="PROJECTOR_TYPE_QWEN3VL",
+        modalities=_VISION_BASE,
         target_architectures=frozenset({"qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "Standalone vision and DeepStack merger graphs are exact. Paired runtime "
+            "execution remains unvalidated because the decoder must consume four-section "
+            "MRoPE positions and hidden_size * (1 + deepstack_layers) embeddings."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+            "clip.vision.spatial_merge_size",
+            "clip.vision.is_deepstack_layers",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.patch_embd.bias",
+            "v.position_embd.weight",
+            "v.post_ln.weight",
+            "v.post_ln.bias",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_QWEN3VL_BLOCK_SUFFIXES,
+        auxiliary_tensor_patterns=(r"v\.deepstack\.\d+\.(?:norm|fc1|fc2)\.(?:weight|bias)",),
+        tensor_roles=(
+            ("v.deepstack.", MMProjTensorRole.PROJECTOR),
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("qwen3-vl-projector-f16",),
     ),
     _deferred(
         "step3vl",
@@ -1411,31 +1598,149 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         real_artifact_ids=("llama4-scout-f16",),
     ),
-    _deferred(
-        "qwen2a",
-        "PROJECTOR_TYPE_QWEN2A",
-        _AUDIO_BASE,
-        "Qwen2 audio encoder/projector is not implemented.",
+    ProjectorSpec(
+        projector_type="qwen2a",
+        enum_name="PROJECTOR_TYPE_QWEN2A",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"qwen2"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The standalone Whisper encoder, two-frame average pool, and affine audio "
+            "projector are exact; paired audio-token runtime execution remains unvalidated."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(*_COMMON_AUDIO_BODY_METADATA, "clip.projector_type"),
+        required_top_tensors=_QWEN2A_TOP_TENSORS,
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("qwen2-audio-projector-f16",),
     ),
-    _deferred(
-        "qwen3a",
-        "PROJECTOR_TYPE_QWEN3A",
-        _AUDIO_BASE,
-        "Qwen3 audio encoder/projector is not implemented.",
+    ProjectorSpec(
+        projector_type="qwen3a",
+        enum_name="PROJECTOR_TYPE_QWEN3A",
+        modalities=_AUDIO_BASE,
         target_architectures=frozenset({"qwen3vl", "qwen3vlmoe"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The standalone 100-frame chunked Conv2D encoder and two-layer audio "
+            "projector are exact; paired MRoPE audio-token runtime execution remains "
+            "unvalidated."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_COMMON_AUDIO_BODY_METADATA,
+            "clip.audio.projector_type",
+        ),
+        required_top_tensors=_QWEN3A_TOP_TENSORS,
+        block_prefix="a.blk.",
+        block_suffixes=_QWEN3A_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("qwen3-audio-projector-bf16",),
     ),
-    _deferred(
-        "glma",
-        "PROJECTOR_TYPE_GLMA",
-        _AUDIO_BASE,
-        "GLM audio encoder/projector is not implemented.",
+    ProjectorSpec(
+        projector_type="glma",
+        enum_name="PROJECTOR_TYPE_GLMA",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"llama"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The serialized legacy Whisper, frame-stack, MLP, and BOI/EOI graph is "
+            "implemented. Current GLM-ASR cannot provide evidence: its converter misses "
+            "the checkpoint architecture and merge_factor and its encoder uses partial "
+            "RoPE instead of this additive-position topology."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_COMMON_AUDIO_BODY_METADATA,
+            "clip.projector_type",
+            "clip.audio.projector.stack_factor",
+        ),
+        required_top_tensors=_GLMA_TOP_TENSORS,
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+            ("v.boi", MMProjTensorRole.PROJECTOR),
+            ("v.eoi", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("glma-converter-checkpoint-drift",),
     ),
-    _deferred(
-        "qwen2.5o",
-        "PROJECTOR_TYPE_QWEN25O",
-        _VISION_BASE | _AUDIO_BASE,
-        "This legacy string changes meaning by modality; accepting it would create a false alias.",
+    ProjectorSpec(
+        projector_type="qwen2.5o",
+        enum_name="PROJECTOR_TYPE_QWEN25O",
+        modalities=_VISION_BASE | _AUDIO_BASE,
         target_architectures=frozenset({"qwen2vl"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The legacy selector is resolved per modality into separate "
+            "qwen2.5vl_merger and qwen2a components; no generic qwen2.5o graph exists. "
+            "Paired multimodal runtime orchestration remains unvalidated."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(
+            MMProjModelRole.VISION_ENCODER,
+            MMProjModelRole.AUDIO_ENCODER,
+        ),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            *_COMMON_AUDIO_BODY_METADATA,
+            "clip.projector_type",
+            "clip.vision.n_wa_pattern",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.post_ln.weight",
+            "mm.0.weight",
+            "mm.0.bias",
+            "mm.2.weight",
+            "mm.2.bias",
+        ),
+        block_prefix="v.blk.",
+        block_suffixes=_QWEN25VL_BLOCK_SUFFIXES,
+        companion_tensors=(
+            CompanionTensorSpec(
+                modality=MMProjModality.AUDIO,
+                projector_type="qwen2.5o",
+                required_metadata=_COMMON_AUDIO_BODY_METADATA,
+                required_top_tensors=_QWEN2A_TOP_TENSORS,
+                block_prefix="a.blk.",
+                block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+            ),
+        ),
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("qwen25-omni-projector-f16",),
     ),
     _deferred(
         "voxtral",
@@ -1531,11 +1836,54 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _AUDIO_BASE,
         "LFM2 conformer audio graph has no GGUF tensor mapping.",
     ),
-    _deferred(
-        "glm4v",
-        "PROJECTOR_TYPE_GLM4V",
-        _VISION_BASE,
-        "GLM4V downsampler and projector are not implemented.",
+    ProjectorSpec(
+        projector_type="glm4v",
+        enum_name="PROJECTOR_TYPE_GLM4V",
+        modalities=_VISION_BASE,
+        target_architectures=frozenset({"glm4", "glm4moe"}),
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The standalone RMS-normalized ViT, learned 2x2 downsampler, and gated "
+            "projector are exact; paired four-section MRoPE runtime execution remains "
+            "unvalidated."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(MMProjModelRole.VISION_ENCODER,),
+        required_metadata=(
+            *_COMMON_REQUIRED_VISION_METADATA,
+            "clip.projector_type",
+        ),
+        required_top_tensors=(
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.patch_embd.bias",
+            "v.post_ln.weight",
+            "mm.model.fc.weight",
+            "mm.up.weight",
+            "mm.gate.weight",
+            "mm.down.weight",
+            "mm.post_norm.weight",
+            "mm.post_norm.bias",
+            "mm.patch_merger.weight",
+            "mm.patch_merger.bias",
+        ),
+        optional_top_tensors=(
+            "v.norm_embd.weight",
+            "v.position_embd.weight",
+        ),
+        block_prefix="v.blk.",
+        block_suffix_variants=(
+            _GLM4V_BLOCK_SUFFIXES,
+            _GLMOCR_BLOCK_SUFFIXES,
+        ),
+        tensor_roles=(
+            ("v.", MMProjTensorRole.ENCODER),
+            ("mm.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("glm4v-projector-f16",),
     ),
     _deferred(
         "youtuvl",
@@ -1616,11 +1964,46 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _AUDIO_BASE,
         "Parakeet audio encoder graph is not implemented.",
     ),
-    _deferred(
-        "qwen3tts_spkenc",
-        "PROJECTOR_TYPE_QWEN3TTS_SPKENC",
-        _AUDIO_BASE,
-        "Qwen3-TTS speaker encoder graph is not implemented.",
+    ProjectorSpec(
+        projector_type="qwen3tts_spkenc",
+        enum_name="PROJECTOR_TYPE_QWEN3TTS_SPKENC",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"qwen3tts"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The standalone ECAPA-TDNN speaker encoder is exact. Runtime use remains "
+            "unvalidated because its one-row output must be added to the tts_pad "
+            "embedding inside the architecture-specific four-section MRoPE prompt, and "
+            "current converters co-package an unowned stateful qwen3tts_gen runtime."
+        ),
+        sidecar_builder="qwen_glm_projector",
+        model_roles=(MMProjModelRole.SPEAKER_ENCODER,),
+        required_metadata=(
+            *_COMMON_AUDIO_BODY_METADATA,
+            "clip.audio.projector_type",
+        ),
+        required_top_tensors=_QWEN3TTS_SPEAKER_TOP_TENSORS,
+        deferred_companions=(
+            DeferredCompanionSpec(
+                modality=MMProjModality.GENERATED_AUDIO,
+                projector_type="qwen3tts_gen",
+                tensor_prefixes=("a.gen.",),
+                reason=(
+                    "qwen3tts_gen owns autoregressive sampling and streaming codec "
+                    "state, not speaker embedding projection."
+                ),
+            ),
+        ),
+        tensor_roles=(
+            ("a.gen.", MMProjTensorRole.GENERATED_AUDIO),
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("qwen3tts-speaker-runtime-boundary",),
     ),
     _rejected(
         "qwen3tts_gen",
@@ -1683,6 +2066,64 @@ _SPECS: tuple[ProjectorSpec, ...] = (
 
 _INDEX: Mapping[str, ProjectorSpec] = MappingProxyType(
     {spec.projector_type: spec for spec in _SPECS}
+)
+
+MMPROJ_SOURCE_EVIDENCE: tuple[MMProjSourceEvidence, ...] = (
+    MMProjSourceEvidence(
+        evidence_id="glma-converter-checkpoint-drift",
+        sources=(
+            (
+                "ggml-org/llama.cpp",
+                LLAMA_CPP_MMPROJ_SHA,
+                "tools/mtmd/models/whisper-enc.cpp",
+            ),
+            (
+                "ggml-org/llama.cpp",
+                LLAMA_CPP_MMPROJ_SHA,
+                "conversion/ultravox.py",
+            ),
+            (
+                "zai-org/GLM-ASR-Nano-2512",
+                "61ba4e0b3309b6656edea3e93e419f7bd5c61957",
+                "config.json",
+            ),
+        ),
+        finding=(
+            "llama.cpp defines the legacy additive-position GLMA graph, but its converter "
+            "registers GlmasrModel and requires a top-level merge_factor. The immutable "
+            "current checkpoint declares GlmAsrForConditionalGeneration, omits "
+            "merge_factor, and configures a partial-RoPE encoder. Mobius can import a "
+            "structurally valid legacy sidecar without claiming that this checkpoint can "
+            "produce one."
+        ),
+    ),
+    MMProjSourceEvidence(
+        evidence_id="qwen3tts-speaker-runtime-boundary",
+        sources=(
+            (
+                "ggml-org/llama.cpp",
+                LLAMA_CPP_MMPROJ_SHA,
+                "tools/mtmd/models/qwen3tts-spkenc.cpp",
+            ),
+            (
+                "ggml-org/llama.cpp",
+                LLAMA_CPP_MMPROJ_SHA,
+                "conversion/qwen3tts.py",
+            ),
+            (
+                "ggml-org/llama.cpp",
+                LLAMA_CPP_MMPROJ_SHA,
+                "tools/mtmd/mtmd-helper-gen.cpp",
+            ),
+        ),
+        finding=(
+            "The speaker graph deterministically emits one text-width ECAPA embedding. "
+            "The downstream helper adds it to the tts_pad embedding inside a hand-built "
+            "four-section MRoPE prompt, while the converter co-emits a separate stateful "
+            "qwen3tts_gen namespace. Mobius exports only the exact speaker_encoder role "
+            "and makes no generated-audio runtime claim."
+        ),
+    ),
 )
 
 MMPROJ_ARTIFACT_AVAILABILITY_PINS: tuple[MMProjArtifactAvailabilityPin, ...] = (
@@ -2255,6 +2696,195 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         tensor_qtypes=(("F32", 506), ("BF16", 303)),
         tensor_count=809,
         parity_test="TestMuseGlimmerVisionEncoder.test_matches_independent_numpy_reference",
+    ),
+    MMProjArtifactPin(
+        artifact_id="qwen3-vl-projector-f16",
+        repository="bartowski/Qwen_Qwen3-VL-2B-Instruct-GGUF",
+        revision="e84f8ae7ffee8b04793a4ed771609e2b61d3f3cf",
+        filename="mmproj-Qwen_Qwen3-VL-2B-Instruct-f16.gguf",
+        size=819_394_848,
+        lfs_sha256="8c3f6a56979a1ce7056b9a20be6cf6b6f6ad4837aa3da532b5afcfcfd1faa38b",
+        projector_types=("qwen3vl_merger",),
+        paired_text_architecture="qwen3vl",
+        paired_text_target="Qwen_Qwen3-VL-2B-Instruct-Q4_K_M.gguf",
+        metadata=(
+            ("clip.vision.embedding_length", 1024),
+            ("clip.vision.projection_dim", 2048),
+            ("clip.vision.block_count", 24),
+            ("clip.vision.patch_size", 16),
+            ("clip.vision.spatial_merge_size", 2),
+            ("clip.vision.is_deepstack_layers", (5, 11, 17)),
+        ),
+        tensor_qtypes=(("F32", 210), ("F16", 106)),
+        tensor_count=316,
+        parity_test="test_qwen3vl_projector_matches_transformers",
+        processor_repository="Qwen/Qwen3-VL-2B-Instruct",
+        processor_revision="89644892e4d85e24eaac8bacfd4f463576704203",
+        processor_files=(
+            "chat_template.json",
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+        ),
+        processor_class="Qwen3VLProcessor",
+        processor_contract=(
+            ("pixel_values", "float32[total_image_patches,1536]"),
+            ("image_grid_thw", "int64[num_images,3]"),
+            ("pixel_values_videos", "float32[total_video_patches,1536]"),
+            ("video_grid_thw", "int64[num_videos,3]"),
+            ("output_rows", "sum(T*H*W/4) in merge-block-major order"),
+            ("output_width", "2048 final + 3x2048 DeepStack features"),
+            ("decoder_positions", "int64[4,batch,sequence] MRoPE; y/x section order"),
+            ("empty_media", "omit pixel and grid keys; do not invoke vision graph"),
+        ),
+    ),
+    MMProjArtifactPin(
+        artifact_id="qwen3-audio-projector-bf16",
+        repository="ggml-org/Qwen3-ASR-0.6B-GGUF",
+        revision="928ab958557df9aa2ef1c93e0e83c7ad0933fae2",
+        filename="mmproj-Qwen3-ASR-0.6B-bf16.gguf",
+        size=378_575_520,
+        lfs_sha256="dae36c855f9a82a8916bea2238b24bda69a39d8da8b2f46dee7c103775656039",
+        projector_types=("qwen3a",),
+        paired_text_architecture="qwen3vl",
+        paired_text_target="Qwen3-ASR-0.6B-bf16.gguf",
+        metadata=(
+            ("clip.audio.embedding_length", 896),
+            ("clip.audio.projection_dim", 1024),
+            ("clip.audio.block_count", 18),
+            ("clip.audio.num_mel_bins", 128),
+        ),
+        tensor_qtypes=(("F32", 188), ("BF16", 110), ("F16", 4)),
+        tensor_count=302,
+        parity_test="test_qwen3a_projector_matches_transformers",
+        processor_repository="Qwen/Qwen3-ASR-0.6B",
+        processor_revision="5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
+        processor_files=(
+            "chat_template.json",
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+        ),
+        processor_class="Qwen3ASRProcessor",
+        processor_contract=(
+            ("input_features", "float32[1,128,frames_multiple_of_100]"),
+            ("input_features_mask", "int32[1,frames_multiple_of_100]"),
+            ("windowing", "at most 800 mel frames, right-pad to a multiple of 100"),
+            ("output_rows", "13 * (padded_frames / 100)"),
+            ("ordering", "window-major, then chunk-major"),
+            ("empty_media", "do not invoke audio graph"),
+        ),
+    ),
+    MMProjArtifactPin(
+        artifact_id="qwen2-audio-projector-f16",
+        repository="mradermacher/Qwen2-Audio-7B-Instruct-GGUF",
+        revision="e1e68850ba33e38eafbc3817919c318d9c7e757b",
+        filename="Qwen2-Audio-7B-Instruct.mmproj-f16.gguf",
+        size=1_289_301_536,
+        lfs_sha256="b52435dead2956f1fc113818c3b5ceb42a940cb487e59163cb1ffc69cae69347",
+        projector_types=("qwen2a",),
+        paired_text_architecture="qwen2",
+        paired_text_target="Qwen2-Audio-7B-Instruct.Q4_K_M.gguf",
+        metadata=(
+            ("clip.audio.embedding_length", 1280),
+            ("clip.audio.projection_dim", 4096),
+            ("clip.audio.block_count", 32),
+            ("clip.audio.num_mel_bins", 128),
+        ),
+        tensor_qtypes=(("F32", 294), ("F16", 195)),
+        tensor_count=489,
+        parity_test="test_qwen2a_projector_matches_transformers",
+        processor_repository="Qwen/Qwen2-Audio-7B-Instruct",
+        processor_revision="0a095220c30b7b31434169c3086508ef3ea5bf0a",
+        processor_files=(
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+        ),
+        processor_class="Qwen2AudioProcessor",
+        processor_contract=(
+            ("input_features", "float32[1,128,3000]"),
+            ("feature_attention_mask", "int32[1,3000]; graph consumes padded chunk"),
+            ("output_rows", "750 per 30-second chunk"),
+            ("ordering", "audio-major fixed chunks"),
+            ("empty_media", "omit input_features; do not invoke audio graph"),
+        ),
+    ),
+    MMProjArtifactPin(
+        artifact_id="qwen25-omni-projector-f16",
+        repository="ggml-org/Qwen2.5-Omni-3B-GGUF",
+        revision="75f1b73b657a50f5092502799457ccb4a4a1f9df",
+        filename="mmproj-Qwen2.5-Omni-3B-f16.gguf",
+        size=2_623_983_328,
+        lfs_sha256="f6d9276e9fa4f060c7abdbe886786cf31a8911b62770f8a54b7581b7b99fa27e",
+        projector_types=("qwen2.5o", "qwen2.5vl_merger", "qwen2a"),
+        paired_text_architecture="qwen2vl",
+        paired_text_target="Qwen2.5-Omni-3B-Q4_K_M.gguf",
+        metadata=(
+            ("clip.projector_type", "qwen2.5o"),
+            ("clip.vision.embedding_length", 1280),
+            ("clip.vision.projection_dim", 2048),
+            ("clip.vision.block_count", 32),
+            ("clip.vision.n_wa_pattern", 8),
+            ("clip.audio.embedding_length", 1280),
+            ("clip.audio.projection_dim", 2048),
+            ("clip.audio.block_count", 32),
+        ),
+        tensor_qtypes=(("F32", 586), ("F16", 422)),
+        tensor_count=1008,
+        parity_test="test_qwen25o_alias_builds_distinct_vision_and_audio_graphs",
+        processor_repository="Qwen/Qwen2.5-Omni-3B",
+        processor_revision="f75b40e3da2003cdd6e1829b1f420ca70797c34e",
+        processor_files=(
+            "chat_template.json",
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+        ),
+        processor_class="Qwen2_5OmniProcessor",
+        processor_contract=(
+            ("vision", "Qwen2.5-VL packed image/video patch ABI"),
+            ("audio_processor", "float32[1,128,30000] plus int32 feature mask"),
+            ("audio_graph", "split processor rows into 3000-frame qwen2a chunks"),
+            ("roles", "separate vision_encoder and audio_encoder graphs"),
+            ("empty_media", "invoke only the component for each present modality"),
+        ),
+    ),
+    MMProjArtifactPin(
+        artifact_id="glm4v-projector-f16",
+        repository="mradermacher/GLM-OCR-GGUF",
+        revision="3c1e642c0fa5df64831f0b04f3c674b57ce341af",
+        filename="GLM-OCR.mmproj-f16.gguf",
+        size=869_018_080,
+        lfs_sha256="fe5805b3b70f3174d25a912b8d197569eaa8e1e3e6d9777a385b8cc4c622af6c",
+        projector_types=("glm4v",),
+        paired_text_architecture="glm4",
+        paired_text_target="GLM-OCR.Q4_K_M.gguf",
+        metadata=(
+            ("clip.projector_type", "glm4v"),
+            ("clip.vision.embedding_length", 1024),
+            ("clip.vision.projection_dim", 1536),
+            ("clip.vision.block_count", 24),
+            ("clip.vision.patch_size", 14),
+        ),
+        tensor_qtypes=(("F32", 221), ("F16", 127)),
+        tensor_count=348,
+        parity_test="test_glm4v_projector_matches_transformers",
+        processor_repository="zai-org/GLM-OCR",
+        processor_revision="ca5d8b3e287e52589e37c28385d9655ee4372f9d",
+        processor_files=(
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+        ),
+        processor_class="Glm46VProcessor",
+        processor_contract=(
+            ("pixel_values", "float32[total_patches,1176]"),
+            ("image_grid_thw", "int64[num_images,3]"),
+            ("output_rows", "sum(T*H*W/4)"),
+            ("ordering", "batch-major images, merge-block-major 2x2 patches"),
+            ("empty_media", "omit pixel and grid keys; do not invoke vision graph"),
+        ),
     ),
 )
 

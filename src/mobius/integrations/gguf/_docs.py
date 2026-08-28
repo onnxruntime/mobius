@@ -225,10 +225,10 @@ def _qtypes() -> str:
 def _projectors() -> str:
     rows = [
         (
-            "| Projector string | Modality | Paired text architecture | "
+            "| Projector string | Modality | Graph role / route | Paired text architecture | "
             "Metadata/tensor/graph/runtime | Exactness/evidence |"
         ),
-        "|---|---|---|---|---|",
+        "|---|---|---|---|---|---|",
     ]
     for spec in sorted(iter_projector_specs(), key=lambda item: item.projector_type):
         modalities = ", ".join(
@@ -237,13 +237,25 @@ def _projectors() -> str:
         targets = (
             ", ".join(f"`{target}`" for target in sorted(spec.target_architectures)) or "—"
         )
-        evidence = (
-            "artifact pins=" + ", ".join(f"`{item}`" for item in spec.real_artifact_ids)
-            if spec.real_artifact_ids
-            else _reason_code(dict(spec.verdicts))
+        roles = ", ".join(role.value for role in spec.model_roles)
+        route = (
+            f"{roles or 'paired package'} via `{spec.sidecar_builder or spec.builder}`"
+            if spec.sidecar_builder or spec.builder
+            else "—"
         )
+        evidence_parts = []
+        if spec.real_artifact_ids:
+            evidence_parts.append(
+                "artifact pins=" + ", ".join(f"`{item}`" for item in spec.real_artifact_ids)
+            )
+        if spec.source_evidence_ids:
+            evidence_parts.append(
+                "source evidence="
+                + ", ".join(f"`{item}`" for item in spec.source_evidence_ids)
+            )
+        evidence = "; ".join(evidence_parts) or _reason_code(dict(spec.verdicts))
         rows.append(
-            f"| `{spec.projector_type}` | {modalities} | {targets} | "
+            f"| `{spec.projector_type}` | {modalities} | {_cell(route)} | {targets} | "
             f"{_cell(_status(dict(spec.verdicts)))} | {_cell(evidence or 'none')} |"
         )
     return "\n".join(rows)
@@ -688,6 +700,11 @@ the original immutable GGUF at runtime. Runtime packages additionally require an
 artifact, graph, tokenizer, runtime version, parity proof, and deterministic state/generation
 evidence match.
 Processor-owned `image_token_id` overrides are forwarded unchanged for `mmproj=` packages.
+
+Use `build_mmproj_from_gguf("mmproj.gguf", projector_type=..., target_architecture=...)`
+to export a registry-evidenced standalone `vision_encoder`, `audio_encoder`, or
+`speaker_encoder`. It never invents decoder, media-mixing, or generated-audio roles and
+warns while downstream runtime orchestration remains unvalidated.
 
 ## Runtime evidence
 

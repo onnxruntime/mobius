@@ -36,10 +36,16 @@ __all__ = [
     "is_mmproj_stat_tensor",
     "map_generic_projector_to_onnx",
     "map_generic_vision_to_onnx",
+    "map_mmproj_glma_audio_to_onnx",
     "map_mmproj_gemma3_vision_to_hf",
     "map_mmproj_qwen_vision_to_hf",
     "map_mmproj_audio_to_hf",
+    "map_mmproj_glm4v_vision_to_onnx",
     "map_mmproj_muse_glimmer_vision_to_hf",
+    "map_mmproj_qwen2_audio_to_onnx",
+    "map_mmproj_qwen3_audio_to_onnx",
+    "map_mmproj_qwen3_speaker_to_onnx",
+    "map_mmproj_qwen3_vision_to_onnx",
     "map_mmproj_vision_to_hf",
 ]
 
@@ -385,6 +391,227 @@ def map_mmproj_qwen_vision_to_hf(name: str) -> str | None:
         "mm.2.bias": "visual.merger.mlp.2.bias",
     }
     return top.get(name)
+
+
+_QWEN_GLM_BLOCK = re.compile(r"^[av]\.blk\.(\d+)\.(.+)$")
+
+
+def _map_standard_encoder_block(name: str, *, prefix: str) -> str | None:
+    """Map llama.cpp's common ViT/Whisper block stems to module paths."""
+    match = _QWEN_GLM_BLOCK.match(name)
+    if match is None:
+        return None
+    index, stem = match.groups()
+    mapped = {
+        "ln1.weight": "norm1.weight",
+        "ln1.bias": "norm1.bias",
+        "ln2.weight": "norm2.weight",
+        "ln2.bias": "norm2.bias",
+        "attn_qkv.weight": "attn.qkv.weight",
+        "attn_qkv.bias": "attn.qkv.bias",
+        "attn_out.weight": "attn.proj.weight",
+        "attn_out.bias": "attn.proj.bias",
+        "ffn_up.weight": "mlp.up_proj.weight",
+        "ffn_up.bias": "mlp.up_proj.bias",
+        "ffn_gate.weight": "mlp.gate_proj.weight",
+        "ffn_gate.bias": "mlp.gate_proj.bias",
+        "ffn_down.weight": "mlp.down_proj.weight",
+        "ffn_down.bias": "mlp.down_proj.bias",
+    }.get(stem)
+    return None if mapped is None else f"{prefix}.{index}.{mapped}"
+
+
+def map_mmproj_qwen3_vision_to_onnx(
+    name: str,
+    *,
+    deepstack_layers: tuple[int, ...],
+) -> str | None:
+    """Map Qwen3-VL sidecar names to the standalone vision component."""
+    mapped = _map_standard_encoder_block(name, prefix="visual.blocks")
+    if mapped is not None:
+        return mapped
+
+    deepstack = re.match(r"^v\.deepstack\.(\d+)\.(norm|fc1|fc2)\.(weight|bias)$", name)
+    if deepstack is not None:
+        layer, stem, kind = deepstack.groups()
+        layer_index = int(layer)
+        if layer_index not in deepstack_layers:
+            return None
+        merger_index = deepstack_layers.index(layer_index)
+        target = {
+            "norm": "norm",
+            "fc1": "linear_fc1",
+            "fc2": "linear_fc2",
+        }[stem]
+        return f"visual.deepstack_merger_list.{merger_index}.{target}.{kind}"
+
+    return {
+        "v.patch_embd.bias": "visual.patch_embed.proj.bias",
+        "v.position_embd.weight": "visual.pos_embed.weight",
+        "v.post_ln.weight": "visual.merger.norm.weight",
+        "v.post_ln.bias": "visual.merger.norm.bias",
+        "mm.0.weight": "visual.merger.linear_fc1.weight",
+        "mm.0.bias": "visual.merger.linear_fc1.bias",
+        "mm.2.weight": "visual.merger.linear_fc2.weight",
+        "mm.2.bias": "visual.merger.linear_fc2.bias",
+    }.get(name)
+
+
+def map_mmproj_glm4v_vision_to_onnx(name: str) -> str | None:
+    """Map GLM4V sidecar names to the standalone vision component."""
+    mapped = _map_standard_encoder_block(name, prefix="visual.blocks")
+    if mapped is not None:
+        return mapped
+    qk_norm = re.match(r"^v\.blk\.(\d+)\.attn_([qk])_norm\.weight$", name)
+    if qk_norm is not None:
+        layer, kind = qk_norm.groups()
+        return f"visual.blocks.{layer}.attn.{kind}_norm.weight"
+    return {
+        "v.patch_embd.bias": "visual.patch_embed.proj.bias",
+        "v.norm_embd.weight": "visual.post_conv_layernorm.weight",
+        "v.position_embd.weight": "visual.position_embeddings",
+        "v.post_ln.weight": "visual.post_layernorm.weight",
+        "mm.model.fc.weight": "visual.merger.proj.weight",
+        "mm.post_norm.weight": "visual.merger.post_projection_norm.weight",
+        "mm.post_norm.bias": "visual.merger.post_projection_norm.bias",
+        "mm.patch_merger.weight": "visual.downsample.weight",
+        "mm.patch_merger.bias": "visual.downsample.bias",
+        "mm.up.weight": "visual.merger.up_proj.weight",
+        "mm.gate.weight": "visual.merger.gate_proj.weight",
+        "mm.down.weight": "visual.merger.down_proj.weight",
+    }.get(name)
+
+
+def _map_whisper_audio_block(name: str, *, prefix: str) -> str | None:
+    match = _QWEN_GLM_BLOCK.match(name)
+    if match is None or not name.startswith("a."):
+        return None
+    index, stem = match.groups()
+    mapped = {
+        "ln1.weight": "self_attn_layer_norm.weight",
+        "ln1.bias": "self_attn_layer_norm.bias",
+        "ln2.weight": "final_layer_norm.weight",
+        "ln2.bias": "final_layer_norm.bias",
+        "attn_q.weight": "self_attn.q_proj.weight",
+        "attn_q.bias": "self_attn.q_proj.bias",
+        "attn_k.weight": "self_attn.k_proj.weight",
+        "attn_v.weight": "self_attn.v_proj.weight",
+        "attn_v.bias": "self_attn.v_proj.bias",
+        "attn_out.weight": "self_attn.out_proj.weight",
+        "attn_out.bias": "self_attn.out_proj.bias",
+        "ffn_up.weight": "fc1.weight",
+        "ffn_up.bias": "fc1.bias",
+        "ffn_down.weight": "fc2.weight",
+        "ffn_down.bias": "fc2.bias",
+    }.get(stem)
+    return None if mapped is None else f"{prefix}.{index}.{mapped}"
+
+
+def map_mmproj_qwen2_audio_to_onnx(name: str) -> str | None:
+    """Map Qwen2-Audio's Whisper tower and linear projector."""
+    mapped = _map_whisper_audio_block(name, prefix="audio_tower.layers")
+    if mapped is not None:
+        return mapped
+    return {
+        "a.conv1d.1.weight": "audio_tower.conv1.weight",
+        "a.conv1d.1.bias": "audio_tower.conv1.bias",
+        "a.conv1d.2.weight": "audio_tower.conv2.weight",
+        "a.conv1d.2.bias": "audio_tower.conv2.bias",
+        "a.position_embd.weight": "audio_tower.position_embeddings",
+        "a.post_ln.weight": "audio_tower.post_layernorm.weight",
+        "a.post_ln.bias": "audio_tower.post_layernorm.bias",
+        "mm.a.fc.weight": "projection.weight",
+        "mm.a.fc.bias": "projection.bias",
+    }.get(name)
+
+
+def map_mmproj_glma_audio_to_onnx(name: str) -> str | None:
+    """Map the legacy GLMA Whisper tower, stacked MLP, and boundary rows."""
+    mapped = _map_whisper_audio_block(name, prefix="audio_tower.layers")
+    if mapped is not None:
+        return mapped
+    return {
+        "a.conv1d.1.weight": "audio_tower.conv1.weight",
+        "a.conv1d.1.bias": "audio_tower.conv1.bias",
+        "a.conv1d.2.weight": "audio_tower.conv2.weight",
+        "a.conv1d.2.bias": "audio_tower.conv2.bias",
+        "a.position_embd.weight": "audio_tower.position_embeddings",
+        "a.post_ln.weight": "audio_tower.post_layernorm.weight",
+        "a.post_ln.bias": "audio_tower.post_layernorm.bias",
+        "mm.a.norm_pre.weight": "pre_projector_norm.weight",
+        "mm.a.norm_pre.bias": "pre_projector_norm.bias",
+        "mm.a.mlp.1.weight": "linear_1.weight",
+        "mm.a.mlp.1.bias": "linear_1.bias",
+        "mm.a.mlp.2.weight": "linear_2.weight",
+        "mm.a.mlp.2.bias": "linear_2.bias",
+        "v.boi": "boi",
+        "v.eoi": "eoi",
+    }.get(name)
+
+
+def map_mmproj_qwen3_audio_to_onnx(name: str) -> str | None:
+    """Map Qwen3 audio sidecar tensors onto ``Qwen3ASRAudioEncoder``."""
+    mapped = _map_whisper_audio_block(name, prefix="audio_tower.layers")
+    if mapped is not None:
+        return mapped
+    key_bias = re.match(r"^a\.blk\.(\d+)\.attn_k\.bias$", name)
+    if key_bias is not None:
+        return f"audio_tower.layers.{key_bias.group(1)}.self_attn.k_proj.bias"
+    return {
+        "a.conv2d.1.weight": "audio_tower.conv2d1.weight",
+        "a.conv2d.1.bias": "audio_tower.conv2d1.bias",
+        "a.conv2d.2.weight": "audio_tower.conv2d2.weight",
+        "a.conv2d.2.bias": "audio_tower.conv2d2.bias",
+        "a.conv2d.3.weight": "audio_tower.conv2d3.weight",
+        "a.conv2d.3.bias": "audio_tower.conv2d3.bias",
+        "a.conv_out.weight": "audio_tower.conv_out.weight",
+        "a.position_embd.weight": "audio_tower.positional_embedding",
+        "a.post_ln.weight": "audio_tower.ln_post.weight",
+        "a.post_ln.bias": "audio_tower.ln_post.bias",
+        "mm.a.mlp.1.weight": "audio_tower.proj1.weight",
+        "mm.a.mlp.1.bias": "audio_tower.proj1.bias",
+        "mm.a.mlp.2.weight": "audio_tower.proj2.weight",
+        "mm.a.mlp.2.bias": "audio_tower.proj2.bias",
+    }.get(name)
+
+
+def map_mmproj_qwen3_speaker_to_onnx(name: str) -> str | None:
+    """Map the Qwen3-TTS ECAPA speaker subset to ``SpeakerEncoder``."""
+    top = {
+        "a.conv1d.0.weight": "encoder.blocks.0.conv.weight",
+        "a.conv1d.0.bias": "encoder.blocks.0.conv.bias",
+        "a.conv_out.weight": "encoder.mfa.conv.weight",
+        "a.conv_out.bias": "encoder.mfa.conv.bias",
+        "a.asp_attn.weight": "encoder.asp.conv.weight",
+        "a.asp_attn.bias": "encoder.asp.conv.bias",
+        "a.asp_tdnn.weight": "encoder.asp.tdnn.conv.weight",
+        "a.asp_tdnn.bias": "encoder.asp.tdnn.conv.bias",
+        "mm.a.fc.weight": "encoder.fc.weight",
+        "mm.a.fc.bias": "encoder.fc.bias",
+    }
+    if name in top:
+        return top[name]
+
+    match = re.match(
+        r"^a\.blk\.([1-3])\."
+        r"(conv_pw1|conv_pw2|se_conv1|se_conv2)\.(weight|bias)$",
+        name,
+    )
+    if match is not None:
+        block, stem, kind = match.groups()
+        target = {
+            "conv_pw1": "tdnn1.conv",
+            "conv_pw2": "tdnn2.conv",
+            "se_conv1": "se_block.conv1",
+            "se_conv2": "se_block.conv2",
+        }[stem]
+        return f"encoder.blocks.{block}.{target}.{kind}"
+
+    res2 = re.match(r"^a\.blk\.([1-3])\.res2\.([0-6])\.(weight|bias)$", name)
+    if res2 is None:
+        return None
+    block, branch, kind = res2.groups()
+    return f"encoder.blocks.{block}.res2net_block.blocks.{branch}.conv.{kind}"
 
 
 # ---------------------------------------------------------------------------
