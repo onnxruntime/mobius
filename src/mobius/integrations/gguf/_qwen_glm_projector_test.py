@@ -496,9 +496,13 @@ _ROUTES = {
 }
 
 
-def _build_package(projector_type: str, *, dtype: str | None = None):
-    factory, target, _ = _ROUTES[projector_type]
-    sidecar = factory()
+def _build_package_from_sidecar(
+    projector_type: str,
+    sidecar: _FakeSidecar,
+    *,
+    dtype: str | None = None,
+):
+    _, target, _ = _ROUTES[projector_type]
     with (
         mock.patch(
             "mobius.integrations.gguf._mmproj._resolve_mmproj_companion_path",
@@ -516,6 +520,11 @@ def _build_package(projector_type: str, *, dtype: str | None = None):
     return sidecar, package
 
 
+def _build_package(projector_type: str, *, dtype: str | None = None):
+    factory, _, _ = _ROUTES[projector_type]
+    return _build_package_from_sidecar(projector_type, factory(), dtype=dtype)
+
+
 @pytest.mark.parametrize("projector_type", tuple(_ROUTES))
 def test_every_route_builds_only_its_declared_components(projector_type: str) -> None:
     _, _, expected = _ROUTES[projector_type]
@@ -529,6 +538,96 @@ def test_every_route_builds_only_its_declared_components(projector_type: str) ->
         for graph in package.values()
         for initializer in graph.graph.initializers.values()
     )
+
+
+def test_public_dispatch_preflights_qwen_route_once() -> None:
+    from mobius.integrations.gguf import _mmproj
+
+    sidecar = _qwen2a_sidecar()
+    with (
+        mock.patch(
+            "mobius.integrations.gguf._mmproj._resolve_mmproj_companion_path",
+            return_value="synthetic.gguf",
+        ),
+        mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+        mock.patch(
+            "mobius.integrations.gguf._mmproj._preflight_standalone_mmproj",
+            wraps=_mmproj._preflight_standalone_mmproj,
+        ) as preflight,
+    ):
+        build_mmproj_from_gguf(
+            "synthetic.gguf",
+            projector_type="qwen2a",
+            target_architecture="qwen2",
+            _mmproj_gguf_model=sidecar,
+        )
+
+    preflight.assert_called_once_with(
+        sidecar,
+        projector_type="qwen2a",
+        target_architecture="qwen2",
+    )
+
+
+@pytest.mark.parametrize("projector_type", ("qwen2a", "qwen3a", "qwen2.5o", "qwen3tts_spkenc"))
+def test_unrelated_silu_metadata_does_not_change_nonconsumer_graph(
+    projector_type: str,
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    baseline_sidecar = factory()
+    unrelated_sidecar = factory()
+    unrelated_sidecar.metadata["clip.use_silu"] = {"invalid": "but unrelated"}
+    _, baseline = _build_package_from_sidecar(projector_type, baseline_sidecar)
+    _, unrelated = _build_package_from_sidecar(projector_type, unrelated_sidecar)
+
+    def signature(package) -> dict[str, tuple[object, ...]]:
+        return {
+            role: (
+                tuple((node.domain, node.op_type) for node in model.graph),
+                tuple(
+                    (value.name, str(value.type), str(value.shape))
+                    for value in model.graph.inputs
+                ),
+                tuple(
+                    (value.name, str(value.type), str(value.shape))
+                    for value in model.graph.outputs
+                ),
+                tuple(model.graph.initializers),
+            )
+            for role, model in package.items()
+        }
+
+    assert baseline.config == unrelated.config
+    assert signature(baseline) == signature(unrelated)
+
+
+@pytest.mark.parametrize("projector_type", ("glm4v", "glma", "qwen3vl_merger"))
+@pytest.mark.parametrize("invalid", [0, 1, "true"])
+def test_silu_consumers_require_boolean_metadata(
+    projector_type: str,
+    invalid: object,
+) -> None:
+    factory, _, _ = _ROUTES[projector_type]
+    sidecar = factory()
+    sidecar.metadata["clip.use_silu"] = invalid
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        validate_qwen_glm_projector_metadata(sidecar, projector_type)
+
+
+def test_qwen3vl_silu_metadata_changes_only_transformer_block_activation() -> None:
+    gelu_sidecar = _qwen3vl_sidecar()
+    silu_sidecar = _qwen3vl_sidecar()
+    silu_sidecar.metadata["clip.use_silu"] = True
+    _, gelu_package = _build_package_from_sidecar("qwen3vl_merger", gelu_sidecar)
+    _, silu_package = _build_package_from_sidecar("qwen3vl_merger", silu_sidecar)
+
+    gelu_ops = [node.op_type for node in gelu_package["vision_encoder"].graph]
+    silu_ops = [node.op_type for node in silu_package["vision_encoder"].graph]
+    assert "Swish" not in gelu_ops
+    assert silu_ops.count("Swish") == 1
+    # Final and DeepStack mergers remain tanh-GELU in both variants.
+    assert silu_ops.count("Gelu") == gelu_ops.count("Gelu") - 1
 
 
 @pytest.mark.parametrize("projector_type", tuple(_ROUTES))
@@ -895,7 +994,7 @@ def test_qwen3a_projector_matches_transformers() -> None:
         "audio_encoder",
         {
             "input_features": features,
-            "feature_attention_mask": np.ones((1, 100), dtype=np.int64),
+            "input_features_mask": np.ones((1, 100), dtype=np.int32),
         },
     )
     np.testing.assert_allclose(actual, expected, rtol=3e-4, atol=3e-4)
@@ -913,7 +1012,7 @@ def test_qwen3a_projector_matches_transformers() -> None:
         padded_outputs = session.run(
             {
                 "input_features": padded,
-                "feature_attention_mask": padded_mask,
+                "input_features_mask": padded_mask.astype(np.int32),
             }
         )
     finally:
@@ -942,20 +1041,64 @@ def test_qwen3a_graph_io_and_processor_metadata_publish_lengths() -> None:
 
     assert [value.name for value in graph.inputs] == [
         "input_features",
-        "feature_attention_mask",
+        "input_features_mask",
     ]
     assert [value.name for value in graph.outputs] == [
         "audio_features",
         "audio_feature_lengths",
     ]
-    assert package.gguf_processor_abi["feature_attention_mask"] == (
-        "int64[1,frames], binary and right-padded"
+    assert package.gguf_processor_abi["input_features_mask"] == (
+        "int32[1,frames], binary and right-padded"
     )
     assert "audio_feature_lengths" in package.gguf_processor_abi["output"]
 
 
+def test_qwen3a_accepts_processor_outputs_without_adapter() -> None:
+    from transformers import WhisperFeatureExtractor
+    from transformers.models.qwen3_asr.processing_qwen3_asr import Qwen3ASRProcessor
+
+    _, package = _build_package("qwen3a")
+    # Construct the pinned processor class with a tiny, network-free feature
+    # extractor. Text is omitted, so only these attributes are consulted.
+    processor = object.__new__(Qwen3ASRProcessor)
+    processor.feature_extractor = WhisperFeatureExtractor(
+        feature_size=8,
+        sampling_rate=16_000,
+        hop_length=160,
+        chunk_length=1,
+        n_fft=400,
+        padding_value=0.0,
+        return_attention_mask=True,
+    )
+    processor.tokenizer = SimpleNamespace(init_kwargs={})
+    processor.chat_template = None
+    processor.timestamp_segment_time = 80
+    processor.audio_token = "<audio>"
+    processed = processor(
+        text=None,
+        audio=[np.zeros(16_000, dtype=np.float32)],
+        sampling_rate=16_000,
+        return_tensors="pt",
+    )
+    input_names = {value.name for value in package["audio_encoder"].graph.inputs}
+    feeds = {name: processed[name].numpy() for name in input_names}
+
+    assert set(feeds) == {"input_features", "input_features_mask"}
+    assert feeds["input_features_mask"].dtype == np.int32
+    session = OnnxModelSession(package["audio_encoder"])
+    try:
+        outputs = session.run(feeds)
+    finally:
+        session.close()
+    assert outputs["audio_features"].shape == (13, 12)
+    np.testing.assert_array_equal(
+        outputs["audio_feature_lengths"],
+        np.array([13], dtype=np.int64),
+    )
+
+
 @pytest.mark.parametrize(
-    "feature_attention_mask",
+    "input_features_mask",
     [
         np.zeros((1, 100), dtype=np.int64),
         np.array([[1] * 49 + [0] + [1] * 50], dtype=np.int64),
@@ -964,7 +1107,7 @@ def test_qwen3a_graph_io_and_processor_metadata_publish_lengths() -> None:
     ids=["empty", "not-right-padded", "non-binary"],
 )
 def test_qwen3a_processor_mask_fails_closed(
-    feature_attention_mask: np.ndarray,
+    input_features_mask: np.ndarray,
 ) -> None:
     _, package = _build_package("qwen3a")
     features = np.zeros((1, 8, 100), dtype=np.float32)
@@ -982,7 +1125,7 @@ def test_qwen3a_processor_mask_fails_closed(
             "audio_encoder",
             {
                 "input_features": features,
-                "feature_attention_mask": feature_attention_mask,
+                "input_features_mask": input_features_mask.astype(np.int32),
             },
         )
 
@@ -1654,7 +1797,7 @@ def test_reduced_precision_audio_casts_float_processor_input(
 
     feeds = {"input_features": features}
     if projector_type == "qwen3a":
-        feeds["feature_attention_mask"] = np.ones((1, frames), dtype=np.int64)
+        feeds["input_features_mask"] = np.ones((1, frames), dtype=np.int32)
     actual = _run_component(package, "audio_encoder", feeds)
 
     assert actual.dtype == np.float16

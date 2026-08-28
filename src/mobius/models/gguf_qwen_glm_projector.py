@@ -241,6 +241,7 @@ class GGUFQwen3VLProjector(nn.Module):
             spatial_merge_size=2,
             num_position_embeddings=int(vision.num_position_embeddings),
             deepstack_visual_indexes=vision.deepstack_visual_indexes or [],
+            block_activation=vision.hidden_act,
             # llama.cpp's FFN_GELU is the tanh approximation for both the
             # final merger and every DeepStack merger.
             merger_gelu_approximate="tanh",
@@ -375,8 +376,8 @@ class GGUFQwen3AudioProjector(nn.Module):
                 ),
             ),
             (
-                "feature_attention_mask",
-                ir.DataType.INT64,
+                "input_features_mask",
+                ir.DataType.INT32,
                 (1, ir.SymbolicDim("audio_frames_multiple_of_100")),
             ),
         )
@@ -385,7 +386,7 @@ class GGUFQwen3AudioProjector(nn.Module):
         self,
         op: OpBuilder,
         input_features: ir.Value,
-        feature_attention_mask: ir.Value,
+        input_features_mask: ir.Value,
     ) -> tuple[ir.Value, ir.Value]:
         input_features = op.CastLike(
             input_features,
@@ -406,11 +407,12 @@ class GGUFQwen3AudioProjector(nn.Module):
         # The encoder derives output cardinality from a binary right-padded
         # processor mask. Reject malformed masks rather than treating holes or
         # non-binary values as valid audio.
-        mask_bool = op.Cast(feature_attention_mask, to=ir.DataType.BOOL)
+        mask_bool = op.Cast(input_features_mask, to=ir.DataType.BOOL)
         binary = op.Equal(
-            feature_attention_mask,
-            op.Cast(mask_bool, to=ir.DataType.INT64),
+            input_features_mask,
+            op.Cast(mask_bool, to=ir.DataType.INT32),
         )
+        feature_attention_mask = op.Cast(input_features_mask, to=ir.DataType.INT64)
         valid_frames = op.ReduceSum(
             feature_attention_mask,
             op.Constant(value_ints=[1]),

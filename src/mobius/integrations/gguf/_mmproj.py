@@ -3134,26 +3134,28 @@ def build_qwen_glm_projector_from_gguf(
     _mmproj_gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Build the exact standalone Qwen/GLM vision, audio, or speaker roles."""
-    from mobius.integrations.gguf._builder import _validate_gguf_model
     from mobius.integrations.gguf._qwen_glm_projector import (
         build_qwen_glm_projector_package,
     )
-    from mobius.integrations.gguf._reader import GGUFModel
 
-    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
-    mmproj_gguf = (
-        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
-    )
-    _validate_gguf_model(
-        mmproj_gguf,
-        source=str(mmproj_gguf_path),
-        allow_mmproj_companion=True,
-    )
-    _preflight_standalone_mmproj(
-        mmproj_gguf,
-        projector_type=projector_type,
-        target_architecture=target_architecture,
-    )
+    resolved_path = Path(mmproj_gguf_path)
+    mmproj_gguf = _mmproj_gguf_model
+    if mmproj_gguf is None:
+        from mobius.integrations.gguf._builder import _validate_gguf_model
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+        mmproj_gguf = GGUFModel(resolved_path)
+        _validate_gguf_model(
+            mmproj_gguf,
+            source=str(mmproj_gguf_path),
+            allow_mmproj_companion=True,
+        )
+        _preflight_standalone_mmproj(
+            mmproj_gguf,
+            projector_type=projector_type,
+            target_architecture=target_architecture,
+        )
     return build_qwen_glm_projector_package(
         mmproj_gguf,
         resolved_path=resolved_path,
@@ -3227,6 +3229,7 @@ _VLM_BUILDERS: dict[str, str] = {
     "qwen_vl": "build_qwen_vlm_from_gguf",
 }
 
+
 #: Standalone sidecar graph entry points selected by
 #: :attr:`ProjectorSpec.sidecar_builder`. Unlike ``_VLM_BUILDERS``, these
 #: functions never create or silently omit a paired text decoder.
@@ -3239,8 +3242,8 @@ def _build_core_vlm_projector_mmproj(*args, **kwargs) -> ModelPackage:
 
 
 _MMPROJ_BUILDERS: dict[str, str] = {
-   "core_vlm_projector": "_build_core_vlm_projector_mmproj",
-   "qwen_glm_projector": "build_qwen_glm_projector_from_gguf",
+    "core_vlm_projector": "_build_core_vlm_projector_mmproj",
+    "qwen_glm_projector": "build_qwen_glm_projector_from_gguf",
 }
 
 

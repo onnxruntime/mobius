@@ -62,7 +62,7 @@ QWEN_GLM_PROCESSOR_ABIS: dict[str, dict[str, str | int]] = {
     "qwen3a": {
         "sample_rate": 16_000,
         "input_features": "float32[1,128,frames_multiple_of_100]",
-        "feature_attention_mask": "int64[1,frames], binary and right-padded",
+        "input_features_mask": "int32[1,frames], binary and right-padded",
         "output": "valid audio rows plus int64[1] audio_feature_lengths",
         "preprocessing": "Qwen3 Whisper mel; 100-frame chunks with right padding",
         "empty_media": "do not invoke the audio graph",
@@ -277,7 +277,7 @@ def validate_qwen_glm_projector_metadata(model: Any, projector_type: str) -> Non
     if not isinstance(actual_type, str) or actual_type != projector_type:
         raise ValueError(f"{type_key} must equal {projector_type!r}, got {actual_type!r}.")
 
-    if "clip.use_silu" in metadata:
+    if projector_type in {"glm4v", "qwen3vl_merger", "glma"} and "clip.use_silu" in metadata:
         _validate_bool(metadata, "clip.use_silu")
     if projector_type in {"glm4v", "qwen3vl_merger"}:
         merge = metadata.get("clip.vision.spatial_merge_size", 2)

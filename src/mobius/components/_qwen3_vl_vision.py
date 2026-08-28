@@ -337,13 +337,19 @@ class Qwen3VLVisionBlock(nn.Module):
     Structure: LayerNorm → Attention → Residual → LayerNorm → MLP → Residual.
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        *,
+        activation: str = "gelu_new",
+    ):
         super().__init__()
         self.norm1 = LayerNorm(hidden_size, eps=1e-6)
         self.attn = Qwen3VLVisionAttention(hidden_size, num_heads)
         self.norm2 = LayerNorm(hidden_size, eps=1e-6)
-        # GELU (tanh approx) MLP with bias (HF linear_fc1/linear_fc2 → up_proj/down_proj)
-        self.mlp = FCMLP(hidden_size, intermediate_size, activation="gelu_new", bias=True)
+        self.mlp = FCMLP(hidden_size, intermediate_size, activation=activation, bias=True)
 
     def forward(
         self,
@@ -502,6 +508,7 @@ class Qwen3VLVisionModel(nn.Module):
         spatial_merge_size: int = 2,
         num_position_embeddings: int = 2304,
         deepstack_visual_indexes: list[int] | None = None,
+        block_activation: str = "gelu_new",
         merger_gelu_approximate: str = "none",
     ):
         super().__init__()
@@ -537,7 +544,12 @@ class Qwen3VLVisionModel(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                Qwen3VLVisionBlock(hidden_size, intermediate_size, num_heads)
+                Qwen3VLVisionBlock(
+                    hidden_size,
+                    intermediate_size,
+                    num_heads,
+                    activation=block_activation,
+                )
                 for _ in range(depth)
             ]
         )
