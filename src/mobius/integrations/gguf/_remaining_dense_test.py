@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,6 +232,15 @@ def _glm_fixture() -> _FakeGGUF:
     return source
 
 
+def _glm_alias_fixture() -> _FakeGGUF:
+    source = _glm_fixture()
+    source.architecture = "glm_dsa"
+    source.metadata = {
+        key.replace("glm-dsa.", "glm_dsa."): value for key, value in source.metadata.items()
+    }
+    return source
+
+
 def _write_gguf(path: Path, source: _FakeGGUF) -> None:
     from gguf import GGUFWriter
 
@@ -393,8 +403,20 @@ def test_mistral4_restores_pinned_yarn_log_multiplier() -> None:
     assert config.rope_scaling is not None
     assert config.rope_scaling["mscale"] == pytest.approx(1.0)
     assert config.rope_scaling["mscale_all_dim"] == pytest.approx(0.707)
-    expected_scale = (1.0 + 0.1 * np.log(4.0)) ** 2 / np.sqrt(4.0)
-    assert Mistral4LatentAttention(config).scaling == pytest.approx(expected_scale)
+    factor = float(source.metadata["mistral4.rope.scaling.factor"])
+    serialized_multiplier = float(source.metadata["mistral4.rope.scaling.yarn_log_multiplier"])
+    qk_head_dim = int(source.metadata["mistral4.attention.key_length_mla"])
+    expected_scale = (1.0 + serialized_multiplier * np.log(factor)) ** 2 / np.sqrt(qk_head_dim)
+    actual_scale = Mistral4LatentAttention(config).scaling
+    assert actual_scale == pytest.approx(expected_scale)
+    assert actual_scale == pytest.approx(0.6028141, rel=1e-6)
+
+    source.metadata["mistral4.rope.scaling.yarn_log_multiplier"] = 0.1
+    mutated_config = gguf_to_config(source)
+    mutated_scale = Mistral4LatentAttention(mutated_config).scaling
+    mutated_expected = (1.0 + 0.1 * np.log(factor)) ** 2 / np.sqrt(qk_head_dim)
+    assert mutated_scale == pytest.approx(mutated_expected)
+    assert mutated_scale != pytest.approx(actual_scale)
 
 
 def test_glm_dsa_indexer_schedule_preserves_explicit_and_legacy_defaults() -> None:
@@ -410,6 +432,69 @@ def test_glm_dsa_indexer_schedule_preserves_explicit_and_legacy_defaults() -> No
     source.metadata["glm-dsa.attention.indexer.types"] = [True]
     with pytest.raises(ValueError, match=r"expected 2, got 1"):
         gguf_to_config(source)
+
+
+def test_glm_dsa_alias_closes_schedule_weights_and_dense_execution(
+    tmp_path: Path,
+) -> None:
+    from mobius.integrations.gguf._builder import _normalize_gguf_weights
+    from mobius.integrations.gguf._tensor_processors import process_tensors
+    from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
+
+    source = _glm_alias_fixture()
+    config = gguf_to_config(source)
+    assert config._gguf_arch == "glm-dsa"
+    assert config.indexer_types == ["full", "shared"]
+    validate_remaining_dense_tensor_contract(source)
+
+    path = tmp_path / "glm_dsa-alias.gguf"
+    _write_gguf(path, source)
+    package = build_from_gguf(path, keep_quantized=False)
+    assert package.gguf_architecture == "glm-dsa"
+    assert package.config._gguf_arch == "glm-dsa"
+    route = json.loads(package.gguf_import_route)
+    assert route["task"]["class"].endswith(".GlmMoeDsaTask")
+    initializers = package["model"].graph.initializers
+    assert all(initializer.const_value is not None for initializer in initializers.values())
+    assert any(name.startswith("model.layers.0.self_attn.indexer.") for name in initializers)
+    assert not any(
+        name.startswith("model.layers.1.self_attn.indexer.") for name in initializers
+    )
+
+    dense_config = dataclasses.replace(config, use_dsa=False)
+    state_dict = {
+        mapped: torch.from_numpy(np.array(value, copy=True))
+        for name, value in source.tensors.items()
+        if (mapped := map_gguf_to_hf_names(name, source.architecture)) is not None
+    }
+    state_dict = process_tensors(state_dict, dense_config)
+    state_dict = _normalize_gguf_weights(
+        state_dict,
+        "glm-dsa",
+        dense_config,
+    )
+    module = GlmMoeDsaCausalLMModel(dense_config)
+    state_dict = module.preprocess_weights(state_dict)
+    dense_package = build_from_module(module, dense_config, task="glm-moe-dsa")
+    dense_package.apply_weights(state_dict)
+    session = OnnxModelSession(dense_package["model"])
+    tokens = np.array([[1, 3]], dtype=np.int64)
+    feeds: dict[str, np.ndarray] = {
+        "input_ids": tokens,
+        "attention_mask": np.ones_like(tokens),
+        "position_ids": np.arange(tokens.shape[1], dtype=np.int64).reshape(1, -1),
+    }
+    for layer in range(dense_config.num_hidden_layers):
+        feeds[f"past_key_values.{layer}.key"] = np.empty(
+            (1, dense_config.num_attention_heads, 0, 4),
+            dtype=np.float32,
+        )
+        feeds[f"past_key_values.{layer}.value"] = np.empty(
+            (1, dense_config.num_attention_heads, 0, 2),
+            dtype=np.float32,
+        )
+    result = session.run(feeds)
+    assert np.isfinite(result["logits"]).all()
 
 
 def test_glm_dsa_rejects_unowned_rope_scaling() -> None:

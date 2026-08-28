@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import dataclasses
-import math
 
 import onnx_ir as ir
 import torch
@@ -21,8 +20,7 @@ from mobius.components import (
     create_attention_bias,
     initialize_rope,
 )
-from mobius.components._rotary_embedding import apply_rotary_pos_emb
-from mobius.models.base import CausalLMModel
+from mobius.components._rotary_embedding import apply_rotary_pos_emb, yarn_apply_mscale
 from mobius.models.deepseek import DeepSeekMoEGate, DeepSeekV3CausalLMModel, _DeepSeekMoEFFN
 
 
@@ -53,7 +51,13 @@ class Mistral4LatentAttention(nn.Module):
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
         self._rope_interleave = config.rope_interleave
-        self.scaling = _mistral4_attention_scale(config, self.qk_head_dim)
+        # The GGUF postprocessor restores yarn_log_multiplier as
+        # mscale_all_dim; keep the softmax scale metadata-owned.
+        self.scaling = yarn_apply_mscale(
+            config.rope_type,
+            config.rope_scaling,
+            self.qk_head_dim**-0.5,
+        )
 
         self.q_a_proj = Linear(config.hidden_size, self.q_lora_rank, bias=False)
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -296,7 +300,7 @@ class Mistral4GGUFCausalLMModel(DeepSeekV3CausalLMModel):
             if config.partial_rotary_factor is not None
             else dataclasses.replace(config, partial_rotary_factor=1.0)
         )
-        CausalLMModel.__init__(self, base_config)
+        super().__init__(base_config)
         self.config = config
         self._replace_text_model(Mistral4TextModel(config))
 
@@ -310,18 +314,3 @@ class Mistral4GGUFCausalLMModel(DeepSeekV3CausalLMModel):
         assert self.config.kv_lora_rank is not None
         assert self.config.qk_rope_head_dim is not None
         return self.config.kv_lora_rank + self.config.qk_rope_head_dim
-
-
-def _mistral4_attention_scale(
-    config: ArchitectureConfig,
-    qk_head_dim: int,
-) -> float:
-    """Return pinned llama.cpp's Mistral4 MLA softmax scale."""
-    scale = qk_head_dim**-0.5
-    if config.rope_type != "yarn" or not config.rope_scaling:
-        return scale
-    factor = float(config.rope_scaling.get("factor", 1.0))
-    if factor <= 1.0:
-        return scale
-    mscale = 1.0 + 0.1 * math.log(factor)
-    return scale * mscale * mscale

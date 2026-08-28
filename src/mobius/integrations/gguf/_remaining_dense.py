@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 
 from mobius._configs import ArchitectureConfig
+from mobius.integrations.gguf._arch_registry import try_get_arch_spec
 from mobius.integrations.gguf._tensor_mapping import is_known_skip
 
 
@@ -312,7 +313,7 @@ def _validate_mistral4(model) -> None:
 
 def _validate_glm_dsa(model) -> None:
     metadata = model.metadata
-    arch = "glm-dsa"
+    arch = model.architecture
     nextn = int(metadata.get(f"{arch}.nextn_predict_layers", 0))
     total_layers = int(metadata[f"{arch}.block_count"])
     layers = total_layers - nextn
@@ -375,6 +376,7 @@ def _validate_glm_dsa(model) -> None:
             max_position_embeddings=int(metadata[f"{arch}.context_length"]),
         ),
         metadata,
+        arch=arch,
     )
     required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
@@ -484,9 +486,11 @@ def _validate_glm_dsa(model) -> None:
 
 def validate_remaining_dense_tensor_contract(model) -> None:
     """Validate the exact executable tensor subset for the three promoted routes."""
-    if model.architecture == "minimax-m2":
+    spec = try_get_arch_spec(model.architecture)
+    architecture = spec.gguf_arch if spec is not None else model.architecture
+    if architecture == "minimax-m2":
         _validate_minimax_m2(model)
-    elif model.architecture == "mistral4":
+    elif architecture == "mistral4":
         _validate_mistral4(model)
-    elif model.architecture == "glm-dsa":
+    elif architecture == "glm-dsa":
         _validate_glm_dsa(model)

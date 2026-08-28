@@ -7118,7 +7118,7 @@ def build_from_gguf(
                 "smallthinker GGUF only supports the dedicated "
                 "'smallthinker-gguf-text-generation' task"
             )
-    if gguf_arch == "glm-dsa":
+    if spec.gguf_arch == "glm-dsa":
         from mobius.tasks import GlmMoeDsaTask
 
         if static_cache:
@@ -7128,6 +7128,8 @@ def build_from_gguf(
             )
         if task is not None and task != "glm-moe-dsa" and not isinstance(task, GlmMoeDsaTask):
             raise ValueError("glm-dsa GGUF only supports the dedicated 'glm-moe-dsa' task")
+        if task is None:
+            task = GlmMoeDsaTask()
     if gguf_arch == "mistral4":
         from mobius.tasks import Mistral4GGUFCausalLMTask
 
@@ -7348,7 +7350,7 @@ def build_from_gguf(
     # ``_gguf_arch`` matters most: it is the key ``process_tensors`` dispatches
     # on, so losing it here would silently demote every non-float32 and every
     # quantized import to the ``model_type`` fallback.
-    config._gguf_arch = gguf_arch
+    config._gguf_arch = spec.gguf_arch
     config._gguf_model_type = model_type
     config._gguf_nextn_predict_layers = mtp_predict_layers
     config._gguf_mtp_block_indices = mtp_block_indices

@@ -4188,7 +4188,7 @@ def _glm_dsa_postprocess(
             f"{config.num_hidden_layers}], got {dense_prefix}"
         )
 
-    indexer_types = _glm_dsa_indexer_types(config, metadata)
+    indexer_types = _glm_dsa_indexer_types(config, metadata, arch=arch)
     names = set(model.tensor_names)
     routed_layers = set(range(dense_prefix, config.num_hidden_layers))
     bias_layers = {
@@ -4248,9 +4248,10 @@ def _glm_dsa_postprocess(
 def _glm_dsa_indexer_types(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
+    *,
+    arch: str = "glm-dsa",
 ) -> list[str]:
-    """Resolve the pinned bool/scalar indexer schedule without model-ID heuristics."""
-    arch = "glm-dsa"
+    """Resolve the raw-prefix bool/scalar schedule without model-ID heuristics."""
     layers = config.num_hidden_layers
     raw = metadata.get(f"{arch}.attention.indexer.types")
     if raw is None:
