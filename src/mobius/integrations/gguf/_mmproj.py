@@ -3329,6 +3329,7 @@ def _preflight_mmproj_quantization_report(
         map_mmproj_audio_projector_to_onnx,
         map_mmproj_audio_to_hf,
         map_mmproj_vision_to_hf,
+        map_ocr_projector_to_onnx,
     )
     from mobius.integrations.gguf._quant_registry import (
         float_storage_type_ids,
@@ -3370,10 +3371,21 @@ def _preflight_mmproj_quantization_report(
 
         hf_name = None
         if standalone_projector_type is not None:
-            hf_name = map_mmproj_audio_projector_to_onnx(
-                tensor.name,
-                standalone_projector_type,
-            )
+            standalone_spec = get_projector_spec(standalone_projector_type)
+            if standalone_spec.sidecar_builder == "ocr_projector":
+                route = standalone_projector_type
+                if standalone_projector_type in {"dots3note_v", "dots3note_a"}:
+                    route = (
+                        "dots3note_a"
+                        if tensor.name.startswith(("a.", "mm.a."))
+                        else "dots3note_v"
+                    )
+                hf_name = map_ocr_projector_to_onnx(tensor.name, route)
+            else:
+                hf_name = map_mmproj_audio_projector_to_onnx(
+                    tensor.name,
+                    standalone_projector_type,
+                )
         elif tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
             if vision_projector_type == "gemma4uv":
                 from mobius.integrations.gguf._core_vlm_projector import (

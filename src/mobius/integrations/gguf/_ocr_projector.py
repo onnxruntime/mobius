@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -313,7 +315,6 @@ def build_ocr_projector_from_gguf(
     _mmproj_gguf_model: Any,
 ):
     """Build exact standalone OCR/document sidecar components."""
-    del _mmproj_path, target_architecture
     if projector_type not in _OCR_PROJECTOR_TYPES:
         raise ValueError(f"Unsupported OCR projector type {projector_type!r}.")
     mmproj = _mmproj_gguf_model
@@ -336,9 +337,48 @@ def build_ocr_projector_from_gguf(
         execution_provider=execution_provider,
     )
     package.apply_weights(_map_state(mmproj, projector_type, mixed=mixed))
-    logger.warning(
-        "Built standalone %s mmproj components; downstream multimodal runtime "
-        "assembly is not validated.",
-        projector_type,
+    from mobius.integrations.gguf._mmproj import (
+        _preflight_mmproj_quantization_report,
+        _require_loaded_projector_initializers,
     )
+
+    _require_loaded_projector_initializers(package, projector_type)
+    package.gguf_quantization_report = _preflight_mmproj_quantization_report(
+        mmproj,
+        include_audio=mixed,
+        standalone_projector_type=projector_type,
+    )
+    package.gguf_source_path = str(Path(_mmproj_path).resolve())  # type: ignore[attr-defined]
+    package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    package.gguf_target_architecture = target_architecture  # type: ignore[attr-defined]
+    package.gguf_projector_output_size = config.hidden_size  # type: ignore[attr-defined]
+    runtime_warning = (
+        "Standalone projector graph only; paired text insertion and downstream "
+        "multimodal runtime execution are not validated."
+    )
+    package.gguf_runtime_warning = runtime_warning  # type: ignore[attr-defined]
+    package_input_schema = {}
+    for component, model in package.items():
+        input_schema = [
+            {
+                "name": value.name,
+                "dtype": str(value.dtype),
+                "shape": [str(dim) for dim in value.shape],
+            }
+            for value in model.graph.inputs
+        ]
+        package_input_schema[component] = input_schema
+        model.metadata_props["mobius.gguf_projector_type"] = projector_type
+        model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
+        model.metadata_props["mobius.gguf_input_schema"] = json.dumps(
+            input_schema,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        model.metadata_props["mobius.projector_output_size"] = str(config.hidden_size)
+        model.metadata_props["mobius.runtime_support"] = (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
+    package.gguf_input_schema = package_input_schema  # type: ignore[attr-defined]
+    logger.warning("%s", runtime_warning)
     return package

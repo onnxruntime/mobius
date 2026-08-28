@@ -424,6 +424,7 @@ def test_route_builder_emits_declared_standalone_roles(projector_type: str, monk
     )
     monkeypatch.setattr(_ocr_projector, "_dots_audio", lambda *args: _AudioStub())
     monkeypatch.setattr(_ocr_projector, "_map_state", lambda *args, **kwargs: {})
+    source = SimpleNamespace(metadata={}, reader_tensors=lambda: ())
 
     package = _ocr_projector.build_ocr_projector_from_gguf(
         "unused.gguf",
@@ -431,12 +432,25 @@ def test_route_builder_emits_declared_standalone_roles(projector_type: str, monk
         target_architecture=_TARGETS[projector_type],
         dtype=None,
         execution_provider="default",
-        _mmproj_gguf_model=object(),
+        _mmproj_gguf_model=source,
     )
 
     assert set(package) == {
         role.value for role in get_projector_spec(projector_type).model_roles
     }
+    assert package.gguf_projector_type == projector_type
+    assert package.gguf_target_architecture == _TARGETS[projector_type]
+    assert package.gguf_projector_output_size == 2
+    assert package.gguf_quantization_report is not None
+    assert set(package.gguf_input_schema) == set(package)
+    for model in package.values():
+        assert model.metadata_props["mobius.gguf_projector_type"] == projector_type
+        assert (
+            model.metadata_props["mobius.gguf_target_architecture"] == _TARGETS[projector_type]
+        )
+        assert isinstance(json.loads(model.metadata_props["mobius.gguf_input_schema"]), list)
+        assert model.metadata_props["mobius.projector_output_size"] == "2"
+        assert "unvalidated" in model.metadata_props["mobius.runtime_support"]
 
 
 class _MapFixture:
