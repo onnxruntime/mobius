@@ -366,7 +366,8 @@ class ModelPackage(UserDict[str, ir.Model]):
         When the package contains a single model, it is saved directly as
         ``model.onnx`` in *directory*.  When multiple models are present,
         each is saved in its own subfolder as ``{name}/model.onnx``. An attached
-        :attr:`mtp_head` package is always saved under ``mtp/``.
+        :attr:`mtp_head` package is saved under a collision-free directory named
+        by ``.mobius-package.json``.
 
         .. note::
             This method writes ONNX files only.  If you need a directory that

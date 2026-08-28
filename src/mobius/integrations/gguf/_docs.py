@@ -29,6 +29,9 @@ from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_PINS,
     iter_projector_specs,
 )
+from mobius.integrations.gguf._mtp_runtime_evidence import (
+    iter_mtp_runtime_evidence,
+)
 from mobius.integrations.gguf._quant_registry import (
     iter_quant_specs,
     render_quant_support_matrix,
@@ -353,6 +356,51 @@ def _runtime_evidence_table() -> str:
             f"{evidence.runtime_version}; result={evidence.result}; "
             f"{evidence.parity_kind}; {evidence.stateful_semantics}"
             f"{'; ' + evidence.limitations if evidence.limitations else ''} |"
+        )
+    for mtp_evidence in iter_mtp_runtime_evidence():
+        layouts = "<br>".join(
+            (
+                f"{layout.name}: "
+                + ", ".join(
+                    f"`{artifact.repository}@{artifact.revision}/{artifact.filename}` "
+                    f"{artifact.size:,} B `{artifact.lfs_sha256}`"
+                    for artifact in layout.artifacts
+                )
+                + f"<br>total {layout.total_size:,} B; "
+                + (
+                    "within 16 GiB"
+                    if layout.within_bounded_artifact_policy
+                    else "above 16 GiB"
+                )
+            )
+            for layout in mtp_evidence.layouts
+        )
+        discriminator = mtp_evidence.target_only_discriminator
+        if discriminator is not None:
+            layouts += (
+                f"<br>target-only discriminator: `{discriminator.filename}` "
+                f"{discriminator.size:,} B `{discriminator.lfs_sha256}`"
+            )
+        limitations = "<br>".join(mtp_evidence.downstream_limitations)
+        deferrals = "<br>".join(mtp_evidence.separate_deferrals)
+        synthetic = (
+            f"; reduced direct-ORT coordinator "
+            f"{dict(mtp_evidence.synthetic_acceptance_statistics)}"
+            if mtp_evidence.synthetic_coordinator_test is not None
+            else ""
+        )
+        rows.append(
+            f"| `{mtp_evidence.evidence_id}` | {layouts} | "
+            f"`{mtp_evidence.config_repository}@{mtp_evidence.config_revision}` "
+            f"`{mtp_evidence.config_sha256}` | "
+            f"`{mtp_evidence.tokenizer_repository}@{mtp_evidence.tokenizer_revision}`; "
+            f"separately deferred; metadata `{mtp_evidence.tokenizer_metadata_sha256}` | "
+            f"status={mtp_evidence.result}; graph/package hashes unclaimed; "
+            f"ORT {mtp_evidence.onnxruntime_version} "
+            f"`{mtp_evidence.execution_provider}`; {mtp_evidence.runtime} "
+            f"{mtp_evidence.runtime_version} source "
+            f"`{mtp_evidence.runtime_source_revision}`{synthetic}; "
+            f"{limitations}<br>{deferrals} |"
         )
     return "\n".join(rows)
 
@@ -708,8 +756,7 @@ warns while downstream runtime orchestration remains unvalidated.
 
 ## Runtime evidence
 
-The first low-cost architecture batch promotes GPT-2, GPT-NeoX/Pythia, MPT, OLMo,
-StarCoder, and StarCoder2 using 334,238,976 bytes of GGUF payload and 346,825,051
+The first low-cost architecture batch promotes GPT-2, GPT-NeoX/Pythia, MPT, OLMo, StarCoder, and StarCoder2 using 334,238,976 bytes of GGUF payload and 346,825,051
 download bytes including tokenizer assets. Every route is explicit-float only. The
 network-free selection, budget, exclusions, and fail-closed candidate reasons are recorded in
 `testdata/evidence/gguf_low_cost_runtime_batch.json`.

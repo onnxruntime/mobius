@@ -23,6 +23,9 @@ Three entry points, in order of increasing convenience:
   HF-model-id → ORT-GenAI-directory case.
 
 All three produce a directory that ``onnxruntime-genai`` can load directly.
+Packages with an MTP sidecar additionally emit an external coordination contract;
+the target remains loadable while combined target/MTP execution is marked
+``runtime_unvalidated``.
 
 Example::
 
@@ -666,6 +669,7 @@ def _copy_tokenizer_files(
     output_dir: str,
     *,
     revision: str | None = None,
+    local_files_only: bool = False,
 ) -> list[str]:
     """Download and copy tokenizer files from HuggingFace Hub.
 
@@ -677,7 +681,14 @@ def _copy_tokenizer_files(
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
         try:
-            src = hf_hub_download(model_id, filename, **_revision_kwargs(revision))
+            download_kwargs: dict[str, Any] = _revision_kwargs(revision)
+            if local_files_only:
+                download_kwargs["local_files_only"] = True
+            src = hf_hub_download(
+                model_id,
+                filename,
+                **download_kwargs,
+            )
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
@@ -1944,6 +1955,93 @@ def _runtime_capability_warnings(pkg: ModelPackage) -> tuple[str, ...]:
     return tuple(warnings)
 
 
+def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
+    """Return exact local cache port pairs from one target or MTP graph."""
+    output_names = {value.name for value in model.graph.outputs if value.name is not None}
+    pairs: list[dict[str, str]] = []
+    for value in model.graph.inputs:
+        name = value.name
+        if name is None or not name.startswith("past_key_values."):
+            continue
+        output = "present." + name.removeprefix("past_key_values.")
+        if output not in output_names:
+            raise ValueError(
+                f"MTP runtime metadata cannot pair cache input {name!r} with {output!r}"
+            )
+        pairs.append({"input": name, "output": output})
+    return sorted(pairs, key=lambda pair: pair["input"])
+
+
+def _mtp_sidecar_model(pkg: ModelPackage, directory: str) -> tuple[Any, str, Any] | None:
+    """Resolve an attached or legacy component MTP graph and its saved path."""
+    attached = getattr(pkg, "mtp_head", None)
+    if attached is not None:
+        if set(attached) != {"model"}:
+            raise ValueError(
+                "ORT GenAI MTP metadata requires one sidecar component named 'model'"
+            )
+        from mobius._model_package import _mtp_sidecar_name, _read_mtp_sidecar_name
+
+        sidecar_name = _read_mtp_sidecar_name(directory)
+        if sidecar_name is None:
+            sidecar_name = _mtp_sidecar_name(pkg)
+        return attached["model"], f"{sidecar_name}/model.onnx", attached.config
+    if "mtp" in pkg:
+        return pkg["mtp"], "mtp/model.onnx", getattr(pkg, "config", None)
+    return None
+
+
+def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
+    """Write the external target/MTP coordination contract without claiming OGA support."""
+    resolved = _mtp_sidecar_model(pkg, directory)
+    if resolved is None:
+        return None
+    mtp_model, model_filename, proposer_config = resolved
+    target_model = pkg.get("decoder") or pkg.get("model")
+    if target_model is None:
+        raise ValueError("MTP runtime metadata requires a target decoder graph")
+    dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
+    dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
+    payload = {
+        "schema_version": 1,
+        "status": "runtime_unvalidated",
+        "model": {"filename": model_filename},
+        "inputs": [value.name for value in mtp_model.graph.inputs if value.name is not None],
+        "outputs": [value.name for value in mtp_model.graph.outputs if value.name is not None],
+        "conditioning": {
+            "target_hidden_output": "mtp_seed",
+            "target_hidden_input": "hidden_states",
+            "embedding": "dedicated" if dedicated_embeddings else "shared_target",
+            "lm_head": "dedicated" if dedicated_lm_head else "shared_target",
+        },
+        "cache_namespaces": {
+            "target": {
+                "namespace": "target",
+                "ports": _mtp_state_ports(target_model),
+            },
+            "mtp": {
+                "namespace": "mtp",
+                "ports": _mtp_state_ports(mtp_model),
+            },
+        },
+        "num_nextn_predict_layers": int(
+            getattr(
+                getattr(pkg, "config", None),
+                "num_nextn_predict_layers",
+                getattr(proposer_config, "num_hidden_layers", 1),
+            )
+        ),
+        "shared_embedding": None if dedicated_embeddings else "model.embed_tokens",
+        "shared_lm_head": None if dedicated_lm_head else "lm_head",
+        "runtime_orchestration": "external",
+    }
+    path = os.path.join(directory, "mtp_config.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return path
+
+
 def write_ort_genai_config(
     pkg: ModelPackage,
     directory: str,
@@ -2122,33 +2220,13 @@ def write_ort_genai_config(
         ort_model_type = "phi4mm"
     result: dict[str, str] = {}
 
-    if "mtp" in pkg:
-        mtp_model = pkg["mtp"]
-        mtp_path = os.path.join(directory, "mtp_config.json")
-        with open(mtp_path, "w") as f:
-            json.dump(
-                {
-                    "model": {"filename": "mtp/model.onnx"},
-                    "inputs": [
-                        value.name
-                        for value in mtp_model.graph.inputs
-                        if value.name is not None
-                    ],
-                    "outputs": [
-                        value.name
-                        for value in mtp_model.graph.outputs
-                        if value.name is not None
-                    ],
-                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
-                    "shared_embedding": "model.embed_tokens",
-                    "shared_lm_head": "lm_head",
-                    "runtime_orchestration": "external",
-                },
-                f,
-                indent=2,
-            )
-            f.write("\n")
+    mtp_path = _write_mtp_config(pkg, directory)
+    if mtp_path is not None:
         result["mtp_config"] = mtp_path
+        logger.warning(
+            "Wrote external MTP coordination metadata. The ONNX target and MTP graphs are "
+            "exported, but onnxruntime-genai orchestration remains runtime_unvalidated."
+        )
 
     # Copy tokenizer files. A local hf_model_id is a local model directory, not a
     # Hub repo id; copy directly instead of calling hf_hub_download.
@@ -2158,10 +2236,10 @@ def write_ort_genai_config(
             tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
         else:
             logger.info("Copying tokenizer files from %s", hf_model_id)
-            tokenizer_files = _copy_tokenizer_files(
-                hf_model_id,
-                directory,
-                **_revision_kwargs(revision),
+            tokenizer_files = (
+                _copy_tokenizer_files(hf_model_id, directory, revision=revision)
+                if revision is not None
+                else _copy_tokenizer_files(hf_model_id, directory)
             )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)

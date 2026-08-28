@@ -17,9 +17,12 @@ so both supported runtimes are reachable from one entry point.
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import importlib.metadata
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -96,6 +99,158 @@ def _publish_directory_no_replace(stage: Path, destination: Path) -> None:
 Runtime = Literal["onnx-genai", "ort-genai"]
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _installed_version(distribution: str) -> str | None:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _mtp_cache_ports(model: Any) -> list[dict[str, str]]:
+    output_names = {value.name for value in model.graph.outputs if value.name is not None}
+    pairs: list[dict[str, str]] = []
+    for value in model.graph.inputs:
+        name = value.name
+        if name is None or not name.startswith("past_key_values."):
+            continue
+        output = "present." + name.removeprefix("past_key_values.")
+        if output not in output_names:
+            raise ValueError(
+                f"MTP package status cannot pair cache input {name!r} with {output!r}"
+            )
+        pairs.append({"input": name, "output": output})
+    return sorted(pairs, key=lambda pair: pair["input"])
+
+
+def _write_mtp_runtime_status(
+    stage: Path,
+    *,
+    pkg: Any,
+    built_identity: Any,
+    graph_identity: Any,
+    runtime_payload_identity: Any,
+    runtime: Runtime,
+    runtime_version: str | None,
+    tokenizer_repository: str | None,
+    tokenizer_revision: str | None,
+    tokenizer_metadata_sha256: str | None,
+) -> str:
+    from mobius._model_package import _read_mtp_sidecar_name
+
+    sidecar_name = _read_mtp_sidecar_name(str(stage))
+    if sidecar_name is None or pkg.mtp_head is None:
+        raise ValueError("Saved MTP package is missing its sidecar manifest identity")
+    if set(pkg.mtp_head) != {"model"} or "model" not in pkg:
+        raise ValueError("GGUF MTP runtime status requires one target and one MTP model")
+    config_hashes = {
+        path.name: _sha256_file(path)
+        for path in sorted(stage.iterdir())
+        if path.is_file()
+        and path.name
+        in {
+            "genai_config.json",
+            "inference_metadata.yaml",
+            "mtp_config.json",
+            "runtime_compatibility.json",
+        }
+    }
+    tokenizer_hashes = {
+        path.name: {"size": path.stat().st_size, "sha256": _sha256_file(path)}
+        for path in sorted(stage.iterdir())
+        if path.is_file()
+        and path.name
+        in {
+            "added_tokens.json",
+            "chat_template.jinja",
+            "merges.txt",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer.jsonl",
+            "tokenizer.model",
+            "tokenizer_config.json",
+            "vocab.json",
+        }
+    }
+    payload = {
+        "schema_version": 1,
+        "status": "runtime_unvalidated",
+        "artifact": {
+            "architecture": built_identity.architecture,
+            "filename": built_identity.filename,
+            "size": built_identity.size,
+            "sha256": built_identity.sha256,
+            "tensor_count": built_identity.tensor_count,
+            "tensor_qtypes": dict(built_identity.tensor_qtypes),
+        },
+        "graph_package": {
+            "files": list(graph_identity.files),
+            "sha256": graph_identity.sha256,
+        },
+        "runtime_payload": {
+            "files": list(runtime_payload_identity.files),
+            "sha256": runtime_payload_identity.sha256,
+            "excludes": "mtp_runtime_status.json",
+        },
+        "config_sha256": config_hashes,
+        "tokenizer": {
+            "repository": tokenizer_repository,
+            "revision": tokenizer_revision,
+            "gguf_metadata_sha256": tokenizer_metadata_sha256,
+            "assets": tokenizer_hashes,
+            "status": (
+                "best_effort_unvalidated"
+                if tokenizer_repository is not None
+                else "not_provided"
+            ),
+        },
+        "cache_namespaces": {
+            "target": {
+                "namespace": "target",
+                "ports": _mtp_cache_ports(pkg["model"]),
+            },
+            "mtp": {
+                "namespace": "mtp",
+                "model": f"{sidecar_name}/model.onnx",
+                "ports": _mtp_cache_ports(pkg.mtp_head["model"]),
+            },
+        },
+        "runtime": {
+            "name": runtime,
+            "requested_version": runtime_version,
+            "installed_onnxruntime_version": _installed_version("onnxruntime"),
+            "installed_ort_genai_version": _installed_version("onnxruntime-genai"),
+            "execution_provider": getattr(pkg, "gguf_execution_provider", None),
+            "orchestration": "external",
+        },
+        "validated_claims": {
+            "artifact_identity": True,
+            "graph_serialization": True,
+            "cache_namespace_separation": True,
+            "runtime_execution": False,
+            "source_value_fidelity": False,
+            "storage_fidelity": False,
+            "target_only_output_equality": False,
+        },
+    }
+    path = stage / "mtp_runtime_status.json"
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    _LOGGER.warning(
+        "Published target and MTP ONNX graphs with runtime_unvalidated external "
+        "coordination metadata; no downstream MTP execution claim is implied."
+    )
+    return str(path)
+
+
 def write_gguf_runtime_package(
     pkg: Any,
     gguf_path: str | Path,
@@ -114,6 +269,8 @@ def write_gguf_runtime_package(
     The graph and configuration contract are always emitted when Mobius can
     represent them correctly. Runtime evidence and processor availability are
     recorded as validation metadata and warnings rather than admission checks.
+    Attached MTP graphs additionally record separate target/MTP cache namespaces
+    and package hashes without claiming downstream orchestration support.
 
     Args:
         pkg: The :class:`~mobius.ModelPackage` returned by
@@ -148,6 +305,11 @@ def write_gguf_runtime_package(
         raise ValueError(
             "tokenizer_repository and tokenizer_revision must be provided together."
         )
+    if (
+        tokenizer_revision is not None
+        and re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None
+    ):
+        raise ValueError("GGUF runtime packaging tokenizer_revision must be immutable 40-hex")
     output_dir = Path(output_dir)
     if output_dir.exists():
         raise FileExistsError(
@@ -266,6 +428,11 @@ def write_gguf_runtime_package(
     try:
         artifacts: dict[str, str] = {}
         pkg.save(str(stage), **save_kwargs)
+        if not source_model.source_matches_path():
+            raise ValueError(
+                "The GGUF source changed while target/MTP graphs were being serialized; "
+                "refusing package publication."
+            )
         graph_identity = gguf_graph_package_identity(stage)
         validation_warnings: list[str] = []
         if architecture_spec.runtime is not Support.SUPPORTED:
@@ -317,6 +484,9 @@ def write_gguf_runtime_package(
 
         if runtime == "ort-genai":
             from mobius.integrations.ort_genai import write_ort_genai_config
+            from mobius.integrations.ort_genai.auto_export import (
+                _copy_tokenizer_files,
+            )
 
             execution_provider = getattr(pkg, "gguf_execution_provider", None)
             if not isinstance(execution_provider, str) or not execution_provider:
@@ -334,6 +504,15 @@ def write_gguf_runtime_package(
                     f"ORT GenAI runtime execution with provider {execution_provider!r} has not "
                     "been validated; the provider identity is preserved in genai_config.json."
                 )
+            if mtp_head is not None and evidence is None and tokenizer_repository is not None:
+                assert tokenizer_revision is not None
+                for filename in _copy_tokenizer_files(
+                    tokenizer_repository,
+                    str(stage),
+                    revision=tokenizer_revision,
+                    local_files_only=local_files_only,
+                ):
+                    artifacts[filename] = str(stage / filename)
             artifacts.update(
                 write_ort_genai_config(
                     pkg,
@@ -347,22 +526,39 @@ def write_gguf_runtime_package(
 
             artifacts.update(
                 write_onnx_genai_config(
-                    pkg, str(stage), config=getattr(pkg, "config", None), source=None
+                    pkg,
+                    str(stage),
+                    config=getattr(pkg, "config", None),
+                    source=(
+                        tokenizer_repository
+                        if mtp_head is not None and evidence is None
+                        else None
+                    ),
+                    revision=(
+                        tokenizer_revision
+                        if mtp_head is not None and evidence is None
+                        else None
+                    ),
                 )
             )
         if draft_manifest is not None:
             from mobius.integrations.gguf._draft import write_draft_manifest
 
             artifacts["draft_manifest"] = write_draft_manifest(draft_manifest, stage)
-        if mtp_head is not None:
+        if mtp_head is not None and runtime == "onnx-genai":
+            from mobius._model_package import _read_mtp_sidecar_name
             from mobius.integrations.onnx_genai.inference_metadata import (
                 write_mtp_speculator_metadata,
             )
 
+            sidecar_name = _read_mtp_sidecar_name(str(stage))
+            if sidecar_name is None:
+                raise ValueError("Saved MTP package has no sidecar manifest")
             speculator_path = write_mtp_speculator_metadata(
                 str(stage),
                 backbone_config=getattr(pkg, "config", None),
                 proposer_config=getattr(mtp_head, "config", None),
+                model_path=f"{sidecar_name}/model.onnx",
             )
             if speculator_path is not None:
                 artifacts["speculator"] = str(speculator_path)
@@ -416,6 +612,26 @@ def write_gguf_runtime_package(
         artifacts["runtime_compatibility"] = str(compatibility_path)
         for warning in validation_warnings:
             _LOGGER.warning("%s", warning)
+        if mtp_head is not None:
+            runtime_payload_identity = gguf_graph_package_identity(stage)
+            status_path = _write_mtp_runtime_status(
+                stage,
+                pkg=pkg,
+                built_identity=built_identity,
+                graph_identity=graph_identity,
+                runtime_payload_identity=runtime_payload_identity,
+                runtime=runtime,
+                runtime_version=runtime_version,
+                tokenizer_repository=tokenizer_repository,
+                tokenizer_revision=tokenizer_revision,
+                tokenizer_metadata_sha256=verdict.metadata_sha256,
+            )
+            artifacts["mtp_runtime_status"] = status_path
+        if not source_model.source_matches_path():
+            raise ValueError(
+                "The GGUF source changed while runtime metadata was being written; "
+                "refusing package publication."
+            )
         _publish_directory_no_replace(stage, output_dir)
         return {
             name: str(output_dir / Path(path).relative_to(stage))

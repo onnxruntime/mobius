@@ -3724,6 +3724,83 @@ def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_
 
     assert config["model"]["type"] == "qwen2"
     assert compatibility["model_type"] == config["model"]["type"]
+    assert compatibility["runtime_validation_status"] == "unvalidated"
+    assert result["mtp_config"].endswith("mtp_config.json")
+
+
+def test_attached_mtp_sidecar_emits_component_qualified_cache_contract(tmp_path):
+    from mobius._model_package import ModelPackage
+
+    pkg = _make_fake_llm_pkg("qwen2")
+    pkg["model"] = _mock_decoder_model(layer_indices=(0,))
+    pkg.mtp_head = ModelPackage(
+        {
+            "model": _mock_model(
+                inputs=[
+                    "inputs_embeds",
+                    "hidden_states",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                ],
+                outputs=["mtp_hidden", "present.0.key", "present.0.value"],
+            )
+        },
+        config=types.SimpleNamespace(
+            num_hidden_layers=1,
+            use_dedicated_embeddings=False,
+            use_dedicated_lm_head=False,
+        ),
+    )
+
+    result = write_ort_genai_config(
+        pkg,
+        str(tmp_path),
+        runtime_version="0.15.2",
+    )
+    with open(result["mtp_config"], encoding="utf-8") as handle:
+        mtp = json.load(handle)
+    with open(result["runtime_compatibility"], encoding="utf-8") as handle:
+        compatibility = json.load(handle)
+
+    assert mtp["status"] == "runtime_unvalidated"
+    assert mtp["model"]["filename"] == ".mobius-mtp/model.onnx"
+    assert mtp["conditioning"] == {
+        "target_hidden_output": "mtp_seed",
+        "target_hidden_input": "hidden_states",
+        "embedding": "shared_target",
+        "lm_head": "shared_target",
+    }
+    assert mtp["cache_namespaces"] == {
+        "target": {
+            "namespace": "target",
+            "ports": [
+                {
+                    "input": "past_key_values.0.key",
+                    "output": "present.0.key",
+                },
+                {
+                    "input": "past_key_values.0.value",
+                    "output": "present.0.value",
+                },
+            ],
+        },
+        "mtp": {
+            "namespace": "mtp",
+            "ports": [
+                {
+                    "input": "past_key_values.0.key",
+                    "output": "present.0.key",
+                },
+                {
+                    "input": "past_key_values.0.value",
+                    "output": "present.0.value",
+                },
+            ],
+        },
+    }
+    assert compatibility["runtime_validation_status"] == "unvalidated"
+    assert compatibility["tested_versions"] == ["0.15.2"]
+    assert compatibility["graph_contract"] is not None
 
 
 @pytest.mark.parametrize(
