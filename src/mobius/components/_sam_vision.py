@@ -562,6 +562,8 @@ class SAMVisionEncoder(nn.Module):
                 [1, self._embed_dim, self._spatial_size, self._spatial_size],
                 mode="cubic",
                 coordinate_transformation_mode="half_pixel",
+                antialias=1,
+                exclude_outside=1,
             )
             position_embedding = op.Transpose(position_embedding, perm=[0, 2, 3, 1])
         x = op.Add(x, position_embedding)

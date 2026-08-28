@@ -1268,10 +1268,11 @@ class DeepSeekOCRCLIPEncoder(nn.Module):
         self._source_side = source_side
 
     def _positions(self, op: OpBuilder, target_side: ir.Value) -> ir.Value:
+        class_position = op.Slice(self.position_embedding, [0], [1], [0])
         patch_positions = op.Slice(
             self.position_embedding,
-            [0],
-            [self._source_side * self._source_side],
+            [1],
+            [self._source_side * self._source_side + 1],
             [0],
         )
         patch_positions = op.Transpose(patch_positions, perm=[1, 0])
@@ -1292,18 +1293,14 @@ class DeepSeekOCRCLIPEncoder(nn.Module):
             sizes,
             mode="cubic",
             coordinate_transformation_mode="half_pixel",
+            antialias=1,
+            exclude_outside=1,
         )
         patch_positions = op.Transpose(
             op.Reshape(patch_positions, [self._hidden_size, -1]),
             perm=[1, 0],
         )
-        class_position = op.Slice(
-            self.position_embedding,
-            [self._source_side * self._source_side],
-            [self._source_side * self._source_side + 1],
-            [0],
-        )
-        return op.Concat(patch_positions, class_position, axis=0)
+        return op.Concat(class_position, patch_positions, axis=0)
 
     def forward(self, op: OpBuilder, sam_features: ir.Value) -> ir.Value:
         batch = op.Shape(sam_features, start=0, end=1)
@@ -1356,7 +1353,7 @@ class DeepSeekOCRVisionEncoder(nn.Module):
             downsample_channels=(512, clip_hidden_size),
             position_size=64,
             rel_pos_size=64,
-            mlp_activation="gelu_pytorch_tanh",
+            mlp_activation="gelu",
         )
         self.clip = DeepSeekOCRCLIPEncoder(
             depth=clip_depth,
@@ -1776,7 +1773,7 @@ class DeepSeekOCR2VisionEncoder(nn.Module):
             downsample_channels=(512, hidden_size),
             position_size=64,
             rel_pos_size=64,
-            mlp_activation="gelu_pytorch_tanh",
+            mlp_activation="gelu",
         )
         self.query_encoder = DeepSeekOCR2QueryEncoder(
             depth=depth,

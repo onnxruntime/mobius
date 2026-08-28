@@ -676,13 +676,13 @@ def test_dots3note_audio_fp16_keeps_rotary_frequency_math_float32():
     assert np.isfinite(actual).all()
 
 
-def test_deepseek_clip_stage_matches_quick_gelu_reference():
+def test_deepseek_clip_stage_matches_cls_first_quick_gelu_reference():
     module = DeepSeekOCRCLIPEncoder(
         depth=1,
         hidden_size=8,
         intermediate_size=12,
         num_heads=2,
-        position_size=5,
+        position_size=10,
         norm_eps=1e-5,
     )
     sam = np.random.default_rng(11).normal(size=(1, 8, 2, 2)).astype(np.float32)
@@ -690,13 +690,18 @@ def test_deepseek_clip_stage_matches_quick_gelu_reference():
     actual, state, _ = _run(module, {"sam_features": sam}, seed=12)
     x = torch.from_numpy(sam).permute(0, 2, 3, 1).reshape(1, 4, 8)
     x = torch.cat((state["class_embedding"][None, None], x), dim=1)
-    x = (
-        x
-        + torch.cat(
-            (state["position_embedding"][:4], state["position_embedding"][4:]),
-            dim=0,
-        )[None]
+    patch_positions = torch_functional.interpolate(
+        state["position_embedding"][1:].T.reshape(1, 8, 3, 3),
+        size=(2, 2),
+        mode="bicubic",
+        antialias=True,
+        align_corners=False,
     )
+    positions = torch.cat(
+        (state["position_embedding"][:1], patch_positions.reshape(8, 4).T),
+        dim=0,
+    )
+    x = x + positions[None]
     x = _layer_norm(x, state, "pre_layernorm", 1e-5)
     residual = x
     normed = _layer_norm(x, state, "blocks.0.norm1", 1e-5)
@@ -714,7 +719,8 @@ def test_deepseek_clip_stage_matches_quick_gelu_reference():
     hidden = hidden * torch.sigmoid(1.702 * hidden)
     expected = x + _linear(hidden, state, "blocks.0.mlp.down_proj")
 
-    np.testing.assert_allclose(actual, expected[:, 1:].numpy(), rtol=4e-5, atol=4e-5)
+    # ONNX Resize's antialias filter differs slightly from PyTorch at the image edge.
+    np.testing.assert_allclose(actual, expected[:, 1:].numpy(), rtol=4e-3, atol=4e-3)
 
 
 def test_deepseek_sam_stage_matches_decomposed_relative_position_reference():
@@ -728,7 +734,7 @@ def test_deepseek_sam_stage_matches_decomposed_relative_position_reference():
         window_size=2,
         global_attn_indexes=(),
         downsample_channels=(6, 8),
-        mlp_activation="gelu_pytorch_tanh",
+        mlp_activation="gelu",
     )
     pixels = np.random.default_rng(25).normal(size=(1, 3, 32, 32)).astype(np.float32)
 
@@ -760,7 +766,7 @@ def test_deepseek_sam_stage_matches_decomposed_relative_position_reference():
     x = residual + attention
     normalized = _layer_norm(x, state, "blocks.0.norm2", 1e-6)
     hidden = _linear(normalized, state, "blocks.0.mlp.up_proj")
-    hidden = torch_functional.gelu(hidden, approximate="tanh")
+    hidden = torch_functional.gelu(hidden)
     x = x + _linear(hidden, state, "blocks.0.mlp.down_proj")
     x = x.permute(0, 3, 1, 2)
     x = torch_functional.conv2d(x, state["neck.0.weight"])
