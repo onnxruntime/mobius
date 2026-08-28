@@ -188,6 +188,25 @@ def test_real_header_rejects_head_dimensions_incompatible_with_2d_rope(
         )
 
 
+@pytest.mark.parametrize(
+    ("projector_type", "invalid_heads"),
+    (("dots_ocr", 256), ("paddleocr", 192)),
+)
+def test_qwen_style_ocr_routes_reject_incompatible_2d_rope_geometry(
+    projector_type: str,
+    invalid_heads: int,
+):
+    source = _HeaderFixture(_evidence()[_ROUTE_HEADERS[projector_type]])
+    source.metadata["clip.vision.attention.head_count"] = invalid_heads
+
+    with pytest.raises(ValueError, match="invalid hidden/head"):
+        _preflight_standalone_mmproj(
+            source,
+            projector_type=projector_type,
+            target_architecture=_TARGETS[projector_type],
+        )
+
+
 @pytest.mark.parametrize("invalid_top_k", (0, 33))
 def test_dots3note_rejects_invalid_expert_top_k(invalid_top_k: int):
     source = _HeaderFixture(_evidence()["dots3note"])

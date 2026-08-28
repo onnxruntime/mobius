@@ -1308,7 +1308,7 @@ def _validate_dots_vision_shapes(mmproj_gguf: Any, projector_type: str) -> None:
             else "clip.vision.spatial_merge_size"
         ]
     )
-    if hidden <= 0 or heads <= 0 or hidden % heads or merge <= 0:
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4 or merge <= 0:
         raise ValueError(f"{projector_type} has invalid hidden/head/merge dimensions.")
     _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
     _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
@@ -1428,7 +1428,7 @@ def _validate_paddleocr_shapes(mmproj_gguf: Any) -> None:
     heads = int(md["clip.vision.attention.head_count"])
     patch = int(md["clip.vision.patch_size"])
     projection = int(md["clip.vision.projection_dim"])
-    if hidden <= 0 or heads <= 0 or hidden % heads:
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
         raise ValueError("paddleocr has invalid hidden/head dimensions.")
     if int(md.get("clip.vision.spatial_merge_size", 2)) != 2:
         raise ValueError("paddleocr only supports its hard-coded spatial merge size 2.")
