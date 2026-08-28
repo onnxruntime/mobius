@@ -585,7 +585,7 @@ _APERTUS_15B_BF16_ORT_GENAI = GGUFRuntimeEvidence(
         "export_report.json",
         *_LOW_COST_RUNTIME_PACKAGE_FILES,
     ),
-    runtime_package_sha256="37c8a587eaeda7dc31bd1a4a6b7611a8aae5e91b7d7bbeb1a106e3a7a2441f08",
+    runtime_package_sha256="97582549e9c5b4114f3bcfa81c92f16aba9d14dd0ea0d2b20acaefd9060e6486",
     parity_test=("test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]"),
     parity_kind="full-logit",
     deterministic_test=(

@@ -478,10 +478,19 @@ class TestWriteGgufRuntimePackage:
 
     def test_exact_runtime_evidence_marks_package_validated(self, tmp_path):
         pkg = _FakePackage()
-        pkg.gguf_tokenizer_verdict = SimpleNamespace(
+        blocker = GGUFTokenizerVerdict(
+            route="deferred",
+            model="gpt2",
+            pre="blocked-pre",
+            canonical_pre="blocked-pre",
+            token_count=2,
             metadata_sha256="f" * 64,
             blocker_category="compiled-llama.cpp-semantic-dependency",
+            audit_status="deferred-compiled-semantics",
+            reason="compiled tokenizer semantics require exact evidence",
         )
+        pkg.gguf_tokenizer_verdict = blocker
+        attach_tokenizer_export_report(pkg, blocker, model_route="llama")
         out = tmp_path / "out"
         evidence = SimpleNamespace(
             evidence_id="test-evidence",
@@ -506,6 +515,14 @@ class TestWriteGgufRuntimePackage:
                 return_value=evidence,
             ),
             mock.patch(
+                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
+                return_value=blocker,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._component_export.resolve_tokenizer_export_verdict",
+                return_value=blocker,
+            ),
+            mock.patch(
                 "mobius.integrations.gguf._runtime_package.gguf_graph_package_identity",
                 side_effect=(
                     SimpleNamespace(files=evidence.graph_files, sha256=evidence.graph_sha256),
@@ -521,6 +538,7 @@ class TestWriteGgufRuntimePackage:
         assert package_identity.call_args_list[0].kwargs["files"] == ("model.onnx",)
         assert pkg.export_report is not None
         assert pkg.export_report.export_status == "complete"
+        assert pkg.export_report.component("tokenizer").output == "exported"
         assert pkg.export_report.runtime_validation_status == "validated"
         assert pkg.export_report.end_to_end_runnable is True
         runtime_component = pkg.export_report.component("runtime")

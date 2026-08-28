@@ -1717,6 +1717,11 @@ def test_promoted_gguf_full_runtime_evidence(
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
     assert package.gguf_quantization_report == source_report
+    assert package.export_report is not None
+    assert package.export_report.export_status == "complete"
+    assert package.export_report.runtime_validation_status == "validated"
+    assert package.export_report.end_to_end_runnable is True
+    assert package.export_report.component("tokenizer").output == "exported"
     assert (
         GGUFQuantizationReport.read_json(output_dir / "quantization_report.json")
         == source_report
