@@ -244,8 +244,8 @@ def test_qwen4exp_header_fixture_matches_pinned_evidence():
 @pytest.mark.parametrize(
     ("keep_quantized", "message"),
     [
-        (True, r"IQ4_NL embedding.*rank-3 routed experts.*No GGUF tensor payload"),
-        (False, r"191 GiB.*bounded-memory route.*No GGUF tensor payload"),
+        (True, r"IQ4_NL embedding.*rank-3 routed experts.*may fall back to downloading"),
+        (False, r"191 GiB.*bounded-memory route.*may fall back to downloading"),
     ],
 )
 def test_qwen4exp_payload_modes_fail_closed_before_raw_payload_access(
@@ -299,7 +299,10 @@ def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monk
         ),
     )
 
-    with pytest.raises(Qwen4ExpGGUFImportError, match="intentionally fail-closed"):
+    with pytest.raises(
+        Qwen4ExpGGUFImportError,
+        match=r"intentionally fail-closed.*No GGUF tensor payload was downloaded",
+    ):
         _builder._preflight_hf_gguf_file(
             "other/Qwen4Exp-GGUF",
             "renamed-00001-of-00003.gguf",
@@ -310,3 +313,36 @@ def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monk
         "renamed-00001-of-00003.gguf",
         revision="feature/revision",
     )
+
+
+def test_qwen4exp_header_fallback_does_not_claim_payload_was_not_downloaded(monkeypatch):
+    from mobius.integrations.gguf import _builder
+
+    commit_hash = "b" * 40
+    download = mock.Mock(return_value="cached-model.gguf")
+    monkeypatch.setattr(
+        _builder,
+        "_preflight_hf_gguf_file",
+        lambda *_args, **_kwargs: _builder._GGUFPreflightFallbackRevision(commit_hash),
+    )
+    api = mock.Mock()
+    api.list_repo_files.return_value = ["model.gguf"]
+    monkeypatch.setattr(_builder, "HfApi", mock.Mock(return_value=api))
+    monkeypatch.setattr(_builder, "hf_hub_download", download)
+
+    assert _builder._resolve_gguf_path("other/Qwen4Exp-GGUF:model.gguf") == "cached-model.gguf"
+    download.assert_called_once_with(
+        repo_id="other/Qwen4Exp-GGUF",
+        filename="model.gguf",
+        revision=commit_hash,
+    )
+
+    with pytest.raises(Qwen4ExpGGUFImportError) as exc_info:
+        _builder._validate_gguf_model(
+            _HeaderFixture(),
+            source="cached-model.gguf",
+            keep_quantized=True,
+        )
+    message = str(exc_info.value)
+    assert "may fall back to downloading" in message
+    assert "No GGUF tensor payload was downloaded." not in message

@@ -102,16 +102,20 @@ complete 1,224-name tensor shape/qtype contract. GGUF's split indexer query/key
 matrices are concatenated row-wise into Hugging Face's fused `index_qk_proj`;
 they are not Q/K-permuted.
 
-Payload conversion deliberately fails before Hub download. The combined PLE
-table is an enormous IQ4_NL embedding for which the graph has no compatible
-native gather ABI. Routed experts are rank-3 banks with IQ1_S gate/up and
-IQ4_NL down tensors, while the released runtime has neither a mixed-format
-sparse native-block MoE ABI nor real-weight execution evidence. Treating these
-as ordinary affine `MatMulNBits` would be incorrect. Explicit float
-dequantization is also rejected because the PLE table alone expands beyond the
-bounded single-tensor materialization policy. The exact header/config/mapping
-support is therefore a fail-closed foundation for future runtime ABI work, not
-a quantized execution claim.
+Payload conversion deliberately fails before tensor materialization. A
+successful bounded-header preflight rejects the architecture before Hub payload
+download. If that range request fails or the metadata header exceeds its bounded
+range, the intentional best-effort fallback downloads the immutable file or
+complete shard set for full local validation before reaching the same fail-closed
+guard. The combined PLE table is an enormous IQ4_NL embedding for which the graph
+has no compatible native gather ABI. Routed experts are rank-3 banks with IQ1_S
+gate/up and IQ4_NL down tensors, while the released runtime has neither a
+mixed-format sparse native-block MoE ABI nor real-weight execution evidence.
+Treating these as ordinary affine `MatMulNBits` would be incorrect. Explicit
+float dequantization is also rejected because the PLE table alone expands beyond
+the bounded single-tensor materialization policy. The exact
+header/config/mapping support is therefore a fail-closed foundation for future
+runtime ABI work, not a quantized execution claim.
 
 Released onnxruntime-genai and the current ONNX GenAI workflow schema cannot
 represent Qwen4-Exp's `ple_input_ids`, four-axis position state, and

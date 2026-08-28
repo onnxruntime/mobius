@@ -25,7 +25,11 @@ class Qwen4ExpGGUFImportError(NotImplementedError):
     """A Qwen4Exp payload has no truthful executable import route."""
 
 
-def _payload_blocker(*, keep_quantized: bool | None) -> Qwen4ExpGGUFImportError:
+def _payload_blocker(
+    *,
+    keep_quantized: bool | None,
+    payload_downloaded: bool | None = None,
+) -> Qwen4ExpGGUFImportError:
     if keep_quantized is True:
         detail = (
             "per_layer_token_embd.weight is an IQ4_NL embedding with no matching "
@@ -49,17 +53,32 @@ def _payload_blocker(*, keep_quantized: bool | None) -> Qwen4ExpGGUFImportError:
             "expert-bank ABIs, while dense materialization exceeds the bounded-memory "
             "import route."
         )
+    if payload_downloaded is False:
+        download_detail = "No GGUF tensor payload was downloaded."
+    else:
+        download_detail = (
+            "This rejection does not imply that no Hub payload was downloaded: "
+            "bounded-header preflight may fall back to downloading the immutable file "
+            "or shard set for full local validation."
+        )
     return Qwen4ExpGGUFImportError(
         "Qwen3.8 Flash-Next GGUF payload import is intentionally fail-closed. "
-        f"{detail} No GGUF tensor payload was downloaded or materialized. The exact header, "
-        "configuration, shard closure, and tensor-name mapping remain supported "
-        "for preflight and future ABI work."
+        f"{detail} No GGUF tensor payload was materialized by the importer. "
+        f"{download_detail} The exact header, configuration, shard closure, and "
+        "tensor-name mapping remain supported for preflight and future ABI work."
     )
 
 
-def reject_qwen4exp_payload(*, keep_quantized: bool | None = None) -> None:
-    """Reject a header-identified Qwen4Exp payload before materializing tensors."""
-    raise _payload_blocker(keep_quantized=keep_quantized)
+def reject_qwen4exp_payload(
+    *,
+    keep_quantized: bool | None = None,
+    payload_downloaded: bool | None = None,
+) -> None:
+    """Reject a header-identified Qwen4Exp payload without materializing tensors."""
+    raise _payload_blocker(
+        keep_quantized=keep_quantized,
+        payload_downloaded=payload_downloaded,
+    )
 
 
 def _qtype_name(qtype: Any) -> str:
