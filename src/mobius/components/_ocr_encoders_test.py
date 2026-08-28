@@ -874,6 +874,29 @@ def test_granite_window_qformer_matches_independent_reference():
     np.testing.assert_allclose(actual, expected.numpy(), rtol=5e-5, atol=5e-5)
 
 
+def test_deepseek_sam_local_tower_accepts_zero_crop_batch():
+    module = SAMVisionEncoder(
+        img_size=32,
+        patch_size=16,
+        embed_dim=8,
+        depth=1,
+        num_heads=2,
+        out_chans=4,
+        window_size=2,
+        global_attn_indexes=(),
+        downsample_channels=(6, 8),
+        mlp_activation="gelu",
+    )
+
+    actual, _, _ = _run(
+        module,
+        {"pixel_values": np.zeros((0, 3, 32, 32), dtype=np.float32)},
+        seed=35,
+    )
+
+    assert actual.shape == (0, 8, 1, 1)
+
+
 def test_deepseek_ocr2_query_mask_matches_independent_reference():
     module = DeepSeekOCR2QueryEncoder(
         depth=1,

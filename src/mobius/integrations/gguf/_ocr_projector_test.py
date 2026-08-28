@@ -207,6 +207,18 @@ def test_qwen_style_ocr_routes_reject_incompatible_2d_rope_geometry(
         )
 
 
+def test_dots3note_audio_rejects_incompatible_partial_rope_geometry():
+    source = _HeaderFixture(_evidence()["dots3note"])
+    source.metadata["clip.audio.attention.head_count"] = 128
+
+    with pytest.raises(ValueError, match="invalid hidden/head dimensions"):
+        _preflight_standalone_mmproj(
+            source,
+            projector_type="dots3note_a",
+            target_architecture="dots3note",
+        )
+
+
 @pytest.mark.parametrize("invalid_top_k", (0, 33))
 def test_dots3note_rejects_invalid_expert_top_k(invalid_top_k: int):
     source = _HeaderFixture(_evidence()["dots3note"])

@@ -1474,9 +1474,22 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
         local_pixel_values: ir.Value,
         local_crop_count: ir.Value,
     ) -> ir.Value:
-        grid_h = op.Squeeze(op.Shape(local_pixel_values, start=0, end=1))
+        has_local = op.Cast(
+            op.Greater(op.Squeeze(local_crop_count), op.Constant(value_int=0)),
+            to=ir.DataType.INT64,
+        )
+        grid_h = op.Mul(
+            op.Squeeze(op.Shape(local_pixel_values, start=0, end=1)),
+            has_local,
+        )
         packed_width = op.Squeeze(op.Shape(local_pixel_values, start=3, end=4))
         grid_w = op.Div(packed_width, op.Constant(value_int=640))
+        local_pixel_values = op.Slice(
+            local_pixel_values,
+            [0],
+            op.Reshape(grid_h, [1]),
+            [0],
+        )
         local_tiles = op.Reshape(
             local_pixel_values,
             op.Concat(
@@ -1511,12 +1524,6 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
         local_h = op.Mul(grid_h, op.Constant(value_int=self._local_side))
         local_w = op.Mul(grid_w, op.Constant(value_int=self._local_side))
         local = self._append_newlines(op, local, local_h, local_w)
-        has_local = op.Cast(
-            op.Greater(op.Squeeze(local_crop_count), op.Constant(value_int=0)),
-            to=ir.DataType.INT64,
-        )
-        local_count = op.Mul(op.Squeeze(op.Shape(local, start=0, end=1)), has_local)
-        local = op.Slice(local, [0], op.Reshape(local_count, [1]), [0])
 
         overview = op.Squeeze(self.global_encoder(op, global_pixel_values), [0])
         overview = self._append_newlines(
@@ -1884,14 +1891,14 @@ class DeepSeekOCR2FullImageEncoder(nn.Module):
         local_pixel_values: ir.Value,
         local_crop_count: ir.Value,
     ) -> ir.Value:
+        local_pixel_values = op.Slice(
+            local_pixel_values,
+            [0],
+            local_crop_count,
+            [0],
+        )
         local = self.local_encoder(op, local_pixel_values)
         local = op.Reshape(local, [-1, self._output_size])
-        local_tokens = op.Div(
-            op.Squeeze(op.Shape(local, start=0, end=1)),
-            op.Squeeze(op.Shape(local_pixel_values, start=0, end=1)),
-        )
-        local_count = op.Mul(op.Squeeze(local_crop_count), local_tokens)
-        local = op.Slice(local, [0], op.Reshape(local_count, [1]), [0])
         overview = op.Squeeze(self.global_encoder(op, global_pixel_values), [0])
         overview = op.Concat(
             overview,

@@ -1247,7 +1247,7 @@ def _validate_dots_audio_shapes(mmproj_gguf: Any) -> None:
     heads = int(md["clip.audio.attention.head_count"])
     output = int(md["clip.audio.projection_dim"])
     mel_bins = int(md["clip.audio.num_mel_bins"])
-    if hidden <= 0 or heads <= 0 or hidden % heads:
+    if hidden <= 0 or heads <= 0 or hidden % heads or (hidden // heads) % 4:
         raise ValueError("dots3note_a has invalid hidden/head dimensions.")
     conv_channels = mmproj_gguf.get_tensor_shape("a.conv2d.1.weight")[0]
     _expect_mmproj_shape(mmproj_gguf, "a.conv2d.1.weight", (conv_channels, 1, 3, 3))
