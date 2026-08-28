@@ -229,17 +229,19 @@ def test_f32_accumulation_linear_executes_bfloat16_cast_path():
 def test_mimovl_post_ln_merge_four_projector_matches_torch():
     module = MiMoVLProjector(hidden_size=2, intermediate_size=3, output_size=2)
     state = _random_parameters(module, seed=3)
-    # RMSNorm scale must not be centred around zero for a useful parity fixture.
+    # LayerNorm scale must not be centred around zero for a useful parity fixture.
     state["post_ln.weight"] += 1.0
     inputs = np.arange(16, dtype=np.float32).reshape(8, 2) / 7.0
     session = _session(module, {"hidden_states": ([8, 2], ir.DataType.FLOAT)}, state)
     actual = session.run(None, {"hidden_states": inputs})[0]
 
     expected = torch.from_numpy(inputs)
-    expected = (
-        expected
-        * torch.rsqrt(expected.float().square().mean(dim=-1, keepdim=True) + 1e-6)
-        * torch.from_numpy(state["post_ln.weight"])
+    expected = torch_functional.layer_norm(
+        expected,
+        (2,),
+        torch.from_numpy(state["post_ln.weight"]),
+        bias=None,
+        eps=1e-6,
     ).reshape(2, 8)
     expected = _torch_linear(expected, state, "fc1")
     expected = _torch_linear(torch_functional.gelu(expected, approximate="none"), state, "fc2")

@@ -11,7 +11,7 @@ import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
-from mobius.components._common import LayerNorm, Linear
+from mobius.components._common import LayerNorm, LayerNormNoBias, Linear
 from mobius.components._rms_norm import RMSNorm
 
 
@@ -324,11 +324,11 @@ class MiMoVLBlock(nn.Module):
 
 
 class MiMoVLProjector(nn.Module):
-    """Post-RMSNorm, merge-four, two-layer GELU projector."""
+    """Post-LayerNorm, merge-four, two-layer GELU projector."""
 
     def __init__(self, hidden_size: int, intermediate_size: int, output_size: int):
         super().__init__()
-        self.post_ln = RMSNorm(hidden_size, eps=1e-6)
+        self.post_ln = LayerNormNoBias(hidden_size, eps=1e-6)
         self.fc1 = F32AccumulationLinear(hidden_size * 4, intermediate_size, bias=False)
         self.fc2 = F32AccumulationLinear(intermediate_size, output_size, bias=False)
         self._merged = hidden_size * 4

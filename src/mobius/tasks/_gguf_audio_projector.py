@@ -11,6 +11,7 @@ from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._model_package import ModelPackage
+from mobius._pipeline_contract import declare_component_presence
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 
 
@@ -38,4 +39,5 @@ class GGUFAudioProjectorTask(ModelTask):
         }
         audio_features = audio_encoder(builder.op, **inputs)
         builder.add_output(audio_features, "audio_features")
+        declare_component_presence(graph, "audio")
         return ModelPackage({"audio_encoder": _make_model(graph)}, config=config)

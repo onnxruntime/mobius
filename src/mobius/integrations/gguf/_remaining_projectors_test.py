@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
+import pytest
 
 from mobius._configs import ArchitectureConfig
 from mobius._testing.ort_inference import OnnxModelSession
@@ -15,9 +16,7 @@ from mobius.integrations.gguf._mmproj import build_mmproj_from_gguf
 from mobius.integrations.gguf._mmproj_mapping import (
     map_mmproj_audio_projector_to_onnx,
 )
-from mobius.integrations.gguf._remaining_projectors import (
-    create_remaining_vision_projector,
-)
+from mobius.integrations.gguf._remaining_projectors import create_remaining_vision_projector
 from mobius.models.gguf_audio_projector import create_gguf_audio_projector
 from mobius.tasks import (
     GGUFAudioProjectorTask,
@@ -91,17 +90,17 @@ def _write_tiny_meralion(path: Path) -> None:
     writer.add_uint32("clip.audio.projection_dim", 5)
     writer.add_uint32("clip.audio.attention.head_count", 1)
     writer.add_float32("clip.audio.attention.layer_norm_epsilon", 1e-5)
-    writer.add_uint32("clip.audio.num_mel_bins", 8)
-    writer.add_uint32("clip.audio.projector.stack_factor", 3)
+    writer.add_uint32("clip.audio.num_mel_bins", 128)
+    writer.add_uint32("clip.audio.projector.stack_factor", 15)
 
     def add(name: str, shape: tuple[int, ...]) -> None:
         writer.add_tensor(name, rng.normal(0.0, 0.2, shape).astype(np.float32))
 
-    add("a.conv1d.1.weight", (4, 8, 3))
+    add("a.conv1d.1.weight", (4, 128, 3))
     add("a.conv1d.1.bias", (4,))
     add("a.conv1d.2.weight", (4, 4, 3))
     add("a.conv1d.2.bias", (4,))
-    add("a.position_embd.weight", (6, 4))
+    add("a.position_embd.weight", (1500, 4))
     add("a.post_ln.weight", (4,))
     add("a.post_ln.bias", (4,))
     prefix = "a.blk.0."
@@ -118,7 +117,7 @@ def _write_tiny_meralion(path: Path) -> None:
     add(prefix + "ffn_down.bias", (4,))
     add("mm.a.norm_pre.weight", (4,))
     add("mm.a.norm_pre.bias", (4,))
-    add("mm.a.mlp.0.weight", (9, 12))
+    add("mm.a.mlp.0.weight", (9, 60))
     add("mm.a.mlp.0.bias", (9,))
     for index in (1, 2):
         add(f"mm.a.mlp.{index}.weight", (9, 9))
@@ -220,15 +219,57 @@ def test_public_meralion_package_persists_processor_contract(tmp_path: Path) -> 
 
     session = OnnxModelSession(package["audio_encoder"])
     output = session.run(
-        {"input_features": np.random.default_rng(5).normal(size=(12, 8)).astype(np.float32)}
+        {
+            "input_features": np.random.default_rng(5)
+            .normal(size=(3000, 128))
+            .astype(np.float32)
+        }
     )["audio_features"]
     session.close()
-    assert output.shape == (2, 5)
+    assert output.shape == (100, 5)
+    assert (
+        package["audio_encoder"].graph.metadata_props["mobius.pipeline.when_present"] == "audio"
+    )
     assert np.isfinite(output).all()
 
 
 def test_meralion_default_task_is_registered() -> None:
     assert isinstance(get_task("gguf-audio-projector"), GGUFAudioProjectorTask)
+
+
+def test_lfm2_contract_accepts_processor_native_int32_mask() -> None:
+    metadata = {
+        "clip.vision.embedding_length": 4,
+        "clip.vision.feed_forward_length": 8,
+        "clip.vision.block_count": 1,
+        "clip.vision.projection_dim": 4,
+        "clip.vision.attention.head_count": 1,
+        "clip.vision.attention.layer_norm_epsilon": 1e-6,
+        "clip.vision.patch_size": 2,
+        "clip.vision.projector.scale_factor": 2,
+    }
+    module = create_remaining_vision_projector(
+        "lfm2",
+        metadata,
+        {"v.position_embd.weight": (4, 4), "mm.1.weight": (8, 16)},
+    )
+    assert module.input_schema[1][1] == ir.DataType.INT32
+
+
+def test_minicpm_rejects_unknown_projector_scale() -> None:
+    metadata = {
+        "clip.vision.embedding_length": 4,
+        "clip.vision.projection_dim": 4,
+        "clip.vision.patch_size": 2,
+        "clip.vision.wa_layer_indexes": [0],
+        "clip.vision.projector.scale_factor": 3,
+    }
+    with pytest.raises(ValueError, match="scale_factor must be 2 or 4"):
+        create_remaining_vision_projector(
+            "minicpmv4_6",
+            metadata,
+            {"v.position_embd.weight": (4, 4)},
+        )
 
 
 def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> None:
@@ -238,19 +279,19 @@ def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> N
         "clip.audio.block_count": 1,
         "clip.audio.attention.head_count": 1,
         "clip.audio.attention.layer_norm_epsilon": 1e-5,
-        "clip.audio.num_mel_bins": 8,
-        "clip.audio.projector.stack_factor": 3,
+        "clip.audio.num_mel_bins": 128,
+        "clip.audio.projector.stack_factor": 15,
     }
     shapes = {
-        "a.position_embd.weight": (6, 4),
-        "mm.a.mlp.0.weight": (9, 12),
+        "a.position_embd.weight": (1500, 4),
+        "mm.a.mlp.0.weight": (9, 60),
         "mm.a.mlp.1.weight": (9, 9),
         "mm.a.mlp.2.weight": (9, 9),
         "mm.a.mlp.3.weight": (5, 9),
     }
     module = create_gguf_audio_projector("meralion", metadata, shapes)
     assert module.audio_encoder.input_schema == (
-        ("input_features", ir.DataType.FLOAT, (ir.SymbolicDim("frames"), 8)),
+        ("input_features", ir.DataType.FLOAT, (3000, 128)),
     )
     assert (
         map_mmproj_audio_projector_to_onnx("mm.a.mlp.3.bias", "meralion")

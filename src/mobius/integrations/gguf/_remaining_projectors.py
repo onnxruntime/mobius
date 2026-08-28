@@ -192,7 +192,7 @@ def _create_lfm2(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.Mod
                 ir.DataType.FLOAT,
                 (images, max_patches, 3 * patch * patch),
             ),
-            ("pixel_attention_mask", ir.DataType.INT64, (images, max_patches)),
+            ("pixel_attention_mask", ir.DataType.INT32, (images, max_patches)),
             ("spatial_shapes", ir.DataType.INT64, (images, 2)),
         ),
     )
@@ -215,6 +215,11 @@ def _create_minicpm(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
     ):
         raise ValueError("minicpmv4_6 requires one integer wa_layer_indexes entry.")
     scale = _metadata_int(metadata, "clip.vision.projector.scale_factor")
+    if scale not in (2, 4):
+        raise ValueError(
+            "minicpmv4_6 clip.vision.projector.scale_factor must be 2 or 4, "
+            f"got {scale}."
+        )
     config = ArchitectureConfig(
         model_type="minicpmv4_6",
         hidden_size=output,

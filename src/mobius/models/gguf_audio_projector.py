@@ -107,7 +107,13 @@ def create_gguf_audio_projector(
 
     hidden_size = _metadata_int(metadata, "clip.audio.embedding_length")
     stack_factor = _metadata_int(metadata, "clip.audio.projector.stack_factor")
+    num_mel_bins = _metadata_int(metadata, "clip.audio.num_mel_bins")
     position_shape = _shape(tensor_shapes, "a.position_embd.weight", 2)
+    if num_mel_bins != 128 or position_shape[0] != 1500 or stack_factor != 15:
+        raise ValueError(
+            "meralion requires the pinned float32[3000,128] processor ABI "
+            "with 1500 encoder positions and stack factor 15"
+        )
     first_shape = _shape(tensor_shapes, "mm.a.mlp.0.weight", 2)
     gate_shape = _shape(tensor_shapes, "mm.a.mlp.1.weight", 2)
     pool_shape = _shape(tensor_shapes, "mm.a.mlp.2.weight", 2)
@@ -124,7 +130,7 @@ def create_gguf_audio_projector(
             "Whisper -> stack -> gated adapter contract"
         )
     encoder = MeralionAudioSidecar(
-        num_mel_bins=_metadata_int(metadata, "clip.audio.num_mel_bins"),
+        num_mel_bins=num_mel_bins,
         d_model=hidden_size,
         encoder_layers=_metadata_int(metadata, "clip.audio.block_count"),
         encoder_heads=_metadata_int(metadata, "clip.audio.attention.head_count"),

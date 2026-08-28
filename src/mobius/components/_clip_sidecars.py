@@ -248,7 +248,7 @@ class MeralionAudioSidecar(nn.Module):
             (
                 "input_features",
                 ir.DataType.FLOAT,
-                (ir.SymbolicDim("frames"), num_mel_bins),
+                (max_source_positions * 2, num_mel_bins),
             ),
         )
         self.conv1 = Conv1d(num_mel_bins, d_model, kernel_size=3, padding=1)
