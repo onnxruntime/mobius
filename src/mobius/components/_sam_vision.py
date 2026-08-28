@@ -110,6 +110,7 @@ class _SAMAttention(nn.Module):
         qkv_bias: bool = True,
         use_rel_pos: bool = False,
         input_size: tuple[int, int] | None = None,
+        rel_pos_input_size: tuple[int, int] | None = None,
     ):
         super().__init__()
         self._num_heads = num_heads
@@ -120,13 +121,16 @@ class _SAMAttention(nn.Module):
 
         self._use_rel_pos = use_rel_pos
         if use_rel_pos and input_size is not None:
+            rel_pos_input_size = rel_pos_input_size or input_size
             # Decomposed relative position bias: separate H and W params
             # rel_pos_h: (2*H-1, head_dim), rel_pos_w: (2*W-1, head_dim)
-            self.rel_pos_h = nn.Parameter([2 * input_size[0] - 1, self._head_dim])
-            self.rel_pos_w = nn.Parameter([2 * input_size[1] - 1, self._head_dim])
+            self.rel_pos_h = nn.Parameter([2 * rel_pos_input_size[0] - 1, self._head_dim])
+            self.rel_pos_w = nn.Parameter([2 * rel_pos_input_size[1] - 1, self._head_dim])
             # Precompute relative position indices
             self._input_h = input_size[0]
             self._input_w = input_size[1]
+            self._rel_input_h = rel_pos_input_size[0]
+            self._rel_input_w = rel_pos_input_size[1]
             self._rel_h_indices = self._compute_rel_indices(input_size[0], input_size[0])
             self._rel_w_indices = self._compute_rel_indices(input_size[1], input_size[1])
 
@@ -137,6 +141,29 @@ class _SAMAttention(nn.Module):
         k_coords = np.arange(k_size)[None, :]
         relative_coords = q_coords - k_coords + (k_size - 1)
         return relative_coords.astype(np.int64)
+
+    def _resize_rel_pos(
+        self,
+        op: OpBuilder,
+        rel_pos: ir.Value,
+        source_size: int,
+        target_size: int,
+    ) -> ir.Value:
+        if source_size == target_size:
+            return rel_pos
+        source_length = 2 * source_size - 1
+        target_length = 2 * target_size - 1
+        table = op.Transpose(rel_pos, perm=[1, 0])
+        table = op.Reshape(table, [1, self._head_dim, source_length])
+        table = op.Resize(
+            table,
+            None,
+            None,
+            [1, self._head_dim, target_length],
+            mode="linear",
+            coordinate_transformation_mode="half_pixel",
+        )
+        return op.Transpose(op.Reshape(table, [self._head_dim, target_length]), perm=[1, 0])
 
     def forward(self, op: OpBuilder, x: ir.Value):
         # x: (B, H, W, C)
@@ -167,10 +194,22 @@ class _SAMAttention(nn.Module):
             # Compute decomposed relative position bias
             # Rh[i,j] = rel_pos_h[q_h - k_h + (H-1)], indexed by (q_h, k_h)
             # → gather: (H, H, head_dim)
+            rel_pos_h = self._resize_rel_pos(
+                op,
+                self.rel_pos_h,
+                self._rel_input_h,
+                H_val,
+            )
+            rel_pos_w = self._resize_rel_pos(
+                op,
+                self.rel_pos_w,
+                self._rel_input_w,
+                W_val,
+            )
             rel_h_idx = op.Constant(value=ir.tensor(self._rel_h_indices))
-            Rh = op.Gather(self.rel_pos_h, rel_h_idx)  # noqa: N806  # (H, H, head_dim)
+            Rh = op.Gather(rel_pos_h, rel_h_idx)  # noqa: N806  # (H, H, head_dim)
             rel_w_idx = op.Constant(value=ir.tensor(self._rel_w_indices))
-            Rw = op.Gather(self.rel_pos_w, rel_w_idx)  # noqa: N806  # (W, W, head_dim)
+            Rw = op.Gather(rel_pos_w, rel_w_idx)  # noqa: N806  # (W, W, head_dim)
 
             # Compute rel_h bias: einsum "bhwc,hkc->bhwk"
             # q reshaped to (BH, H, W, head_dim)
@@ -261,7 +300,9 @@ class _SAMBlock(nn.Module):
         mlp_ratio: float = 4.0,
         window_size: int = 0,
         input_size: tuple[int, int] = (64, 64),
+        rel_pos_input_size: tuple[int, int] | None = None,
         use_rel_pos: bool = True,
+        mlp_activation: str = "gelu",
     ):
         super().__init__()
         self.norm1 = _SAMLayerNorm(dim)
@@ -273,10 +314,20 @@ class _SAMBlock(nn.Module):
             qkv_bias=True,
             use_rel_pos=use_rel_pos,
             input_size=attn_input_size,
+            rel_pos_input_size=(
+                (window_size, window_size)
+                if window_size > 0
+                else (rel_pos_input_size or input_size)
+            ),
         )
         self.norm2 = _SAMLayerNorm(dim)
         # GELU MLP with bias (HF lin1/lin2 → up_proj/down_proj)
-        self.mlp = FCMLP(dim, int(dim * mlp_ratio), activation="gelu", bias=True)
+        self.mlp = FCMLP(
+            dim,
+            int(dim * mlp_ratio),
+            activation=mlp_activation,
+            bias=True,
+        )
 
         self._window_size = window_size
         self._input_size = input_size
@@ -323,7 +374,7 @@ class _SAMBlock(nn.Module):
             # Pad spatial dims (H and W) with zeros
             x = op.Pad(
                 x,
-                [0, 0, 0, 0, 0, self._pad_h, 0, self._pad_w],
+                [0, 0, 0, 0, 0, self._pad_h, self._pad_w, 0],
                 0.0,
             )
 
@@ -423,11 +474,19 @@ class SAMVisionEncoder(nn.Module):
         window_size: int = 14,
         global_attn_indexes: tuple[int, ...] = (2, 5, 8, 11),
         downsample_channels: tuple[int, ...] = (512, 896),
+        position_size: int | None = None,
+        rel_pos_size: int | None = None,
+        mlp_activation: str = "gelu",
     ):
         super().__init__()
         self._img_size = img_size
         self._has_downsample = len(downsample_channels) >= 2
         spatial_size = img_size // patch_size  # 64
+        position_size = spatial_size if position_size is None else position_size
+        rel_pos_size = spatial_size if rel_pos_size is None else rel_pos_size
+        self._spatial_size = spatial_size
+        self._position_size = position_size
+        self._embed_dim = embed_dim
 
         self.patch_embed = _SAMPatchEmbed(
             in_channels=3,
@@ -436,7 +495,7 @@ class SAMVisionEncoder(nn.Module):
         )
 
         # Absolute positional embedding: (1, 64, 64, 768)
-        self.pos_embed = nn.Parameter([1, spatial_size, spatial_size, embed_dim])
+        self.pos_embed = nn.Parameter([1, position_size, position_size, embed_dim])
 
         # Transformer blocks
         self.blocks = nn.ModuleList(
@@ -447,7 +506,9 @@ class SAMVisionEncoder(nn.Module):
                     mlp_ratio=mlp_ratio,
                     window_size=(window_size if i not in global_attn_indexes else 0),
                     input_size=(spatial_size, spatial_size),
+                    rel_pos_input_size=(rel_pos_size, rel_pos_size),
                     use_rel_pos=True,
+                    mlp_activation=mlp_activation,
                 )
                 for i in range(depth)
             ]
@@ -491,8 +552,19 @@ class SAMVisionEncoder(nn.Module):
         # → (B, 64, 64, 768)
         x = self.patch_embed(op, pixel_values)
 
-        # Add position embedding (same size, no interpolation needed)
-        x = op.Add(x, self.pos_embed)
+        position_embedding = self.pos_embed
+        if self._position_size != self._spatial_size:
+            position_embedding = op.Transpose(position_embedding, perm=[0, 3, 1, 2])
+            position_embedding = op.Resize(
+                position_embedding,
+                None,
+                None,
+                [1, self._embed_dim, self._spatial_size, self._spatial_size],
+                mode="cubic",
+                coordinate_transformation_mode="half_pixel",
+            )
+            position_embedding = op.Transpose(position_embedding, perm=[0, 2, 3, 1])
+        x = op.Add(x, position_embedding)
 
         # Transformer blocks
         for blk in self.blocks:

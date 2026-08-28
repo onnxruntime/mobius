@@ -64,6 +64,8 @@ from mobius._model_package import ModelPackage
 from mobius.integrations.gguf._arch_registry import MMPROJ_ARCHITECTURE
 from mobius.integrations.gguf._mmproj_registry import (
     LLAMA_CPP_MMPROJ_SHA,
+    BlockTensorVariantSpec,
+    IndexedTensorSpec,
     MMProjModality,
     ProjectorSpec,
     get_projector_spec,
@@ -513,6 +515,19 @@ def _collect_block_tensors(
     return blocks, matched
 
 
+def _all_block_suffixes(
+    suffixes: tuple[str, ...],
+    variant: BlockTensorVariantSpec | None,
+) -> tuple[str, ...]:
+    if variant is None:
+        return suffixes
+    return (
+        *suffixes,
+        *variant.default_suffixes,
+        *variant.triggered_suffixes,
+    )
+
+
 def _validate_block_tensor_set(
     *,
     projector_type: str,
@@ -521,6 +536,7 @@ def _validate_block_tensor_set(
     block_count: int,
     required_suffixes: tuple[str, ...],
     suffix_variants: tuple[tuple[str, ...], ...] = (),
+    variant: BlockTensorVariantSpec | None = None,
 ) -> None:
     expected_layers = set(range(block_count))
     if set(blocks) != expected_layers:
@@ -542,17 +558,76 @@ def _validate_block_tensor_set(
             )
         return
 
-    required = set(required_suffixes)
-    missing = {
-        layer: sorted(required - blocks[layer])
-        for layer in sorted(blocks)
-        if required - blocks[layer]
-    }
+    common = set(required_suffixes)
+    missing: dict[int, list[str]] = {}
+    mixed: dict[int, list[str]] = {}
+    for layer in sorted(blocks):
+        present = blocks[layer]
+        required = set(common)
+        if variant is not None:
+            triggered = variant.trigger_suffix in present
+            selected = (
+                set(variant.triggered_suffixes) if triggered else set(variant.default_suffixes)
+            )
+            forbidden = (
+                set(variant.default_suffixes) if triggered else set(variant.triggered_suffixes)
+            )
+            required.update(selected)
+            unexpected_variant = sorted(present & forbidden)
+            if unexpected_variant:
+                mixed[layer] = unexpected_variant
+        absent = sorted(required - present)
+        if absent:
+            missing[layer] = absent
     if missing:
         raise ValueError(
             f"{projector_type} mmproj is missing required {modality.value} block "
             f"suffixes: {missing}"
         )
+    if mixed:
+        raise ValueError(
+            f"{projector_type} mmproj mixes dense and triggered {modality.value} "
+            f"block suffix families: {mixed}"
+        )
+
+
+def _indexed_tensor_count(metadata: dict[str, Any], family: IndexedTensorSpec) -> int:
+    value = metadata[family.count_metadata]
+    if family.count_is_array_length:
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{family.count_metadata} must be a nonempty integer array.")
+        if any(
+            isinstance(item, bool) or not isinstance(item, (int, np.integer)) for item in value
+        ):
+            raise ValueError(f"{family.count_metadata} must contain only integers.")
+        return len(value)
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise ValueError(f"{family.count_metadata} must be a positive integer.")
+    return int(value)
+
+
+def _collect_indexed_tensor_family(
+    names: set[str],
+    metadata: dict[str, Any],
+    family: IndexedTensorSpec,
+    *,
+    projector_type: str,
+    modality: MMProjModality,
+) -> set[str]:
+    count = _indexed_tensor_count(metadata, family)
+    blocks, matched = _collect_block_tensors(
+        names,
+        prefix=family.prefix,
+        suffixes=family.required_suffixes,
+    )
+    _validate_block_tensor_set(
+        projector_type=projector_type,
+        modality=modality,
+        blocks=blocks,
+        block_count=count,
+        required_suffixes=family.required_suffixes,
+    )
+    return matched
 
 
 def _validate_gemma4_audio_metadata(metadata: dict[str, Any]) -> None:
@@ -613,12 +688,29 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
         block_names, matched = _collect_block_tensors(
             names,
             prefix=spec.block_prefix,
-            suffixes=allowed_suffixes,
+            suffixes=_all_block_suffixes(allowed_suffixes, spec.block_variant),
         )
     for pattern in spec.auxiliary_tensor_patterns:
         expression = re.compile(pattern)
         matched.update(name for name in names if expression.fullmatch(name))
     matched.update(top & names)
+    for group in spec.optional_top_tensor_groups:
+        present = set(group) & names
+        if present and present != set(group):
+            raise ValueError(
+                f"{spec.projector_type} mmproj has a partial optional tensor family: "
+                f"present={sorted(present)}, expected={sorted(group)}."
+            )
+    for family in spec.indexed_tensors:
+        matched.update(
+            _collect_indexed_tensor_family(
+                names,
+                mmproj_gguf.metadata,
+                family,
+                projector_type=spec.projector_type,
+                modality=spec.primary_modality,
+            )
+        )
 
     active_companions = []
     for companion in spec.companion_tensors:
@@ -642,13 +734,18 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             )
         if companion.projector_type == "gemma4a":
             _validate_gemma4_audio_metadata(mmproj_gguf.metadata)
-        companion_top = set(companion.required_top_tensors)
+        companion_top = set(companion.required_top_tensors) | set(
+            companion.optional_top_tensors
+        )
         companion_blocks, companion_matched = _collect_block_tensors(
             names,
             prefix=companion.block_prefix,
-            suffixes=companion.block_suffixes,
+            suffixes=_all_block_suffixes(
+                companion.block_suffixes,
+                companion.block_variant,
+            ),
         )
-        missing_top = sorted(companion_top - names)
+        missing_top = sorted(set(companion.required_top_tensors) - names)
         if missing_top:
             raise ValueError(
                 f"{companion.projector_type} companion is missing required tensor(s): "
@@ -661,9 +758,20 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             blocks=companion_blocks,
             block_count=int(mmproj_gguf.metadata[block_count_key]),
             required_suffixes=companion.block_suffixes,
+            variant=companion.block_variant,
         )
         matched.update(companion_top & names)
         matched.update(companion_matched)
+        for family in companion.indexed_tensors:
+            matched.update(
+                _collect_indexed_tensor_family(
+                    names,
+                    mmproj_gguf.metadata,
+                    family,
+                    projector_type=companion.projector_type,
+                    modality=companion.modality,
+                )
+            )
         active_companions.append(companion)
 
     quarantined_names: set[str] = set()
@@ -713,6 +821,7 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             block_count=layers,
             required_suffixes=spec.block_suffixes,
             suffix_variants=spec.block_suffix_variants,
+            variant=spec.block_variant,
         )
 
     for name in sorted(names):
@@ -814,7 +923,720 @@ def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) ->
                 _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (1,))
 
 
+def _require_true(metadata: dict[str, Any], key: str, projector_type: str) -> None:
+    if metadata.get(key) is not True:
+        raise ValueError(f"{projector_type} requires {key}=true.")
+
+
+def _positive_metadata_int(metadata: dict[str, Any], key: str) -> int:
+    value = metadata[key]
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise ValueError(f"{key} must be a positive integer, got {value!r}.")
+    return int(value)
+
+
+def _positive_metadata_float(metadata: dict[str, Any], key: str) -> float:
+    value = metadata[key]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float, np.integer, np.floating))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError(f"{key} must be a positive finite number, got {value!r}.")
+    return float(value)
+
+
+def _metadata_int_array(metadata: dict[str, Any], key: str, *, nonempty: bool) -> list[int]:
+    value = metadata[key]
+    if (
+        not isinstance(value, list)
+        or (nonempty and not value)
+        or any(
+            isinstance(item, bool) or not isinstance(item, (int, np.integer)) for item in value
+        )
+    ):
+        qualifier = "nonempty " if nonempty else ""
+        raise ValueError(f"{key} must be a {qualifier}integer array.")
+    return [int(item) for item in value]
+
+
+def _validate_ocr_metadata(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    """Validate exact typed metadata before any OCR graph dimensions are used."""
+    route = spec.projector_type
+    if route not in {
+        "deepseekocr",
+        "deepseekocr2",
+        "dots_ocr",
+        "dots3note_v",
+        "dots3note_a",
+        "paddleocr",
+        "lightonocr",
+        "youtuvl",
+        "granite4_vision",
+    }:
+        return
+    md = mmproj_gguf.metadata
+    presence = f"clip.has_{spec.primary_modality.value}_encoder"
+    _require_true(md, presence, route)
+    prefix = f"clip.{spec.primary_modality.value}"
+    for suffix in (
+        "embedding_length",
+        "feed_forward_length",
+        "block_count",
+        "projection_dim",
+        "attention.head_count",
+    ):
+        _positive_metadata_int(md, f"{prefix}.{suffix}")
+    _positive_metadata_float(md, f"{prefix}.attention.layer_norm_epsilon")
+    if spec.primary_modality is MMProjModality.VISION:
+        image_size = md["clip.vision.image_size"]
+        if (
+            isinstance(image_size, bool)
+            or not isinstance(image_size, (int, np.integer))
+            or image_size < 0
+        ):
+            raise ValueError("clip.vision.image_size must be a non-negative integer.")
+        _positive_metadata_int(md, "clip.vision.patch_size")
+        for key in ("clip.vision.image_mean", "clip.vision.image_std"):
+            value = md[key]
+            if (
+                not isinstance(value, list)
+                or len(value) < 3
+                or any(
+                    isinstance(item, bool)
+                    or not isinstance(item, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(item))
+                    for item in value[:3]
+                )
+            ):
+                raise ValueError(f"{key} must contain at least three finite numbers.")
+    else:
+        _positive_metadata_int(md, "clip.audio.num_mel_bins")
+
+    if route in {"deepseekocr", "deepseekocr2"}:
+        if _positive_metadata_int(md, "clip.vision.sam.block_count") != 12:
+            raise ValueError("clip.vision.sam.block_count must be exactly 12.")
+        _positive_metadata_int(md, "clip.vision.sam.embedding_length")
+        _positive_metadata_int(md, "clip.vision.sam.head_count")
+        _positive_metadata_int(md, "clip.vision.window_size")
+        min_tiles = md.get("clip.vision.preproc_min_tiles", 2)
+        max_tiles = md.get(
+            "clip.vision.preproc_max_tiles",
+            9 if route == "deepseekocr" else 6,
+        )
+        if (
+            isinstance(min_tiles, bool)
+            or isinstance(max_tiles, bool)
+            or not isinstance(min_tiles, (int, np.integer))
+            or not isinstance(max_tiles, (int, np.integer))
+            or not 0 <= int(min_tiles) <= int(max_tiles) <= 256
+        ):
+            raise ValueError("DeepSeek OCR preprocessor tile bounds are invalid.")
+    if route in {"dots_ocr", "dots3note_v", "paddleocr"}:
+        minimum = _positive_metadata_int(md, "clip.vision.image_min_pixels")
+        maximum = _positive_metadata_int(md, "clip.vision.image_max_pixels")
+        if minimum > maximum:
+            raise ValueError("clip.vision.image_min_pixels must not exceed image_max_pixels.")
+    if route == "dots_ocr":
+        _positive_metadata_int(md, "clip.vision.projector.scale_factor")
+    if route == "dots3note_v":
+        _require_true(md, "clip.has_audio_encoder", route)
+        _positive_metadata_int(md, "clip.vision.spatial_merge_size")
+        _positive_metadata_int(md, "clip.vision.expert_used_count")
+    if route == "dots3note_a":
+        _require_true(md, "clip.has_vision_encoder", route)
+    if route == "lightonocr":
+        _positive_metadata_int(md, "clip.vision.spatial_merge_size")
+        if "clip.vision.preproc_image_size" in md:
+            _positive_metadata_int(md, "clip.vision.preproc_image_size")
+    if route == "youtuvl":
+        if _positive_metadata_int(md, "clip.vision.spatial_merge_size") != 2:
+            raise ValueError("youtuvl spatial merge size must be exactly 2.")
+        _positive_metadata_int(md, "clip.vision.window_size")
+        _metadata_int_array(md, "clip.vision.wa_layer_indexes", nonempty=True)
+    if route == "granite4_vision":
+        feature_layers = _metadata_int_array(
+            md,
+            "clip.vision.feature_layer",
+            nonempty=True,
+        )
+        offsets = _metadata_int_array(
+            md,
+            "clip.vision.projector.spatial_offsets",
+            nonempty=True,
+        )
+        if len(feature_layers) != len(offsets):
+            raise ValueError(
+                "granite4_vision feature layers and spatial offsets must have equal length."
+            )
+        pinpoints = _metadata_int_array(
+            md,
+            "clip.vision.image_grid_pinpoints",
+            nonempty=True,
+        )
+        if len(pinpoints) % 2:
+            raise ValueError(
+                "clip.vision.image_grid_pinpoints must contain height/width pairs."
+            )
+        _positive_metadata_int(md, "clip.vision.projector.query_side")
+        _positive_metadata_int(md, "clip.vision.projector.window_side")
+
+
+def _validate_deepseek_sam_shapes(mmproj_gguf: Any, output_channels: int) -> None:
+    md = mmproj_gguf.metadata
+    sam_hidden = int(md["clip.vision.sam.embedding_length"])
+    sam_heads = int(md["clip.vision.sam.head_count"])
+    sam_layers = int(md["clip.vision.sam.block_count"])
+    if sam_layers != 12 or sam_hidden <= 0 or sam_hidden % sam_heads:
+        raise ValueError(
+            "DeepSeek OCR SAM must have 12 layers and divisible hidden/head dimensions."
+        )
+    head_dim = sam_hidden // sam_heads
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.sam.patch_embd.weight",
+        (sam_hidden, 3, 16, 16),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.patch_embd.bias", (sam_hidden,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.sam.pos_embd.weight",
+        (1, 64, 64, sam_hidden),
+    )
+    global_layers = {2, 5, 8, 11}
+    window = int(md["clip.vision.window_size"])
+    for layer in range(sam_layers):
+        prefix = f"v.sam.blk.{layer}."
+        for suffix in ("pre_ln.weight", "pre_ln.bias", "post_ln.weight", "post_ln.bias"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (sam_hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn.qkv.weight",
+            (3 * sam_hidden, sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "attn.qkv.bias", (3 * sam_hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn.out.weight",
+            (sam_hidden, sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "attn.out.bias", (sam_hidden,))
+        rel_length = 127 if layer in global_layers else 2 * window - 1
+        for axis in ("h", "w"):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + f"attn.pos_{axis}.weight",
+                (rel_length, head_dim),
+            )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "mlp.lin1.weight",
+            (4 * sam_hidden, sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "mlp.lin1.bias", (4 * sam_hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "mlp.lin2.weight",
+            (sam_hidden, 4 * sam_hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "mlp.lin2.bias", (sam_hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.neck.0.weight", (256, sam_hidden, 1, 1))
+    for name in ("v.sam.neck.1.weight", "v.sam.neck.1.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (256,))
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.neck.2.weight", (256, 256, 3, 3))
+    for name in ("v.sam.neck.3.weight", "v.sam.neck.3.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (256,))
+    _expect_mmproj_shape(mmproj_gguf, "v.sam.net_2.weight", (512, 256, 3, 3))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.sam.net_3.weight",
+        (output_channels, 512, 3, 3),
+    )
+
+
+def _validate_deepseek_ocr_shapes(mmproj_gguf: Any, projector_type: str) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", projector_type)
+    hidden = int(md["clip.vision.embedding_length"])
+    heads = int(md["clip.vision.attention.head_count"])
+    layers = int(md["clip.vision.block_count"])
+    projection = int(md["clip.vision.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError(f"{projector_type} has invalid hidden/head dimensions.")
+    _validate_deepseek_sam_shapes(mmproj_gguf, hidden)
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        if projector_type == "deepseekocr":
+            for suffix in ("ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "attn_qkv.weight",
+                (3 * hidden, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "attn_qkv.bias", (3 * hidden,))
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "attn_out.weight",
+                (hidden, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + "attn_out.bias", (hidden,))
+            ffn = mmproj_gguf.get_tensor_shape(prefix + "ffn_up.weight")[0]
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.weight", (ffn, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (ffn,))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.weight", (hidden, ffn))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+        else:
+            kv_heads = int(md["clip.vision.attention.head_count_kv"])
+            if kv_heads <= 0 or heads % kv_heads:
+                raise ValueError("deepseekocr2 head_count_kv must divide head_count.")
+            head_dim = hidden // heads
+            kv_width = kv_heads * head_dim
+            for stem, width in (
+                ("attn_q", hidden),
+                ("attn_k", kv_width),
+                ("attn_v", kv_width),
+            ):
+                _expect_mmproj_shape(
+                    mmproj_gguf,
+                    prefix + stem + ".weight",
+                    (width, hidden),
+                )
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (width,))
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "attn_out.weight",
+                (hidden, hidden),
+            )
+            for suffix in ("ln1.weight", "ln2.weight"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+            ffn = int(md["clip.vision.feed_forward_length"])
+            for stem in ("ffn_gate", "ffn_up"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (ffn, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.weight", (hidden, ffn))
+    if projector_type == "deepseekocr":
+        _expect_mmproj_shape(mmproj_gguf, "v.class_embd", (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, 14, 14))
+        _expect_mmproj_shape(mmproj_gguf, "v.position_embd.weight", (257, hidden))
+        for name in ("v.pre_ln.weight", "v.pre_ln.bias"):
+            _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, "v.image_newline", (projection,))
+        _expect_mmproj_shape(mmproj_gguf, "mm.model.fc.weight", (projection, 2 * hidden))
+    else:
+        _expect_mmproj_shape(mmproj_gguf, "v.post_ln.weight", (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, "v.resample_query_768.weight", (144, hidden))
+        _expect_mmproj_shape(mmproj_gguf, "v.resample_query_1024.weight", (256, hidden))
+        _expect_mmproj_shape(mmproj_gguf, "mm.model.fc.weight", (projection, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "mm.model.fc.bias", (projection,))
+    view_shape = mmproj_gguf.get_tensor_shape("v.view_seperator")
+    if view_shape not in {(projection,), (1, projection)}:
+        raise ValueError(
+            f"v.view_seperator has shape {view_shape}, expected {(projection,)} or "
+            f"{(1, projection)}."
+        )
+
+
+def _validate_dots_audio_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    hidden = int(md["clip.audio.embedding_length"])
+    intermediate = int(md["clip.audio.feed_forward_length"])
+    layers = int(md["clip.audio.block_count"])
+    heads = int(md["clip.audio.attention.head_count"])
+    output = int(md["clip.audio.projection_dim"])
+    mel_bins = int(md["clip.audio.num_mel_bins"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError("dots3note_a has invalid hidden/head dimensions.")
+    conv_channels = mmproj_gguf.get_tensor_shape("a.conv2d.1.weight")[0]
+    _expect_mmproj_shape(mmproj_gguf, "a.conv2d.1.weight", (conv_channels, 1, 3, 3))
+    _expect_mmproj_shape(mmproj_gguf, "a.conv2d.1.bias", (conv_channels,))
+    for index in (2, 3):
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            f"a.conv2d.{index}.weight",
+            (conv_channels, conv_channels, 3, 3),
+        )
+        _expect_mmproj_shape(mmproj_gguf, f"a.conv2d.{index}.bias", (conv_channels,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "a.conv_out.weight",
+        (hidden, conv_channels * ((mel_bins + 7) // 8)),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "a.post_ln.weight", (hidden,))
+    for layer in range(layers):
+        prefix = f"a.blk.{layer}."
+        for suffix in ("ln1.weight", "ln2.weight"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        for stem in ("attn_q", "attn_v", "attn_out"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+        _expect_mmproj_shape(mmproj_gguf, prefix + "attn_k.weight", (hidden, hidden))
+        for stem in ("ffn_gate", "ffn_up"):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + stem + ".weight",
+                (intermediate, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (intermediate,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, intermediate),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+    for name in ("mm.a.norm_pre.weight", "mm.a.norm_pre.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.1.weight", (output, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.1.bias", (output,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.3.weight", (output, output))
+    _expect_mmproj_shape(mmproj_gguf, "mm.a.mlp.3.bias", (output,))
+
+
+def _validate_dots_vision_shapes(mmproj_gguf: Any, projector_type: str) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_silu", projector_type)
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    merge = int(
+        md[
+            "clip.vision.projector.scale_factor"
+            if projector_type == "dots_ocr"
+            else "clip.vision.spatial_merge_size"
+        ]
+    )
+    if hidden <= 0 or heads <= 0 or hidden % heads or merge <= 0:
+        raise ValueError(f"{projector_type} has invalid hidden/head/merge dimensions.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for suffix in ("ln1.weight", "ln2.weight"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn_qkv.weight",
+            (3 * hidden, hidden),
+        )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "attn_out.weight",
+            (hidden, hidden),
+        )
+        if projector_type == "dots3note_v":
+            head_dim = hidden // heads
+            for suffix in ("attn_q_norm.weight", "attn_k_norm.weight"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (head_dim,))
+        if prefix + "ffn_gate_exps.weight" in mmproj_gguf.tensor_names:
+            experts, expert_intermediate, expert_hidden = mmproj_gguf.get_tensor_shape(
+                prefix + "ffn_gate_exps.weight"
+            )
+            if expert_hidden != hidden:
+                raise ValueError(f"{prefix} expert gate hidden size is invalid.")
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_up_exps.weight",
+                (experts, expert_intermediate, hidden),
+            )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_down_exps.weight",
+                (experts, hidden, expert_intermediate),
+            )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_gate_inp.weight",
+                (experts, hidden),
+            )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "exp_probs_b.weight",
+                (experts,),
+            )
+        else:
+            for stem in ("ffn_gate", "ffn_up"):
+                _expect_mmproj_shape(
+                    mmproj_gguf,
+                    prefix + stem + ".weight",
+                    (intermediate, hidden),
+                )
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + "ffn_down.weight",
+                (hidden, intermediate),
+            )
+    _expect_mmproj_shape(mmproj_gguf, "mm.post_norm.weight", (hidden,))
+    for name in ("mm.input_norm.weight", "mm.input_norm.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    merged = hidden * merge * merge
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.weight", (merged, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.bias", (merged,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.bias", (projection,))
+    if projector_type == "dots3note_v":
+        _validate_ocr_metadata(mmproj_gguf, get_projector_spec("dots3note_a"))
+        _validate_dots_audio_shapes(mmproj_gguf)
+
+
+def _validate_split_vision_block_shapes(
+    mmproj_gguf: Any,
+    *,
+    hidden: int,
+    intermediate: int,
+    layers: int,
+) -> None:
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+        for suffix in ("ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_up.weight",
+            (intermediate, hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_up.bias", (intermediate,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, intermediate),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+
+
+def _validate_paddleocr_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", "paddleocr")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError("paddleocr has invalid hidden/head dimensions.")
+    if int(md.get("clip.vision.spatial_merge_size", 2)) != 2:
+        raise ValueError("paddleocr only supports its hard-coded spatial merge size 2.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    position = mmproj_gguf.get_tensor_shape("v.position_embd.weight")
+    if (
+        len(position) != 2
+        or position[1] != hidden
+        or math.isqrt(position[0]) ** 2 != position[0]
+    ):
+        raise ValueError("paddleocr position embeddings must be a square table.")
+    for name in ("v.post_ln.weight", "v.post_ln.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _validate_split_vision_block_shapes(
+        mmproj_gguf,
+        hidden=hidden,
+        intermediate=intermediate,
+        layers=layers,
+    )
+    for name in ("mm.input_norm.weight", "mm.input_norm.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    merged = hidden * 4
+    _expect_mmproj_shape(mmproj_gguf, "mm.1.weight", (merged, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.1.bias", (merged,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.bias", (projection,))
+
+
+def _validate_lightonocr_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_silu", "lightonocr")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    merge = int(md["clip.vision.spatial_merge_size"])
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
+    for layer in range(layers):
+        prefix = f"v.blk.{layer}."
+        for stem in ("attn_q", "attn_k", "attn_v", "attn_out"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".weight", (hidden, hidden))
+        for suffix in ("ln1.weight", "ln2.weight"):
+            _expect_mmproj_shape(mmproj_gguf, prefix + suffix, (hidden,))
+        for stem in ("ffn_gate", "ffn_up"):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + stem + ".weight",
+                (intermediate, hidden),
+            )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, intermediate),
+        )
+    _expect_mmproj_shape(mmproj_gguf, "mm.input_norm.weight", (hidden,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "mm.patch_merger.weight",
+        (hidden, hidden * merge * merge),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "mm.1.weight", (hidden, hidden))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, hidden))
+    for name in ("mm.1.bias", "mm.2.bias"):
+        if name in mmproj_gguf.tensor_names:
+            expected = hidden if name == "mm.1.bias" else projection
+            _expect_mmproj_shape(mmproj_gguf, name, (expected,))
+
+
+def _validate_youtuvl_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", "youtuvl")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    merge = int(md["clip.vision.spatial_merge_size"])
+    window = int(md["clip.vision.window_size"])
+    indexes = md["clip.vision.wa_layer_indexes"]
+    if (
+        not isinstance(indexes, list)
+        or not indexes
+        or len(set(indexes)) != len(indexes)
+        or any(isinstance(index, bool) or not 0 <= index < layers for index in indexes)
+    ):
+        raise ValueError("youtuvl wa_layer_indexes must be unique in-range integers.")
+    if window <= 0 or window % (patch * merge):
+        raise ValueError("youtuvl window_size must divide into merged patch windows.")
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.patch_embd.weight",
+        (hidden, 3 * patch * patch),
+    )
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    for name in ("v.post_ln.weight", "v.post_ln.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _validate_split_vision_block_shapes(
+        mmproj_gguf,
+        hidden=hidden,
+        intermediate=intermediate,
+        layers=layers,
+    )
+    _expect_mmproj_shape(mmproj_gguf, "mm.input_norm.weight", (hidden,))
+    merged = hidden * merge * merge
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.weight", (merged, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.0.bias", (merged,))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.weight", (projection, merged))
+    _expect_mmproj_shape(mmproj_gguf, "mm.2.bias", (projection,))
+
+
+def _validate_granite4_vision_shapes(mmproj_gguf: Any) -> None:
+    md = mmproj_gguf.metadata
+    _require_true(md, "clip.use_gelu", "granite4_vision")
+    hidden = int(md["clip.vision.embedding_length"])
+    intermediate = int(md["clip.vision.feed_forward_length"])
+    layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
+    image = int(md["clip.vision.image_size"])
+    patch = int(md["clip.vision.patch_size"])
+    projection = int(md["clip.vision.projection_dim"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError("granite4_vision has invalid hidden/head dimensions.")
+    feature_layers = md["clip.vision.feature_layer"]
+    offsets = md["clip.vision.projector.spatial_offsets"]
+    query_side = int(md["clip.vision.projector.query_side"])
+    window_side = int(md["clip.vision.projector.window_side"])
+    if (
+        not isinstance(feature_layers, list)
+        or not feature_layers
+        or not isinstance(offsets, list)
+        or len(offsets) != len(feature_layers)
+        or any(not 0 <= index < layers for index in feature_layers)
+        or any(offset not in {-1, 0, 1, 2, 3} for offset in offsets)
+    ):
+        raise ValueError("granite4_vision feature layers/spatial offsets are invalid.")
+    image_side = image // patch
+    if (
+        image % patch
+        or image_side % window_side
+        or image_side // window_side * query_side * 2 != image_side
+    ):
+        raise ValueError("granite4_vision patch/window/query geometry is invalid.")
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
+    _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
+    _expect_mmproj_shape(
+        mmproj_gguf,
+        "v.position_embd.weight",
+        (image_side * image_side, hidden),
+    )
+    for name in ("v.post_ln.weight", "v.post_ln.bias"):
+        _expect_mmproj_shape(mmproj_gguf, name, (hidden,))
+    _expect_mmproj_shape(mmproj_gguf, "v.image_newline", (projection,))
+    _validate_split_vision_block_shapes(
+        mmproj_gguf,
+        hidden=hidden,
+        intermediate=intermediate,
+        layers=layers,
+    )
+    for index in range(len(feature_layers)):
+        prefix = f"v.proj_blk.{index}."
+        _expect_mmproj_shape(mmproj_gguf, prefix + "img_pos", (1, window_side**2, hidden))
+        _expect_mmproj_shape(mmproj_gguf, prefix + "query", (1, query_side**2, hidden))
+        for stem in (
+            "norm",
+            "post_norm",
+            "self_attn_norm",
+            "cross_attn_norm",
+            "ffn_norm",
+        ):
+            for kind in ("weight", "bias"):
+                _expect_mmproj_shape(mmproj_gguf, prefix + stem + "." + kind, (hidden,))
+        for stem in (
+            "self_attn_q",
+            "self_attn_k",
+            "self_attn_v",
+            "self_attn_out",
+            "cross_attn_q",
+            "cross_attn_k",
+            "cross_attn_v",
+            "cross_attn_out",
+        ):
+            _expect_mmproj_shape(
+                mmproj_gguf,
+                prefix + stem + ".weight",
+                (hidden, hidden),
+            )
+            _expect_mmproj_shape(mmproj_gguf, prefix + stem + ".bias", (hidden,))
+        qformer_intermediate = mmproj_gguf.get_tensor_shape(prefix + "ffn_up.weight")[0]
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_up.weight",
+            (qformer_intermediate, hidden),
+        )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_up.bias",
+            (qformer_intermediate,),
+        )
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "ffn_down.weight",
+            (hidden, qformer_intermediate),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "ffn_down.bias", (hidden,))
+        _expect_mmproj_shape(
+            mmproj_gguf,
+            prefix + "linear.weight",
+            (projection, hidden),
+        )
+        _expect_mmproj_shape(mmproj_gguf, prefix + "linear.bias", (projection,))
+
+
 def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    _validate_ocr_metadata(mmproj_gguf, spec)
     if spec.sidecar_builder == "core_vlm_projector":
         from mobius.integrations.gguf._core_vlm_projector import (
             validate_core_vlm_projector_shapes,
@@ -833,8 +1655,13 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
         from mobius.integrations.gguf._remaining_projectors import (
             validate_remaining_projector_shapes,
         )
-
         validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
+        validate_remaining_projector_shapes(mmproj_gguf, spec.projector_type)
+    if spec.projector_type == "dots3note_a":
+        _validate_ocr_metadata(mmproj_gguf, get_projector_spec("dots3note_v"))
+        _validate_dots_audio_shapes(mmproj_gguf)
+        _validate_dots_vision_shapes(mmproj_gguf, "dots3note_v")
+        _validate_dots_vision_shapes(mmproj_gguf, "dots3note_v")
         return
     if spec.primary_modality is not MMProjModality.VISION:
         raise RuntimeError(
@@ -842,6 +1669,24 @@ def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> 
             "an architecture-specific shape validator."
         )
     md = mmproj_gguf.metadata
+    if spec.projector_type in {"deepseekocr", "deepseekocr2"}:
+        _validate_deepseek_ocr_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.projector_type in {"dots_ocr", "dots3note_v"}:
+        _validate_dots_vision_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.projector_type == "paddleocr":
+        _validate_paddleocr_shapes(mmproj_gguf)
+        return
+    if spec.projector_type == "lightonocr":
+        _validate_lightonocr_shapes(mmproj_gguf)
+        return
+    if spec.projector_type == "youtuvl":
+        _validate_youtuvl_shapes(mmproj_gguf)
+        return
+    if spec.projector_type == "granite4_vision":
+        _validate_granite4_vision_shapes(mmproj_gguf)
+        return
     hidden = int(md["clip.vision.embedding_length"])
     intermediate = int(md["clip.vision.feed_forward_length"])
     layers = int(md["clip.vision.block_count"])
@@ -1291,6 +2136,15 @@ def build_mmproj_from_gguf(
             spec.reason,
         )
     return package
+
+
+def build_ocr_projector_from_gguf(*args, **kwargs) -> ModelPackage:
+    """Lazily dispatch the OCR/document standalone sidecar builder."""
+    from mobius.integrations.gguf._ocr_projector import (
+        build_ocr_projector_from_gguf as build,
+    )
+
+    return build(*args, **kwargs)
 
 
 def _token_id(text_gguf: Any, token: str) -> int | None:
@@ -3594,6 +4448,7 @@ _MMPROJ_BUILDERS: dict[str, str] = {
     "qwen_glm_projector": "build_qwen_glm_projector_from_gguf",
     "audio_projector": "build_audio_projector_from_gguf",
     "remaining_vision_projector": "build_remaining_vision_projector_from_gguf",
+    "ocr_projector": "build_ocr_projector_from_gguf",
 }
 
 

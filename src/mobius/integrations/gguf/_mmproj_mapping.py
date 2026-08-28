@@ -37,6 +37,7 @@ __all__ = [
     "map_generic_projector_to_onnx",
     "map_generic_vision_to_onnx",
     "map_mmproj_glma_audio_to_onnx",
+    "map_ocr_projector_to_onnx",
     "map_mmproj_gemma3_vision_to_hf",
     "map_mmproj_qwen_vision_to_hf",
     "map_mmproj_audio_to_hf",
@@ -277,6 +278,338 @@ def map_generic_projector_to_onnx(name: str, projector_type: str) -> str | None:
             "resampler.proj.weight": "projector.proj.weight",
         }.get(name)
     raise ValueError(f"Unknown generic GGUF projector type {projector_type!r}")
+
+
+def _map_deepseek_sam(name: str) -> str | None:
+    top = {
+        "v.sam.pos_embd.weight": "sam.pos_embed",
+        "v.sam.patch_embd.weight": "sam.patch_embed.proj.weight",
+        "v.sam.patch_embd.bias": "sam.patch_embed.proj.bias",
+        "v.sam.neck.0.weight": "sam.neck.0.weight",
+        "v.sam.neck.1.weight": "sam.neck.1.weight",
+        "v.sam.neck.1.bias": "sam.neck.1.bias",
+        "v.sam.neck.2.weight": "sam.neck.2.weight",
+        "v.sam.neck.3.weight": "sam.neck.3.weight",
+        "v.sam.neck.3.bias": "sam.neck.3.bias",
+        "v.sam.net_2.weight": "sam.net_2.weight",
+        "v.sam.net_3.weight": "sam.net_3.weight",
+    }
+    if name in top:
+        return top[name]
+    match = re.match(r"^v\.sam\.blk\.(\d+)\.(.+)$", name)
+    if match is None:
+        return None
+    index, suffix = match.groups()
+    mapped = {
+        "pre_ln.weight": "norm1.weight",
+        "pre_ln.bias": "norm1.bias",
+        "post_ln.weight": "norm2.weight",
+        "post_ln.bias": "norm2.bias",
+        "attn.qkv.weight": "attn.qkv.weight",
+        "attn.qkv.bias": "attn.qkv.bias",
+        "attn.out.weight": "attn.proj.weight",
+        "attn.out.bias": "attn.proj.bias",
+        "attn.pos_h.weight": "attn.rel_pos_h",
+        "attn.pos_w.weight": "attn.rel_pos_w",
+        "mlp.lin1.weight": "mlp.up_proj.weight",
+        "mlp.lin1.bias": "mlp.up_proj.bias",
+        "mlp.lin2.weight": "mlp.down_proj.weight",
+        "mlp.lin2.bias": "mlp.down_proj.bias",
+    }.get(suffix)
+    return None if mapped is None else f"sam.blocks.{index}.{mapped}"
+
+
+def _map_dots_vision(name: str) -> str | None:
+    top = {
+        "v.patch_embd.weight": "patch_embed.weight",
+        "v.patch_embd.bias": "patch_embed.bias",
+        "v.pre_ln.weight": "pre_layernorm.weight",
+        "mm.post_norm.weight": "post_layernorm.weight",
+        "mm.input_norm.weight": "projector.input_norm.weight",
+        "mm.input_norm.bias": "projector.input_norm.bias",
+        "mm.0.weight": "projector.linear_0.weight",
+        "mm.0.bias": "projector.linear_0.bias",
+        "mm.2.weight": "projector.linear_2.weight",
+        "mm.2.bias": "projector.linear_2.bias",
+    }
+    if name in top:
+        return top[name]
+    match = re.match(r"^v\.blk\.(\d+)\.(.+)$", name)
+    if match is None:
+        return None
+    index, suffix = match.groups()
+    mapped = {
+        "ln1.weight": "norm1.weight",
+        "ln2.weight": "norm2.weight",
+        "attn_qkv.weight": "attn.qkv.weight",
+        "attn_out.weight": "attn.proj.weight",
+        "attn_q_norm.weight": "attn.q_norm.weight",
+        "attn_k_norm.weight": "attn.k_norm.weight",
+        "ffn_gate.weight": "mlp.gate_proj.weight",
+        "ffn_up.weight": "mlp.up_proj.weight",
+        "ffn_down.weight": "mlp.down_proj.weight",
+        "ffn_gate_inp.weight": "mlp.ffn_gate_inp",
+        "ffn_gate_exps.weight": "mlp.ffn_gate_exps",
+        "ffn_up_exps.weight": "mlp.ffn_up_exps",
+        "ffn_down_exps.weight": "mlp.ffn_down_exps",
+        "exp_probs_b.weight": "mlp.exp_probs_b",
+    }.get(suffix)
+    return None if mapped is None else f"blocks.{index}.{mapped}"
+
+
+def _map_dots_audio(name: str) -> str | None:
+    top = {
+        "a.conv2d.1.weight": "conv2d.0.weight",
+        "a.conv2d.1.bias": "conv2d.0.bias",
+        "a.conv2d.2.weight": "conv2d.1.weight",
+        "a.conv2d.2.bias": "conv2d.1.bias",
+        "a.conv2d.3.weight": "conv2d.2.weight",
+        "a.conv2d.3.bias": "conv2d.2.bias",
+        "a.conv_out.weight": "conv_out.weight",
+        "a.post_ln.weight": "post_layernorm.weight",
+        "mm.a.norm_pre.weight": "projector.norm_pre.weight",
+        "mm.a.norm_pre.bias": "projector.norm_pre.bias",
+        "mm.a.mlp.1.weight": "projector.linear_1.weight",
+        "mm.a.mlp.1.bias": "projector.linear_1.bias",
+        "mm.a.mlp.3.weight": "projector.linear_3.weight",
+        "mm.a.mlp.3.bias": "projector.linear_3.bias",
+    }
+    if name in top:
+        return top[name]
+    match = re.match(r"^a\.blk\.(\d+)\.(.+)$", name)
+    if match is None:
+        return None
+    index, suffix = match.groups()
+    mapped = {
+        "ln1.weight": "norm1.weight",
+        "ln2.weight": "norm2.weight",
+        "attn_q.weight": "attn.q_proj.weight",
+        "attn_q.bias": "attn.q_proj.bias",
+        "attn_k.weight": "attn.k_proj.weight",
+        "attn_v.weight": "attn.v_proj.weight",
+        "attn_v.bias": "attn.v_proj.bias",
+        "attn_out.weight": "attn.out_proj.weight",
+        "attn_out.bias": "attn.out_proj.bias",
+        "ffn_gate.weight": "mlp.gate_proj.weight",
+        "ffn_gate.bias": "mlp.gate_proj.bias",
+        "ffn_up.weight": "mlp.up_proj.weight",
+        "ffn_up.bias": "mlp.up_proj.bias",
+        "ffn_down.weight": "mlp.down_proj.weight",
+        "ffn_down.bias": "mlp.down_proj.bias",
+    }.get(suffix)
+    return None if mapped is None else f"blocks.{index}.{mapped}"
+
+
+def _map_split_vision_block(name: str) -> str | None:
+    match = re.match(r"^v\.blk\.(\d+)\.(.+)$", name)
+    if match is None:
+        return None
+    index, suffix = match.groups()
+    mapped = {
+        "ln1.weight": "norm1.weight",
+        "ln1.bias": "norm1.bias",
+        "ln2.weight": "norm2.weight",
+        "ln2.bias": "norm2.bias",
+        "attn_q.weight": "attn.q_proj.weight",
+        "attn_q.bias": "attn.q_proj.bias",
+        "attn_k.weight": "attn.k_proj.weight",
+        "attn_k.bias": "attn.k_proj.bias",
+        "attn_v.weight": "attn.v_proj.weight",
+        "attn_v.bias": "attn.v_proj.bias",
+        "attn_out.weight": "attn.out_proj.weight",
+        "attn_out.bias": "attn.out_proj.bias",
+        "ffn_up.weight": "mlp.up_proj.weight",
+        "ffn_up.bias": "mlp.up_proj.bias",
+        "ffn_down.weight": "mlp.down_proj.weight",
+        "ffn_down.bias": "mlp.down_proj.bias",
+    }.get(suffix)
+    return None if mapped is None else f"blocks.{index}.{mapped}"
+
+
+def _map_granite_projector(name: str) -> str | None:
+    match = re.match(r"^v\.proj_blk\.(\d+)\.(.+)$", name)
+    if match is None:
+        return None
+    index, suffix = match.groups()
+    mapped = {
+        "img_pos": "image_positions",
+        "query": "query",
+        "linear.weight": "linear.weight",
+        "linear.bias": "linear.bias",
+        "norm.weight": "norm.weight",
+        "norm.bias": "norm.bias",
+        "post_norm.weight": "post_norm.weight",
+        "post_norm.bias": "post_norm.bias",
+        "self_attn_q.weight": "qformer.self_attn.q_proj.weight",
+        "self_attn_q.bias": "qformer.self_attn.q_proj.bias",
+        "self_attn_k.weight": "qformer.self_attn.k_proj.weight",
+        "self_attn_k.bias": "qformer.self_attn.k_proj.bias",
+        "self_attn_v.weight": "qformer.self_attn.v_proj.weight",
+        "self_attn_v.bias": "qformer.self_attn.v_proj.bias",
+        "self_attn_out.weight": "qformer.self_attn.out_proj.weight",
+        "self_attn_out.bias": "qformer.self_attn.out_proj.bias",
+        "self_attn_norm.weight": "qformer.self_attn_norm.weight",
+        "self_attn_norm.bias": "qformer.self_attn_norm.bias",
+        "cross_attn_q.weight": "qformer.cross_attn.q_proj.weight",
+        "cross_attn_q.bias": "qformer.cross_attn.q_proj.bias",
+        "cross_attn_k.weight": "qformer.cross_attn.k_proj.weight",
+        "cross_attn_k.bias": "qformer.cross_attn.k_proj.bias",
+        "cross_attn_v.weight": "qformer.cross_attn.v_proj.weight",
+        "cross_attn_v.bias": "qformer.cross_attn.v_proj.bias",
+        "cross_attn_out.weight": "qformer.cross_attn.out_proj.weight",
+        "cross_attn_out.bias": "qformer.cross_attn.out_proj.bias",
+        "cross_attn_norm.weight": "qformer.cross_attn_norm.weight",
+        "cross_attn_norm.bias": "qformer.cross_attn_norm.bias",
+        "ffn_up.weight": "qformer.ffn_up.weight",
+        "ffn_up.bias": "qformer.ffn_up.bias",
+        "ffn_down.weight": "qformer.ffn_down.weight",
+        "ffn_down.bias": "qformer.ffn_down.bias",
+        "ffn_norm.weight": "qformer.ffn_norm.weight",
+        "ffn_norm.bias": "qformer.ffn_norm.bias",
+    }.get(suffix)
+    return None if mapped is None else f"projectors.{index}.{mapped}"
+
+
+def map_ocr_projector_to_onnx(name: str, projector_type: str) -> str | None:
+    """Map one OCR/document sidecar tensor onto its standalone component."""
+    if projector_type in {"deepseekocr", "deepseekocr2"}:
+        sam = _map_deepseek_sam(name)
+        if sam is not None:
+            return sam
+        common = {
+            "v.view_seperator": "view_separator",
+            "mm.model.fc.weight": "projector.weight",
+            "mm.model.fc.bias": "projector.bias",
+        }
+        if projector_type == "deepseekocr":
+            common.update(
+                {
+                    "mm.model.fc.weight": "projector.linear.weight",
+                    "mm.model.fc.bias": "projector.linear.bias",
+                    "v.class_embd": "clip.class_embedding",
+                    "v.position_embd.weight": "clip.position_embedding",
+                    "v.pre_ln.weight": "clip.pre_layernorm.weight",
+                    "v.pre_ln.bias": "clip.pre_layernorm.bias",
+                    "v.image_newline": "image_newline",
+                }
+            )
+            match = re.match(r"^v\.blk\.(\d+)\.(.+)$", name)
+            if match is not None:
+                index, suffix = match.groups()
+                mapped = {
+                    "ln1.weight": "norm1.weight",
+                    "ln1.bias": "norm1.bias",
+                    "ln2.weight": "norm2.weight",
+                    "ln2.bias": "norm2.bias",
+                    "attn_qkv.weight": "attn.qkv.weight",
+                    "attn_qkv.bias": "attn.qkv.bias",
+                    "attn_out.weight": "attn.out_proj.weight",
+                    "attn_out.bias": "attn.out_proj.bias",
+                    "ffn_up.weight": "mlp.up_proj.weight",
+                    "ffn_up.bias": "mlp.up_proj.bias",
+                    "ffn_down.weight": "mlp.down_proj.weight",
+                    "ffn_down.bias": "mlp.down_proj.bias",
+                }.get(suffix)
+                if mapped is not None:
+                    return f"clip.blocks.{index}.{mapped}"
+        else:
+            common.update(
+                {
+                    "v.post_ln.weight": "query_encoder.norm.weight",
+                    "v.resample_query_768.weight": "query_encoder.query_768",
+                    "v.resample_query_1024.weight": "query_encoder.query_1024",
+                }
+            )
+            match = re.match(r"^v\.blk\.(\d+)\.(.+)$", name)
+            if match is not None:
+                index, suffix = match.groups()
+                mapped = {
+                    "ln1.weight": "norm1.weight",
+                    "ln2.weight": "norm2.weight",
+                    "attn_q.weight": "attn.q_proj.weight",
+                    "attn_q.bias": "attn.q_proj.bias",
+                    "attn_k.weight": "attn.k_proj.weight",
+                    "attn_k.bias": "attn.k_proj.bias",
+                    "attn_v.weight": "attn.v_proj.weight",
+                    "attn_v.bias": "attn.v_proj.bias",
+                    "attn_out.weight": "attn.out_proj.weight",
+                    "ffn_gate.weight": "mlp.gate_proj.weight",
+                    "ffn_up.weight": "mlp.up_proj.weight",
+                    "ffn_down.weight": "mlp.down_proj.weight",
+                }.get(suffix)
+                if mapped is not None:
+                    return f"query_encoder.blocks.{index}.{mapped}"
+        return common.get(name)
+    if projector_type in {"dots_ocr", "dots3note_v"}:
+        return _map_dots_vision(name)
+    if projector_type == "dots3note_a":
+        return _map_dots_audio(name)
+    if projector_type == "paddleocr":
+        top = {
+            "v.patch_embd.weight": "patch_embed.weight",
+            "v.patch_embd.bias": "patch_embed.bias",
+            "v.position_embd.weight": "position_embedding",
+            "v.post_ln.weight": "post_layernorm.weight",
+            "v.post_ln.bias": "post_layernorm.bias",
+            "mm.input_norm.weight": "projector.input_norm.weight",
+            "mm.input_norm.bias": "projector.input_norm.bias",
+            "mm.1.weight": "projector.linear_1.weight",
+            "mm.1.bias": "projector.linear_1.bias",
+            "mm.2.weight": "projector.linear_2.weight",
+            "mm.2.bias": "projector.linear_2.bias",
+        }
+        return top.get(name) or _map_split_vision_block(name)
+    if projector_type == "youtuvl":
+        top = {
+            "v.patch_embd.weight": "patch_embed.weight",
+            "v.patch_embd.bias": "patch_embed.bias",
+            "v.post_ln.weight": "post_layernorm.weight",
+            "v.post_ln.bias": "post_layernorm.bias",
+            "mm.input_norm.weight": "projector.input_norm.weight",
+            "mm.0.weight": "projector.linear_0.weight",
+            "mm.0.bias": "projector.linear_0.bias",
+            "mm.2.weight": "projector.linear_2.weight",
+            "mm.2.bias": "projector.linear_2.bias",
+        }
+        return top.get(name) or _map_split_vision_block(name)
+    if projector_type == "lightonocr":
+        match = re.match(r"^v\.blk\.(\d+)\.(.+)$", name)
+        if match is not None:
+            index, suffix = match.groups()
+            mapped = {
+                "ln1.weight": "attention_norm.weight",
+                "ln2.weight": "ffn_norm.weight",
+                "attn_q.weight": "attention.q_proj.weight",
+                "attn_k.weight": "attention.k_proj.weight",
+                "attn_v.weight": "attention.v_proj.weight",
+                "attn_out.weight": "attention.o_proj.weight",
+                "ffn_gate.weight": "feed_forward.gate_proj.weight",
+                "ffn_up.weight": "feed_forward.up_proj.weight",
+                "ffn_down.weight": "feed_forward.down_proj.weight",
+            }.get(suffix)
+            if mapped is not None:
+                return f"vision_tower.transformer.layers.{index}.{mapped}"
+        return {
+            "v.patch_embd.weight": "vision_tower.patch_conv.weight",
+            "v.pre_ln.weight": "vision_tower.ln_pre.weight",
+            "mm.input_norm.weight": "projector.input_norm.weight",
+            "mm.patch_merger.weight": "projector.patch_merger.merging_layer.weight",
+            "mm.1.weight": "projector.linear_1.weight",
+            "mm.1.bias": "projector.linear_1.bias",
+            "mm.2.weight": "projector.linear_2.weight",
+            "mm.2.bias": "projector.linear_2.bias",
+        }.get(name)
+    if projector_type == "granite4_vision":
+        projector = _map_granite_projector(name)
+        if projector is not None:
+            return projector
+        return {
+            "v.patch_embd.weight": "patch_embedding.weight",
+            "v.patch_embd.bias": "patch_embedding.bias",
+            "v.position_embd.weight": "position_embedding",
+            "v.image_newline": "image_newline",
+        }.get(name) or _map_split_vision_block(name)
+    raise ValueError(f"Unknown OCR GGUF projector type {projector_type!r}")
 
 
 def map_mmproj_vision_to_hf(name: str) -> str | None:
