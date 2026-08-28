@@ -24,10 +24,6 @@ class _AudioProjectorModule(Protocol):
     audio_encoder: nn.Module
 
 
-class _SpeakerProjectorModule(Protocol):
-    speaker_encoder: nn.Module
-
-
 class GGUFAudioProjectorModel(nn.Module):
     """Container exposing one exact sidecar audio encoder/projector."""
 
@@ -119,45 +115,6 @@ class GGUFVisionProjectorTask(ModelTask):
         builder.add_output(image_features, "image_features")
         declare_component_presence(graph, "image")
         return ModelPackage({"vision_encoder": _make_model(graph)}, config=config)
-
-
-class GGUFAudioProjectorModel(nn.Module):
-    """Container exposing one exact sidecar audio encoder/projector."""
-
-    def __init__(self, audio_encoder: nn.Module) -> None:
-        super().__init__()
-        self.audio_encoder = audio_encoder
-
-    def forward(self, op, **kwargs):
-        del op, kwargs
-        raise NotImplementedError("GGUFAudioProjectorTask builds the audio component")
-
-
-class GGUFAudioProjectorTask(ModelTask):
-    """Build one processor-native rank-3 audio feature graph."""
-
-    model_roles: ClassVar[dict[str, str]] = {"audio_encoder": "encoder"}
-    components = ComponentSpec(audio_encoder="audio_encoder")
-
-    def build(
-        self,
-        module: nn.Module,
-        config: ArchitectureConfig,
-    ) -> ModelPackage:
-        self._validate_components(module)
-        audio_encoder = cast(_AudioProjectorModule, module).audio_encoder
-        input_schema = getattr(audio_encoder, "input_schema", None)
-        if not isinstance(input_schema, tuple) or not input_schema:
-            raise TypeError("GGUF audio encoder must declare a non-empty input_schema")
-
-        graph, builder = _make_graph(name="audio_encoder")
-        inputs = {
-            name: builder.input(name, dtype=dtype, shape=list(shape))
-            for name, dtype, shape in input_schema
-        }
-        audio_features = audio_encoder(builder.op, **inputs)
-        builder.add_output(audio_features, "audio_features")
-        return ModelPackage({"audio_encoder": _make_model(graph)}, config=config)
 
 
 class GGUFVisionAudioProjectorModel(nn.Module):

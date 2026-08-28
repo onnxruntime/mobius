@@ -44,8 +44,6 @@ __all__ = [
     "GGUFAudioProjectorTask",
     "GGUFEmbeddingFeatureExtractionTask",
     "GGUFProjectorVisionLanguageTask",
-    "GGUFAudioProjectorModel",
-    "GGUFAudioProjectorTask",
     "GGUFSpeakerProjectorModel",
     "GGUFSpeakerProjectorTask",
     "GGUFVisionProjectorModel",
