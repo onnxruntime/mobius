@@ -805,6 +805,59 @@ def _diffusion_component_kwargs(pkg: Any) -> dict[str, Any]:
     return derived
 
 
+def _write_advisory_component_contract(
+    pkg: Any,
+    output_dir: str,
+    *,
+    warning: str,
+) -> dict[str, str]:
+    """Write exact component metadata for a package unsupported by the tested runtime."""
+    try:
+        package_items = list(pkg.items())
+    except (AttributeError, TypeError) as error:
+        raise ValueError("Package must expose named model components.") from error
+    if not package_items:
+        raise ValueError("Package must contain at least one model component.")
+
+    components: dict[str, dict[str, Any]] = {}
+    for name, model in package_items:
+        if not isinstance(name, str) or not name:
+            raise ValueError("Package component names must be non-empty strings.")
+        graph = getattr(model, "graph", None)
+        if graph is None:
+            raise ValueError(f"Package component {name!r} has no graph contract.")
+        inputs = [value.name for value in graph.inputs]
+        outputs = [value.name for value in graph.outputs]
+        if any(not isinstance(value, str) or not value for value in (*inputs, *outputs)):
+            raise ValueError(f"Package component {name!r} has unnamed graph ports.")
+        if not outputs:
+            raise ValueError(f"Package component {name!r} has no graph outputs.")
+        components[name] = {
+            "filename": ("model.onnx" if len(package_items) == 1 else f"{name}/model.onnx"),
+            "inputs": inputs,
+            "outputs": outputs,
+            "metadata": dict(getattr(model, "metadata_props", {})),
+        }
+
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = {
+        "runtime_validation_status": "unsupported-by-tested-runtime",
+        "warnings": [warning],
+        "components": components,
+    }
+    inference_path = os.path.join(output_dir, "inference_metadata.yaml")
+    compatibility_path = os.path.join(output_dir, "runtime_compatibility.json")
+    for path in (inference_path, compatibility_path):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+            handle.write("\n")
+    _LOGGER.warning("%s", warning)
+    return {
+        "inference_metadata": inference_path,
+        "runtime_compatibility": compatibility_path,
+    }
+
+
 def write_onnx_genai_config(
     pkg: Any,
     output_dir: str,
@@ -861,40 +914,12 @@ def write_onnx_genai_config(
     )
     qwen4_signature = {"ple_input_ids", "past_position_ids"} <= decoder_inputs
     if config_types & {"qwen4_exp", "qwen4_exp_text"} or qwen4_signature:
-        os.makedirs(output_dir, exist_ok=True)
         warning = (
             "The tested onnx-genai runtime cannot orchestrate Qwen4-Exp's ple_input_ids "
             "and four-axis position state; component graphs and their exact contracts "
             "are exported without claiming runtime validation."
         )
-        components = {
-            name: {
-                "inputs": [
-                    value.name for value in model.graph.inputs if value.name is not None
-                ],
-                "outputs": [
-                    value.name for value in model.graph.outputs if value.name is not None
-                ],
-                "metadata": dict(model.metadata_props),
-            }
-            for name, model in pkg.items()
-        }
-        metadata = {
-            "runtime_validation_status": "unsupported-by-tested-runtime",
-            "warnings": [warning],
-            "components": components,
-        }
-        inference_path = os.path.join(output_dir, "inference_metadata.yaml")
-        compatibility_path = os.path.join(output_dir, "runtime_compatibility.json")
-        for path in (inference_path, compatibility_path):
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(metadata, handle, indent=2)
-                handle.write("\n")
-        _LOGGER.warning("%s", warning)
-        return {
-            "inference_metadata": inference_path,
-            "runtime_compatibility": compatibility_path,
-        }
+        return _write_advisory_component_contract(pkg, output_dir, warning=warning)
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
         resolved_config = config if config is not None else getattr(pkg, "config", None)
@@ -1142,8 +1167,27 @@ def write_onnx_genai_config(
         )
         return {"inference_metadata": path}
 
+    try:
+        component_names = sorted(pkg.keys())
+    except (AttributeError, TypeError):
+        component_names = []
     resolved_config = config if config is not None else getattr(pkg, "config", None)
     if resolved_config is None:
+        known_config_topology = (
+            _looks_like_multimodal(pkg)
+            or _looks_like_speech_to_text(pkg)
+            or _looks_like_multi_decoder_tts(pkg)
+        )
+        if len(component_names) > 1 and not known_config_topology:
+            return _write_advisory_component_contract(
+                pkg,
+                output_dir,
+                warning=(
+                    "The tested onnx-genai runtime does not recognize this multi-component "
+                    f"package topology (components: {component_names}); exact component "
+                    "contracts are exported without runtime orchestration."
+                ),
+            )
         raise ValueError(
             "onnx-genai decoder metadata requires a model config (pass config=... "
             "or a package carrying `.config`)"
@@ -1227,20 +1271,18 @@ def write_onnx_genai_config(
         path = write_tts_workflow_metadata(pkg, output_dir, resolved_config)
         return {"inference_metadata": path}
 
-    # Fallback: a single-component decoder language model. A multi-component
-    # package that matched none of the composite shapes above would be silently
-    # mis-emitted as a bare decoder — fail loudly instead so an unsupported shape
-    # is obvious rather than producing wrong metadata.
-    try:
-        component_names = sorted(pkg.keys())
-    except (AttributeError, TypeError):
-        component_names = []
+    # Fallback: a single-component decoder language model. Preserve unknown
+    # multi-component packages as exact component contracts without claiming that
+    # the tested runtime can orchestrate them.
     if len(component_names) > 1:
-        raise ValueError(
-            "onnx-genai config emission does not recognize this multi-component "
-            f"package shape (components: {component_names}). Supported composite "
-            "shapes: diffusion, audio codec, multimodal VLM, speech-to-text. "
-            "Multi-decoder pipelines such as TTS require a dedicated emitter."
+        return _write_advisory_component_contract(
+            pkg,
+            output_dir,
+            warning=(
+                "The tested onnx-genai runtime does not recognize this multi-component "
+                f"package topology (components: {component_names}); exact component contracts "
+                "are exported without runtime orchestration."
+            ),
         )
 
     if kv_native_dtype is not None:

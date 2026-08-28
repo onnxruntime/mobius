@@ -18,6 +18,11 @@ from mobius.integrations.gguf._spec import Support
 
 _TOKENIZER_REPOSITORY = "owner/tokenizer"
 _TOKENIZER_REVISION = "c" * 40
+_BUILT_IDENTITY = SimpleNamespace(
+    architecture="llama",
+    filename="model.gguf",
+    sha256="a" * 64,
+)
 
 
 class _FakePackage:
@@ -26,9 +31,7 @@ class _FakePackage:
         self.gguf_architecture = "llama"
         self.gguf_execution_provider = "cpu"
         self.gguf_import_route = '{"route_schema":1}'
-        self.gguf_artifact_identity = SimpleNamespace(
-            architecture="llama", filename="model.gguf", sha256="a" * 64
-        )
+        self.gguf_artifact_identity = _BUILT_IDENTITY
         self.gguf_tokenizer_verdict = _materialized()
         self.saved_to: str | None = None
 
@@ -148,6 +151,10 @@ def _runtime_supported():
         mock.patch(
             "mobius.integrations.gguf._runtime_package.gguf_graph_package_identity",
             return_value=SimpleNamespace(files=("model.onnx",), sha256="b" * 64),
+        ),
+        mock.patch(
+            "mobius.integrations.gguf._runtime_package.gguf_artifact_identity",
+            return_value=_BUILT_IDENTITY,
         ),
     ):
         yield
@@ -355,6 +362,38 @@ class TestWriteGgufRuntimePackage:
         assert pkg.saved_to is None
         assert not out.exists()
 
+    def test_replaced_same_architecture_source_identity_always_rejects(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        current_identity = SimpleNamespace(
+            architecture="llama",
+            filename="model.gguf",
+            sha256="d" * 64,
+        )
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.open_gguf_model",
+                return_value=SimpleNamespace(
+                    metadata={},
+                    architecture="llama",
+                    source_matches_path=lambda: True,
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.gguf_artifact_identity",
+                return_value=current_identity,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.matching_runtime_evidence"
+            ) as evidence_lookup,
+            pytest.raises(ValueError, match="exact artifact identity"),
+        ):
+            write_gguf_runtime_package(pkg, tmp_path / "replacement.gguf", out)
+
+        evidence_lookup.assert_not_called()
+        assert pkg.saved_to is None
+        assert not out.exists()
+
     def test_existing_output_is_never_replaced(self, tmp_path):
         pkg = _FakePackage()
         out = tmp_path / "out"
@@ -384,6 +423,19 @@ class TestWriteGgufRuntimePackage:
                 runtime="ort-genai",
             )
         assert not (tmp_path / "out").exists()
+
+    def test_unknown_execution_provider_is_preserved_as_advisory(self, tmp_path):
+        pkg = _FakePackage()
+        pkg.gguf_execution_provider = "future-accelerator"
+        out = tmp_path / "out"
+
+        with _successful_runtime_dependencies("ort-genai"):
+            _write_runtime(pkg, tmp_path / "m.gguf", out, runtime="ort-genai")
+
+        compatibility = json.loads((out / "runtime_compatibility.json").read_text())
+        assert compatibility["execution_provider"] == "future-accelerator"
+        assert compatibility["runtime_validation_status"] == "unvalidated"
+        assert any("future-accelerator" in warning for warning in compatibility["warnings"])
 
     def test_target_coupled_draft_runtime_package_is_exported(self, tmp_path):
         pkg = _FakePackage()

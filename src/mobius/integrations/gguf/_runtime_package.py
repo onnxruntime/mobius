@@ -28,6 +28,7 @@ from typing import Any, Literal
 
 from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._runtime_evidence import (
+    gguf_artifact_identity,
     gguf_graph_package_identity,
     matching_runtime_evidence,
 )
@@ -197,6 +198,22 @@ def write_gguf_runtime_package(
             f"captured during graph construction: built={architecture!r}, "
             f"current={source_architecture!r}."
         )
+    current_identity = gguf_artifact_identity(
+        source_path,
+        source_model,
+        architecture=architecture,
+        filename=built_identity.filename,
+    )
+    if current_identity != built_identity:
+        raise ValueError(
+            "The GGUF source no longer matches the exact artifact identity captured during "
+            f"graph construction: built={built_identity!r}, current={current_identity!r}."
+        )
+    if not source_model.source_matches_path():
+        raise ValueError(
+            "The GGUF source changed while its artifact identity was being validated; "
+            "refusing runtime publication."
+        )
     evidence = None
     if (
         tokenizer_repository is not None
@@ -302,16 +319,21 @@ def write_gguf_runtime_package(
             from mobius.integrations.ort_genai import write_ort_genai_config
 
             execution_provider = getattr(pkg, "gguf_execution_provider", None)
-            if execution_provider not in {"default", "cpu", "cuda", "dml"}:
+            if not isinstance(execution_provider, str) or not execution_provider:
                 raise ValueError(
-                    "ORT GenAI runtime packaging requires an explicit evidenced execution "
-                    "provider: default, cpu, cuda, or dml."
+                    "ORT GenAI runtime packaging requires the graph's non-empty execution "
+                    "provider identity."
                 )
             # The portable/default graph intentionally keeps standard ONNX operators.
             # ORT GenAI still needs a concrete provider for session construction.
             runtime_execution_provider = (
                 "cpu" if execution_provider == "default" else execution_provider
             )
+            if execution_provider not in {"default", "cpu", "cuda", "dml"}:
+                validation_warnings.append(
+                    f"ORT GenAI runtime execution with provider {execution_provider!r} has not "
+                    "been validated; the provider identity is preserved in genai_config.json."
+                )
             artifacts.update(
                 write_ort_genai_config(
                     pkg,
@@ -374,6 +396,7 @@ def write_gguf_runtime_package(
             {
                 "runtime_validation_status": validation_status,
                 "gguf_architecture": architecture,
+                "execution_provider": getattr(pkg, "gguf_execution_provider", None),
                 "gguf_graph_identity": {
                     "files": list(graph_identity.files),
                     "sha256": str(graph_identity.sha256),

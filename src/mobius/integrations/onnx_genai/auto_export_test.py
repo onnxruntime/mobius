@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import onnx_ir as ir
@@ -1636,16 +1637,59 @@ def test_dispatch_multi_decoder_tts_with_pre_embedder(tmp_path):
     assert (tmp_path / "policies" / "code_frame_update.onnx").is_file()
 
 
-def test_unrecognized_multi_component_package_fails_loudly(tmp_path):
-    # A multi-component package matching no known shape must not be silently
-    # emitted as a bare decoder.
+def test_unrecognized_valid_multi_component_package_exports_contracts(tmp_path):
     pkg = _EncoderDecoderPkg(
         {
-            "widget": _FakeModel(["x"]),
-            "gadget": _FakeModel(["y"]),
+            "widget": _FakeModel(["x"], ["widget_output"]),
+            "gadget": _FakeModel(["y"], ["gadget_output"]),
         }
     )
-    with pytest.raises(ValueError, match="multi-component"):
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+
+    compatibility = json.loads(
+        Path(artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
+    )
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert compatibility["components"] == {
+        "widget": {
+            "filename": "widget/model.onnx",
+            "inputs": ["x"],
+            "outputs": ["widget_output"],
+            "metadata": {},
+        },
+        "gadget": {
+            "filename": "gadget/model.onnx",
+            "inputs": ["y"],
+            "outputs": ["gadget_output"],
+            "metadata": {},
+        },
+    }
+
+
+def test_unrecognized_configless_multi_component_package_exports_contracts(tmp_path):
+    pkg = {
+        "widget": _FakeModel(["x"], ["widget_output"]),
+        "gadget": _FakeModel(["y"], ["gadget_output"]),
+    }
+
+    artifacts = write_onnx_genai_config(pkg, str(tmp_path))
+    compatibility = json.loads(
+        Path(artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
+    )
+
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert set(compatibility["components"]) == {"widget", "gadget"}
+
+
+def test_unrecognized_malformed_component_contract_still_fails(tmp_path):
+    pkg = _EncoderDecoderPkg(
+        {
+            "widget": _FakeModel(["x"], ["widget_output"]),
+            "gadget": object(),
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"gadget.*no graph contract"):
         write_onnx_genai_config(pkg, str(tmp_path))
 
 
