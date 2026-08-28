@@ -41,7 +41,11 @@ def _conv(x, state, stem, stride, padding):
     return functional.conv2d(
         x,
         torch.from_numpy(state[f"{stem}.weight"]),
-        torch.from_numpy(state[f"{stem}.bias"]),
+        (
+            torch.from_numpy(state[f"{stem}.bias"])
+            if f"{stem}.bias" in state
+            else None
+        ),
         stride=stride,
         padding=padding,
     )
@@ -228,7 +232,7 @@ def test_step3vl_resized_positions_and_biased_conv_downsamplers():
         .permute(0, 2, 3, 1)
         .reshape(1, 35, 8)
     )
-    x = x + learned
+    x = _layer_norm(x + learned, state, "pre_layer_norm")
     residual = x
     x = _layer_norm(x, state, "layers.0.norm1")
     x = residual + _attention(

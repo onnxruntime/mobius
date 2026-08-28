@@ -27,6 +27,7 @@ __all__ = [
     "DeferredCompanionSpec",
     "MMProjArtifactAvailabilityPin",
     "MMProjArtifactPin",
+    "MMPROJ_SOURCE_EVIDENCE",
     "MMProjSourceEvidence",
     "MMProjModelRole",
     "MMProjModality",
@@ -34,6 +35,8 @@ __all__ = [
     "ProjectorSpec",
     "get_projector_spec",
     "iter_projector_specs",
+    "iter_projector_source_evidence",
+    "projector_source_evidence",
     "projector_type_for_modality",
     "supported_projector_types",
 ]
@@ -44,6 +47,10 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
+from mobius.integrations.gguf._remaining_projector_evidence import (
+    REMAINING_MMPROJ_ARTIFACT_RECORDS,
+    REMAINING_MMPROJ_SOURCE_RECORDS,
+)
 from mobius.integrations.gguf._spec import Support
 
 LLAMA_CPP_MMPROJ_SHA = "86632248188c106d749fad34a1dcd237c95863d4"
@@ -232,6 +239,8 @@ class MMProjArtifactPin:
     tensor_qtypes: tuple[tuple[str, int], ...]
     tensor_count: int
     parity_test: str
+    bounded_header_bytes: int | None = None
+    bounded_header_sha256: str | None = None
     paired_text_repository: str | None = None
     paired_text_revision: str | None = None
     paired_text_size: int | None = None
@@ -263,6 +272,16 @@ class MMProjArtifactPin:
             raise ValueError(
                 f"{self.artifact_id}: processor source requires an immutable revision"
             )
+        if (self.bounded_header_bytes is None) != (self.bounded_header_sha256 is None):
+            raise ValueError(
+                f"{self.artifact_id}: bounded header size and SHA-256 must be specified together"
+            )
+        if self.bounded_header_bytes is not None and (
+            self.bounded_header_bytes <= 0
+            or self.bounded_header_bytes > self.size
+            or len(self.bounded_header_sha256 or "") != 64
+        ):
+            raise ValueError(f"{self.artifact_id}: bounded header identity is invalid")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -2124,6 +2143,7 @@ MMPROJ_SOURCE_EVIDENCE: tuple[MMProjSourceEvidence, ...] = (
             "and makes no generated-audio runtime claim."
         ),
     ),
+    *(MMProjSourceEvidence(**record) for record in REMAINING_MMPROJ_SOURCE_RECORDS),
 )
 
 MMPROJ_ARTIFACT_AVAILABILITY_PINS: tuple[MMProjArtifactAvailabilityPin, ...] = (
@@ -2886,12 +2906,27 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
             ("empty_media", "omit pixel and grid keys; do not invoke vision graph"),
         ),
     ),
+    *(MMProjArtifactPin(**record) for record in REMAINING_MMPROJ_ARTIFACT_RECORDS),
+)
+
+_SOURCE_EVIDENCE_INDEX: Mapping[str, MMProjSourceEvidence] = MappingProxyType(
+    {evidence.evidence_id: evidence for evidence in MMPROJ_SOURCE_EVIDENCE}
 )
 
 
 def iter_projector_specs() -> tuple[ProjectorSpec, ...]:
     """Return the exact 60-string pinned projector census."""
     return _SPECS
+
+
+def iter_projector_source_evidence() -> tuple[MMProjSourceEvidence, ...]:
+    """Return immutable source proofs for route-specific sidecar semantics."""
+    return MMPROJ_SOURCE_EVIDENCE
+
+
+def projector_source_evidence(evidence_id: str) -> MMProjSourceEvidence | None:
+    """Return one immutable source proof by ID."""
+    return _SOURCE_EVIDENCE_INDEX.get(evidence_id)
 
 
 def get_projector_spec(projector_type: str) -> ProjectorSpec:

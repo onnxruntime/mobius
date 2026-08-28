@@ -16,14 +16,17 @@ from onnxscript import OpBuilder, nn
 
 from mobius.components._activations import gelu_tanh, quick_gelu
 from mobius.components._common import LayerNorm, Linear
-from mobius.components._conv import Conv2d
+from mobius.components._conv import Conv2d, Conv2dNoBias
 from mobius.components._rms_norm import RMSNorm
 
 
 class _PatchEmbedding(nn.Module):
-    def __init__(self, channels: int, hidden_size: int, patch_size: int):
+    def __init__(
+        self, channels: int, hidden_size: int, patch_size: int, *, bias: bool = True
+    ):
         super().__init__()
-        self.proj = Conv2d(channels, hidden_size, patch_size, patch_size)
+        conv_type = Conv2d if bias else Conv2dNoBias
+        self.proj = conv_type(channels, hidden_size, patch_size, patch_size)
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         # BCHW -> BC(hw) -> B(hw)C, matching clip_graph::build_inp.
@@ -255,8 +258,14 @@ class _Step3VLAttention(_VisionAttention):
             op.Cast(op.Reshape(positions, [-1, 1]), to=ir.DataType.FLOAT),
             op.Reshape(freq, [1, -1]),
         )
-        cos = op.Reshape(op.Cos(angles), [1, 1, -1, pair_count])
-        sin = op.Reshape(op.Sin(angles), [1, 1, -1, pair_count])
+        cos = op.CastLike(
+            op.Reshape(op.Cos(angles), [1, 1, -1, pair_count]),
+            even,
+        )
+        sin = op.CastLike(
+            op.Reshape(op.Sin(angles), [1, 1, -1, pair_count]),
+            even,
+        )
         rot_even = op.Sub(op.Mul(even, cos), op.Mul(odd, sin))
         rot_odd = op.Add(op.Mul(even, sin), op.Mul(odd, cos))
         return op.Reshape(
@@ -341,10 +350,16 @@ class Step3VLClipSidecar(nn.Module):
         rope_theta: float = 10000.0,
     ):
         super().__init__()
-        self.patch_embedding = _PatchEmbedding(3, vision_hidden_size, patch_size)
+        self.patch_embedding = _PatchEmbedding(
+            3,
+            vision_hidden_size,
+            patch_size,
+            bias=False,
+        )
         self.position_embedding = nn.Parameter(
             [position_grid_size * position_grid_size, vision_hidden_size]
         )
+        self.pre_layer_norm = LayerNorm(vision_hidden_size, eps)
         self.layers = nn.ModuleList(
             [
                 _Step3VLBlock(
@@ -398,8 +413,9 @@ class Step3VLClipSidecar(nn.Module):
         pos_h: ir.Value,
         pos_w: ir.Value,
     ) -> ir.Value:
-        hidden_states = op.Add(
-            self.patch_embedding(op, pixel_values), self._resize_positions(op)
+        hidden_states = self.pre_layer_norm(
+            op,
+            op.Add(self.patch_embedding(op, pixel_values), self._resize_positions(op)),
         )
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, pos_h, pos_w)
