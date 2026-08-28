@@ -1355,7 +1355,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "full-vector Q/K RMSNorm, partial NeoX RoPE, standard dynamic/static KV cache, "
             "and F32 selection-biased sigmoid MoE routing. Loader-accepted Q/K/V biases "
             "and fused QKV are rejected because the pinned graph ignores or cannot execute "
-            "them. Packed projection/expert import and runtime packaging remain deferred; "
+            "them. Packed projection/expert import and real-artifact runtime validation remain "
+            "deferred; "
             "the smallest immutable public GGUF is 46,514,882,176 bytes, above the "
             "16 GiB evidence budget. Use keep_quantized=False."
         ),
@@ -1412,7 +1413,8 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "Mamba1/attention layers and mixed state ABI. ORT GenAI 0.15.2 discovers "
             "sparse KV and conv/recurrent slots, but its recurrent-state naming, beam "
             "reorder, and nonzero-rewind contracts do not yet match this export. Runtime "
-            "packaging remains deferred to onnxruntime/mobius#605."
+            "validation remains deferred to onnxruntime/mobius#605; export remains available "
+            "with the exact graph state contract."
         ),
     ),
     GGUFArchitectureSpec(
@@ -1442,9 +1444,10 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=(
             "The dedicated graph and GGUF importer preserve parallel Attention+Mamba2 "
-            "layers and their four-state ABI, but runtime packaging remains deferred "
-            "pending heterogeneous-state schema support (onnxruntime/mobius#605) and "
-            "real full-logit plus deterministic stateful-generation evidence."
+            "layers and their four-state ABI. Export records that exact state contract; "
+            "runtime validation remains pending heterogeneous-state executor support "
+            "(onnxruntime/mobius#605) and real full-logit plus deterministic "
+            "stateful-generation evidence."
         ),
     ),
     # --------------------------------------------------------- Encoder-only

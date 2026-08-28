@@ -85,7 +85,7 @@ def _summary() -> str:
     quantized_import_counts = Counter(spec.quantized_import.value for spec in architectures)
     projector_counts = {
         "graph-importable": sum(spec.is_importable for spec in projectors),
-        "runtime-supported": sum(spec.runtime is Support.SUPPORTED for spec in projectors),
+        "runtime-evidenced": sum(spec.runtime is Support.SUPPORTED for spec in projectors),
     }
     return "\n".join(
         (
@@ -117,9 +117,10 @@ def _summary() -> str:
             (
                 "`SUPPORTED` means the named capability is implemented and mechanically tested. "
                 "`DEFERRED` means it is intentionally unavailable pending the stated work. "
-                "`REJECTED` means the input or route is invalid by policy. Graph support proves "
-                "construction/execution only; runtime support additionally requires a pinned real "
-                "artifact, independent parity, and deterministic generation or stateful semantics. "
+                "`REJECTED` means the input or route is invalid by policy. Graph support controls "
+                "export. The separate runtime verdict records pinned real-artifact validation, "
+                "independent parity, and deterministic generation or stateful semantics; it never "
+                "gates export of a faithfully represented graph and package contract. "
                 "Tokenizer `copy` requires embedded ordered-vocabulary identity; `pinned-source` "
                 "also binds the complete GGUF artifact, immutable Hub assets, reconstruction "
                 "policy, semantic hashes, and representative token-ID vectors."
@@ -149,7 +150,7 @@ def _reason_code(verdicts: dict[str, Support]) -> str:
     if graph is not Support.SUPPORTED:
         return "GRAPH_DEFERRED — Executable graph construction is not implemented."
     if runtime is Support.REJECTED:
-        return "RUNTIME_REJECTED — Runtime package publication is deliberately refused."
+        return "RUNTIME_EVIDENCE_REJECTED — The recorded runtime route is invalid."
     if runtime is not Support.SUPPORTED and quantized is Support.REJECTED:
         return (
             "RUNTIME_EVIDENCE_PENDING / FLOAT_IMPORT_ONLY — Runtime evidence is incomplete, "
@@ -162,7 +163,7 @@ def _reason_code(verdicts: dict[str, Support]) -> str:
         )
     if quantized is Support.REJECTED:
         return "FLOAT_IMPORT_ONLY — Runtime is evidenced only through explicit float import."
-    return "EVIDENCED_SCOPE — Runtime publication is limited to registry-linked immutable evidence."
+    return "EVIDENCED_SCOPE — Registry-linked immutable runtime evidence is available."
 
 
 def _architecture_reason(spec: GGUFArchitectureSpec) -> str:

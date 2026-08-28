@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
@@ -168,11 +170,12 @@ def test_parakeet_synthetic_parity_with_padding():
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_parakeet_rejects_unsupported_ort_genai_export(tmp_path):
+def test_parakeet_exports_with_unsupported_runtime_status(tmp_path):
     _, _, _, package = _build_tiny()
 
-    with pytest.raises(
-        ValueError,
-        match="does not define a feature-input CTC ASR pipeline",
-    ):
-        write_ort_genai_config(package, str(tmp_path))
+    result = write_ort_genai_config(package, str(tmp_path))
+    compatibility = json.loads(
+        Path(result["runtime_compatibility"]).read_text(encoding="utf-8")
+    )
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert "feature-input CTC ASR pipeline" in compatibility["warnings"][0]

@@ -869,7 +869,7 @@ class TestCLIBuildRuntime:
         assert call_kwargs.kwargs.get("hf_model_id") == "Qwen/Qwen2.5-0.5B"
         assert call_kwargs.kwargs.get("trust_remote_code") is False
 
-    def test_qwen4_ort_genai_rejects_before_saving_package(self, tmp_path):
+    def test_qwen4_ort_genai_runtime_gap_does_not_block_package_save(self, tmp_path):
         pkg = mock.MagicMock()
         pkg.config = SimpleNamespace(model_type="qwen4_exp_text")
         args = SimpleNamespace(
@@ -882,10 +882,13 @@ class TestCLIBuildRuntime:
             release=False,
         )
 
-        with pytest.raises(SystemExit, match="Qwen4-Exp"):
+        with mock.patch(
+            "mobius.integrations.ort_genai.write_ort_genai_config"
+        ) as config_writer:
             _save_package(pkg, str(tmp_path), args, None, None)
 
-        pkg.save.assert_not_called()
+        pkg.save.assert_called_once()
+        config_writer.assert_called_once()
 
     def test_runtime_ort_genai_propagates_trust_remote_code(self):
         """--trust-remote-code also applies to runtime config generation."""
@@ -937,17 +940,13 @@ class TestCLIBuildRuntime:
         detect_diffusers.assert_called_once_with("LiquidAI/LFM2.5-VL-3B", revision=revision)
         assert build_model.call_args.kwargs["revision"] == revision
 
-    def test_runtime_ort_genai_rejects_mage_vl_before_saving(self):
+    def test_runtime_ort_genai_mage_vl_gap_does_not_block_saving(self):
         with (
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch("mobius._model_package.ModelPackage.save") as save,
             mock.patch(
                 "mobius.integrations.ort_genai.write_ort_genai_config"
             ) as config_writer,
-            pytest.raises(
-                SystemExit,
-                match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
-            ),
         ):
             main(
                 [
@@ -962,8 +961,8 @@ class TestCLIBuildRuntime:
                 ]
             )
 
-        save.assert_not_called()
-        config_writer.assert_not_called()
+        save.assert_called()
+        config_writer.assert_called_once()
 
     def test_runtime_onnx_genai_routes_vlm_through_workflow_emitter(self):
         """A VLM package emits the workflow IR, not a legacy composite pipeline."""
@@ -1129,14 +1128,35 @@ class TestCLIBuildGGUF:
 
         assert args.image_token_id == -200
 
-    def test_runtime_requires_explicit_pinned_tokenizer_before_output_creation(
+    def test_runtime_allows_missing_downstream_tokenizer_processor(
         self, tmp_path: Path
     ) -> None:
         gguf_path = tmp_path / "llama.gguf"
         output_dir = tmp_path / "must-not-exist"
         _write_gated_gguf(gguf_path, architecture="llama", quantized=False)
 
-        with pytest.raises(SystemExit, match="requires --tokenizer-repository"):
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(("model",))
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=gguf_path,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
+                return_value=mock.MagicMock(),
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                return_value={},
+            ) as writer,
+            mock.patch("mobius.__main__._print_saved_gguf_models"),
+        ):
             main(
                 [
                     "build-gguf",
@@ -1149,7 +1169,8 @@ class TestCLIBuildGGUF:
                 ]
             )
 
-        assert not output_dir.exists()
+        assert writer.call_args.kwargs["tokenizer_repository"] is None
+        assert writer.call_args.kwargs["tokenizer_revision"] is None
 
     def test_runtime_rejects_mutable_tokenizer_revision_before_build(
         self, tmp_path: Path

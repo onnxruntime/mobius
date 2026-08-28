@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import types
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
@@ -94,23 +95,12 @@ def _mock_decoder_model(
     return _mock_model(inputs=inputs, outputs=outputs)
 
 
-def test_moonshine_native_runtime_is_rejected(tmp_path):
-    from mobius._model_package import ModelPackage
+def test_moonshine_runtime_limitation_is_advisory(tmp_path):
+    result = write_ort_genai_config(_make_fake_llm_pkg("moonshine"), str(tmp_path))
 
-    config = mock.MagicMock()
-    config.model_type = "moonshine"
-    package = ModelPackage(
-        {"encoder": _mock_model(), "decoder": _mock_model()},
-        config=config,
-    )
-
-    with pytest.raises(
-        NotImplementedError,
-        match="variable-length raw-waveform encoder",
-    ) as error:
-        write_ort_genai_config(package, str(tmp_path))
-    assert "onnx-genai" not in str(error.value)
-    assert "ONNX Runtime" in str(error.value)
+    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert "variable-length raw-waveform encoder" in compatibility["warnings"][0]
 
 
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
@@ -1291,7 +1281,7 @@ class TestExportForOrtGenai:
         assert data["model"]["decoder"]["inputs"]["position_ids"] == "position_ids"
         assert (tmp_path / "runtime_compatibility.json").is_file()
 
-    def test_rejects_generic_vision_encoder_decoder_package(self, tmp_path):
+    def test_generic_vision_encoder_decoder_exports_with_warning(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1299,6 +1289,14 @@ class TestExportForOrtGenai:
         @dataclasses.dataclass
         class FakeConfig:
             model_type: str = "nemotron_parse"
+            vocab_size: int = 256
+            hidden_size: int = 64
+            num_hidden_layers: int = 2
+            num_attention_heads: int = 4
+            num_key_value_heads: int = 2
+            head_dim: int = 16
+            max_position_embeddings: int = 4096
+            pad_token_id: int = 0
 
         pkg = ModelPackage(
             {
@@ -1307,12 +1305,10 @@ class TestExportForOrtGenai:
             },
             config=FakeConfig(),
         )
-        with pytest.raises(
-            NotImplementedError,
-            match="does not support generic vision encoder-decoder",
-        ):
-            write_ort_genai_config(pkg, str(tmp_path))
-        assert not (tmp_path / "genai_config.json").exists()
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+        assert "generic vision encoder-decoder" in compatibility["warnings"][0]
 
     def test_processor_config_written_with_vision(self, tmp_path):
         """image_processor.json is written when pkg.config.vision is set."""
@@ -1740,7 +1736,7 @@ class TestExportForOrtGenai:
         assert data["model"]["type"] == "qwen3_5_moe"
         assert data["model"]["vision"]["patch_size"] == 16
 
-    def test_mage_vl_is_rejected_before_writing_runtime_artifacts(self, tmp_path):
+    def test_mage_vl_exports_with_runtime_warning(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -1775,12 +1771,10 @@ class TestExportForOrtGenai:
         )
 
         output_dir = tmp_path / "ort-genai"
-        with pytest.raises(
-            ValueError,
-            match=r"Mage-VL.*patch_positions.*1D decoder position_ids",
-        ):
-            write_ort_genai_config(pkg, str(output_dir))
-        assert not output_dir.exists()
+        result = write_ort_genai_config(pkg, str(output_dir))
+        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+        assert "vision_encoder" in compatibility["graph_contract"]
 
     def test_processor_config_not_written_without_vision(self, tmp_path):
         """image_processor.json is NOT written when pkg.config has no vision attr."""
@@ -1988,8 +1982,7 @@ class TestExportForOrtGenai:
         assert speech["inputs"]["audio_embeds"] == "input_features"
         assert speech["inputs"]["attention_mask"] == "input_features_mask"
 
-    def test_glmasr_rejected_until_runtime_registers_model_type(self, tmp_path):
-        """Do not emit metadata that onnxruntime-genai cannot load."""
+    def test_glmasr_registry_gap_does_not_block_export(self, tmp_path):
         import dataclasses
 
         from mobius._model_package import ModelPackage
@@ -2028,8 +2021,11 @@ class TestExportForOrtGenai:
             config=FakeConfig(),
         )
 
-        with pytest.raises(ValueError, match="does not register a GLM-ASR"):
-            write_ort_genai_config(pkg, str(tmp_path))
+        result = write_ort_genai_config(pkg, str(tmp_path))
+        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+        assert compatibility["model_type"] == "glmasr"
+        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+        assert "does not register" in compatibility["warnings"][0]
 
     def test_tokenizer_not_copied_without_model_id(self, tmp_path):
         """No tokenizer files copied when hf_model_id=None."""
@@ -2933,17 +2929,16 @@ class TestExportPackage:
         # ONNX path is in the manifest (single-component package)
         assert result["model"] == os.path.join(str(tmp_path), "model.onnx")
 
-    def test_mage_vl_is_rejected_before_saving_onnx(self, tmp_path):
+    def test_mage_vl_runtime_gap_does_not_block_saving_onnx(self, tmp_path):
         pkg = self._make_pkg()
         pkg.config.model_type = "mage_vl"
 
-        with (
-            mock.patch.object(pkg, "save") as save,
-            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
-        ):
-            export_package(pkg, str(tmp_path))
+        with mock.patch.object(pkg, "save") as save:
+            result = export_package(pkg, str(tmp_path))
 
-        save.assert_not_called()
+        save.assert_called_once()
+        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
 
     def test_propagates_save_kwargs(self, tmp_path, monkeypatch):
         """external_data and progress_bar are forwarded to pkg.save."""
@@ -3308,13 +3303,14 @@ class TestHybridAttentionShareBufferGuard:
             has_speech=False,
         )
 
-    def test_recurrent_state_with_standard_attention_and_no_gqa_raises(self, tmp_path):
-        """LinearAttention + standard Attention + no GQA is an unrunnable config."""
+    def test_recurrent_state_with_standard_attention_exports_metadata(self, tmp_path):
         pkg = self._make_pkg(
             [("LinearAttention", "com.microsoft"), ("Attention", "")],
         )
-        with pytest.raises(ValueError, match="past_present_share_buffer"):
-            self._write(pkg, tmp_path)
+        path = self._write(pkg, tmp_path)
+        assert (
+            json.loads(Path(path).read_text())["search"]["past_present_share_buffer"] is True
+        )
 
     def test_recurrent_state_with_gqa_does_not_raise(self, tmp_path):
         """LinearAttention + GQA (no standard Attention) is a valid hybrid config."""
@@ -3329,7 +3325,7 @@ class TestHybridAttentionShareBufferGuard:
             data = json.load(f)
         assert data["search"]["past_present_share_buffer"] is True
 
-    def test_recurrent_state_with_standard_attention_and_gqa_raises(self, tmp_path):
+    def test_recurrent_state_with_standard_attention_and_gqa_exports(self, tmp_path):
         """Partial GQA fusion still leaves an incompatible standard Attention node.
 
         Regression test: the guard previously read
@@ -3346,8 +3342,10 @@ class TestHybridAttentionShareBufferGuard:
                 ("Attention", ""),
             ],
         )
-        with pytest.raises(ValueError, match="past_present_share_buffer"):
-            self._write(pkg, tmp_path)
+        path = self._write(pkg, tmp_path)
+        assert (
+            json.loads(Path(path).read_text())["search"]["past_present_share_buffer"] is True
+        )
 
     def test_recurrent_state_only_does_not_raise(self, tmp_path):
         """LinearAttention with no full-attention layers at all is unaffected."""
@@ -3602,31 +3600,30 @@ class TestGenericDecoderAbi:
         with pytest.raises(ValueError, match="rank-5 combined KV-cache"):
             _inspect_decoder_abi(_mock_decoder_model(), model_type="gpt2")
 
-    @pytest.mark.parametrize(
-        "inputs,outputs,message",
-        [
-            (
-                ["input_ids", "key_cache.0", "value_cache.0"],
-                ["logits", "present_key_cache.0", "present_value_cache.0"],
-                "cannot automatically supply",
+    def test_preserves_additional_semantic_input(self):
+        abi = _inspect_decoder_abi(
+            _mock_decoder_model(
+                semantic_inputs=["input_ids", "cache_position"],
+                layer_indices=(0,),
             ),
-            (
-                [
+            model_type="decoder",
+        )
+        assert abi.inputs["cache_position"] == "cache_position"
+
+    def test_heterogeneous_state_does_not_block_abi_inspection(self):
+        abi = _inspect_decoder_abi(
+            _mock_model(
+                inputs=[
                     "input_ids",
                     "past_key_values.0.key",
                     "past_key_values.0.value",
                     "past_key_values.1.ssm_state",
                 ],
-                ["logits", "present.0.key", "present.0.value", "present.1.ssm_state"],
-                "state kinds",
+                outputs=["logits", "present.0.key", "present.0.value", "present.1.ssm_state"],
             ),
-        ],
-    )
-    def test_rejects_unreleased_state_topologies(self, inputs, outputs, message):
-        with pytest.raises(ValueError, match=message):
-            _inspect_decoder_abi(
-                _mock_model(inputs=inputs, outputs=outputs), model_type="decoder"
-            )
+            model_type="decoder",
+        )
+        assert abi.cache_slots == 2
 
 
 def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
@@ -3640,13 +3637,63 @@ def test_generic_decoder_runtime_compatibility_metadata(tmp_path):
     assert metadata == {
         "runtime": "onnxruntime-genai",
         "model_type": "decoder",
+        "requested_version": "0.15.2",
+        "runtime_validation_status": "unvalidated",
+        "warnings": [],
         "minimum_version": "0.14.0",
         "tested_versions": ["0.15.2"],
         "uses_main_only_state_groups": False,
         "heterogeneous_state_manifest": (
             "deferred: https://github.com/onnxruntime/mobius/issues/605"
         ),
+        "graph_contract": {
+            "model": {
+                "inputs": [
+                    "input_ids",
+                    "attention_mask",
+                    "position_ids",
+                    "past_key_values.0.key",
+                    "past_key_values.0.value",
+                    "past_key_values.1.key",
+                    "past_key_values.1.value",
+                ],
+                "outputs": [
+                    "logits",
+                    "present.0.key",
+                    "present.0.value",
+                    "present.1.key",
+                    "present.1.value",
+                ],
+            }
+        },
     }
+
+
+def test_heterogeneous_decoder_state_exports_with_specific_runtime_warning(tmp_path):
+    pkg = _make_fake_llm_pkg("unknown_architecture")
+    pkg["model"] = _mock_model(
+        inputs=[
+            "input_ids",
+            "cache_position",
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+            "past_key_values.1.ssm_state",
+        ],
+        outputs=[
+            "logits",
+            "present.0.key",
+            "present.0.value",
+            "present.1.ssm_state",
+        ],
+    )
+
+    result = write_ort_genai_config(pkg, str(tmp_path))
+    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+
+    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert any("ssm_state" in warning for warning in compatibility["warnings"])
+    assert any("cache_position" in warning for warning in compatibility["warnings"])
+    assert "past_key_values.1.ssm_state" in compatibility["graph_contract"]["model"]["inputs"]
 
 
 def test_lfm2_runtime_compatibility_is_pinned_to_released_probe(tmp_path):
@@ -3658,10 +3705,11 @@ def test_lfm2_runtime_compatibility_is_pinned_to_released_probe(tmp_path):
 
     assert metadata["minimum_version"] == "0.15.2"
     assert metadata["tested_versions"] == ["0.15.2"]
-    with pytest.raises(ValueError, match=r"lfm2.*>= 0\.15\.2"):
-        _write_runtime_compatibility(
-            str(tmp_path), model_type="lfm2", runtime_version="0.15.1"
-        )
+    old_path = _write_runtime_compatibility(
+        str(tmp_path), model_type="lfm2", runtime_version="0.15.1"
+    )
+    old_metadata = json.loads(Path(old_path).read_text())
+    assert old_metadata["runtime_validation_status"] == "unsupported-by-tested-runtime"
 
 
 def test_decoder_sidecar_preserves_type_and_matching_compatibility_metadata(tmp_path):
@@ -3721,14 +3769,23 @@ def test_generic_decoder_schema_is_architecture_and_weight_agnostic(
     assert config["search"]["past_present_share_buffer"] is False
 
 
-def test_generic_decoder_rejects_pre_014_runtime(tmp_path):
-    with pytest.raises(ValueError, match=r">= 0\.14\.0"):
-        write_ort_genai_config(
-            _make_fake_llm_pkg("qwen2"),
-            str(tmp_path),
-            runtime_version="0.13.0",
-        )
-    assert not (tmp_path / "genai_config.json").exists()
+@pytest.mark.parametrize("runtime_version", ["0.13.0", "unknown-development-build"])
+def test_generic_decoder_old_or_unknown_runtime_does_not_block_export(
+    tmp_path, runtime_version
+):
+    result = write_ort_genai_config(
+        _make_fake_llm_pkg("unknown_architecture"),
+        str(tmp_path),
+        runtime_version=runtime_version,
+    )
+    config = json.loads(Path(result["genai_config"]).read_text())
+    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+    assert config["model"]["type"] == "decoder"
+    assert config["model"]["decoder"]["inputs"]["past_key_names"] == ("past_key_values.%d.key")
+    assert compatibility["runtime_validation_status"] in {
+        "unvalidated",
+        "unsupported-by-tested-runtime",
+    }
 
 
 def test_gpt2_separate_cache_graph_uses_generic_decoder(tmp_path):
@@ -4038,17 +4095,35 @@ class TestGemma4RealModel:
             revision=revision,
         )
 
-    def test_auto_export_rejects_mage_vl_before_saving(self, tmp_path):
+    def test_auto_export_keeps_mage_vl_runtime_gap_advisory(self, tmp_path):
         pkg = _make_fake_llm_pkg("mage_vl")
 
         with (
             mock.patch("mobius.integrations.transformers.build", return_value=pkg),
             mock.patch.object(pkg, "save") as save,
-            pytest.raises(ValueError, match=r"Mage-VL.*patch_positions"),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._copy_tokenizer_files",
+                return_value=[],
+            ),
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=types.SimpleNamespace(
+                    model_type="mage_vl",
+                    bos_token_id=1,
+                    eos_token_id=2,
+                    pad_token_id=0,
+                ),
+            ),
+            mock.patch(
+                "mobius.integrations.ort_genai.auto_export._load_generation_config",
+                return_value=None,
+            ),
         ):
-            auto_export("microsoft/Mage-VL", str(tmp_path))
+            result = auto_export("microsoft/Mage-VL", str(tmp_path))
 
-        save.assert_not_called()
+        save.assert_called_once()
+        compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
+        assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
 
     def test_auto_export_produces_genai_config(self, tmp_path):
         """Mock build() to return a tiny package, verify genai_config."""
