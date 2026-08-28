@@ -445,13 +445,13 @@ sidecar fail before graph construction, and ORT GenAI packaging remains
 deferred. See
 [`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-h-moe-support-boundary).
 
-Runtime packaging requires a validated embedded `tokenizer.huggingface.json`;
-opaque tokenizer pre-types are never reconstructed. Deferred/rejected
-architecture, tokenizer, draft-pairing, or mmproj checks run before durable
-output. Multimodal packages use `decoder`, `vision_encoder`, optional
-`audio_encoder`, and `embedding`. Graph-only exports persist an admitted
-trailing MTP head under `mtp/`; runtime packaging currently rejects packages
-with an attached MTP sidecar.
+Runtime packaging materializes a tokenizer only when its source can be represented
+faithfully; opaque processors remain explicit validation warnings and do not block
+graph/config/package export. Intrinsic graph, tensor, source-identity, and storage
+errors still fail before durable output. Multimodal packages use `decoder`,
+`vision_encoder`, optional `audio_encoder`, and `embedding`. MTP exports persist the
+target and sidecar in separate manifest-selected namespaces and emit exact external
+cache bindings plus `runtime_unvalidated` metadata.
 
 ---
 
