@@ -45,6 +45,8 @@ __all__ = [
     "GQAContext",
     "INT64_MAX",
     "InputMixer",
+    "Idefics3Projector",
+    "InternVLProjector",
     "LayerNorm",
     "LayerNormNoAffine",
     "LayerNormNoBias",
@@ -52,6 +54,8 @@ __all__ = [
     "LayerScale",
     "Linear",
     "LinearMultiModalProjector",
+    "Llama4Projector",
+    "Llama4VisionTower",
     "GGUFMLPProjector",
     "GLMEdgeAdapterProjector",
     "LoRALinear",
@@ -71,6 +75,7 @@ __all__ = [
     "ParakeetFastConformerEncoder",
     "PostGatedRMSNorm",
     "PostNormDecoderLayer",
+    "PixtralProjector",
     "QuantizedEmbedding",
     "QuantizedLinear",
     "RadioVisionModel",
@@ -87,6 +92,7 @@ __all__ = [
     "SoftmaxTopKGate",
     "SparseMixerGate",
     "SpeakerEncoder",
+    "SpatialPixelUnshuffle",
     "SplitResidualVectorQuantizer",
     "StaticCacheState",
     "TimestepEmbedding",
@@ -162,6 +168,13 @@ from mobius.components._conv import (
     ConvTranspose2d,
     RmsNorm2d,
 )
+from mobius.components._core_vlm_projector import (
+    Idefics3Projector,
+    InternVLProjector,
+    Llama4Projector,
+    PixtralProjector,
+    SpatialPixelUnshuffle,
+)
 from mobius.components._decoder import (
     DecoderLayer,
     PostNormDecoderLayer,
@@ -195,6 +208,7 @@ from mobius.components._kimi_linear import KimiDeltaAttention, KimiMLAAttention
 from mobius.components._lightning_attention import (
     LightningAttention as LightningAttention,
 )
+from mobius.components._llama4_vision import Llama4VisionTower
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock

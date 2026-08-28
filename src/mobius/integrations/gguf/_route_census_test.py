@@ -64,8 +64,8 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-mobius-abi-blocked": 99,
-        "evidence-only": 108,
-        "immediately-implementable": 47,
+        "evidence-only": 117,
+        "immediately-implementable": 38,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }
@@ -105,7 +105,18 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
     assert by_id["architecture:jamba"].category == "evidence-only"
     assert by_id["projector:qwen2vl_merger"].category == "evidence-only"
     assert by_id["projector:lfm2"].category == "immediately-implementable"
-    assert by_id["projector:pixtral"].category == "immediately-implementable"
+    assert by_id["projector:pixtral"].category == "evidence-only"
+    for projector_type in (
+        "gemma3na",
+        "gemma3nv",
+        "gemma4a",
+        "gemma4ua",
+        "gemma4uv",
+        "idefics3",
+        "internvl",
+        "llama4",
+    ):
+        assert by_id[f"projector:{projector_type}"].category == "evidence-only"
     assert by_id["projector:qwen3tts_gen"].category == "intentionally-rejected"
     assert by_id["tokenizer:llama4"].category == "artifact-unavailable"
     assert "PR #652" not in by_id["tokenizer:llama4"].dependencies

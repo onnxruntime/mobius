@@ -83,6 +83,8 @@ class _InternVisionEmbeddings(nn.Module):
         patch_size: int,
         hidden_size: int,
         num_channels: int = 3,
+        *,
+        class_token_at_end: bool = False,
     ):
         super().__init__()
         self.num_patches = (image_size // patch_size) ** 2
@@ -97,6 +99,7 @@ class _InternVisionEmbeddings(nn.Module):
         )
         # Position embedding includes CLS position — bare parameter
         self.position_embedding = nn.Parameter([1, self.num_patches + 1, hidden_size])
+        self._class_token_at_end = class_token_at_end
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value):
         # pixel_values: [batch, channels, height, width]
@@ -117,8 +120,12 @@ class _InternVisionEmbeddings(nn.Module):
             self.class_embedding,
             op.Concat(batch_size, op.Constant(value_ints=[1]), hidden_dim, axis=0),
         )
-        # [batch, num_patches + 1, hidden_size]
-        embeddings = op.Concat(cls_token, patch_embeds, axis=1)
+        # HF prepends CLS; llama.cpp's serialized InternVL route appends it.
+        embeddings = (
+            op.Concat(patch_embeds, cls_token, axis=1)
+            if self._class_token_at_end
+            else op.Concat(cls_token, patch_embeds, axis=1)
+        )
 
         # Add position embeddings
         embeddings = op.Add(embeddings, self.position_embedding)
@@ -263,7 +270,12 @@ class _InternVisionModel(nn.Module):
     HF reference: ``InternVisionModel`` in ``modeling_intern_vit.py``.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        *,
+        class_token_at_end: bool = False,
+    ):
         super().__init__()
         vc = config.vision
         assert vc is not None, "VisionConfig is required"
@@ -271,6 +283,7 @@ class _InternVisionModel(nn.Module):
             image_size=vc.image_size,
             patch_size=vc.patch_size,
             hidden_size=vc.hidden_size,
+            class_token_at_end=class_token_at_end,
         )
         self.encoder = _InternVisionEncoder(
             num_layers=vc.num_hidden_layers,

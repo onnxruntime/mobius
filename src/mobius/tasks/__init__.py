@@ -42,6 +42,10 @@ __all__ = [
     "GGUFEncoderFeatureExtractionTask",
     "GGUFEmbeddingFeatureExtractionTask",
     "GGUFProjectorVisionLanguageTask",
+    "GGUFSpeakerProjectorModel",
+    "GGUFSpeakerProjectorTask",
+    "GGUFVisionProjectorModel",
+    "GGUFVisionProjectorTask",
     "FunASRSpeechLanguageTask",
     "Gemma3VisionLanguageTask",
     "Gemma3nTask",
@@ -143,6 +147,12 @@ from mobius.tasks._gemma4 import (
     Gemma4UnifiedTask,
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
+from mobius.tasks._gguf_projector import (
+    GGUFSpeakerProjectorModel,
+    GGUFSpeakerProjectorTask,
+    GGUFVisionProjectorModel,
+    GGUFVisionProjectorTask,
+)
 from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
 from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
