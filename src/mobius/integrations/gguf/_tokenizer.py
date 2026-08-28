@@ -586,9 +586,14 @@ def _validate_incomplete_tokenizer_fields(
 
     for key in _SPECIAL_ID_KEYS:
         value = metadata.get(key)
-        if value is not None and (
-            type(value) is not int or value < 0 or (tokens and value >= len(tokens))
-        ):
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"{key} must be a non-negative integer")
+        if value is not None and tokens and value >= len(tokens):
+            raise ValueError(f"{key} must be an integer in [0, {len(tokens)})")
+        tokenless_diffusion_mask = key == "tokenizer.ggml.mask_token_id" and metadata.get(
+            "general.architecture"
+        ) in {"dream", "llada", "llada-moe", "rnd1"}
+        if value is not None and not tokens and not tokenless_diffusion_mask:
             upper_bound = str(len(tokens)) if tokens else "the serialized token count"
             raise ValueError(f"{key} must be an integer in [0, {upper_bound})")
     for key in _BOOL_KEYS:

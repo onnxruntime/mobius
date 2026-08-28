@@ -503,9 +503,6 @@ def write_gguf_runtime_package(
 
         if runtime == "ort-genai":
             from mobius.integrations.ort_genai import write_ort_genai_config
-            from mobius.integrations.ort_genai.auto_export import (
-                _copy_tokenizer_files,
-            )
 
             execution_provider = getattr(pkg, "gguf_execution_provider", None)
             if not isinstance(execution_provider, str) or not execution_provider:
@@ -523,15 +520,6 @@ def write_gguf_runtime_package(
                     f"ORT GenAI runtime execution with provider {execution_provider!r} has not "
                     "been validated; the provider identity is preserved in genai_config.json."
                 )
-            if mtp_head is not None and evidence is None and tokenizer_repository is not None:
-                assert tokenizer_revision is not None
-                for filename in _copy_tokenizer_files(
-                    tokenizer_repository,
-                    str(stage),
-                    revision=tokenizer_revision,
-                    local_files_only=local_files_only,
-                ):
-                    artifacts[filename] = str(stage / filename)
             artifacts.update(
                 write_ort_genai_config(
                     pkg,
@@ -548,16 +536,8 @@ def write_gguf_runtime_package(
                     pkg,
                     str(stage),
                     config=getattr(pkg, "config", None),
-                    source=(
-                        tokenizer_repository
-                        if mtp_head is not None and evidence is None
-                        else None
-                    ),
-                    revision=(
-                        tokenizer_revision
-                        if mtp_head is not None and evidence is None
-                        else None
-                    ),
+                    source=None,
+                    revision=None,
                 )
             )
         if draft_manifest is not None:

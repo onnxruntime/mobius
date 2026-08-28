@@ -5303,6 +5303,7 @@ class TestLanguageDiffusionDispatch:
         class _DreamGGUF:
             architecture = "dream"
             metadata: ClassVar[dict] = {
+                "general.architecture": "dream",
                 "dream.embedding_length": 8,
                 "dream.feed_forward_length": 16,
                 "dream.block_count": 1,

@@ -805,6 +805,18 @@ class TestWriteGgufRuntimePackage:
     def test_onnx_runtime_emits_unvalidated_mtp_without_artifact_allowlist(self, tmp_path):
         pkg = _FakePackage()
         pkg.mtp_head = SimpleNamespace(config=object())
+        deferred_tokenizer = GGUFTokenizerVerdict(
+            route="deferred",
+            model="llama",
+            pre=None,
+            canonical_pre=None,
+            reason="tokenizer pipeline is incomplete",
+            token_count=0,
+            metadata_sha256="f" * 64,
+            audit_status="deferred-incomplete-pipeline",
+            blocker_category="serialized-tokenizer-pipeline-incomplete",
+        )
+        pkg.gguf_tokenizer_verdict = deferred_tokenizer
         out = tmp_path / "out"
 
         def write_status(stage, **_kwargs):
@@ -836,19 +848,19 @@ class TestWriteGgufRuntimePackage:
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
-                return_value=_materialized(),
+                return_value=deferred_tokenizer,
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.write_gguf_tokenizer_json",
                 side_effect=_write_tokenizer,
-            ),
+            ) as write_tokenizer,
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.matching_runtime_evidence"
             ) as match_evidence,
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
                 side_effect=_write_config,
-            ),
+            ) as write_config,
             mock.patch(
                 "mobius._model_package._read_mtp_sidecar_name",
                 return_value=".mobius-mtp",
@@ -872,7 +884,11 @@ class TestWriteGgufRuntimePackage:
                 runtime_version="1.29.0",
             )
         match_evidence.assert_not_called()
+        write_tokenizer.assert_not_called()
+        assert write_config.call_args.kwargs["source"] is None
+        assert write_config.call_args.kwargs["revision"] is None
         assert out.is_dir()
+        assert not (out / "tokenizer.json").exists()
         assert artifacts["mtp_runtime_status"] == str(out / "mtp_runtime_status.json")
 
     def test_mtp_source_change_during_serialization_publishes_nothing(self, tmp_path):

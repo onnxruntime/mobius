@@ -273,7 +273,21 @@ class TestInspectGgufTokenizer:
                     "tokenizer.ggml.model": "llama",
                     "tokenizer.ggml.eos_token_id": -1,
                 },
+                "eos_token_id must be a non-negative integer",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.eos_token_id": 999,
+                },
                 "eos_token_id must be an integer",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.mask_token_id": 999,
+                },
+                "mask_token_id must be an integer",
             ),
             (
                 {
@@ -326,6 +340,20 @@ class TestInspectGgufTokenizer:
         assert next(
             key for key in metadata if key not in LOADER_CONSUMED_TOKENIZER_FIELDS
         ) in (verdict.reason)
+
+    def test_tokenless_diffusion_mask_id_is_left_to_graph_contract_validation(
+        self,
+    ) -> None:
+        verdict = inspect_gguf_tokenizer(
+            {
+                "general.architecture": "dream",
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.mask_token_id": 999,
+            }
+        )
+
+        assert verdict.route == "deferred"
+        assert verdict.blocker_category == "serialized-tokenizer-pipeline-incomplete"
 
     def test_complete_unknown_field_prevents_embedded_tokenizer_copy(self) -> None:
         metadata = _metadata(embedded=True)
