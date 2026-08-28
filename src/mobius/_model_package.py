@@ -191,7 +191,11 @@ def _validate_mtp_save_paths(
         os.path.islink(report_path) or not os.path.isfile(report_path)
     ):
         raise ValueError("ModelPackage quantization report output must be a real file.")
-    if package.gguf_quantization_report is None and os.path.isfile(report_path):
+    if (
+        package.gguf_quantization_report is None
+        and package.gguf_reuse_plan is None
+        and os.path.isfile(report_path)
+    ):
         raise ValueError(
             "ModelPackage output contains a stale quantization_report.json, but the "
             "package being saved has no GGUF quantization report. Remove or clean the "
@@ -202,7 +206,11 @@ def _validate_mtp_save_paths(
         os.path.islink(export_report_path) or not os.path.isfile(export_report_path)
     ):
         raise ValueError("ModelPackage component export report output must be a real file.")
-    if package.export_report is None and os.path.isfile(export_report_path):
+    if (
+        package.export_report is None
+        and package.gguf_reuse_plan is None
+        and os.path.isfile(export_report_path)
+    ):
         raise ValueError(
             "ModelPackage output contains a stale export_report.json, but the package "
             "being saved has no component export report. Remove or clean the output "
@@ -544,7 +552,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         previous_sidecar_name = _read_mtp_sidecar_name(directory)
         os.makedirs(directory, exist_ok=True)
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
-        if self.gguf_quantization_report is not None:
+        if self.gguf_quantization_report is not None and reuse_plan is None:
             self.gguf_quantization_report.write_json(quantization_report_path)
         export_report_path = os.path.join(directory, _EXPORT_REPORT)
         selected = {
@@ -622,6 +630,15 @@ class ModelPackage(UserDict[str, ir.Model]):
                     from mobius.integrations.gguf._reuse import save_reuse_package
 
                     package_metadata: dict[str, bytes] = {}
+                    if self.gguf_quantization_report is not None:
+                        package_metadata[_QUANTIZATION_REPORT] = (
+                            json.dumps(
+                                self.gguf_quantization_report.to_dict(),
+                                indent=2,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        ).encode()
                     if self.export_report is not None:
                         package_metadata[_EXPORT_REPORT] = (
                             self.export_report.to_json().encode()

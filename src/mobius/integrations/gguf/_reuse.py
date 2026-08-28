@@ -34,7 +34,9 @@ _MANIFEST_NAME = "gguf-reuse.json"
 _SIDECAR_NAME = "model.onnx.data"
 _TRANSACTION_NAME = ".gguf-reuse.transaction.json"
 _LOCK_NAME = ".gguf-reuse.lock"
-_OPTIONAL_PACKAGE_METADATA = frozenset({"draft_manifest.json", "export_report.json"})
+_OPTIONAL_PACKAGE_METADATA = frozenset(
+    {"draft_manifest.json", "export_report.json", "quantization_report.json"}
+)
 _EXTERNAL_WEIGHT_THRESHOLD = 256
 _GENERATED_NAMES = frozenset(
     {
@@ -934,7 +936,7 @@ def save_reuse_package(
                     path,
                     final_sidecar,
                     final_manifest,
-                    *(final for _, final in staged_metadata.values()),
+                    *(path.parent / name for name in sorted(_OPTIONAL_PACKAGE_METADATA)),
                 ),
             )
         finally:

@@ -214,6 +214,87 @@ class TestInspectGgufTokenizer:
         assert verdict.blocker_category == "serialized-tokenizer-pipeline-incomplete"
         assert reason in verdict.reason
 
+    @pytest.mark.parametrize(
+        ("metadata", "message"),
+        [
+            (
+                {"tokenizer.ggml.tokens": ["duplicate", "duplicate"]},
+                "duplicate token strings",
+            ),
+            (
+                {"tokenizer.ggml.tokens": ["valid", 1]},
+                "contain only UTF-8 strings",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.token_type": [7],
+                },
+                "token_type length",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.chat_templates": ["missing"],
+                },
+                "does not exactly match",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": 1,
+                    "tokenizer.ggml.tokens": ["valid"],
+                },
+                "must be a non-empty string",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.pre": 1,
+                },
+                "pre must be a non-empty string",
+            ),
+            (
+                {
+                    "tokenizer.ggml.tokens": [],
+                    "tokenizer.huggingface.json": 42,
+                },
+                "tokenizer.huggingface.json must be a string",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.huggingface.json": "{",
+                },
+                "not valid JSON",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.eos_token_id": -1,
+                },
+                "eos_token_id must be an integer",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.pre": "hunyuan-dense",
+                },
+                "pre for non-BPE model",
+            ),
+            (
+                {"tokenizer.rwkv.world": 42},
+                "tokenizer.rwkv.world must be a string",
+            ),
+        ],
+    )
+    def test_incomplete_pipeline_does_not_downgrade_present_field_corruption(
+        self,
+        metadata: dict,
+        message: str,
+    ) -> None:
+        with pytest.raises((TypeError, ValueError), match=message):
+            inspect_gguf_tokenizer(metadata)
+
     def test_known_pre_without_complete_pipeline_is_deferred(self):
         verdict = inspect_gguf_tokenizer(_metadata(pre="hunyuan-dense"))
         assert verdict.route == "deferred"

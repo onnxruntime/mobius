@@ -444,6 +444,144 @@ def _incomplete_tokenizer_verdict(
     )
 
 
+def _validate_incomplete_tokenizer_fields(
+    metadata: Mapping[str, Any],
+    *,
+    source: str,
+    model: str | None,
+) -> int:
+    """Validate every serialized field before downgrading an incomplete pipeline."""
+    tokens_raw = _require_list(metadata, "tokenizer.ggml.tokens")
+    tokens = list(tokens_raw or ())
+    if any(not isinstance(token, str) for token in tokens):
+        raise ValueError(f"{source} tokenizer.ggml.tokens must contain only UTF-8 strings")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError(f"{source} tokenizer.ggml.tokens contains duplicate token strings")
+
+    pre = metadata.get("tokenizer.ggml.pre")
+    if pre is not None:
+        if not isinstance(pre, str) or not pre:
+            raise ValueError("tokenizer.ggml.pre must be a non-empty string")
+        if pre not in tokenizer_pre_policies():
+            raise ValueError(f"{source} declares unknown tokenizer.ggml.pre {pre!r}")
+        if model is not None and model not in _BPE_MODELS:
+            architecture = metadata.get("general.architecture")
+            legacy_default = pre == "default" and (
+                model == "plamo2"
+                or (
+                    model == "llama"
+                    and isinstance(architecture, str)
+                    and architecture in {"minicpm", "minicpm3"}
+                )
+            )
+            if not legacy_default:
+                raise ValueError(
+                    f"{source} declares tokenizer.ggml.pre for non-BPE model {model!r}; "
+                    "the pinned loader does not consume that combination"
+                )
+
+    rwkv_world = metadata.get("tokenizer.rwkv.world")
+    if rwkv_world is not None and not isinstance(rwkv_world, str):
+        raise ValueError("tokenizer.rwkv.world must be a string")
+
+    embedded = metadata.get("tokenizer.huggingface.json")
+    if embedded is not None:
+        if not isinstance(embedded, str):
+            raise ValueError("tokenizer.huggingface.json must be a string")
+        if tokens:
+            _validate_embedded_tokenizer_json(embedded, tokens)
+        else:
+            try:
+                payload = json.loads(embedded)
+            except json.JSONDecodeError as error:
+                raise ValueError("tokenizer.huggingface.json is not valid JSON") from error
+            if not isinstance(payload, dict):
+                raise TypeError("tokenizer.huggingface.json must contain a JSON object")
+            try:
+                from tokenizers import Tokenizer
+
+                Tokenizer.from_str(embedded)
+            except Exception as error:
+                raise ValueError(
+                    "tokenizer.huggingface.json is not a loadable tokenizers tokenizer"
+                ) from error
+
+    token_types = _require_list(metadata, "tokenizer.ggml.token_type")
+    if token_types is not None:
+        if len(token_types) != len(tokens):
+            raise ValueError(
+                "tokenizer.ggml.token_type length must equal tokenizer token count"
+            )
+        if any(type(value) is not int or value not in range(7) for value in token_types):
+            raise ValueError("tokenizer.ggml.token_type values must be integers in [0, 6]")
+
+    scores = _require_list(metadata, "tokenizer.ggml.scores")
+    if scores is not None:
+        if len(scores) != len(tokens):
+            raise ValueError("tokenizer.ggml.scores length must equal tokenizer token count")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in scores
+        ):
+            raise ValueError("tokenizer.ggml.scores must contain finite numeric values")
+
+    merges = _require_list(metadata, "tokenizer.ggml.merges")
+    if merges is not None:
+        pairs: list[tuple[str, str]] = []
+        vocabulary = set(tokens)
+        for index, merge in enumerate(merges):
+            if not isinstance(merge, str):
+                raise TypeError(f"tokenizer.ggml.merges[{index}] must be a string")
+            separator = merge.find(" ", 1)
+            if separator < 0:
+                raise ValueError(f"tokenizer.ggml.merges[{index}] has no valid pair separator")
+            pair = (merge[:separator], merge[separator + 1 :])
+            if not all(pair) or pair[0] not in vocabulary or pair[1] not in vocabulary:
+                raise ValueError(
+                    f"tokenizer.ggml.merges[{index}] references a token outside the vocabulary"
+                )
+            pairs.append(pair)
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("tokenizer.ggml.merges contains duplicate merge pairs")
+
+    for key in _SPECIAL_ID_KEYS:
+        value = metadata.get(key)
+        if value is not None and (
+            type(value) is not int or value < 0 or (tokens and value >= len(tokens))
+        ):
+            upper_bound = str(len(tokens)) if tokens else "the serialized token count"
+            raise ValueError(f"{key} must be an integer in [0, {upper_bound})")
+    for key in _BOOL_KEYS:
+        value = metadata.get(key)
+        if value is not None and type(value) is not bool:
+            raise ValueError(f"{key} must be a boolean")
+
+    type_count = metadata.get("tokenizer.ggml.token_type_count")
+    if type_count is not None and (type(type_count) is not int or type_count <= 0):
+        raise ValueError("tokenizer.ggml.token_type_count must be a positive integer")
+    suppress = _require_list(metadata, "tokenizer.ggml.suppress_tokens")
+    if suppress is not None and any(
+        type(value) is not int or value < 0 or value >= len(tokens) for value in suppress
+    ):
+        raise ValueError("tokenizer.ggml.suppress_tokens contains an out-of-range token id")
+    if suppress is not None and len(set(suppress)) != len(suppress):
+        raise ValueError("tokenizer.ggml.suppress_tokens contains duplicate token ids")
+    charsmap = _require_list(metadata, "tokenizer.ggml.precompiled_charsmap")
+    if charsmap is not None and any(
+        type(value) is not int or value < -128 or value > 255 for value in charsmap
+    ):
+        raise ValueError("tokenizer.ggml.precompiled_charsmap must contain byte values")
+    if "tokenizer.ggml.byte_fallback" in metadata:
+        raise ValueError(
+            "tokenizer.ggml.byte_fallback is not a pinned GGUF key; byte-fallback semantics "
+            "cannot be inferred from it"
+        )
+    _validate_chat_templates(metadata)
+    return len(tokens)
+
+
 def inspect_gguf_tokenizer(
     metadata: Mapping[str, Any],
     *,
@@ -460,15 +598,22 @@ def inspect_gguf_tokenizer(
         )
 
     model = metadata.get("tokenizer.ggml.model")
-    if not isinstance(model, str) or not model:
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError(f"{source} tokenizer.ggml.model must be a non-empty string")
+    if model is None:
         if not require_complete:
+            token_count = _validate_incomplete_tokenizer_fields(
+                metadata,
+                source=source,
+                model=None,
+            )
             return _incomplete_tokenizer_verdict(
                 model=None,
                 reason=(
                     f"{source} contains partial tokenizer metadata without "
                     "tokenizer.ggml.model"
                 ),
-                token_count=len(metadata.get("tokenizer.ggml.tokens", ())),
+                token_count=token_count,
             )
         raise ValueError(f"{source} tokenizer.ggml.model must be a non-empty string")
     if model not in _KNOWN_MODELS:
@@ -477,10 +622,15 @@ def inspect_gguf_tokenizer(
     tokens_raw = _require_list(metadata, "tokenizer.ggml.tokens")
     if not tokens_raw:
         if not require_complete:
+            token_count = _validate_incomplete_tokenizer_fields(
+                metadata,
+                source=source,
+                model=model,
+            )
             return _incomplete_tokenizer_verdict(
                 model=model,
                 reason=f"{source} contains no complete tokenizer token table",
-                token_count=0,
+                token_count=token_count,
             )
         raise ValueError(f"{source} tokenizer.ggml.tokens must be a non-empty string array")
     if any(not isinstance(token, str) for token in tokens_raw):

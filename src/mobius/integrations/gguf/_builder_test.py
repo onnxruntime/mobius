@@ -2957,6 +2957,35 @@ class TestReuseGgufWeights:
         loaded.save(str(ordinary_output), progress_bar=False)
         assert not (ordinary_output / "gguf-reuse.json").exists()
 
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_reuse_transaction_removes_stale_optional_package_metadata(
+        self,
+        tmp_path: Path,
+        projection_quantization: str,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(
+            gguf_path,
+            projection_quantization=projection_quantization,
+        )
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.draft_manifest = {"architecture": "eagle3"}
+        package.save(str(tmp_path), progress_bar=False)
+        assert (tmp_path / "draft_manifest.json").is_file()
+        assert (tmp_path / "export_report.json").is_file()
+        assert (tmp_path / "quantization_report.json").is_file()
+
+        package.draft_manifest = None
+        package.export_report = None
+        package.gguf_quantization_report = None
+        package.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "draft_manifest.json").exists()
+        assert not (tmp_path / "export_report.json").exists()
+        assert not (tmp_path / "quantization_report.json").exists()
+
     def test_verifier_rejects_unmanifested_external_initializer(self, tmp_path: Path):
         from mobius.integrations.gguf import (
             build_from_gguf,
@@ -3162,10 +3191,17 @@ class TestReuseGgufWeights:
 
         gguf_path = tmp_path / "source.gguf"
         _write_quantized_gguf(gguf_path, projection_quantization="f32")
-        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
-            str(tmp_path), progress_bar=False
+        initial = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        initial.draft_manifest = {"architecture": "eagle3", "generation": 1}
+        initial.save(str(tmp_path), progress_bar=False)
+        artifact_names = (
+            "model.onnx",
+            "model.onnx.data",
+            "gguf-reuse.json",
+            "quantization_report.json",
+            "export_report.json",
+            "draft_manifest.json",
         )
-        artifact_names = ("model.onnx", "model.onnx.data", "gguf-reuse.json")
         original = {name: (tmp_path / name).read_bytes() for name in artifact_names}
 
         real_replace = _reuse.os.replace
@@ -3186,6 +3222,7 @@ class TestReuseGgufWeights:
 
         monkeypatch.setattr(_reuse.os, "replace", fail_manifest_install)
         rerun = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        rerun.draft_manifest = {"architecture": "eagle3", "generation": 2}
         with pytest.raises(OSError, match="injected"):
             rerun.save(str(tmp_path), progress_bar=False)
 
