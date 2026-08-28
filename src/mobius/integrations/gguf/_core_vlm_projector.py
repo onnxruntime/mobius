@@ -933,6 +933,10 @@ def build_core_vlm_projector_mmproj(
             task=GGUFVisionProjectorTask(),
             execution_provider=execution_provider,
         )
+    for model in package.values():
+        model.metadata_props["mobius.runtime_support"] = (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
     state = _load_core_vlm_projector_weights(mmproj_gguf, projector_type)
     expected = {
         name

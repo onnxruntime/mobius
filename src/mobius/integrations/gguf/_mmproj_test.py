@@ -1005,6 +1005,9 @@ class TestStandaloneCoreProjectorBuild:
             "input_features",
             "input_features_mask",
         ]
+        assert package["audio_encoder"].metadata_props["mobius.runtime_support"] == (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
 
     @pytest.mark.parametrize(
         ("projector_type", "expected_role"),
@@ -1032,6 +1035,9 @@ class TestStandaloneCoreProjectorBuild:
             )
 
         assert set(package) == {expected_role}
+        assert package[expected_role].metadata_props["mobius.runtime_support"] == (
+            "standalone-sidecar-only; paired multimodal runtime unvalidated"
+        )
 
     def test_unified_cross_pairing_fails_closed(self, tmp_path: Path):
         from mobius.integrations.gguf import build_mmproj_from_gguf
