@@ -141,9 +141,7 @@ def test_artifact_pins_cover_every_ocr_header_and_both_dots_roles():
     for projector_type, pin in pins.items():
         item = _evidence()[_ROUTE_HEADERS[projector_type]]
         assert item["tensor_count"] == pin.tensor_count
-        assert tuple(sorted(item["tensor_qtypes"].items())) == tuple(
-            sorted(pin.tensor_qtypes)
-        )
+        assert tuple(sorted(item["tensor_qtypes"].items())) == tuple(sorted(pin.tensor_qtypes))
 
 
 @pytest.mark.parametrize("projector_type", tuple(_ROUTE_HEADERS))
@@ -202,7 +200,7 @@ def test_real_header_requires_exact_boolean_presence(projector_type: str):
     modality = get_projector_spec(projector_type).primary_modality.value
     source.metadata[f"clip.has_{modality}_encoder"] = 1
 
-    with pytest.raises(ValueError, match="requires .*true"):
+    with pytest.raises(ValueError, match=r"requires .*true"):
         _validate_mmproj_tensor_closure(source, get_projector_spec(projector_type))
 
 
@@ -250,11 +248,7 @@ def test_every_real_tensor_is_mapped_or_an_explicit_upstream_compatibility_tenso
             name = tensor["name"]
             route = projector_type
             if projector_type in {"dots3note_v", "dots3note_a"}:
-                route = (
-                    "dots3note_a"
-                    if name.startswith(("a.", "mm.a."))
-                    else "dots3note_v"
-                )
+                route = "dots3note_a" if name.startswith(("a.", "mm.a.")) else "dots3note_v"
             if map_ocr_projector_to_onnx(name, route) is None:
                 assert (route, name) in compatibility_only
 
@@ -354,9 +348,7 @@ def test_lighton_qk_rows_are_reverse_permuted_by_value():
 
 
 def test_deepseek_source_tensor_is_shared_across_global_and_local_graphs():
-    source = _MapFixture(
-        {"v.sam.neck.0.weight": np.ones((2, 2, 1, 1), dtype=np.float32)}
-    )
+    source = _MapFixture({"v.sam.neck.0.weight": np.ones((2, 2, 1, 1), dtype=np.float32)})
 
     state = _ocr_projector._map_state(source, "deepseekocr2", mixed=False)
 

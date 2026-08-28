@@ -89,15 +89,8 @@ def _dots_vision(mmproj: Any, *, qk_norm: bool) -> DotsVisionEncoder:
         shape = mmproj.get_tensor_shape(name)
         expert_counts.append(int(shape[0]))
         expert_intermediate = int(shape[1])
-    projector_type = (
-        "dots3note_v"
-        if qk_norm
-        else "dots_ocr"
-    )
     merge_key = (
-        "clip.vision.spatial_merge_size"
-        if qk_norm
-        else "clip.vision.projector.scale_factor"
+        "clip.vision.spatial_merge_size" if qk_norm else "clip.vision.projector.scale_factor"
     )
     return DotsVisionEncoder(
         depth=depth,
@@ -130,7 +123,9 @@ def _dots_audio(mmproj: Any) -> Dots3NoteAudioEncoder:
     )
 
 
-def _lighton(mmproj: Any, *, dtype: str | None) -> tuple[LightOnOCRVisionEncoder, ArchitectureConfig]:
+def _lighton(
+    mmproj: Any, *, dtype: str | None
+) -> tuple[LightOnOCRVisionEncoder, ArchitectureConfig]:
     md = mmproj.metadata
     hidden = int(md["clip.vision.embedding_length"])
     output = int(md["clip.vision.projection_dim"])
@@ -180,9 +175,7 @@ def _vision_module(
                 patch_size=int(md["clip.vision.patch_size"]),
                 position_size=int(mmproj.get_tensor_shape("v.position_embd.weight")[0]),
                 output_size=output,
-                projector_intermediate_size=int(
-                    mmproj.get_tensor_shape("mm.1.weight")[0]
-                ),
+                projector_intermediate_size=int(mmproj.get_tensor_shape("mm.1.weight")[0]),
                 norm_eps=float(md["clip.vision.attention.layer_norm_epsilon"]),
             ),
             _standalone_config(output, dtype=dtype),
@@ -198,9 +191,7 @@ def _vision_module(
                 pixel_size=3 * patch_size * patch_size,
                 patch_size=patch_size,
                 output_size=output,
-                projector_intermediate_size=int(
-                    mmproj.get_tensor_shape("mm.0.weight")[0]
-                ),
+                projector_intermediate_size=int(mmproj.get_tensor_shape("mm.0.weight")[0]),
                 spatial_merge_size=int(md["clip.vision.spatial_merge_size"]),
                 window_size=int(md["clip.vision.window_size"]),
                 full_attention_layers=tuple(md["clip.vision.wa_layer_indexes"]),
@@ -296,9 +287,7 @@ def _map_state(
         values = np.asarray(mmproj.get_tensor(name), dtype=np.float32)
         if name == "v.view_seperator":
             values = values.reshape(-1)
-        if route == "lightonocr" and (
-            name.endswith("attn_q.weight") or name.endswith("attn_k.weight")
-        ):
+        if route == "lightonocr" and name.endswith(("attn_q.weight", "attn_k.weight")):
             values = _reverse_permute(
                 torch.from_numpy(values),
                 int(mmproj.metadata["clip.vision.attention.head_count"]),
