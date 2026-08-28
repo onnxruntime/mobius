@@ -363,6 +363,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
         import transformers
 
         config_path = args.config
+        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+
+        if _is_reuse_checkpoint(config_path):
+            if task not in (None, "speech-enhancement"):
+                from mobius.tasks import SpeechEnhancementTask
+
+                if not isinstance(task, SpeechEnhancementTask):
+                    raise SystemExit(
+                        "Error: RE-USE checkpoints only support --task speech-enhancement."
+                    )
+            pkg = build_reuse(
+                config_path,
+                dtype=dtype_override,
+                execution_provider=execution_provider,
+                load_weights=load_weights,
+            )
+            _save_package(pkg, output_dir, args, optimize, component_filter)
+            return
         try:
             hf_config = transformers.AutoConfig.from_pretrained(
                 config_path, trust_remote_code=trust_remote_code

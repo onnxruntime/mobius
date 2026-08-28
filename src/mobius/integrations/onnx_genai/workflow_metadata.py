@@ -10435,6 +10435,10 @@ def _stft_transforms(config: Any) -> list[dict[str, Any]] | None:
             "hop_length": geometry["hop_length"],
             "win_length": geometry["win_length"],
             "window": "hann",
+            # NVIDIA uses torch.stft(center=True, pad_mode="reflect",
+            # normalized=False). Keep those coupled semantics explicit rather
+            # than letting an adapter select different defaults.
+            "mode": "center_reflect_unnormalized",
             "outputs": ["magnitude", "phase"],
         },
     ]
@@ -10603,9 +10607,6 @@ def build_speech_enhancement_workflow_metadata(
         "version": "1.0",
         "requirement": "required",
         "outputs": profile_outputs,
-        # Each row is enhanced from its own spectrogram and nothing reduces
-        # across the batch, so a row's values never depend on its co-tenants.
-        "batch_invariance": "row_independent",
     }
 
     metadata: dict[str, Any] = {"schema_version": "v1"}

@@ -211,6 +211,37 @@ def build_transformers_model(
         trust_remote_code=trust_remote_code,
     )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
+        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+
+        if module_class is None and _is_reuse_checkpoint(model_id, revision):
+            from mobius.tasks import SpeechEnhancementTask
+
+            if task not in (None, "speech-enhancement") and not isinstance(
+                task, SpeechEnhancementTask
+            ):
+                raise ValueError("RE-USE checkpoints only support task='speech-enhancement'.")
+            unsupported = {
+                "output_layer_indices": output_layer_indices is not None,
+                "text_only": text_only,
+                "fp8_kv_cache": fp8_kv_cache,
+                "kv_cache_scales": kv_cache_scales is not None,
+                "prune_prefill_prefix": prune_prefill_prefix,
+                "glm_full_attention": glm_full_attention,
+                "export_paged_attention": export_paged_attention,
+            }
+            selected = sorted(name for name, enabled in unsupported.items() if enabled)
+            if selected:
+                raise ValueError(
+                    "RE-USE checkpoints do not support these decoder-only options: "
+                    + ", ".join(selected)
+                )
+            return build_reuse(
+                model_id,
+                revision=revision,
+                dtype=dtype,
+                execution_provider=execution_provider,
+                load_weights=load_weights,
+            )
         if text_only:
             raise ValueError(
                 f"text_only=True is not supported for '{model_id}': it does not "

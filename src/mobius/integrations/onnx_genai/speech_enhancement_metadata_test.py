@@ -103,6 +103,7 @@ class TestMetadata:
         assert spectrogram["n_fft"] == config.n_fft
         assert spectrogram["hop_length"] == config.hop_size
         assert spectrogram["win_length"] == config.win_size
+        assert spectrogram["mode"] == "center_reflect_unnormalized"
         # The model is trained on log1p-compressed magnitudes.
         assert "log1p" in by_op
         assert by_op["log1p"]["inputs"] == ["magnitude"]

@@ -11,11 +11,13 @@ import numpy as np
 import onnx_ir as ir
 import pytest
 
-from mobius import build_from_module
+from mobius import build, build_from_module
 from mobius.models.reuse import (
+    REUSE_REVISION,
     ReUseConfig,
     SEMambaSpeechEnhancementModel,
     _atan2,
+    _effective_revision,
     build_reuse,
 )
 from mobius.tasks import SpeechEnhancementTask, get_task
@@ -133,6 +135,9 @@ class TestReUseConfig:
     def test_validate_rejects_odd_n_fft(self):
         with pytest.raises(ValueError, match="n_fft"):
             ReUseConfig(n_fft=33).validate()
+
+    def test_remote_default_is_pinned(self):
+        assert _effective_revision("nvidia/RE-USE", None) == REUSE_REVISION
 
 
 class TestBuildGraphReUse:
@@ -426,6 +431,32 @@ class TestBuildReUse:
         pkg = build_reuse(str(self._checkpoint_dir(tmp_path)), load_weights=False)
 
         assert "model" in pkg
+
+    def test_public_build_detects_bespoke_checkpoint(self, tmp_path):
+        """The normal API/CLI path detects RE-USE without Transformers metadata."""
+        pytest.importorskip("safetensors")
+        checkpoint = self._checkpoint_dir(tmp_path)
+
+        pkg = build(str(checkpoint), load_weights=False)
+
+        assert set(pkg) == {"model"}
+        assert pkg["model"].metadata_props["mobius.source_revision"] == "local"
+
+    def test_public_build_accepts_task_object(self, tmp_path):
+        pytest.importorskip("safetensors")
+        checkpoint = self._checkpoint_dir(tmp_path)
+
+        pkg = build(
+            str(checkpoint),
+            task=SpeechEnhancementTask(),
+            load_weights=False,
+        )
+
+        assert set(pkg) == {"model"}
+
+    def test_local_revision_metadata_never_claims_a_remote_revision(self, tmp_path):
+        checkpoint = self._checkpoint_dir(tmp_path)
+        assert _effective_revision(str(checkpoint), "unrelated-remote-sha") == "local"
 
     def test_norm_epsilon_reaches_every_normalization(self):
         """``norm_epsilon`` must govern the LayerNorms too, not just the InstanceNorms.

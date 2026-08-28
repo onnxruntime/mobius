@@ -35,8 +35,8 @@ from mobius.components._common import Linear
 from mobius.components._scan_utils import create_body_graph, rename_subgraph_values
 
 
-class SelectiveScan(nn.Module):
-    """Core selective scan (S6) operation.
+class _SelectiveScanBase(nn.Module):
+    """Parameters and projections shared by step-wise and sequence scans.
 
     Args:
         d_inner: Expanded hidden dimension (``expand * d_model``).
@@ -80,6 +80,10 @@ class SelectiveScan(nn.Module):
             _outputs=3,
         )
         return dt_raw, b_mat, c_mat
+
+
+class SelectiveScan(_SelectiveScanBase):
+    """Core single-step selective scan (S6) operation."""
 
     def forward(
         self,
@@ -244,7 +248,7 @@ class JambaSelectiveScan(SelectiveScan):
         )
 
 
-class SequenceSelectiveScan(SelectiveScan):
+class SequenceSelectiveScan(_SelectiveScanBase):
     """Selective scan (S6) over a whole sequence, with no carried state.
 
     Unlike :class:`SelectiveScan`, which advances one token per call and
@@ -268,7 +272,7 @@ class SequenceSelectiveScan(SelectiveScan):
     state in float32.
     """
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         op: OpBuilder,
         x: ir.Value,

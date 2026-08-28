@@ -39,7 +39,9 @@ in the ``nvidia/RE-USE`` repository.
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
+import os
 
 import onnx_ir as ir
 import torch
@@ -61,6 +63,10 @@ _INT64_MIN = -9223372036854775808
 _ENCODER_FREQ_TAIL_PAD = 2
 _ENCODER_FREQ_KERNEL = 3
 _ENCODER_FREQ_STRIDE = 2
+
+# Immutable NVIDIA checkpoint revision used unless callers explicitly select
+# another revision. Config, source, and weights are therefore resolved together.
+REUSE_REVISION = "761905064ea1ea882e015e20a64e2e9d28458890"
 
 
 # ---------------------------------------------------------------------------
@@ -196,18 +202,7 @@ class ReUseConfig(BaseModelConfig):
         ``architectures`` field, so ``transformers.AutoConfig`` cannot read
         it and the generic :func:`mobius.build` entry point does not apply.
         """
-        import json
-        import os
-
-        local = os.path.join(model_id, "config.json")
-        if os.path.isfile(local):
-            path = local
-        else:
-            from huggingface_hub import hf_hub_download
-
-            path = hf_hub_download(model_id, "config.json", revision=revision)
-        with open(path) as f:
-            return cls.from_json(json.load(f))
+        return cls.from_json(_load_config_dict(model_id, revision))
 
 
 # ---------------------------------------------------------------------------
@@ -728,8 +723,9 @@ def build_reuse(
     Args:
         model_id: Local directory or HuggingFace Hub repo holding
             ``config.json`` and ``model.safetensors``.
-        revision: Optional Hub revision (branch, tag, or commit SHA) to pin
-            downloads. Ignored for local directories.
+        revision: Hub revision (branch, tag, or commit SHA) to pin downloads.
+            Defaults to the immutable revision in :data:`REUSE_REVISION` and
+            is ignored for local directories.
         dtype: Override model dtype (e.g. ``"f16"``). Defaults to float32.
         execution_provider: Target execution provider for EP-aware
             optimizations.
@@ -759,18 +755,65 @@ def build_reuse(
             package["model"],
             module.preprocess_weights(_load_state_dict(model_id, revision)),
         )
+    for model in package.values():
+        model.metadata_props["mobius.source_revision"] = _effective_revision(
+            model_id, revision
+        )
     return package
+
+
+def _effective_revision(model_id: str, revision: str | None) -> str:
+    """Return the checkpoint revision recorded on exported artifacts."""
+    if os.path.isdir(model_id):
+        return "local"
+    return revision or REUSE_REVISION
+
+
+def _load_config_dict(model_id: str, revision: str | None) -> dict:
+    """Read the bespoke config from a local directory or pinned Hub revision."""
+    local = os.path.join(model_id, "config.json")
+    if not os.path.isfile(local):
+        from huggingface_hub import hf_hub_download
+
+        local = hf_hub_download(
+            model_id,
+            "config.json",
+            revision=_effective_revision(model_id, revision),
+        )
+    with open(local, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _is_reuse_checkpoint(model_id: str, revision: str | None = None) -> bool:
+    """Return whether a non-Transformers checkpoint has the RE-USE contract."""
+    try:
+        config = _load_config_dict(model_id, revision)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    model_cfg = config.get("model_cfg")
+    stft_cfg = config.get("stft_cfg")
+    return (
+        isinstance(model_cfg, dict)
+        and isinstance(stft_cfg, dict)
+        and all(
+            name in model_cfg
+            for name in ("hid_feature", "num_tfmamba", "d_state", "d_conv", "expand")
+        )
+        and all(name in stft_cfg for name in ("n_fft", "hop_size", "win_size"))
+    )
 
 
 def _load_state_dict(model_id: str, revision: str | None) -> dict[str, torch.Tensor]:
     """Read ``model.safetensors`` from a local directory or the Hub."""
-    import os
-
     from safetensors.torch import load_file
 
     local = os.path.join(model_id, "model.safetensors")
     if not os.path.isfile(local):
         from huggingface_hub import hf_hub_download
 
-        local = hf_hub_download(model_id, "model.safetensors", revision=revision)
+        local = hf_hub_download(
+            model_id,
+            "model.safetensors",
+            revision=_effective_revision(model_id, revision),
+        )
     return load_file(local)
