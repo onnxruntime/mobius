@@ -107,12 +107,29 @@ _AUDIO_BLOCK_STEMS: dict[str, str] = {
     "attn_out.weight": "self_attn.post.weight",
     "attn_k_rel.weight": "self_attn.relative_k_proj.weight",
     "per_dim_scale.weight": "self_attn.per_dim_scale",
-    "norm_conv.weight": "lconv1d.pre_layer_norm.weight",
+    # The converter's historical names are reversed: conv_norm is the
+    # pre-convolution norm and norm_conv is the norm inside the conv module.
+    "conv_norm.weight": "lconv1d.pre_layer_norm.weight",
     "conv_pw1.weight": "lconv1d.linear_start.weight",
     "conv_dw.weight": "lconv1d.depthwise_conv1d.weight",
-    "conv_norm.weight": "lconv1d.conv_norm.weight",
+    "norm_conv.weight": "lconv1d.conv_norm.weight",
     "conv_pw2.weight": "lconv1d.linear_end.weight",
 }
+
+for _gguf_stem, _hf_stem in {
+    "attn_q": "self_attn.q_proj",
+    "attn_k": "self_attn.k_proj",
+    "attn_v": "self_attn.v_proj",
+    "attn_out": "self_attn.post",
+    "conv_pw1": "lconv1d.linear_start",
+    "conv_pw2": "lconv1d.linear_end",
+    "ffn_up": "feed_forward1.ffw_layer_1",
+    "ffn_down": "feed_forward1.ffw_layer_2",
+    "ffn_up_1": "feed_forward2.ffw_layer_1",
+    "ffn_down_1": "feed_forward2.ffw_layer_2",
+}.items():
+    for _bound in ("input_min", "input_max", "output_min", "output_max"):
+        _AUDIO_BLOCK_STEMS[f"{_gguf_stem}.{_bound}"] = f"{_hf_stem}.{_bound}"
 
 _VISION_BLK = re.compile(r"^v\.blk\.(\d+)\.(.+)$")
 _AUDIO_BLK = re.compile(r"^a\.blk\.(\d+)\.(.+)$")
@@ -451,13 +468,8 @@ def map_mmproj_audio_to_hf(name: str) -> str | None:
     """Map a ``clip`` mmproj audio tensor name to its HF Gemma4 name.
 
     Returns the HuggingFace name (``audio_tower.*`` / ``embed_audio.*``), or
-    ``None`` if skipped. See the module docstring: the audio Conformer
-    forward-pass wiring is not yet applied to a built graph, so this is
-    provided and name-tested but treated as experimental by the builder.
+    ``None`` if the tensor belongs to another modality.
     """
-    if is_mmproj_stat_tensor(name):
-        return None
-
     blk = _AUDIO_BLK.match(name)
     if blk is not None:
         idx, stem = blk.group(1), blk.group(2)
@@ -474,6 +486,8 @@ def map_mmproj_audio_to_hf(name: str) -> str | None:
         "a.input_projection.weight": (
             "audio_tower.subsample_conv_projection.input_proj_linear.weight"
         ),
+        "a.pre_encode.out.weight": "audio_tower.output_proj.weight",
+        "a.pre_encode.out.bias": "audio_tower.output_proj.bias",
         "mm.a.input_projection.weight": "embed_audio.embedding_projection.weight",
     }
     return audio_top.get(name)

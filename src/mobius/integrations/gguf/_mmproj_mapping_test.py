@@ -246,13 +246,30 @@ class TestAudioMapping:
                 "mm.a.input_projection.weight",
                 "embed_audio.embedding_projection.weight",
             ),
+            (
+                "a.pre_encode.out.weight",
+                "audio_tower.output_proj.weight",
+            ),
         ],
     )
     def test_audio_names(self, gguf_name: str, expected: str):
         assert map_mmproj_audio_to_hf(gguf_name) == expected
 
-    def test_stat_tensors_skipped(self):
-        assert map_mmproj_audio_to_hf("a.blk.0.attn_q.weight.output_min") is None
+    def test_clipping_bounds_are_mapped(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.attn_q.output_min")
+            == "audio_tower.layers.0.self_attn.q_proj.output_min"
+        )
+
+    def test_historical_conv_norm_names_are_swapped_back(self):
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.conv_norm.weight")
+            == "audio_tower.layers.0.lconv1d.pre_layer_norm.weight"
+        )
+        assert (
+            map_mmproj_audio_to_hf("a.blk.0.norm_conv.weight")
+            == "audio_tower.layers.0.lconv1d.conv_norm.weight"
+        )
 
 
 class TestMuseGlimmerVisionMapping:

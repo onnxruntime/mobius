@@ -112,19 +112,34 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "qwen2vl_merger",
         "qwen2.5vl_merger",
         "gemma3",
+        "gemma3nv",
+        "gemma3na",
         "gemma4v",
+        "gemma4a",
+        "gemma4uv",
+        "gemma4ua",
+        "idefics3",
+        "pixtral",
+        "internvl",
+        "llama4",
         "muse-glimmer",
     )
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
     assert set(pins) == {
         "glm-edge-v-2b-adapter-f16",
         "gemma3-4b-f16",
+        "gemma3n-e4b-f16",
         "gemma4-e2b-f16",
+        "gemma4-unified-12b-f16",
         "llava-llama3-8b-mlp-f16",
         "minicpm-v2-resampler-f16",
         "mobilevlm-1.7b-ldp-f16",
         "mobilevlm-v2-1.7b-ldpv2-f16",
         "muse-glimmer-30b-bf16",
+        "smolvlm-256m-idefics3-f16",
+        "internvl25-1b-f16",
+        "llama4-scout-f16",
+        "pixtral-12b-f16",
         "qwen2-vl-2b-f16",
         "qwen25-vl-3b-f16",
     }
@@ -159,14 +174,13 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
     assert sum(pin.size + (pin.paired_text_size or 0) for pin in cohort) <= 16 * 1024**3
 
 
-def test_deferred_lfm2_and_pixtral_artifacts_are_immutably_available() -> None:
+def test_deferred_and_packed_projector_artifacts_are_immutably_available() -> None:
     pins = {
         (pin.projector_type, pin.filename): pin for pin in MMPROJ_ARTIFACT_AVAILABILITY_PINS
     }
     assert set(pins) == {
         ("lfm2", "mmproj-LFM2-VL-1.6B-F16.gguf"),
         ("lfm2", "mmproj-LFM2-VL-1.6B-Q8_0.gguf"),
-        ("pixtral", "mmproj-pixtral-12b-f16.gguf"),
         ("pixtral", "mmproj-pixtral-12b-Q8_0.gguf"),
     }
     assert {
@@ -187,20 +201,12 @@ def test_deferred_lfm2_and_pixtral_artifacts_are_immutably_available() -> None:
         (
             "ggml-org/pixtral-12b-GGUF",
             "cba1ea4420bc2b4f15f50fdec59e30769880a63c",
-            870_070_176,
-            "b4819558d6524a2e5623a06104ee085253a6dfd2b51470c60771ec33976f81bb",
-        ),
-        (
-            "ggml-org/pixtral-12b-GGUF",
-            "cba1ea4420bc2b4f15f50fdec59e30769880a63c",
             463_091_616,
             "5504fe00067629053e6f99abac05f628c653a50394f4929bcc185bc80a10daf4",
         ),
     }
-    for projector_type in ("lfm2", "pixtral"):
-        spec = get_projector_spec(projector_type)
-        assert not spec.is_importable
-        assert "mapping" in spec.reason or "parity" in spec.reason
+    assert not get_projector_spec("lfm2").is_importable
+    assert get_projector_spec("pixtral").is_importable
 
 
 def test_gemma3_real_artifact_pin_matches_huggingface_api_metadata() -> None:
@@ -279,10 +285,6 @@ def test_vlm_text_cohort_records_exact_companion_identity_without_support_claims
     expected_targets = {
         "qwen3vl_merger": {"qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe"},
         "qwen3a": {"qwen3vl", "qwen3vlmoe"},
-        "gemma3nv": {"gemma3n"},
-        "gemma3na": {"gemma3n"},
-        "pixtral": {"deepseek2", "llama", "mistral3", "mistral4"},
-        "llama4": {"llama4"},
         "qwen2.5o": {"qwen2vl"},
         "paddleocr": {"paddleocr"},
         "cogvlm": {"cogvlm"},
@@ -330,7 +332,7 @@ def test_missing_modality_and_global_projector_fails_closed() -> None:
         projector_type_for_modality({}, MMProjModality.GENERATED_AUDIO)
 
 
-@pytest.mark.parametrize("projector_type", ["gemma4a", "qwen2.5o"])
+@pytest.mark.parametrize("projector_type", ["qwen2.5o"])
 def test_deferred_projector_has_no_dispatch_or_loader_closure(projector_type: str) -> None:
     spec = get_projector_spec(projector_type)
     assert not spec.is_supported
@@ -338,6 +340,43 @@ def test_deferred_projector_has_no_dispatch_or_loader_closure(projector_type: st
     assert spec.required_metadata == ()
     assert spec.required_top_tensors == ()
     assert spec.block_suffixes == ()
+
+
+def test_core_vlm_routes_preserve_roles_pairing_and_bounded_evidence() -> None:
+    from mobius.integrations.gguf._mmproj_registry import MMProjModelRole
+
+    expected = {
+        "gemma3nv": ({"gemma3n"}, MMProjModality.VISION, MMProjModelRole.VISION_ENCODER),
+        "gemma3na": ({"gemma3n"}, MMProjModality.AUDIO, MMProjModelRole.AUDIO_ENCODER),
+        "gemma4a": ({"gemma4"}, MMProjModality.AUDIO, MMProjModelRole.AUDIO_ENCODER),
+        "gemma4uv": ({"gemma4"}, MMProjModality.VISION, MMProjModelRole.VISION_ENCODER),
+        "gemma4ua": ({"gemma4"}, MMProjModality.AUDIO, MMProjModelRole.AUDIO_ENCODER),
+        "idefics3": ({"llama"}, MMProjModality.VISION, MMProjModelRole.VISION_ENCODER),
+        "internvl": ({"qwen2"}, MMProjModality.VISION, MMProjModelRole.VISION_ENCODER),
+        "llama4": ({"llama4"}, MMProjModality.VISION, MMProjModelRole.VISION_ENCODER),
+        "pixtral": ({"llama"}, MMProjModality.VISION, MMProjModelRole.VISION_ENCODER),
+    }
+    pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
+    for projector_type, (targets, modality, role) in expected.items():
+        spec = get_projector_spec(projector_type)
+        assert spec.target_architectures == frozenset(targets)
+        assert spec.primary_modality is modality
+        assert spec.model_roles == (role,)
+        assert spec.sidecar_builder == "core_vlm_projector"
+        assert spec.is_importable
+        assert spec.runtime is Support.DEFERRED
+        for artifact_id in spec.real_artifact_ids:
+            pin = pins[artifact_id]
+            assert pin.size <= 16 * 1024**3
+            assert pin.parity_test
+            assert len(pin.revision) == 40
+            assert len(pin.lfs_sha256) == 64
+
+    assert get_projector_spec("gemma3nv").modalities == frozenset({MMProjModality.VISION})
+    assert get_projector_spec("gemma3na").modalities == frozenset({MMProjModality.AUDIO})
+    assert get_projector_spec("gemma4a").required_top_tensors != (
+        get_projector_spec("gemma4ua").required_top_tensors
+    )
 
 
 @pytest.mark.parametrize("projector_type", ["qwen3tts_gen", "pockettts_gen"])

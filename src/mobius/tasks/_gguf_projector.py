@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._configs import ArchitectureConfig
@@ -39,7 +38,7 @@ class GGUFVisionProjectorTask(ModelTask):
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
-        vision_encoder = module.vision_encoder
+        vision_encoder = module.vision_encoder  # type: ignore[attr-defined]
         input_schema = getattr(vision_encoder, "input_schema", None)
         if not isinstance(input_schema, tuple) or not input_schema:
             raise TypeError("GGUF vision encoder must declare a non-empty input_schema")
@@ -78,7 +77,7 @@ class GGUFSpeakerProjectorTask(ModelTask):
         config: ArchitectureConfig,
     ) -> ModelPackage:
         self._validate_components(module)
-        speaker_encoder = module.speaker_encoder
+        speaker_encoder = module.speaker_encoder  # type: ignore[attr-defined]
         input_schema = getattr(speaker_encoder, "input_schema", None)
         if not isinstance(input_schema, tuple) or not input_schema:
             raise TypeError("GGUF speaker encoder must declare a non-empty input_schema")

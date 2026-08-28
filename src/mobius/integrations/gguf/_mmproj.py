@@ -22,11 +22,9 @@ HF names (:mod:`_mmproj_mapping`) so they flow through the same tested
 ``Gemma4Model.preprocess_weights`` path as a real HF checkpoint.
 
 Audio: :func:`read_mmproj_audio_config` extracts the Conformer
-:class:`Gemma4AudioConfig` and the audio tensor mapping exists
-(:func:`map_mmproj_audio_to_hf`), but the audio encoder is **not** yet wired
-into the assembled package — its Conformer forward-pass weight layout still
-needs validation against llama.cpp's ``clip.cpp`` gemma4a reference.  Pass
-``include_audio=True`` to opt in to the (experimental) audio path.
+:class:`Gemma4AudioConfig`; active ``gemma4a`` and encoder-free ``gemma4ua``
+roles are retained by default. Callers may explicitly request a vision-only
+package with ``include_audio=False``.
 """
 
 from __future__ import annotations
@@ -50,9 +48,11 @@ __all__ = [
 import dataclasses
 import logging
 import math
+import re
+import warnings
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -436,7 +436,9 @@ def read_mmproj_audio_config(gguf_model: Any):
         linear_units=int(md["clip.audio.feed_forward_length"]),
         subsampling_conv_channels=[conv0, conv1],
         output_proj_dims=output_proj_dims,
-        rms_norm_eps=float(md.get("clip.audio.attention.layer_norm_epsilon", 1e-6)),
+        # The converter historically serialized 1e-5 here, while every
+        # Gemma4 audio graph and the upstream loader use 1e-6.
+        rms_norm_eps=1e-6,
     )
 
 
@@ -628,25 +630,25 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
         active_companions.append(companion)
 
     quarantined_names: set[str] = set()
-    for companion in spec.deferred_companions:
-        presence_key = f"clip.has_{companion.modality.value.replace('.', '_')}_encoder"
+    for deferred in spec.deferred_companions:
+        presence_key = f"clip.has_{deferred.modality.value.replace('.', '_')}_encoder"
         if not mmproj_gguf.metadata.get(presence_key):
             continue
         actual_type = projector_type_for_modality(
             mmproj_gguf.metadata,
-            companion.modality,
+            deferred.modality,
         )
-        if actual_type != companion.projector_type:
+        if actual_type != deferred.projector_type:
             raise ValueError(
                 f"{spec.projector_type} sidecar declares deferred "
-                f"{companion.modality.value} projector {actual_type!r}, expected "
-                f"{companion.projector_type!r}."
+                f"{deferred.modality.value} projector {actual_type!r}, expected "
+                f"{deferred.projector_type!r}."
             )
-        for prefix in companion.tensor_prefixes:
+        for prefix in deferred.tensor_prefixes:
             prefixed = {name for name in names if name.startswith(prefix)}
             if not prefixed:
                 raise ValueError(
-                    f"{companion.projector_type} deferred companion has no tensors "
+                    f"{deferred.projector_type} deferred companion has no tensors "
                     f"under required namespace {prefix!r}."
                 )
             quarantined_names.update(prefixed)
@@ -758,6 +760,7 @@ def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) ->
         "attn_pre_norm.weight": (hidden,),
         "attn_post_norm.weight": (hidden,),
         "ln2.weight": (hidden,),
+        "conv_norm.weight": (hidden,),
         "norm_conv.weight": (hidden,),
         "per_dim_scale.weight": (head_dim,),
     }
@@ -771,6 +774,13 @@ def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) ->
 
 
 def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    if spec.sidecar_builder == "core_vlm_projector":
+        from mobius.integrations.gguf._core_vlm_projector import (
+            validate_core_vlm_projector_shapes,
+        )
+
+        validate_core_vlm_projector_shapes(mmproj_gguf, spec.projector_type)
+        return
     if spec.sidecar_builder == "qwen_glm_projector":
         from mobius.integrations.gguf._qwen_glm_projector import (
             validate_qwen_glm_projector_shapes,
@@ -1167,9 +1177,7 @@ def build_mmproj_from_gguf(
 
     resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
     mmproj_gguf = (
-        _mmproj_gguf_model
-        if _mmproj_gguf_model is not None
-        else GGUFModel(resolved_path)
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
     )
     _validate_gguf_model(
         mmproj_gguf,
@@ -1181,6 +1189,13 @@ def build_mmproj_from_gguf(
         projector_type=projector_type,
         target_architecture=target_architecture,
     )
+    if spec.runtime is not Support.SUPPORTED:
+        warnings.warn(
+            f"clip projector {projector_type!r} exports an exact ONNX component, "
+            "but downstream runtime execution remains unvalidated.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     builder_attribute = _MMPROJ_BUILDERS.get(spec.sidecar_builder or "")
     if builder_attribute is None:
         raise RuntimeError(
@@ -2375,6 +2390,19 @@ def _preflight_mmproj_quantization_report(
     from mobius.integrations.gguf._spec import Support
 
     float_type_ids = float_storage_type_ids()
+    metadata = getattr(mmproj_gguf, "metadata", {})
+    vision_projector_type = (
+        projector_type_for_modality(metadata, MMProjModality.VISION) if metadata else "gemma4v"
+    )
+    audio_projector_type = (
+        (
+            projector_type_for_modality(metadata, MMProjModality.AUDIO)
+            if metadata
+            else "gemma4a"
+        )
+        if include_audio
+        else None
+    )
     source_qtypes: list[tuple[str, int]] = []
     records: list[QuantizationTensorRecord] = []
     rejected: list[QuantizationTensorRecord] = []
@@ -2390,11 +2418,25 @@ def _preflight_mmproj_quantization_report(
 
         hf_name = None
         if tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
-            hf_name = map_mmproj_vision_to_hf(tensor.name)
+            if vision_projector_type == "gemma4uv":
+                from mobius.integrations.gguf._core_vlm_projector import (
+                    map_core_vlm_projector_tensor,
+                )
+
+                hf_name = map_core_vlm_projector_tensor(tensor.name, "gemma4uv")
+            else:
+                hf_name = map_mmproj_vision_to_hf(tensor.name)
         elif include_audio and (
             tensor.name.startswith("a.") or tensor.name == "mm.a.input_projection.weight"
         ):
-            hf_name = map_mmproj_audio_to_hf(tensor.name)
+            if audio_projector_type == "gemma4ua":
+                from mobius.integrations.gguf._core_vlm_projector import (
+                    map_core_vlm_projector_tensor,
+                )
+
+                hf_name = map_core_vlm_projector_tensor(tensor.name, "gemma4ua")
+            else:
+                hf_name = map_mmproj_audio_to_hf(tensor.name)
         if hf_name is None:
             # Unmapped tensor (e.g. a different modality, or an unused
             # metadata tensor): still counted in the source qtype census
@@ -2512,7 +2554,7 @@ def build_gemma4_vlm_from_gguf(
     dtype: str | None = None,
     execution_provider: str = "default",
     image_token_id: int | None = None,
-    include_audio: bool = False,
+    include_audio: bool | None = None,
     keep_quantized: bool = True,
     _text_gguf_model: Any | None = None,
     _mmproj_gguf_model: Any | None = None,
@@ -2527,8 +2569,8 @@ def build_gemma4_vlm_from_gguf(
         image_token_id: Vocabulary id of the image soft-token placeholder used
             to scatter image features into text embeddings. When ``None``, the
             value carried by the text config is used (if any).
-        include_audio: When ``True``, also build the (experimental) audio
-            encoder. Off by default — see the module docstring.
+        include_audio: Whether to build an audio role when the sidecar carries
+            one. ``None`` (the default) preserves every active supported role.
         keep_quantized: Preserve the text backbone's GGUF quantization when
             present as quantized target storage. This is the default: decoder projections become
             MatMulNBits and compatible token-embedding tables become
@@ -2560,6 +2602,7 @@ def build_gemma4_vlm_from_gguf(
     import dataclasses
 
     from mobius._builder import resolve_dtype
+    from mobius._configs import Gemma4Config
     from mobius.integrations.gguf._builder import (
         _has_quantized_weights,
         _preflight_quantization_report,
@@ -2568,8 +2611,8 @@ def build_gemma4_vlm_from_gguf(
     )
     from mobius.integrations.gguf._config_mapping import gguf_to_config
     from mobius.integrations.gguf._reader import GGUFModel
-    from mobius.models.gemma4 import Gemma4Model
-    from mobius.tasks._gemma4 import Gemma4Task
+    from mobius.models.gemma4 import Gemma4Model, Gemma4UnifiedModel
+    from mobius.tasks._gemma4 import Gemma4Task, Gemma4UnifiedTask
 
     resolved_text_path = _resolve_local_path(text_gguf_path)
     text_gguf = (
@@ -2607,6 +2650,13 @@ def build_gemma4_vlm_from_gguf(
         source=str(mmproj_gguf_path),
         allow_mmproj_companion=True,
     )
+    vision_projector_type = projector_type_for_modality(
+        mmproj_gguf.metadata,
+        MMProjModality.VISION,
+    )
+    is_unified = vision_projector_type == "gemma4uv"
+    if include_audio is None:
+        include_audio = bool(mmproj_gguf.metadata.get("clip.has_audio_encoder"))
     modalities = (
         (MMProjModality.VISION, MMProjModality.AUDIO)
         if include_audio
@@ -2616,8 +2666,18 @@ def build_gemma4_vlm_from_gguf(
     logger.info("Building Gemma4 VLM from text=%s mmproj=%s", text_gguf_path, mmproj_gguf_path)
 
     # 1. Text config + merged vision/audio sub-configs.
-    config = gguf_to_config(text_gguf)
-    vision_config = read_mmproj_vision_config(mmproj_gguf)
+    config = cast(Gemma4Config, gguf_to_config(text_gguf))
+    if is_unified:
+        from mobius.integrations.gguf._core_vlm_projector import (
+            read_core_vlm_projector_config,
+        )
+
+        vision_config = read_core_vlm_projector_config(
+            mmproj_gguf,
+            "gemma4uv",
+        ).vision
+    else:
+        vision_config = read_mmproj_vision_config(mmproj_gguf)
     if vision_config is None:
         raise ValueError(
             "mmproj GGUF has no vision encoder (clip.has_vision_encoder is unset)."
@@ -2625,7 +2685,14 @@ def build_gemma4_vlm_from_gguf(
     config = dataclasses.replace(config, vision=vision_config)
 
     if include_audio:
-        config = dataclasses.replace(config, audio=read_mmproj_audio_config(mmproj_gguf))
+        if is_unified:
+            audio_config = read_core_vlm_projector_config(
+                mmproj_gguf,
+                "gemma4ua",
+            ).audio
+        else:
+            audio_config = read_mmproj_audio_config(mmproj_gguf)
+        config = dataclasses.replace(config, audio=audio_config)
     else:
         # Vision-only VLM: drop any audio sub-config so the package is the
         # 3-component (decoder + vision + embedding) multimodal shape.
@@ -2638,9 +2705,22 @@ def build_gemma4_vlm_from_gguf(
         if config.image_token_id is not None
         else _token_id(text_gguf, "<|image|>")
     )
-    updates: dict[str, Any] = {"image_token_id": resolved_image_token_id}
-    if include_audio and config.audio_token_id is None:
-        updates["audio_token_id"] = _token_id(text_gguf, "<|audio|>")
+    updates: dict[str, Any] = {
+        "image_token_id": resolved_image_token_id,
+        "model_type": "gemma4_unified" if is_unified else config.model_type,
+    }
+    if include_audio:
+        resolved_audio_token_id = (
+            config.audio_token_id
+            if config.audio_token_id is not None
+            else _token_id(text_gguf, "<|audio|>")
+        )
+        updates["audio_token_id"] = resolved_audio_token_id
+        if config.audio is not None:
+            updates["audio"] = dataclasses.replace(
+                config.audio,
+                audio_token_id=resolved_audio_token_id,
+            )
     config = dataclasses.replace(config, **updates)
     if dtype is not None:
         resolved = resolve_dtype(dtype)
@@ -2701,7 +2781,8 @@ def build_gemma4_vlm_from_gguf(
     #    directly would skip those optimizations.
     from mobius._builder import build_from_module
 
-    module = Gemma4Model(config)
+    module = Gemma4UnifiedModel(config) if is_unified else Gemma4Model(config)
+    task = Gemma4UnifiedTask() if is_unified else Gemma4Task()
 
     def target_name(hf_name: str) -> str:
         if hf_name.startswith("language_model.lm_head."):
@@ -2718,14 +2799,21 @@ def build_gemma4_vlm_from_gguf(
     # afterwards can never introduce a lossy-requantize tensor (mmproj
     # weights always stay float — see _preflight_mmproj_quantization_report),
     # so it cannot change that warning; the merge below must not re-emit it.
+    quantization = config.quantization
     quantization_report = _preflight_quantization_report(
         text_gguf,
         "gemma4",
         module,
         config,
         preserve_quantization=preserve_quantization,
-        target_bits=(config.quantization.bits if preserve_quantization else None),
-        target_block_size=(config.quantization.group_size if preserve_quantization else None),
+        target_bits=(
+            quantization.bits if preserve_quantization and quantization is not None else None
+        ),
+        target_block_size=(
+            quantization.group_size
+            if preserve_quantization and quantization is not None
+            else None
+        ),
         execution_provider=execution_provider,
         name_mapper=lambda name, _architecture: _text_gguf_name_to_hf_multimodal(name),
         target_name_mapper=target_name,
@@ -2736,9 +2824,7 @@ def build_gemma4_vlm_from_gguf(
     quantization_report = _merge_component_quantization_reports(
         quantization_report, mmproj_quantization_report
     )
-    pkg = build_from_module(
-        module, config, task=Gemma4Task(), execution_provider=execution_provider
-    )
+    pkg = build_from_module(module, config, task=task, execution_provider=execution_provider)
     pkg.gguf_quantization_report = quantization_report
     logger.info("Built Gemma4 VLM graph (%d components: %s)", len(pkg), list(pkg))
 
@@ -2757,13 +2843,21 @@ def build_gemma4_vlm_from_gguf(
         )
     else:
         state_dict = _text_gguf_to_hf_multimodal(text_gguf)
-    state_dict.update(_mmproj_vision_to_hf(mmproj_gguf))
-    if include_audio:
-        state_dict.update(_mmproj_audio_to_hf(mmproj_gguf))
+    if is_unified:
+        from mobius.integrations.gguf._core_vlm_projector import (
+            _load_core_vlm_projector_weights,
+        )
 
-    # 4. Run the tested HF→ONNX preprocessing and apply. Names are already
-    #    component-qualified after preprocessing, so no prefix_map is needed.
-    state_dict = module.preprocess_weights(state_dict)
+        state_dict = module.preprocess_weights(state_dict)
+        state_dict.update(_load_core_vlm_projector_weights(mmproj_gguf, "gemma4uv"))
+        if include_audio:
+            state_dict.update(_load_core_vlm_projector_weights(mmproj_gguf, "gemma4ua"))
+    else:
+        state_dict.update(_mmproj_vision_to_hf(mmproj_gguf))
+        if include_audio:
+            state_dict.update(_mmproj_audio_to_hf(mmproj_gguf))
+        # Run the tested HF->ONNX preprocessing for the non-unified layout.
+        state_dict = module.preprocess_weights(state_dict)
     pkg.apply_weights(state_dict)
     logger.info("Applied %d mapped weights to the Gemma4 VLM package", len(state_dict))
     from mobius.integrations.gguf._tokenizer import inspect_gguf_tokenizer
@@ -3048,10 +3142,21 @@ _VLM_BUILDERS: dict[str, str] = {
     "qwen_vl": "build_qwen_vlm_from_gguf",
 }
 
+
 #: Standalone sidecar graph entry points selected by
 #: :attr:`ProjectorSpec.sidecar_builder`. Unlike ``_VLM_BUILDERS``, these
 #: functions never create or silently omit a paired text decoder.
-_MMPROJ_BUILDERS: dict[str, str] = {}
+def _build_core_vlm_projector_mmproj(*args, **kwargs) -> ModelPackage:
+    from mobius.integrations.gguf._core_vlm_projector import (
+        build_core_vlm_projector_mmproj,
+    )
+
+    return build_core_vlm_projector_mmproj(*args, **kwargs)
+
+
+_MMPROJ_BUILDERS: dict[str, str] = {
+    "core_vlm_projector": "_build_core_vlm_projector_mmproj",
+}
 
 
 def _resolve_vlm_builder(text_arch: str, projector_type: str) -> Callable[..., ModelPackage]:
@@ -3116,6 +3221,13 @@ def _mmproj_audio_to_hf(mmproj_gguf: Any) -> dict:
             continue
         values = np.array(mmproj_gguf.get_tensor(name)).astype(np.float32)
         if hf_name.endswith(".per_dim_scale"):
-            values = values.reshape(-1)
+            # Gemma converters store softplus(raw); the model applies softplus.
+            if np.any(values <= 0):
+                raise ValueError(f"{name} must contain positive baked softplus values.")
+            values = np.log(np.expm1(values.astype(np.float64))).astype(np.float32)
+        elif name.endswith(".conv_dw.weight") and values.ndim == 2:
+            values = values[:, None, :]
+        elif name.endswith(_CLIPPING_BOUND_SUFFIXES):
+            values = values.reshape(())
         state_dict[hf_name] = torch.from_numpy(values)
     return state_dict

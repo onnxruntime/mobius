@@ -143,12 +143,12 @@ def test_text_gguf_opener_preserves_resolved_shard_manifest(monkeypatch):
 
 # Small synthetic audio encoder dimensions.
 _AUDIO_HIDDEN = 16
-_AUDIO_FFN = 32
+_AUDIO_FFN = 64
 _AUDIO_LAYERS = 2
 _AUDIO_HEADS = 2
 _NUM_MEL_BINS = 8
 _AUDIO_CONV0 = 16
-_AUDIO_CONV1 = 16
+_AUDIO_CONV1 = 8
 _AUDIO_PROJ_OUT = _TEXT_HIDDEN
 
 
@@ -258,10 +258,14 @@ def _write_clip_mmproj_gguf(
                 "attn_pre_norm",
                 "attn_post_norm",
                 "ln2",
+                "conv_norm",
                 "norm_conv",
             ):
                 _f32(prefix + norm + ".weight", (_AUDIO_HIDDEN,))
-            _f32(prefix + "per_dim_scale.weight", (audio_head_dim,))
+            writer.add_tensor(
+                prefix + "per_dim_scale.weight",
+                np.ones((audio_head_dim,), dtype=np.float32),
+            )
             for stem in ("attn_q", "attn_k", "attn_v", "attn_out", "attn_k_rel"):
                 _f32(prefix + stem + ".weight", (_AUDIO_HIDDEN, _AUDIO_HIDDEN))
             _f32(prefix + "conv_pw1.weight", (2 * _AUDIO_HIDDEN, _AUDIO_HIDDEN))
@@ -331,6 +335,66 @@ def _write_gemma3_mmproj_gguf(
     if extra_tensor is not None:
         add(extra_tensor, (1,))
 
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def _write_gemma4_unified_mmproj_gguf(
+    path: Path,
+    *,
+    vision_projector_type: str = "gemma4uv",
+    audio_projector_type: str = "gemma4ua",
+) -> None:
+    """Write the exact encoder-free Gemma4 unified sidecar closure."""
+    from gguf import GGUFWriter
+
+    vision_hidden = 32
+    audio_hidden = 8
+    patch_size = 1
+    pooling = 3
+    patch_dim = 3 * (patch_size * pooling) ** 2
+    writer = GGUFWriter(str(path), "clip")
+    writer.add_string("general.type", "mmproj")
+    writer.add_bool("clip.has_vision_encoder", True)
+    writer.add_string("clip.vision.projector_type", vision_projector_type)
+    writer.add_uint32("clip.vision.embedding_length", vision_hidden)
+    writer.add_uint32("clip.vision.feed_forward_length", 0)
+    writer.add_uint32("clip.vision.block_count", 0)
+    writer.add_uint32("clip.vision.projection_dim", vision_hidden)
+    writer.add_uint32("clip.vision.attention.head_count", 1)
+    writer.add_float32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+    writer.add_uint32("clip.vision.image_size", 6)
+    writer.add_uint32("clip.vision.patch_size", patch_size)
+    writer.add_array("clip.vision.image_mean", [0.0, 0.0, 0.0])
+    writer.add_array("clip.vision.image_std", [1.0, 1.0, 1.0])
+    writer.add_bool("clip.has_audio_encoder", True)
+    writer.add_string("clip.audio.projector_type", audio_projector_type)
+    writer.add_uint32("clip.audio.embedding_length", audio_hidden)
+    writer.add_uint32("clip.audio.feed_forward_length", 0)
+    writer.add_uint32("clip.audio.block_count", 0)
+    writer.add_uint32("clip.audio.projection_dim", vision_hidden)
+    writer.add_uint32("clip.audio.attention.head_count", 1)
+    writer.add_float32("clip.audio.attention.layer_norm_epsilon", 1e-6)
+    writer.add_uint32("clip.audio.num_mel_bins", 128)
+
+    rng = np.random.default_rng(29)
+
+    def add(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, rng.normal(size=shape).astype(np.float32))
+
+    add("mm.a.input_projection.weight", (vision_hidden, audio_hidden))
+    add("mm.input_projection.weight", (vision_hidden, vision_hidden))
+    add("v.patch_embd.weight", (vision_hidden, patch_dim))
+    add("v.patch_embd.bias", (vision_hidden,))
+    add("v.patch_norm.1.weight", (patch_dim,))
+    add("v.patch_norm.1.bias", (patch_dim,))
+    add("v.patch_norm.2.weight", (vision_hidden,))
+    add("v.patch_norm.2.bias", (vision_hidden,))
+    add("v.position_embd.weight", (2, 4, vision_hidden))
+    add("v.patch_norm.3.weight", (vision_hidden,))
+    add("v.patch_norm.3.bias", (vision_hidden,))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -922,6 +986,97 @@ class TestMultimodalPreflightGuards:
             _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
 
 
+class TestStandaloneCoreProjectorBuild:
+    def test_gemma4a_builds_only_the_audio_role(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_mmproj_from_gguf
+
+        path = tmp_path / "gemma4a.gguf"
+        _write_clip_mmproj_gguf(path, with_audio=True)
+
+        with pytest.warns(RuntimeWarning, match="runtime execution remains unvalidated"):
+            package = build_mmproj_from_gguf(
+                path,
+                projector_type="gemma4a",
+                target_architecture="gemma4",
+            )
+
+        assert set(package) == {"audio_encoder"}
+        assert [value.name for value in package["audio_encoder"].graph.inputs] == [
+            "input_features",
+            "input_features_mask",
+        ]
+
+    @pytest.mark.parametrize(
+        ("projector_type", "expected_role"),
+        [
+            ("gemma4uv", "vision_encoder"),
+            ("gemma4ua", "audio_encoder"),
+        ],
+    )
+    def test_gemma4_unified_roles_build_independently(
+        self,
+        tmp_path: Path,
+        projector_type: str,
+        expected_role: str,
+    ):
+        from mobius.integrations.gguf import build_mmproj_from_gguf
+
+        path = tmp_path / "gemma4u.gguf"
+        _write_gemma4_unified_mmproj_gguf(path)
+
+        with pytest.warns(RuntimeWarning, match="runtime execution remains unvalidated"):
+            package = build_mmproj_from_gguf(
+                path,
+                projector_type=projector_type,
+                target_architecture="gemma4",
+            )
+
+        assert set(package) == {expected_role}
+
+    def test_unified_cross_pairing_fails_closed(self, tmp_path: Path):
+        from mobius.integrations.gguf import build_mmproj_from_gguf
+
+        path = tmp_path / "cross-paired.gguf"
+        _write_gemma4_unified_mmproj_gguf(
+            path,
+            audio_projector_type="gemma4a",
+        )
+
+        with pytest.raises(ValueError, match="companion audio projector"):
+            build_mmproj_from_gguf(
+                path,
+                projector_type="gemma4uv",
+                target_architecture="gemma4",
+            )
+
+    def test_paired_gemma4_builder_dispatches_unified_roles(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "gemma4u.gguf"
+        _write_quantized_gemma4_text_gguf(text_path)
+        _write_gemma4_unified_mmproj_gguf(mmproj_path)
+        text = GGUFModel(str(text_path))
+        text.metadata["tokenizer.ggml.tokens"] = ["<|audio|>", *(["token"] * 63)]
+
+        package = build_gemma4_vlm_from_gguf(
+            text_path,
+            mmproj_path,
+            image_token_id=63,
+            keep_quantized=False,
+            _text_gguf_model=text,
+        )
+
+        assert set(package) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }
+        assert package.config.model_type == "gemma4_unified"
+
+
 class TestGemma3Preflight:
     def _pair(self, tmp_path: Path, *, extra_tensor: str | None = None):
         from mobius.integrations.gguf._reader import GGUFModel
@@ -1305,6 +1460,35 @@ class TestVisionEncoderBuildAndRun:
         assert next(iter(model.graph.inputs[0].shape)) == 1
         assert next(iter(model.graph.inputs[1].shape)) == 1
 
+    def test_full_builder_retains_active_audio_role_by_default(self, tmp_path: Path):
+        from mobius.integrations.gguf._mmproj import build_gemma4_vlm_from_gguf
+        from mobius.integrations.gguf._reader import GGUFModel
+
+        text_path = tmp_path / "gemma4.gguf"
+        mmproj_path = tmp_path / "mmproj.gguf"
+        _write_quantized_gemma4_text_gguf(text_path)
+        _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
+        text = GGUFModel(str(text_path))
+        text.metadata["tokenizer.ggml.tokens"] = ["<|audio|>", *(["token"] * 63)]
+
+        package = build_gemma4_vlm_from_gguf(
+            text_path,
+            mmproj_path,
+            image_token_id=63,
+            _text_gguf_model=text,
+        )
+
+        assert set(package) == {
+            "decoder",
+            "vision_encoder",
+            "audio_encoder",
+            "embedding",
+        }
+        assert [value.name for value in package["audio_encoder"].graph.outputs] == [
+            "audio_features",
+            "audio_features_mask",
+        ]
+
     def test_matches_independent_numpy_reference(self, tmp_path: Path):
         """Check patch, position, pooling, norm, and projection semantics."""
         import onnx_ir as ir
@@ -1528,7 +1712,12 @@ class TestKeepQuantizedMixedPrecision:
         text_gguf = tmp_path / "gemma4-q4-f32-embedding.gguf"
         _write_quantized_gemma4_text_gguf(text_gguf)
 
-        package = build_gemma4_vlm_from_gguf(text_gguf, clip_mmproj_gguf, image_token_id=63)
+        package = build_gemma4_vlm_from_gguf(
+            text_gguf,
+            clip_mmproj_gguf,
+            image_token_id=63,
+            include_audio=False,
+        )
         assert "MatMulNBits" in _component_op_types(package["decoder"])
         assert "GatherBlockQuantized" not in _component_op_types(package["embedding"])
         float_embedding = package["embedding"].graph.initializers[
@@ -1572,12 +1761,18 @@ class TestKeepQuantizedMixedPrecision:
         _write_quantized_gemma4_text_gguf(text_gguf, float_projection=True)
 
         with pytest.raises(ValueError, match=r"would quantize a source-float tensor"):
-            build_gemma4_vlm_from_gguf(text_gguf, clip_mmproj_gguf, image_token_id=63)
+            build_gemma4_vlm_from_gguf(
+                text_gguf,
+                clip_mmproj_gguf,
+                image_token_id=63,
+                include_audio=False,
+            )
 
         package = build_gemma4_vlm_from_gguf(
             text_gguf,
             clip_mmproj_gguf,
             image_token_id=63,
+            include_audio=False,
             keep_quantized=False,
         )
         assert "MatMulNBits" not in _component_op_types(package["decoder"])
@@ -1884,7 +2079,12 @@ class TestGemma4MultimodalQuantizationReportMerge:
         text_gguf = GGUFModel(str(text_path))
         mmproj_gguf = GGUFModel(str(mmproj_path))
 
-        package = build_gemma4_vlm_from_gguf(text_path, mmproj_path, image_token_id=63)
+        package = build_gemma4_vlm_from_gguf(
+            text_path,
+            mmproj_path,
+            image_token_id=63,
+            include_audio=False,
+        )
         report = package.gguf_quantization_report
 
         # The census covers every tensor from BOTH source files (including
