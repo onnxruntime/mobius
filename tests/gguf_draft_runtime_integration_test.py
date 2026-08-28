@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,14 @@ def _evidence() -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _independent_trace(record: dict) -> dict:
+    metadata = record["independent_direct_ort_trace"]
+    path = Path(__file__).parents[1] / "testdata" / "evidence" / metadata["filename"]
+    payload = path.read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == metadata["sha256"]
+    return json.loads(payload)
+
+
 @pytest.mark.integration
 @pytest.mark.integration_slow
 @pytest.mark.parametrize("architecture", ["dflash", "eagle3"])
@@ -34,6 +43,7 @@ def test_real_gguf_draft_pair_direct_ort_acceptance_loop(
         pytest.skip("set MOBIUS_RUN_GGUF_DRAFT_REAL=1 for the <=16 GiB real pair probe")
 
     import onnxruntime as ort
+    from gguf_draft_oracle import IndependentDraftOracle, assert_trace_matches
     from huggingface_hub import hf_hub_download
     from tokenizers import Tokenizer
 
@@ -81,27 +91,47 @@ def test_real_gguf_draft_pair_direct_ort_acceptance_loop(
     options.intra_op_num_threads = min(os.cpu_count() or 1, 8)
     options.inter_op_num_threads = 1
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    runner = DraftPairRunner(output, session_options=options)
     tokenizer = Tokenizer.from_file(str(target_config / "tokenizer.json"))
     prompt = "Here is a quick sort implementation in C++. Just code, no comments:\n\n#include"
     input_ids = np.array([tokenizer.encode(prompt).ids], dtype=np.int64)
-    baseline = runner.generate_target_only(input_ids, max_new_tokens=32)
-    result = runner.generate(
-        input_ids,
-        max_new_tokens=32,
-        max_draft_tokens=(4 if architecture == "eagle3" else None),
+    oracle = IndependentDraftOracle(
+        output,
+        Path(draft_path),
+        session_options=options,
     )
+    trace = oracle.run(input_ids, 32)
+    expected_trace = _independent_trace(record)
+    assert_trace_matches(trace, expected_trace)
+    assert trace["tokens_equal"] is True
+    assert trace["counters"]["accepted"] > 0
+    assert trace["counters"]["multi_token_rounds"] > 0
+    assert trace["counters"]["rejections"] > 0
+    for round_trace in trace["rounds"]:
+        assert round_trace["target"]["replay_tokens_match"] is True
+        assert round_trace["target"]["replay_max_abs"] >= 0
+        assert round_trace["draft"]["replay_max_abs"] == 0
 
-    assert result.tokens == baseline
-    token_sha256 = hashlib.sha256(
-        json.dumps(result.tokens, separators=(",", ":")).encode()
-    ).hexdigest()
-    assert token_sha256 == record["direct_ort_result"]["generated_tokens_sha256"]
-    assert result.stats.accepted_tokens > 0
-    assert result.stats.multi_token_rounds > 0
-    assert result.stats.rollback_events
-    assert result.stats.proposed_tokens > result.stats.accepted_tokens
+    runner = DraftPairRunner(output, session_options=options)
+    production = runner.generate(input_ids, max_new_tokens=32)
+    assert list(production.tokens) == trace["generated_tokens"]
+    assert production.tokens == runner.generate_target_only(input_ids, max_new_tokens=32)
+    assert production.stats.rounds == trace["counters"]["rounds"]
+    assert production.stats.proposed_tokens == trace["counters"]["proposed"]
+    assert production.stats.accepted_tokens == trace["counters"]["accepted"]
+    assert production.stats.multi_token_rounds == trace["counters"]["multi_token_rounds"]
+    assert len(production.stats.rollback_events) == trace["counters"]["rejections"]
+
+    discriminators = record["independent_direct_ort_trace"]["mutation_discriminators"]
+    for mutation, path in discriminators.items():
+        mutated = IndependentDraftOracle(
+            output,
+            Path(draft_path),
+            session_options=options,
+            mutation=mutation,
+        ).run(input_ids, 32)
+        with pytest.raises(AssertionError, match=re.escape(path)):
+            assert_trace_matches(mutated, expected_trace)
 
     runner.close()
-    del runner, package
+    del oracle, runner, package
     gc.collect()

@@ -34,6 +34,20 @@
     "batch_size": 1,
     "beam_reorder_supported": false
   },
+  "independent_direct_ort": {
+    "coordinator": "tests.gguf_draft_oracle.IndependentDraftOracle",
+    "production_runner_imported": false,
+    "transition_helpers_imported": false,
+    "draft_mapping_source": "raw immutable draft GGUF metadata",
+    "sampling": "greedy argmax",
+    "cache_replay_disposition": "Batched verification and accepted-prefix replay can produce different quantized target cache values; every cache tensor state is hashed, maximum absolute differences are recorded, and replay argmax tokens must match exactly.",
+    "mutations": [
+      "draft_mapping",
+      "proposal_order",
+      "cache_copy",
+      "rollback"
+    ]
+  },
   "routes": [
     {
       "architecture": "dflash",
@@ -125,6 +139,16 @@
         "baseline_seconds": 3.3284722499083728,
         "speculative_seconds": 8.09696033410728,
         "timing_disposition": "Functional CPU evidence only; this run was slower and makes no speedup claim."
+      },
+      "independent_direct_ort_trace": {
+        "filename": "gguf_dflash_independent_ort_trace.json",
+        "sha256": "c6a68ae5564f9a4bb8ce70fcc73592869e2a02c6b57b451907a72860cf45a424",
+        "mutation_discriminators": {
+          "draft_mapping": "trace.counters.accepted",
+          "proposal_order": "trace.rounds[0].proposal_tokens[0]",
+          "cache_copy": "trace.rounds[0].draft.committed_sha256",
+          "rollback": "trace.rounds[0].target.committed_length"
+        }
       },
       "upstream_result": {
         "generated_token_count": 66,
@@ -224,6 +248,16 @@
         "baseline_seconds": 4.271001750137657,
         "speculative_seconds": 3.870915165869519,
         "timing_disposition": "Functional CPU evidence only; the observed 1.10x run is not a benchmark claim."
+      },
+      "independent_direct_ort_trace": {
+        "filename": "gguf_eagle3_independent_ort_trace.json",
+        "sha256": "6b28cb17ccc92d4484e9d036ef40a339f261480d6b7d715d3592925b4a495caa",
+        "mutation_discriminators": {
+          "draft_mapping": "trace.counters.accepted",
+          "proposal_order": "trace.rounds[0].proposal_tokens[0]",
+          "cache_copy": "trace.rounds[0].draft.committed_sha256",
+          "rollback": "trace.rounds[0].target.committed_length"
+        }
       },
       "upstream_result": {
         "generated_token_count": 67,

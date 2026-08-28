@@ -761,6 +761,14 @@ def render_document() -> str:
             "higher-level runtimes without gating direct ORT. CLI:",
             "`mobius build-gguf draft.gguf --target-gguf target.gguf",
             "--target-config target-config --output output`.",
+            "The committed real-pair evidence also uses a test-only direct ORT",
+            "coordinator that reads remapping metadata from the raw immutable draft GGUF",
+            "and does not import `DraftPairRunner` or its transition helpers. Per-round",
+            "DFlash and EAGLE3 traces bind proposal/remap tokens, proposal-logit hashes,",
+            "accepted prefixes, correction tokens, target replay, target/draft cache",
+            "states, final counters, and four mutation discriminators. Beam reorder is",
+            "reported unsupported for the batch-size-one reference coordinator rather",
+            "than inferred.",
         )
     )
     return f"""# `build_from_gguf()`

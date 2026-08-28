@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -18,15 +19,27 @@ def _evidence() -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _independent_trace(record: dict) -> dict:
+    metadata = record["independent_direct_ort_trace"]
+    path = Path(__file__).parents[4] / "testdata" / "evidence" / metadata["filename"]
+    payload = path.read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == metadata["sha256"]
+    return json.loads(payload)
+
+
 def test_draft_runtime_evidence_is_bounded_immutable_and_complete() -> None:
     evidence = _evidence()
     policy = evidence["policy"]
+    independent = evidence["independent_direct_ort"]
     assert evidence["schema_version"] == 1
     assert (
         policy["bound_target_draft_source_and_tokenizer_bytes"]
         <= policy["maximum_session_bytes"]
     )
     assert policy["higher_level_runtime_status"] == "runtime_unvalidated"
+    assert independent["production_runner_imported"] is False
+    assert independent["transition_helpers_imported"] is False
+    assert independent["draft_mapping_source"] == "raw immutable draft GGUF metadata"
     assert {record["architecture"] for record in evidence["routes"]} == {
         "dflash",
         "eagle3",
@@ -70,6 +83,43 @@ def test_draft_runtime_evidence_proves_real_speculative_work() -> None:
             "not a benchmark claim" in result["timing_disposition"].lower()
         )
         assert "does not gate" in record["runtime_warning"]
+
+        trace = _independent_trace(record)
+        assert trace["tokens_equal"] is True
+        assert trace["generated_tokens_sha256"] == result["generated_tokens_sha256"]
+        assert trace["counters"] == {
+            "accepted": result["accepted_tokens"],
+            "multi_token_rounds": result["multi_token_rounds"],
+            "proposed": result["proposed_tokens"],
+            "rejections": result["rollback_events"],
+            "rounds": result["rounds"],
+        }
+        assert trace["reorder"]["supported"] is False
+        assert record["independent_direct_ort_trace"]["mutation_discriminators"] == {
+            "draft_mapping": "trace.counters.accepted",
+            "proposal_order": "trace.rounds[0].proposal_tokens[0]",
+            "cache_copy": "trace.rounds[0].draft.committed_sha256",
+            "rollback": "trace.rounds[0].target.committed_length",
+        }
+        assert any(round_trace["accepted_prefix"] > 1 for round_trace in trace["rounds"])
+        assert any(round_trace["accepted_prefix"] == 0 for round_trace in trace["rounds"])
+        for round_trace in trace["rounds"]:
+            assert len(round_trace["proposal_ids"]) == result["draft_width"]
+            assert len(round_trace["proposal_tokens"]) == result["draft_width"]
+            assert re.fullmatch(r"[0-9a-f]{64}", round_trace["proposal_logits_sha256"])
+            assert round_trace["target"]["replay_tokens_match"] is True
+            assert (
+                round_trace["target"]["before_length"]
+                < (round_trace["target"]["tentative_length"])
+            )
+            assert (
+                round_trace["target"]["committed_length"]
+                == (round_trace["target"]["replay_length"])
+            )
+            assert (
+                round_trace["draft"]["committed_length"]
+                == (round_trace["draft"]["replay_length"])
+            )
 
 
 def test_draft_source_fidelity_dispositions_are_truthful() -> None:
