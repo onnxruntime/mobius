@@ -12,7 +12,7 @@ import onnx_ir as ir
 import pytest
 from onnxscript import nn
 
-from mobius._configs import QuantizationConfig
+from mobius._configs import QuantizationConfig, QuantizationOverride
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -282,6 +282,34 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
     stripped = transformers_builder._strip_to_text_only(config, "qwen2")
 
     assert stripped.component_quantization is None
+    assert stripped.quantization is decoder
+
+
+def test_strip_to_text_only_resolves_decoder_module_plan() -> None:
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        overrides={"model.language_model": QuantizationOverride(bits=8, group_size=32)},
+    )
+    config = make_config(
+        quantization=decoder,
+        component_quantization={"decoder": decoder},
+    )
+
+    stripped = transformers_builder._strip_to_text_only(
+        config,
+        "qwen2",
+        decoder_source_paths=(
+            "model.language_model.layers",
+            "model.language_model.norm",
+        ),
+    )
+
+    assert stripped.component_quantization is None
+    assert stripped.quantization is not None
+    assert (stripped.quantization.bits, stripped.quantization.group_size) == (8, 32)
+    assert stripped.quantization.overrides == {}
 
 
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:

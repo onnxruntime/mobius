@@ -25,6 +25,7 @@ from mobius._builder import (
     build_from_module,
     resolve_dtype,
 )
+from mobius._component_quantization import attach_hf_component_sources
 from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
 from mobius.integrations.transformers import (
@@ -374,6 +375,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         parent_config = hf_config
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
+            _reject_unsupported_affine_qwen4,
         )
 
         if _is_qwen4_exp_composite(parent_config):
@@ -431,6 +433,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
         elif task is None:
             task = _default_task_for_model(model_type)
         model_module = module_class(config)
+        attach_hf_component_sources(
+            model_module,
+            model_type=model_type,
+            hf_config=parent_config,
+        )
         pkg = build_from_module(
             model_module,
             config,
@@ -443,6 +450,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
+            _reject_unsupported_affine_qwen4(model_type, config)
             if compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
                 # The same loader owns both faithful native storage and the

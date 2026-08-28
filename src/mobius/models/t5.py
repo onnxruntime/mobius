@@ -13,14 +13,22 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
-from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
+from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
+    preprocess_quantized_weights,
+)
 from mobius.components._activations import ACT2FN
 from mobius.components._common import Embedding, Linear
 from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
 from mobius.components._rms_norm import RMSNorm
-from mobius.models.base import embedding_for_config, linear_class_for_config
+from mobius.models.base import (
+    effective_tie_word_embeddings,
+    embedding_for_config,
+    linear_class_for_config,
+)
 
 # ---------------------------------------------------------------------------
 # T5 Relative Position Bias
@@ -538,6 +546,29 @@ class T5ForConditionalGeneration(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        if self.config.component_quantization is not None and any(
+            name.startswith("shared.") and is_packed_quant_key(name) for name in state_dict
+        ):
+            layouts = []
+            for component in ("encoder", "decoder"):
+                quantization = self.config.quantization_for(component)
+                layouts.append(
+                    (
+                        quantization.bits,
+                        quantization.group_size,
+                        quantization.sym,
+                    )
+                    if quantization is not None
+                    and quantization.quant_method != "none"
+                    and quantization.quantize_embeddings
+                    else None
+                )
+            if layouts[0] != layouts[1]:
+                raise ValueError(
+                    "T5 shared packed embeddings require encoder and decoder "
+                    "components to use the same embedding quantization layout."
+                )
+
         new_state_dict = {}
         for name, tensor in state_dict.items():
             new_name = _rename_t5_weight(name, is_gated_act=self.config.is_gated_act)
@@ -552,6 +583,16 @@ class T5ForConditionalGeneration(nn.Module):
             suffix = name[len("shared.") :]
             new_state_dict.setdefault(f"encoder.embed_tokens.{suffix}", tensor)
             new_state_dict.setdefault(f"decoder.embed_tokens.{suffix}", tensor)
+            del new_state_dict[name]
+        if effective_tie_word_embeddings(self.config):
+            decoder_quantization = self.config.quantization_for("decoder")
+            materialize_split_tied_olive_lm_head(
+                new_state_dict,
+                embed_key="decoder.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+                embedding_quantization=decoder_quantization,
+                head_quantization=decoder_quantization,
+            )
         # Tied lm_head
         if "decoder.lm_head.weight" not in new_state_dict:
             embed = new_state_dict.get("encoder.embed_tokens.weight")

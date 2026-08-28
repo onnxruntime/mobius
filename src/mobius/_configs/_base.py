@@ -532,6 +532,27 @@ class BaseModelConfig:
             None,
         )
 
+    def quantization_for_source_paths(
+        self,
+        component: str,
+        source_paths: tuple[str, ...],
+        *,
+        ignored_source_names: tuple[str, ...] = ("lm_head", "embed_tokens"),
+    ) -> QuantizationConfig | None:
+        """Resolve module-level rules using one component's Hugging Face paths."""
+        quantization = self.quantization_for(component)
+        if quantization is None or not quantization.has_module_plan:
+            return quantization
+        effective_paths = tuple(
+            path
+            for path in source_paths
+            if path.rsplit(".", 1)[-1] not in ignored_source_names
+        )
+        return quantization.for_source_paths(
+            effective_paths or source_paths,
+            component=component,
+        )
+
 
 @dataclasses.dataclass
 class ArchitectureConfig(BaseModelConfig):

@@ -190,6 +190,9 @@ class WhisperForConditionalGeneration(nn.Module):
         "encoder": ("model.encoder",),
         "decoder": ("model.decoder", "proj_out"),
     }
+    COMPONENT_OUTPUT_HEADS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "decoder": ("proj_out",),
+    }
 
     def __init__(self, config: WhisperConfig):
         super().__init__()

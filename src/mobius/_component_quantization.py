@@ -54,6 +54,41 @@ _KNOWN_COMPONENT_NAMES = frozenset(
 )
 
 
+def attach_hf_component_sources(
+    module: nn.Module,
+    *,
+    model_type: str,
+    hf_config: object,
+) -> None:
+    """Attach the runtime HF component map selected for this concrete model."""
+    resolver = getattr(type(module), "get_hf_component_sources", None)
+    if resolver is not None:
+        source_map = resolver(model_type=model_type, hf_config=hf_config)
+    else:
+        source_map = getattr(type(module), "HF_COMPONENT_SOURCES", {})
+    module._hf_component_sources = {
+        component: tuple(paths) for component, paths in source_map.items()
+    }
+
+
+def _component_source_map(module: nn.Module) -> dict[str, tuple[str, ...]]:
+    return getattr(
+        module,
+        "_hf_component_sources",
+        getattr(type(module), "HF_COMPONENT_SOURCES", {}),
+    )
+
+
+def _component_output_head_paths(module: nn.Module, component: str) -> tuple[str, ...]:
+    mapping = getattr(type(module), "COMPONENT_OUTPUT_HEADS", {})
+    aliases = {
+        "decoder": ("decoder", "model"),
+        "model": ("model", "decoder"),
+    }.get(component, (component,))
+    declared = next((tuple(mapping[name]) for name in aliases if name in mapping), ())
+    return tuple(dict.fromkeys(("lm_head", *declared)))
+
+
 def _resolve_path(root: nn.Module, path: str) -> nn.Module | None:
     current: object = root
     for part in path.split("."):
@@ -165,7 +200,7 @@ def _effective_component_quantization(
     if not quantization.has_module_plan:
         return quantization
 
-    source_map = getattr(type(module), "HF_COMPONENT_SOURCES", {})
+    source_map = _component_source_map(module)
     source_paths = tuple(source_map.get(component, ()))
     if not source_paths:
         raise ValueError(
@@ -173,18 +208,119 @@ def _effective_component_quantization(
             f"but {type(module).__name__} declares no HF_COMPONENT_SOURCES entry "
             "from which Mobius can derive a uniform component layout."
         )
-    return quantization.for_source_paths(source_paths, component=component)
+    return config.quantization_for_source_paths(
+        component,
+        source_paths,
+        ignored_source_names=(
+            *_component_output_head_paths(module, component),
+            "embed_tokens",
+        ),
+    )
 
 
 def _float_linear(module: QuantizedLinear) -> Linear:
     return Linear(module._k, module._n, bias=module.bias is not None)
 
 
+class _ScaledEmbedding(Embedding):
+    """Float token embedding that preserves a model's post-gather scale."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int | None,
+        *,
+        embed_scale: float,
+    ):
+        super().__init__(num_embeddings, embedding_dim, padding_idx)
+        self.embed_scale = embed_scale
+
+    def forward(self, op, input_ids):
+        return op.Mul(super().forward(op, input_ids), self.embed_scale)
+
+
+class _ScaledQuantizedEmbedding(QuantizedEmbedding):
+    """Quantized token embedding that preserves a model's post-gather scale."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        bits: int,
+        block_size: int,
+        has_zero_point: bool,
+        padding_idx: int | None,
+        embed_scale: float,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            bits=bits,
+            block_size=block_size,
+            has_zero_point=has_zero_point,
+            padding_idx=padding_idx,
+        )
+        self.embed_scale = embed_scale
+
+    def forward(self, op, input_ids):
+        return op.Mul(super().forward(op, input_ids), self.embed_scale)
+
+
 def _float_embedding(module: QuantizedEmbedding) -> Embedding:
-    return Embedding(
+    args = (
         int(module.qweight.shape[0]),
         module._embedding_dim,
         module.padding_idx,
+    )
+    embed_scale = getattr(module, "embed_scale", None)
+    if embed_scale is not None:
+        return _ScaledEmbedding(*args, embed_scale=float(embed_scale))
+    if type(module).forward is not QuantizedEmbedding.forward:
+        raise TypeError(
+            "Component plan cannot convert specialized quantized embedding "
+            f"{type(module).__name__} to a plain embedding without dropping "
+            "its forward semantics."
+        )
+    return Embedding(*args)
+
+
+def _quantized_embedding(
+    module: Embedding | QuantizedEmbedding,
+    quantization: QuantizationConfig,
+) -> QuantizedEmbedding:
+    if isinstance(module, QuantizedEmbedding):
+        num_embeddings = int(module.qweight.shape[0])
+        embedding_dim = module._embedding_dim
+    else:
+        num_embeddings, embedding_dim = (int(dim) for dim in module.weight.shape)
+    embed_scale = getattr(module, "embed_scale", None)
+    if embed_scale is not None:
+        return _ScaledQuantizedEmbedding(
+            num_embeddings,
+            embedding_dim,
+            bits=quantization.bits,
+            block_size=quantization.group_size,
+            has_zero_point=not quantization.sym,
+            padding_idx=module.padding_idx,
+            embed_scale=float(embed_scale),
+        )
+    if (
+        isinstance(module, QuantizedEmbedding)
+        and type(module).forward is not QuantizedEmbedding.forward
+    ) or (isinstance(module, Embedding) and type(module).forward is not Embedding.forward):
+        raise TypeError(
+            "Component plan cannot quantize specialized embedding "
+            f"{type(module).__name__} without dropping its forward semantics."
+        )
+    return QuantizedEmbedding(
+        num_embeddings,
+        embedding_dim,
+        bits=quantization.bits,
+        block_size=quantization.group_size,
+        has_zero_point=not quantization.sym,
+        padding_idx=module.padding_idx,
     )
 
 
@@ -200,10 +336,53 @@ def _embedding_layout_matches(
     )
 
 
+def _excluded_from_component_quantization(
+    root: nn.Module,
+    path: str,
+    quantization: QuantizationConfig,
+) -> bool:
+    """Return whether a model-declared subtree stays float for this method."""
+    parts = path.split(".")
+    for end in range(1, len(parts) + 1):
+        module = _resolve_path(root, ".".join(parts[:end]))
+        methods = getattr(module, "component_quantization_excluded_methods", ())
+        if quantization.quant_method in methods:
+            return True
+    return False
+
+
+def _component_token_embedding_keys(
+    module: nn.Module,
+    component: str,
+    component_path: str,
+) -> tuple[str, ...]:
+    """Return canonical float keys for token tables owned by one component."""
+    component_module = _component_module(module, component_path)
+    prefixes = {component_path, component} if component_path else {""}
+    keys: set[str] = set()
+    for name, child in component_module.named_modules():
+        if (
+            name
+            and isinstance(child, (Embedding, QuantizedEmbedding))
+            and name.rsplit(".", 1)[-1] in _TOKEN_EMBEDDING_NAMES
+        ):
+            for prefix in prefixes:
+                path = f"{prefix}.{name}" if prefix else name
+                keys.add(f"{path}.weight")
+    return tuple(sorted(keys))
+
+
+def _packed_qweight_for(key: str, float_key: str) -> bool:
+    owner = float_key.removesuffix(".weight")
+    return key in {f"{float_key}_qweight", f"{owner}.qweight"}
+
+
 def _configure_component_module(
     component_module: nn.Module,
     config: BaseModelConfig,
     quantization: QuantizationConfig | None,
+    *,
+    output_head_paths: tuple[str, ...],
 ) -> None:
     """Rewrite float/quantized projection scaffolding for one component."""
     named_modules = list(component_module.named_modules())
@@ -219,10 +398,21 @@ def _configure_component_module(
     for name, child in named_modules:
         if not name:
             continue
-        is_lm_head = name == "lm_head" or name.endswith(".lm_head")
+        is_lm_head = (
+            name == "lm_head" or name.endswith(".lm_head") or name in output_head_paths
+        )
+        excluded = quantization is not None and _excluded_from_component_quantization(
+            component_module,
+            name,
+            quantization,
+        )
 
         if isinstance(child, ClippableQuantizedLinear):
-            if quantization is None or (is_lm_head and not quantization.quantize_lm_head):
+            if (
+                quantization is None
+                or excluded
+                or (is_lm_head and not quantization.quantize_lm_head)
+            ):
                 replacement: nn.Module = ClippableLinear(
                     child._k,
                     child._n,
@@ -239,7 +429,11 @@ def _configure_component_module(
             continue
 
         if isinstance(child, QuantizedLinear):
-            if quantization is None or (is_lm_head and not quantization.quantize_lm_head):
+            if (
+                quantization is None
+                or excluded
+                or (is_lm_head and not quantization.quantize_lm_head)
+            ):
                 replacement = _float_linear(child)
             else:
                 assert linear_factory is not None
@@ -254,58 +448,29 @@ def _configure_component_module(
         if isinstance(child, QuantizedEmbedding):
             if quantization is None or not quantization.quantize_embeddings:
                 replacements.append((name, _float_embedding(child)))
-            elif type(child).forward is not QuantizedEmbedding.forward:
-                if not _embedding_layout_matches(child, quantization):
-                    raise TypeError(
-                        f"Component plan cannot retarget specialized quantized "
-                        f"embedding {name!r} ({type(child).__name__}) to "
-                        f"{quantization.bits}-bit/group-{quantization.group_size}."
-                    )
             elif not _embedding_layout_matches(child, quantization):
-                replacements.append(
-                    (
-                        name,
-                        QuantizedEmbedding(
-                            int(child.qweight.shape[0]),
-                            child._embedding_dim,
-                            bits=quantization.bits,
-                            block_size=quantization.group_size,
-                            has_zero_point=not quantization.sym,
-                            padding_idx=child.padding_idx,
-                        ),
-                    )
-                )
+                replacements.append((name, _quantized_embedding(child, quantization)))
             continue
 
         if quantization is None:
+            continue
+        if excluded:
             continue
         if is_lm_head and not quantization.quantize_lm_head:
             continue
         if name.split(".")[-1] in {"router", "shared_expert_gate"}:
             continue
-        if (
-            isinstance(child, Embedding)
-            and type(child).forward is Embedding.forward
-            and name.rsplit(".", 1)[-1] in _TOKEN_EMBEDDING_NAMES
+        if isinstance(child, Embedding) and name.rsplit(".", 1)[-1] in (
+            _TOKEN_EMBEDDING_NAMES
         ):
-            if (
-                quantization.quantize_embeddings
-                and int(child.weight.shape[1]) % quantization.group_size == 0
-            ):
-                num_embeddings, embedding_dim = (int(dim) for dim in child.weight.shape)
-                replacements.append(
-                    (
-                        name,
-                        QuantizedEmbedding(
-                            num_embeddings,
-                            embedding_dim,
-                            bits=quantization.bits,
-                            block_size=quantization.group_size,
-                            has_zero_point=not quantization.sym,
-                            padding_idx=child.padding_idx,
-                        ),
+            if quantization.quantize_embeddings:
+                if int(child.weight.shape[1]) % quantization.group_size != 0:
+                    raise ValueError(
+                        f"Embedding {name!r} dimension {int(child.weight.shape[1])} "
+                        f"is not divisible by quantization group size "
+                        f"{quantization.group_size}."
                     )
-                )
+                replacements.append((name, _quantized_embedding(child, quantization)))
             continue
         if isinstance(child, Linear) and type(child).forward is Linear.forward:
             assert linear_factory is not None
@@ -386,6 +551,7 @@ def configure_component_quantization(
             _component_module(module, path),
             config,
             quantization,
+            output_head_paths=_component_output_head_paths(module, component),
         )
 
 
@@ -482,11 +648,16 @@ def preprocess_component_quantized_state_dict(
                 f"{packed_expert_key!r} after model preprocessing. Its model "
                 "must provide a component-aware QMoE conversion."
             )
+        output_head_paths = _component_output_head_paths(module, component)
         packed_lm_head = next(
             (
                 key
                 for key in component_weights
-                if key.endswith(("_qweight", ".qweight")) and "lm_head" in key
+                if key.endswith(("_qweight", ".qweight"))
+                and any(
+                    key.startswith(f"{head_path}.") or f".{head_path}." in key
+                    for head_path in output_head_paths
+                )
             ),
             None,
         )
@@ -495,25 +666,50 @@ def preprocess_component_quantized_state_dict(
                 f"Component {component!r} keeps lm_head floating point, but "
                 f"packed checkpoint weight {packed_lm_head!r} was found."
             )
-        packed_embedding = next(
-            (
-                key
-                for key in component_weights
-                if key.endswith(("_qweight", ".qweight"))
-                and any(token in key for token in ("embed_tokens", "embedding"))
-            ),
-            None,
+        embedding_keys = _component_token_embedding_keys(
+            module,
+            component,
+            component_path,
         )
+        packed_embeddings = [
+            (key, embedding_key)
+            for key in component_weights
+            for embedding_key in embedding_keys
+            if _packed_qweight_for(key, embedding_key)
+        ]
+        packed_embedding = packed_embeddings[0][0] if packed_embeddings else None
         if packed_embedding is not None and not quantization.quantize_embeddings:
             raise ValueError(
                 f"Component {component!r} keeps embeddings floating point, but "
                 f"packed checkpoint weight {packed_embedding!r} was found."
             )
+        if len(packed_embeddings) > 1:
+            raise NotImplementedError(
+                f"Component {component!r} contains multiple packed token tables; "
+                "generic component preprocessing currently supports one per component."
+            )
+        if (
+            packed_embedding is not None
+            and quantization.quant_method != "olive"
+            and quantization.quantize_embeddings
+        ):
+            raise NotImplementedError(
+                "Generic component preprocessing supports packed token embeddings "
+                "only for Olive checkpoints."
+            )
+        embed_key = (
+            packed_embeddings[0][1]
+            if packed_embeddings
+            else embedding_keys[0]
+            if len(embedding_keys) == 1
+            else "__mobius_no_token_embedding__.weight"
+        )
 
         converted = preprocess_quantized_weights(
             component_weights,
             quantization,
             tie_embeddings=False,
+            embed_key=embed_key,
             qmoe_target_path=None,
         )
         if len(component_names) == 1:

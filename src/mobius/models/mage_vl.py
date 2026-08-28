@@ -597,8 +597,9 @@ class MageVLForConditionalGeneration(nn.Module):
         renamed: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("model.language_model."):
-                if key == "model.language_model.embed_tokens.weight":
-                    renamed["embedding.embed_tokens.weight"] = value
+                if key.startswith("model.language_model.embed_tokens."):
+                    suffix = key[len("model.language_model.") :]
+                    renamed[f"embedding.{suffix}"] = value
                 else:
                     renamed[f"decoder.{key}"] = value
             elif key.startswith("model.visual."):

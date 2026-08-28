@@ -90,15 +90,6 @@ _GEMMA4_COMPONENT_SOURCES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# Source paths that own quantizable linear projections. Embedding tables and
-# the LM head are controlled by their dedicated QuantizationConfig flags.
-_GEMMA4_QUANTIZATION_SOURCES: dict[str, tuple[str, ...]] = {
-    "decoder": ("model.language_model.layers",),
-    "vision_encoder": _GEMMA4_COMPONENT_SOURCES["vision_encoder"],
-    "audio_encoder": _GEMMA4_COMPONENT_SOURCES["audio_encoder"],
-    "embedding": ("model.language_model.per_layer_model_projection",),
-}
-
 
 def _split_per_layer_projection_weight(
     state_dict: dict[str, torch.Tensor],
@@ -176,40 +167,24 @@ def _component_quantization_config(
     component: str,
 ) -> QuantizationConfig | None:
     """Return the effective packed-linear layout for one Gemma4 component."""
-    quantization = config.quantization_for(component)
     if config.component_quantization is not None:
+        quantization = config.quantization_for_source_paths(
+            component,
+            _GEMMA4_COMPONENT_SOURCES.get(component, ()),
+        )
         return _active_quantization(quantization)
 
+    quantization = config.quantization_for(component)
     quantization = _active_quantization(quantization)
     if quantization is None:
         return None
 
-    source_paths = _GEMMA4_QUANTIZATION_SOURCES[component]
-    plan_names = (
-        *(quantization.modules_to_not_convert or ()),
-        *quantization.overrides,
-    )
-    plan_mentions_component = any(
-        name.startswith("re:")
-        or any(
-            name == prefix or name.startswith(f"{prefix}.") or prefix.startswith(f"{name}.")
-            for prefix in source_paths
-        )
-        for name in plan_names
-    )
-    # Preserve legacy behavior unless the root config explicitly selected
-    # vision or Olive recorded a component-level mixed-precision plan.
-    if component == "vision_encoder" and not (
-        quantization.quantize_vision or plan_mentions_component
-    ):
+    # A top-level module plan does not opt package components into quantization.
+    # Only legacy flags or an explicit component mapping do that.
+    if component == "vision_encoder" and not quantization.quantize_vision:
         return None
-    if component in {"audio_encoder", "embedding"} and not plan_mentions_component:
+    if component in {"audio_encoder", "embedding"}:
         return None
-    if plan_mentions_component:
-        return quantization.for_source_paths(
-            source_paths,
-            component=component,
-        )
     return quantization
 
 
@@ -380,9 +355,7 @@ def _preprocess_component_quantized_weights(
 ) -> dict[str, torch.Tensor]:
     """Convert packed weights with each package component's own layout."""
     root_quantization = _active_quantization(config.quantization)
-    component_mode = config.component_quantization is not None or (
-        root_quantization is not None and root_quantization.has_module_plan
-    )
+    component_mode = config.component_quantization is not None
     if not component_mode:
         if root_quantization is None or root_quantization.quant_method not in {
             "olive",
@@ -2925,8 +2898,7 @@ class _Gemma4VisionEncoderModel(nn.Module):
                 # exposes its layers as "layers" directly, so strip the extra prefix.
                 new_key = new_key.replace("encoder.encoder.", "encoder.", 1)
                 # Flatten Gemma4ClippableLinear's .linear. wrapper
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                new_key = new_key.replace(".linear.", ".")
                 renamed[new_key] = value
             elif key.startswith("embed_vision.embedding_projection."):
                 suffix = key[len("embed_vision.embedding_projection.") :]
@@ -3604,8 +3576,7 @@ class Gemma4Model(nn.Module):
                     "vision_encoder.encoder.encoder.", "vision_encoder.encoder.", 1
                 )
                 # HF uses Gemma4ClippableLinear which adds a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                new_key = new_key.replace(".linear.", ".")
                 renamed[new_key] = value
 
             elif key.startswith("embed_vision.embedding_projection."):
@@ -3618,8 +3589,7 @@ class Gemma4Model(nn.Module):
             elif key.startswith("audio_tower."):
                 new_key = "audio_encoder.encoder." + key[len("audio_tower.") :]
                 # HF Conformer linear layers use a ".linear." infix; strip it
-                new_key = new_key.replace(".linear.weight", ".weight")
-                new_key = new_key.replace(".linear.bias", ".bias")
+                new_key = new_key.replace(".linear.", ".")
                 # HF subsample_conv_projection uses "layerN.conv" / "layerN.norm" names;
                 # our ONNX module uses "convN" / "normN" directly.
                 new_key = new_key.replace(

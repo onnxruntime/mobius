@@ -16,6 +16,7 @@ from mobius._configs import (
     Gemma4AudioConfig,
     Gemma4Config,
     QuantizationConfig,
+    QuantizationOverride,
 )
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
@@ -217,6 +218,41 @@ class TestGemma4ModelPreprocessWeights:
         assert result["vision_encoder.projector.weight"].shape == (64, 2, 8)
         assert result["vision_encoder.projector.scales"].shape == (64, 2)
 
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq"])
+    def test_gptq_awq_clippable_vision_sidecars_drop_linear_wrapper(self, quant_method):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method=quant_method,
+                sym=True,
+                quantize_vision=True,
+            ),
+        )
+        model = Gemma4Model(config)
+        fake_sd = {
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.qweight": torch.zeros(
+                4, 32, dtype=torch.int32
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.scales": torch.ones(
+                2, 32
+            ),
+        }
+
+        result = model.preprocess_weights(fake_sd)
+
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            2,
+            8,
+        )
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.scales"].shape == (
+            32,
+            2,
+        )
+        assert not any(".linear." in name for name in result)
+
     def test_top_level_lm_head_routes_to_decoder(self):
         model = Gemma4Model(_tiny_gemma4_config(tie_word_embeddings=False))
         weight = torch.randn(256, 64)
@@ -371,6 +407,31 @@ class TestGemma4VisionQuantization:
 
         assert not any(node.op_type == "MatMulNBits" for node in graph)
 
+    def test_top_level_vision_override_does_not_enable_vision_quantization(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_vision=False,
+                overrides={
+                    "model.vision_tower": {
+                        "bits": 4,
+                        "group_size": 16,
+                        "sym": True,
+                    }
+                },
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+
+        assert not any(node.op_type == "MatMulNBits" for node in graph)
+
 
 class TestGemma4PerComponentQuantization:
     @staticmethod
@@ -485,6 +546,43 @@ class TestGemma4PerComponentQuantization:
             32,
             4,
             16,
+        )
+
+    def test_component_override_uses_same_layout_for_graph_and_weights(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        override = QuantizationOverride(bits=8, group_size=32)
+        vision_quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            sym=True,
+            overrides={
+                "model.vision_tower": override,
+                "model.embed_vision": override,
+            },
+        )
+        config = self._config()
+        config.component_quantization["vision_encoder"] = vision_quantization
+        model = Gemma4Model(config)
+        graph = Gemma4Task().build(model, config)["vision_encoder"].graph
+
+        result = model.preprocess_weights(
+            {
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                    32, 32, dtype=torch.uint8
+                ),
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                    32, 1
+                ),
+            }
+        )
+
+        assert self._layouts(graph) == {(8, 32)}
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            1,
+            32,
         )
 
 
