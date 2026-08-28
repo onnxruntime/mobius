@@ -136,10 +136,18 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "musicflamingo",
         "lfm2",
         "kimivl",
+        "paddleocr",
+        "lightonocr",
         "cogvlm",
         "janus_pro",
+        "dots_ocr",
+        "dots3note_v",
+        "dots3note_a",
+        "deepseekocr",
+        "deepseekocr2",
         "lfm2a",
         "glm4v",
+        "youtuvl",
         "yasa2",
         "kimik25",
         "nemotron_v2_vl",
@@ -149,6 +157,7 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "granite_speech",
         "mimovl",
         "minimax_m3",
+        "granite4_vision",
         "mimo_audio",
         "parakeet",
         "qwen3tts_spkenc",
@@ -178,6 +187,14 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "qwen2-audio-projector-f16",
         "qwen25-omni-projector-f16",
         "glm4v-projector-f16",
+        "deepseek-ocr-bf16",
+        "deepseek-ocr2-bf16",
+        "dots-ocr-f16",
+        "dots3note-prev-f16",
+        "granite4-vision-4.1-f16",
+        "lightonocr-1b-1025-f16",
+        "paddleocr-vl-1.6-bf16",
+        "youtu-vl-4b-bf16",
     } <= set(pins)
     for projector_type in supported_projector_types():
         spec = get_projector_spec(projector_type)
@@ -332,21 +349,6 @@ def test_gemma3_processor_assets_and_real_contract_are_exactly_pinned() -> None:
     }
 
 
-def test_vlm_text_cohort_records_exact_companion_identity_without_support_claims() -> None:
-    expected_targets = {
-        "paddleocr": {"paddleocr"},
-        "deepseekocr": {"deepseek2-ocr"},
-        "deepseekocr2": {"deepseek2-ocr"},
-    }
-    for projector_type, targets in expected_targets.items():
-        spec = get_projector_spec(projector_type)
-        assert spec.target_architectures == frozenset(targets)
-        assert not spec.is_supported
-        assert set(spec.verdicts.values()) == {Support.DEFERRED}
-        assert spec.builder is None
-        assert spec.required_top_tensors == ()
-
-
 def test_qwen_glm_routes_have_exact_standalone_roles_and_pairing() -> None:
     expected = {
         "glm4v": ({"glm4", "glm4moe"}, (MMProjModelRole.VISION_ENCODER,)),
@@ -407,11 +409,12 @@ def test_every_non_supported_verdict_has_an_actionable_reason() -> None:
 
 
 def test_metadata_schema_captures_the_pinned_absence_of_a_text_encoder() -> None:
-    assert len(CLIP_METADATA_SCHEMA) == 62
+    assert len(CLIP_METADATA_SCHEMA) == 63
     fields = {field.key: field for field in CLIP_METADATA_SCHEMA}
     assert fields["clip.has_vision_encoder"].default is False
     assert fields["clip.has_audio_encoder"].default is False
     assert fields["clip.has_gen_audio_encoder"].default is False
+    assert "clip.vision.expert_count_per_layer" in fields
     assert "Absent from the pinned ABI" in fields["clip.has_text_encoder"].note
 
 

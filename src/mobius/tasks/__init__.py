@@ -48,6 +48,8 @@ __all__ = [
     "GGUFSpeakerProjectorTask",
     "GGUFVisionProjectorModel",
     "GGUFVisionProjectorTask",
+    "GGUFVisionAudioProjectorModel",
+    "GGUFVisionAudioProjectorTask",
     "FunASRSpeechLanguageTask",
     "Gemma3VisionLanguageTask",
     "Gemma3nTask",
@@ -154,6 +156,8 @@ from mobius.tasks._gguf_projector import (
     GGUFAudioProjectorTask,
     GGUFSpeakerProjectorModel,
     GGUFSpeakerProjectorTask,
+    GGUFVisionAudioProjectorModel,
+    GGUFVisionAudioProjectorTask,
     GGUFVisionProjectorModel,
     GGUFVisionProjectorTask,
 )
