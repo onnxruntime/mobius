@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -832,7 +833,7 @@ def test_cli_bad_target_never_mutates_output(tmp_path: Path, existing_output: bo
 
 
 @pytest.mark.parametrize("existing_output", [False, True])
-def test_cli_draft_runtime_rejection_never_mutates_output(
+def test_cli_draft_runtime_export_reaches_advisory_package_writer(
     tmp_path: Path,
     monkeypatch,
     existing_output: bool,
@@ -848,25 +849,32 @@ def test_cli_draft_runtime_rejection_never_mutates_output(
         output.mkdir()
         (output / "sentinel.bin").write_bytes(b"unchanged")
     before = _directory_bytes(output) if existing_output else None
+    package = mock.MagicMock()
+    package.__iter__.return_value = iter(("model",))
     monkeypatch.setattr(
         "mobius.integrations.gguf.build_from_gguf",
-        lambda *args, **kwargs: pytest.fail("build must not start"),
+        lambda *args, **kwargs: package,
+    )
+    writer_calls = []
+    monkeypatch.setattr(
+        "mobius.integrations.gguf.write_gguf_runtime_package",
+        lambda *args, **kwargs: writer_calls.append((args, kwargs)) or {},
     )
 
-    with pytest.raises(SystemExit, match="do not support standalone runtime packaging"):
-        main(
-            [
-                "build-gguf",
-                str(draft),
-                "--target-config",
-                str(target),
-                "--runtime",
-                "onnx-genai",
-                "--output",
-                str(output),
-            ]
-        )
+    main(
+        [
+            "build-gguf",
+            str(draft),
+            "--target-config",
+            str(target),
+            "--runtime",
+            "onnx-genai",
+            "--output",
+            str(output),
+        ]
+    )
 
+    assert writer_calls
     assert output.exists() is existing_output
     if existing_output:
         assert _directory_bytes(output) == before

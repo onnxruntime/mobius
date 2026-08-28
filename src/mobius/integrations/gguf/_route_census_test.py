@@ -48,7 +48,7 @@ def test_every_route_has_one_actionable_classification() -> None:
     allowed = {
         "immediately-implementable",
         "evidence-only",
-        "dependency-or-runtime-abi-blocked",
+        "dependency-or-mobius-abi-blocked",
         "artifact-unavailable",
         "intentionally-rejected",
     }
@@ -63,8 +63,8 @@ def test_every_route_has_one_actionable_classification() -> None:
         "draft": 2,
     }
     assert Counter(item.category for item in items) == {
-        "dependency-or-runtime-abi-blocked": 107,
-        "evidence-only": 100,
+        "dependency-or-mobius-abi-blocked": 99,
+        "evidence-only": 108,
         "immediately-implementable": 47,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
@@ -97,12 +97,12 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
     assert by_id["architecture:glm-dsa"].category == "evidence-only"
     assert by_id["architecture:minimax-m2"].category == "evidence-only"
     assert by_id["architecture:mistral4"].category == "evidence-only"
-    assert by_id["architecture:deepseek4"].category == "dependency-or-runtime-abi-blocked"
-    assert by_id["architecture:rwkv6"].category == "dependency-or-runtime-abi-blocked"
+    assert by_id["architecture:deepseek4"].category == "dependency-or-mobius-abi-blocked"
+    assert by_id["architecture:rwkv6"].category == "dependency-or-mobius-abi-blocked"
     assert by_id["architecture:bailingmoe2"].category == "intentionally-rejected"
-    assert by_id["architecture:plamo3"].category == "dependency-or-runtime-abi-blocked"
-    assert by_id["architecture:plamo2"].category == "dependency-or-runtime-abi-blocked"
-    assert "issue #605" in by_id["architecture:plamo2"].dependencies[0]
+    assert by_id["architecture:plamo3"].category == "dependency-or-mobius-abi-blocked"
+    assert by_id["architecture:plamo2"].category == "evidence-only"
+    assert by_id["architecture:jamba"].category == "evidence-only"
     assert by_id["projector:qwen2vl_merger"].category == "evidence-only"
     assert by_id["projector:lfm2"].category == "immediately-implementable"
     assert by_id["projector:pixtral"].category == "immediately-implementable"
@@ -119,10 +119,10 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
         "tiny_aya",
     ):
         item = by_id[f"tokenizer:{identifier}"]
-        assert item.category == "dependency-or-runtime-abi-blocked"
+        assert item.category == "dependency-or-mobius-abi-blocked"
         assert item.batch == "tokenizer-compiled-semantics"
     assert by_id["mtp:qwen35"].category == "evidence-only"
-    assert by_id["mtp:deepseek2"].category == "dependency-or-runtime-abi-blocked"
+    assert by_id["mtp:deepseek2"].category == "dependency-or-mobius-abi-blocked"
     assert by_id["mtp:exaone4"].category == "intentionally-rejected"
 
 

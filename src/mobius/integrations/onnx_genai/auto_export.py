@@ -861,12 +861,40 @@ def write_onnx_genai_config(
     )
     qwen4_signature = {"ple_input_ids", "past_position_ids"} <= decoder_inputs
     if config_types & {"qwen4_exp", "qwen4_exp_text"} or qwen4_signature:
-        raise ValueError(
-            "onnx-genai cannot represent Qwen4-Exp's required ple_input_ids "
-            "and four-axis position state. Use ModelPackage.save() and the "
-            "decoder's mobius.state_manifest metadata; refusing to write an "
-            "incomplete workflow."
+        os.makedirs(output_dir, exist_ok=True)
+        warning = (
+            "The tested onnx-genai runtime cannot orchestrate Qwen4-Exp's ple_input_ids "
+            "and four-axis position state; component graphs and their exact contracts "
+            "are exported without claiming runtime validation."
         )
+        components = {
+            name: {
+                "inputs": [
+                    value.name for value in model.graph.inputs if value.name is not None
+                ],
+                "outputs": [
+                    value.name for value in model.graph.outputs if value.name is not None
+                ],
+                "metadata": dict(model.metadata_props),
+            }
+            for name, model in pkg.items()
+        }
+        metadata = {
+            "runtime_validation_status": "unsupported-by-tested-runtime",
+            "warnings": [warning],
+            "components": components,
+        }
+        inference_path = os.path.join(output_dir, "inference_metadata.yaml")
+        compatibility_path = os.path.join(output_dir, "runtime_compatibility.json")
+        for path in (inference_path, compatibility_path):
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2)
+                handle.write("\n")
+        _LOGGER.warning("%s", warning)
+        return {
+            "inference_metadata": inference_path,
+            "runtime_compatibility": compatibility_path,
+        }
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
         resolved_config = config if config is not None else getattr(pkg, "config", None)

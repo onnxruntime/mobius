@@ -7618,8 +7618,9 @@ def build_from_gguf(
         separators=(",", ":"),
         sort_keys=True,
     )
-    if spec.runtime is Support.SUPPORTED:
-        if not gguf_model.source_matches_path():
+    source_matches_path = getattr(gguf_model, "source_matches_path", None)
+    if source_matches_path is not None:
+        if not source_matches_path():
             raise ValueError(
                 "GGUF source changed after the reader opened it; refusing to bind the graph "
                 "to a different artifact identity."
@@ -7632,7 +7633,7 @@ def build_from_gguf(
             architecture=spec.gguf_arch,
             filename=logical_source_filename,
         )
-        if not gguf_model.source_matches_path():
+        if not source_matches_path():
             raise ValueError(
                 "GGUF source changed while its graph and artifact identity were being built."
             )

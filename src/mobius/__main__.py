@@ -511,15 +511,6 @@ def _save_package(
 ) -> None:
     """Save a ModelPackage to disk, applying optimizations and runtime configs."""
     runtime = getattr(args, "runtime", None)
-    if runtime == "ort-genai":
-        from mobius.integrations.ort_genai.auto_export import (
-            _validate_ort_genai_compatibility,
-        )
-
-        try:
-            _validate_ort_genai_compatibility(pkg)
-        except ValueError as error:
-            raise SystemExit(f"Error: {error}") from error
 
     components = (lambda name: name == component_filter) if component_filter else None
     for name, model in pkg.items():
@@ -703,11 +694,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
-    if target_config is not None and runtime is not None:
-        raise SystemExit(
-            "Error: dflash/eagle3 target-coupled drafts do not support standalone "
-            "runtime packaging; omit --runtime to save the auxiliary graph and manifest."
-        )
     tokenizer_repository = getattr(args, "tokenizer_repository", None)
     tokenizer_revision = getattr(args, "tokenizer_revision", None)
     if (tokenizer_repository is None) != (tokenizer_revision is None):
@@ -720,35 +706,26 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         )
 
     if runtime is not None:
-        from mobius.integrations.gguf._arch_registry import get_arch_spec
         from mobius.integrations.gguf._builder import (
             _resolve_gguf_path,
             _validate_gguf_model,
         )
         from mobius.integrations.gguf._shard_set import open_gguf_model
-        from mobius.integrations.gguf._spec import Support
 
-        # Resolve and validate the exact selected source before graph construction
-        # so a deferred tokenizer cannot leave a graph-only directory behind.
+        # Resolve and validate the exact selected source before graph construction.
         resolved_gguf_path = _resolve_gguf_path(gguf_path)
         gguf_model = open_gguf_model(resolved_gguf_path)
         _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
-        architecture_spec = get_arch_spec(gguf_model.architecture)
-        if architecture_spec.runtime is not Support.SUPPORTED:
-            raise SystemExit(
-                f"Error: GGUF runtime packaging for {architecture_spec.gguf_arch!r} is "
-                f"{architecture_spec.runtime.value}: {architecture_spec.reason}"
-            )
-        if tokenizer_repository is None or tokenizer_revision is None:
-            raise SystemExit(
-                "Error: GGUF runtime packaging requires --tokenizer-repository and an "
-                "immutable --tokenizer-revision."
-            )
-        if tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/")):
+        if tokenizer_repository is not None and (
+            tokenizer_repository.count("/") != 1 or not all(tokenizer_repository.split("/"))
+        ):
             raise SystemExit(
                 "Error: --tokenizer-repository must be an owner/repository Hub ID."
             )
-        if re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None:
+        if (
+            tokenizer_revision is not None
+            and re.fullmatch(r"[0-9a-f]{40}", tokenizer_revision) is None
+        ):
             raise SystemExit(
                 "Error: --tokenizer-revision must be an immutable 40-hex commit SHA."
             )
