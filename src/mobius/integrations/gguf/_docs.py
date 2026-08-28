@@ -13,6 +13,7 @@ __all__ = [
     "update_document",
 ]
 
+import json
 import re
 from collections import Counter
 from pathlib import Path
@@ -24,6 +25,7 @@ from mobius.integrations.gguf._arch_registry import (
 from mobius.integrations.gguf._artifact_blocker_evidence import (
     iter_artifact_blocker_evidence,
 )
+from mobius.integrations.gguf._draft import has_direct_draft_runtime
 from mobius.integrations.gguf._mmproj_registry import (
     LLAMA_CPP_MMPROJ_SHA,
     MMPROJ_ARTIFACT_AVAILABILITY_PINS,
@@ -58,6 +60,10 @@ from mobius.integrations.gguf._upstream import (
     UPSTREAM_COMMIT,
     UPSTREAM_DATE,
     upstream_architectures,
+)
+
+_DRAFT_RUNTIME_EVIDENCE_PATH = (
+    Path(__file__).parents[4] / "testdata" / "evidence" / "gguf_draft_runtime_evidence.json"
 )
 
 DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
@@ -172,6 +178,12 @@ def _reason_code(verdicts: dict[str, Support]) -> str:
 
 
 def _architecture_reason(spec: GGUFArchitectureSpec) -> str:
+    if has_direct_draft_runtime(spec.gguf_arch):
+        return (
+            "DIRECT_ORT_EVIDENCED / RUNTIME_UNVALIDATED — Exact target-coupled "
+            "direct ORT acceptance, rollback, and deterministic generation are evidenced; "
+            "higher-level runtime compatibility remains advisory."
+        )
     capabilities = dict(spec.capabilities)
     code = _reason_code(capabilities).partition(" — ")[0]
     reason = spec.reason
@@ -686,6 +698,35 @@ def _projector_availability_table() -> str:
     return "\n".join(rows)
 
 
+def _draft_runtime_evidence_summary() -> str:
+    evidence = json.loads(_DRAFT_RUNTIME_EVIDENCE_PATH.read_text(encoding="utf-8"))
+    summaries = []
+    for record in evidence["routes"]:
+        result = record["direct_ort_result"]
+        fidelity = record["source_fidelity"]
+        fidelity_summary = (
+            "source tensors exact"
+            if fidelity.get("all_types_shapes_values_equal")
+            else (
+                f"source cosine={fidelity['cosine']:.6f}, "
+                f"relative-L2={fidelity['relative_l2']:.6f}"
+            )
+        )
+        summaries.append(
+            f"`{record['architecture']}`: "
+            f"{result['generated_token_count']} target-only-equal greedy tokens; "
+            f"{result['accepted_tokens']}/{result['proposed_tokens']} accepted; "
+            f"{result['multi_token_rounds']} multi-token rounds; "
+            f"{result['rollback_events']} rollbacks; {fidelity_summary}"
+        )
+    return (
+        "Pinned DFlash/EAGLE3 source, artifact, tokenizer, graph, and package hashes live in "
+        "`testdata/evidence/gguf_draft_runtime_evidence.json`: "
+        + "; ".join(summaries)
+        + ". Both use separate target/draft caches; higher-level runtime=`runtime_unvalidated`."
+    )
+
+
 def render_document() -> str:
     """Render the complete concise API document from live registries and evidence."""
     blocks = render_blocks()
@@ -737,6 +778,8 @@ a proven graph: the API returns the model, emits one structured warning, omits a
 and persists the exact component disposition in `export_report.json`. Lossy qtype
 conversion remains in `quantization_report.json`; use `keep_quantized=False` for float.
 
+For target-coupled DFlash/EAGLE3, use `build_draft_pair_from_gguf`, `write_draft_pair_package`, and `DraftPairRunner`; the package carries independent caches and required target bridges, while `runtime_unvalidated` warns about higher-level runtimes without gating direct ORT. CLI: `mobius build-gguf draft.gguf --target-gguf target.gguf --target-config target-config --output output`.
+
 Packed MatMulNBits storage may use a native op or portable nibble unpack,
 `DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
 Use `mmproj=` only for evidenced sidecars; CLI: `mobius build model.gguf -o output`.
@@ -760,6 +803,7 @@ build_from_gguf(
     allow_dense_moe=None,
     reuse_gguf_weights=False,
     target_config=None,
+    output_layer_indices=None,
 )
 ```
 
@@ -786,6 +830,8 @@ network-free selection, budget, exclusions, and fail-closed candidate reasons ar
 `testdata/evidence/gguf_low_cost_runtime_batch.json`.
 
 {_runtime_evidence_table()}
+
+{_draft_runtime_evidence_summary()}
 
 Runtime support above is independent from tokenizer materialization support below.
 ### Fail-closed runtime evidence

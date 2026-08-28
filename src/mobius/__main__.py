@@ -678,7 +678,9 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     gguf_reference = gguf_path
     output_dir = args.output_dir
     target_config = getattr(args, "target_config", None)
+    target_gguf = getattr(args, "target_gguf", None)
     runtime = getattr(args, "runtime", None)
+    draft_pair = target_gguf is not None
 
     if args.max_seq_len is not None and not args.static_cache:
         raise SystemExit("Error: --max-seq-len can only be used with --static-cache.")
@@ -688,18 +690,25 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         raise SystemExit("Error: --max-workers must be a positive integer.")
     if mmproj_path is not None and args.static_cache:
         raise SystemExit("Error: --static-cache cannot be used with --mmproj.")
+    if draft_pair and target_config is None:
+        raise SystemExit("Error: --target-gguf requires --target-config.")
+    if draft_pair and (mmproj_path is not None or args.static_cache or reuse_gguf_weights):
+        raise SystemExit(
+            "Error: --target-gguf cannot be combined with --mmproj, --static-cache, "
+            "or --reuse-gguf-weights."
+        )
     tokenizer_repository = getattr(args, "tokenizer_repository", None)
     tokenizer_revision = getattr(args, "tokenizer_revision", None)
     if (tokenizer_repository is None) != (tokenizer_revision is None):
         raise SystemExit(
             "Error: --tokenizer-repository and --tokenizer-revision must be provided together."
         )
-    if runtime is None and tokenizer_repository is not None:
+    if (runtime is None or draft_pair) and tokenizer_repository is not None:
         raise SystemExit(
             "Error: pinned tokenizer materialization is only available with --runtime."
         )
 
-    if runtime is not None:
+    if runtime is not None and not draft_pair:
         from mobius.integrations.gguf._builder import (
             _resolve_gguf_path,
             _validate_gguf_model,
@@ -726,35 +735,59 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
                 "Error: --tokenizer-revision must be an immutable 40-hex commit SHA."
             )
 
-    pkg = build_from_gguf(
-        gguf_reference,
-        mmproj=mmproj_path,
-        image_token_id=args.image_token_id,
-        dtype=args.dtype,
-        keep_quantized=keep_quantized,
-        execution_provider=args.execution_provider,
-        static_cache=args.static_cache,
-        max_seq_len=args.max_seq_len,
-        reuse_gguf_weights=reuse_gguf_weights,
-        target_config=target_config,
-        _gguf_model=gguf_model if runtime is not None else None,
-    )
+    if draft_pair:
+        from mobius.integrations.gguf import build_draft_pair_from_gguf
+
+        pkg = build_draft_pair_from_gguf(
+            target_gguf,
+            gguf_reference,
+            target_config=target_config,
+            dtype=args.dtype,
+            keep_quantized=keep_quantized,
+            execution_provider=args.execution_provider,
+        )
+        if runtime is not None:
+            print(
+                f"Warning: --runtime {runtime} does not claim downstream draft execution; "
+                "saving the direct-ORT package with runtime=runtime_unvalidated."
+            )
+            runtime = None
+    else:
+        pkg = build_from_gguf(
+            gguf_reference,
+            mmproj=mmproj_path,
+            image_token_id=args.image_token_id,
+            dtype=args.dtype,
+            keep_quantized=keep_quantized,
+            execution_provider=args.execution_provider,
+            static_cache=args.static_cache,
+            max_seq_len=args.max_seq_len,
+            reuse_gguf_weights=reuse_gguf_weights,
+            target_config=target_config,
+            _gguf_model=gguf_model if runtime is not None else None,
+        )
 
     if args.release:
         for model in pkg.values():
             strip_debug_metadata(model)
 
     if runtime is None:
-        if getattr(pkg, "export_report", None) is None:
-            os.makedirs(output_dir, exist_ok=True)
-        pkg.save(
-            output_dir,
-            external_data=args.external_data,
-            max_shard_size_bytes=(
+        save_kwargs = {
+            "external_data": args.external_data,
+            "max_shard_size_bytes": (
                 _parse_size(args.max_shard_size) if args.max_shard_size else None
             ),
-            max_workers=args.max_workers,
-        )
+            "max_workers": args.max_workers,
+        }
+        if draft_pair:
+            from mobius.integrations.gguf import write_draft_pair_package
+
+            artifacts = write_draft_pair_package(pkg, output_dir, **save_kwargs)
+        else:
+            if getattr(pkg, "export_report", None) is None:
+                os.makedirs(output_dir, exist_ok=True)
+            pkg.save(output_dir, **save_kwargs)
+            artifacts = {}
         _print_saved_gguf_models(pkg, output_dir)
         _print_gguf_export_status(pkg, output_dir, runtime=runtime)
 
@@ -769,7 +802,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             print(f"Saved mtp head to {os.path.join(output_dir, mtp_dir, 'model.onnx')}")
 
         draft_manifest = getattr(pkg, "draft_manifest", None)
-        if draft_manifest is not None:
+        if draft_manifest is not None and not draft_pair:
             if getattr(pkg, "export_report", None) is None:
                 from mobius.integrations.gguf._draft import write_draft_manifest
 
@@ -777,6 +810,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             else:
                 manifest_path = os.path.join(output_dir, "draft_manifest.json")
             print(f"Saved draft pairing manifest to {manifest_path}")
+        elif draft_pair:
+            print(f"Saved draft pairing manifest to {artifacts['manifest']}")
 
     if runtime in ("onnx-genai", "ort-genai"):
         from mobius.integrations.gguf import write_gguf_runtime_package
@@ -1409,6 +1444,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Exact target model directory or config.json for a dflash/eagle3 "
             "speculative draft. The adjacent tokenizer.json is required and its "
             "ordered vocabulary must exactly match the GGUF tokenizer."
+        ),
+    )
+    gguf_parser.add_argument(
+        "--target-gguf",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Exact target GGUF for a dflash/eagle3 pair. Emits target and draft "
+            "graphs, independent cache namespaces, required embedding/head bridges, "
+            "and a runtime_unvalidated direct-ORT manifest."
         ),
     )
     gguf_parser.add_argument(

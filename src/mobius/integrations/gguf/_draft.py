@@ -26,6 +26,11 @@ def is_draft_architecture(architecture: str) -> bool:
     return architecture in _DRAFT_ARCHITECTURES
 
 
+def has_direct_draft_runtime(architecture: str) -> bool:
+    """Return whether Mobius ships a target-paired direct ORT coordinator."""
+    return architecture in _DRAFT_ARCHITECTURES
+
+
 def _ordered_tokenizer_vocab(
     tokenizer_json: Mapping[str, Any],
     *,
@@ -108,9 +113,26 @@ def _ordered_tokenizer_vocab(
         if tokens[index] not in (None, token):
             raise ValueError(f"target tokenizer id {index} has conflicting token values")
         tokens[index] = token
-    if any(token is None for token in tokens):
-        missing = [index for index, token in enumerate(tokens) if token is None]
-        raise ValueError(f"target tokenizer vocabulary has unmapped ids: {missing[:8]}")
+    missing = [index for index, token in enumerate(tokens) if token is None]
+    if missing:
+        first_missing = missing[0]
+        if missing != list(range(first_missing, expected_vocab_size)):
+            raise ValueError(
+                f"target tokenizer vocabulary has unmapped non-trailing ids: {missing[:8]}"
+            )
+        padding = [f"[PAD{index}]" for index in missing]
+        mapped_tokens = {token for token in tokens if token is not None}
+        collisions = [token for token in padding if token in mapped_tokens]
+        if collisions:
+            raise ValueError(
+                "target tokenizer vocabulary has trailing padding names that collide "
+                f"with mapped tokens: {collisions[:8]}"
+            )
+        # llama.cpp fills model-only vocabulary rows that have no tokenizer id
+        # with deterministic UNUSED tokens. The later full-list comparison still
+        # requires the draft GGUF to contain these exact placeholders.
+        for index, token in zip(missing, padding):
+            tokens[index] = token
     return [str(token) for token in tokens]
 
 
@@ -382,9 +404,12 @@ def _load_target(
         limit=_MAX_TOKENIZER_JSON_BYTES,
     )
     target = _flatten_text_config(data)
+    expected_vocab_size = target.get("vocab_size")
+    if type(expected_vocab_size) is not int:
+        raise ValueError("target config vocab_size must be an integer")
     ordered_vocab = _ordered_tokenizer_vocab(
         tokenizer,
-        expected_vocab_size=target.get("vocab_size"),
+        expected_vocab_size=expected_vocab_size,
     )
     from tokenizers import Tokenizer
 
@@ -528,6 +553,8 @@ def validate_draft_pairing(
         )
 
     if architecture == "dflash":
+        if not isinstance(config, DFlashConfig):
+            raise TypeError("dflash pairing requires DFlashConfig")
         sliding_keys = (
             "dflash.attention.sliding_window",
             "dflash.attention.sliding_window_pattern",
@@ -546,14 +573,20 @@ def validate_draft_pairing(
         if not config.block_size or config.block_size <= 0:
             raise ValueError("dflash.block_size must be a positive integer")
     else:
+        if not isinstance(config, Eagle3Config):
+            raise TypeError("eagle3 pairing requires Eagle3Config")
         if config.target_hidden_size != target_hidden:
             raise ValueError(
                 f"eagle3.target_hidden_size={config.target_hidden_size} does not match "
                 f"target hidden_size={target_hidden}"
             )
-        if target_hidden != config.hidden_size:
+        borrows_target_embedding = "token_embd.weight" not in gguf_model.tensor_names
+        borrows_target_lm_head = "output.weight" not in gguf_model.tensor_names
+        if (
+            borrows_target_embedding or borrows_target_lm_head
+        ) and target_hidden != config.hidden_size:
             raise ValueError(
-                "eagle3 target-shared embeddings require target_hidden_size to equal "
+                "eagle3 target-shared embedding/head requires target_hidden_size to equal "
                 f"draft hidden_size, got target={target_hidden}, draft={config.hidden_size}"
             )
 
@@ -573,7 +606,7 @@ def validate_draft_pairing(
         "kind": "speculative-draft",
         "architecture": architecture,
         "standalone": False,
-        "runtime": "deferred",
+        "runtime": "runtime_unvalidated",
         "target": {
             **target_identity,
             "model_type": target.get("model_type"),
@@ -590,12 +623,18 @@ def validate_draft_pairing(
             "num_key_value_heads": config.num_key_value_heads,
             "intermediate_size": config.intermediate_size,
             "block_size": getattr(config, "block_size", None),
+            "mask_token_id": getattr(config, "mask_token_id", None),
+            "head_dim": config.head_dim,
             "draft_vocab_size": len(remap) if remap is not None else target_vocab,
         },
         "draft_to_target": remap,
         "orchestration": {
             "standalone_dispatch": "rejected",
-            "embedding_source": "target",
+            "embedding_source": (
+                "draft"
+                if architecture == "eagle3" and "token_embd.weight" in gguf_model.tensor_names
+                else "target"
+            ),
             "lm_head_source": "draft" if has_draft_head else "target",
             "graph_output": output_name,
             "logits_vocabulary": (
@@ -640,6 +679,11 @@ def validate_draft_tensor_contract(gguf_model: Any) -> None:
         "output.weight": (target_vocab, hidden),
     }
     if architecture == "dflash":
+        if "token_embd.weight" in actual:
+            raise ValueError(
+                "dflash GGUF contains a draft-owned token_embd.weight, but the "
+                "current draft graph consumes target-provided noise_embedding"
+            )
         required["enc.output_norm.weight"] = (hidden,)
         layer_shapes = {
             "attn_q.weight": (heads * head_dim, hidden),
@@ -690,12 +734,6 @@ def validate_draft_tensor_contract(gguf_model: Any) -> None:
         raise ValueError(
             "eagle3 cannot share a target lm_head with a reduced draft vocabulary"
         )
-    if "token_embd.weight" in actual:
-        raise ValueError(
-            f"{architecture} GGUF contains a draft-owned token_embd.weight, but the Mobius "
-            "draft graph consumes target-provided inputs_embeds and will not ignore it"
-        )
-
     allowed_stems = set(required) | set(optional)
     unexpected = []
     for name in actual:

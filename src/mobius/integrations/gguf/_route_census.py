@@ -17,7 +17,10 @@ from collections import defaultdict
 from typing import Literal
 
 from mobius.integrations.gguf._arch_registry import iter_arch_specs
-from mobius.integrations.gguf._draft import is_draft_architecture
+from mobius.integrations.gguf._draft import (
+    has_direct_draft_runtime,
+    is_draft_architecture,
+)
 from mobius.integrations.gguf._mmproj_registry import iter_projector_specs
 from mobius.integrations.gguf._mtp import mtp_architecture_capabilities
 from mobius.integrations.gguf._spec import Support
@@ -187,7 +190,9 @@ def _architecture_dependencies(spec) -> tuple[str, ...]:
 def _architecture_items() -> list[GGUFRouteWorkItem]:
     items = []
     for spec in iter_arch_specs():
-        if spec.runtime is Support.SUPPORTED:
+        if spec.runtime is Support.SUPPORTED or (
+            is_draft_architecture(spec.gguf_arch) and has_direct_draft_runtime(spec.gguf_arch)
+        ):
             continue
         reason = spec.reason or "Registry has no reason."
         core_verdicts = (spec.config, spec.tensor_map, spec.graph, spec.runtime)
@@ -367,7 +372,7 @@ def _draft_items() -> list[GGUFRouteWorkItem]:
             reason,
         )
         for architecture in ("dflash", "eagle3")
-        if is_draft_architecture(architecture)
+        if is_draft_architecture(architecture) and not has_direct_draft_runtime(architecture)
     ]
 
 

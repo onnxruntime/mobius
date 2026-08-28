@@ -344,6 +344,46 @@ def test_target_manifest_hashes_full_tokenizer_semantics(tmp_path: Path) -> None
     assert first_target["tokenizer_sha256"] != second_target["tokenizer_sha256"]
 
 
+def test_target_tokenizer_accepts_only_exact_trailing_gguf_padding(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    real_tokens = [f"token-{index}" for index in range(60)]
+    padded_tokens = [*real_tokens, *[f"[PAD{index}]" for index in range(60, 64)]]
+    target = _target(padded_tokens, tokenizer_json=_tokenizer(real_tokens))
+    exact = _write_draft(
+        tmp_path / "dflash-padded.gguf",
+        "dflash",
+        tokens=padded_tokens,
+    )
+
+    manifest = build_from_gguf(exact, target_config=target).draft_manifest
+
+    assert manifest["target"]["vocab_size"] == 64
+    assert manifest["target"]["tokenizer_tokens_sha256"]
+
+    mismatched_tokens = [*padded_tokens[:-1], "not-the-upstream-padding-token"]
+    mismatched = _write_draft(
+        tmp_path / "dflash-mismatched-padding.gguf",
+        "dflash",
+        tokens=mismatched_tokens,
+    )
+    with pytest.raises(ValueError, match="tokenizer is not identical"):
+        build_from_gguf(mismatched, target_config=target)
+
+
+def test_target_tokenizer_rejects_unmapped_interior_ids(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    tokens = [f"token-{index}" for index in range(64)]
+    tokenizer = _tokenizer(tokens)
+    del tokenizer["model"]["vocab"]["token-7"]
+    target = _target(tokens, tokenizer_json=tokenizer)
+    draft = _write_draft(tmp_path / "dflash-interior-gap.gguf", "dflash", tokens=tokens)
+
+    with pytest.raises(ValueError, match="unmapped non-trailing ids"):
+        build_from_gguf(draft, target_config=target)
+
+
 def test_target_manifest_is_stable_across_relocation_and_mapping(tmp_path: Path) -> None:
     from mobius.integrations.gguf import build_from_gguf
 
@@ -555,8 +595,7 @@ def test_suffix_closure_rejects_unknown_tensor_before_graph(
         build_from_gguf(path, target_config=_target([f"token-{i}" for i in range(64)]))
 
 
-def test_draft_owned_embedding_is_not_silently_ignored(tmp_path: Path, monkeypatch) -> None:
-    from mobius import _builder as core_builder
+def test_draft_owned_embedding_is_consumed_by_eagle3_graph(tmp_path: Path) -> None:
     from mobius.integrations.gguf import build_from_gguf
 
     path = _write_draft(
@@ -564,13 +603,33 @@ def test_draft_owned_embedding_is_not_silently_ignored(tmp_path: Path, monkeypat
         "eagle3",
         own_embedding=True,
     )
-    monkeypatch.setattr(
-        core_builder,
-        "build_from_module",
-        lambda *args, **kwargs: pytest.fail("graph construction must not start"),
+    package = build_from_gguf(
+        path,
+        target_config=_target([f"token-{i}" for i in range(64)]),
     )
-    with pytest.raises(ValueError, match="draft-owned token_embd"):
-        build_from_gguf(path, target_config=_target([f"token-{i}" for i in range(64)]))
+
+    inputs = {value.name for value in package["model"].graph.inputs}
+    initializers = set(package["model"].graph.initializers)
+    assert "input_ids" in inputs
+    assert "inputs_embeds" not in inputs
+    assert "embed_tokens.weight" in initializers
+    assert package.draft_manifest["orchestration"]["embedding_source"] == "draft"
+
+
+def test_dflash_draft_owned_embedding_fails_closed(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    path = _write_draft(
+        tmp_path / "dflash-own-embedding.gguf",
+        "dflash",
+        own_embedding=True,
+    )
+
+    with pytest.raises(ValueError, match="consumes target-provided noise_embedding"):
+        build_from_gguf(
+            path,
+            target_config=_target([f"token-{index}" for index in range(64)]),
+        )
 
 
 def test_eagle3_cross_width_target_sharing_is_rejected(tmp_path: Path, monkeypatch) -> None:
@@ -587,7 +646,7 @@ def test_eagle3_cross_width_target_sharing_is_rejected(tmp_path: Path, monkeypat
         "build_from_module",
         lambda *args, **kwargs: pytest.fail("graph construction must not start"),
     )
-    with pytest.raises(ValueError, match="target-shared embeddings require"):
+    with pytest.raises(ValueError, match="target-shared embedding/head requires"):
         build_from_gguf(
             path,
             target_config=_target(
@@ -595,6 +654,31 @@ def test_eagle3_cross_width_target_sharing_is_rejected(tmp_path: Path, monkeypat
                 hidden_size=32,
             ),
         )
+
+
+def test_eagle3_cross_width_owned_embedding_and_head_builds(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    path = _write_draft(
+        tmp_path / "eagle3-cross-width-owned.gguf",
+        "eagle3",
+        target_hidden_size=32,
+        own_embedding=True,
+        d2t=np.arange(8, dtype=np.int64),
+    )
+
+    package = build_from_gguf(
+        path,
+        target_config=_target(
+            [f"token-{index}" for index in range(64)],
+            hidden_size=32,
+        ),
+    )
+
+    assert package.draft_manifest["target"]["hidden_size"] == 32
+    assert package.draft_manifest["draft"]["hidden_size"] == 64
+    assert package.draft_manifest["orchestration"]["embedding_source"] == "draft"
+    assert package.draft_manifest["orchestration"]["lm_head_source"] == "draft"
 
 
 def test_eagle3_rope_frequency_shape_is_exact(tmp_path: Path, monkeypatch) -> None:
@@ -649,6 +733,22 @@ def test_dflash_layer_input_indices_are_normalized(tmp_path: Path) -> None:
         target_config=_target([f"token-{i}" for i in range(64)]),
     )
     assert package.draft_manifest["target"]["target_layers"] == [0, 3, 7]
+
+
+def test_eagle3_hidden_state_indices_are_normalized(tmp_path: Path) -> None:
+    from mobius.integrations.gguf import build_from_gguf
+
+    path = _write_draft(
+        tmp_path / "eagle3-hidden-state-indices.gguf",
+        "eagle3",
+        target_layers=[2, 4, 8],
+    )
+    package = build_from_gguf(
+        path,
+        target_config=_target([f"token-{index}" for index in range(64)]),
+    )
+
+    assert package.draft_manifest["target"]["target_layers"] == [1, 3, 7]
 
 
 def test_dflash_zero_layer_input_index_is_rejected_before_graph(
@@ -729,7 +829,7 @@ def test_synthetic_draft_runs_multiple_speculative_steps(
     tokens = [f"token-{index}" for index in range(64)]
     package = build_from_gguf(path, target_config=_target(tokens))
     assert package.draft_manifest["standalone"] is False
-    assert package.draft_manifest["runtime"] == "deferred"
+    assert package.draft_manifest["runtime"] == "runtime_unvalidated"
 
     session = OnnxModelSession(package["model"])
     try:
@@ -793,11 +893,65 @@ def test_cli_exposes_explicit_target_config() -> None:
             "draft.gguf",
             "--target-config",
             "target/config.json",
+            "--target-gguf",
+            "target.gguf",
             "--output",
             "out",
         ]
     )
     assert args.target_config == "target/config.json"
+    assert args.target_gguf == "target.gguf"
+
+
+def test_cli_target_pair_uses_hashed_pair_writer(tmp_path: Path, monkeypatch) -> None:
+    import onnx_ir as ir
+
+    from mobius.__main__ import main
+    from mobius._model_package import ModelPackage
+
+    package = ModelPackage(
+        {
+            "target": ir.Model(ir.Graph([], [], nodes=[], name="target"), ir_version=11),
+            "draft": ir.Model(ir.Graph([], [], nodes=[], name="draft"), ir_version=11),
+        }
+    )
+    package.draft_manifest = {"architecture": "dflash"}
+    captured = {}
+
+    monkeypatch.setattr(
+        "mobius.integrations.gguf.build_draft_pair_from_gguf",
+        lambda *args, **kwargs: package,
+    )
+
+    def write_pair(pkg, output_dir, **kwargs):
+        output = Path(output_dir)
+        output.mkdir()
+        manifest = output / "draft_manifest.json"
+        manifest.write_text("{}")
+        captured.update(package=pkg, output=output, kwargs=kwargs)
+        return {"package": str(output), "manifest": str(manifest)}
+
+    monkeypatch.setattr(
+        "mobius.integrations.gguf.write_draft_pair_package",
+        write_pair,
+    )
+    output = tmp_path / "output"
+    main(
+        [
+            "build-gguf",
+            "draft.gguf",
+            "--target-config",
+            "target-config",
+            "--target-gguf",
+            "target.gguf",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert captured["package"] is package
+    assert captured["output"] == output
+    assert captured["kwargs"]["external_data"] == "onnx"
 
 
 @pytest.mark.parametrize("existing_output", [False, True])

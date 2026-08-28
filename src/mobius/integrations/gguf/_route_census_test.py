@@ -25,6 +25,7 @@ def test_remaining_route_census_closes_every_authoritative_registry() -> None:
             f"architecture:{spec.gguf_arch}"
             for spec in iter_arch_specs()
             if spec.runtime is not Support.SUPPORTED
+            and spec.gguf_arch not in {"dflash", "eagle3"}
         ),
         *(
             f"projector:{spec.projector_type}"
@@ -37,8 +38,6 @@ def test_remaining_route_census_closes_every_authoritative_registry() -> None:
             if record.current_status != "validated-pinned-source"
         ),
         *(f"mtp:{architecture}" for architecture in mtp_architecture_capabilities()),
-        "draft:dflash",
-        "draft:eagle3",
     }
     assert actual == expected
     assert len(actual) == len(items)
@@ -55,15 +54,14 @@ def test_every_route_has_one_actionable_classification() -> None:
     assert {item.category for item in items} == allowed
     assert all(item.batch and item.dependencies and item.reason.strip() for item in items)
     assert Counter(item.kind for item in items) == {
-        "architecture": 138,
+        "architecture": 136,
         "projector": 60,
         "tokenizer": 56,
         "mtp": 22,
-        "draft": 2,
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-mobius-abi-blocked": 99,
-        "evidence-only": 155,
+        "evidence-only": 151,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }
@@ -144,6 +142,8 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
     assert by_id["mtp:qwen35"].category == "evidence-only"
     assert by_id["mtp:deepseek2"].category == "dependency-or-mobius-abi-blocked"
     assert by_id["mtp:exaone4"].category == "intentionally-rejected"
+    assert "draft:dflash" not in by_id
+    assert "draft:eagle3" not in by_id
 
 
 def test_recent_pr_reconciliation_is_explicit() -> None:

@@ -334,9 +334,10 @@ _DIFFUSION_RUNTIME_VALIDATION_PENDING = (
 _DRAFT_RUNTIME_VALIDATION_PENDING = (
     "This is a target-coupled speculative draft, never a standalone CausalLM. "
     "Config extraction, exact tensor closure, target shape/tokenizer validation, and "
-    "synthetic draft execution are covered, but no pinned real GGUF pair has passed "
-    "independent target+draft full-logit/proposed-token parity. Runtime packaging remains "
-    "deferred until that evidence and an acceptance-loop integration exist."
+    "synthetic draft execution are covered. Exact real target/draft pairs pass the direct "
+    "ONNX Runtime acceptance loop with independent source/raw-GGUF evidence, cache rollback, "
+    "multi-token acceptance, and target-only greedy equality. Use build_draft_pair_from_gguf; "
+    "higher-level generation runtimes remain runtime_unvalidated and do not gate export."
 )
 
 _POCKETTTS_BUNDLE_REASON = (
