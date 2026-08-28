@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 __all__ = [
+    "FINAL_RUNTIME_PACKAGE_SCHEMA",
     "GGUFArtifactIdentity",
     "GGUFGraphPackageIdentity",
     "GGUFRuntimeEvidence",
+    "RuntimeEvidenceUnavailableError",
+    "find_matching_runtime_evidence",
     "gguf_artifact_identity",
     "gguf_graph_package_identity",
     "iter_runtime_evidence",
@@ -29,6 +32,13 @@ from types import MappingProxyType
 from typing import Any
 
 from mobius.integrations.gguf._reader import _descriptor_identity
+
+FINAL_RUNTIME_PACKAGE_SCHEMA = "mobius.gguf-runtime-package.v2"
+LEGACY_RUNTIME_PACKAGE_SCHEMA = "legacy-without-component-export-report"
+
+
+class RuntimeEvidenceUnavailableError(ValueError):
+    """An otherwise-valid package route without exact downstream runtime evidence."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -89,6 +99,7 @@ class GGUFRuntimeEvidence:
     runtime_version: str
     result: str = "passed"
     limitations: str | None = None
+    runtime_package_schema: str = LEGACY_RUNTIME_PACKAGE_SCHEMA
 
     def __post_init__(self) -> None:
         text_fields = (
@@ -117,6 +128,7 @@ class GGUFRuntimeEvidence:
             self.runtime,
             self.runtime_version,
             self.result,
+            self.runtime_package_schema,
         )
         if any(not value.strip() for value in text_fields):
             raise ValueError("GGUF runtime evidence fields must be non-empty")
@@ -954,7 +966,7 @@ def validate_runtime_evidence_ids(architecture: str, evidence_ids: tuple[str, ..
         )
 
 
-def matching_runtime_evidence(
+def find_matching_runtime_evidence(
     evidence_ids: tuple[str, ...],
     *,
     architecture: str,
@@ -964,11 +976,12 @@ def matching_runtime_evidence(
     built_identity: GGUFArtifactIdentity,
     import_route: str,
     runtime_version: str | None,
-    tokenizer_repository: str,
-    tokenizer_revision: str,
-) -> GGUFRuntimeEvidence:
-    """Return exact evidence for the package source, route, and requested runtime."""
-    validate_runtime_evidence_ids(architecture, evidence_ids)
+    tokenizer_repository: str | None,
+    tokenizer_revision: str | None,
+) -> GGUFRuntimeEvidence | None:
+    """Return exact runtime evidence, while treating an absent match as unvalidated."""
+    if evidence_ids:
+        validate_runtime_evidence_ids(architecture, evidence_ids)
     current_identity = gguf_artifact_identity(
         source_path,
         gguf_model,
@@ -980,15 +993,20 @@ def matching_runtime_evidence(
             "The GGUF source no longer matches the exact artifact identity captured during "
             f"graph construction: built={built_identity!r}, current={current_identity!r}."
         )
-    if runtime_version is None:
-        raise ValueError(
-            "Runtime packaging requires the exact runtime version covered by evidence."
-        )
+    if (
+        not evidence_ids
+        or runtime_version is None
+        or tokenizer_repository is None
+        or tokenizer_revision is None
+    ):
+        return None
     identity = built_identity
     candidates = [
         _RUNTIME_EVIDENCE[evidence_id]
         for evidence_id in evidence_ids
-        if _RUNTIME_EVIDENCE[evidence_id].runtime == runtime
+        if _RUNTIME_EVIDENCE[evidence_id].runtime_package_schema
+        == FINAL_RUNTIME_PACKAGE_SCHEMA
+        and _RUNTIME_EVIDENCE[evidence_id].runtime == runtime
         and _RUNTIME_EVIDENCE[evidence_id].runtime_version == runtime_version
         and _RUNTIME_EVIDENCE[evidence_id].filename == identity.filename
         and _RUNTIME_EVIDENCE[evidence_id].size == identity.size
@@ -999,13 +1017,47 @@ def matching_runtime_evidence(
         and _RUNTIME_EVIDENCE[evidence_id].tokenizer_repository == tokenizer_repository
         and _RUNTIME_EVIDENCE[evidence_id].tokenizer_revision == tokenizer_revision
     ]
-    if len(candidates) != 1:
-        raise ValueError(
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "GGUF runtime evidence contains duplicate package identities for "
+            f"architecture={architecture!r}, runtime={runtime!r} {runtime_version!r}."
+        )
+    return candidates[0] if candidates else None
+
+
+def matching_runtime_evidence(
+    evidence_ids: tuple[str, ...],
+    *,
+    architecture: str,
+    runtime: str,
+    source_path: Path,
+    gguf_model: Any,
+    built_identity: GGUFArtifactIdentity,
+    import_route: str,
+    runtime_version: str | None,
+    tokenizer_repository: str | None,
+    tokenizer_revision: str | None,
+) -> GGUFRuntimeEvidence:
+    """Return exact evidence for the package source, route, and requested runtime."""
+    match = find_matching_runtime_evidence(
+        evidence_ids,
+        architecture=architecture,
+        runtime=runtime,
+        source_path=source_path,
+        gguf_model=gguf_model,
+        built_identity=built_identity,
+        import_route=import_route,
+        runtime_version=runtime_version,
+        tokenizer_repository=tokenizer_repository,
+        tokenizer_revision=tokenizer_revision,
+    )
+    if match is None:
+        raise RuntimeEvidenceUnavailableError(
             f"No unique GGUF runtime evidence matches architecture={architecture!r}, "
-            f"runtime={runtime!r} {runtime_version!r}, artifact={identity!r}, "
+            f"runtime={runtime!r} {runtime_version!r}, artifact={built_identity!r}, "
             f"import_route={import_route!r}."
         )
-    return candidates[0]
+    return match
 
 
 def gguf_artifact_identity(

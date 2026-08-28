@@ -221,10 +221,18 @@ class GGUFTokenizerVerdict:
     token_count: int
     tokenizer_sha256: str | None = None
     metadata_sha256: str | None = None
+    audit_status: str | None = None
+    blocker_category: str | None = None
+    evidence_id: str | None = None
 
     @property
     def materialized(self) -> bool:
         return self.route in {"copy", "pinned-source"}
+
+    @property
+    def route_identifier(self) -> str:
+        """Exact serialized route discriminator used for diagnostics."""
+        return self.pre or self.model or "absent"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -385,6 +393,233 @@ def _tokenizer_metadata_sha256(metadata: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _deferred_route_diagnostics(
+    pre: str | None,
+    *,
+    reason: str,
+) -> tuple[str | None, str | None, str | None, str]:
+    """Resolve stable authoritative diagnostics for a deferred tokenizer route."""
+    if pre is None:
+        return (
+            "deferred-incomplete-pipeline",
+            "serialized-tokenizer-pipeline-incomplete",
+            None,
+            reason,
+        )
+
+    # Imported lazily because the census evidence records depend on the tokenizer
+    # source dataclasses defined in this module.
+    from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
+
+    audit = next(
+        (record for record in tokenizer_route_census() if record.identifier == pre),
+        None,
+    )
+    if audit is None or audit.current_status == "validated-pinned-source":
+        return None, None, None, reason
+    return (
+        audit.current_status,
+        audit.blocker_category,
+        audit.blocker_evidence_id or audit.evidence_id,
+        audit.candidate_disposition or reason,
+    )
+
+
+def _incomplete_tokenizer_verdict(
+    *,
+    model: str | None,
+    reason: str,
+    token_count: int,
+) -> GGUFTokenizerVerdict:
+    """Return an authoritative deferred verdict for incomplete serialized metadata."""
+    return GGUFTokenizerVerdict(
+        "deferred",
+        model,
+        None,
+        None,
+        reason,
+        token_count,
+        audit_status="deferred-incomplete-pipeline",
+        blocker_category="serialized-tokenizer-pipeline-incomplete",
+    )
+
+
+def _unsupported_tokenizer_fields(metadata: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return tokenizer fields outside the pinned loader/converter closure."""
+    known = LOADER_CONSUMED_TOKENIZER_FIELDS | CONVERTER_OR_EXTENSION_TOKENIZER_FIELDS
+    return tuple(
+        sorted(
+            key
+            for key in metadata
+            if key.startswith("tokenizer.")
+            and key not in known
+            and not key.startswith("tokenizer.chat_template.")
+        )
+    )
+
+
+def _unsupported_fields_verdict(
+    *,
+    metadata: Mapping[str, Any],
+    model: str | None,
+    pre: str | None,
+    canonical_pre: str | None,
+    token_count: int,
+    unsupported: tuple[str, ...],
+) -> GGUFTokenizerVerdict:
+    """Defer tokenizer publication when serialized semantics are outside closure."""
+    return GGUFTokenizerVerdict(
+        "deferred",
+        model,
+        pre,
+        canonical_pre,
+        f"unsupported tokenizer metadata fields are outside the pinned loader/converter "
+        f"closure: {list(unsupported)}",
+        token_count,
+        metadata_sha256=_tokenizer_metadata_sha256(metadata),
+        audit_status="deferred-unsupported-metadata-fields",
+        blocker_category="unsupported-tokenizer-metadata-fields",
+    )
+
+
+def _validate_incomplete_tokenizer_fields(
+    metadata: Mapping[str, Any],
+    *,
+    source: str,
+    model: str | None,
+) -> int:
+    """Validate every serialized field before downgrading an incomplete pipeline."""
+    tokens_raw = _require_list(metadata, "tokenizer.ggml.tokens")
+    tokens = list(tokens_raw or ())
+    if any(not isinstance(token, str) for token in tokens):
+        raise ValueError(f"{source} tokenizer.ggml.tokens must contain only UTF-8 strings")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError(f"{source} tokenizer.ggml.tokens contains duplicate token strings")
+
+    pre = metadata.get("tokenizer.ggml.pre")
+    if pre is not None:
+        if not isinstance(pre, str) or not pre:
+            raise ValueError("tokenizer.ggml.pre must be a non-empty string")
+        if pre not in tokenizer_pre_policies():
+            raise ValueError(f"{source} declares unknown tokenizer.ggml.pre {pre!r}")
+        if model is not None and model not in _BPE_MODELS:
+            architecture = metadata.get("general.architecture")
+            legacy_default = pre == "default" and (
+                model == "plamo2"
+                or (
+                    model == "llama"
+                    and isinstance(architecture, str)
+                    and architecture in {"minicpm", "minicpm3"}
+                )
+            )
+            if not legacy_default:
+                raise ValueError(
+                    f"{source} declares tokenizer.ggml.pre for non-BPE model {model!r}; "
+                    "the pinned loader does not consume that combination"
+                )
+
+    rwkv_world = metadata.get("tokenizer.rwkv.world")
+    if rwkv_world is not None and not isinstance(rwkv_world, str):
+        raise ValueError("tokenizer.rwkv.world must be a string")
+
+    embedded = metadata.get("tokenizer.huggingface.json")
+    if embedded is not None:
+        if not isinstance(embedded, str):
+            raise ValueError("tokenizer.huggingface.json must be a string")
+        if tokens:
+            _validate_embedded_tokenizer_json(embedded, tokens)
+        else:
+            try:
+                payload = json.loads(embedded)
+            except json.JSONDecodeError as error:
+                raise ValueError("tokenizer.huggingface.json is not valid JSON") from error
+            if not isinstance(payload, dict):
+                raise TypeError("tokenizer.huggingface.json must contain a JSON object")
+            try:
+                from tokenizers import Tokenizer
+
+                Tokenizer.from_str(embedded)
+            except Exception as error:
+                raise ValueError(
+                    "tokenizer.huggingface.json is not a loadable tokenizers tokenizer"
+                ) from error
+
+    token_types = _require_list(metadata, "tokenizer.ggml.token_type")
+    if token_types is not None:
+        if len(token_types) != len(tokens):
+            raise ValueError(
+                "tokenizer.ggml.token_type length must equal tokenizer token count"
+            )
+        if any(type(value) is not int or value not in range(7) for value in token_types):
+            raise ValueError("tokenizer.ggml.token_type values must be integers in [0, 6]")
+
+    scores = _require_list(metadata, "tokenizer.ggml.scores")
+    if scores is not None:
+        if len(scores) != len(tokens):
+            raise ValueError("tokenizer.ggml.scores length must equal tokenizer token count")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in scores
+        ):
+            raise ValueError("tokenizer.ggml.scores must contain finite numeric values")
+
+    merges = _require_list(metadata, "tokenizer.ggml.merges")
+    if merges is not None:
+        pairs: list[tuple[str, str]] = []
+        vocabulary = set(tokens)
+        for index, merge in enumerate(merges):
+            if not isinstance(merge, str):
+                raise TypeError(f"tokenizer.ggml.merges[{index}] must be a string")
+            separator = merge.find(" ", 1)
+            if separator < 0:
+                raise ValueError(f"tokenizer.ggml.merges[{index}] has no valid pair separator")
+            pair = (merge[:separator], merge[separator + 1 :])
+            if not all(pair) or pair[0] not in vocabulary or pair[1] not in vocabulary:
+                raise ValueError(
+                    f"tokenizer.ggml.merges[{index}] references a token outside the vocabulary"
+                )
+            pairs.append(pair)
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("tokenizer.ggml.merges contains duplicate merge pairs")
+
+    for key in _SPECIAL_ID_KEYS:
+        value = metadata.get(key)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(f"{key} must be a non-negative integer")
+        if value is not None and tokens and value >= len(tokens):
+            raise ValueError(f"{key} must be an integer in [0, {len(tokens)})")
+        tokenless_diffusion_mask = key == "tokenizer.ggml.mask_token_id" and metadata.get(
+            "general.architecture"
+        ) in {"dream", "llada", "llada-moe", "rnd1"}
+        if value is not None and not tokens and not tokenless_diffusion_mask:
+            upper_bound = str(len(tokens)) if tokens else "the serialized token count"
+            raise ValueError(f"{key} must be an integer in [0, {upper_bound})")
+    for key in _BOOL_KEYS:
+        value = metadata.get(key)
+        if value is not None and type(value) is not bool:
+            raise ValueError(f"{key} must be a boolean")
+
+    type_count = metadata.get("tokenizer.ggml.token_type_count")
+    if type_count is not None and (type(type_count) is not int or type_count <= 0):
+        raise ValueError("tokenizer.ggml.token_type_count must be a positive integer")
+    suppress = _require_list(metadata, "tokenizer.ggml.suppress_tokens")
+    if suppress is not None and any(
+        type(value) is not int or value < 0 or value >= len(tokens) for value in suppress
+    ):
+        raise ValueError("tokenizer.ggml.suppress_tokens contains an out-of-range token id")
+    if suppress is not None and len(set(suppress)) != len(suppress):
+        raise ValueError("tokenizer.ggml.suppress_tokens contains duplicate token ids")
+    charsmap = _require_list(metadata, "tokenizer.ggml.precompiled_charsmap")
+    if charsmap is not None and any(
+        type(value) is not int or value < -128 or value > 255 for value in charsmap
+    ):
+        raise ValueError("tokenizer.ggml.precompiled_charsmap must contain byte values")
+    _validate_chat_templates(metadata)
+    return len(tokens)
+
+
 def inspect_gguf_tokenizer(
     metadata: Mapping[str, Any],
     *,
@@ -394,25 +629,39 @@ def inspect_gguf_tokenizer(
     """Validate embedded tokenizer metadata and return an exact route verdict."""
     tokenizer_keys = [key for key in metadata if key.startswith("tokenizer.")]
     if not tokenizer_keys:
-        return GGUFTokenizerVerdict(
-            "deferred",
-            None,
-            None,
-            None,
-            f"{source} contains no tokenizer metadata",
-            0,
+        return _incomplete_tokenizer_verdict(
+            model=None,
+            reason=f"{source} contains no tokenizer metadata",
+            token_count=0,
         )
 
     model = metadata.get("tokenizer.ggml.model")
-    if not isinstance(model, str) or not model:
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ValueError(f"{source} tokenizer.ggml.model must be a non-empty string")
+    if model is None:
         if not require_complete:
-            return GGUFTokenizerVerdict(
-                "deferred",
-                None,
-                None,
-                None,
-                f"{source} contains partial tokenizer metadata without tokenizer.ggml.model",
-                len(metadata.get("tokenizer.ggml.tokens", ())),
+            token_count = _validate_incomplete_tokenizer_fields(
+                metadata,
+                source=source,
+                model=None,
+            )
+            unsupported = _unsupported_tokenizer_fields(metadata)
+            if unsupported:
+                return _unsupported_fields_verdict(
+                    metadata=metadata,
+                    model=None,
+                    pre=metadata.get("tokenizer.ggml.pre"),
+                    canonical_pre=None,
+                    token_count=token_count,
+                    unsupported=unsupported,
+                )
+            return _incomplete_tokenizer_verdict(
+                model=None,
+                reason=(
+                    f"{source} contains partial tokenizer metadata without "
+                    "tokenizer.ggml.model"
+                ),
+                token_count=token_count,
             )
         raise ValueError(f"{source} tokenizer.ggml.model must be a non-empty string")
     if model not in _KNOWN_MODELS:
@@ -421,13 +670,27 @@ def inspect_gguf_tokenizer(
     tokens_raw = _require_list(metadata, "tokenizer.ggml.tokens")
     if not tokens_raw:
         if not require_complete:
-            return GGUFTokenizerVerdict(
-                "deferred",
-                model,
-                None,
-                None,
-                f"{source} contains no complete tokenizer token table",
-                0,
+            token_count = _validate_incomplete_tokenizer_fields(
+                metadata,
+                source=source,
+                model=model,
+            )
+            unsupported = _unsupported_tokenizer_fields(metadata)
+            if unsupported:
+                pre = metadata.get("tokenizer.ggml.pre")
+                policy = tokenizer_pre_policies().get(pre) if isinstance(pre, str) else None
+                return _unsupported_fields_verdict(
+                    metadata=metadata,
+                    model=model,
+                    pre=pre,
+                    canonical_pre=policy.canonical if policy else None,
+                    token_count=token_count,
+                    unsupported=unsupported,
+                )
+            return _incomplete_tokenizer_verdict(
+                model=model,
+                reason=f"{source} contains no complete tokenizer token table",
+                token_count=token_count,
             )
         raise ValueError(f"{source} tokenizer.ggml.tokens must be a non-empty string array")
     if any(not isinstance(token, str) for token in tokens_raw):
@@ -537,18 +800,30 @@ def inspect_gguf_tokenizer(
         type(value) is not int or value < -128 or value > 255 for value in charsmap
     ):
         raise ValueError("tokenizer.ggml.precompiled_charsmap must contain byte values")
-    if "tokenizer.ggml.byte_fallback" in metadata:
-        raise ValueError(
-            "tokenizer.ggml.byte_fallback is not a pinned GGUF key; byte-fallback semantics "
-            "cannot be inferred from it"
-        )
     _validate_chat_templates(metadata)
 
+    rwkv_world = metadata.get("tokenizer.rwkv.world")
+    if rwkv_world is not None and not isinstance(rwkv_world, str):
+        raise ValueError("tokenizer.rwkv.world must be a string")
     embedded = metadata.get("tokenizer.huggingface.json")
+    embedded_digest = None
     if embedded is not None:
         if not isinstance(embedded, str):
             raise ValueError("tokenizer.huggingface.json must be a string")
-        digest = _validate_embedded_tokenizer_json(embedded, tokens)
+        embedded_digest = _validate_embedded_tokenizer_json(embedded, tokens)
+
+    unsupported = _unsupported_tokenizer_fields(metadata)
+    if unsupported:
+        return _unsupported_fields_verdict(
+            metadata=metadata,
+            model=model,
+            pre=pre_value,
+            canonical_pre=policy.canonical if policy else None,
+            token_count=len(tokens),
+            unsupported=unsupported,
+        )
+
+    if embedded_digest is not None:
         return GGUFTokenizerVerdict(
             "copy",
             model,
@@ -557,7 +832,7 @@ def inspect_gguf_tokenizer(
             "embedded tokenizers JSON is copied verbatim and its ordered vocabulary "
             "matches GGUF; pipeline execution is delegated to that artifact",
             len(tokens),
-            digest,
+            embedded_digest,
             _tokenizer_metadata_sha256(metadata),
         )
 
@@ -566,14 +841,22 @@ def inspect_gguf_tokenizer(
         if pre_value is not None
         else f"model {model!r} omits the complete tokenizer pipeline"
     )
+    reason = f"{detail}; exact ORT tokenizer materialization is unavailable"
+    audit_status, blocker_category, evidence_id, reason = _deferred_route_diagnostics(
+        pre_value,
+        reason=reason,
+    )
     return GGUFTokenizerVerdict(
         "deferred",
         model,
         pre_value,
         policy.canonical if policy else None,
-        f"{detail}; exact ORT tokenizer materialization is unavailable",
+        reason,
         len(tokens),
         metadata_sha256=_tokenizer_metadata_sha256(metadata),
+        audit_status=audit_status,
+        blocker_category=blocker_category,
+        evidence_id=evidence_id,
     )
 
 

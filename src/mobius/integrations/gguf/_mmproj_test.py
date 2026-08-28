@@ -1084,7 +1084,10 @@ class TestStandaloneCoreProjectorBuild:
         _write_quantized_gemma4_text_gguf(text_path)
         _write_gemma4_unified_mmproj_gguf(mmproj_path)
         text = GGUFModel(str(text_path))
-        text.metadata["tokenizer.ggml.tokens"] = ["<|audio|>", *(["token"] * 63)]
+        text.metadata["tokenizer.ggml.tokens"] = [
+            "<|audio|>",
+            *(f"token-{index}" for index in range(1, 64)),
+        ]
 
         package = build_gemma4_vlm_from_gguf(
             text_path,
@@ -1495,7 +1498,10 @@ class TestVisionEncoderBuildAndRun:
         _write_quantized_gemma4_text_gguf(text_path)
         _write_clip_mmproj_gguf(mmproj_path, with_audio=True)
         text = GGUFModel(str(text_path))
-        text.metadata["tokenizer.ggml.tokens"] = ["<|audio|>", *(["token"] * 63)]
+        text.metadata["tokenizer.ggml.tokens"] = [
+            "<|audio|>",
+            *(f"token-{index}" for index in range(1, 64)),
+        ]
 
         package = build_gemma4_vlm_from_gguf(
             text_path,

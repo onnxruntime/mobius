@@ -22,8 +22,8 @@ Usage::
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
 
-    # Runtime packaging is fail-closed and available only for an exact artifact,
-    # import route, runtime version, and pinned tokenizer evidence record.
+    # Exact evidence emits a validated runtime package. Downstream runtime
+    # limitations preserve an accurate model package marked runtime-unvalidated.
 
 :func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
 to the matching architecture-specific multimodal builder.

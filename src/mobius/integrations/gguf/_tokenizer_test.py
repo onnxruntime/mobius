@@ -16,11 +16,13 @@ import pytest
 
 from mobius.integrations.gguf import _tokenizer
 from mobius.integrations.gguf._tokenizer import (
+    LOADER_CONSUMED_TOKENIZER_FIELDS,
     GGUFTokenizerAsset,
     GGUFTokenizerSource,
     inspect_gguf_tokenizer,
     materialize_gguf_tokenizer,
 )
+from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 
 _PINNED_PRE_IDENTIFIERS = (
@@ -183,11 +185,268 @@ class TestTokenizerPreCensus:
 
 
 class TestInspectGgufTokenizer:
+    @pytest.mark.parametrize(
+        ("metadata", "route", "reason"),
+        [
+            ({}, "absent", "contains no tokenizer metadata"),
+            (
+                {"tokenizer.ggml.tokens": ["token"]},
+                "absent",
+                "without tokenizer.ggml.model",
+            ),
+            (
+                {"tokenizer.ggml.model": "llama"},
+                "llama",
+                "no complete tokenizer token table",
+            ),
+        ],
+    )
+    def test_incomplete_metadata_has_authoritative_deferred_diagnostics(
+        self,
+        metadata: dict,
+        route: str,
+        reason: str,
+    ) -> None:
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.route_identifier == route
+        assert verdict.audit_status == "deferred-incomplete-pipeline"
+        assert verdict.blocker_category == "serialized-tokenizer-pipeline-incomplete"
+        assert reason in verdict.reason
+
+    @pytest.mark.parametrize(
+        ("metadata", "message"),
+        [
+            (
+                {"tokenizer.ggml.tokens": ["duplicate", "duplicate"]},
+                "duplicate token strings",
+            ),
+            (
+                {"tokenizer.ggml.tokens": ["valid", 1]},
+                "contain only UTF-8 strings",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.token_type": [7],
+                },
+                "token_type length",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.chat_templates": ["missing"],
+                },
+                "does not exactly match",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": 1,
+                    "tokenizer.ggml.tokens": ["valid"],
+                },
+                "must be a non-empty string",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.pre": 1,
+                },
+                "pre must be a non-empty string",
+            ),
+            (
+                {
+                    "tokenizer.ggml.tokens": [],
+                    "tokenizer.huggingface.json": 42,
+                },
+                "tokenizer.huggingface.json must be a string",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.huggingface.json": "{",
+                },
+                "not valid JSON",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.eos_token_id": -1,
+                },
+                "eos_token_id must be a non-negative integer",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.eos_token_id": 999,
+                },
+                "eos_token_id must be an integer",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.mask_token_id": 999,
+                },
+                "mask_token_id must be an integer",
+            ),
+            (
+                {
+                    "tokenizer.ggml.model": "llama",
+                    "tokenizer.ggml.pre": "hunyuan-dense",
+                },
+                "pre for non-BPE model",
+            ),
+            (
+                {"tokenizer.rwkv.world": 42},
+                "tokenizer.rwkv.world must be a string",
+            ),
+        ],
+    )
+    def test_incomplete_pipeline_does_not_downgrade_present_field_corruption(
+        self,
+        metadata: dict,
+        message: str,
+    ) -> None:
+        with pytest.raises((TypeError, ValueError), match=message):
+            inspect_gguf_tokenizer(metadata)
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"tokenizer.ggml.future_semantics": "opaque"},
+            {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.future_semantics": "opaque",
+            },
+            {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.chat_templates.tool": "near-miss",
+            },
+            {
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.byte_fallback": True,
+            },
+        ],
+    )
+    def test_incomplete_unknown_fields_are_authoritatively_deferred(
+        self, metadata: dict
+    ) -> None:
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.audit_status == "deferred-unsupported-metadata-fields"
+        assert verdict.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert "outside the pinned loader/converter closure" in verdict.reason
+        assert next(
+            key for key in metadata if key not in LOADER_CONSUMED_TOKENIZER_FIELDS
+        ) in (verdict.reason)
+
+    def test_tokenless_diffusion_mask_id_is_left_to_graph_contract_validation(
+        self,
+    ) -> None:
+        verdict = inspect_gguf_tokenizer(
+            {
+                "general.architecture": "dream",
+                "tokenizer.ggml.model": "llama",
+                "tokenizer.ggml.mask_token_id": 999,
+            }
+        )
+
+        assert verdict.route == "deferred"
+        assert verdict.blocker_category == "serialized-tokenizer-pipeline-incomplete"
+
+    def test_complete_unknown_field_prevents_embedded_tokenizer_copy(self) -> None:
+        metadata = _metadata(embedded=True)
+        metadata["tokenizer.ggml.future_semantics"] = "opaque"
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.route == "deferred"
+        assert verdict.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert verdict.tokenizer_sha256 is None
+        assert "tokenizer.ggml.future_semantics" in verdict.reason
+
+    @pytest.mark.parametrize(
+        "field",
+        ["tokenizer.ggml.byte_fallback", "tokenizer.ggml.future_semantics"],
+    )
+    def test_complete_unknown_semantic_field_is_deferred(self, field: str) -> None:
+        metadata = _metadata()
+        metadata[field] = True
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert field in verdict.reason
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("tokenizer.huggingface.json", 42, "must be a string"),
+            ("tokenizer.rwkv.world", 42, "must be a string"),
+        ],
+    )
+    def test_malformed_known_extension_stays_fatal_with_unknown_field(
+        self, field: str, value: object, message: str
+    ) -> None:
+        metadata = _metadata()
+        metadata["tokenizer.ggml.future_semantics"] = "opaque"
+        metadata[field] = value
+
+        with pytest.raises(ValueError, match=message):
+            inspect_gguf_tokenizer(metadata)
+
+    @pytest.mark.parametrize("complete", [False, True])
+    def test_named_chat_template_namespace_is_inside_field_closure(
+        self, complete: bool
+    ) -> None:
+        metadata = _metadata(embedded=True) if complete else {"tokenizer.ggml.model": "llama"}
+        metadata["tokenizer.chat_template.tool_use"] = "tool-template"
+
+        verdict = inspect_gguf_tokenizer(metadata)
+
+        assert verdict.blocker_category != "unsupported-tokenizer-metadata-fields"
+        assert verdict.route == ("copy" if complete else "deferred")
+
     def test_known_pre_without_complete_pipeline_is_deferred(self):
         verdict = inspect_gguf_tokenizer(_metadata(pre="hunyuan-dense"))
         assert verdict.route == "deferred"
         assert verdict.pre == "hunyuan-dense"
         assert "compiled llama.cpp behavior" in verdict.reason
+        assert verdict.audit_status == "deferred-compiled-semantics"
+        assert verdict.blocker_category == "compiled-llama.cpp-semantic-dependency"
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "bailingmoe",
+            "bailingmoe2",
+            "llada-moe",
+            "chatglm-bpe",
+            "glm4",
+            "cohere2moe",
+            "tiny_aya",
+        ],
+    )
+    def test_known_alias_blocker_uses_exact_authoritative_evidence(
+        self, identifier: str
+    ) -> None:
+        audit = next(
+            record for record in tokenizer_route_census() if record.identifier == identifier
+        )
+        verdict = inspect_gguf_tokenizer(_metadata(pre=identifier))
+
+        assert verdict.audit_status == "deferred-pinned-artifact-mismatch"
+        assert verdict.blocker_category == "pinned-candidate-source-semantic-mismatch"
+        assert verdict.evidence_id == audit.blocker_evidence_id
+        assert verdict.reason == audit.candidate_disposition
+
+    def test_validated_route_is_not_mislabeled_as_supported_tokenizer_output(self) -> None:
+        verdict = inspect_gguf_tokenizer(_metadata(pre="gpt-2"))
+
+        assert verdict.route == "deferred"
+        assert verdict.blocker_category is None
+        assert verdict.evidence_id is None
 
     def test_plamo2_legacy_default_pre_is_validated_but_deferred(self):
         metadata = _metadata(pre="default")
@@ -276,10 +535,6 @@ class TestInspectGgufTokenizer:
                     "tokenizer.ggml.precompiled_charsmap", [0, 256]
                 ),
                 "byte values",
-            ),
-            (
-                lambda value: value.__setitem__("tokenizer.ggml.byte_fallback", True),
-                "not a pinned GGUF key",
             ),
             (
                 lambda value: value.__setitem__("tokenizer.ggml.suppress_tokens", [0, 0]),

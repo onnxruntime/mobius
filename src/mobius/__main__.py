@@ -663,12 +663,6 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
     mmproj_path = getattr(args, "mmproj", None)
     keep_quantized = not args.dequantize
     reuse_gguf_weights = args.reuse_gguf_weights
-    if reuse_gguf_weights and args.runtime == "ort-genai":
-        raise SystemExit(
-            "Error: --reuse-gguf-weights cannot be combined with --runtime ort-genai "
-            "because genai_config.json cannot require disabled ORT constant folding. "
-            "Use direct ONNX Runtime with ORT_DISABLE_ALL."
-        )
 
     if keep_quantized:
         print(
@@ -713,6 +707,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
         from mobius.integrations.gguf._shard_set import open_gguf_model
 
         # Resolve and validate the exact selected source before graph construction.
+        # Authoritative tokenizer blockers may later produce a clearly reported
+        # partial package; all model and source checks still fail closed here.
         resolved_gguf_path = _resolve_gguf_path(gguf_path)
         gguf_model = open_gguf_model(resolved_gguf_path)
         _validate_gguf_model(gguf_model, source=str(resolved_gguf_path))
@@ -749,7 +745,8 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             strip_debug_metadata(model)
 
     if runtime is None:
-        os.makedirs(output_dir, exist_ok=True)
+        if getattr(pkg, "export_report", None) is None:
+            os.makedirs(output_dir, exist_ok=True)
         pkg.save(
             output_dir,
             external_data=args.external_data,
@@ -759,6 +756,7 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
         )
         _print_saved_gguf_models(pkg, output_dir)
+        _print_gguf_export_status(pkg, output_dir, runtime=runtime)
 
         # ModelPackage.save() persisted the MTP sidecar into its manifest-selected
         # collision-safe directory.
@@ -772,9 +770,12 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
 
         draft_manifest = getattr(pkg, "draft_manifest", None)
         if draft_manifest is not None:
-            from mobius.integrations.gguf._draft import write_draft_manifest
+            if getattr(pkg, "export_report", None) is None:
+                from mobius.integrations.gguf._draft import write_draft_manifest
 
-            manifest_path = write_draft_manifest(draft_manifest, output_dir)
+                manifest_path = write_draft_manifest(draft_manifest, output_dir)
+            else:
+                manifest_path = os.path.join(output_dir, "draft_manifest.json")
             print(f"Saved draft pairing manifest to {manifest_path}")
 
     if runtime in ("onnx-genai", "ort-genai"):
@@ -795,11 +796,20 @@ def _cmd_build_gguf(args: argparse.Namespace) -> None:
             ),
             max_workers=args.max_workers,
         )
-        # The writer returns only after atomically publishing the complete graph,
-        # tokenizer, and runtime configuration directory.
+        # The writer atomically publishes either the validated runtime package or
+        # an accurate model package with an explicit unvalidated disposition.
         _print_saved_gguf_models(pkg, output_dir)
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
+        from mobius._export_report import ComponentExportReport
+
+        if isinstance(getattr(pkg, "export_report", None), ComponentExportReport):
+            _print_gguf_export_status(pkg, output_dir, runtime=runtime)
+        else:
+            print(
+                f"Export status: COMPLETE - {runtime} package is end-to-end runnable "
+                "under its pinned evidence contract."
+            )
 
 
 def _print_saved_gguf_models(pkg: Any, output_dir: str) -> None:
@@ -812,6 +822,59 @@ def _print_saved_gguf_models(pkg: Any, output_dir: str) -> None:
             else os.path.join(output_dir, "model.onnx")
         )
         print(f"Saved {name} to {path}")
+
+
+def _print_gguf_export_status(
+    pkg: Any,
+    output_dir: str,
+    *,
+    runtime: str | None,
+) -> None:
+    """Distinguish a durable partial package from a complete runtime package."""
+    from mobius._export_report import ComponentExportReport
+
+    report = getattr(pkg, "export_report", None)
+    if not isinstance(report, ComponentExportReport):
+        print(
+            "Export status: MODEL ONLY - ONNX model files were saved; "
+            "runtime/tokenizer packaging was not requested."
+        )
+        return
+    omitted = ", ".join(
+        component.name for component in report.components if component.output == "omitted"
+    )
+    if report.export_status == "partial":
+        if omitted:
+            print(
+                "Export status: PARTIAL - proven model files were saved, but one or more "
+                "components were omitted."
+            )
+        else:
+            print(
+                "Export status: PARTIAL - all requested components were exported, but "
+                "one or more support dispositions remain deferred or blocked."
+            )
+    else:
+        print("Export status: COMPLETE - the accurate model package was saved.")
+    if report.runtime_validation_status == "unvalidated":
+        print(
+            "Runtime validation: UNVALIDATED - export success is not a runtime "
+            "support or end-to-end execution claim."
+        )
+    elif report.runtime_validation_status == "validated":
+        print("Runtime validation: VALIDATED - the package is end-to-end runnable.")
+    runtime_component = report.component("runtime")
+    if (
+        runtime is not None
+        and runtime_component is not None
+        and runtime_component.output == "omitted"
+    ):
+        print(f"  requested runtime: {runtime} (omitted)")
+    elif runtime is not None and report.runtime_validation_status == "unvalidated":
+        print(f"  requested runtime: {runtime} (unvalidated)")
+    if omitted:
+        print(f"  omitted components: {omitted}")
+    print(f"  export report: {os.path.join(output_dir, 'export_report.json')}")
 
 
 def _cmd_convert_comfyui(args: argparse.Namespace) -> None:
@@ -1353,9 +1416,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ort-genai", "onnx-genai"],
         default=None,
         help=(
-            "Generate runtime-specific config files after building. "
-            "Both routes require an exact tokenizer.huggingface.json embedded in "
-            "the GGUF; opaque tokenizer.ggml.pre metadata is not reconstructed. "
+            "Request runtime-specific packaging after building. Exact evidence emits "
+            "a validated runtime config and tokenizer; downstream runtime/version/"
+            "registry/executor limitations preserve the model with an unvalidated "
+            "export report instead of blocking it. "
             "'onnx-genai' writes inference_metadata.yaml and 'ort-genai' writes "
             "genai_config.json."
         ),
@@ -1364,8 +1428,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--runtime-version",
         default=None,
         help=(
-            "Exact selected runtime version. Required once an architecture has a "
-            "runtime-supported evidence record; it must equal the version validated there."
+            "Selected runtime version. An exact evidence match marks the package "
+            "validated; other versions are exported with runtime status unvalidated."
         ),
     )
     gguf_parser.add_argument(
@@ -1374,7 +1438,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="OWNER/REPO",
         help=(
             "Exact Hugging Face repository containing tokenizer assets for runtime "
-            "packaging. Requires --tokenizer-revision and must match runtime evidence."
+            "packaging. Requires --tokenizer-revision. Missing or unmatched evidence "
+            "preserves a model-only runtime-unvalidated package."
         ),
     )
     gguf_parser.add_argument(

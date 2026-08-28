@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Emit a runnable package from a GGUF build.
+"""Emit a validated runtime package or an accurate runtime-unvalidated model package.
 
 Saving the ONNX graph is not enough to run a model: the runtime also needs a
 tokenizer and its own configuration contract. Those come from two different
@@ -9,9 +9,10 @@ places — the tokenizer from the GGUF's embedded ggml metadata, the contract
 from the built package — so a caller that saves the graph and stops produces a
 directory that loads nowhere.
 
-This module is the single place that knows the full artifact set, so the CLI
-and the Python API cannot drift apart on what a complete package contains, and
-so both supported runtimes are reachable from one entry point.
+This module is the single place that knows the full artifact set. Exact runtime
+evidence produces a complete package. Downstream runtime, version, registry, or
+executor limitations preserve the model package with explicit unvalidated
+metadata instead of blocking export.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from typing import Any, Literal
 
 from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._runtime_evidence import (
+    RuntimeEvidenceUnavailableError,
     gguf_artifact_identity,
     gguf_graph_package_identity,
     matching_runtime_evidence,
@@ -251,6 +253,14 @@ def _write_mtp_runtime_status(
     return str(path)
 
 
+def _runtime_package_matches_evidence(evidence: Any, identity: Any) -> bool:
+    """Whether the complete final package bytes match one runtime evidence record."""
+    return (
+        identity.files == evidence.runtime_package_files
+        and identity.sha256 == evidence.runtime_package_sha256
+    )
+
+
 def write_gguf_runtime_package(
     pkg: Any,
     gguf_path: str | Path,
@@ -335,13 +345,6 @@ def write_gguf_runtime_package(
             "GGUF runtime packaging requires the immutable source identity captured during "
             "graph construction."
         )
-    if runtime == "ort-genai" and getattr(pkg, "gguf_reuse_plan", None) is not None:
-        raise ValueError(
-            "ORT GenAI packaging is not supported with reused GGUF weights because "
-            "genai_config.json has no supported setting that disables ORT constant "
-            "folding. Use direct ONNX Runtime with ORT_DISABLE_ALL, or build without "
-            "reuse_gguf_weights."
-        )
     draft_manifest = getattr(pkg, "draft_manifest", None)
     mtp_head = getattr(pkg, "mtp_head", None)
 
@@ -377,6 +380,7 @@ def write_gguf_runtime_package(
             "refusing runtime publication."
         )
     evidence = None
+    evidence_warning: str | None = None
     if (
         tokenizer_repository is not None
         and tokenizer_revision is not None
@@ -395,14 +399,8 @@ def write_gguf_runtime_package(
                 tokenizer_repository=tokenizer_repository,
                 tokenizer_revision=tokenizer_revision,
             )
-        except ValueError as error:
-            if not (
-                str(error).startswith("No unique GGUF runtime evidence matches")
-                or str(error)
-                == "Runtime packaging requires the exact runtime version covered by evidence."
-            ):
-                raise
-            _LOGGER.warning("%s Export continues without claiming runtime validation.", error)
+        except RuntimeEvidenceUnavailableError as error:
+            evidence_warning = f"{error} Export continues without claiming runtime validation."
     if not source_model.source_matches_path():
         raise ValueError(
             "The GGUF source changed while runtime evidence was being matched; "
@@ -420,14 +418,20 @@ def write_gguf_runtime_package(
             "The GGUF tokenizer metadata no longer matches the identity captured during "
             "graph construction; refusing to pair the graph with a replaced tokenizer source."
         )
+    if getattr(built_verdict, "blocker_category", None) is not None:
+        # Exact runtime evidence cannot override a tokenizer route that the
+        # authoritative tokenizer census has explicitly withheld.
+        evidence = None
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(
         tempfile.mkdtemp(prefix=f".{output_dir.name}.", suffix=".tmp", dir=output_dir.parent)
     )
+    previous_export_report = getattr(pkg, "export_report", None)
+    published = False
     try:
         artifacts: dict[str, str] = {}
-        pkg.save(str(stage), **save_kwargs)
+        pkg.save(str(stage), _atomic_export_report=False, **save_kwargs)
         if not source_model.source_matches_path():
             raise ValueError(
                 "The GGUF source changed while target/MTP graphs were being serialized; "
@@ -435,10 +439,17 @@ def write_gguf_runtime_package(
             )
         graph_identity = gguf_graph_package_identity(stage)
         validation_warnings: list[str] = []
+        if evidence_warning is not None:
+            validation_warnings.append(evidence_warning)
         if architecture_spec.runtime is not Support.SUPPORTED:
             validation_warnings.append(
                 f"No real-artifact runtime validation is recorded for {architecture!r}: "
                 f"{architecture_spec.reason}"
+            )
+        if runtime == "ort-genai" and getattr(pkg, "gguf_reuse_plan", None) is not None:
+            validation_warnings.append(
+                "ORT GenAI cannot disable constant folding for reused GGUF weights; "
+                "the faithful package is exported without claiming runtime validation."
             )
         if evidence is not None and (
             graph_identity.files != evidence.graph_files
@@ -449,6 +460,8 @@ def write_gguf_runtime_package(
             )
             evidence = None
 
+        tokenizer_exported = False
+        tokenizer_warning: str | None = None
         if evidence is not None:
             tokenizer_source = GGUFTokenizerSource(
                 repository=evidence.tokenizer_repository,
@@ -468,6 +481,7 @@ def write_gguf_runtime_package(
                 local_files_only=local_files_only,
             )
             artifacts["tokenizer"] = tokenizer_path
+            tokenizer_exported = True
         elif verdict.materialized:
             artifacts["tokenizer"] = write_gguf_tokenizer_json(
                 source_path,
@@ -476,17 +490,19 @@ def write_gguf_runtime_package(
                 expected_metadata_sha256=verdict.metadata_sha256,
                 source_identity=f"sha256:{built_identity.sha256}/{built_identity.filename}",
             )
+            tokenizer_exported = True
         else:
-            validation_warnings.append(
-                "No faithful tokenizer processor could be materialized from the GGUF source; "
-                "the graph and runtime metadata were still exported."
+            tokenizer_warning = (
+                f"Tokenizer route {verdict.route_identifier!r} was omitted "
+                f"({verdict.blocker_category or 'tokenizer-materialization-unvalidated'}"
+                f"{f'; evidence={verdict.evidence_id}' if verdict.evidence_id else ''}): "
+                f"{verdict.reason} Tokenizer semantics are unverified; provide and validate "
+                "a tokenizer before end-to-end use."
             )
+            validation_warnings.append(tokenizer_warning)
 
         if runtime == "ort-genai":
             from mobius.integrations.ort_genai import write_ort_genai_config
-            from mobius.integrations.ort_genai.auto_export import (
-                _copy_tokenizer_files,
-            )
 
             execution_provider = getattr(pkg, "gguf_execution_provider", None)
             if not isinstance(execution_provider, str) or not execution_provider:
@@ -504,15 +520,6 @@ def write_gguf_runtime_package(
                     f"ORT GenAI runtime execution with provider {execution_provider!r} has not "
                     "been validated; the provider identity is preserved in genai_config.json."
                 )
-            if mtp_head is not None and evidence is None and tokenizer_repository is not None:
-                assert tokenizer_revision is not None
-                for filename in _copy_tokenizer_files(
-                    tokenizer_repository,
-                    str(stage),
-                    revision=tokenizer_revision,
-                    local_files_only=local_files_only,
-                ):
-                    artifacts[filename] = str(stage / filename)
             artifacts.update(
                 write_ort_genai_config(
                     pkg,
@@ -529,16 +536,8 @@ def write_gguf_runtime_package(
                     pkg,
                     str(stage),
                     config=getattr(pkg, "config", None),
-                    source=(
-                        tokenizer_repository
-                        if mtp_head is not None and evidence is None
-                        else None
-                    ),
-                    revision=(
-                        tokenizer_revision
-                        if mtp_head is not None and evidence is None
-                        else None
-                    ),
+                    source=None,
+                    revision=None,
                 )
             )
         if draft_manifest is not None:
@@ -562,59 +561,103 @@ def write_gguf_runtime_package(
             )
             if speculator_path is not None:
                 artifacts["speculator"] = str(speculator_path)
-        runtime_identity = gguf_graph_package_identity(stage)
-        if evidence is not None and (
-            runtime_identity.files != evidence.runtime_package_files
-            or runtime_identity.sha256 != evidence.runtime_package_sha256
-        ):
-            validation_warnings.append(
-                "The completed runtime package does not match the recorded runtime-evidence "
-                "identity."
-            )
-            evidence = None
         compatibility_path = stage / "runtime_compatibility.json"
         compatibility = (
             json.loads(compatibility_path.read_text(encoding="utf-8"))
             if compatibility_path.exists()
             else {"runtime": runtime}
         )
+        compatibility_warnings = list(compatibility.get("warnings", []))
         existing_status = compatibility.get("runtime_validation_status")
-        if existing_status == "unsupported-by-tested-runtime":
-            validation_status = existing_status
-        else:
-            validation_status = "unvalidated"
-        if evidence is not None:
-            validation_warnings.append(
-                "Exact graph/tokenizer evidence exists, but the emitted compatibility metadata "
-                "changes the recorded package identity; new end-to-end evidence is required."
-            )
-        compatibility.update(
-            {
-                "runtime_validation_status": validation_status,
-                "gguf_architecture": architecture,
-                "execution_provider": getattr(pkg, "gguf_execution_provider", None),
-                "gguf_graph_identity": {
-                    "files": list(graph_identity.files),
-                    "sha256": str(graph_identity.sha256),
-                },
-                "runtime_evidence_id": (
-                    evidence.evidence_id if evidence is not None else None
-                ),
-                "warnings": [
-                    *compatibility.get("warnings", []),
-                    *validation_warnings,
-                ],
-            }
+        from mobius.integrations.gguf._component_export import (
+            attach_runtime_unvalidated_report,
         )
-        compatibility_path.write_text(
-            json.dumps(compatibility, indent=2) + "\n", encoding="utf-8"
-        )
+
+        export_report_path = stage / "export_report.json"
+        artifacts["export_report"] = str(export_report_path)
         artifacts["runtime_compatibility"] = str(compatibility_path)
-        for warning in validation_warnings:
-            _LOGGER.warning("%s", warning)
-        if mtp_head is not None:
+
+        def write_final_metadata() -> None:
+            if evidence is not None:
+                validation_status = "validated"
+                runtime_support: Literal["supported", "deferred", "blocked"] = "supported"
+                blocker_category = None
+                runtime_reason = None
+                report_validation_status: Literal["validated", "unvalidated"] = "validated"
+            elif existing_status == "unsupported-by-tested-runtime":
+                validation_status = existing_status
+                runtime_support = "blocked"
+                blocker_category = "runtime-unsupported-by-tested-runtime"
+                runtime_reason = "; ".join(validation_warnings)
+                report_validation_status = "unvalidated"
+            elif architecture_spec.runtime is Support.REJECTED:
+                validation_status = "unvalidated"
+                runtime_support = "blocked"
+                blocker_category = "runtime-route-rejected"
+                runtime_reason = "; ".join(validation_warnings)
+                report_validation_status = "unvalidated"
+            elif architecture_spec.runtime is Support.DEFERRED:
+                validation_status = "unvalidated"
+                runtime_support = "deferred"
+                blocker_category = "runtime-route-deferred"
+                runtime_reason = "; ".join(validation_warnings)
+                report_validation_status = "unvalidated"
+            else:
+                validation_status = "unvalidated"
+                runtime_support = "deferred"
+                blocker_category = "runtime-validation-unavailable"
+                runtime_reason = (
+                    "; ".join(validation_warnings)
+                    or "No exact end-to-end runtime validation is claimed for the "
+                    "emitted package."
+                )
+                report_validation_status = "unvalidated"
+
+            attach_runtime_unvalidated_report(
+                pkg,
+                runtime,
+                blocker_category=blocker_category,
+                reason=runtime_reason,
+                evidence_id=(evidence.evidence_id if evidence is not None else None),
+                support_status=runtime_support,
+                runtime_output="exported",
+                runtime_validation_status=report_validation_status,
+                tokenizer_exported=tokenizer_exported,
+                emit_warning=False,
+            )
+            assert pkg.export_report is not None
+            pkg.export_report.write_json(export_report_path)
+            compatibility.update(
+                {
+                    "runtime_validation_status": validation_status,
+                    "gguf_architecture": architecture,
+                    "execution_provider": getattr(pkg, "gguf_execution_provider", None),
+                    "gguf_graph_identity": {
+                        "files": list(graph_identity.files),
+                        "sha256": str(graph_identity.sha256),
+                    },
+                    "runtime_evidence_id": (
+                        evidence.evidence_id if evidence is not None else None
+                    ),
+                    "warnings": [
+                        *compatibility_warnings,
+                        *validation_warnings,
+                    ],
+                }
+            )
+            compatibility_path.write_text(
+                json.dumps(compatibility, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        def write_mtp_status() -> None:
+            if mtp_head is None:
+                return
+            status_path = stage / "mtp_runtime_status.json"
+            if status_path.exists():
+                status_path.unlink()
             runtime_payload_identity = gguf_graph_package_identity(stage)
-            status_path = _write_mtp_runtime_status(
+            artifacts["mtp_runtime_status"] = _write_mtp_runtime_status(
                 stage,
                 pkg=pkg,
                 built_identity=built_identity,
@@ -626,13 +669,33 @@ def write_gguf_runtime_package(
                 tokenizer_revision=tokenizer_revision,
                 tokenizer_metadata_sha256=verdict.metadata_sha256,
             )
-            artifacts["mtp_runtime_status"] = status_path
+
+        write_final_metadata()
+        write_mtp_status()
+        final_identity = gguf_graph_package_identity(stage)
+        if evidence is not None and not _runtime_package_matches_evidence(
+            evidence, final_identity
+        ):
+            validation_warnings.append(
+                "The final staged runtime package, including export and compatibility "
+                "metadata, does not match the recorded runtime-evidence identity."
+            )
+            evidence = None
+            write_final_metadata()
+            write_mtp_status()
         if not source_model.source_matches_path():
             raise ValueError(
                 "The GGUF source changed while runtime metadata was being written; "
                 "refusing package publication."
             )
         _publish_directory_no_replace(stage, output_dir)
+        published = True
+        for warning in validation_warnings:
+            if (
+                warning != tokenizer_warning
+                or getattr(built_verdict, "blocker_category", None) is None
+            ):
+                _LOGGER.warning("%s", warning)
         return {
             name: str(output_dir / Path(path).relative_to(stage))
             for name, path in artifacts.items()
@@ -640,3 +703,5 @@ def write_gguf_runtime_package(
     finally:
         if stage.exists():
             shutil.rmtree(stage)
+        if not published:
+            pkg.export_report = previous_export_report

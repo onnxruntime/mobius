@@ -2953,8 +2953,38 @@ class TestReuseGgufWeights:
         )
 
         loaded = ModelPackage.load(str(tmp_path))
-        loaded.save(str(tmp_path), progress_bar=False)
-        assert not (tmp_path / "gguf-reuse.json").exists()
+        ordinary_output = tmp_path / "ordinary-resave"
+        loaded.save(str(ordinary_output), progress_bar=False)
+        assert not (ordinary_output / "gguf-reuse.json").exists()
+
+    @pytest.mark.parametrize("projection_quantization", ["f32", "q4_0"])
+    def test_reuse_transaction_removes_stale_optional_package_metadata(
+        self,
+        tmp_path: Path,
+        projection_quantization: str,
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf
+
+        gguf_path = tmp_path / "source.gguf"
+        _write_quantized_gguf(
+            gguf_path,
+            projection_quantization=projection_quantization,
+        )
+        package = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        package.draft_manifest = {"architecture": "eagle3"}
+        package.save(str(tmp_path), progress_bar=False)
+        assert (tmp_path / "draft_manifest.json").is_file()
+        assert (tmp_path / "export_report.json").is_file()
+        assert (tmp_path / "quantization_report.json").is_file()
+
+        package.draft_manifest = None
+        package.export_report = None
+        package.gguf_quantization_report = None
+        package.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "draft_manifest.json").exists()
+        assert not (tmp_path / "export_report.json").exists()
+        assert not (tmp_path / "quantization_report.json").exists()
 
     def test_verifier_rejects_unmanifested_external_initializer(self, tmp_path: Path):
         from mobius.integrations.gguf import (
@@ -3161,10 +3191,17 @@ class TestReuseGgufWeights:
 
         gguf_path = tmp_path / "source.gguf"
         _write_quantized_gguf(gguf_path, projection_quantization="f32")
-        build_from_gguf(gguf_path, reuse_gguf_weights=True).save(
-            str(tmp_path), progress_bar=False
+        initial = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        initial.draft_manifest = {"architecture": "eagle3", "generation": 1}
+        initial.save(str(tmp_path), progress_bar=False)
+        artifact_names = (
+            "model.onnx",
+            "model.onnx.data",
+            "gguf-reuse.json",
+            "quantization_report.json",
+            "export_report.json",
+            "draft_manifest.json",
         )
-        artifact_names = ("model.onnx", "model.onnx.data", "gguf-reuse.json")
         original = {name: (tmp_path / name).read_bytes() for name in artifact_names}
 
         real_replace = _reuse.os.replace
@@ -3185,6 +3222,7 @@ class TestReuseGgufWeights:
 
         monkeypatch.setattr(_reuse.os, "replace", fail_manifest_install)
         rerun = build_from_gguf(gguf_path, reuse_gguf_weights=True)
+        rerun.draft_manifest = {"architecture": "eagle3", "generation": 2}
         with pytest.raises(OSError, match="injected"):
             rerun.save(str(tmp_path), progress_bar=False)
 
@@ -5265,6 +5303,7 @@ class TestLanguageDiffusionDispatch:
         class _DreamGGUF:
             architecture = "dream"
             metadata: ClassVar[dict] = {
+                "general.architecture": "dream",
                 "dream.embedding_length": 8,
                 "dream.feed_forward_length": 16,
                 "dream.block_count": 1,
@@ -7240,7 +7279,7 @@ class TestKimiLinearGGUFBuild:
 
         output = tmp_path / "roundtrip"
         package.save(output, progress_bar=False)
-        reloaded = ModelPackage.load(output)
+        reloaded = ModelPackage.load(str(output))
         assert set(reloaded) == {"model"}
         assert (
             reloaded["model"].metadata_props["mobius.cache_abi"]
@@ -7699,7 +7738,7 @@ class TestNemotronHMoEGGUFBuild:
         package = build_from_gguf(path)
 
         output = tmp_path / "runtime-package"
-        write_gguf_runtime_package(
+        artifacts = write_gguf_runtime_package(
             package,
             path,
             output,
@@ -7712,6 +7751,44 @@ class TestNemotronHMoEGGUFBuild:
         )
         assert compatibility["runtime_validation_status"] == "unvalidated"
         assert compatibility["gguf_architecture"] == "nemotron_h_moe"
+        assert (output / "model.onnx").is_file()
+        assert Path(artifacts["export_report"]).is_file()
+        report = package.export_report
+        assert report is not None
+        model = report.component("model")
+        runtime = report.component("runtime")
+        assert model is not None
+        assert runtime is not None
+        assert model.output == "exported"
+        assert runtime.output == "exported"
+        assert runtime.runtime_validation_status == "unvalidated"
+        assert runtime.blocker_category == "runtime-route-deferred"
+        assert not (output / "tokenizer.json").exists()
+
+    def test_runtime_unvalidated_fallback_rejects_source_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        from mobius.integrations.gguf import build_from_gguf, write_gguf_runtime_package
+
+        path = tmp_path / "nemotron-h-moe-mutated.gguf"
+        _write_nemotron_h_moe_gguf(path, quantized=False)
+        package = build_from_gguf(path)
+        with path.open("r+b") as stream:
+            stream.seek(-1, os.SEEK_END)
+            value = stream.read(1)
+            stream.seek(-1, os.SEEK_END)
+            stream.write(bytes([value[0] ^ 0xFF]))
+
+        output = tmp_path / "runtime-mutated"
+        with pytest.raises(ValueError, match="exact artifact identity"):
+            write_gguf_runtime_package(
+                package,
+                path,
+                output,
+                runtime_version="0.15.2",
+            )
+        assert not output.exists()
+        assert not output.exists()
 
     def test_latent_projection_imports_and_executes(self, tmp_path: Path) -> None:
         from mobius._testing.ort_inference import OnnxModelSession
@@ -7920,19 +7997,47 @@ class TestMultimodalQuantizationDefault:
         self, keep_quantized: bool
     ):
         from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._tokenizer import GGUFTokenizerVerdict
 
-        expected = mock.sentinel.package
+        expected = mock.MagicMock()
+        expected.__iter__.return_value = iter(("model", "vision"))
+        expected.config = SimpleNamespace(model_type="test-vlm")
+        expected.gguf_source_path = "text.gguf"
+        expected.gguf_source_filename = "text.gguf"
+        expected.gguf_tokenizer_verdict = GGUFTokenizerVerdict(
+            route="copy",
+            model="gpt2",
+            pre="gpt-2",
+            canonical_pre="gpt-2",
+            reason="exact embedded tokenizer",
+            token_count=2,
+        )
+        expected.export_report = None
+        text_model = SimpleNamespace(
+            architecture="llama",
+            metadata={},
+            source_identity=(1, 2, 3),
+            source_matches_path=lambda: True,
+        )
         with mock.patch(
             "mobius.integrations.gguf._mmproj.build_vlm_from_gguf",
             return_value=expected,
         ) as build_multimodal:
-            kwargs = {} if keep_quantized else {"keep_quantized": False}
-            actual = build_from_gguf(
-                "text.gguf",
-                mmproj="mmproj.gguf",
-                image_token_id=-200,
-                **kwargs,
-            )
+            if keep_quantized:
+                actual = build_from_gguf(
+                    "text.gguf",
+                    mmproj="mmproj.gguf",
+                    image_token_id=-200,
+                    _gguf_model=text_model,
+                )
+            else:
+                actual = build_from_gguf(
+                    "text.gguf",
+                    mmproj="mmproj.gguf",
+                    image_token_id=-200,
+                    keep_quantized=False,
+                    _gguf_model=text_model,
+                )
 
         assert actual is expected
         build_multimodal.assert_called_once_with(
@@ -7942,6 +8047,7 @@ class TestMultimodalQuantizationDefault:
             execution_provider="default",
             image_token_id=-200,
             keep_quantized=keep_quantized,
+            _text_gguf_model=text_model,
         )
 
     def test_image_token_id_requires_mmproj(self):
