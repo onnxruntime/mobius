@@ -12,6 +12,7 @@ import pytest
 
 from mobius.integrations.gguf._mmproj import (
     _interleaved_rope_rows,
+    _mmproj_audio_projector_to_onnx,
     _preflight_mmproj_quantization_report,
     _preflight_standalone_mmproj,
 )
@@ -100,6 +101,26 @@ def test_pockettts_qk_row_transform_matches_adjacent_to_halfsplit_permutation():
     actual = _interleaved_rope_rows(values, head_dim=4)
 
     np.testing.assert_array_equal(actual, values[[0, 2, 1, 3]])
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "head_count"),
+    [(8, 0), (8, -1), (0, 2), (7, 2)],
+)
+def test_audio_weight_loader_rejects_invalid_attention_dimensions(
+    hidden_size: int,
+    head_count: int,
+):
+    sidecar = SimpleNamespace(
+        metadata={
+            "clip.audio.embedding_length": hidden_size,
+            "clip.audio.attention.head_count": head_count,
+        },
+        tensor_names=(),
+    )
+
+    with pytest.raises(ValueError, match="positive and evenly divisible"):
+        _mmproj_audio_projector_to_onnx(sidecar, "ultravox")
 
 
 def test_audio_projector_evidence_is_test_only_immutable_and_bounded():

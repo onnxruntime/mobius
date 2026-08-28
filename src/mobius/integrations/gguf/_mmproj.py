@@ -3228,6 +3228,11 @@ def _mmproj_audio_projector_to_onnx(
 
     head_count = int(mmproj_gguf.metadata["clip.audio.attention.head_count"])
     hidden_size = int(mmproj_gguf.metadata["clip.audio.embedding_length"])
+    if head_count <= 0 or hidden_size <= 0 or hidden_size % head_count:
+        raise ValueError(
+            "clip.audio.embedding_length must be positive and evenly divisible by "
+            "the positive clip.audio.attention.head_count."
+        )
     head_dim = hidden_size // head_count
     state_dict: dict[str, torch.Tensor] = {}
     for name in mmproj_gguf.tensor_names:
