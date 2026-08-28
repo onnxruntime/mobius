@@ -567,6 +567,20 @@ class DraftPairRunner:
             ),
         )
 
+    def _finish_target_only(
+        self,
+        generated: list[int],
+        target_cache: dict[str, np.ndarray],
+        max_new_tokens: int,
+    ) -> dict[str, np.ndarray]:
+        while len(generated) < max_new_tokens:
+            outputs, target_cache = self._run_target(
+                np.array([[generated[-1]]], dtype=np.int64),
+                target_cache,
+            )
+            generated.append(int(np.argmax(outputs["logits"][0, -1])))
+        return target_cache
+
     def _generate_dflash(
         self,
         input_ids: np.ndarray,
@@ -588,6 +602,13 @@ class DraftPairRunner:
         rollbacks: list[tuple[int, int, int, int]] = []
 
         while len(generated) < max_new_tokens:
+            if max_new_tokens - len(generated) < block_size:
+                target_cache = self._finish_target_only(
+                    generated,
+                    target_cache,
+                    max_new_tokens,
+                )
+                break
             start = input_ids.shape[1] + len(generated) - 1
             block = np.array(
                 [[generated[-1], *([mask_token_id] * (block_size - 1))]],
@@ -686,13 +707,22 @@ class DraftPairRunner:
         rollbacks: list[tuple[int, int, int, int]] = []
 
         while len(generated) < max_new_tokens:
+            remaining = max_new_tokens - len(generated)
+            if remaining == 1:
+                target_cache = self._finish_target_only(
+                    generated,
+                    target_cache,
+                    max_new_tokens,
+                )
+                break
+            round_width = min(width, remaining - 1)
             start = input_ids.shape[1] + len(generated) - 1
             base_cache = draft_cache
             proposals: list[int] = []
             recycled = np.zeros((1, 1, hidden_size), dtype=draft_dtype)
             token = generated[-1]
             tentative = draft_cache
-            for step in range(width):
+            for step in range(round_width):
                 features = (
                     pending_features
                     if step == 0
@@ -751,7 +781,7 @@ class DraftPairRunner:
                 verified,
                 slice(accepted, accepted + 1),
             )
-            if accepted < width:
+            if accepted < round_width:
                 rollbacks.append(
                     (
                         next(iter(tentative.values())).shape[2],
@@ -760,7 +790,7 @@ class DraftPairRunner:
                         new_length,
                     )
                 )
-            rounds.append((accepted, width))
+            rounds.append((accepted, round_width))
         return self._result(generated, max_new_tokens, rounds, rollbacks)
 
     def _run_eagle_step(

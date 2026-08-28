@@ -96,18 +96,27 @@ def test_draft_runtime_evidence_proves_real_speculative_work() -> None:
         }
         assert trace["reorder"]["supported"] is False
         assert record["independent_direct_ort_trace"]["mutation_discriminators"] == {
-            "draft_mapping": "trace.counters.accepted",
-            "proposal_order": "trace.rounds[0].proposal_tokens[0]",
-            "cache_copy": "trace.rounds[0].draft.committed_sha256",
-            "rollback": "trace.rounds[0].target.committed_length",
+            "draft_mapping": "semantic.draft_mapping",
+            "proposal_order": "semantic.proposal_order",
+            "cache_copy": "semantic.draft_cache_replay",
+            "rollback": "semantic.target_replay_tokens",
         }
         assert any(round_trace["accepted_prefix"] > 1 for round_trace in trace["rounds"])
         assert any(round_trace["accepted_prefix"] == 0 for round_trace in trace["rounds"])
+        assert trace["final_target_cache"]["length"] == 47
+        assert (
+            sum(len(item["proposal_ids"]) for item in trace["rounds"])
+            == result["proposed_tokens"]
+        )
         for round_trace in trace["rounds"]:
-            assert len(round_trace["proposal_ids"]) == result["draft_width"]
-            assert len(round_trace["proposal_tokens"]) == result["draft_width"]
+            assert 0 < len(round_trace["proposal_ids"]) <= result["draft_width"]
+            assert len(round_trace["proposal_tokens"]) == len(round_trace["proposal_ids"])
             assert re.fullmatch(r"[0-9a-f]{64}", round_trace["proposal_logits_sha256"])
             assert round_trace["target"]["replay_tokens_match"] is True
+            assert (
+                round_trace["target"]["tentative_length"]
+                <= trace["final_target_cache"]["length"]
+            )
             assert (
                 round_trace["target"]["before_length"]
                 < (round_trace["target"]["tentative_length"])

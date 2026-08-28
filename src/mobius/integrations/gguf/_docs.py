@@ -766,9 +766,10 @@ def render_document() -> str:
             "and does not import `DraftPairRunner` or its transition helpers. Per-round",
             "DFlash and EAGLE3 traces bind proposal/remap tokens, proposal-logit hashes,",
             "accepted prefixes, correction tokens, target replay, target/draft cache",
-            "states, final counters, and four mutation discriminators. Beam reorder is",
-            "reported unsupported for the batch-size-one reference coordinator rather",
-            "than inferred.",
+            "states, final counters, and four execution-mutating discriminators. Target",
+            "replay starts from an empty cache, and final speculative rounds never process",
+            "past the requested token count. Beam reorder is reported unsupported for the",
+            "batch-size-one reference coordinator rather than inferred.",
         )
     )
     return f"""# `build_from_gguf()`

@@ -111,6 +111,7 @@ def _write_draft(
     target_hidden = target_hidden_size or hidden
     if architecture == "dflash":
         writer.add_uint32("dflash.block_size", 4)
+        writer.add_uint32("tokenizer.ggml.mask_token_id", len(tokens) - 1)
     else:
         writer.add_uint32("eagle3.target_hidden_size", target_hidden)
         writer.add_bool("eagle3.norm_before_residual", False)

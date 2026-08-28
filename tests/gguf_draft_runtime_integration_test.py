@@ -122,15 +122,14 @@ def test_real_gguf_draft_pair_direct_ort_acceptance_loop(
     assert len(production.stats.rollback_events) == trace["counters"]["rejections"]
 
     discriminators = record["independent_direct_ort_trace"]["mutation_discriminators"]
-    for mutation, path in discriminators.items():
-        mutated = IndependentDraftOracle(
-            output,
-            Path(draft_path),
-            session_options=options,
-            mutation=mutation,
-        ).run(input_ids, 32)
-        with pytest.raises(AssertionError, match=re.escape(path)):
-            assert_trace_matches(mutated, expected_trace)
+    for mutation, discriminator in discriminators.items():
+        with pytest.raises(AssertionError, match=re.escape(discriminator)):
+            IndependentDraftOracle(
+                output,
+                Path(draft_path),
+                session_options=options,
+                mutation=mutation,
+            ).run(input_ids, 32)
 
     runner.close()
     del oracle, runner, package

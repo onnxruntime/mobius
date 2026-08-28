@@ -129,25 +129,25 @@
         "generated_tokens_sha256": "78c55f7b34e9a14f4c02850a631ed9f85e0a155f25901b5d99db36f1755b7a35",
         "target_only_equal": true,
         "draft_width": 15,
-        "rounds": 7,
-        "proposed_tokens": 105,
-        "accepted_tokens": 24,
-        "multi_token_rounds": 4,
-        "rollback_events": 7,
+        "rounds": 5,
+        "proposed_tokens": 75,
+        "accepted_tokens": 18,
+        "multi_token_rounds": 3,
+        "rollback_events": 5,
         "target_cache_threaded": true,
         "draft_cache_threaded": true,
-        "baseline_seconds": 3.3284722499083728,
-        "speculative_seconds": 8.09696033410728,
-        "timing_disposition": "Functional CPU evidence only; this run was slower and makes no speedup claim."
+        "baseline_seconds": 26.956369041930884,
+        "speculative_seconds": 18.034498166991398,
+        "timing_disposition": "Functional CPU evidence only; the observed 1.49x run is not a benchmark claim."
       },
       "independent_direct_ort_trace": {
         "filename": "gguf_dflash_independent_ort_trace.json",
-        "sha256": "c6a68ae5564f9a4bb8ce70fcc73592869e2a02c6b57b451907a72860cf45a424",
+        "sha256": "d81f0d1ec7294289679a04d637c56a0c46cba0153e6e0aa6a2e079d3fb2a9519",
         "mutation_discriminators": {
-          "draft_mapping": "trace.counters.accepted",
-          "proposal_order": "trace.rounds[0].proposal_tokens[0]",
-          "cache_copy": "trace.rounds[0].draft.committed_sha256",
-          "rollback": "trace.rounds[0].target.committed_length"
+          "draft_mapping": "semantic.draft_mapping",
+          "proposal_order": "semantic.proposal_order",
+          "cache_copy": "semantic.draft_cache_replay",
+          "rollback": "semantic.target_replay_tokens"
         }
       },
       "upstream_result": {
@@ -239,24 +239,24 @@
         "target_only_equal": true,
         "draft_width": 4,
         "rounds": 11,
-        "proposed_tokens": 44,
-        "accepted_tokens": 21,
+        "proposed_tokens": 43,
+        "accepted_tokens": 20,
         "multi_token_rounds": 7,
         "rollback_events": 10,
         "target_cache_threaded": true,
         "draft_cache_threaded": true,
-        "baseline_seconds": 4.271001750137657,
-        "speculative_seconds": 3.870915165869519,
-        "timing_disposition": "Functional CPU evidence only; the observed 1.10x run is not a benchmark claim."
+        "baseline_seconds": 5.135919083841145,
+        "speculative_seconds": 2.7995243340265006,
+        "timing_disposition": "Functional CPU evidence only; the observed 1.83x run is not a benchmark claim."
       },
       "independent_direct_ort_trace": {
         "filename": "gguf_eagle3_independent_ort_trace.json",
-        "sha256": "6b28cb17ccc92d4484e9d036ef40a339f261480d6b7d715d3592925b4a495caa",
+        "sha256": "2f45ddddd60bbc480914b0a95c58291c209b39524517baa3f872d32df52e56c6",
         "mutation_discriminators": {
-          "draft_mapping": "trace.counters.accepted",
-          "proposal_order": "trace.rounds[0].proposal_tokens[0]",
-          "cache_copy": "trace.rounds[0].draft.committed_sha256",
-          "rollback": "trace.rounds[0].target.committed_length"
+          "draft_mapping": "semantic.draft_mapping",
+          "proposal_order": "semantic.proposal_order",
+          "cache_copy": "semantic.draft_cache_replay",
+          "rollback": "semantic.target_replay_tokens"
         }
       },
       "upstream_result": {

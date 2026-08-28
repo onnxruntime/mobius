@@ -74,7 +74,9 @@ def _assert_cache_equal(
     if actual.keys() != expected.keys() or any(
         not np.array_equal(actual[name], expected[name]) for name in actual
     ):
-        raise AssertionError("independent draft cache replay differs")
+        raise AssertionError(
+            "semantic.draft_cache_replay: independent draft cache replay differs"
+        )
 
 
 def _empty_cache(session: Any) -> dict[str, np.ndarray]:
@@ -251,6 +253,36 @@ class IndependentDraftOracle:
             mapped[0] = int(remap[(int(draft_ids[0]) + 1) % len(remap)])
         return mapped
 
+    def _reference_proposals(self, draft_ids: np.ndarray) -> list[int]:
+        remap = self.contract["draft_to_target"]
+        if remap is None:
+            return [int(token) for token in draft_ids]
+        return [int(remap[int(token)]) for token in draft_ids]
+
+    def _replay_target(
+        self,
+        history: list[np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+        cache = _empty_cache(self.target)
+        outputs: dict[str, np.ndarray] = {}
+        for tokens in history:
+            outputs, cache = self._run_target(tokens, cache)
+        return outputs, cache
+
+    def _finish_target_only(
+        self,
+        generated: list[int],
+        cache: dict[str, np.ndarray],
+        history: list[np.ndarray],
+        count: int,
+    ) -> dict[str, np.ndarray]:
+        while len(generated) < count:
+            tokens = np.array([[generated[-1]]], dtype=np.int64)
+            outputs, cache = self._run_target(tokens, cache)
+            history.append(tokens)
+            generated.append(int(np.argmax(outputs["logits"][0, -1])))
+        return cache
+
     def target_only(self, input_ids: np.ndarray, count: int) -> list[int]:
         cache = _empty_cache(self.target)
         outputs, cache = self._run_target(input_ids, cache)
@@ -289,19 +321,6 @@ class IndependentDraftOracle:
         draft_committed: dict[str, np.ndarray],
         draft_replay: dict[str, np.ndarray],
     ) -> dict[str, Any]:
-        if self.mutation == "proposal_order" and len(proposals) > 1:
-            proposals = [proposals[1], proposals[0], *proposals[2:]]
-        if self.mutation == "cache_copy":
-            first = next(iter(draft_committed))
-            draft_committed = dict(draft_committed)
-            draft_committed[first] = draft_committed[first].copy()
-            if draft_committed[first].size:
-                draft_committed[first].flat[0] += 1
-        if self.mutation == "rollback":
-            target_committed = _crop(
-                target_tentative,
-                max(0, _cache_length(target_committed) - 1),
-            )
         return {
             "proposal_ids": proposal_ids,
             "proposal_tokens": proposals,
@@ -343,6 +362,7 @@ class IndependentDraftOracle:
             raise AssertionError("DFlash requires target embedding component")
         target_cache = _empty_cache(self.target)
         outputs, target_cache = self._run_target(input_ids, target_cache)
+        target_history = [input_ids]
         generated = [int(np.argmax(outputs["logits"][0, -1]))]
         target_hidden = self._features(outputs)
         draft_cache = _empty_cache(self.draft)
@@ -353,6 +373,14 @@ class IndependentDraftOracle:
         draft_history: list[tuple[dict[str, np.ndarray], int]] = []
         rounds = []
         while len(generated) < count:
+            if count - len(generated) < block_size:
+                target_cache = self._finish_target_only(
+                    generated,
+                    target_cache,
+                    target_history,
+                    count,
+                )
+                break
             start = input_ids.shape[1] + len(generated) - 1
             target_before = target_cache
             draft_before = draft_cache
@@ -373,7 +401,10 @@ class IndependentDraftOracle:
             draft_tentative = _present(draft_outputs, len(draft_before) // 2)
             proposal_logits = self._draft_logits(draft_outputs)[:, -block_size + 1 :]
             proposal_ids = np.argmax(proposal_logits, axis=-1).astype(np.int64)[0]
+            reference_proposals = self._reference_proposals(proposal_ids)
             proposals = self._map_proposals(proposal_ids)
+            if self.mutation == "proposal_order" and len(proposals) > 1:
+                proposals = [proposals[1], proposals[0], *proposals[2:]]
             verified, target_tentative = self._run_target(
                 [[generated[-1], *proposals]],
                 target_before,
@@ -388,15 +419,25 @@ class IndependentDraftOracle:
                 len(proposals),
             )
             correction = int(posterior[accepted])
+            if proposals != reference_proposals:
+                discriminator = (
+                    "semantic.proposal_order"
+                    if self.mutation == "proposal_order"
+                    else "semantic.draft_mapping"
+                )
+                raise AssertionError(f"{discriminator}: proposal invariant failed")
             committed_inputs = [[generated[-1], *proposals[:accepted]]]
-            replay_outputs, target_replay = self._run_target(
-                committed_inputs,
-                target_before,
-            )
+            committed_array = np.array(committed_inputs, dtype=np.int64)
+            target_history.append(committed_array)
+            replay_outputs, target_replay = self._replay_target(target_history)
             target_committed = _crop(
                 target_tentative,
                 start + accepted + 1,
             )
+            if _cache_length(target_committed) != _cache_length(target_replay):
+                raise AssertionError(
+                    "semantic.target_history_length: target replay length differs"
+                )
             draft_committed = _crop(draft_tentative, start)
             draft_history.append((draft_feeds, start))
             draft_replay = _empty_cache(self.draft)
@@ -414,7 +455,9 @@ class IndependentDraftOracle:
                 np.argmax(replay_outputs["logits"], axis=-1).astype(np.int64)[0].tolist()
             )
             if replay_tokens != posterior[: accepted + 1].astype(np.int64).tolist():
-                raise AssertionError("target replay tokens differ from verification")
+                raise AssertionError(
+                    "semantic.target_replay_tokens: target replay tokens differ"
+                )
             rounds.append(
                 self._round(
                     proposal_ids=proposal_ids.tolist(),
@@ -440,6 +483,13 @@ class IndependentDraftOracle:
             target_cache = target_committed
             draft_cache = draft_committed
             target_hidden = self._features(verified, slice(0, accepted + 1))
+            if len(rounds) == 1 and self.mutation == "cache_copy":
+                first = next(iter(draft_cache))
+                draft_cache = dict(draft_cache)
+                draft_cache[first] = draft_cache[first].copy()
+                draft_cache[first].flat[0] += 100
+            if len(rounds) == 1 and self.mutation == "rollback":
+                target_cache = _crop(target_cache, _cache_length(target_cache) - 1)
         return self._finish(generated, count, rounds, target_cache, draft_cache)
 
     def _run_eagle_step(
@@ -480,6 +530,7 @@ class IndependentDraftOracle:
     def _run_eagle3(self, input_ids: np.ndarray, count: int) -> dict[str, Any]:
         target_cache = _empty_cache(self.target)
         outputs, target_cache = self._run_target(input_ids, target_cache)
+        target_history = [input_ids]
         generated = [int(np.argmax(outputs["logits"][0, -1]))]
         all_features = self._features(outputs)
         draft_cache = _empty_cache(self.draft)
@@ -507,6 +558,16 @@ class IndependentDraftOracle:
         pending = all_features[:, -1:]
         rounds = []
         while len(generated) < count:
+            remaining = count - len(generated)
+            if remaining == 1:
+                target_cache = self._finish_target_only(
+                    generated,
+                    target_cache,
+                    target_history,
+                    count,
+                )
+                break
+            round_width = min(4, remaining - 1)
             start = input_ids.shape[1] + len(generated) - 1
             target_before = target_cache
             draft_before = draft_cache
@@ -514,7 +575,7 @@ class IndependentDraftOracle:
             tentative = draft_before
             recycled = np.zeros((1, 1, hidden), dtype=draft_dtype)
             token = generated[-1]
-            for step in range(4):
+            for step in range(round_width):
                 features = (
                     pending
                     if step == 0
@@ -530,6 +591,9 @@ class IndependentDraftOracle:
                 token = self._map_proposals(np.array([draft_id]))[0]
                 proposals.append(token)
                 recycled = draft_outputs["next_hidden"][:, -1:]
+            reference_proposals = self._reference_proposals(np.array(proposal_ids))
+            if self.mutation == "proposal_order" and len(proposals) > 1:
+                proposals = [proposals[1], proposals[0], *proposals[2:]]
             proposal_logits = np.concatenate(proposal_logits_rows, axis=1)
             verified, target_tentative = self._run_target(
                 [[generated[-1], *proposals]],
@@ -545,12 +609,22 @@ class IndependentDraftOracle:
                 len(proposals),
             )
             correction = int(posterior[accepted])
+            if proposals != reference_proposals:
+                discriminator = (
+                    "semantic.proposal_order"
+                    if self.mutation == "proposal_order"
+                    else "semantic.draft_mapping"
+                )
+                raise AssertionError(f"{discriminator}: proposal invariant failed")
             committed_inputs = [[generated[-1], *proposals[:accepted]]]
-            replay_outputs, target_replay = self._run_target(
-                committed_inputs,
-                target_before,
-            )
+            committed_array = np.array(committed_inputs, dtype=np.int64)
+            target_history.append(committed_array)
+            replay_outputs, target_replay = self._replay_target(target_history)
             target_committed = _crop(target_tentative, start + accepted + 1)
+            if _cache_length(target_committed) != _cache_length(target_replay):
+                raise AssertionError(
+                    "semantic.target_history_length: target replay length differs"
+                )
             accepted_features = (
                 np.concatenate(
                     [pending, self._features(verified, slice(0, accepted))],
@@ -584,7 +658,9 @@ class IndependentDraftOracle:
                 np.argmax(replay_outputs["logits"], axis=-1).astype(np.int64)[0].tolist()
             )
             if replay_tokens != posterior[: accepted + 1].astype(np.int64).tolist():
-                raise AssertionError("target replay tokens differ from verification")
+                raise AssertionError(
+                    "semantic.target_replay_tokens: target replay tokens differ"
+                )
             rounds.append(
                 self._round(
                     proposal_ids=proposal_ids,
@@ -610,6 +686,13 @@ class IndependentDraftOracle:
             target_cache = target_committed
             draft_cache = draft_committed
             pending = self._features(verified, slice(accepted, accepted + 1))
+            if len(rounds) == 1 and self.mutation == "cache_copy":
+                first = next(iter(draft_cache))
+                draft_cache = dict(draft_cache)
+                draft_cache[first] = draft_cache[first].copy()
+                draft_cache[first].flat[0] += 100
+            if len(rounds) == 1 and self.mutation == "rollback":
+                target_cache = _crop(target_cache, _cache_length(target_cache) - 1)
         return self._finish(generated, count, rounds, target_cache, draft_cache)
 
     @staticmethod

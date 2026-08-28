@@ -4896,6 +4896,7 @@ def _dflash_postprocess(
         vocab_size=len(metadata.get("tokenizer.ggml.tokens", ())),
         target_layer_ids=target_layers,
         block_size=int(metadata["dflash.block_size"]),
+        mask_token_id=int(metadata["tokenizer.ggml.mask_token_id"]),
         num_target_layers=None,
         draft_vocab_size=draft_vocab,
         use_draft_lm_head="output.weight" in model.tensor_names,
