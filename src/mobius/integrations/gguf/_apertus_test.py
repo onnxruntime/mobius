@@ -110,7 +110,8 @@ def test_apertus_registry_promotes_exact_float_and_quantized_graph_import() -> N
     assert spec.tensor_map_recipe == ("llama", "apertus_extras")
     assert spec.config_postprocessor == "apertus"
     assert spec.quantized_import.value == "supported"
-    assert spec.runtime.value == "deferred"
+    assert spec.runtime.value == "supported"
+    assert spec.runtime_evidence_ids == ("apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",)
 
 
 def test_apertus_consumes_serialized_rope_and_xielu_values_exactly() -> None:
@@ -130,6 +131,42 @@ def test_apertus_consumes_serialized_rope_and_xielu_values_exactly() -> None:
     assert config.attn_q_norm_biases == (True, True)
     assert config.attn_k_norm_biases == (True, True)
     assert config.attn_o_bias
+
+
+def test_apertus_accepts_generic_xielu_metadata_and_default_rope() -> None:
+    metadata = _metadata()
+    for suffix in ("alpha_p", "alpha_n", "beta", "eps"):
+        metadata[f"xielu.{suffix}"] = metadata.pop(f"apertus.xielu.{suffix}")
+    tensors = _tensors()
+    tensors.pop("rope_freqs.weight")
+
+    config = gguf_to_config(_FakeGGUF(metadata, tensors))
+
+    assert config.rope_type == "default"
+    assert config.rope_scaling is None
+    assert config.xielu_alpha_p == (-0.2, -0.1)
+    assert config.xielu_alpha_n == (-1.0, -0.9)
+
+
+def test_apertus_rejects_conflicting_xielu_metadata_or_unserialized_rope_scaling() -> None:
+    metadata = _metadata()
+    metadata["xielu.beta"] = 0.25
+    with pytest.raises(ValueError, match=r"conflicting apertus\.xielu\.beta and xielu\.beta"):
+        gguf_to_config(_FakeGGUF(metadata, _tensors()))
+
+    metadata = _metadata()
+    metadata["apertus.rope.scaling.type"] = "longrope"
+    tensors = _tensors()
+    tensors.pop("rope_freqs.weight")
+    with pytest.raises(ValueError, match="factorless RoPE"):
+        gguf_to_config(_FakeGGUF(metadata, tensors))
+
+    metadata = _metadata()
+    metadata["apertus.rope.scaling.original_context_length"] = 16
+    tensors = _tensors()
+    tensors.pop("rope_freqs.weight")
+    with pytest.raises(ValueError, match="original_context_length requires"):
+        gguf_to_config(_FakeGGUF(metadata, tensors))
 
 
 def test_apertus_maps_qk_norm_and_output_bias_without_value_transform() -> None:
@@ -162,6 +199,11 @@ def test_apertus_rejects_quantized_or_malformed_serialized_rope_factors() -> Non
     tensors = _tensors()
     tensors["rope_freqs.weight"] = np.ones((3,), np.float32)
     with pytest.raises(ValueError, match=r"shape \(2,\)"):
+        gguf_to_config(_FakeGGUF(_metadata(), tensors))
+
+    tensors = _tensors()
+    tensors["rope_factors_short.weight"] = np.ones((2,), np.float32)
+    with pytest.raises(ValueError, match="must contain exactly"):
         gguf_to_config(_FakeGGUF(_metadata(), tensors))
 
 

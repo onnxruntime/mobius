@@ -2258,15 +2258,14 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="apertus",
         tensor_map_recipe=("llama", "apertus_extras"),
         config_postprocessor="apertus",
-        required_metadata=(
-            "attention.layer_norm_rms_epsilon",
-            "xielu.alpha_n",
-            "xielu.alpha_p",
-            "xielu.beta",
-            "xielu.eps",
+        required_metadata=("attention.layer_norm_rms_epsilon",),
+        runtime=Support.SUPPORTED,
+        runtime_evidence_ids=("apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",),
+        reason=(
+            "Runtime support is restricted to the pinned Apertus-v1.1-1.5B-Instruct "
+            "BF16 artifact's exact-float CPU route, official tokenizer revision, full-logit "
+            "stateful evidence, and ORT GenAI 0.15.2."
         ),
-        runtime=Support.DEFERRED,
-        reason=_RUNTIME_VALIDATION_PENDING,
     ),
     GGUFArchitectureSpec(
         gguf_arch="minicpm",

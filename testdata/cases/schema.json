@@ -308,7 +308,7 @@
         "max_download_bytes": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 1073741824,
+          "maximum": 17179869184,
           "description": "Hard per-case aggregate artifact download budget."
         },
         "released_capabilities": {

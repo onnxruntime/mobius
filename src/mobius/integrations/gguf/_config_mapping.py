@@ -473,6 +473,7 @@ def _validate_closed_rope_scaling_metadata(
     arch: str,
     *,
     allowed_suffixes: set[str] | None = None,
+    allowed_types: set[str] | None = None,
 ) -> None:
     """Reject RoPE-scaling metadata outside an architecture's exact subset."""
     allowed = {f"{arch}.rope.scaling.{suffix}" for suffix in (allowed_suffixes or set())}
@@ -495,7 +496,8 @@ def _validate_closed_rope_scaling_metadata(
             f"{arch} has unsupported RoPE scaling metadata: {', '.join(sorted(unsupported))}"
         )
     scaling_type = metadata.get(f"{arch}.rope.scaling.type")
-    if "type" in (allowed_suffixes or set()) and scaling_type not in (None, "", "none"):
+    accepted_types = {None, "", "none", *(allowed_types or set())}
+    if "type" in (allowed_suffixes or set()) and scaling_type not in accepted_types:
         raise ValueError(
             f"{arch} rope.scaling.type={scaling_type!r} is not in the exact supported subset"
         )
@@ -1415,7 +1417,24 @@ def _apertus_postprocess(
     layers = config.num_hidden_layers
 
     def per_layer(suffix: str) -> tuple[float, ...]:
-        raw = metadata[f"{arch}.xielu.{suffix}"]
+        qualified = f"{arch}.xielu.{suffix}"
+        generic = f"xielu.{suffix}"
+        if qualified in metadata and generic in metadata:
+            if not np.array_equal(
+                np.asarray(metadata[qualified]), np.asarray(metadata[generic])
+            ):
+                raise ValueError(
+                    f"GGUF architecture {arch!r} has conflicting {qualified} and {generic}"
+                )
+            raw = metadata[qualified]
+        elif qualified in metadata:
+            raw = metadata[qualified]
+        elif generic in metadata:
+            raw = metadata[generic]
+        else:
+            raise ValueError(
+                f"GGUF architecture {arch!r} is missing required metadata: xielu.{suffix}"
+            )
         values = list(raw) if isinstance(raw, (list, tuple, np.ndarray)) else [raw] * layers
         if len(values) != layers:
             raise ValueError(
@@ -1440,15 +1459,36 @@ def _apertus_postprocess(
     }
     if any(type_id not in {0, 1, 30} for type_id in raw_types.values()):
         raise ValueError("Apertus serialized RoPE factors must use F32/F16/BF16 storage")
+    _validate_closed_rope_scaling_metadata(
+        metadata,
+        arch,
+        allowed_suffixes={"original_context_length", "type"},
+        allowed_types={"longrope"},
+    )
+    scaling_type = metadata.get(f"{arch}.rope.scaling.type")
+    original_context_key = f"{arch}.rope.scaling.original_context_length"
+    factor_pair = {"rope_factors_long.weight", "rope_factors_short.weight"}
+    if original_context_key in metadata and rope_names != factor_pair:
+        raise ValueError(
+            "Apertus rope.scaling.original_context_length requires the complete "
+            "rope_factors_long.weight/rope_factors_short.weight pair"
+        )
 
-    if rope_names == {"rope_freqs.weight"}:
+    if not rope_names:
+        if scaling_type not in {None, "", "none"}:
+            raise ValueError(
+                "Apertus factorless RoPE requires rope.scaling.type to be absent or 'none'"
+            )
+        short_factors = long_factors = None
+        original_context = config.max_position_embeddings
+    elif rope_names == {"rope_freqs.weight"}:
         factors = np.asarray(model.get_tensor("rope_freqs.weight"), dtype=np.float32).reshape(
             -1
         )
         short_factors = long_factors = factors
         original_context = config.max_position_embeddings
-    elif rope_names == {"rope_factors_long.weight", "rope_factors_short.weight"}:
-        original_context_raw = metadata.get(f"{arch}.rope.scaling.original_context_length")
+    elif rope_names == factor_pair:
+        original_context_raw = metadata.get(original_context_key)
         if original_context_raw is None:
             raise ValueError(
                 "Apertus LongRoPE factors require apertus.rope.scaling.original_context_length"
@@ -1470,18 +1510,24 @@ def _apertus_postprocess(
             "Apertus GGUF must contain exactly rope_freqs.weight or the complete "
             "rope_factors_long.weight/rope_factors_short.weight pair"
         )
+    if rope_names and scaling_type not in {None, "", "none", "longrope"}:
+        raise ValueError(
+            "Apertus serialized RoPE factors require rope.scaling.type to be absent, "
+            "'none', or 'longrope'"
+        )
 
-    expected = config.head_dim // 2
-    for name, factors in (("short", short_factors), ("long", long_factors)):
-        if (
-            factors.shape != (expected,)
-            or not np.all(np.isfinite(factors))
-            or np.any(factors <= 0)
-        ):
-            raise ValueError(
-                f"Apertus {name} RoPE factors must have shape ({expected},) and be "
-                "finite positive values"
-            )
+    if short_factors is not None and long_factors is not None:
+        expected = config.head_dim // 2
+        for name, factors in (("short", short_factors), ("long", long_factors)):
+            if (
+                factors.shape != (expected,)
+                or not np.all(np.isfinite(factors))
+                or np.any(factors <= 0)
+            ):
+                raise ValueError(
+                    f"Apertus {name} RoPE factors must have shape ({expected},) and be "
+                    "finite positive values"
+                )
 
     q_biases = tuple(f"blk.{layer}.attn_q_norm.bias" in names for layer in range(layers))
     k_biases = tuple(f"blk.{layer}.attn_k_norm.bias" in names for layer in range(layers))
@@ -1491,11 +1537,15 @@ def _apertus_postprocess(
         attn_qk_norm=True,
         attn_q_norm_biases=q_biases,
         attn_k_norm_biases=k_biases,
-        rope_type="longrope",
-        rope_scaling={
-            "short_factor": short_factors.tolist(),
-            "long_factor": long_factors.tolist(),
-        },
+        rope_type="default" if short_factors is None else "longrope",
+        rope_scaling=(
+            None
+            if short_factors is None or long_factors is None
+            else {
+                "short_factor": short_factors.tolist(),
+                "long_factor": long_factors.tolist(),
+            }
+        ),
         original_max_position_embeddings=original_context,
         xielu_alpha_p=per_layer("alpha_p"),
         xielu_alpha_n=per_layer("alpha_n"),

@@ -144,9 +144,11 @@ def test_production_runtime_evidence_requires_final_package_regeneration() -> No
 
     records = iter_runtime_evidence()
     assert records
-    assert all(
-        record.runtime_package_schema != FINAL_RUNTIME_PACKAGE_SCHEMA for record in records
-    )
+    assert [
+        record.evidence_id
+        for record in records
+        if record.runtime_package_schema == FINAL_RUNTIME_PACKAGE_SCHEMA
+    ] == ["apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2"]
 
 
 def test_low_cost_runtime_batch_manifest_is_closed_and_within_budget() -> None:
@@ -281,6 +283,21 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             runtime_version="1.0.0",
             tokenizer_repository=record.tokenizer_repository,
             tokenizer_revision=record.tokenizer_revision,
+        )
+        is record
+    )
+    assert (
+        matching_runtime_evidence(
+            (record.evidence_id,),
+            architecture="llama",
+            runtime="onnx-genai",
+            source_path=source,
+            gguf_model=_model(),
+            built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
+            import_route=record.import_route,
+            runtime_version="1.0.0",
+            tokenizer_repository=None,
+            tokenizer_revision=None,
         )
         is record
     )

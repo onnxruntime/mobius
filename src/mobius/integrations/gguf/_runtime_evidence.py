@@ -534,6 +534,71 @@ _LOW_COST_STATEFUL_SEMANTICS = (
     "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps"
 )
 
+_APERTUS_15B_BF16_ORT_GENAI = GGUFRuntimeEvidence(
+    evidence_id="apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",
+    architecture="apertus",
+    repository="MrMeOrYou/Apertus-v1.1-1.5B-Instruct-GGUF",
+    revision="88c75ad49566d3c2157d03709bf772262c3241ed",
+    filename="Apertus-v1.1-1.5B-Instruct-BF16.gguf",
+    size=3_028_052_608,
+    lfs_sha256="f9ec154d0ec29dad1f6465b458b7f27bd25ad7b9a3899233ae98ca6d358501c2",
+    config_repository="swiss-ai/Apertus-v1.1-1.5B-Instruct",
+    config_revision="9e9d01154446a645d30f04174cf1515a38058be7",
+    tokenizer_repository="swiss-ai/Apertus-v1.1-1.5B-Instruct",
+    tokenizer_revision="9e9d01154446a645d30f04174cf1515a38058be7",
+    tokenizer_metadata_sha256=(
+        "3097bd9f22efd32db9045c4705d978539dc8adeeae763324062a5e1a73fc24a5"
+    ),
+    tokenizer_assets=(
+        (
+            "chat_template.jinja",
+            5_250,
+            "4afab8361a4bd0c2994404e0b0851dbaad461a06e56bdfdb635aae3977473c19",
+        ),
+        (
+            "special_tokens_map.json",
+            560,
+            "9f69883bd70fc5d8b55822799837a216d3ac4fb565e05256a0d4f9850404bbc5",
+        ),
+        (
+            "tokenizer.json",
+            17_078_368,
+            "be12f4375d655cc740864e3a9041bcddd8477942f209d9e7f27f6c8767162638",
+        ),
+        (
+            "tokenizer_config.json",
+            177_274,
+            "77b14a0664585c26065f07d7a4c852a4615c83348d9378e23def01957bbd3f57",
+        ),
+    ),
+    tensor_count=163,
+    tensor_qtypes=(("BF16", 98), ("F32", 65)),
+    import_route='{"architecture":"apertus","config_sha256":"2a9660c48656c0980e76f1b374262bf8383256603e8b4221aa99bcfa11c510b0","execution_provider":"cpu","model_type":"apertus","module_type":"apertus","preserve_quantization":false,"registry_import":{"config_key_map":null,"config_postprocessor":"apertus","llama_qk_permute":false,"offset_norm":false,"required_metadata":["attention.layer_norm_rms_epsilon"],"rope_interleave":false,"tensor_processor":null,"v_head_reorder":false,"vlm_builder":null},"route_schema":1,"static_cache":false,"task":{"class":"builtins.str","state":"text-generation"},"tensor_map_recipe":["llama","apertus_extras"]}',
+    source_fidelity=True,
+    storage_quantized=False,
+    target_storage_format="float",
+    compute_mode="float operators",
+    graph_files=_LOW_COST_GRAPH_FILES,
+    graph_sha256="4bb91bade19d41559cb524e28692453851fe67274cc58109787ee968df3e0fe5",
+    runtime_package_files=(
+        "chat_template.jinja",
+        "export_report.json",
+        *_LOW_COST_RUNTIME_PACKAGE_FILES,
+    ),
+    runtime_package_sha256="97582549e9c5b4114f3bcfa81c92f16aba9d14dd0ea0d2b20acaefd9060e6486",
+    parity_test=("test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]"),
+    parity_kind="full-logit",
+    deterministic_test=(
+        "test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]"
+    ),
+    stateful_semantics=_LOW_COST_STATEFUL_SEMANTICS,
+    execution_provider="CPUExecutionProvider",
+    onnxruntime_version="1.29.0",
+    runtime="ort-genai",
+    runtime_version="0.15.2",
+    runtime_package_schema=FINAL_RUNTIME_PACKAGE_SCHEMA,
+)
+
 _GPT2_Q2_K_ORT_GENAI = GGUFRuntimeEvidence(
     evidence_id="gpt2-q2-k-ort-genai-0.15.2",
     architecture="gpt2",
@@ -863,6 +928,7 @@ _RUNTIME_EVIDENCE: MappingProxyType[str, GGUFRuntimeEvidence] = MappingProxyType
     {
         record.evidence_id: record
         for record in (
+            _APERTUS_15B_BF16_ORT_GENAI,
             _LFM2_350M_F16_ORT_GENAI,
             _QWEN25_Q8_ORT_GENAI,
             _QWEN35MOE_087B_Q2_K_ORT_GENAI,
@@ -993,12 +1059,7 @@ def find_matching_runtime_evidence(
             "The GGUF source no longer matches the exact artifact identity captured during "
             f"graph construction: built={built_identity!r}, current={current_identity!r}."
         )
-    if (
-        not evidence_ids
-        or runtime_version is None
-        or tokenizer_repository is None
-        or tokenizer_revision is None
-    ):
+    if not evidence_ids or runtime_version is None:
         return None
     identity = built_identity
     candidates = [
@@ -1014,8 +1075,14 @@ def find_matching_runtime_evidence(
         and _RUNTIME_EVIDENCE[evidence_id].tensor_count == identity.tensor_count
         and _RUNTIME_EVIDENCE[evidence_id].tensor_qtypes == identity.tensor_qtypes
         and _RUNTIME_EVIDENCE[evidence_id].import_route == import_route
-        and _RUNTIME_EVIDENCE[evidence_id].tokenizer_repository == tokenizer_repository
-        and _RUNTIME_EVIDENCE[evidence_id].tokenizer_revision == tokenizer_revision
+        and (
+            tokenizer_repository is None
+            or _RUNTIME_EVIDENCE[evidence_id].tokenizer_repository == tokenizer_repository
+        )
+        and (
+            tokenizer_revision is None
+            or _RUNTIME_EVIDENCE[evidence_id].tokenizer_revision == tokenizer_revision
+        )
     ]
     if len(candidates) > 1:
         raise RuntimeError(

@@ -248,7 +248,10 @@ def attach_runtime_unvalidated_report(
         else None
     )
     tokenizer_verdict = getattr(pkg, "gguf_tokenizer_verdict", None)
-    if tokenizer is None:
+    if tokenizer is None or (
+        tokenizer_exported
+        and (tokenizer.support != "supported" or tokenizer.output != "exported")
+    ):
         if tokenizer_verdict is None:
             raise ValueError(
                 "Runtime-unvalidated packaging requires the tokenizer disposition captured "
