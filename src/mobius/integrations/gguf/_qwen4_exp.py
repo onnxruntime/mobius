@@ -28,7 +28,7 @@ class Qwen4ExpGGUFImportError(NotImplementedError):
 def _payload_blocker(
     *,
     keep_quantized: bool | None,
-    payload_downloaded: bool | None = None,
+    complete_payload_downloaded: bool | None = None,
 ) -> Qwen4ExpGGUFImportError:
     if keep_quantized is True:
         detail = (
@@ -53,8 +53,11 @@ def _payload_blocker(
             "expert-bank ABIs, while dense materialization exceeds the bounded-memory "
             "import route."
         )
-    if payload_downloaded is False:
-        download_detail = "No GGUF tensor payload was downloaded."
+    if complete_payload_downloaded is False:
+        download_detail = (
+            "Only bounded GGUF preflight range data was fetched; no complete GGUF "
+            "file or shard payload was downloaded."
+        )
     else:
         download_detail = (
             "This rejection does not imply that no Hub payload was downloaded: "
@@ -72,12 +75,12 @@ def _payload_blocker(
 def reject_qwen4exp_payload(
     *,
     keep_quantized: bool | None = None,
-    payload_downloaded: bool | None = None,
+    complete_payload_downloaded: bool | None = None,
 ) -> None:
     """Reject a header-identified Qwen4Exp payload without materializing tensors."""
     raise _payload_blocker(
         keep_quantized=keep_quantized,
-        payload_downloaded=payload_downloaded,
+        complete_payload_downloaded=complete_payload_downloaded,
     )
 
 

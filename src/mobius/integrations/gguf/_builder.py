@@ -629,7 +629,7 @@ def _preflight_hf_gguf_file(
     if architecture == "qwen4exp" and dispatch_architecture:
         from mobius.integrations.gguf._qwen4_exp import reject_qwen4exp_payload
 
-        reject_qwen4exp_payload(payload_downloaded=False)
+        reject_qwen4exp_payload(complete_payload_downloaded=False)
     return _GGUFPreflightRevision(commit_hash, header_info)
 
 
@@ -6348,7 +6348,7 @@ def _select_hf_gguf_set_from_split_headers(
     if primary_architecture == "qwen4exp":
         from mobius.integrations.gguf._qwen4_exp import reject_qwen4exp_payload
 
-        reject_qwen4exp_payload(payload_downloaded=False)
+        reject_qwen4exp_payload(complete_payload_downloaded=False)
     mismatched_architectures = {
         name: architecture
         for name, architecture in declared_architectures.items()
