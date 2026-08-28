@@ -33,6 +33,7 @@ from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     HierarchicalAudioWorkflowConfig,
+    _validate_reuse_rate_selection,
     write_audio_codec_workflow_metadata,
     write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
@@ -48,6 +49,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_video_diffusion_workflow_metadata,
     write_vlm_workflow_metadata,
 )
+from mobius.models.reuse import ReUseConfig
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -929,6 +931,9 @@ def write_onnx_genai_config(
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
     package_config = getattr(pkg, "config", None)
+    resolved_config = config if config is not None else package_config
+    if isinstance(resolved_config, ReUseConfig):
+        _validate_reuse_rate_selection(resolved_config)
     config_types = {
         getattr(candidate, "model_type", None)
         for candidate in (package_config, config)
@@ -957,7 +962,6 @@ def write_onnx_genai_config(
         return _write_advisory_component_contract(pkg, output_dir, warning=warning)
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
-        resolved_config = config if config is not None else getattr(pkg, "config", None)
         if resolved_config is None:
             raise ValueError("shared-state pixel-flow metadata requires a model config")
         path = write_shared_state_pixel_flow_workflow_metadata(

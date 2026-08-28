@@ -513,6 +513,49 @@ class TestNativeRateRuntime:
 class TestAutoExport:
     """`write_onnx_genai_config` must route the package here."""
 
+    @pytest.mark.parametrize("bwe_sampling_rate", [16_000, 48_000])
+    def test_rejects_dual_rates_before_package_inspection_or_output(
+        self, tmp_path, bwe_sampling_rate
+    ):
+        _, config = _package()
+        config.sampling_rate = None  # type: ignore[assignment]
+        config.input_sampling_rate = 16_000
+        config.bwe_sampling_rate = bwe_sampling_rate
+        output_dir = tmp_path / "metadata"
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            write_onnx_genai_config({}, str(output_dir), config=config)
+
+        assert not output_dir.exists()
+
+    @pytest.mark.parametrize("rate_name", ["input_sampling_rate", "bwe_sampling_rate"])
+    @pytest.mark.parametrize("value", ["16000", 16_000.0, True, False, 0, -1])
+    def test_rejects_malformed_rate_before_package_inspection_or_output(
+        self, tmp_path, rate_name, value
+    ):
+        _, config = _package()
+        config.n_fft = None  # type: ignore[assignment]
+        setattr(config, rate_name, value)
+        output_dir = tmp_path / "metadata"
+
+        with pytest.raises(ValueError, match=f"{rate_name} must be a positive integer"):
+            write_onnx_genai_config({}, str(output_dir), config=config)
+
+        assert not output_dir.exists()
+
+    def test_validates_package_config_before_structural_dispatch(self, tmp_path):
+        pkg, config = _package()
+        pkg.clear()
+        config.hop_size = None  # type: ignore[assignment]
+        config.input_sampling_rate = 16_000
+        config.bwe_sampling_rate = 48_000
+        output_dir = tmp_path / "metadata"
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            write_onnx_genai_config(pkg, str(output_dir))
+
+        assert not output_dir.exists()
+
     def test_dispatches_to_the_enhancement_writer(self, tmp_path):
         pkg, config = _package()
 
