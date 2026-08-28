@@ -144,9 +144,11 @@ def test_production_runtime_evidence_requires_final_package_regeneration() -> No
 
     records = iter_runtime_evidence()
     assert records
-    assert all(
-        record.runtime_package_schema != FINAL_RUNTIME_PACKAGE_SCHEMA for record in records
-    )
+    assert [
+        record.evidence_id
+        for record in records
+        if record.runtime_package_schema == FINAL_RUNTIME_PACKAGE_SCHEMA
+    ] == ["apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2"]
 
 
 def test_low_cost_runtime_batch_manifest_is_closed_and_within_budget() -> None:

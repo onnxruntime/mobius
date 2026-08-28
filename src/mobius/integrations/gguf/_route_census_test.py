@@ -54,14 +54,14 @@ def test_every_route_has_one_actionable_classification() -> None:
     assert {item.category for item in items} == allowed
     assert all(item.batch and item.dependencies and item.reason.strip() for item in items)
     assert Counter(item.kind for item in items) == {
-        "architecture": 136,
+        "architecture": 135,
         "projector": 60,
         "tokenizer": 56,
         "mtp": 22,
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-mobius-abi-blocked": 99,
-        "evidence-only": 151,
+        "evidence-only": 150,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }

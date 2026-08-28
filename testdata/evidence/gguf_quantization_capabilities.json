@@ -384,7 +384,7 @@
     "max_selected_artifact_bytes": 17179869184,
     "preserved_definition": "Only byte-identical native blocks or exact affine repacks preserve source represented values. Dequantize/requantize is never preserved.",
     "runtime_definition": "Runtime support requires immutable same-artifact full-logit parity plus deterministic prefill/decode/replay/rollback/reorder evidence.",
-    "selected_artifact_bytes": 2724371296,
+    "selected_artifact_bytes": 5752423904,
     "target_storage_definition": "Lossy affine normalization may still produce supported packed target storage while source_fidelity is false."
   },
   "qtypes": [
@@ -3008,6 +3008,42 @@
       "tensor_qtypes": {
         "F16": 93,
         "F32": 55
+      }
+    },
+    {
+      "evidence_ids": [
+        "apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2"
+      ],
+      "filename": "Apertus-v1.1-1.5B-Instruct-BF16.gguf",
+      "lfs_sha256": "f9ec154d0ec29dad1f6465b458b7f27bd25ad7b9a3899233ae98ca6d358501c2",
+      "repository": "MrMeOrYou/Apertus-v1.1-1.5B-Instruct-GGUF",
+      "revision": "88c75ad49566d3c2157d03709bf772262c3241ed",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "4bb91bade19d41559cb524e28692453851fe67274cc58109787ee968df3e0fe5",
+          "import_route": "{\"architecture\":\"apertus\",\"config_sha256\":\"2a9660c48656c0980e76f1b374262bf8383256603e8b4221aa99bcfa11c510b0\",\"execution_provider\":\"cpu\",\"model_type\":\"apertus\",\"module_type\":\"apertus\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"apertus\",\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.layer_norm_rms_epsilon\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\",\"apertus_extras\"]}",
+          "limitations": null,
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]",
+          "result": "passed",
+          "runtime_package_sha256": "23ddcfe528db36e9846d09706d0913a344df4ede7ecbac7594110b056cbee5da",
+          "source_fidelity": true,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 3028052608,
+      "tensor_qtypes": {
+        "BF16": 98,
+        "F32": 65
       }
     },
     {

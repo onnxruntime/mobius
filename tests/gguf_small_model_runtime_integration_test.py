@@ -261,6 +261,37 @@ class _PromotedRuntimeCase:
 
 _PROMOTED_RUNTIME_CASES = (
     _PromotedRuntimeCase(
+        name="apertus-v1.1-1.5b-instruct-bf16",
+        evidence_id="apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",
+        prompt="Hello",
+        generated_tokens=(
+            1044,
+            1362,
+            4525,
+            1875,
+            1317,
+            1278,
+            4304,
+            1307,
+            19466,
+            1321,
+            1362,
+            6483,
+            2151,
+            6370,
+            1317,
+            8178,
+            17616,
+            1046,
+            1362,
+            6483,
+        ),
+        atol=2e-4,
+        cache_atol=4e-5,
+        reference_kind="apertus",
+        required_free_bytes=13_000_000_000,
+    ),
+    _PromotedRuntimeCase(
         name="gpt2-q2-k",
         evidence_id="gpt2-q2-k-ort-genai-0.15.2",
         prompt="The capital of France is",
@@ -740,7 +771,8 @@ def _load_low_cost_same_value_reference(
     # The oracle reads and maps upstream GGUF tensors directly. It deliberately
     # shares no Mobius tensor loader, name mapping, value processor, or normalizer.
     source: dict[str, torch.Tensor] = {}
-    for tensor in GGUFReader(gguf_path).tensors:
+    reader = GGUFReader(gguf_path)
+    for tensor in reader.tensors:
         shape = tuple(int(dimension) for dimension in reversed(tensor.shape))
         if tensor.tensor_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
             value = tensor.data.reshape(shape)
@@ -776,6 +808,11 @@ def _load_low_cost_same_value_reference(
 
     renamed: dict[str, torch.Tensor] = {}
     global_names = {
+        "apertus": {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output_norm.weight": "model.norm.weight",
+            "output.weight": "lm_head.weight",
+        },
         "gptneox": {
             "token_embd.weight": "gpt_neox.embed_in.weight",
             "output_norm.weight": "gpt_neox.final_layer_norm.weight",
@@ -798,6 +835,18 @@ def _load_low_cost_same_value_reference(
         },
     }[reference_kind]
     layer_names = {
+        "apertus": {
+            "attn_norm": "attention_layernorm",
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_output": "self_attn.o_proj",
+            "attn_q_norm": "self_attn.q_norm",
+            "attn_k_norm": "self_attn.k_norm",
+            "ffn_norm": "feedforward_layernorm",
+            "ffn_up": "mlp.up_proj",
+            "ffn_down": "mlp.down_proj",
+        },
         "gptneox": {
             "attn_norm": "input_layernorm",
             "attn_qkv": "attention.query_key_value",
@@ -833,6 +882,7 @@ def _load_low_cost_same_value_reference(
         },
     }[reference_kind]
     layer_prefix = {
+        "apertus": "model.layers",
         "gptneox": "gpt_neox.layers",
         "mpt": "transformer.blocks",
         "olmo": "model.layers",
@@ -855,9 +905,27 @@ def _load_low_cost_same_value_reference(
                 )
                 value = undo_llama_qk_permutation(value, heads)
         renamed[target] = value
-    assert len(renamed) == len(source)
 
-    if reference_kind == "gptneox":
+    if reference_kind == "apertus":
+        for suffix in ("alpha_p", "alpha_n", "beta", "eps"):
+            field = reader.fields[f"xielu.{suffix}"]
+            values = [float(field.parts[index][0]) for index in field.data]
+            assert len(values) == int(hf_config.num_hidden_layers)
+            for layer, value in enumerate(values):
+                target = f"model.layers.{layer}.mlp.act_fn.{suffix}"
+                renamed[target] = torch.tensor(
+                    [value] if suffix in {"alpha_p", "alpha_n"} else value,
+                    dtype=torch.float32,
+                )
+    expected_metadata_parameters = (
+        4 * int(hf_config.num_hidden_layers) if reference_kind == "apertus" else 0
+    )
+    assert len(renamed) == len(source) + expected_metadata_parameters
+
+    if reference_kind == "apertus":
+        reference = AutoModelForCausalLM.from_config(hf_config)
+        reference.load_state_dict(renamed, assign=True, strict=True)
+    elif reference_kind == "gptneox":
         reference = GPTNeoXForCausalLM(hf_config)
         reference.load_state_dict(renamed, strict=True)
     elif reference_kind == "starcoder":
@@ -1689,7 +1757,7 @@ def test_promoted_gguf_full_runtime_evidence(
         )
     else:
         with ExitStack() as reference_guard:
-            if case.reference_kind in {"gptneox", "mpt", "olmo", "starcoder"}:
+            if case.reference_kind in {"apertus", "gptneox", "mpt", "olmo", "starcoder"}:
                 for helper in (
                     "mobius.integrations.gguf._builder._load_dequantized_state_dict",
                     "mobius.integrations.gguf._builder._normalize_gguf_weights",

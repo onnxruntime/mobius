@@ -147,6 +147,10 @@ def test_runtime_support_requires_structured_evidence() -> None:
         ("gpt2", ("gpt2-q2-k-ort-genai-0.15.2",)),
         ("starcoder2", ("tiny-starcoder2-q2-k-ort-genai-0.15.2",)),
         ("olmo", ("tiny-olmo-q2-k-ort-genai-0.15.2",)),
+        (
+            "apertus",
+            ("apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",),
+        ),
         ("mpt", ("tiny-mpt-q2-k-ort-genai-0.15.2",)),
         ("gptneox", ("pythia-70m-q2-k-ort-genai-0.15.2",)),
         ("starcoder", ("tiny-starcoder-q2-k-ort-genai-0.15.2",)),
