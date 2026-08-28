@@ -64,8 +64,8 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-mobius-abi-blocked": 99,
-        "evidence-only": 124,
-        "immediately-implementable": 31,
+        "evidence-only": 138,
+        "immediately-implementable": 17,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }
@@ -114,7 +114,8 @@ def test_known_route_boundaries_are_not_collapsed() -> None:
         "qwen3tts_spkenc",
     ):
         assert by_id[f"projector:{projector_type}"].category == "evidence-only"
-    assert by_id["projector:lfm2"].category == "immediately-implementable"
+    assert by_id["projector:lfm2"].category == "evidence-only"
+    assert by_id["projector:minimax_m3"].category == "evidence-only"
     assert by_id["projector:pixtral"].category == "evidence-only"
     for projector_type in (
         "gemma3na",

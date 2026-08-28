@@ -234,6 +234,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "feature-extraction": FeatureExtractionTask,
     "gguf-encoder-feature-extraction": GGUFEncoderFeatureExtractionTask,
     "gguf-embedding-feature-extraction": GGUFEmbeddingFeatureExtractionTask,
+    "gguf-audio-projector": GGUFAudioProjectorTask,
     "masked-diffusion": MaskedDiffusionTask,
     "minimax-music3-condition": MiniMaxMusic3ConditionTask,
     "minimax-music3-denoising": MiniMaxMusic3DenoisingTask,

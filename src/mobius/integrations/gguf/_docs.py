@@ -25,8 +25,10 @@ from mobius.integrations.gguf._artifact_blocker_evidence import (
     iter_artifact_blocker_evidence,
 )
 from mobius.integrations.gguf._mmproj_registry import (
+    LLAMA_CPP_MMPROJ_SHA,
     MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
+    iter_projector_source_evidence,
     iter_projector_specs,
 )
 from mobius.integrations.gguf._mtp_runtime_evidence import (
@@ -622,6 +624,11 @@ def _projector_evidence_table() -> str:
         "|---|---|---:|---|---|---|---|",
     ]
     for pin in MMPROJ_ARTIFACT_PINS:
+        sidecar = f"`{pin.repository}@{pin.revision}`<br>`{pin.filename}`"
+        if pin.bounded_header_bytes is not None and pin.bounded_header_sha256 is not None:
+            sidecar += (
+                f"<br>first {pin.bounded_header_bytes:,} B `{pin.bounded_header_sha256}`"
+            )
         paired_text = f"`{pin.paired_text_target}`"
         if pin.paired_text_repository and pin.paired_text_revision:
             paired_text = (
@@ -634,8 +641,7 @@ def _projector_evidence_table() -> str:
         if pin.processor_repository and pin.processor_revision:
             processor = f"`{pin.processor_repository}@{pin.processor_revision}`"
         rows.append(
-            f"| `{pin.artifact_id}` | `{pin.repository}@{pin.revision}`<br>"
-            f"`{pin.filename}` | {pin.size:,} | `{pin.lfs_sha256}` | "
+            f"| `{pin.artifact_id}` | {sidecar} | {pin.size:,} | `{pin.lfs_sha256}` | "
             f"{', '.join(f'`{item}`' for item in pin.projector_types)} | "
             f"{paired_text} | {processor} |"
         )
@@ -650,6 +656,20 @@ def _projector_evidence_table() -> str:
             ),
         )
     )
+    return "\n".join(rows)
+
+
+def _projector_source_evidence_table() -> str:
+    rows = [
+        "| Evidence ID | Immutable sources | Finding |",
+        "|---|---|---|",
+    ]
+    for evidence in iter_projector_source_evidence():
+        sources = "<br>".join(
+            f"`{repository}@{revision}` `{path}`"
+            for repository, revision, path in evidence.sources
+        )
+        rows.append(f"| `{evidence.evidence_id}` | {sources} | {evidence.finding} |")
     return "\n".join(rows)
 
 
@@ -823,8 +843,13 @@ operator ABI for every tensor role, and treats dequantize/requantize as non-pres
 
 {_projector_evidence_table()}
 
+Pinned source proofs cover graph semantics that cannot be inferred from tensor names,
+including conversion-time permutations, co-resident modality roles, and processor boundaries.
+
+{_projector_source_evidence_table()}
+
 These additional immutable files prove artifact availability only. Their routes remain
-implementation work until tensor mapping and component parity are independently established.
+governed by the capability matrix until tensor mapping and component parity are established.
 
 {_projector_availability_table()}
 
@@ -864,7 +889,7 @@ def update_document(path: Path = DOC_PATH) -> str:
             flags=re.IGNORECASE,
         )
     )
-    if pins - {UPSTREAM_COMMIT}:
+    if pins - {UPSTREAM_COMMIT, LLAMA_CPP_MMPROJ_SHA}:
         raise ValueError(f"Stale llama.cpp pins outside generated blocks: {sorted(pins)}")
     return render_document()
 

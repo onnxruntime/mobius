@@ -42,8 +42,10 @@ __all__ = [
     "Glm4VVisionModel",
     "GatedShortConv",
     "ClippableLinear",
+    "CogVLMClipSidecar",
     "GroupNorm",
     "GQAContext",
+    "HunyuanVLClipSidecar",
     "INT64_MAX",
     "InputMixer",
     "Idefics3Projector",
@@ -57,6 +59,15 @@ __all__ = [
     "LinearMultiModalProjector",
     "Llama4Projector",
     "Llama4VisionTower",
+    "MeralionAudioSidecar",
+    "MeralionProjector",
+    "MiMoDualTemporalPatchEmbedding",
+    "MiMoVLBlock",
+    "MiMoVLProjector",
+    "MiMoVLVisionSidecar",
+    "MiniMaxM3Projector",
+    "MiniMaxM3VisionBlock",
+    "MiniMaxM3VisionSidecar",
     "GGUFMLPProjector",
     "GGUFLegacyGlmAudioProjector",
     "GGUFQwen2AudioProjector",
@@ -97,6 +108,8 @@ __all__ = [
     "SparseMixerGate",
     "SpeakerEncoder",
     "SpatialPixelUnshuffle",
+    "SpatialMergeOrder",
+    "Step3VLClipSidecar",
     "SplitResidualVectorQuantizer",
     "StaticCacheState",
     "TimestepEmbedding",
@@ -106,6 +119,14 @@ __all__ = [
     "VisionEncoder",
     "VisionEncoderLayer",
     "VisionModel",
+    "Yasa2VisionSidecar",
+    "ExactGELUMLPProjector",
+    "FixedResolutionSiglipMLPSidecar",
+    "map_fixed_siglip_sidecar_weight",
+    "Exaone45VisionSidecar",
+    "KimiK25VisionSidecar",
+    "KimiVLVisionSidecar",
+    "NemotronV2VLClipSidecar",
     "apply_rms_norm",
     "apply_rotary_pos_emb",
     "build_packed_token_offset",
@@ -131,6 +152,11 @@ from mobius.components._attention import (
     Qwen35Attention as Qwen35Attention,
 )
 from mobius.components._audio import ConformerEncoder
+from mobius.components._clip_sidecars import (
+    MeralionAudioSidecar,
+    MeralionProjector,
+    Yasa2VisionSidecar,
+)
 from mobius.components._codec_conv import (
     CausalConv1d,
     CausalConvNd,
@@ -148,6 +174,10 @@ from mobius.components._codec_transformer import (
     CodecEncoderTransformerModel as CodecEncoderTransformerModel,
 )
 from mobius.components._codec_vq import SplitResidualVectorQuantizer
+from mobius.components._cog_nemotron_clip import (
+    CogVLMClipSidecar,
+    NemotronV2VLClipSidecar,
+)
 from mobius.components._common import (
     INT64_MAX,
     Embedding,
@@ -202,6 +232,11 @@ from mobius.components._encoder import (
 from mobius.components._encoder_decoder_attention import (
     EncoderDecoderAttention,
 )
+from mobius.components._fixed_siglip_sidecar import (
+    ExactGELUMLPProjector,
+    FixedResolutionSiglipMLPSidecar,
+    map_fixed_siglip_sidecar_weight,
+)
 from mobius.components._gated_deltanet import GatedDeltaNet
 from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
 from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
@@ -214,6 +249,10 @@ from mobius.components._gguf_audio_projectors import (
 )
 from mobius.components._glm4v_vision import Glm4VVisionModel
 from mobius.components._glm_ocr_vision import GlmOcrVisionModel
+from mobius.components._hunyuan_step_vision import (
+    HunyuanVLClipSidecar,
+    Step3VLClipSidecar,
+)
 from mobius.components._kimi_linear import KimiDeltaAttention, KimiMLAAttention
 from mobius.components._lightning_attention import (
     LightningAttention as LightningAttention,
@@ -222,6 +261,18 @@ from mobius.components._llama4_vision import Llama4VisionTower
 from mobius.components._lora import LoRALinear
 from mobius.components._mamba_block import Mamba2Block as Mamba2Block
 from mobius.components._mamba_block import MambaBlock as MambaBlock
+from mobius.components._mimo_minimax_vision import (
+    DualTemporalPatchEmbedding as MiMoDualTemporalPatchEmbedding,
+)
+from mobius.components._mimo_minimax_vision import (
+    MiMoVLBlock,
+    MiMoVLProjector,
+    MiMoVLVisionSidecar,
+    MiniMaxM3Projector,
+    MiniMaxM3VisionBlock,
+    MiniMaxM3VisionSidecar,
+    SpatialMergeOrder,
+)
 from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
 from mobius.components._mobilenetv5 import MobileNetV5Encoder
 from mobius.components._moe import (
@@ -337,6 +388,11 @@ from mobius.components._qwen25_vl_vision import (
 )
 from mobius.components._qwen25_vl_vision import (
     Qwen25VLVisionRotaryEmbedding as Qwen25VLVisionRotaryEmbedding,
+)
+from mobius.components._qwenlike_clip_vision import (
+    Exaone45VisionSidecar,
+    KimiK25VisionSidecar,
+    KimiVLVisionSidecar,
 )
 from mobius.components._radio_vision import RadioVisionModel
 from mobius.components._rms_norm import (

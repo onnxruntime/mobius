@@ -60,6 +60,7 @@ class GGUFAudioProjectorTask(ModelTask):
             raise ValueError("GGUF audio encoder output count does not match output_names")
         for value, name in zip(output_values, output_names):
             builder.add_output(value, name)
+        declare_component_presence(graph, "audio")
         return ModelPackage({"audio_encoder": _make_model(graph)}, config=config)
 
 
@@ -100,6 +101,8 @@ class GGUFVisionProjectorTask(ModelTask):
             for name, dtype, shape in input_schema
         }
         image_features = vision_encoder(builder.op, **inputs)
+        if bool(getattr(vision_encoder, "squeeze_batch_dim", False)):
+            image_features = builder.op.Squeeze(image_features, [0])
         builder.add_output(image_features, "image_features")
         declare_component_presence(graph, "image")
         return ModelPackage({"vision_encoder": _make_model(graph)}, config=config)

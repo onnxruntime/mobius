@@ -41,6 +41,7 @@ __all__ = [
     "map_mmproj_qwen_vision_to_hf",
     "map_mmproj_audio_to_hf",
     "map_mmproj_glm4v_vision_to_onnx",
+    "map_mmproj_audio_projector_to_onnx",
     "map_mmproj_muse_glimmer_vision_to_hf",
     "map_mmproj_qwen2_audio_to_onnx",
     "map_mmproj_qwen3_audio_to_onnx",
@@ -718,3 +719,52 @@ def map_mmproj_audio_to_hf(name: str) -> str | None:
         "mm.a.input_projection.weight": "embed_audio.embedding_projection.weight",
     }
     return audio_top.get(name)
+
+
+_WHISPER_AUDIO_BLOCK_STEMS: dict[str, str] = {
+    "ln1.weight": "self_attn_layer_norm.weight",
+    "ln1.bias": "self_attn_layer_norm.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q.bias": "self_attn.q_proj.bias",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_v.bias": "self_attn.v_proj.bias",
+    "attn_out.weight": "self_attn.out_proj.weight",
+    "attn_out.bias": "self_attn.out_proj.bias",
+    "ln2.weight": "final_layer_norm.weight",
+    "ln2.bias": "final_layer_norm.bias",
+    "ffn_up.weight": "fc1.weight",
+    "ffn_up.bias": "fc1.bias",
+    "ffn_down.weight": "fc2.weight",
+    "ffn_down.bias": "fc2.bias",
+}
+
+
+def map_mmproj_audio_projector_to_onnx(
+    name: str,
+    projector_type: str,
+) -> str | None:
+    """Map the exact standalone MERaLiON sidecar closure."""
+    if projector_type != "meralion":
+        raise ValueError(f"Unknown standalone GGUF audio projector type {projector_type!r}.")
+    block = _AUDIO_BLK.match(name)
+    if block is not None:
+        index, stem = block.groups()
+        mapped = _WHISPER_AUDIO_BLOCK_STEMS.get(stem)
+        return None if mapped is None else f"audio_encoder.layers.{index}.{mapped}"
+    return {
+        "a.conv1d.1.weight": "audio_encoder.conv1.weight",
+        "a.conv1d.1.bias": "audio_encoder.conv1.bias",
+        "a.conv1d.2.weight": "audio_encoder.conv2.weight",
+        "a.conv1d.2.bias": "audio_encoder.conv2.bias",
+        "a.position_embd.weight": "audio_encoder.position_embeddings",
+        "a.post_ln.weight": "audio_encoder.layer_norm.weight",
+        "a.post_ln.bias": "audio_encoder.layer_norm.bias",
+        "mm.a.norm_pre.weight": "audio_encoder.projector.norm_weight",
+        "mm.a.norm_pre.bias": "audio_encoder.projector.norm_bias",
+        **{
+            f"mm.a.mlp.{index}.{kind}": f"audio_encoder.projector.linear{index}.{kind}"
+            for index in range(4)
+            for kind in ("weight", "bias")
+        },
+    }.get(name)
