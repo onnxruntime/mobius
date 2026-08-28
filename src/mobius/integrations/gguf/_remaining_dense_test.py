@@ -246,7 +246,9 @@ def _write_gguf(path: Path, source: _FakeGGUF) -> None:
 
     writer = GGUFWriter(str(path), source.architecture)
     for key, value in source.metadata.items():
-        if isinstance(value, bool):
+        if isinstance(value, str):
+            writer.add_string(key, value)
+        elif isinstance(value, bool):
             writer.add_bool(key, value)
         elif isinstance(value, (int, np.integer)):
             writer.add_uint32(key, int(value))
@@ -417,6 +419,73 @@ def test_mistral4_restores_pinned_yarn_log_multiplier() -> None:
     mutated_expected = (1.0 + 0.1 * np.log(factor)) ** 2 / np.sqrt(qk_head_dim)
     assert mutated_scale == pytest.approx(mutated_expected)
     assert mutated_scale != pytest.approx(actual_scale)
+
+
+@pytest.mark.parametrize(
+    "yarn_log_multiplier",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        -1e-6,
+        float(np.nextafter(np.float32(0.1), np.float32(np.inf))),
+    ],
+    ids=["nan", "positive-inf", "negative-inf", "below-range", "above-range"],
+)
+def test_mistral4_rejects_invalid_yarn_log_multiplier(
+    yarn_log_multiplier: float,
+) -> None:
+    source = _m4_fixture()
+    source.metadata.update(
+        {
+            "mistral4.rope.scaling.type": "yarn",
+            "mistral4.rope.scaling.factor": 4.0,
+            "mistral4.rope.scaling.original_context_length": 8,
+            "mistral4.rope.scaling.yarn_beta_fast": 32.0,
+            "mistral4.rope.scaling.yarn_beta_slow": 1.0,
+            "mistral4.rope.scaling.yarn_log_multiplier": yarn_log_multiplier,
+        }
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"yarn_log_multiplier must be finite and within \[0\.0, 0\.1\]",
+    ):
+        gguf_to_config(source)
+
+
+def test_mistral4_accepts_finite_yarn_log_multiplier_boundaries(
+    tmp_path: Path,
+) -> None:
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    scales = []
+    for yarn_log_multiplier in (0.0, 0.1):
+        source = _m4_fixture()
+        source.metadata.update(
+            {
+                "mistral4.rope.scaling.type": "yarn",
+                "mistral4.rope.scaling.factor": 4.0,
+                "mistral4.rope.scaling.original_context_length": 8,
+                "mistral4.rope.scaling.yarn_beta_fast": 32.0,
+                "mistral4.rope.scaling.yarn_beta_slow": 1.0,
+                "mistral4.rope.scaling.yarn_log_multiplier": yarn_log_multiplier,
+            }
+        )
+        path = tmp_path / f"mistral4-yarn-{yarn_log_multiplier}.gguf"
+        _write_gguf(path, source)
+        roundtripped = GGUFModel(path)
+        config = gguf_to_config(roundtripped)
+        assert config.rope_scaling is not None
+        assert config.rope_scaling["mscale_all_dim"] == pytest.approx(
+            yarn_log_multiplier / 0.1
+        )
+        attention = Mistral4LatentAttention(config)
+        model = Mistral4GGUFCausalLMModel(config)
+        scales.append(attention.scaling)
+        assert np.isfinite(attention.scaling)
+        assert np.isfinite(model.model.rotary_emb.cos_cache.const_value.numpy()).all()
+        assert np.isfinite(model.model.rotary_emb.sin_cache.const_value.numpy()).all()
+    assert scales[0] != pytest.approx(scales[1])
 
 
 def test_glm_dsa_indexer_schedule_preserves_explicit_and_legacy_defaults() -> None:

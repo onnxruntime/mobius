@@ -61,6 +61,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MISTRAL4_YARN_LOG_MULTIPLIER_UNIT = float(np.float32(0.1))
+
 
 # Map GGUF architecture names → our registry model_type strings.
 #
@@ -4436,8 +4438,23 @@ def _mistral4_postprocess(
     if yarn_log_multiplier is not None:
         if rope_scaling is None or config.rope_type != "yarn":
             raise ValueError("Mistral4 yarn_log_multiplier requires YaRN rope metadata")
+        if isinstance(yarn_log_multiplier, bool) or not isinstance(
+            yarn_log_multiplier,
+            (int, float, np.integer, np.floating),
+        ):
+            raise TypeError("Mistral4 yarn_log_multiplier must be a numeric scalar")
+        yarn_log_multiplier = float(yarn_log_multiplier)
+        if (
+            not math.isfinite(yarn_log_multiplier)
+            or not 0.0 <= yarn_log_multiplier <= _MISTRAL4_YARN_LOG_MULTIPLIER_UNIT
+        ):
+            raise ValueError(
+                "Mistral4 yarn_log_multiplier must be finite and within [0.0, 0.1]"
+            )
         rope_scaling["mscale"] = 1.0
-        rope_scaling["mscale_all_dim"] = float(yarn_log_multiplier) / 0.1
+        rope_scaling["mscale_all_dim"] = (
+            yarn_log_multiplier / _MISTRAL4_YARN_LOG_MULTIPLIER_UNIT
+        )
 
     return dataclasses.replace(
         config,
