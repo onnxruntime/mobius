@@ -1313,6 +1313,7 @@ def _validate_dots_vision_shapes(mmproj_gguf: Any, projector_type: str) -> None:
     _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
     _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.bias", (hidden,))
     _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
+    expert_counts: list[int] = []
     for layer in range(layers):
         prefix = f"v.blk.{layer}."
         for suffix in ("ln1.weight", "ln2.weight"):
@@ -1335,6 +1336,7 @@ def _validate_dots_vision_shapes(mmproj_gguf: Any, projector_type: str) -> None:
             experts, expert_intermediate, expert_hidden = mmproj_gguf.get_tensor_shape(
                 prefix + "ffn_gate_exps.weight"
             )
+            expert_counts.append(experts)
             if expert_hidden != hidden:
                 raise ValueError(f"{prefix} expert gate hidden size is invalid.")
             _expect_mmproj_shape(
@@ -1368,6 +1370,13 @@ def _validate_dots_vision_shapes(mmproj_gguf: Any, projector_type: str) -> None:
                 mmproj_gguf,
                 prefix + "ffn_down.weight",
                 (hidden, intermediate),
+            )
+    if expert_counts:
+        top_k = int(md.get("clip.vision.expert_used_count", 0))
+        if top_k <= 0 or any(top_k > count for count in expert_counts):
+            raise ValueError(
+                f"{projector_type} expert_used_count must be positive and no larger "
+                "than every layer expert count."
             )
     _expect_mmproj_shape(mmproj_gguf, "mm.post_norm.weight", (hidden,))
     for name in ("mm.input_norm.weight", "mm.input_norm.bias"):
@@ -1455,9 +1464,12 @@ def _validate_lightonocr_shapes(mmproj_gguf: Any) -> None:
     hidden = int(md["clip.vision.embedding_length"])
     intermediate = int(md["clip.vision.feed_forward_length"])
     layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
     patch = int(md["clip.vision.patch_size"])
     projection = int(md["clip.vision.projection_dim"])
     merge = int(md["clip.vision.spatial_merge_size"])
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError("lightonocr has invalid hidden/head dimensions.")
     _expect_mmproj_shape(mmproj_gguf, "v.patch_embd.weight", (hidden, 3, patch, patch))
     _expect_mmproj_shape(mmproj_gguf, "v.pre_ln.weight", (hidden,))
     for layer in range(layers):
@@ -1497,11 +1509,14 @@ def _validate_youtuvl_shapes(mmproj_gguf: Any) -> None:
     hidden = int(md["clip.vision.embedding_length"])
     intermediate = int(md["clip.vision.feed_forward_length"])
     layers = int(md["clip.vision.block_count"])
+    heads = int(md["clip.vision.attention.head_count"])
     patch = int(md["clip.vision.patch_size"])
     projection = int(md["clip.vision.projection_dim"])
     merge = int(md["clip.vision.spatial_merge_size"])
     window = int(md["clip.vision.window_size"])
     indexes = md["clip.vision.wa_layer_indexes"]
+    if hidden <= 0 or heads <= 0 or hidden % heads:
+        raise ValueError("youtuvl has invalid hidden/head dimensions.")
     if (
         not isinstance(indexes, list)
         or not indexes

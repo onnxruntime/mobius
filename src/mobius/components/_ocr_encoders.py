@@ -252,7 +252,7 @@ class DotsVisionBlock(nn.Module):
                 hidden_size,
                 expert_intermediate_size,
                 num_experts,
-                min(top_k, num_experts),
+                top_k,
             )
         else:
             self.mlp = GatedMLP(
@@ -306,6 +306,9 @@ class DotsVisionEncoder(Qwen25VLVisionModel):
         counts = tuple(expert_counts or (0,) * depth)
         if len(counts) != depth:
             raise ValueError("expert_counts must have one entry per vision block")
+        routed_counts = tuple(count for count in counts if count)
+        if routed_counts and (top_k <= 0 or any(top_k > count for count in routed_counts)):
+            raise ValueError("top_k must be positive and no larger than every expert count")
         self._spatial_merge_size = spatial_merge_size
         self._spatial_merge_unit = spatial_merge_size * spatial_merge_size
         self.input_schema = (
@@ -322,6 +325,7 @@ class DotsVisionEncoder(Qwen25VLVisionModel):
         self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(
             hidden_size // num_heads // 2,
         )
+        self.rotary_pos_emb.freq_table._keep_float32 = True  # type: ignore[attr-defined]
         self.blocks = nn.ModuleList(
             [
                 DotsVisionBlock(
@@ -355,6 +359,8 @@ class DotsVisionEncoder(Qwen25VLVisionModel):
         rotary_pos_ids = self._compute_rotary_pos_ids(op, image_grid_thw)
         cu_seqlens = self._compute_cu_seqlens(op, image_grid_thw)
         cos, sin = self.rotary_pos_emb(op, rotary_pos_ids)
+        cos = op.CastLike(cos, hidden_states)
+        sin = op.CastLike(sin, hidden_states)
         for block in self.blocks:
             hidden_states = block(op, hidden_states, cu_seqlens, cos, sin)
         hidden_states = self.post_layernorm(op, hidden_states)
@@ -518,6 +524,7 @@ class PaddleOCRVisionEncoder(Qwen25VLVisionModel):
         self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(
             hidden_size // num_heads // 2,
         )
+        self.rotary_pos_emb.freq_table._keep_float32 = True  # type: ignore[attr-defined]
         self.blocks = nn.ModuleList(
             [
                 SplitQKVVisionBlock(
@@ -580,6 +587,8 @@ class PaddleOCRVisionEncoder(Qwen25VLVisionModel):
         )
         rotary_pos_ids = _raster_rotary_pos_ids(op, grid_h, grid_w)
         cos, sin = self.rotary_pos_emb(op, rotary_pos_ids)
+        cos = op.CastLike(cos, hidden_states)
+        sin = op.CastLike(sin, hidden_states)
         cu_seqlens = op.Concat(
             op.Constant(value_ints=[0]),
             op.Reshape(op.Mul(grid_h, grid_w), [1]),
@@ -628,6 +637,7 @@ class YouTuVLVisionEncoder(Qwen25VLVisionModel):
         self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(
             hidden_size // num_heads // 2,
         )
+        self.rotary_pos_emb.freq_table._keep_float32 = True  # type: ignore[attr-defined]
         self.blocks = nn.ModuleList(
             [
                 SplitQKVVisionBlock(
@@ -677,6 +687,8 @@ class YouTuVLVisionEncoder(Qwen25VLVisionModel):
             [-1, 2],
         )
         cos, sin = self.rotary_pos_emb(op, rotary_pos_ids)
+        cos = op.CastLike(cos, hidden_states)
+        sin = op.CastLike(sin, hidden_states)
 
         for layer_index, block in enumerate(self.blocks):
             block_cu = (
@@ -1430,6 +1442,7 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
                 ir.DataType.FLOAT,
                 ("num_tile_rows", 3, 640, "local_row_width"),
             ),
+            ("local_crop_count", ir.DataType.INT64, (1,)),
         )
 
     def _append_newlines(
@@ -1459,6 +1472,7 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
         op: OpBuilder,
         global_pixel_values: ir.Value,
         local_pixel_values: ir.Value,
+        local_crop_count: ir.Value,
     ) -> ir.Value:
         grid_h = op.Squeeze(op.Shape(local_pixel_values, start=0, end=1))
         packed_width = op.Squeeze(op.Shape(local_pixel_values, start=3, end=4))
@@ -1474,7 +1488,14 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
             ),
         )
         local_tiles = op.Transpose(local_tiles, perm=[0, 3, 1, 2, 4])
-        local_tiles = op.Reshape(local_tiles, [-1, 3, 640, 640])
+        local_tiles = op.Reshape(
+            local_tiles,
+            op.Concat(
+                op.Reshape(op.Mul(grid_h, grid_w), [1]),
+                [3, 640, 640],
+                axis=0,
+            ),
+        )
         local = self.local_encoder(op, local_tiles)
         local = op.Reshape(
             local,
@@ -1490,6 +1511,12 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
         local_h = op.Mul(grid_h, op.Constant(value_int=self._local_side))
         local_w = op.Mul(grid_w, op.Constant(value_int=self._local_side))
         local = self._append_newlines(op, local, local_h, local_w)
+        has_local = op.Cast(
+            op.Greater(op.Squeeze(local_crop_count), op.Constant(value_int=0)),
+            to=ir.DataType.INT64,
+        )
+        local_count = op.Mul(op.Squeeze(op.Shape(local, start=0, end=1)), has_local)
+        local = op.Slice(local, [0], op.Reshape(local_count, [1]), [0])
 
         overview = op.Squeeze(self.global_encoder(op, global_pixel_values), [0])
         overview = self._append_newlines(
@@ -1847,6 +1874,7 @@ class DeepSeekOCR2FullImageEncoder(nn.Module):
         self.input_schema = (
             ("global_pixel_values", ir.DataType.FLOAT, (1, 3, 1024, 1024)),
             ("local_pixel_values", ir.DataType.FLOAT, ("num_tiles", 3, 768, 768)),
+            ("local_crop_count", ir.DataType.INT64, (1,)),
         )
 
     def forward(
@@ -1854,9 +1882,16 @@ class DeepSeekOCR2FullImageEncoder(nn.Module):
         op: OpBuilder,
         global_pixel_values: ir.Value,
         local_pixel_values: ir.Value,
+        local_crop_count: ir.Value,
     ) -> ir.Value:
         local = self.local_encoder(op, local_pixel_values)
         local = op.Reshape(local, [-1, self._output_size])
+        local_tokens = op.Div(
+            op.Squeeze(op.Shape(local, start=0, end=1)),
+            op.Squeeze(op.Shape(local_pixel_values, start=0, end=1)),
+        )
+        local_count = op.Mul(op.Squeeze(local_crop_count), local_tokens)
+        local = op.Slice(local, [0], op.Reshape(local_count, [1]), [0])
         overview = op.Squeeze(self.global_encoder(op, global_pixel_values), [0])
         overview = op.Concat(
             overview,

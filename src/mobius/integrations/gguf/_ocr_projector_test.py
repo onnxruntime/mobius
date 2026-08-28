@@ -152,6 +152,38 @@ def test_artifact_pins_cover_every_ocr_header_and_both_dots_roles():
         assert tuple(sorted(item["tensor_qtypes"].items())) == tuple(sorted(pin.tensor_qtypes))
 
 
+@pytest.mark.parametrize("projector_type", ("lightonocr", "youtuvl"))
+@pytest.mark.parametrize("invalid_heads", (0, 7))
+def test_real_header_rejects_invalid_vision_head_geometry(
+    projector_type: str,
+    invalid_heads: int,
+):
+    source = _HeaderFixture(_evidence()[_ROUTE_HEADERS[projector_type]])
+    source.metadata["clip.vision.attention.head_count"] = invalid_heads
+
+    with pytest.raises(ValueError, match=r"positive integer|invalid hidden/head dimensions"):
+        _preflight_standalone_mmproj(
+            source,
+            projector_type=projector_type,
+            target_architecture=_TARGETS[projector_type],
+        )
+
+
+@pytest.mark.parametrize("invalid_top_k", (0, 33))
+def test_dots3note_rejects_invalid_expert_top_k(invalid_top_k: int):
+    source = _HeaderFixture(_evidence()["dots3note"])
+    source.metadata["clip.vision.expert_used_count"] = invalid_top_k
+
+    with pytest.raises(
+        ValueError, match=r"positive integer|expert_used_count must be positive"
+    ):
+        _preflight_standalone_mmproj(
+            source,
+            projector_type="dots3note_v",
+            target_architecture="dots3note",
+        )
+
+
 @pytest.mark.parametrize("projector_type", tuple(_ROUTE_HEADERS))
 def test_real_header_rejects_unknown_extra_tensor(projector_type: str):
     source = _HeaderFixture(_evidence()[_ROUTE_HEADERS[projector_type]])

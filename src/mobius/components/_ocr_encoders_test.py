@@ -8,6 +8,7 @@ import math
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 import torch
 import torch.nn.functional as torch_functional
 from onnxscript import nn
@@ -982,6 +983,70 @@ def test_deepseek_ocr2_fp16_keeps_rotary_frequency_math_float32():
     assert np.isfinite(actual).all()
 
 
+@pytest.mark.parametrize("dtype", (ir.DataType.FLOAT16, ir.DataType.BFLOAT16))
+@pytest.mark.parametrize("encoder_name", ("dots", "paddle", "youtu"))
+def test_ocr_vision_rotary_long_positions_keep_float32_before_cast(
+    dtype,
+    encoder_name: str,
+):
+    common = dict(
+        depth=1,
+        hidden_size=32,
+        intermediate_size=40,
+        num_heads=2,
+        output_size=32,
+        projector_intermediate_size=32,
+        spatial_merge_size=1,
+        norm_eps=1e-6,
+    )
+    if encoder_name == "dots":
+        module = DotsVisionEncoder(**common, patch_size=1, qk_norm=False)
+    elif encoder_name == "paddle":
+        module = PaddleOCRVisionEncoder(**common, patch_size=1, position_size=4)
+    else:
+        module = YouTuVLVisionEncoder(
+            **common,
+            pixel_size=3,
+            patch_size=1,
+            window_size=1,
+            full_attention_layers=(0,),
+        )
+    config = ArchitectureConfig(
+        vocab_size=1,
+        hidden_size=32,
+        intermediate_size=40,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=32,
+        max_position_embeddings=1,
+        hidden_act="silu",
+        dtype=dtype,
+    )
+    model = build_from_module(
+        GGUFVisionProjectorModel(module),
+        config,
+        task=GGUFVisionProjectorTask(),
+    )["vision_encoder"]
+
+    frequency = next(
+        initializer
+        for name, initializer in model.graph.initializers.items()
+        if name.endswith("rotary_pos_emb.freq_table")
+    )
+    assert frequency.dtype == ir.DataType.FLOAT
+    row = np.asarray(frequency.const_value)[511]
+    expected = 511.0 / (10000.0 ** (np.arange(row.size, dtype=np.float32) / row.size))
+    np.testing.assert_allclose(row, expected, rtol=1e-6, atol=1e-6)
+    trig_nodes = [node for node in model.graph if node.op_type in {"Cos", "Sin"}]
+    assert len(trig_nodes) == 2
+    assert all(
+        consumer.op_type == "Cast"
+        for node in trig_nodes
+        for consumer, _ in node.outputs[0].uses()
+    )
+
+
 class _FeatureStub(nn.Module):
     def __init__(self, tokens: int, hidden_size: int, offset: int):
         super().__init__()
@@ -1035,6 +1100,7 @@ def test_deepseek_v1_full_media_order_and_newlines():
         {
             "global_pixel_values": global_pixels,
             "local_pixel_values": local_pixels,
+            "local_crop_count": np.array([2], dtype=np.int64),
         },
         seed=17,
     )
@@ -1081,6 +1147,7 @@ def test_deepseek_v2_full_media_order_and_global_separator():
         {
             "global_pixel_values": np.zeros((1, 1), dtype=np.float32),
             "local_pixel_values": np.zeros((2, 1), dtype=np.float32),
+            "local_crop_count": np.array([2], dtype=np.int64),
         },
         seed=18,
     )
@@ -1092,6 +1159,57 @@ def test_deepseek_v2_full_media_order_and_global_separator():
     )
 
     np.testing.assert_array_equal(actual, np.concatenate((local, overview), axis=0))
+
+
+@pytest.mark.parametrize("version", (1, 2))
+def test_deepseek_no_crop_placeholder_emits_only_overview(version: int):
+    common = dict(
+        sam_hidden_size=8,
+        sam_num_heads=2,
+        sam_depth=1,
+        sam_window_size=2,
+        output_size=4,
+    )
+    if version == 1:
+        module = DeepSeekOCRFullImageEncoder(
+            **common,
+            clip_hidden_size=8,
+            clip_intermediate_size=12,
+            clip_num_heads=2,
+            clip_depth=1,
+        )
+        module.global_encoder = _FeatureStub(256, 4, 10_000)
+        module.local_encoder = _FeatureStub(100, 4, 0)
+        local_pixels = np.zeros((1, 3, 640, 640), dtype=np.float32)
+        overview_rows = 16 * 17
+    else:
+        module = DeepSeekOCR2FullImageEncoder(
+            **common,
+            hidden_size=8,
+            intermediate_size=12,
+            depth=1,
+            num_heads=2,
+            num_kv_heads=1,
+            norm_eps=1e-6,
+        )
+        module.global_encoder = _FeatureStub(256, 4, 10_000)
+        module.local_encoder = _FeatureStub(144, 4, 0)
+        local_pixels = np.zeros((1, 1), dtype=np.float32)
+        overview_rows = 256
+
+    actual, state, _ = _run(
+        module,
+        {
+            "global_pixel_values": np.zeros((1, 1), dtype=np.float32),
+            "local_pixel_values": local_pixels,
+            "local_crop_count": np.array([0], dtype=np.int64),
+        },
+        seed=19 + version,
+    )
+
+    assert actual.shape == (overview_rows + 1, 4)
+    assert actual[0, 0] == 10_000
+    np.testing.assert_array_equal(actual[-1], state["view_separator"].numpy())
 
 
 def test_granite_anyres_assembly_adds_one_newline_per_unpadded_row():

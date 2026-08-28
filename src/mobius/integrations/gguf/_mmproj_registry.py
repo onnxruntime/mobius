@@ -4792,8 +4792,10 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         processor_contract=(
             ("global_view", "float32[1,3,1024,1024]"),
             ("local_rows", "float32[num_rows,3,640,640*num_tiles_per_row]"),
+            ("local_crop_count", "int64[1], zero for the processor placeholder"),
             ("ordering", "local tile rows followed by the global overview"),
-            ("empty_media", "reject"),
+            ("no_crop", "omit all local feature rows and emit only the overview"),
+            ("empty_media", "reject when the global view is absent"),
         ),
     ),
     MMProjArtifactPin(
@@ -4825,8 +4827,10 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         processor_contract=(
             ("global_view", "float32[1,3,1024,1024] -> 257 feature rows"),
             ("local_tiles", "float32[num_tiles,3,768,768] -> 144 rows per tile"),
+            ("local_crop_count", "int64[1], zero for the processor placeholder"),
             ("ordering", "local tiles followed by the global overview"),
-            ("empty_media", "reject"),
+            ("no_crop", "omit all local feature rows and emit only the overview"),
+            ("empty_media", "reject when the global view is absent"),
         ),
     ),
     MMProjArtifactPin(
