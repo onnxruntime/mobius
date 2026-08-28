@@ -37,6 +37,23 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
+def _realize_captured_module_parameters(
+    op: OpBuilder,
+    module: nn.Module,
+    *,
+    prefix: str,
+) -> None:
+    """Register captured subgraph parameters under their parent-graph module paths."""
+    for relative_name, parameter in module.named_parameters():
+        if parameter._realized:  # type: ignore[attr-defined]
+            continue
+        module_path, _, _ = relative_name.rpartition(".")
+        parameter.name = ".".join(
+            part for part in (prefix, module_path, parameter.name) if part
+        )
+        parameter._realize(op.builder.root)  # type: ignore[attr-defined]
+
+
 class PackedVisionPatchEmbed(nn.Module):
     """Apply a 2-D patch kernel to processor-packed patch rows."""
 
@@ -1320,7 +1337,12 @@ class DeepSeekOCRCLIPEncoder(nn.Module):
         hidden_states = op.Transpose(sam_features, perm=[0, 2, 3, 1])
         hidden_states = op.Reshape(
             hidden_states,
-            op.Concat(batch, [-1, self._hidden_size], axis=0),
+            op.Concat(
+                batch,
+                op.Reshape(op.Mul(side, side), [1]),
+                [self._hidden_size],
+                axis=0,
+            ),
         )
         class_token = op.Expand(
             op.Reshape(self.class_embedding, [1, 1, self._hidden_size]),
@@ -1393,9 +1415,16 @@ class DeepSeekOCRVisionEncoder(nn.Module):
         clip_features = self.clip(op, sam_map)
         sam_features = op.Transpose(sam_map, perm=[0, 2, 3, 1])
         batch = op.Shape(sam_features, start=0, end=1)
+        sam_h = op.Shape(sam_features, start=1, end=2)
+        sam_w = op.Shape(sam_features, start=2, end=3)
         sam_features = op.Reshape(
             sam_features,
-            op.Concat(batch, [-1, self._clip_hidden_size], axis=0),
+            op.Concat(
+                batch,
+                op.Mul(sam_h, sam_w),
+                [self._clip_hidden_size],
+                axis=0,
+            ),
         )
         return self.projector(op, clip_features, sam_features)
 
@@ -1465,31 +1494,16 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
             op.Reshape(self.image_newline, [1, 1, self._output_size]),
             op.Concat(op.Reshape(height, [1]), [1, self._output_size], axis=0),
         )
-        return op.Reshape(op.Concat(hidden_states, newline, axis=1), [-1, self._output_size])
+        rows = op.Mul(height, op.Add(width, op.Constant(value_int=1)))
+        return op.Reshape(
+            op.Concat(hidden_states, newline, axis=1),
+            op.Concat(op.Reshape(rows, [1]), [self._output_size], axis=0),
+        )
 
-    def forward(
-        self,
-        op: OpBuilder,
-        global_pixel_values: ir.Value,
-        local_pixel_values: ir.Value,
-        local_crop_count: ir.Value,
-    ) -> ir.Value:
-        has_local = op.Cast(
-            op.Greater(op.Squeeze(local_crop_count), op.Constant(value_int=0)),
-            to=ir.DataType.INT64,
-        )
-        grid_h = op.Mul(
-            op.Squeeze(op.Shape(local_pixel_values, start=0, end=1)),
-            has_local,
-        )
+    def _encode_local(self, op: OpBuilder, local_pixel_values: ir.Value) -> ir.Value:
+        grid_h = op.Squeeze(op.Shape(local_pixel_values, start=0, end=1))
         packed_width = op.Squeeze(op.Shape(local_pixel_values, start=3, end=4))
         grid_w = op.Div(packed_width, op.Constant(value_int=640))
-        local_pixel_values = op.Slice(
-            local_pixel_values,
-            [0],
-            op.Reshape(grid_h, [1]),
-            [0],
-        )
         local_tiles = op.Reshape(
             local_pixel_values,
             op.Concat(
@@ -1523,7 +1537,43 @@ class DeepSeekOCRFullImageEncoder(nn.Module):
         local = op.Transpose(local, perm=[0, 2, 1, 3, 4])
         local_h = op.Mul(grid_h, op.Constant(value_int=self._local_side))
         local_w = op.Mul(grid_w, op.Constant(value_int=self._local_side))
-        local = self._append_newlines(op, local, local_h, local_w)
+        return self._append_newlines(op, local, local_h, local_w)
+
+    def _empty_local(self, op: OpBuilder) -> ir.Value:
+        return op.Reshape(
+            op.CastLike(
+                op.Constant(value=ir.tensor(np.empty((0,), dtype=np.float32))),
+                self.view_separator,
+            ),
+            [0, self._output_size],
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        global_pixel_values: ir.Value,
+        local_pixel_values: ir.Value,
+        local_crop_count: ir.Value,
+    ) -> ir.Value:
+        has_local = op.Greater(op.Squeeze(local_crop_count), op.Constant(value_int=0))
+        _realize_captured_module_parameters(op, self.local_encoder, prefix="local_encoder")
+        then_branch = op.builder.subgraph(
+            lambda branch_op: self._encode_local(branch_op, local_pixel_values),
+            inputs=[],
+            outputs=[ir.Value(name="local_features")],
+            name="encode_local",
+        )
+        else_branch = op.builder.subgraph(
+            lambda branch_op: self._empty_local(branch_op),
+            inputs=[],
+            outputs=[ir.Value(name="empty_local_features")],
+            name="skip_local",
+        )
+        local = op.If(
+            has_local,
+            then_branch=then_branch,
+            else_branch=else_branch,
+        )
 
         overview = op.Squeeze(self.global_encoder(op, global_pixel_values), [0])
         overview = self._append_newlines(
@@ -1729,10 +1779,12 @@ class DeepSeekOCR2QueryEncoder(nn.Module):
 
     def forward(self, op: OpBuilder, sam_features: ir.Value) -> ir.Value:
         batch = op.Shape(sam_features, start=0, end=1)
+        height = op.Shape(sam_features, start=2, end=3)
+        width = op.Shape(sam_features, start=3, end=4)
         hidden_states = op.Transpose(sam_features, perm=[0, 2, 3, 1])
         hidden_states = op.Reshape(
             hidden_states,
-            op.Concat(batch, [-1, self._hidden_size], axis=0),
+            op.Concat(batch, op.Mul(height, width), [self._hidden_size], axis=0),
         )
         visual_tokens = op.Squeeze(op.Shape(hidden_states, start=1, end=2))
         valid = op.Or(
@@ -1884,10 +1936,9 @@ class DeepSeekOCR2FullImageEncoder(nn.Module):
             ("local_crop_count", ir.DataType.INT64, (1,)),
         )
 
-    def forward(
+    def _encode_local(
         self,
         op: OpBuilder,
-        global_pixel_values: ir.Value,
         local_pixel_values: ir.Value,
         local_crop_count: ir.Value,
     ) -> ir.Value:
@@ -1898,7 +1949,56 @@ class DeepSeekOCR2FullImageEncoder(nn.Module):
             [0],
         )
         local = self.local_encoder(op, local_pixel_values)
-        local = op.Reshape(local, [-1, self._output_size])
+        local_shape = op.Shape(local, start=0, end=2)
+        local = op.Reshape(
+            local,
+            op.Concat(
+                op.Reshape(op.ReduceProd(local_shape, keepdims=False), [1]),
+                [self._output_size],
+                axis=0,
+            ),
+        )
+        return local
+
+    def _empty_local(self, op: OpBuilder) -> ir.Value:
+        return op.Reshape(
+            op.CastLike(
+                op.Constant(value=ir.tensor(np.empty((0,), dtype=np.float32))),
+                self.view_separator,
+            ),
+            [0, self._output_size],
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        global_pixel_values: ir.Value,
+        local_pixel_values: ir.Value,
+        local_crop_count: ir.Value,
+    ) -> ir.Value:
+        has_local = op.Greater(op.Squeeze(local_crop_count), op.Constant(value_int=0))
+        _realize_captured_module_parameters(op, self.local_encoder, prefix="local_encoder")
+        then_branch = op.builder.subgraph(
+            lambda branch_op: self._encode_local(
+                branch_op,
+                local_pixel_values,
+                local_crop_count,
+            ),
+            inputs=[],
+            outputs=[ir.Value(name="local_features")],
+            name="encode_local",
+        )
+        else_branch = op.builder.subgraph(
+            lambda branch_op: self._empty_local(branch_op),
+            inputs=[],
+            outputs=[ir.Value(name="empty_local_features")],
+            name="skip_local",
+        )
+        local = op.If(
+            has_local,
+            then_branch=then_branch,
+            else_branch=else_branch,
+        )
         overview = op.Squeeze(self.global_encoder(op, global_pixel_values), [0])
         overview = op.Concat(
             overview,

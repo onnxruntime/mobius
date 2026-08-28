@@ -169,16 +169,12 @@ class _SAMAttention(nn.Module):
         # x: (B, H, W, C)
         # Flatten spatial dims for attention
         B = op.Shape(x, start=0, end=1)  # noqa: N806
-        batch_heads = op.Mul(B, op.Constant(value_ints=[self._num_heads]))
         H_val = self._input_h  # noqa: N806
         W_val = self._input_w  # noqa: N806
         N = H_val * W_val  # total spatial tokens  # noqa: N806
 
         # (B, H, W, C) → (B, N, C)
-        x_flat = op.Reshape(
-            x,
-            op.Concat(B, [N, self._num_heads * self._head_dim], axis=0),
-        )
+        x_flat = op.Reshape(x, op.Concat(B, [-1, self._num_heads * self._head_dim], axis=0))
 
         # Q, K, V projection: (B, N, 3*C) -> 3 x (B, num_heads, N, head_dim)
         qkv = self.qkv(op, x_flat)
@@ -219,16 +215,12 @@ class _SAMAttention(nn.Module):
             # q reshaped to (BH, H, W, head_dim)
             q_4d = op.Reshape(
                 q,
-                op.Concat(batch_heads, [H_val, W_val, self._head_dim], axis=0),
+                op.Concat([-1, H_val, W_val, self._head_dim], axis=0),
             )
             # Rh: (H, K, D) → transpose to (H, D, K) for matmul
             Rh_t = op.Transpose(Rh, perm=[0, 2, 1])  # noqa: N806  # (H, D, K)
             # Unsqueeze to (1, H, D, K) for batch broadcast
             Rh_t = op.Unsqueeze(Rh_t, [0])  # noqa: N806
-            Rh_t = op.Expand(  # noqa: N806
-                Rh_t,
-                op.Concat(batch_heads, [H_val, self._head_dim, H_val], axis=0),
-            )
             # q_4d: (BH, H, W, D) @ (1, H, D, K) → (BH, H, W, K)
             # MatMul broadcasts: batch dims (BH, H) vs (1, H) → OK
             rel_h = op.MatMul(q_4d, Rh_t)  # (BH, H, W, K=H)
@@ -239,10 +231,6 @@ class _SAMAttention(nn.Module):
             # Rw: (W, K, D) → transpose to (W, D, K)
             Rw_t = op.Transpose(Rw, perm=[0, 2, 1])  # noqa: N806  # (W, D, K)
             Rw_t = op.Unsqueeze(Rw_t, [0])  # noqa: N806  # (1, W, D, K)
-            Rw_t = op.Expand(  # noqa: N806
-                Rw_t,
-                op.Concat(batch_heads, [W_val, self._head_dim, W_val], axis=0),
-            )
             # (BH, W, H, D) @ (1, W, D, K) → (BH, W, H, K=W)
             rel_w = op.MatMul(q_for_w, Rw_t)  # (BH, W, H, W)
             # Transpose back: (BH, H, W, W)
@@ -253,7 +241,7 @@ class _SAMAttention(nn.Module):
             rel_h_5d = op.Unsqueeze(rel_h, [-1])  # (BH, H, W, H, 1)
             rel_w_5d = op.Unsqueeze(rel_w, [3])  # (BH, H, W, 1, W)
             attn_bias = op.Add(rel_h_5d, rel_w_5d)  # (BH, H, W, H, W)
-            attn_bias = op.Reshape(attn_bias, op.Concat(batch_heads, [N, N], axis=0))
+            attn_bias = op.Reshape(attn_bias, [-1, N, N])
             # → (B, num_heads, N, N)
             attn_bias = op.Reshape(
                 attn_bias,
@@ -368,10 +356,9 @@ class _SAMBlock(nn.Module):
         x = self.norm2(op, x)
         B = op.Shape(x, start=0, end=1)  # noqa: N806
         H, W = self._input_size  # noqa: N806
-        C = self.attn._num_heads * self.attn._head_dim  # noqa: N806
-        x_flat = op.Reshape(x, op.Concat(B, [H * W, C], axis=0))
+        x_flat = op.Reshape(x, op.Concat(B, [H * W, -1], axis=0))
         x_flat = self.mlp(op, x_flat)
-        x = op.Reshape(x_flat, op.Concat(B, [H, W, C], axis=0))
+        x = op.Reshape(x_flat, op.Concat(B, [H, W, -1], axis=0))
         return op.Add(residual, x)
 
     def _window_partition_attn(self, op, x):
@@ -399,10 +386,7 @@ class _SAMBlock(nn.Module):
         # → (B, nH, nW, ws, ws, C)
         x = op.Transpose(x, perm=[0, 1, 3, 2, 4, 5])
         # → (B*nH*nW, ws, ws, C)
-        x = op.Reshape(
-            x,
-            op.Concat(op.Mul(B, op.Constant(value_ints=[nH * nW])), [ws, ws, C], axis=0),
-        )
+        x = op.Reshape(x, [-1, ws, ws, C])
 
         # Apply attention to each window
         x = self.attn(op, x)
