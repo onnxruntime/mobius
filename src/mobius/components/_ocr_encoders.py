@@ -1601,7 +1601,13 @@ class _DeepSeekQueryAttention(nn.Module):
         rope_theta: float,
     ):
         super().__init__()
+        if hidden_size <= 0 or num_heads <= 0 or hidden_size % num_heads:
+            raise ValueError(
+                "DeepSeek OCR2 attention requires divisible hidden/head dimensions"
+            )
         head_dim = hidden_size // num_heads
+        if head_dim % 2:
+            raise ValueError("DeepSeek OCR2 rotary head dimension must be even")
         self.q_proj = Linear(hidden_size, hidden_size, bias=True)
         self.k_proj = Linear(hidden_size, num_kv_heads * head_dim, bias=True)
         self.v_proj = Linear(hidden_size, num_kv_heads * head_dim, bias=True)

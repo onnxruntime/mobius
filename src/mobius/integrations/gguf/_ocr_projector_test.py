@@ -219,6 +219,18 @@ def test_dots3note_audio_rejects_incompatible_partial_rope_geometry():
         )
 
 
+def test_deepseek_ocr2_rejects_odd_rotary_head_dimension():
+    source = _HeaderFixture(_evidence()["deepseekocr2"])
+    source.metadata["clip.vision.attention.head_count"] = 128
+
+    with pytest.raises(ValueError, match="invalid hidden/head dimensions"):
+        _preflight_standalone_mmproj(
+            source,
+            projector_type="deepseekocr2",
+            target_architecture="deepseek2-ocr",
+        )
+
+
 @pytest.mark.parametrize("invalid_top_k", (0, 33))
 def test_dots3note_rejects_invalid_expert_top_k(invalid_top_k: int):
     source = _HeaderFixture(_evidence()["dots3note"])

@@ -1164,7 +1164,12 @@ def _validate_deepseek_ocr_shapes(mmproj_gguf: Any, projector_type: str) -> None
     heads = int(md["clip.vision.attention.head_count"])
     layers = int(md["clip.vision.block_count"])
     projection = int(md["clip.vision.projection_dim"])
-    if hidden <= 0 or heads <= 0 or hidden % heads:
+    if (
+        hidden <= 0
+        or heads <= 0
+        or hidden % heads
+        or (projector_type == "deepseekocr2" and (hidden // heads) % 2)
+    ):
         raise ValueError(f"{projector_type} has invalid hidden/head dimensions.")
     _validate_deepseek_sam_shapes(mmproj_gguf, hidden)
     for layer in range(layers):
