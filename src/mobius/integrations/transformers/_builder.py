@@ -201,6 +201,9 @@ def build_transformers_model(
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
     """
+    if input_sampling_rate is not None and bwe_sampling_rate is not None:
+        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
+
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,

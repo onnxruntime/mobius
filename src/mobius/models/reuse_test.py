@@ -142,6 +142,17 @@ class TestReUseConfig:
         with pytest.raises(ValueError, match="too small"):
             ReUseConfig().stft_geometry(1)
 
+    @pytest.mark.parametrize(
+        ("input_rate", "bwe_rate"),
+        [(8_000, 16_000), (16_000, 16_000)],
+    )
+    def test_validate_rejects_ambiguous_native_and_bwe_rates(self, input_rate, bwe_rate):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ReUseConfig(
+                input_sampling_rate=input_rate,
+                bwe_sampling_rate=bwe_rate,
+            ).validate()
+
     def test_remote_default_is_pinned(self):
         assert _effective_revision("nvidia/RE-USE", None) == REUSE_REVISION
 
@@ -485,6 +496,23 @@ class TestBuildReUse:
         for value in pkg["model"].graph.inputs:
             assert value.shape[1] == expected_bins
 
+    @pytest.mark.parametrize(
+        ("input_rate", "bwe_rate"),
+        [(8_000, 16_000), (16_000, 16_000)],
+    )
+    def test_build_reuse_rejects_both_rate_modes(
+        self,
+        input_rate,
+        bwe_rate,
+    ):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build_reuse(
+                "config-must-not-be-read",
+                load_weights=False,
+                input_sampling_rate=input_rate,
+                bwe_sampling_rate=bwe_rate,
+            )
+
     def test_public_build_detects_bespoke_checkpoint(self, tmp_path):
         """The normal API/CLI path detects RE-USE without Transformers metadata."""
         pytest.importorskip("safetensors")
@@ -507,6 +535,31 @@ class TestBuildReUse:
 
         assert pkg.config.input_sampling_rate == 16_000
         assert pkg["model"].graph.inputs[0].shape[1] == 33
+
+    @pytest.mark.parametrize(
+        ("input_rate", "bwe_rate"),
+        [(8_000, 16_000), (16_000, 16_000)],
+    )
+    def test_public_build_rejects_both_rate_modes(
+        self,
+        monkeypatch,
+        input_rate,
+        bwe_rate,
+    ):
+        from mobius.integrations.transformers import _builder
+
+        def _unexpected_probe(*_args, **_kwargs):
+            raise AssertionError("config probe must not run for ambiguous rate modes")
+
+        monkeypatch.setattr(_builder, "_load_transformers_config", _unexpected_probe)
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            build(
+                "config-must-not-be-read",
+                load_weights=False,
+                input_sampling_rate=input_rate,
+                bwe_sampling_rate=bwe_rate,
+            )
 
     def test_canonical_detection_is_pinned_before_auto_config(self, monkeypatch):
         from mobius.integrations.transformers import _builder

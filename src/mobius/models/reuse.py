@@ -224,6 +224,10 @@ class ReUseConfig(BaseModelConfig):
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive when provided")
+        if self.input_sampling_rate is not None and self.bwe_sampling_rate is not None:
+            raise ValueError(
+                "input_sampling_rate and bwe_sampling_rate are mutually exclusive"
+            )
 
     @classmethod
     def from_json(cls, cfg: dict) -> ReUseConfig:
@@ -806,6 +810,9 @@ def build_reuse(
         A :class:`ModelPackage` whose ``"model"`` entry is the enhancement
         network.
     """
+    if input_sampling_rate is not None and bwe_sampling_rate is not None:
+        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
+
     from mobius._builder import build_from_module, resolve_dtype
     from mobius.integrations._weight_loading import apply_weights
 
