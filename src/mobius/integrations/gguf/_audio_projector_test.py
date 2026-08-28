@@ -304,7 +304,8 @@ def test_vision_companion_quarantine_never_hides_unknown_audio_projector_tensor(
     sidecar.tensor_names = (
         *sidecar.tensor_names,
         "v.patch_embd.weight",
-        "mm.vision.weight",
+        "mm.0.weight",
+        "mm.2.weight",
         "mm.a.future.weight",
     )
     tensor_types = {name: SimpleNamespace(name="F32") for name in sidecar.tensor_names}

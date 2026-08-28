@@ -3333,20 +3333,29 @@ def build_audio_projector_from_gguf(
         tensor_shapes,
     )
     if spec.model_roles[0].value == "speaker_encoder":
-        module = GGUFSpeakerProjectorModel(audio_encoder, output_name="speaker_features")
-        task = GGUFSpeakerProjectorTask()
+        package = build_from_module(
+            GGUFSpeakerProjectorModel(audio_encoder, output_name="speaker_features"),
+            config,
+            task=GGUFSpeakerProjectorTask(),
+            execution_provider=execution_provider,
+        )
     else:
-        module = GGUFAudioProjectorModel(audio_encoder)
-        task = GGUFAudioProjectorTask()
-    package = build_from_module(
-        module,
-        config,
-        task=task,
-        execution_provider=execution_provider,
-    )
+        package = build_from_module(
+            GGUFAudioProjectorModel(audio_encoder),
+            config,
+            task=GGUFAudioProjectorTask(),
+            execution_provider=execution_provider,
+        )
     package.apply_weights(_mmproj_audio_projector_to_onnx(mmproj_gguf, projector_type))
     _require_loaded_projector_initializers(package, projector_type)
     processor_abi = AUDIO_PROCESSOR_ABIS[projector_type]
+    output_size = getattr(
+        audio_encoder,
+        "output_size",
+        mmproj_gguf.metadata.get("clip.audio.projection_dim"),
+    )
+    if not isinstance(output_size, int) or output_size <= 0:
+        raise TypeError(f"{projector_type} audio encoder must declare a positive output_size")
     serialized_processor_abi = json.dumps(
         dataclasses.asdict(processor_abi),
         sort_keys=True,
@@ -3357,9 +3366,7 @@ def build_audio_projector_from_gguf(
         model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
         model.metadata_props["mobius.gguf_audio_processor_abi"] = serialized_processor_abi
         model.metadata_props["mobius.processor_abi"] = serialized_processor_abi
-        model.metadata_props["mobius.projector_output_size"] = str(
-            cast(_ProjectorOutput, audio_encoder).output_size
-        )
+        model.metadata_props["mobius.projector_output_size"] = str(output_size)
         model.metadata_props["mobius.runtime_support"] = (
             "standalone-sidecar-only; paired multimodal runtime unvalidated"
         )
@@ -3370,9 +3377,7 @@ def build_audio_projector_from_gguf(
     )
     package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
     package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
-    package.gguf_projector_output_size = cast(  # type: ignore[attr-defined]
-        _ProjectorOutput, audio_encoder
-    ).output_size
+    package.gguf_projector_output_size = output_size  # type: ignore[attr-defined]
     package.gguf_audio_processor_abi = processor_abi  # type: ignore[attr-defined]
     runtime_warning = (
         "Standalone projector graph only; paired text insertion and downstream "

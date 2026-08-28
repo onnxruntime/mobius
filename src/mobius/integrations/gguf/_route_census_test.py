@@ -64,8 +64,8 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-mobius-abi-blocked": 99,
-        "evidence-only": 138,
-        "immediately-implementable": 17,
+        "evidence-only": 146,
+        "immediately-implementable": 9,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }

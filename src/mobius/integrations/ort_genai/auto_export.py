@@ -2165,6 +2165,22 @@ def write_ort_genai_config(
     capability_warnings = _runtime_capability_warnings(pkg)
 
     os.makedirs(directory, exist_ok=True)
+    component_names = set(pkg)
+    if component_names in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
+        pkg, "gguf_projector_type", None
+    ):
+        warning = (
+            "The tested onnxruntime-genai runtime cannot orchestrate a standalone GGUF "
+            "audio/speaker sidecar; no genai_config.json was emitted."
+        )
+        compatibility_path = _write_runtime_compatibility(
+            directory,
+            model_type=str(getattr(config, "model_type", "unknown")),
+            runtime_version=runtime_version,
+            pkg=pkg,
+            capability_warnings=(warning,),
+        )
+        return {"runtime_compatibility": compatibility_path}
 
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
     # that carry no EP-specific session options → treat as CPU.

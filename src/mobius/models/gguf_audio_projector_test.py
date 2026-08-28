@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import onnx_ir as ir
@@ -14,13 +15,15 @@ from onnxscript import OpBuilder, nn
 
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
+from mobius._model_package import ModelPackage
 from mobius.integrations.gguf._mmproj_mapping import (
     map_mmproj_audio_projector_to_onnx,
 )
 from mobius.integrations.gguf._mmproj_registry import get_projector_spec
+from mobius.integrations.onnx_genai import write_onnx_genai_config
+from mobius.integrations.ort_genai import write_ort_genai_config
 from mobius.models.gguf_audio_projector import (
     AUDIO_PROCESSOR_ABIS,
-    GGUFAudioProjectorModel,
     _GeluProjector,
     _GraniteSpeechAttention,
     _LFM2AudioAdapter,
@@ -31,6 +34,7 @@ from mobius.models.gguf_audio_projector import (
     create_gguf_audio_projector,
 )
 from mobius.tasks import (
+    GGUFAudioProjectorModel,
     GGUFAudioProjectorTask,
     GGUFSpeakerProjectorModel,
     GGUFSpeakerProjectorTask,
@@ -331,7 +335,7 @@ def _build(
     )
     if projector_type == "pockettts_spkenc":
         speaker_module = GGUFSpeakerProjectorModel(
-            module.audio_encoder,
+            module,
             output_name="speaker_features",
         )
         return case, build_from_module(
@@ -339,9 +343,11 @@ def _build(
             config,
             task=GGUFSpeakerProjectorTask(),
         )["speaker_encoder"]
-    return case, build_from_module(module, config, task=GGUFAudioProjectorTask())[
-        "audio_encoder"
-    ]
+    return case, build_from_module(
+        GGUFAudioProjectorModel(module),
+        config,
+        task=GGUFAudioProjectorTask(),
+    )["audio_encoder"]
 
 
 _PROJECTOR_TYPES = (
@@ -394,9 +400,9 @@ def test_audio_projector_tensor_map_covers_every_graph_parameter(projector_type:
         case.shapes,
     )
     if projector_type == "pockettts_spkenc":
-        mapped_module: nn.Module = GGUFSpeakerProjectorModel(module.audio_encoder)
+        mapped_module: nn.Module = GGUFSpeakerProjectorModel(module)
     else:
-        mapped_module = module
+        mapped_module = GGUFAudioProjectorModel(module)
     parameters = {
         name
         for name, _ in mapped_module.named_parameters()
@@ -521,6 +527,7 @@ def test_audio_processor_abis_preserve_sample_channel_and_frame_contracts():
         "parakeet",
         "mimo_audio",
         "pockettts_spkenc",
+        "meralion",
     )
     assert AUDIO_PROCESSOR_ABIS["ultravox"].sample_rate == 16_000
     assert AUDIO_PROCESSOR_ABIS["voxtral"].chunk_seconds == 30
@@ -533,6 +540,61 @@ def test_audio_processor_abis_preserve_sample_channel_and_frame_contracts():
     assert AUDIO_PROCESSOR_ABIS["pockettts_spkenc"].max_seconds == 30
     with pytest.raises(TypeError):
         AUDIO_PROCESSOR_ABIS["ultravox"] = AUDIO_PROCESSOR_ABIS["voxtral"]  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("projector_type", "component"),
+    [
+        ("ultravox", "audio_encoder"),
+        ("pockettts_spkenc", "speaker_encoder"),
+    ],
+)
+def test_standalone_runtime_exports_are_advisory(
+    tmp_path,
+    projector_type: str,
+    component: str,
+):
+    _, model = _build(projector_type)
+    config = ArchitectureConfig(
+        model_type=f"gguf_{projector_type}",
+        vocab_size=1,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=8,
+        max_position_embeddings=16,
+    )
+    package = ModelPackage({component: model}, config=config)
+    package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    model.metadata_props["mobius.processor_abi"] = json.dumps(
+        asdict(AUDIO_PROCESSOR_ABIS[projector_type]),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    onnx_paths = write_onnx_genai_config(package, str(tmp_path / "onnx-genai"))
+    onnx_metadata = json.loads(
+        (tmp_path / "onnx-genai" / "inference_metadata.yaml").read_text()
+    )
+    assert set(onnx_paths) == {"inference_metadata", "runtime_compatibility"}
+    assert onnx_metadata["components"][component]["inputs"] == [
+        value.name for value in model.graph.inputs
+    ]
+    assert onnx_metadata["components"][component]["outputs"] == [
+        value.name for value in model.graph.outputs
+    ]
+    assert "mobius.processor_abi" in onnx_metadata["components"][component]["metadata"]
+
+    ort_paths = write_ort_genai_config(package, str(tmp_path / "ort-genai"))
+    ort_metadata = json.loads(
+        (tmp_path / "ort-genai" / "runtime_compatibility.json").read_text()
+    )
+    assert set(ort_paths) == {"runtime_compatibility"}
+    assert not (tmp_path / "ort-genai" / "genai_config.json").exists()
+    assert ort_metadata["runtime_validation_status"] == "unsupported-by-tested-runtime"
+    assert set(ort_metadata["graph_contract"]) == {component}
 
 
 def test_granite_feature_capture_precedes_midpoint_ctc_injection():
@@ -555,7 +617,7 @@ def test_granite_feature_capture_precedes_midpoint_ctc_injection():
         max_position_embeddings=32,
     )
     graph = build_from_module(
-        module,
+        GGUFAudioProjectorModel(module),
         config,
         task=GGUFAudioProjectorTask(),
     )["audio_encoder"].graph

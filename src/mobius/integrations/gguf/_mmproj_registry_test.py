@@ -124,17 +124,21 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "gemma4ua",
         "idefics3",
         "pixtral",
+        "ultravox",
         "internvl",
         "llama4",
         "qwen2a",
         "qwen3a",
         "glma",
         "qwen2.5o",
+        "voxtral",
         "meralion",
+        "musicflamingo",
         "lfm2",
         "kimivl",
         "cogvlm",
         "janus_pro",
+        "lfm2a",
         "glm4v",
         "yasa2",
         "kimik25",
@@ -142,9 +146,13 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "exaone4_5",
         "hunyuanvl",
         "minicpmv4_6",
+        "granite_speech",
         "mimovl",
         "minimax_m3",
+        "mimo_audio",
+        "parakeet",
         "qwen3tts_spkenc",
+        "pockettts_spkenc",
         "muse-glimmer",
     )
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
@@ -419,16 +427,6 @@ def test_modality_projector_overrides_global_fallback() -> None:
 def test_missing_modality_and_global_projector_fails_closed() -> None:
     with pytest.raises(ValueError, match=r"neither 'clip\.projector_type' nor"):
         projector_type_for_modality({}, MMProjModality.GENERATED_AUDIO)
-
-
-@pytest.mark.parametrize("projector_type", ["voxtral"])
-def test_deferred_projector_has_no_dispatch_or_loader_closure(projector_type: str) -> None:
-    spec = get_projector_spec(projector_type)
-    assert not spec.is_supported
-    assert spec.builder is None
-    assert spec.required_metadata == ()
-    assert spec.required_top_tensors == ()
-    assert spec.block_suffixes == ()
 
 
 def test_core_vlm_routes_preserve_roles_pairing_and_bounded_evidence() -> None:
