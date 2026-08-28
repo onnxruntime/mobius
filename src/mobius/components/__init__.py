@@ -39,6 +39,7 @@ __all__ = [
     "Gemma3nAudioEncoder",
     "Gemma3nMultimodalEmbedder",
     "GlmOcrVisionModel",
+    "Glm4VVisionModel",
     "GatedShortConv",
     "ClippableLinear",
     "GroupNorm",
@@ -57,6 +58,9 @@ __all__ = [
     "Llama4Projector",
     "Llama4VisionTower",
     "GGUFMLPProjector",
+    "GGUFLegacyGlmAudioProjector",
+    "GGUFQwen2AudioProjector",
+    "GGUFWhisperAudioTower",
     "GLMEdgeAdapterProjector",
     "LoRALinear",
     "MLP",
@@ -203,6 +207,12 @@ from mobius.components._gemma3n_audio import Gemma3nAudioEncoder
 from mobius.components._gemma3n_embedder import Gemma3nMultimodalEmbedder
 from mobius.components._gemma4_audio import ClippableLinear
 from mobius.components._gemma4_audio import Gemma4AudioEncoder as Gemma4AudioEncoder
+from mobius.components._gguf_audio_projectors import (
+    GGUFLegacyGlmAudioProjector,
+    GGUFQwen2AudioProjector,
+    GGUFWhisperAudioTower,
+)
+from mobius.components._glm4v_vision import Glm4VVisionModel
 from mobius.components._glm_ocr_vision import GlmOcrVisionModel
 from mobius.components._kimi_linear import KimiDeltaAttention, KimiMLAAttention
 from mobius.components._lightning_attention import (

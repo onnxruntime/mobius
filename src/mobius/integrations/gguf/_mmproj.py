@@ -34,6 +34,7 @@ __all__ = [
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
     "build_mmproj_from_gguf",
+    "build_qwen_glm_projector_from_gguf",
     "build_qwen_vlm_from_gguf",
     "build_vlm_from_gguf",
     "build_muse_glimmer_vlm_from_gguf",
@@ -516,6 +517,7 @@ def _validate_block_tensor_set(
     blocks: dict[int, set[str]],
     block_count: int,
     required_suffixes: tuple[str, ...],
+    suffix_variants: tuple[tuple[str, ...], ...] = (),
 ) -> None:
     expected_layers = set(range(block_count))
     if set(blocks) != expected_layers:
@@ -523,6 +525,20 @@ def _validate_block_tensor_set(
             f"{projector_type} {modality.value} block indices are "
             f"{sorted(blocks)}, expected {sorted(expected_layers)}."
         )
+    if suffix_variants:
+        variants = tuple(set(variant) for variant in suffix_variants)
+        mismatched = {
+            layer: sorted(blocks[layer])
+            for layer in sorted(blocks)
+            if not any(blocks[layer] == variant for variant in variants)
+        }
+        if mismatched:
+            raise ValueError(
+                f"{projector_type} mmproj has unsupported {modality.value} block "
+                f"suffix variants: {mismatched}"
+            )
+        return
+
     required = set(required_suffixes)
     missing = {
         layer: sorted(required - blocks[layer])
@@ -573,10 +589,19 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
         block_names: dict[int, set[str]] = {}
         matched: set[str] = set()
     else:
+        allowed_suffixes = (
+            tuple(
+                sorted(
+                    {suffix for variant in spec.block_suffix_variants for suffix in variant}
+                )
+            )
+            if spec.block_suffix_variants
+            else spec.block_suffixes
+        )
         block_names, matched = _collect_block_tensors(
             names,
             prefix=spec.block_prefix,
-            suffixes=spec.block_suffixes,
+            suffixes=allowed_suffixes,
         )
     for pattern in spec.auxiliary_tensor_patterns:
         expression = re.compile(pattern)
@@ -675,6 +700,7 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
             blocks=block_names,
             block_count=layers,
             required_suffixes=spec.block_suffixes,
+            suffix_variants=spec.block_suffix_variants,
         )
 
     for name in sorted(names):
@@ -1216,6 +1242,15 @@ def build_mmproj_from_gguf(
         raise RuntimeError(
             f"{projector_type} standalone builder produced components "
             f"{sorted(package)}, expected {sorted(expected_roles)}."
+        )
+    if spec.runtime is not Support.SUPPORTED:
+        logger.warning(
+            "Built standalone %s graph component(s) for clip projector %r; "
+            "downstream runtime orchestration is %s: %s",
+            ", ".join(sorted(expected_roles)),
+            projector_type,
+            spec.runtime.value,
+            spec.reason,
         )
     return package
 
@@ -3078,6 +3113,45 @@ def build_muse_glimmer_vlm_from_gguf(
     return pkg
 
 
+def build_qwen_glm_projector_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build the exact standalone Qwen/GLM vision, audio, or speaker roles."""
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._qwen_glm_projector import (
+        build_qwen_glm_projector_package,
+    )
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model if _mmproj_gguf_model is not None else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    return build_qwen_glm_projector_package(
+        mmproj_gguf,
+        resolved_path=resolved_path,
+        projector_type=projector_type,
+        dtype=dtype,
+        execution_provider=execution_provider,
+    )
+
+
 def build_vlm_from_gguf(
     text_gguf_path: str | Path,
     mmproj_gguf_path: str | Path,
@@ -3154,7 +3228,8 @@ def _build_core_vlm_projector_mmproj(*args, **kwargs) -> ModelPackage:
 
 
 _MMPROJ_BUILDERS: dict[str, str] = {
-    "core_vlm_projector": "_build_core_vlm_projector_mmproj",
+   "core_vlm_projector": "_build_core_vlm_projector_mmproj",
+   "qwen_glm_projector": "build_qwen_glm_projector_from_gguf",
 }
 
 
