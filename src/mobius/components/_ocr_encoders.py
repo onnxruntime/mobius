@@ -1532,7 +1532,7 @@ class _DeepSeekQueryAttention(nn.Module):
             rope_theta ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
         )
         self.inv_freq = nn.Parameter([len(inv_freq)], data=ir.tensor(inv_freq))
-        self.inv_freq._keep_float32 = True
+        self.inv_freq._keep_float32 = True  # type: ignore[attr-defined]
 
     def _rope(self, op: OpBuilder, states: ir.Value) -> ir.Value:
         seq_len = op.Squeeze(op.Shape(states, start=2, end=3))
@@ -1886,7 +1886,7 @@ class PartialRotaryAudioAttention(nn.Module):
             ** (np.arange(0, self._rotary_dim, 2, dtype=np.float32) / self._rotary_dim)
         )
         self.inv_freq = nn.Parameter([len(inv_freq)], data=ir.tensor(inv_freq))
-        self.inv_freq._keep_float32 = True
+        self.inv_freq._keep_float32 = True  # type: ignore[attr-defined]
 
     def _apply_rope(self, op: OpBuilder, states: ir.Value) -> ir.Value:
         seq_len = op.Squeeze(op.Shape(states, start=2, end=3))
