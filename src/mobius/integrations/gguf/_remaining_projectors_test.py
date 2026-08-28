@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +66,60 @@ def _write_tiny_janus(path: Path) -> None:
     add(prefix + "ffn_up.bias", (intermediate,))
     add(prefix + "ffn_down.weight", (hidden, intermediate))
     add(prefix + "ffn_down.bias", (hidden,))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def _write_tiny_meralion(path: Path) -> None:
+    from gguf import GGUFWriter
+
+    rng = np.random.default_rng(23)
+    writer = GGUFWriter(str(path), "clip")
+    writer.add_string("general.type", "mmproj")
+    writer.add_bool("clip.has_audio_encoder", True)
+    writer.add_string("clip.projector_type", "meralion")
+    writer.add_uint32("clip.audio.embedding_length", 4)
+    writer.add_uint32("clip.audio.feed_forward_length", 8)
+    writer.add_uint32("clip.audio.block_count", 1)
+    writer.add_uint32("clip.audio.projection_dim", 5)
+    writer.add_uint32("clip.audio.attention.head_count", 1)
+    writer.add_float32("clip.audio.attention.layer_norm_epsilon", 1e-5)
+    writer.add_uint32("clip.audio.num_mel_bins", 8)
+    writer.add_uint32("clip.audio.projector.stack_factor", 3)
+
+    def add(name: str, shape: tuple[int, ...]) -> None:
+        writer.add_tensor(name, rng.normal(0.0, 0.2, shape).astype(np.float32))
+
+    add("a.conv1d.1.weight", (4, 8, 3))
+    add("a.conv1d.1.bias", (4,))
+    add("a.conv1d.2.weight", (4, 4, 3))
+    add("a.conv1d.2.bias", (4,))
+    add("a.position_embd.weight", (6, 4))
+    add("a.post_ln.weight", (4,))
+    add("a.post_ln.bias", (4,))
+    prefix = "a.blk.0."
+    for norm in ("ln1", "ln2"):
+        add(prefix + norm + ".weight", (4,))
+        add(prefix + norm + ".bias", (4,))
+    for projection in ("attn_q", "attn_k", "attn_v", "attn_out"):
+        add(prefix + projection + ".weight", (4, 4))
+        if projection != "attn_k":
+            add(prefix + projection + ".bias", (4,))
+    add(prefix + "ffn_up.weight", (8, 4))
+    add(prefix + "ffn_up.bias", (8,))
+    add(prefix + "ffn_down.weight", (4, 8))
+    add(prefix + "ffn_down.bias", (4,))
+    add("mm.a.norm_pre.weight", (4,))
+    add("mm.a.norm_pre.bias", (4,))
+    add("mm.a.mlp.0.weight", (9, 12))
+    add("mm.a.mlp.0.bias", (9,))
+    for index in (1, 2):
+        add(f"mm.a.mlp.{index}.weight", (9, 9))
+        add(f"mm.a.mlp.{index}.bias", (9,))
+    add("mm.a.mlp.3.weight", (5, 9))
+    add("mm.a.mlp.3.bias", (5,))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
@@ -135,6 +190,32 @@ def test_source_only_minimax_component_builds_with_explicit_positions() -> None:
     package = GGUFVisionProjectorTask().build(GGUFVisionProjectorModel(module), config)
     assert set(package) == {"vision_encoder"}
     assert package["vision_encoder"].graph.num_nodes() > 0
+
+
+def test_public_meralion_package_persists_processor_contract(tmp_path: Path) -> None:
+    path = tmp_path / "meralion.gguf"
+    _write_tiny_meralion(path)
+    package = build_mmproj_from_gguf(
+        path,
+        projector_type="meralion",
+        target_architecture="gemma2",
+        dtype="f32",
+    )
+    assert set(package) == {"audio_encoder"}
+    metadata = json.loads(
+        package["audio_encoder"].metadata_props["mobius.gguf_audio_processor_abi"]
+    )
+    assert metadata["sample_rate"] == 16_000
+    assert metadata["chunk_seconds"] == 30
+    assert metadata["graph_layout"] == "float32[3000,128]"
+
+    session = OnnxModelSession(package["audio_encoder"])
+    output = session.run(
+        {"input_features": np.random.default_rng(5).normal(size=(12, 8)).astype(np.float32)}
+    )["audio_features"]
+    session.close()
+    assert output.shape == (2, 5)
+    assert np.isfinite(output).all()
 
 
 def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> None:

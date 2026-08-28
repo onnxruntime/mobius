@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
@@ -124,7 +126,7 @@ def test_hunyuanvl_external_position_projector_and_token_order():
     )
     builder, op, graph = create_test_builder()
     pixels_value = create_test_input(builder, "pixel_values", [1, 3, 4, 4])
-    positions_value = create_test_input(builder, "position_embeddings", [1, 16, 4])
+    positions_value = create_test_input(builder, "position_embeddings", [16, 4])
     output = component(op, pixels_value, positions_value)
     output.name = "image_features"
     graph.outputs.append(output)
@@ -145,7 +147,7 @@ def test_hunyuanvl_external_position_projector_and_token_order():
         .permute(0, 2, 3, 1)
         .reshape(1, 16, 4)
     )
-    positions = positions_t.numpy()
+    positions = positions_t.squeeze(0).numpy()
 
     actual = session.run(None, {"pixel_values": pixels, "position_embeddings": positions})[0]
     x = _conv(torch.from_numpy(pixels), state, "patch_embedding.proj", 1, 0)
@@ -288,3 +290,77 @@ def test_step3vl_axial_rope_attention_matches_torch():
     expected = _linear(context, state, "out_proj").numpy()
 
     np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-5)
+
+
+def test_hunyuanvl_runtime_grid_controls_newline_token_count():
+    component = HunyuanVLClipSidecar(
+        vision_hidden_size=4,
+        intermediate_size=7,
+        num_heads=1,
+        num_layers=0,
+        patch_size=1,
+        grid_height=4,
+        grid_width=4,
+        projector_hidden_size=5,
+        output_size=3,
+    )
+    builder, op, graph = create_test_builder()
+    height = ir.SymbolicDim("height")
+    width = ir.SymbolicDim("width")
+    patches = ir.SymbolicDim("patches")
+    pixels = create_test_input(builder, "pixel_values", [1, 3, height, width])
+    positions = create_test_input(builder, "position_embeddings", [patches, 4])
+    output = component(op, pixels, positions)
+    output.name = "image_features"
+    graph.outputs.append(output)
+    _, session = _state_and_session(component, graph, 41)
+
+    rng = np.random.default_rng(42)
+    for h, w in ((4, 4), (2, 4)):
+        actual = session.run(
+            None,
+            {
+                "pixel_values": rng.normal(size=(1, 3, h, w)).astype(np.float32),
+                "position_embeddings": rng.normal(size=(h * w, 4)).astype(np.float32),
+            },
+        )[0]
+        assert actual.shape == (1, (w // 2 + 1) * (h // 2) + 2, 3)
+
+
+def test_step3vl_runtime_grid_controls_position_resize_and_downsampling():
+    component = Step3VLClipSidecar(
+        vision_hidden_size=8,
+        intermediate_size=8,
+        num_heads=2,
+        num_layers=0,
+        patch_size=1,
+        grid_height=4,
+        grid_width=4,
+        position_grid_size=2,
+        downsample_hidden_size=5,
+        output_size=3,
+    )
+    builder, op, graph = create_test_builder()
+    height = ir.SymbolicDim("height")
+    width = ir.SymbolicDim("width")
+    patches = ir.SymbolicDim("patches")
+    pixels = create_test_input(builder, "pixel_values", [1, 3, height, width])
+    pos_h = create_test_input(builder, "pos_h", [patches], dtype=ir.DataType.INT64)
+    pos_w = create_test_input(builder, "pos_w", [patches], dtype=ir.DataType.INT64)
+    output = component(op, pixels, pos_h, pos_w)
+    output.name = "image_features"
+    graph.outputs.append(output)
+    _, session = _state_and_session(component, graph, 43)
+
+    rng = np.random.default_rng(44)
+    for h, w in ((4, 4), (4, 8)):
+        rows, columns = np.indices((h, w), dtype=np.int64)
+        actual = session.run(
+            None,
+            {
+                "pixel_values": rng.normal(size=(1, 3, h, w)).astype(np.float32),
+                "pos_h": rows.reshape(-1),
+                "pos_w": columns.reshape(-1),
+            },
+        )[0]
+        assert actual.shape == (1, math.ceil(h / 4) * math.ceil(w / 4), 3)

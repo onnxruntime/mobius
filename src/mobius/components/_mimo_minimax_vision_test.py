@@ -27,6 +27,7 @@ from mobius.components._mimo_minimax_vision import (
     MiniMaxM3PartialRotaryEmbedding,
     MiniMaxM3Projector,
     MiniMaxM3VisionBlock,
+    MiniMaxM3VisionSidecar,
     SpatialMergeOrder,
     minimax_m3_qk_permutation,
 )
@@ -403,3 +404,44 @@ def test_minimax_per_patch_then_merger_mlp_matches_torch():
         torch_functional.gelu(expected, approximate="none"), state, "merger_mlp.fc2"
     )
     np.testing.assert_allclose(actual, expected.numpy(), rtol=1e-5, atol=1e-6)
+
+
+def test_minimax_full_sidecar_uses_runtime_grid_geometry():
+    module = MiniMaxM3VisionSidecar(
+        hidden_size=12,
+        intermediate_size=16,
+        num_heads=1,
+        num_layers=1,
+        patch_size=1,
+        grid_height=2,
+        grid_width=2,
+        patch_mlp_size=12,
+        projected_size=12,
+        merger_mlp_size=16,
+        output_size=8,
+    )
+    state = _random_parameters(module, seed=61)
+    builder, op, graph = create_test_builder()
+    tokens = ir.SymbolicDim("tokens")
+    pixels = create_test_input(builder, "pixel_values", [tokens, 6])
+    grid = create_test_input(builder, "grid_size", [2], dtype=ir.DataType.INT64)
+    output = module(op, pixels, grid)
+    output.name = "output"
+    graph.outputs.append(output)
+    for name, parameter in module.named_parameters():
+        parameter.const_value = ir.tensor(state[name])
+    model = ir.Model(graph, ir_version=11)
+    session = ort.InferenceSession(
+        ir.serde.serialize_model(model).SerializeToString(),
+        providers=["CPUExecutionProvider"],
+    )
+
+    actual = session.run(
+        None,
+        {
+            "pixel_values": np.random.default_rng(62).normal(size=(8, 6)).astype(np.float32),
+            "grid_size": np.array([2, 4], dtype=np.int64),
+        },
+    )[0]
+    assert actual.shape == (2, 8)
+    assert np.isfinite(actual).all()

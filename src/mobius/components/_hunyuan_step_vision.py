@@ -137,7 +137,7 @@ class HunyuanVLClipSidecar(nn.Module):
     ):
         super().__init__()
         if grid_height % merge_size or grid_width % merge_size:
-            raise ValueError("grid dimensions must be divisible by merge_size")
+            raise ValueError("reference grid dimensions must be divisible by merge_size")
         self.patch_embedding = _PatchEmbedding(3, vision_hidden_size, patch_size)
         self.layers = nn.ModuleList(
             [
@@ -160,8 +160,8 @@ class HunyuanVLClipSidecar(nn.Module):
         self.image_begin = nn.Parameter([output_size])
         self.image_end = nn.Parameter([output_size])
         self.post_projector_norm = RMSNorm(output_size, eps)
-        self._grid_height = grid_height
-        self._grid_width = grid_width
+        self._patch_size = patch_size
+        self._merge_size = merge_size
         self._projector_channels = projector_hidden_size * 2
         self._output_size = output_size
 
@@ -171,7 +171,19 @@ class HunyuanVLClipSidecar(nn.Module):
         pixel_values: ir.Value,
         position_embeddings: ir.Value,
     ) -> ir.Value:
-        hidden_states = op.Add(self.patch_embedding(op, pixel_values), position_embeddings)
+        grid_height = op.Div(
+            op.Squeeze(op.Shape(pixel_values, start=2, end=3), [0]),
+            self._patch_size,
+        )
+        grid_width = op.Div(
+            op.Squeeze(op.Shape(pixel_values, start=3, end=4), [0]),
+            self._patch_size,
+        )
+        hidden_states = self.patch_embedding(op, pixel_values)
+        hidden_states = op.Add(
+            hidden_states,
+            op.CastLike(op.Unsqueeze(position_embeddings, [0]), hidden_states),
+        )
         for layer in self.layers:
             hidden_states = layer(op, hidden_states)
         hidden_states = self.pre_projector_norm(op, hidden_states)
@@ -182,7 +194,9 @@ class HunyuanVLClipSidecar(nn.Module):
             hidden_states,
             op.Concat(
                 batch,
-                op.Constant(value_ints=[self._grid_height, self._grid_width, -1]),
+                op.Reshape(grid_height, [1]),
+                op.Reshape(grid_width, [1]),
+                op.Constant(value_ints=[-1]),
                 axis=0,
             ),
         )
@@ -194,14 +208,15 @@ class HunyuanVLClipSidecar(nn.Module):
 
         # Append newline along width before flattening: row-major
         # [patch(0,0), ..., patch(0,W-1), newline, patch(1,0), ...].
-        out_height = self._grid_height // self.projector_conv1._strides[0]
+        out_height = op.Div(grid_height, self._merge_size)
         channels = self._projector_channels
         newline = op.Reshape(self.image_newline, [1, 1, 1, channels])
         newline = op.Expand(
             newline,
             op.Concat(
                 batch,
-                op.Constant(value_ints=[out_height, 1, channels]),
+                op.Reshape(out_height, [1]),
+                op.Constant(value_ints=[1, channels]),
                 axis=0,
             ),
         )
@@ -377,11 +392,17 @@ class Step3VLClipSidecar(nn.Module):
         self.projector = Linear(downsample_hidden_size * 2, output_size, bias=False)
         self._grid_height = grid_height
         self._grid_width = grid_width
+        self._patch_size = patch_size
         self._position_grid_size = position_grid_size
         self._vision_hidden_size = vision_hidden_size
         self._projector_channels = downsample_hidden_size * 2
 
-    def _resize_positions(self, op: OpBuilder) -> ir.Value:
+    def _resize_positions(
+        self,
+        op: OpBuilder,
+        grid_height: ir.Value,
+        grid_width: ir.Value,
+    ) -> ir.Value:
         # [S*S,C] -> [1,C,S,S] -> bilinear/antialiased [1,C,H,W] -> [1,HW,C].
         positions = op.Reshape(
             self.position_embedding,
@@ -397,7 +418,12 @@ class Step3VLClipSidecar(nn.Module):
             positions,
             None,
             None,
-            [1, self._vision_hidden_size, self._grid_height, self._grid_width],
+            op.Concat(
+                op.Constant(value_ints=[1, self._vision_hidden_size]),
+                op.Reshape(grid_height, [1]),
+                op.Reshape(grid_width, [1]),
+                axis=0,
+            ),
             mode="linear",
             coordinate_transformation_mode="half_pixel",
             antialias=1,
@@ -405,7 +431,12 @@ class Step3VLClipSidecar(nn.Module):
         positions = op.Transpose(positions, perm=[0, 2, 3, 1])
         return op.Reshape(
             positions,
-            [1, self._grid_height * self._grid_width, self._vision_hidden_size],
+            op.Concat(
+                op.Constant(value_ints=[1]),
+                op.Reshape(op.Mul(grid_height, grid_width), [1]),
+                op.Constant(value_ints=[self._vision_hidden_size]),
+                axis=0,
+            ),
         )
 
     def forward(
@@ -415,9 +446,20 @@ class Step3VLClipSidecar(nn.Module):
         pos_h: ir.Value,
         pos_w: ir.Value,
     ) -> ir.Value:
+        grid_height = op.Div(
+            op.Squeeze(op.Shape(pixel_values, start=2, end=3), [0]),
+            self._patch_size,
+        )
+        grid_width = op.Div(
+            op.Squeeze(op.Shape(pixel_values, start=3, end=4), [0]),
+            self._patch_size,
+        )
         hidden_states = self.pre_layer_norm(
             op,
-            op.Add(self.patch_embedding(op, pixel_values), self._resize_positions(op)),
+            op.Add(
+                self.patch_embedding(op, pixel_values),
+                self._resize_positions(op, grid_height, grid_width),
+            ),
         )
         for layer in self.layers:
             hidden_states = layer(op, hidden_states, pos_h, pos_w)
@@ -427,7 +469,9 @@ class Step3VLClipSidecar(nn.Module):
             hidden_states,
             op.Concat(
                 batch,
-                op.Constant(value_ints=[self._grid_height, self._grid_width, -1]),
+                op.Reshape(grid_height, [1]),
+                op.Reshape(grid_width, [1]),
+                op.Constant(value_ints=[-1]),
                 axis=0,
             ),
         )

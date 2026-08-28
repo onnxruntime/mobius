@@ -95,7 +95,9 @@ def _shape(shapes: TensorShapes, name: str, rank: int | None = None) -> tuple[in
     except KeyError as exc:
         raise ValueError(f"GGUF projector is missing tensor {name!r}.") from exc
     if rank is not None and len(shape) != rank:
-        raise ValueError(f"GGUF projector tensor {name!r} has shape {shape}, expected rank {rank}.")
+        raise ValueError(
+            f"GGUF projector tensor {name!r} has shape {shape}, expected rank {rank}."
+        )
     if any(dim <= 0 for dim in shape):
         raise ValueError(f"GGUF projector tensor {name!r} has non-positive shape {shape}.")
     return shape
@@ -308,14 +310,17 @@ def _create_hunyuan(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
         merge_size=_metadata_int(metadata, "clip.vision.spatial_merge_size"),
         eps=_metadata_float(metadata, "clip.vision.attention.layer_norm_epsilon"),
     )
+    height = ir.SymbolicDim("height")
+    width = ir.SymbolicDim("width")
+    patches = ir.SymbolicDim("num_patches")
     return _attach_contract(
         module,
         (
-            ("pixel_values", ir.DataType.FLOAT, (1, 3, image, image)),
+            ("pixel_values", ir.DataType.FLOAT, (1, 3, height, width)),
             (
                 "position_embeddings",
                 ir.DataType.FLOAT,
-                (1, grid * grid, _metadata_int(metadata, "clip.vision.embedding_length")),
+                (patches, _metadata_int(metadata, "clip.vision.embedding_length")),
             ),
         ),
         squeeze_batch_dim=True,
@@ -345,12 +350,15 @@ def _create_step3(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.Mo
         output_size=output,
         eps=_metadata_float(metadata, "clip.vision.attention.layer_norm_epsilon"),
     )
+    height = ir.SymbolicDim("height")
+    width = ir.SymbolicDim("width")
+    patches = ir.SymbolicDim("num_patches")
     return _attach_contract(
         module,
         (
-            ("pixel_values", ir.DataType.FLOAT, (1, 3, image, image)),
-            ("pos_h", ir.DataType.INT64, (grid * grid,)),
-            ("pos_w", ir.DataType.INT64, (grid * grid,)),
+            ("pixel_values", ir.DataType.FLOAT, (1, 3, height, width)),
+            ("pos_h", ir.DataType.INT64, (patches,)),
+            ("pos_w", ir.DataType.INT64, (patches,)),
         ),
         squeeze_batch_dim=True,
     )
@@ -554,13 +562,12 @@ def _create_minimax(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
         merge_size=merge,
         norm_eps=_metadata_float(metadata, "clip.vision.attention.layer_norm_epsilon"),
     )
-    patches = (image // patch) ** 2
+    patches = ir.SymbolicDim("total_patches")
     return _attach_contract(
         module,
         (
             ("pixel_values", ir.DataType.FLOAT, (patches, 2 * 3 * patch * patch)),
-            ("position_h", ir.DataType.INT64, (patches,)),
-            ("position_w", ir.DataType.INT64, (patches,)),
+            ("grid_size", ir.DataType.INT64, (2,)),
         ),
     )
 
@@ -740,11 +747,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ffn_down.weight": "mlp_down.weight",
                     "ffn_down.bias": "mlp_down.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if local_suffix is None
-                    else f"layers.{index}.{local_suffix}"
-                )
+                local = None if local_suffix is None else f"layers.{index}.{local_suffix}"
             else:
                 local = {
                     "v.patch_embd.weight": "patch_embedding.proj.weight",
@@ -779,11 +782,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ffn_down.weight": "mlp_down.weight",
                     "ffn_down.bias": "mlp_down.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if local_suffix is None
-                    else f"layers.{index}.{local_suffix}"
-                )
+                local = None if local_suffix is None else f"layers.{index}.{local_suffix}"
             else:
                 local = {
                     "v.patch_embd.weight": "patch_embedding.proj.weight",
@@ -800,9 +799,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
             if block is not None:
                 mapped = _STANDARD_BLOCK_MAP.get(suffix)
                 local = (
-                    None
-                    if mapped is None
-                    else f"vision_tower.encoder.layers.{index}.{mapped}"
+                    None if mapped is None else f"vision_tower.encoder.layers.{index}.{mapped}"
                 )
             else:
                 local = {
@@ -822,9 +819,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
             if block is not None:
                 mapped = _STANDARD_BLOCK_MAP.get(suffix)
                 local = (
-                    None
-                    if mapped is None
-                    else f"vision_tower.encoder.layers.{index}.{mapped}"
+                    None if mapped is None else f"vision_tower.encoder.layers.{index}.{mapped}"
                 )
             elif name.startswith("v.vit_merger."):
                 suffix = name.removeprefix("v.vit_merger.")
@@ -846,11 +841,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ds_ffn_down.weight": "linear_2.weight",
                     "ds_ffn_down.bias": "linear_2.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if mapped is None
-                    else f"vision_tower.encoder.vit_merger.{mapped}"
-                )
+                local = None if mapped is None else f"vision_tower.encoder.vit_merger.{mapped}"
             else:
                 local = {
                     "v.patch_embd.weight": "vision_tower.embeddings.patch_embedding",
@@ -888,11 +879,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ffn_down.weight": "mlp.down_proj.weight",
                     "ffn_down.bias": "mlp.down_proj.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if local_suffix is None
-                    else f"layers.{index}.{local_suffix}"
-                )
+                local = None if local_suffix is None else f"layers.{index}.{local_suffix}"
             else:
                 local = {
                     "v.patch_embd.weight": "patch_embed.proj",
@@ -923,11 +910,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ffn_down.weight": "mlp.down_proj.weight",
                     "ffn_down.bias": "mlp.down_proj.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if local_suffix is None
-                    else f"blocks.{index}.{local_suffix}"
-                )
+                local = None if local_suffix is None else f"blocks.{index}.{local_suffix}"
             else:
                 local = {
                     "v.patch_embd.weight": "patch_embed.weight_0",
@@ -955,11 +938,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ffn_down.weight": "mlp.down_proj.weight",
                     "ffn_down.bias": "mlp.down_proj.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if local_suffix is None
-                    else f"blocks.{index}.{local_suffix}"
-                )
+                local = None if local_suffix is None else f"blocks.{index}.{local_suffix}"
             else:
                 local = {
                     "v.patch_embd.weight": "patch_embed.weight_0",
@@ -988,11 +967,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                     "ffn_down.weight": "mlp.fc2.weight",
                     "ffn_down.bias": "mlp.fc2.bias",
                 }.get(suffix)
-                local = (
-                    None
-                    if local_suffix is None
-                    else f"blocks.{index}.{local_suffix}"
-                )
+                local = None if local_suffix is None else f"blocks.{index}.{local_suffix}"
             else:
                 local = {
                     "v.patch_embd.weight": "patch_embed.weight_0",
@@ -1015,9 +990,7 @@ def _fused_hunyuan_state(mmproj_gguf: Any) -> tuple[dict[str, torch.Tensor], set
     layers = _metadata_int(mmproj_gguf.metadata, "clip.vision.block_count")
     for layer in range(layers):
         for kind in ("weight", "bias"):
-            names = [
-                f"v.blk.{layer}.attn_{part}.{kind}" for part in ("q", "k", "v")
-            ]
+            names = [f"v.blk.{layer}.attn_{part}.{kind}" for part in ("q", "k", "v")]
             values = [
                 np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32) for name in names
             ]
@@ -1034,9 +1007,7 @@ def _fused_cog_state(mmproj_gguf: Any) -> tuple[dict[str, torch.Tensor], set[str
     layers = _metadata_int(mmproj_gguf.metadata, "clip.vision.block_count")
     for layer in range(layers):
         for kind in ("weight", "bias"):
-            names = [
-                f"v.blk.{layer}.attn_{part}.{kind}" for part in ("q", "k", "v")
-            ]
+            names = [f"v.blk.{layer}.attn_{part}.{kind}" for part in ("q", "k", "v")]
             values = [
                 np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32) for name in names
             ]
@@ -1116,15 +1087,11 @@ def validate_remaining_projector_shapes(mmproj_gguf: Any, projector_type: str) -
     if projector_type == "hunyuanvl":
         for layer in range(_metadata_int(mmproj_gguf.metadata, "clip.vision.block_count")):
             for kind in ("weight", "bias"):
-                mapped_targets.add(
-                    f"vision_encoder.layers.{layer}.attn.in_proj.{kind}"
-                )
+                mapped_targets.add(f"vision_encoder.layers.{layer}.attn.in_proj.{kind}")
     elif projector_type == "cogvlm":
         for layer in range(_metadata_int(mmproj_gguf.metadata, "clip.vision.block_count")):
             for kind in ("weight", "bias"):
-                mapped_targets.add(
-                    f"vision_encoder.blocks.{layer}.attention.qkv.{kind}"
-                )
+                mapped_targets.add(f"vision_encoder.blocks.{layer}.attention.qkv.{kind}")
     missing = sorted(set(parameters) - mapped_targets)
     if missing:
         raise ValueError(

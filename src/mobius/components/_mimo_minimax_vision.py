@@ -510,7 +510,7 @@ class MiniMaxM3Attention(nn.Module):
         position_h: ir.Value,
         position_w: ir.Value,
     ) -> ir.Value:
-        shape = [0, 0, self._heads, self._head_dim]
+        shape = [1, -1, self._heads, self._head_dim]
         query = self.rotary(
             op, op.Reshape(self.q_proj(op, hidden_states), shape), position_h, position_w
         )
@@ -518,9 +518,9 @@ class MiniMaxM3Attention(nn.Module):
             op, op.Reshape(self.k_proj(op, hidden_states), shape), position_h, position_w
         )
         value = op.Reshape(self.v_proj(op, hidden_states), shape)
-        query = op.Reshape(query, [0, 0, -1])
-        key = op.Reshape(key, [0, 0, -1])
-        value = op.Reshape(value, [0, 0, -1])
+        query = op.Reshape(query, [1, -1, self._heads * self._head_dim])
+        key = op.Reshape(key, [1, -1, self._heads * self._head_dim])
+        value = op.Reshape(value, [1, -1, self._heads * self._head_dim])
         attended = op.Attention(
             query,
             key,
@@ -529,7 +529,7 @@ class MiniMaxM3Attention(nn.Module):
             kv_num_heads=self._heads,
             scale=1.0 / math.sqrt(self._head_dim),
         )
-        return self.out_proj(op, op.Reshape(attended, [0, 0, -1]))
+        return self.out_proj(op, op.Squeeze(attended, [0]))
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -620,12 +620,10 @@ class MiniMaxM3VisionSidecar(nn.Module):
     ):
         super().__init__()
         self.patch_embed = DualTemporalPatchEmbedding(3, hidden_size, patch_size)
-        self.pre_vit_merge = SpatialMergeOrder(
-            grid_height,
-            grid_width,
-            hidden_size,
-            merge_size,
-        )
+        if grid_height % merge_size or grid_width % merge_size:
+            raise ValueError("reference patch grid must be divisible by merge_size")
+        self._hidden_size = hidden_size
+        self._merge_size = merge_size
         self.blocks = nn.ModuleList(
             [
                 MiniMaxM3VisionBlock(
@@ -650,10 +648,43 @@ class MiniMaxM3VisionSidecar(nn.Module):
         self,
         op: OpBuilder,
         pixel_values: ir.Value,
-        position_h: ir.Value,
-        position_w: ir.Value,
+        grid_size: ir.Value,
     ) -> ir.Value:
-        hidden_states = self.pre_vit_merge(op, self.patch_embed(op, pixel_values))
+        hidden_states = self.patch_embed(op, pixel_values)
+        grid_height = op.Gather(grid_size, 0)
+        grid_width = op.Gather(grid_size, 1)
+        merged_height = op.Div(grid_height, self._merge_size)
+        merged_width = op.Div(grid_width, self._merge_size)
+        hidden_states = op.Reshape(
+            hidden_states,
+            op.Concat(
+                op.Reshape(merged_height, [1]),
+                [self._merge_size],
+                op.Reshape(merged_width, [1]),
+                [self._merge_size, self._hidden_size],
+                axis=0,
+            ),
+        )
+        hidden_states = op.Transpose(hidden_states, perm=[0, 2, 1, 3, 4])
+        hidden_states = op.Reshape(hidden_states, [-1, self._hidden_size])
+        indices = op.Range(0, op.Mul(grid_height, grid_width), 1)
+        position_h = op.Div(indices, grid_width)
+        position_w = op.Mod(indices, grid_width)
+        position_shape = op.Concat(
+            op.Reshape(merged_height, [1]),
+            [self._merge_size],
+            op.Reshape(merged_width, [1]),
+            [self._merge_size],
+            axis=0,
+        )
+        position_h = op.Reshape(
+            op.Transpose(op.Reshape(position_h, position_shape), perm=[0, 2, 1, 3]),
+            [-1],
+        )
+        position_w = op.Reshape(
+            op.Transpose(op.Reshape(position_w, position_shape), perm=[0, 2, 1, 3]),
+            [-1],
+        )
         for block in self.blocks:
             hidden_states = block(op, hidden_states, position_h, position_w)
         return self.projector(op, hidden_states)
