@@ -15,6 +15,7 @@ import torch
 
 from mobius._builder import build_from_module
 from mobius._configs import VisionConfig
+from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._model_package import (
     ModelPackage,
     _make_progress_callback,
@@ -31,6 +32,36 @@ def _make_simple_model(name: str = "test") -> ir.Model:
     """Create a minimal ir.Model for testing."""
     graph = ir.Graph([], [], nodes=[], name=name)
     return ir.Model(graph, ir_version=10)
+
+
+def _partial_export_report() -> ComponentExportReport:
+    return ComponentExportReport.create(
+        (
+            ComponentExportDisposition(
+                name="model",
+                route="llama",
+                requested=True,
+                discovered=True,
+                support="supported",
+                output="exported",
+            ),
+            ComponentExportDisposition(
+                name="tokenizer",
+                route="blocked-pre",
+                requested=True,
+                discovered=True,
+                support="blocked",
+                output="omitted",
+                runtime_validation_status="unvalidated",
+                blocker_category="semantic-mismatch",
+                reason="the pinned tokenizer differs",
+                evidence_id="tokenizer-evidence",
+                impact="the package is not runnable",
+                remediation="provide and validate a tokenizer",
+            ),
+        ),
+        end_to_end_runnable=False,
+    )
 
 
 class TestModelPackageDict:
@@ -214,6 +245,93 @@ class TestWeightLoadingReport:
 
         assert external.read_text() == "unchanged"
         assert not (tmp_path / "model.onnx").exists()
+
+
+class TestComponentExportReport:
+    def test_partial_report_roundtrips_deterministically(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        pkg.save(str(tmp_path), progress_bar=False)
+        report_bytes = (tmp_path / "export_report.json").read_bytes()
+        loaded = ModelPackage.load(str(tmp_path))
+
+        assert loaded.export_report == pkg.export_report
+        loaded_report = loaded.export_report
+        assert loaded_report is not None
+        assert loaded_report.status == "partial"
+        assert loaded_report.runtime_validation_status == "unvalidated"
+        tokenizer = loaded_report.component("tokenizer")
+        assert tokenizer is not None
+        assert tokenizer.exported is False
+        assert report_bytes == pkg.export_report.to_json().encode()
+        payload = pkg.export_report.to_dict()
+        assert payload["export_status"] == "partial"
+        assert payload["runtime_validation_status"] == "unvalidated"
+        components = payload["components"]
+        assert isinstance(components, dict)
+        assert components["tokenizer"]["export_status"] == "omitted"
+        assert components["tokenizer"]["runtime_validation_status"] == "unvalidated"
+
+    def test_save_without_report_rejects_stale_report(self, tmp_path):
+        report_path = tmp_path / "export_report.json"
+        report_path.write_text(_partial_export_report().to_json(), encoding="utf-8")
+        pkg = ModelPackage({"model": _make_simple_model()})
+
+        with pytest.raises(ValueError, match=r"stale export_report.json"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert not (tmp_path / "model.onnx").exists()
+
+    def test_partial_report_rejects_stale_omitted_component_assets(self, tmp_path):
+        stale_tokenizer = tmp_path / "tokenizer.json"
+        stale_tokenizer.write_text('{"unverified": true}', encoding="utf-8")
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        with pytest.raises(FileExistsError, match="unverified components cannot survive"):
+            pkg.save(str(tmp_path), progress_bar=False)
+
+        assert stale_tokenizer.read_text(encoding="utf-8") == '{"unverified": true}'
+        assert not (tmp_path / "model.onnx").exists()
+
+    def test_report_is_written_only_after_model_serialization(self, tmp_path, monkeypatch):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        def fail_save(*_args, **_kwargs):
+            raise OSError("serialization failed")
+
+        monkeypatch.setattr(ir, "save", fail_save)
+        with pytest.raises(OSError, match="serialization failed"):
+            pkg.save(str(tmp_path / "output"), progress_bar=False)
+
+        assert not (tmp_path / "output" / "export_report.json").exists()
+
+    def test_report_rejects_component_filtered_save(self, tmp_path):
+        pkg = ModelPackage({"model": _make_simple_model()})
+        pkg.export_report = _partial_export_report()
+
+        with pytest.raises(ValueError, match="Component-filtered saves"):
+            pkg.save(
+                str(tmp_path),
+                components=lambda _name: False,
+                progress_bar=False,
+            )
+
+        assert not (tmp_path / "model.onnx").exists()
+        assert not (tmp_path / "export_report.json").exists()
+
+    def test_report_rejects_contradictory_status_booleans(self):
+        payload = _partial_export_report().to_dict()
+        components = payload["components"]
+        assert isinstance(components, dict)
+        tokenizer = components["tokenizer"]
+        assert isinstance(tokenizer, dict)
+        tokenizer["exported"] = True
+
+        with pytest.raises(ValueError, match="contradictory status booleans"):
+            ComponentExportReport.from_dict(payload)
 
 
 class TestOnnxShardedSave:

@@ -21,6 +21,7 @@ from mobius.integrations.gguf._tokenizer import (
     inspect_gguf_tokenizer,
     materialize_gguf_tokenizer,
 )
+from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 
 _PINNED_PRE_IDENTIFIERS = (
@@ -188,6 +189,40 @@ class TestInspectGgufTokenizer:
         assert verdict.route == "deferred"
         assert verdict.pre == "hunyuan-dense"
         assert "compiled llama.cpp behavior" in verdict.reason
+        assert verdict.audit_status == "deferred-compiled-semantics"
+        assert verdict.blocker_category == "compiled-llama.cpp-semantic-dependency"
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "bailingmoe",
+            "bailingmoe2",
+            "llada-moe",
+            "chatglm-bpe",
+            "glm4",
+            "cohere2moe",
+            "tiny_aya",
+        ],
+    )
+    def test_known_alias_blocker_uses_exact_authoritative_evidence(
+        self, identifier: str
+    ) -> None:
+        audit = next(
+            record for record in tokenizer_route_census() if record.identifier == identifier
+        )
+        verdict = inspect_gguf_tokenizer(_metadata(pre=identifier))
+
+        assert verdict.audit_status == "deferred-pinned-artifact-mismatch"
+        assert verdict.blocker_category == "pinned-candidate-source-semantic-mismatch"
+        assert verdict.evidence_id == audit.blocker_evidence_id
+        assert verdict.reason == audit.candidate_disposition
+
+    def test_validated_route_is_not_mislabeled_as_supported_tokenizer_output(self) -> None:
+        verdict = inspect_gguf_tokenizer(_metadata(pre="gpt-2"))
+
+        assert verdict.route == "deferred"
+        assert verdict.blocker_category is None
+        assert verdict.evidence_id is None
 
     def test_plamo2_legacy_default_pre_is_validated_but_deferred(self):
         metadata = _metadata(pre="default")

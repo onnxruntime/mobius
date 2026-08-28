@@ -24,6 +24,7 @@ from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_evidence import (
     iter_tokenizer_blocker_evidence,
     iter_tokenizer_evidence,
+    matching_tokenizer_blocker_evidence,
     matching_tokenizer_evidence,
     tokenizer_blocker_evidence,
     tokenizer_evidence,
@@ -798,6 +799,14 @@ def test_matching_plm_blocker_reports_exact_normalizer_mismatch(tmp_path, monkey
         get_tensor_shape=lambda _name: (2, 4),
     )
 
+    assert (
+        matching_tokenizer_blocker_evidence(
+            tmp_path / "tiny.gguf",
+            model,
+            metadata_sha256=tiny.tokenizer_metadata_sha256,
+        )
+        is tiny
+    )
     with pytest.raises(ValueError, match=r"explicitly blocked.*NFC normalization"):
         matching_tokenizer_evidence(
             tmp_path / "tiny.gguf",

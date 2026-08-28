@@ -732,10 +732,10 @@ package.save("output")
 ```
 
 `keep_quantized=True` requests quantized target storage where supported; it does
-not guarantee source byte or numerical fidelity. Mobius classifies qtypes before
-payload conversion, emits one aggregate warning for lossy requantization, and
-saves the typed result as `quantization_report.json`. Use
-`keep_quantized=False` for explicit float import.
+not guarantee source fidelity. An authoritative tokenizer blocker does not invalidate
+a proven graph: the API returns the model, emits one structured warning, omits assets,
+and persists the exact component disposition in `export_report.json`. Lossy qtype
+conversion remains in `quantization_report.json`; use `keep_quantized=False` for float.
 
 Packed MatMulNBits storage may use a native op or portable nibble unpack,
 `DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
@@ -763,12 +763,13 @@ build_from_gguf(
 )
 ```
 
-The function returns a `ModelPackage`. Import validates architecture metadata, exact tensor
-closure, shapes, qtypes, and selected graph route before publication. Source reuse requires
-the original immutable GGUF at runtime. Runtime packages additionally require an exact
-artifact, graph, tokenizer, runtime version, parity proof, and deterministic state/generation
-evidence match.
-Processor-owned `image_token_id` overrides are forwarded unchanged for `mmproj=` packages.
+The function returns a `ModelPackage`. Mobius-side graph/semantic inability, corruption,
+identity, I/O, malformed tokenizer, and unexpected errors remain fail-closed. Authoritative
+tokenizer blockers become partial exports with exact reasons and no unverified assets.
+Downstream runtime, version, registry, or executor limitations preserve the accurate model
+package and record distinct `export_status` and `runtime_validation_status` fields instead of
+blocking export. Only exact artifact, graph, tokenizer, version, parity, and state evidence
+marks a complete runtime package validated and end-to-end runnable.
 
 Use `build_mmproj_from_gguf("mmproj.gguf", projector_type=..., target_architecture=...)`
 to export a registry-evidenced standalone `vision_encoder`, `audio_encoder`, or

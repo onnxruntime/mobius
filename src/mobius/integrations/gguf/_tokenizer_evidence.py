@@ -10,6 +10,7 @@ __all__ = [
     "GGUFTokenizerEvidence",
     "iter_tokenizer_blocker_evidence",
     "iter_tokenizer_evidence",
+    "matching_tokenizer_blocker_evidence",
     "matching_tokenizer_evidence",
     "tokenizer_blocker_evidence",
     "tokenizer_evidence",
@@ -2307,6 +2308,90 @@ def iter_tokenizer_blocker_evidence() -> tuple[GGUFTokenizerBlockerEvidence, ...
     )
 
 
+def _sequence_digest(metadata: dict[str, Any], key: str) -> tuple[int, str]:
+    values = metadata.get(key)
+    if not isinstance(values, list):
+        return 0, ""
+    payload = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()
+    return len(values), hashlib.sha256(payload).hexdigest()
+
+
+def _matching_tokenizer_blockers(
+    identity: Any,
+    gguf_model: Any,
+    *,
+    metadata_sha256: str | None,
+) -> list[GGUFTokenizerBlockerEvidence]:
+    metadata = gguf_model.metadata
+    token_count, vocabulary_sha256 = _sequence_digest(metadata, "tokenizer.ggml.tokens")
+    merge_count, merges_sha256 = _sequence_digest(metadata, "tokenizer.ggml.merges")
+    score_count, scores_sha256 = _sequence_digest(metadata, "tokenizer.ggml.scores")
+    token_type_count, token_types_sha256 = _sequence_digest(
+        metadata, "tokenizer.ggml.token_type"
+    )
+    return [
+        evidence
+        for evidence in _TOKENIZER_BLOCKER_EVIDENCE.values()
+        if evidence.architecture == gguf_model.architecture
+        and evidence.pre_identifier == metadata.get("tokenizer.ggml.pre")
+        and evidence.tokenizer_model == metadata.get("tokenizer.ggml.model")
+        and evidence.filename == identity.filename
+        and evidence.size == identity.size
+        and evidence.lfs_sha256 == identity.sha256
+        and evidence.tensor_count == identity.tensor_count
+        and evidence.tensor_qtypes == identity.tensor_qtypes
+        and evidence.tokenizer_metadata_sha256 == metadata_sha256
+        and evidence.token_count == token_count
+        and evidence.ordered_vocabulary_sha256 == vocabulary_sha256
+        and evidence.merge_count == merge_count
+        and evidence.ordered_merges_sha256 == (merges_sha256 or None)
+        and evidence.score_count == score_count
+        and evidence.ordered_scores_sha256 == (scores_sha256 or None)
+        and evidence.token_count == token_type_count
+        and evidence.ordered_token_types_sha256 == token_types_sha256
+        and gguf_model.get_tensor_shape("token_embd.weight")[0]
+        == evidence.embedding_vocabulary_size
+    ]
+
+
+def matching_tokenizer_blocker_evidence(
+    source_path: Path,
+    gguf_model: Any,
+    *,
+    metadata_sha256: str | None,
+    artifact_identity: Any | None = None,
+) -> GGUFTokenizerBlockerEvidence | None:
+    """Return an exact authoritative tokenizer blocker for one artifact, if any."""
+    metadata = gguf_model.metadata
+    candidates = [
+        evidence
+        for evidence in _TOKENIZER_BLOCKER_EVIDENCE.values()
+        if evidence.architecture == gguf_model.architecture
+        and evidence.pre_identifier == metadata.get("tokenizer.ggml.pre")
+        and evidence.tokenizer_model == metadata.get("tokenizer.ggml.model")
+        and evidence.tokenizer_metadata_sha256 == metadata_sha256
+    ]
+    if not candidates:
+        return None
+    identity = artifact_identity
+    if identity is None:
+        identity = gguf_artifact_identity(
+            source_path,
+            gguf_model,
+            architecture=gguf_model.architecture,
+        )
+    blockers = _matching_tokenizer_blockers(
+        identity,
+        gguf_model,
+        metadata_sha256=metadata_sha256,
+    )
+    if len(blockers) == 1:
+        return blockers[0]
+    if blockers:
+        raise RuntimeError("Tokenizer blocker evidence contains duplicate artifact identities")
+    return None
+
+
 def matching_tokenizer_evidence(
     source_path: Path,
     gguf_model: Any,
@@ -2322,17 +2407,12 @@ def matching_tokenizer_evidence(
     )
     metadata = gguf_model.metadata
 
-    def sequence_digest(key: str) -> tuple[int, str]:
-        values = metadata.get(key)
-        if not isinstance(values, list):
-            return 0, ""
-        payload = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode()
-        return len(values), hashlib.sha256(payload).hexdigest()
-
-    token_count, vocabulary_sha256 = sequence_digest("tokenizer.ggml.tokens")
-    merge_count, merges_sha256 = sequence_digest("tokenizer.ggml.merges")
-    score_count, scores_sha256 = sequence_digest("tokenizer.ggml.scores")
-    token_type_count, token_types_sha256 = sequence_digest("tokenizer.ggml.token_type")
+    token_count, vocabulary_sha256 = _sequence_digest(metadata, "tokenizer.ggml.tokens")
+    merge_count, merges_sha256 = _sequence_digest(metadata, "tokenizer.ggml.merges")
+    score_count, scores_sha256 = _sequence_digest(metadata, "tokenizer.ggml.scores")
+    token_type_count, token_types_sha256 = _sequence_digest(
+        metadata, "tokenizer.ggml.token_type"
+    )
     token_types = metadata.get("tokenizer.ggml.token_type")
     effective_pre = metadata.get("tokenizer.ggml.pre")
     if effective_pre is None and metadata.get("tokenizer.ggml.model") == "gemma4":
@@ -2373,29 +2453,11 @@ def matching_tokenizer_evidence(
             for token, token_id in evidence.user_defined_token_ids
         )
     ]
-    blockers = [
-        evidence
-        for evidence in _TOKENIZER_BLOCKER_EVIDENCE.values()
-        if evidence.architecture == architecture
-        and evidence.pre_identifier == metadata.get("tokenizer.ggml.pre")
-        and evidence.tokenizer_model == metadata.get("tokenizer.ggml.model")
-        and evidence.filename == identity.filename
-        and evidence.size == identity.size
-        and evidence.lfs_sha256 == identity.sha256
-        and evidence.tensor_count == identity.tensor_count
-        and evidence.tensor_qtypes == identity.tensor_qtypes
-        and evidence.tokenizer_metadata_sha256 == metadata_sha256
-        and evidence.token_count == token_count
-        and evidence.ordered_vocabulary_sha256 == vocabulary_sha256
-        and evidence.merge_count == merge_count
-        and evidence.ordered_merges_sha256 == (merges_sha256 or None)
-        and evidence.score_count == score_count
-        and evidence.ordered_scores_sha256 == (scores_sha256 or None)
-        and evidence.token_count == token_type_count
-        and evidence.ordered_token_types_sha256 == token_types_sha256
-        and gguf_model.get_tensor_shape("token_embd.weight")[0]
-        == evidence.embedding_vocabulary_size
-    ]
+    blockers = _matching_tokenizer_blockers(
+        identity,
+        gguf_model,
+        metadata_sha256=metadata_sha256,
+    )
     if len(blockers) == 1:
         blocker = blockers[0]
         raise ValueError(

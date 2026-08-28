@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Tests for atomic, tokenizer-gated GGUF runtime package emission."""
+"""Tests for atomic, component-aware GGUF runtime package emission."""
 
 from __future__ import annotations
 
@@ -9,12 +9,16 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import pytest
 
 from mobius.integrations.gguf import _runtime_package, write_gguf_runtime_package
+from mobius.integrations.gguf._component_export import attach_tokenizer_export_report
+from mobius.integrations.gguf._runtime_evidence import RuntimeEvidenceUnavailableError
 from mobius.integrations.gguf._spec import Support
+from mobius.integrations.gguf._tokenizer import GGUFTokenizerVerdict
 
 _TOKENIZER_REPOSITORY = "owner/tokenizer"
 _TOKENIZER_REVISION = "c" * 40
@@ -33,12 +37,15 @@ class _FakePackage:
         self.gguf_import_route = '{"route_schema":1}'
         self.gguf_artifact_identity = _BUILT_IDENTITY
         self.gguf_tokenizer_verdict = _materialized()
+        self.export_report: Any = None
         self.saved_to: str | None = None
 
     def save(self, path, **kwargs):
         self.saved_to = path
         Path(path).mkdir(parents=True, exist_ok=True)
         (Path(path) / "model.onnx").write_bytes(b"stub")
+        if self.export_report is not None:
+            self.export_report.write_json(Path(path) / "export_report.json")
 
     def __iter__(self):
         return iter(("model",))
@@ -47,6 +54,7 @@ class _FakePackage:
 def _materialized():
     return SimpleNamespace(
         materialized=True,
+        route_identifier="embedded",
         reason="exact embedded tokenizer",
         metadata_sha256="f" * 64,
     )
@@ -109,6 +117,14 @@ def _successful_runtime_dependencies(runtime: str = "onnx-genai"):
         ),
     ):
         yield
+
+
+def _source_model():
+    return SimpleNamespace(
+        metadata={},
+        architecture="llama",
+        source_matches_path=lambda: True,
+    )
 
 
 def _write_runtime(pkg, source, output, **kwargs):
@@ -276,7 +292,7 @@ class TestWriteGgufRuntimePackage:
             ),
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
-                side_effect=ValueError(
+                side_effect=RuntimeEvidenceUnavailableError(
                     "No unique GGUF runtime evidence matches architecture='llama'"
                 ),
             ),
@@ -286,6 +302,11 @@ class TestWriteGgufRuntimePackage:
         compatibility = json.loads((out / "runtime_compatibility.json").read_text())
         assert compatibility["runtime_validation_status"] == "unvalidated"
         assert "independent parity is missing" in compatibility["warnings"][0]
+        assert pkg.export_report is not None
+        runtime_component = pkg.export_report.component("runtime")
+        assert runtime_component is not None
+        assert runtime_component.output == "exported"
+        assert runtime_component.support == "deferred"
 
     def test_atomically_emits_graph_tokenizer_and_runtime_config(self, tmp_path):
         pkg = _FakePackage()
@@ -294,9 +315,7 @@ class TestWriteGgufRuntimePackage:
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.open_gguf_model",
                 return_value=SimpleNamespace(
-                    metadata={},
-                    architecture="llama",
-                    source_matches_path=lambda: True,
+                    **vars(_source_model()),
                 ),
             ),
             mock.patch(
@@ -320,7 +339,60 @@ class TestWriteGgufRuntimePackage:
         compatibility = json.loads((out / "runtime_compatibility.json").read_text())
         assert compatibility["runtime_validation_status"] == "unvalidated"
         assert "completed runtime package" in compatibility["warnings"][-1]
+        assert pkg.export_report is not None
+        assert pkg.export_report.component("runtime").output == "exported"
+        assert pkg.export_report.component("tokenizer").output == "exported"
+        assert (out / "export_report.json").is_file()
         assert not list(tmp_path.glob(".out.*.tmp"))
+
+    def test_exact_runtime_evidence_marks_package_validated(self, tmp_path):
+        pkg = _FakePackage()
+        out = tmp_path / "out"
+        evidence = SimpleNamespace(
+            evidence_id="test-evidence",
+            graph_files=("model.onnx",),
+            graph_sha256="b" * 64,
+            runtime_package_files=(
+                "inference_metadata.yaml",
+                "model.onnx",
+                "tokenizer.json",
+            ),
+            runtime_package_sha256="c" * 64,
+            tokenizer_repository=_TOKENIZER_REPOSITORY,
+            tokenizer_revision=_TOKENIZER_REVISION,
+            tokenizer_metadata_sha256="f" * 64,
+            tokenizer_assets=(("tokenizer.json", 2, "a" * 64),),
+        )
+        with (
+            _successful_runtime_dependencies(),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
+                return_value=evidence,
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.gguf_graph_package_identity",
+                side_effect=(
+                    SimpleNamespace(files=evidence.graph_files, sha256=evidence.graph_sha256),
+                    SimpleNamespace(
+                        files=evidence.runtime_package_files,
+                        sha256=evidence.runtime_package_sha256,
+                    ),
+                ),
+            ),
+        ):
+            _write_runtime(pkg, tmp_path / "m.gguf", out, runtime_version="0.15.2")
+
+        assert pkg.export_report is not None
+        assert pkg.export_report.export_status == "complete"
+        assert pkg.export_report.runtime_validation_status == "validated"
+        assert pkg.export_report.end_to_end_runnable is True
+        runtime_component = pkg.export_report.component("runtime")
+        assert runtime_component is not None
+        assert runtime_component.support == "supported"
+        assert runtime_component.runtime_validation_status == "validated"
+        compatibility = json.loads((out / "runtime_compatibility.json").read_text())
+        assert compatibility["runtime_validation_status"] == "validated"
+        assert compatibility["runtime_evidence_id"] == "test-evidence"
 
     def test_missing_evidence_runtime_version_does_not_block_export(self, tmp_path):
         pkg = _FakePackage()
@@ -328,7 +400,7 @@ class TestWriteGgufRuntimePackage:
         with (
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
-                side_effect=ValueError(
+                side_effect=RuntimeEvidenceUnavailableError(
                     "Runtime packaging requires the exact runtime version covered by evidence."
                 ),
             ),
@@ -348,9 +420,7 @@ class TestWriteGgufRuntimePackage:
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.open_gguf_model",
                 return_value=SimpleNamespace(
-                    metadata={},
-                    architecture="llama",
-                    source_matches_path=lambda: True,
+                    **vars(_source_model()),
                 ),
             ),
             mock.patch(
@@ -387,9 +457,7 @@ class TestWriteGgufRuntimePackage:
             mock.patch(
                 "mobius.integrations.gguf._runtime_package.open_gguf_model",
                 return_value=SimpleNamespace(
-                    metadata={},
-                    architecture="llama",
-                    source_matches_path=lambda: True,
+                    **vars(_source_model()),
                 ),
             ),
             mock.patch(
@@ -444,6 +512,43 @@ class TestWriteGgufRuntimePackage:
                 tokenizer_revision="main",
             )
         read_source.assert_not_called()
+
+    def test_tokenizer_blocker_omits_only_tokenizer_assets(self, tmp_path, caplog):
+        pkg = _FakePackage()
+        blocker = GGUFTokenizerVerdict(
+            route="deferred",
+            model="gpt2",
+            pre="blocked-pre",
+            canonical_pre="blocked-pre",
+            token_count=2,
+            metadata_sha256="f" * 64,
+            blocker_category="semantic-mismatch",
+            audit_status="deferred-pinned-artifact-mismatch",
+            reason="recorded tokenizer mismatch",
+            evidence_id="blocker-evidence",
+        )
+        out = tmp_path / "out"
+        with (
+            caplog.at_level("WARNING"),
+            _successful_runtime_dependencies(),
+            mock.patch(
+                "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
+                return_value=blocker,
+            ),
+        ):
+            pkg.gguf_tokenizer_verdict = blocker
+            attach_tokenizer_export_report(pkg, blocker, model_route="llama")
+            artifacts = _write_runtime(pkg, tmp_path / "m.gguf", out)
+
+        assert (out / "model.onnx").is_file()
+        assert Path(artifacts["export_report"]).is_file()
+        assert pkg.export_report.component("tokenizer").output == "omitted"
+        runtime_component = pkg.export_report.component("runtime")
+        assert runtime_component.output == "exported"
+        assert runtime_component.support == "deferred"
+        assert not (out / "tokenizer.json").exists()
+        assert (out / "inference_metadata.yaml").is_file()
+        assert caplog.text.count("GGUF PARTIAL EXPORT WARNING:") == 1
 
     def test_replaced_source_tokenizer_rejects_before_save_or_output(self, tmp_path):
         pkg = _FakePackage()
@@ -521,17 +626,26 @@ class TestWriteGgufRuntimePackage:
             "sentinel.bin": b"unchanged"
         }
 
-    def test_ort_genai_rejects_reused_gguf_weights(self, tmp_path):
+    def test_ort_genai_exports_reused_weights_as_runtime_unvalidated(self, tmp_path, caplog):
         pkg = _FakePackage()
         pkg.gguf_reuse_plan = object()
-        with pytest.raises(ValueError, match="no supported setting"):
-            _write_runtime(
+        out = tmp_path / "out"
+        with (
+            _successful_runtime_dependencies("ort-genai"),
+            caplog.at_level("WARNING"),
+        ):
+            artifacts = _write_runtime(
                 pkg,
                 tmp_path / "m.gguf",
-                tmp_path / "out",
+                out,
                 runtime="ort-genai",
             )
-        assert not (tmp_path / "out").exists()
+        assert (out / "model.onnx").is_file()
+        assert Path(artifacts["export_report"]).is_file()
+        runtime_component = pkg.export_report.component("runtime")
+        assert runtime_component.output == "exported"
+        assert "cannot disable constant folding" in runtime_component.reason
+        assert "cannot disable constant folding" in caplog.text
 
     def test_unknown_execution_provider_is_preserved_as_advisory(self, tmp_path):
         pkg = _FakePackage()

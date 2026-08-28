@@ -6847,7 +6847,7 @@ def build_from_gguf(
         from mobius.integrations.gguf._mmproj import build_vlm_from_gguf
 
         parsed_source = {"_text_gguf_model": _gguf_model} if _gguf_model is not None else {}
-        return build_vlm_from_gguf(
+        pkg = build_vlm_from_gguf(
             gguf_path,
             mmproj,
             dtype=dtype,
@@ -6856,6 +6856,80 @@ def build_from_gguf(
             keep_quantized=keep_quantized,
             **parsed_source,
         )
+        from mobius.integrations.gguf._arch_registry import get_arch_spec
+        from mobius.integrations.gguf._component_export import (
+            attach_tokenizer_export_report,
+            resolve_tokenizer_export_verdict,
+        )
+        from mobius.integrations.gguf._shard_set import open_gguf_model
+
+        if not pkg.gguf_source_path:
+            raise RuntimeError(
+                "Multimodal GGUF builder did not preserve its canonical text source path."
+            )
+        source_path = Path(pkg.gguf_source_path)
+        text_model = _gguf_model if _gguf_model is not None else open_gguf_model(source_path)
+        source_matches_path = getattr(text_model, "source_matches_path", None)
+        if callable(source_matches_path) and not source_matches_path():
+            raise ValueError(
+                "GGUF source changed after multimodal graph construction; "
+                "refusing to bind stale source metadata."
+            )
+        architecture_spec = get_arch_spec(text_model.architecture)
+        canonical_architecture = architecture_spec.gguf_arch
+        pkg.gguf_architecture = canonical_architecture
+        pkg.gguf_execution_provider = execution_provider
+        source_filename = getattr(pkg, "gguf_source_filename", None)
+        if not isinstance(source_filename, str) or not source_filename:
+            source_filename = source_path.name
+            pkg.gguf_source_filename = source_filename
+        source_identities = getattr(text_model, "source_identities", None)
+        pkg.gguf_source_identity = (
+            tuple(source_identities)
+            if source_identities is not None
+            else getattr(text_model, "source_identity", None)
+        )
+        pkg.gguf_import_route = json.dumps(
+            {
+                "architecture": architecture_spec.gguf_arch,
+                "components": sorted(pkg),
+                "execution_provider": execution_provider,
+                "model_type": getattr(pkg.config, "model_type", None),
+                "multimodal_projector": True,
+                "route_schema": 1,
+                "task": "multimodal",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        tokenizer_verdict = getattr(pkg, "gguf_tokenizer_verdict", None)
+        if getattr(pkg, "gguf_artifact_identity", None) is None:
+            from mobius.integrations.gguf._runtime_evidence import gguf_artifact_identity
+
+            pkg.gguf_artifact_identity = gguf_artifact_identity(
+                source_path,
+                text_model,
+                architecture=canonical_architecture,
+                filename=source_filename,
+            )
+            if callable(source_matches_path) and not source_matches_path():
+                raise ValueError(
+                    "GGUF source changed while its multimodal package identity was captured."
+                )
+        if tokenizer_verdict is not None:
+            tokenizer_verdict = resolve_tokenizer_export_verdict(
+                text_model,
+                source_path,
+                verdict=tokenizer_verdict,
+                artifact_identity=getattr(pkg, "gguf_artifact_identity", None),
+            )
+            pkg.gguf_tokenizer_verdict = tokenizer_verdict
+            attach_tokenizer_export_report(
+                pkg,
+                tokenizer_verdict,
+                model_route=canonical_architecture,
+            )
+        return pkg
     if image_token_id is not None:
         raise ValueError("image_token_id requires a companion mmproj package.")
 
@@ -7580,6 +7654,18 @@ def build_from_gguf(
     pkg.gguf_source_filename = logical_source_filename
     pkg.gguf_architecture = spec.gguf_arch
     pkg.gguf_execution_provider = execution_provider
+    source_matches_path = getattr(gguf_model, "source_matches_path", None)
+    if callable(source_matches_path) and not source_matches_path():
+        raise ValueError(
+            "GGUF source changed during graph construction; refusing to bind the package "
+            "to stale source metadata."
+        )
+    source_identities = getattr(gguf_model, "source_identities", None)
+    pkg.gguf_source_identity = (
+        tuple(source_identities)
+        if source_identities is not None
+        else getattr(gguf_model, "source_identity", None)
+    )
     if dataclasses.is_dataclass(resolved_task) and not isinstance(resolved_task, type):
         task_state: object = dataclasses.asdict(resolved_task)
     elif isinstance(resolved_task, str):
@@ -7619,7 +7705,7 @@ def build_from_gguf(
         sort_keys=True,
     )
     source_matches_path = getattr(gguf_model, "source_matches_path", None)
-    if source_matches_path is not None:
+    if callable(source_matches_path):
         if not source_matches_path():
             raise ValueError(
                 "GGUF source changed after the reader opened it; refusing to bind the graph "
@@ -7637,7 +7723,19 @@ def build_from_gguf(
             raise ValueError(
                 "GGUF source changed while its graph and artifact identity were being built."
             )
+    from mobius.integrations.gguf._component_export import (
+        attach_tokenizer_export_report,
+        resolve_tokenizer_export_verdict,
+    )
+
+    tokenizer_verdict = resolve_tokenizer_export_verdict(
+        gguf_model,
+        canonical_source_path,
+        verdict=tokenizer_verdict,
+        artifact_identity=getattr(pkg, "gguf_artifact_identity", None),
+    )
     pkg.gguf_tokenizer_verdict = tokenizer_verdict
+    attach_tokenizer_export_report(pkg, tokenizer_verdict, model_route=spec.gguf_arch)
 
     return pkg
 

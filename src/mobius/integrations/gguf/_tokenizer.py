@@ -221,10 +221,18 @@ class GGUFTokenizerVerdict:
     token_count: int
     tokenizer_sha256: str | None = None
     metadata_sha256: str | None = None
+    audit_status: str | None = None
+    blocker_category: str | None = None
+    evidence_id: str | None = None
 
     @property
     def materialized(self) -> bool:
         return self.route in {"copy", "pinned-source"}
+
+    @property
+    def route_identifier(self) -> str:
+        """Exact serialized route discriminator used for diagnostics."""
+        return self.pre or self.model or "absent"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -383,6 +391,38 @@ def _tokenizer_metadata_sha256(metadata: Mapping[str, Any]) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _deferred_route_diagnostics(
+    pre: str | None,
+    *,
+    reason: str,
+) -> tuple[str | None, str | None, str | None, str]:
+    """Resolve stable authoritative diagnostics for a deferred tokenizer route."""
+    if pre is None:
+        return (
+            "deferred-incomplete-pipeline",
+            "serialized-tokenizer-pipeline-incomplete",
+            None,
+            reason,
+        )
+
+    # Imported lazily because the census evidence records depend on the tokenizer
+    # source dataclasses defined in this module.
+    from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
+
+    audit = next(
+        (record for record in tokenizer_route_census() if record.identifier == pre),
+        None,
+    )
+    if audit is None or audit.current_status == "validated-pinned-source":
+        return None, None, None, reason
+    return (
+        audit.current_status,
+        audit.blocker_category,
+        audit.blocker_evidence_id or audit.evidence_id,
+        audit.candidate_disposition or reason,
+    )
 
 
 def inspect_gguf_tokenizer(
@@ -566,14 +606,22 @@ def inspect_gguf_tokenizer(
         if pre_value is not None
         else f"model {model!r} omits the complete tokenizer pipeline"
     )
+    reason = f"{detail}; exact ORT tokenizer materialization is unavailable"
+    audit_status, blocker_category, evidence_id, reason = _deferred_route_diagnostics(
+        pre_value,
+        reason=reason,
+    )
     return GGUFTokenizerVerdict(
         "deferred",
         model,
         pre_value,
         policy.canonical if policy else None,
-        f"{detail}; exact ORT tokenizer materialization is unavailable",
+        reason,
         len(tokens),
         metadata_sha256=_tokenizer_metadata_sha256(metadata),
+        audit_status=audit_status,
+        blocker_category=blocker_category,
+        evidence_id=evidence_id,
     )
 
 

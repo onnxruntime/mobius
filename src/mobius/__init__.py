@@ -22,6 +22,8 @@ __all__ = [
     "CausalLMConfig",
     "CausalLMTask",
     "ComponentInfo",
+    "ComponentExportDisposition",
+    "ComponentExportReport",
     "DepthAnythingConfig",
     "EncoderConfig",
     "EpCapabilities",
@@ -108,6 +110,7 @@ from mobius._configs import (
 )
 from mobius._constants import OPSET_VERSION
 from mobius._execution_providers import EpCapabilities, ep_registry, get_ep, register_ep
+from mobius._export_report import ComponentExportDisposition, ComponentExportReport
 from mobius._inspect import ComponentInfo, inspect_components
 from mobius._model_package import ModelPackage
 from mobius._optimizations import optimize_model

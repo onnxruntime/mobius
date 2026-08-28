@@ -37,6 +37,7 @@ import rfc8785
 import torch
 import tqdm
 
+from mobius._export_report import ComponentExportReport
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.adapters import (
     AdapterArtifact,
@@ -48,6 +49,8 @@ from mobius.integrations._weight_loading import _assign_weight
 
 if TYPE_CHECKING:
     from mobius.integrations.gguf._quantization_report import GGUFQuantizationReport
+    from mobius.integrations.gguf._runtime_evidence import GGUFArtifactIdentity
+    from mobius.integrations.gguf._tokenizer import GGUFTokenizerVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,7 @@ _PACKAGE_MANIFEST = ".mobius-package.json"
 _PACKAGE_MANIFEST_FORMAT = "mobius.model-package.v1"
 _MTP_SIDECAR_BASENAME = ".mobius-mtp"
 _QUANTIZATION_REPORT = "quantization_report.json"
+_EXPORT_REPORT = "export_report.json"
 _WEIGHT_LOADING_REPORT = "weight-loading-report.json"
 _DEFAULT_STREAMING_DENSE_SHARD_BYTES = 1 << 30
 _MAX_STREAMING_DENSE_SHARD_BYTES = 5_000_000_000
@@ -138,6 +142,7 @@ def _validate_mtp_chain(package: ModelPackage) -> None:
             component_keys.add(collision_key)
             if collision_key in {
                 _PACKAGE_MANIFEST.casefold(),
+                _EXPORT_REPORT.casefold(),
                 _QUANTIZATION_REPORT.casefold(),
                 _WEIGHT_LOADING_REPORT.casefold(),
             }:
@@ -176,6 +181,11 @@ def _validate_mtp_save_paths(
 ) -> None:
     """Reject unsafe output paths throughout the package chain before any writes."""
     _validate_output_directory(directory, kind="package", inspect_contents=False)
+    if package.export_report is not None and components is not None:
+        raise ValueError(
+            "Component-filtered saves cannot preserve an attached export report; "
+            "save the complete package or detach and replace the report."
+        )
     report_path = os.path.join(directory, _QUANTIZATION_REPORT)
     if os.path.lexists(report_path) and (
         os.path.islink(report_path) or not os.path.isfile(report_path)
@@ -186,6 +196,31 @@ def _validate_mtp_save_paths(
             "ModelPackage output contains a stale quantization_report.json, but the "
             "package being saved has no GGUF quantization report. Remove or clean the "
             "output directory before saving."
+        )
+    export_report_path = os.path.join(directory, _EXPORT_REPORT)
+    if os.path.lexists(export_report_path) and (
+        os.path.islink(export_report_path) or not os.path.isfile(export_report_path)
+    ):
+        raise ValueError("ModelPackage component export report output must be a real file.")
+    if package.export_report is None and os.path.isfile(export_report_path):
+        raise ValueError(
+            "ModelPackage output contains a stale export_report.json, but the package "
+            "being saved has no component export report. Remove or clean the output "
+            "directory before saving."
+        )
+    if (
+        package.export_report is not None
+        and (
+            package.export_report.status == "partial"
+            or package.export_report.runtime_validation_status == "unvalidated"
+        )
+        and os.path.isdir(directory)
+        and os.listdir(directory)
+    ):
+        raise FileExistsError(
+            "Partial or runtime-unvalidated component exports require an empty output "
+            "directory so omitted or unverified components cannot survive from a "
+            "previous package."
         )
     weight_report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
     if os.path.lexists(weight_report_path) and (
@@ -293,6 +328,8 @@ class ModelPackage(UserDict[str, ir.Model]):
             or ``None`` if not available (e.g. after :meth:`load`).
         gguf_quantization_report: Optional persisted report describing GGUF
             source-storage preservation and conversion behavior.
+        export_report: Optional persisted component-level report describing
+            independently supported/exported and deferred/omitted package parts.
         quantization_report: Optional transient, loader-specific metadata describing
             quantization handling. The concrete report type and schema belong to the
             integration that produced it (for example, ``CompressedTensorsLoadReport``);
@@ -315,10 +352,20 @@ class ModelPackage(UserDict[str, ir.Model]):
         super().__init__(models or {})
         self.config = config
         self.gguf_quantization_report: GGUFQuantizationReport | None = None
+        self.gguf_architecture = ""
+        self.gguf_artifact_identity: GGUFArtifactIdentity | None = None
+        self.gguf_execution_provider = ""
+        self.gguf_import_route = ""
+        self.gguf_source_filename = ""
+        self.gguf_source_identity: object | None = None
+        self.gguf_source_path = ""
+        self.gguf_tokenizer_verdict: GGUFTokenizerVerdict | None = None
+        self.export_report: ComponentExportReport | None = None
         self.quantization_report: object | None = None
         self.weight_loading_report: dict[str, object] | None = None
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
+        self.draft_manifest: Any = None
         self.mtp_head: ModelPackage | None = None
         self.policy_components = dict(policy_components or {})
         self.adapter_target_manifest = adapter_target_manifest
@@ -457,6 +504,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         quantization_report_path = os.path.join(directory, _QUANTIZATION_REPORT)
         if self.gguf_quantization_report is not None:
             self.gguf_quantization_report.write_json(quantization_report_path)
+        export_report_path = os.path.join(directory, _EXPORT_REPORT)
         selected = {
             name: model
             for name, model in self.data.items()
@@ -618,6 +666,10 @@ class ModelPackage(UserDict[str, ir.Model]):
                 and not os.path.islink(previous_sidecar)
             ):
                 shutil.rmtree(previous_sidecar)
+        if self.export_report is not None:
+            if os.path.islink(export_report_path):
+                raise ValueError("Component export report must not be a symlink.")
+            self.export_report.write_json(export_report_path)
 
     def add_policy_component(self, name: str, component: PolicyComponent) -> None:
         """Attach a reusable generation-policy graph to this package."""
@@ -987,6 +1039,11 @@ class ModelPackage(UserDict[str, ir.Model]):
             package.gguf_quantization_report = GGUFQuantizationReport.read_json(
                 quantization_report_path
             )
+        export_report_path = os.path.join(directory, _EXPORT_REPORT)
+        if os.path.lexists(export_report_path):
+            if os.path.islink(export_report_path) or not os.path.isfile(export_report_path):
+                raise ValueError("ModelPackage component export report must be a real file.")
+            package.export_report = ComponentExportReport.read_json(export_report_path)
         report_path = os.path.join(directory, _WEIGHT_LOADING_REPORT)
         if os.path.lexists(report_path):
             if os.path.islink(report_path) or not os.path.isfile(report_path):
