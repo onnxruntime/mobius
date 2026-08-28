@@ -228,7 +228,8 @@ def test_public_meralion_package_persists_processor_contract(tmp_path: Path) -> 
     session.close()
     assert output.shape == (100, 5)
     assert (
-        package["audio_encoder"].graph.metadata_props["mobius.pipeline.when_present"] == "audio"
+        package["audio_encoder"].graph.metadata_props["mobius.pipeline.when_present"]
+        == "audio"
     )
     assert np.isfinite(output).all()
 
@@ -290,9 +291,7 @@ def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> N
         "mm.a.mlp.3.weight": (5, 9),
     }
     module = create_gguf_audio_projector("meralion", metadata, shapes)
-    assert module.audio_encoder.input_schema == (
-        ("input_features", ir.DataType.FLOAT, (3000, 128)),
-    )
+    assert module.input_schema == (("input_features", ir.DataType.FLOAT, (3000, 128)),)
     assert (
         map_mmproj_audio_projector_to_onnx("mm.a.mlp.3.bias", "meralion")
         == "audio_encoder.projector.linear3.bias"

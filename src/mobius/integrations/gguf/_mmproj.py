@@ -3218,7 +3218,7 @@ def build_audio_projector_from_gguf(
         AUDIO_PROCESSOR_ABIS,
         create_gguf_audio_projector,
     )
-    from mobius.tasks import GGUFAudioProjectorTask
+    from mobius.tasks import GGUFAudioProjectorModel, GGUFAudioProjectorTask
 
     resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
     mmproj_gguf = (
@@ -3256,11 +3256,12 @@ def build_audio_projector_from_gguf(
         name: tuple(int(dim) for dim in mmproj_gguf.get_tensor_shape(name))
         for name in mmproj_gguf.tensor_names
     }
-    module = create_gguf_audio_projector(
+    audio_encoder = create_gguf_audio_projector(
         spec.projector_type,
         mmproj_gguf.metadata,
         tensor_shapes,
     )
+    module = GGUFAudioProjectorModel(audio_encoder)
     package = build_from_module(
         module,
         config,

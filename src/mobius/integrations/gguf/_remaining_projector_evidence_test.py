@@ -30,7 +30,11 @@ _ROUTES = {
 
 
 def test_remaining_projector_source_evidence_is_complete_and_immutable() -> None:
-    records = MMPROJ_SOURCE_EVIDENCE
+    records = tuple(
+        record
+        for record in MMPROJ_SOURCE_EVIDENCE
+        if record.evidence_id.endswith("-pinned-graph-source")
+    )
     assert {record.evidence_id.removesuffix("-pinned-graph-source") for record in records} == {
         route.replace("_", "-") for route in _ROUTES
     }

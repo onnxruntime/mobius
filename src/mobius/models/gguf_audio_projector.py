@@ -10,7 +10,7 @@ import math
 from collections.abc import Mapping
 
 import numpy as np
-from onnxscript import OpBuilder, nn
+from onnxscript import nn
 
 from mobius.components import MeralionAudioSidecar
 
@@ -79,26 +79,11 @@ def _shape(shapes: TensorShapes, name: str, rank: int) -> tuple[int, ...]:
     return shape
 
 
-class GGUFAudioProjectorModel(nn.Module):
-    """One standalone audio sidecar component with no implied text runtime."""
-
-    default_task = "gguf-audio-projector"
-    category = "Audio"
-
-    def __init__(self, audio_encoder: nn.Module):
-        super().__init__()
-        self.audio_encoder = audio_encoder
-
-    def forward(self, op: OpBuilder, **kwargs):
-        del op, kwargs
-        raise NotImplementedError("GGUF audio projectors are built as an audio_encoder graph.")
-
-
 def create_gguf_audio_projector(
     projector_type: str,
     metadata: Mapping[str, object],
     tensor_shapes: TensorShapes,
-) -> GGUFAudioProjectorModel:
+) -> nn.Module:
     """Create the exact reusable graph for one supported audio route."""
     if projector_type != "meralion":
         raise NotImplementedError(
@@ -141,4 +126,4 @@ def create_gguf_audio_projector(
         stack_factor=stack_factor,
         eps=_metadata_float(metadata, "clip.audio.attention.layer_norm_epsilon"),
     )
-    return GGUFAudioProjectorModel(encoder)
+    return encoder

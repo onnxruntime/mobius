@@ -60,6 +60,7 @@ class GGUFAudioProjectorTask(ModelTask):
             raise ValueError("GGUF audio encoder output count does not match output_names")
         for value, name in zip(output_values, output_names):
             builder.add_output(value, name)
+        declare_component_presence(graph, "audio")
         return ModelPackage({"audio_encoder": _make_model(graph)}, config=config)
 
 

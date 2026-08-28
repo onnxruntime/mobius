@@ -27,7 +27,6 @@ __all__ = [
     "DeferredCompanionSpec",
     "MMProjArtifactAvailabilityPin",
     "MMProjArtifactPin",
-    "MMPROJ_SOURCE_EVIDENCE",
     "MMProjSourceEvidence",
     "MMProjModelRole",
     "MMProjModality",

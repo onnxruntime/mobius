@@ -217,8 +217,7 @@ def _create_minicpm(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
     scale = _metadata_int(metadata, "clip.vision.projector.scale_factor")
     if scale not in (2, 4):
         raise ValueError(
-            "minicpmv4_6 clip.vision.projector.scale_factor must be 2 or 4, "
-            f"got {scale}."
+            f"minicpmv4_6 clip.vision.projector.scale_factor must be 2 or 4, got {scale}."
         )
     config = ArchitectureConfig(
         model_type="minicpmv4_6",
