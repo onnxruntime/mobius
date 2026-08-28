@@ -957,6 +957,26 @@ class TestMultimodalPreflightGuards:
         with pytest.raises(ValueError, match=r"positive integer"):
             _preflight_mmproj_pair(text, mmproj, modalities=(MMProjModality.VISION,))
 
+    def test_only_encoder_free_gemma4_audio_allows_zero_transformer_depth(self):
+        from mobius.integrations.gguf._mmproj import _validate_gemma4_audio_metadata
+
+        metadata = {
+            "clip.has_audio_encoder": True,
+            "clip.audio.projector_type": "gemma4a",
+            "clip.audio.embedding_length": 8,
+            "clip.audio.feed_forward_length": 0,
+            "clip.audio.block_count": 0,
+            "clip.audio.projection_dim": 16,
+            "clip.audio.attention.head_count": 1,
+            "clip.audio.num_mel_bins": 128,
+            "clip.audio.attention.layer_norm_epsilon": 1e-6,
+        }
+        with pytest.raises(ValueError, match="feed_forward_length must be a positive"):
+            _validate_gemma4_audio_metadata(metadata)
+
+        metadata["clip.audio.projector_type"] = "gemma4ua"
+        _validate_gemma4_audio_metadata(metadata)
+
     def test_quantized_projector_weight_is_rejected_by_role(self, tmp_path: Path):
         from types import SimpleNamespace
 

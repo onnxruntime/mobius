@@ -276,7 +276,7 @@ class FusedQKVVisionAttention(GroupedQueryVisionAttention):
     """Fused-QKV full attention used by converted Kimi-K2.5 weights."""
 
     def __init__(self, hidden_size: int, num_heads: int):
-        _SplitRotaryAttentionBase.__init__(self, hidden_size, num_heads, num_heads)
+        super().__init__(hidden_size, num_heads, num_heads)
         self.qkv = Linear(hidden_size, hidden_size * 3, bias=True)
         self.proj = Linear(hidden_size, hidden_size, bias=True)
 

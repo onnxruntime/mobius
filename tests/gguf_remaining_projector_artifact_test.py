@@ -48,7 +48,9 @@ def test_projector_header_identity_and_tensor_inventory(
     header_path = tmp_path / "header.bin"
     sparse_path = tmp_path / "sparse.gguf"
     try:
-        with urllib.request.urlopen(request) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            assert response.status == 206
+            assert response.headers["Content-Range"].startswith("bytes 0-")
             header = response.read(pin.bounded_header_bytes + 1)
         assert len(header) == pin.bounded_header_bytes
         assert hashlib.sha256(header).hexdigest() == pin.bounded_header_sha256

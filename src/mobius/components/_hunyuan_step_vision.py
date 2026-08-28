@@ -329,9 +329,11 @@ class _Step3VLAttention(_VisionAttention):
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
-        pos_h: ir.Value,
-        pos_w: ir.Value,
+        pos_h: ir.Value | None = None,
+        pos_w: ir.Value | None = None,
     ) -> ir.Value:
+        if pos_h is None or pos_w is None:
+            raise ValueError("Step3VL attention requires both height and width positions.")
         q, k, v = self._qkv(op, hidden_states)
         q_w, q_h = op.Split(q, num_outputs=2, axis=-1, _outputs=2)
         k_w, k_h = op.Split(k, num_outputs=2, axis=-1, _outputs=2)
