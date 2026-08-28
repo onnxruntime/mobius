@@ -111,8 +111,8 @@ def _attention(x, state, stem, *, pos_h=None, pos_w=None, theta=10000.0):
     return _linear(context, state, f"{stem}.out_proj")
 
 
-def test_hunyuanvl_external_position_projector_and_token_order():
-    """CPU position resize and ``(ow+1)*oh+2`` ordering match pinned mtmd."""
+def test_hunyuanvl_position_interpolation_projector_and_token_order():
+    """Position resize and ``(ow+1)*oh+2`` ordering match pinned mtmd."""
     component = HunyuanVLClipSidecar(
         vision_hidden_size=4,
         intermediate_size=7,
@@ -121,21 +121,20 @@ def test_hunyuanvl_external_position_projector_and_token_order():
         patch_size=1,
         grid_height=4,
         grid_width=4,
+        position_grid_size=2,
         projector_hidden_size=5,
         output_size=3,
     )
     builder, op, graph = create_test_builder()
     pixels_value = create_test_input(builder, "pixel_values", [1, 3, 4, 4])
-    positions_value = create_test_input(builder, "position_embeddings", [16, 4])
-    output = component(op, pixels_value, positions_value)
+    output = component(op, pixels_value)
     output.name = "image_features"
     graph.outputs.append(output)
     state, session = _state_and_session(component, graph, 11)
 
     rng = np.random.default_rng(12)
     pixels = rng.normal(size=(1, 3, 4, 4)).astype(np.float32)
-    source_positions = rng.normal(size=(1, 4, 2, 2)).astype(np.float32)
-    # llama.cpp supplies this bilinear-resampled table from the CPU.
+    source_positions = state["position_embedding"].reshape(1, 2, 2, 4).transpose(0, 3, 1, 2)
     positions_t = (
         functional.interpolate(
             torch.from_numpy(source_positions),
@@ -147,9 +146,7 @@ def test_hunyuanvl_external_position_projector_and_token_order():
         .permute(0, 2, 3, 1)
         .reshape(1, 16, 4)
     )
-    positions = positions_t.squeeze(0).numpy()
-
-    actual = session.run(None, {"pixel_values": pixels, "position_embeddings": positions})[0]
+    actual = session.run(None, {"pixel_values": pixels})[0]
     x = _conv(torch.from_numpy(pixels), state, "patch_embedding.proj", 1, 0)
     x = x.flatten(2).transpose(1, 2) + positions_t
     residual = x
@@ -301,16 +298,15 @@ def test_hunyuanvl_runtime_grid_controls_newline_token_count():
         patch_size=1,
         grid_height=4,
         grid_width=4,
+        position_grid_size=2,
         projector_hidden_size=5,
         output_size=3,
     )
     builder, op, graph = create_test_builder()
     height = ir.SymbolicDim("height")
     width = ir.SymbolicDim("width")
-    patches = ir.SymbolicDim("patches")
     pixels = create_test_input(builder, "pixel_values", [1, 3, height, width])
-    positions = create_test_input(builder, "position_embeddings", [patches, 4])
-    output = component(op, pixels, positions)
+    output = component(op, pixels)
     output.name = "image_features"
     graph.outputs.append(output)
     _, session = _state_and_session(component, graph, 41)
@@ -319,10 +315,7 @@ def test_hunyuanvl_runtime_grid_controls_newline_token_count():
     for h, w in ((4, 4), (2, 4)):
         actual = session.run(
             None,
-            {
-                "pixel_values": rng.normal(size=(1, 3, h, w)).astype(np.float32),
-                "position_embeddings": rng.normal(size=(h * w, 4)).astype(np.float32),
-            },
+            {"pixel_values": rng.normal(size=(1, 3, h, w)).astype(np.float32)},
         )[0]
         assert actual.shape == (1, (w // 2 + 1) * (h // 2) + 2, 3)
 

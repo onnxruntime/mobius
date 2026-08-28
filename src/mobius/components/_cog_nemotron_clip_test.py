@@ -44,9 +44,7 @@ def _randomize(model: ir.Model, seed: int) -> dict[str, np.ndarray]:
             continue
         shape = tuple(int(dim) for dim in initializer.shape)
         values = rng.normal(0.0, 0.12, shape).astype(np.float32)
-        if (name.endswith(".weight") and (".ln" in name or "post_fc_norm" in name)) or (
-            name == "mm.model.mlp.0.weight"
-        ):
+        if (name.endswith(".weight") and "norm" in name) or name == "projector_norm_weight":
             values += 1.0
         state[name] = values
     apply_weights(model, {name: torch.from_numpy(value) for name, value in state.items()})
@@ -89,7 +87,7 @@ def _layer_norm(
 
 def _attention(x: torch.Tensor, state: dict[str, np.ndarray], stem: str) -> torch.Tensor:
     # Independent split/reshape makes a wrong fused-QKV ordering observable.
-    qkv = _linear(x, state, f"{stem}.attn_qkv", bias=True)
+    qkv = _linear(x, state, f"{stem}.attention.qkv", bias=True)
     query, key, value = qkv.chunk(3, dim=-1)
     head_dim = _HIDDEN // _HEADS
 
@@ -99,7 +97,7 @@ def _attention(x: torch.Tensor, state: dict[str, np.ndarray], stem: str) -> torc
     query, key, value = heads(query), heads(key), heads(value)
     scores = query @ key.transpose(-1, -2) / head_dim**0.5
     attended = (scores.softmax(dim=-1) @ value).transpose(1, 2).reshape_as(x)
-    return _linear(attended, state, f"{stem}.attn_out", bias=True)
+    return _linear(attended, state, f"{stem}.attention.proj", bias=True)
 
 
 def _patches(
@@ -107,8 +105,8 @@ def _patches(
 ) -> torch.Tensor:
     patches = torch_functional.conv2d(
         pixels,
-        torch.from_numpy(state[_key(state, "v.patch_embd.weight")]),
-        torch.from_numpy(state[_key(state, "v.patch_embd.bias")]) if bias else None,
+        torch.from_numpy(state[_key(state, "patch_embedding.weight")]),
+        torch.from_numpy(state[_key(state, "patch_embedding.bias")]) if bias else None,
         stride=_PATCH_SIZE,
     )
     return patches.flatten(2).transpose(1, 2)
@@ -139,25 +137,25 @@ def test_cogvlm_sidecar_matches_post_norm_swiglu_reference():
 
     x = _patches(torch.from_numpy(pixels), state, bias=True)
     x = torch.cat(
-        (x, torch.from_numpy(state["v.class_embd"]).unsqueeze(0)),
+        (x, torch.from_numpy(state["class_embedding"]).unsqueeze(0)),
         dim=1,
     )
-    x = x + torch.from_numpy(state["v.position_embd.weight"]).unsqueeze(0)
-    stem = "v.blk.0"
-    x = x + _layer_norm(_attention(x, state, stem), state, f"{stem}.ln1", 1e-6)
-    up = _linear(x, state, f"{stem}.ffn_up", bias=True)
-    ffn = _linear(up * torch.sigmoid(1.702 * up), state, f"{stem}.ffn_down", bias=True)
-    x = x + _layer_norm(ffn, state, f"{stem}.ln2", 1e-6)
+    x = x + torch.from_numpy(state["position_embedding"]).unsqueeze(0)
+    stem = "blocks.0"
+    x = x + _layer_norm(_attention(x, state, stem), state, f"{stem}.input_layernorm", 1e-6)
+    up = _linear(x, state, f"{stem}.mlp.up", bias=True)
+    ffn = _linear(up * torch.sigmoid(1.702 * up), state, f"{stem}.mlp.down", bias=True)
+    x = x + _layer_norm(ffn, state, f"{stem}.post_attention_layernorm", 1e-6)
 
     # The appended CLS row is removed before the linear/LN/GELU projector.
-    x = _linear(x[:, :-1], state, "mm.model.fc", bias=False)
-    x = _layer_norm(x, state, "mm.post_fc_norm", 1e-5)
+    x = _linear(x[:, :-1], state, "projection", bias=False)
+    x = _layer_norm(x, state, "projector_norm", 1e-5)
     x = torch_functional.gelu(x, approximate="tanh")
-    up = _linear(x, state, "mm.up", bias=False)
-    gate = torch_functional.silu(_linear(x, state, "mm.gate", bias=False))
-    x = _linear(up * gate, state, "mm.down", bias=False)
+    up = _linear(x, state, "projector_up", bias=False)
+    gate = torch_functional.silu(_linear(x, state, "projector_gate", bias=False))
+    x = _linear(up * gate, state, "projector_down", bias=False)
     expected = torch.cat(
-        (torch.from_numpy(state["v.boi"]), x, torch.from_numpy(state["v.eoi"])),
+        (torch.from_numpy(state["boi"]), x, torch.from_numpy(state["eoi"])),
         dim=1,
     ).numpy()
 
@@ -165,8 +163,8 @@ def test_cogvlm_sidecar_matches_post_norm_swiglu_reference():
     assert model.graph.num_nodes() > 0
     assert actual.shape == (1, 6, 5)
     # The endpoints separately lock BOI -> patches -> EOI ordering.
-    np.testing.assert_allclose(actual[:, :1], state["v.boi"], rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(actual[:, -1:], state["v.eoi"], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual[:, :1], state["boi"], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual[:, -1:], state["eoi"], rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
 
 
@@ -188,37 +186,39 @@ def test_nemotron_sidecar_matches_register_merge_relu_squared_reference():
     pixels = np.random.default_rng(4).normal(size=(1, 3, 4, 4)).astype(np.float32)
 
     patches = _patches(torch.from_numpy(pixels), state, bias=False)
-    patches = patches + torch.from_numpy(state["v.position_embd.weight"])
+    patches = patches + torch.from_numpy(state["position_embedding"])
     x = torch.cat(
-        (torch.from_numpy(state["v.class_embd"]).unsqueeze(0), patches),
+        (torch.from_numpy(state["class_embedding"]).unsqueeze(0), patches),
         dim=1,
     )
-    stem = "v.blk.0"
-    normalized = _layer_norm(x, state, f"{stem}.ln1", 1e-6)
+    stem = "blocks.0"
+    normalized = _layer_norm(x, state, f"{stem}.norm1", 1e-6)
     x = x + _attention(normalized, state, stem)
-    normalized = _layer_norm(x, state, f"{stem}.ln2", 1e-6)
-    normalized = torch_functional.gelu(_linear(normalized, state, f"{stem}.ffn_up", bias=True))
-    x = x + _linear(normalized, state, f"{stem}.ffn_down", bias=True)
+    normalized = _layer_norm(x, state, f"{stem}.norm2", 1e-6)
+    normalized = torch_functional.gelu(
+        _linear(normalized, state, f"{stem}.mlp.fc1", bias=True)
+    )
+    x = x + _linear(normalized, state, f"{stem}.mlp.fc2", bias=True)
 
     # Three (not hard-coded eight) leading rows are removed, then the 2x2
     # block is flattened in NHWC pixel-unshuffle order.
     x = x[:, 3:].reshape(1, 1, 2, 1, 2, _HIDDEN)
     x = x.permute(0, 1, 3, 2, 4, 5).reshape(1, 1, 4 * _HIDDEN)
-    rms_weight = torch.from_numpy(state["mm.model.mlp.0.weight"])
+    rms_weight = torch.from_numpy(state["projector_norm_weight"])
     x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + 1e-6) * rms_weight
     x = torch_functional.relu(
-        torch_functional.linear(x, torch.from_numpy(state["mm.model.mlp.1.weight"]))
+        torch_functional.linear(x, torch.from_numpy(state["projector_up_weight"]))
     ).square()
     expected = torch_functional.linear(
         x,
-        torch.from_numpy(state["mm.model.mlp.3.weight"]),
+        torch.from_numpy(state["projector_down_weight"]),
     ).numpy()
 
     actual = _run(model, pixels)
     assert {
-        "mm.model.mlp.0.weight",
-        "mm.model.mlp.1.weight",
-        "mm.model.mlp.3.weight",
+        "projector_norm_weight",
+        "projector_up_weight",
+        "projector_down_weight",
     } <= parameter_names
     assert model.graph.num_nodes() > 0
     assert actual.shape == (1, 1, 5)

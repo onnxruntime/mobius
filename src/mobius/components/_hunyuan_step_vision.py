@@ -112,9 +112,6 @@ class HunyuanVLClipSidecar(nn.Module):
 
     Inputs:
         pixel_values: Normalized NCHW image tensor.
-        position_embeddings: Bilinearly resized patch positions, shape
-            ``[1, grid_height * grid_width, vision_hidden_size]``. llama.cpp
-            deliberately computes this table on CPU.
 
     Output token order is image-begin, rows of projected patches with one
     newline token after every row, image-end.
@@ -130,6 +127,7 @@ class HunyuanVLClipSidecar(nn.Module):
         patch_size: int,
         grid_height: int,
         grid_width: int,
+        position_grid_size: int,
         projector_hidden_size: int,
         output_size: int,
         merge_size: int = 2,
@@ -139,6 +137,9 @@ class HunyuanVLClipSidecar(nn.Module):
         if grid_height % merge_size or grid_width % merge_size:
             raise ValueError("reference grid dimensions must be divisible by merge_size")
         self.patch_embedding = _PatchEmbedding(3, vision_hidden_size, patch_size)
+        self.position_embedding = nn.Parameter(
+            [position_grid_size * position_grid_size, vision_hidden_size]
+        )
         self.layers = nn.ModuleList(
             [
                 _HunyuanVLBlock(vision_hidden_size, intermediate_size, num_heads, eps)
@@ -164,12 +165,47 @@ class HunyuanVLClipSidecar(nn.Module):
         self._merge_size = merge_size
         self._projector_channels = projector_hidden_size * 2
         self._output_size = output_size
+        self._position_grid_size = position_grid_size
+        self._vision_hidden_size = vision_hidden_size
+
+    def _resize_positions(
+        self,
+        op: OpBuilder,
+        grid_height: ir.Value,
+        grid_width: ir.Value,
+    ) -> ir.Value:
+        # [S*S,C] -> [1,C,S,S] -> bilinear/antialiased [1,C,H,W] -> [1,HW,C].
+        positions = op.Reshape(
+            self.position_embedding,
+            [
+                self._position_grid_size,
+                self._position_grid_size,
+                self._vision_hidden_size,
+            ],
+        )
+        positions = op.Unsqueeze(op.Transpose(positions, perm=[2, 0, 1]), [0])
+        positions = op.Resize(
+            positions,
+            None,
+            None,
+            op.Concat(
+                op.Constant(value_ints=[1, self._vision_hidden_size]),
+                op.Reshape(grid_height, [1]),
+                op.Reshape(grid_width, [1]),
+                axis=0,
+            ),
+            mode="linear",
+            coordinate_transformation_mode="half_pixel",
+            antialias=1,
+        )
+        return op.Reshape(
+            op.Transpose(positions, perm=[0, 2, 3, 1]), [1, -1, self._vision_hidden_size]
+        )
 
     def forward(
         self,
         op: OpBuilder,
         pixel_values: ir.Value,
-        position_embeddings: ir.Value,
     ) -> ir.Value:
         grid_height = op.Div(
             op.Squeeze(op.Shape(pixel_values, start=2, end=3), [0]),
@@ -182,7 +218,7 @@ class HunyuanVLClipSidecar(nn.Module):
         hidden_states = self.patch_embedding(op, pixel_values)
         hidden_states = op.Add(
             hidden_states,
-            op.CastLike(op.Unsqueeze(position_embeddings, [0]), hidden_states),
+            op.CastLike(self._resize_positions(op, grid_height, grid_width), hidden_states),
         )
         for layer in self.layers:
             hidden_states = layer(op, hidden_states)

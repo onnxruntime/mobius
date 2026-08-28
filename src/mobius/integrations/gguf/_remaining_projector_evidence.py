@@ -122,7 +122,7 @@ REMAINING_MMPROJ_ARTIFACT_RECORDS: tuple[dict[str, Any], ...] = (
         "processor_class": "HunYuanVLImageProcessor",
         "processor_contract": (
             ("pixel_values", "float32[1,3,dynamic_height,dynamic_width]"),
-            ("position_embeddings", "float32[num_patches,1152]"),
+            ("position_embeddings", "graph bilinear-resizes v.position_embd.weight"),
             ("ordering", "BOI, rows with image_newline, EOI"),
         ),
     },

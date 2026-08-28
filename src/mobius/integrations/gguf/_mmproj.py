@@ -3200,6 +3200,26 @@ def _mmproj_audio_projector_to_onnx(
     return state_dict
 
 
+def _require_loaded_projector_initializers(
+    package: ModelPackage,
+    projector_type: str,
+) -> None:
+    """Fail if production weight application left any graph parameter unresolved."""
+    missing = {
+        component: sorted(
+            name
+            for name, initializer in model.graph.initializers.items()
+            if initializer.const_value is None
+        )
+        for component, model in package.items()
+    }
+    missing = {component: names for component, names in missing.items() if names}
+    if missing:
+        raise ValueError(
+            f"{projector_type} did not initialize every exported graph parameter: {missing}"
+        )
+
+
 def build_audio_projector_from_gguf(
     mmproj_gguf_path: str | Path,
     *,
@@ -3269,6 +3289,7 @@ def build_audio_projector_from_gguf(
         execution_provider=execution_provider,
     )
     package.apply_weights(_mmproj_audio_projector_to_onnx(mmproj_gguf, projector_type))
+    _require_loaded_projector_initializers(package, projector_type)
     processor_abi = AUDIO_PROCESSOR_ABIS[projector_type]
     serialized_processor_abi = json.dumps(
         dataclasses.asdict(processor_abi),
@@ -3311,6 +3332,7 @@ def build_remaining_vision_projector_from_gguf(
     from mobius.integrations.gguf._remaining_projectors import (
         create_remaining_vision_projector,
         remaining_projector_state_dict,
+        validate_remaining_projector_state_dict,
     )
     from mobius.tasks import GGUFVisionProjectorModel, GGUFVisionProjectorTask
 
@@ -3383,7 +3405,14 @@ def build_remaining_vision_projector_from_gguf(
         model.metadata_props["mobius.runtime_support"] = (
             "standalone-sidecar-only; paired multimodal runtime unvalidated"
         )
-    package.apply_weights(remaining_projector_state_dict(mmproj_gguf, projector_type))
+    state_dict = remaining_projector_state_dict(mmproj_gguf, projector_type)
+    validate_remaining_projector_state_dict(
+        package["vision_encoder"],
+        state_dict,
+        projector_type,
+    )
+    package.apply_weights(state_dict)
+    _require_loaded_projector_initializers(package, projector_type)
     package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
     package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
     package.gguf_input_schema = input_schema  # type: ignore[attr-defined]

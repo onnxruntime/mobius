@@ -23,30 +23,25 @@ if TYPE_CHECKING:
 class _NamedLinear(Linear):
     def __init__(self, in_features: int, out_features: int, stem: str):
         super().__init__(in_features, out_features)
-        self.weight = nn.Parameter([out_features, in_features], name=f"{stem}.weight")
-        self.bias = nn.Parameter([out_features], name=f"{stem}.bias")
+        del stem
 
 
 class _NamedLinearNoBias(Linear):
     def __init__(self, in_features: int, out_features: int, stem: str):
         super().__init__(in_features, out_features, bias=False)
-        self.weight = nn.Parameter([out_features, in_features], name=f"{stem}.weight")
+        del stem
 
 
 class _NamedLayerNorm(LayerNorm):
     def __init__(self, hidden_size: int, stem: str, eps: float):
         super().__init__(hidden_size, eps)
-        self.weight = nn.Parameter([hidden_size], name=f"{stem}.weight")
-        self.bias = nn.Parameter([hidden_size], name=f"{stem}.bias")
+        del stem
 
 
 class _PatchEmbeddingBase(nn.Module):
     def __init__(self, hidden_size: int, patch_size: int, grid_size: int):
         super().__init__()
-        self.weight = nn.Parameter(
-            [hidden_size, 3, patch_size, patch_size],
-            name="v.patch_embd.weight",
-        )
+        self.weight = nn.Parameter([hidden_size, 3, patch_size, patch_size])
         self._patch_size = patch_size
         self._hidden_size = hidden_size
         self._num_patches = grid_size * grid_size
@@ -68,7 +63,7 @@ class _PatchEmbeddingBase(nn.Module):
 class _ClipPatchEmbedding(_PatchEmbeddingBase):
     def __init__(self, hidden_size: int, patch_size: int, grid_size: int):
         super().__init__(hidden_size, patch_size, grid_size)
-        self.bias = nn.Parameter([hidden_size], name="v.patch_embd.bias")
+        self.bias = nn.Parameter([hidden_size])
 
     def _conv(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         return op.Conv(
@@ -202,10 +197,8 @@ class CogVLMClipSidecar(nn.Module):
         self.patch_embedding = _ClipPatchEmbedding(
             hidden_size, patch_size, image_size // patch_size
         )
-        self.class_embedding = nn.Parameter([1, hidden_size], name="v.class_embd")
-        self.position_embedding = nn.Parameter(
-            [num_patches + 1, hidden_size], name="v.position_embd.weight"
-        )
+        self.class_embedding = nn.Parameter([1, hidden_size])
+        self.position_embedding = nn.Parameter([num_patches + 1, hidden_size])
         self.blocks = nn.ModuleList(
             [
                 CogVLMClipBlock(
@@ -231,8 +224,8 @@ class CogVLMClipSidecar(nn.Module):
             output_size,
             "mm.down",
         )
-        self.boi = nn.Parameter([1, 1, output_size], name="v.boi")
-        self.eoi = nn.Parameter([1, 1, output_size], name="v.eoi")
+        self.boi = nn.Parameter([1, 1, output_size])
+        self.eoi = nn.Parameter([1, 1, output_size])
         self._num_patches = num_patches
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
@@ -330,12 +323,8 @@ class NemotronV2VLClipSidecar(nn.Module):
         if grid_size % 2:
             raise ValueError("Nemotron patch grid must be divisible by the 2x2 merge")
         self.patch_embedding = _RadioPatchEmbedding(hidden_size, patch_size, grid_size)
-        self.class_embedding = nn.Parameter(
-            [num_register_tokens, hidden_size], name="v.class_embd"
-        )
-        self.position_embedding = nn.Parameter(
-            [1, grid_size * grid_size, hidden_size], name="v.position_embd.weight"
-        )
+        self.class_embedding = nn.Parameter([num_register_tokens, hidden_size])
+        self.position_embedding = nn.Parameter([1, grid_size * grid_size, hidden_size])
         self.blocks = nn.ModuleList(
             [
                 NemotronV2VLClipBlock(
@@ -349,18 +338,9 @@ class NemotronV2VLClipSidecar(nn.Module):
             ]
         )
         merged_size = hidden_size * 4
-        self.projector_norm_weight = nn.Parameter(
-            [merged_size],
-            name="mm.model.mlp.0.weight",
-        )
-        self.projector_up_weight = nn.Parameter(
-            [projector_hidden_size, merged_size],
-            name="mm.model.mlp.1.weight",
-        )
-        self.projector_down_weight = nn.Parameter(
-            [output_size, projector_hidden_size],
-            name="mm.model.mlp.3.weight",
-        )
+        self.projector_norm_weight = nn.Parameter([merged_size])
+        self.projector_up_weight = nn.Parameter([projector_hidden_size, merged_size])
+        self.projector_down_weight = nn.Parameter([output_size, projector_hidden_size])
         self._grid_size = grid_size
         self._hidden_size = hidden_size
         self._merge_size = 2

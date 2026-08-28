@@ -299,6 +299,10 @@ def _create_hunyuan(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
     image = _metadata_int(metadata, "clip.vision.image_size")
     patch = _metadata_int(metadata, "clip.vision.patch_size")
     grid = image // patch
+    position_count = _shape(shapes, "v.position_embd.weight", 2)[0]
+    position_grid_size = math.isqrt(position_count)
+    if position_grid_size * position_grid_size != position_count:
+        raise ValueError("hunyuanvl position table must contain a square patch grid.")
     conv = _shape(shapes, "mm.0.weight", 4)
     output = _shape(shapes, "mm.model.fc.weight", 2)[0]
     module = HunyuanVLClipSidecar(
@@ -309,6 +313,7 @@ def _create_hunyuan(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
         patch_size=patch,
         grid_height=grid,
         grid_width=grid,
+        position_grid_size=position_grid_size,
         projector_hidden_size=conv[0],
         output_size=output,
         merge_size=_metadata_int(metadata, "clip.vision.spatial_merge_size"),
@@ -316,17 +321,9 @@ def _create_hunyuan(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.
     )
     height = ir.SymbolicDim("height")
     width = ir.SymbolicDim("width")
-    patches = ir.SymbolicDim("num_patches")
     return _attach_contract(
         module,
-        (
-            ("pixel_values", ir.DataType.FLOAT, (1, 3, height, width)),
-            (
-                "position_embeddings",
-                ir.DataType.FLOAT,
-                (patches, _metadata_int(metadata, "clip.vision.embedding_length")),
-            ),
-        ),
+        (("pixel_values", ir.DataType.FLOAT, (1, 3, height, width)),),
         squeeze_batch_dim=True,
     )
 
@@ -756,6 +753,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                 local = {
                     "v.patch_embd.weight": "patch_embedding.proj.weight",
                     "v.patch_embd.bias": "patch_embedding.proj.bias",
+                    "v.position_embd.weight": "position_embedding",
                     "mm.pre_norm.weight": "pre_projector_norm.weight",
                     "mm.0.weight": "projector_conv1.weight",
                     "mm.0.bias": "projector_conv1.bias",
@@ -809,7 +807,7 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                 local = {
                     "v.patch_embd.weight": "vision_tower.embeddings.patch_embedding.weight",
                     "v.patch_embd.bias": "vision_tower.embeddings.patch_embedding.bias",
-                    "v.position_embd.weight": "vision_tower.embeddings.position_embedding",
+                    "v.position_embd.weight": "vision_tower.embeddings.position_embedding.weight",
                     "v.post_ln.weight": "vision_tower.post_layernorm.weight",
                     "v.post_ln.bias": "vision_tower.post_layernorm.bias",
                     "mm.input_norm.weight": "multi_modal_projector.layer_norm.weight",
@@ -848,9 +846,9 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
                 local = None if mapped is None else f"vision_tower.encoder.vit_merger.{mapped}"
             else:
                 local = {
-                    "v.patch_embd.weight": "vision_tower.embeddings.patch_embedding",
-                    "v.patch_embd.bias": "vision_tower.embeddings.patch_embedding_bias",
-                    "v.position_embd.weight": "vision_tower.embeddings.position_embedding",
+                    "v.patch_embd.weight": "vision_tower.embeddings.patch_embedding.weight",
+                    "v.patch_embd.bias": "vision_tower.embeddings.patch_embedding.bias",
+                    "v.position_embd.weight": "vision_tower.embeddings.position_embedding.weight",
                     "v.post_ln.weight": "vision_tower.post_layernorm.weight",
                     "v.post_ln.bias": "vision_tower.post_layernorm.bias",
                     "mm.input_norm.weight": "merger.mlp.0.pre_norm.weight",
@@ -1057,14 +1055,31 @@ def validate_remaining_projector_shapes(mmproj_gguf: Any, projector_type: str) -
         for name in mmproj_gguf.tensor_names
     }
     module = create_remaining_vision_projector(projector_type, mmproj_gguf.metadata, shapes)
+    from mobius.tasks import GGUFVisionProjectorModel
+    from mobius.tasks._base import _make_graph, _make_model
+
+    wrapper = GGUFVisionProjectorModel(module)
+    graph, builder = _make_graph(name=f"{projector_type}_shape_validation")
+    input_schema = getattr(module, "input_schema", None)
+    if not isinstance(input_schema, tuple):
+        raise TypeError(f"{projector_type} projector does not declare an input_schema.")
+    inputs = {
+        name: builder.input(name, dtype=dtype, shape=list(shape))
+        for name, dtype, shape in input_schema
+    }
+    image_features = wrapper.vision_encoder(builder.op, **inputs)
+    if bool(getattr(module, "squeeze_batch_dim", False)):
+        image_features = builder.op.Squeeze(image_features, [0])
+    builder.add_output(image_features, "image_features")
+    graph_model = _make_model(graph)
     parameters: dict[str, tuple[int, ...]] = {}
-    for name, parameter in module.named_parameters():
-        if parameter.const_value is not None:
+    for name, initializer in graph_model.graph.initializers.items():
+        if initializer.const_value is not None:
             continue
-        shape = parameter.shape
+        shape = initializer.shape
         if shape is None or any(not isinstance(dim, int) for dim in shape):
             raise ValueError(f"{projector_type} parameter {name!r} has no static shape.")
-        parameters[f"vision_encoder.{name}"] = cast(tuple[int, ...], tuple(shape))
+        parameters[name] = cast(tuple[int, ...], tuple(shape))
     mapped_targets: set[str] = set()
     for name, source_shape in shapes.items():
         mapped = map_remaining_projector_weight(name, projector_type)
@@ -1100,4 +1115,25 @@ def validate_remaining_projector_shapes(mmproj_gguf: Any, projector_type: str) -
     if missing:
         raise ValueError(
             f"{projector_type} sidecar does not initialize graph parameter(s): {missing}"
+        )
+
+
+def validate_remaining_projector_state_dict(
+    model: ir.Model,
+    state_dict: Mapping[str, torch.Tensor],
+    projector_type: str,
+) -> None:
+    """Require production mapping to initialize every non-constant graph parameter."""
+    required = {
+        name
+        for name, initializer in model.graph.initializers.items()
+        if initializer.const_value is None
+    }
+    provided = set(state_dict)
+    missing = sorted(required - provided)
+    unknown = sorted(provided - required)
+    if missing or unknown:
+        raise ValueError(
+            f"{projector_type} weight mapping does not close over the exported graph: "
+            f"missing={missing}, unknown={unknown}"
         )

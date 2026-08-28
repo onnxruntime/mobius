@@ -16,7 +16,10 @@ from mobius.integrations.gguf._mmproj import build_mmproj_from_gguf
 from mobius.integrations.gguf._mmproj_mapping import (
     map_mmproj_audio_projector_to_onnx,
 )
-from mobius.integrations.gguf._remaining_projectors import create_remaining_vision_projector
+from mobius.integrations.gguf._remaining_projectors import (
+    create_remaining_vision_projector,
+    remaining_projector_state_dict,
+)
 from mobius.models.gguf_audio_projector import create_gguf_audio_projector
 from mobius.tasks import (
     GGUFAudioProjectorTask,
@@ -257,6 +260,42 @@ def test_lfm2_contract_accepts_processor_native_int32_mask() -> None:
     assert module.input_schema[1][1] == ir.DataType.INT32
 
 
+@pytest.mark.parametrize(
+    ("projector_type", "source_name", "target_name"),
+    [
+        ("cogvlm", "v.patch_embd.weight", "vision_encoder.patch_embedding.weight"),
+        ("nemotron_v2_vl", "v.patch_embd.weight", "vision_encoder.patch_embedding.weight"),
+        ("kimik25", "v.patch_embd.weight", "vision_encoder.patch_embed.proj"),
+        ("kimivl", "v.patch_embd.weight", "vision_encoder.patch_embed.proj"),
+        ("exaone4_5", "v.patch_embd.weight", "vision_encoder.patch_embed.weight_0"),
+        ("mimovl", "v.patch_embd.weight", "vision_encoder.patch_embed.weight_0"),
+        ("minimax_m3", "v.patch_embd.weight", "vision_encoder.patch_embed.weight_0"),
+    ],
+)
+def test_production_patch_weight_mapping_preserves_values(
+    projector_type: str,
+    source_name: str,
+    target_name: str,
+) -> None:
+    values = np.arange(24, dtype=np.float32).reshape(2, 3, 2, 2)
+
+    class _Reader:
+        def __init__(self) -> None:
+            self.tensor_names = (source_name,)
+            self.metadata = {"clip.vision.block_count": 1}
+
+        def get_tensor(self, name: str) -> np.ndarray:
+            if name == source_name:
+                return values
+            if name.endswith(".weight"):
+                return np.arange(4, dtype=np.float32).reshape(2, 2)
+            return np.arange(2, dtype=np.float32)
+
+    state = remaining_projector_state_dict(_Reader(), projector_type)
+    assert target_name in state
+    np.testing.assert_array_equal(state[target_name].numpy(), values)
+
+
 def test_minicpm_rejects_unknown_projector_scale() -> None:
     metadata = {
         "clip.vision.embedding_length": 4,
@@ -276,6 +315,7 @@ def test_minicpm_rejects_unknown_projector_scale() -> None:
 def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> None:
     metadata = {
         "clip.audio.embedding_length": 4,
+        "clip.audio.projection_dim": 5,
         "clip.audio.feed_forward_length": 8,
         "clip.audio.block_count": 1,
         "clip.audio.attention.head_count": 1,
@@ -296,3 +336,25 @@ def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> N
         map_mmproj_audio_projector_to_onnx("mm.a.mlp.3.bias", "meralion")
         == "audio_encoder.projector.linear3.bias"
     )
+
+
+def test_meralion_rejects_projection_width_metadata_mismatch() -> None:
+    metadata = {
+        "clip.audio.embedding_length": 4,
+        "clip.audio.projection_dim": 6,
+        "clip.audio.feed_forward_length": 8,
+        "clip.audio.block_count": 1,
+        "clip.audio.attention.head_count": 1,
+        "clip.audio.attention.layer_norm_epsilon": 1e-5,
+        "clip.audio.num_mel_bins": 128,
+        "clip.audio.projector.stack_factor": 15,
+    }
+    shapes = {
+        "a.position_embd.weight": (1500, 4),
+        "mm.a.mlp.0.weight": (9, 60),
+        "mm.a.mlp.1.weight": (9, 9),
+        "mm.a.mlp.2.weight": (9, 9),
+        "mm.a.mlp.3.weight": (5, 9),
+    }
+    with pytest.raises(ValueError, match="gated adapter contract"):
+        create_gguf_audio_projector("meralion", metadata, shapes)

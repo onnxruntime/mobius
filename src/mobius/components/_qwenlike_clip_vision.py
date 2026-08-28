@@ -39,8 +39,8 @@ class DualTemporalPatchEmbedding(nn.Module):
         self._in_channels = in_channels
         self._patch_size = patch_size
         shape = [hidden_size, in_channels, patch_size, patch_size]
-        self.weight_0 = nn.Parameter(shape, name="proj.weight")
-        self.weight_1 = nn.Parameter(shape, name="proj.weight.1")
+        self.weight_0 = nn.Parameter(shape)
+        self.weight_1 = nn.Parameter(shape)
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         p = self._patch_size
@@ -385,9 +385,7 @@ class LearnedPositionGrid3D(nn.Module):
     def __init__(self, hidden_size: int, stored_height: int, stored_width: int):
         super().__init__()
         self._hidden_size = hidden_size
-        self.position_embeddings = nn.Parameter(
-            [hidden_size, stored_width, stored_height], name="position_embeddings"
-        )
+        self.position_embeddings = nn.Parameter([hidden_size, stored_width, stored_height])
 
     def forward(self, op: OpBuilder, grid_height: ir.Value, grid_width: ir.Value) -> ir.Value:
         # llama.cpp stores C,W,H; convert to N,C,H,W before bicubic interpolation.
@@ -417,9 +415,7 @@ class LearnedPositionGrid2D(nn.Module):
         self._hidden_size = hidden_size
         self._stored_height = stored_height
         self._stored_width = stored_width
-        self.position_embeddings = nn.Parameter(
-            [stored_height * stored_width, hidden_size], name="position_embeddings"
-        )
+        self.position_embeddings = nn.Parameter([stored_height * stored_width, hidden_size])
 
     def forward(self, op: OpBuilder, grid_height: ir.Value, grid_width: ir.Value) -> ir.Value:
         table = op.Reshape(
@@ -451,10 +447,8 @@ class SpatialPatchEmbedding(nn.Module):
         super().__init__()
         self._hidden_size = hidden_size
         self._patch_size = patch_size
-        self.proj = nn.Parameter(
-            [hidden_size, in_channels, patch_size, patch_size], name="proj.weight"
-        )
-        self.bias = nn.Parameter([hidden_size], name="proj.bias")
+        self.proj = nn.Parameter([hidden_size, in_channels, patch_size, patch_size])
+        self.bias = nn.Parameter([hidden_size])
 
     def forward(self, op: OpBuilder, pixel_values: ir.Value) -> ir.Value:
         p = self._patch_size

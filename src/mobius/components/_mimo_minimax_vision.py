@@ -37,14 +37,8 @@ class DualTemporalPatchEmbedding(nn.Module):
 
     def __init__(self, in_channels: int, hidden_size: int, patch_size: int):
         super().__init__()
-        self.weight_0 = nn.Parameter(
-            [hidden_size, in_channels, patch_size, patch_size],
-            name="patch_embeddings_0",
-        )
-        self.weight_1 = nn.Parameter(
-            [hidden_size, in_channels, patch_size, patch_size],
-            name="patch_embeddings_1",
-        )
+        self.weight_0 = nn.Parameter([hidden_size, in_channels, patch_size, patch_size])
+        self.weight_1 = nn.Parameter([hidden_size, in_channels, patch_size, patch_size])
         self._in_channels = in_channels
         self._hidden_size = hidden_size
         self._patch_size = patch_size

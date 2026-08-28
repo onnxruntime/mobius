@@ -91,6 +91,7 @@ def create_gguf_audio_projector(
         )
 
     hidden_size = _metadata_int(metadata, "clip.audio.embedding_length")
+    projection_dim = _metadata_int(metadata, "clip.audio.projection_dim")
     stack_factor = _metadata_int(metadata, "clip.audio.projector.stack_factor")
     num_mel_bins = _metadata_int(metadata, "clip.audio.num_mel_bins")
     position_shape = _shape(tensor_shapes, "a.position_embd.weight", 2)
@@ -109,6 +110,7 @@ def create_gguf_audio_projector(
         or gate_shape != (first_shape[0], first_shape[0])
         or pool_shape != gate_shape
         or output_shape[1] != first_shape[0]
+        or output_shape[0] != projection_dim
     ):
         raise ValueError(
             "meralion position/projector shapes do not form the pinned "
