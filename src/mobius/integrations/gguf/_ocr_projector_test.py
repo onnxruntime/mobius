@@ -139,6 +139,13 @@ def test_artifact_pins_cover_every_ocr_header_and_both_dots_roles():
     assert set(pins) == set(_ROUTE_HEADERS)
     assert pins["dots3note_v"] is pins["dots3note_a"]
     assert pins["dots3note_v"].size < 16 * 1024**3
+    assert dict(pins["paddleocr"].processor_contract) == {
+        "pixel_values": "float32[image_patches,3,14,14] for one image",
+        "image_grid_thw": "int64[1,3] for the same image",
+        "vision_invocation": "split processor rows to one image per graph call",
+        "ordering": "concatenate outputs in processor batch-major image order",
+        "empty_media": "omit pixel and grid keys",
+    }
     for projector_type, pin in pins.items():
         item = _evidence()[_ROUTE_HEADERS[projector_type]]
         assert item["tensor_count"] == pin.tensor_count

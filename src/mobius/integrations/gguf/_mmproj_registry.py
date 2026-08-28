@@ -4935,9 +4935,10 @@ MMPROJ_ARTIFACT_PINS: tuple[MMProjArtifactPin, ...] = (
         ),
         processor_class="PaddleOCRVLProcessor",
         processor_contract=(
-            ("pixel_values", "float32[total_patches,3,14,14]"),
-            ("image_grid_thw", "int64[num_images,3]"),
-            ("ordering", "batch-major raster patch order"),
+            ("pixel_values", "float32[image_patches,3,14,14] for one image"),
+            ("image_grid_thw", "int64[1,3] for the same image"),
+            ("vision_invocation", "split processor rows to one image per graph call"),
+            ("ordering", "concatenate outputs in processor batch-major image order"),
             ("empty_media", "omit pixel and grid keys"),
         ),
     ),
