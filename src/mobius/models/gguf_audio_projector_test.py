@@ -429,6 +429,17 @@ def test_audio_projector_tensor_map_covers_every_graph_parameter(projector_type:
 
 @pytest.mark.parametrize("projector_type", _PROJECTOR_TYPES)
 def test_audio_projector_graph_executes_nonzero_features(projector_type: str):
+    case, session = _materialized_session(projector_type)
+    (actual,) = session.run(None, case.inputs)
+
+    assert actual.shape == case.expected_shape
+    assert np.isfinite(actual).all()
+    assert np.count_nonzero(actual) > 0
+
+
+def _materialized_session(
+    projector_type: str,
+) -> tuple[_RouteCase, ort.InferenceSession]:
     case, model = _build(projector_type)
     rng = np.random.default_rng(sum(projector_type.encode()))
     for name, initializer in model.graph.initializers.items():
@@ -459,11 +470,45 @@ def test_audio_projector_graph_executes_nonzero_features(projector_type: str):
         ir.serde.serialize_model(model).SerializeToString(),
         providers=["CPUExecutionProvider"],
     )
-    (actual,) = session.run(None, case.inputs)
+    return case, session
 
-    assert actual.shape == case.expected_shape
-    assert np.isfinite(actual).all()
-    assert np.count_nonzero(actual) > 0
+
+_ORT_INPUT_ERRORS = (
+    ort.capi.onnxruntime_pybind11_state.Fail,
+    ort.capi.onnxruntime_pybind11_state.InvalidArgument,
+    ort.capi.onnxruntime_pybind11_state.RuntimeException,
+)
+
+
+@pytest.mark.parametrize(
+    ("projector_type", "feeds"),
+    [
+        (
+            "ultravox",
+            {"input_features": np.zeros((65, 4), dtype=np.float32)},
+        ),
+        (
+            "lfm2a",
+            {"input_features": np.zeros((513, 8), dtype=np.float32)},
+        ),
+        (
+            "pockettts_spkenc",
+            {"input_values": np.zeros((1919,), dtype=np.float32)},
+        ),
+        (
+            "pockettts_spkenc",
+            {"input_values": np.zeros((30 * 24_000 + 1,), dtype=np.float32)},
+        ),
+    ],
+)
+def test_audio_projector_rejects_unsupported_frame_contracts(
+    projector_type: str,
+    feeds: dict[str, np.ndarray],
+):
+    _, session = _materialized_session(projector_type)
+
+    with pytest.raises(_ORT_INPUT_ERRORS, match="indices element out of data bounds"):
+        session.run(None, feeds)
 
 
 def test_audio_processor_abis_preserve_sample_channel_and_frame_contracts():

@@ -22,9 +22,27 @@
         "size": 1159354752,
         "lfs_sha256": "0d3615076cbe1d35c3f60c43a60a4047b3e2eeee1b2c233580be60186faab5c5",
         "tensor_count": 559,
+        "graph_output_size": 2048,
         "qtypes": {
           "F16": 152,
           "F32": 407
+        },
+        "metadata": {
+          "clip.has_audio_encoder": true,
+          "clip.projector_type": "granite_speech",
+          "clip.audio.embedding_length": 1024,
+          "clip.audio.feed_forward_length": 4096,
+          "clip.audio.block_count": 16,
+          "clip.audio.projection_dim": 2048,
+          "clip.audio.attention.head_count": 8,
+          "clip.audio.attention.layer_norm_epsilon": 0.00001,
+          "clip.audio.num_mel_bins": 160,
+          "clip.audio.chunk_size": 200,
+          "clip.audio.conv_kernel_size": 15,
+          "clip.audio.max_pos_emb": 512,
+          "clip.audio.projector.window_size": 15,
+          "clip.audio.projector.downsample_rate": 5,
+          "clip.audio.projector.head_count": 16
         },
         "storage_disposition": "supported"
       },
@@ -45,9 +63,21 @@
         "size": 458806624,
         "lfs_sha256": "71330d7820768417d950f2dce42227896c7f6146917453957a63ba765decf621",
         "tensor_count": 650,
+        "graph_output_size": 2048,
         "qtypes": {
           "F16": 157,
           "F32": 493
+        },
+        "metadata": {
+          "clip.has_audio_encoder": true,
+          "clip.projector_type": "lfm2a",
+          "clip.audio.embedding_length": 512,
+          "clip.audio.feed_forward_length": 512,
+          "clip.audio.block_count": 17,
+          "clip.audio.projection_dim": 2048,
+          "clip.audio.attention.head_count": 8,
+          "clip.audio.attention.layer_norm_epsilon": 0.00001,
+          "clip.audio.num_mel_bins": 128
         },
         "storage_disposition": "supported"
       },
@@ -86,9 +116,21 @@
         "size": 1324506912,
         "lfs_sha256": "d4be69ed65f25dae97062febd44f9f41c0f6b14178f1cfb530fd894d595a4f94",
         "tensor_count": 491,
+        "graph_output_size": 3584,
         "qtypes": {
           "BF16": 194,
           "F32": 297
+        },
+        "metadata": {
+          "clip.has_audio_encoder": true,
+          "clip.projector_type": "musicflamingo",
+          "clip.audio.embedding_length": 1280,
+          "clip.audio.feed_forward_length": 5120,
+          "clip.audio.block_count": 32,
+          "clip.audio.projection_dim": 3584,
+          "clip.audio.attention.head_count": 20,
+          "clip.audio.attention.layer_norm_epsilon": 0.00001,
+          "clip.audio.num_mel_bins": 128
         },
         "storage_disposition": "supported"
       },
@@ -147,9 +189,22 @@
         "size": 1371123616,
         "lfs_sha256": "b34dde1835752949d6b960528269af93c92fec91c61ea0534fcc73f96c1ed8b2",
         "tensor_count": 491,
+        "graph_output_size": 2048,
         "qtypes": {
           "F16": 196,
           "F32": 295
+        },
+        "metadata": {
+          "clip.has_audio_encoder": true,
+          "clip.projector_type": "ultravox",
+          "clip.audio.embedding_length": 1280,
+          "clip.audio.feed_forward_length": 5120,
+          "clip.audio.block_count": 32,
+          "clip.audio.projection_dim": 4096,
+          "clip.audio.attention.head_count": 20,
+          "clip.audio.attention.layer_norm_epsilon": 0.00001,
+          "clip.audio.num_mel_bins": 128,
+          "clip.audio.projector.stack_factor": 8
         },
         "storage_disposition": "supported"
       },
@@ -170,10 +225,23 @@
         "size": 715714080,
         "lfs_sha256": "4f24c4ef3ce929d02ed9d1cfb050ae9a7365f057c0ddec0d489580982ebe0d02",
         "tensor_count": 489,
+        "graph_output_size": 3072,
         "qtypes": {
           "F16": 2,
           "F32": 293,
           "Q8_0": 194
+        },
+        "metadata": {
+          "clip.has_audio_encoder": true,
+          "clip.projector_type": "voxtral",
+          "clip.audio.embedding_length": 1280,
+          "clip.audio.feed_forward_length": 5120,
+          "clip.audio.block_count": 32,
+          "clip.audio.projection_dim": 3072,
+          "clip.audio.attention.head_count": 20,
+          "clip.audio.attention.layer_norm_epsilon": 0.00001,
+          "clip.audio.num_mel_bins": 128,
+          "clip.audio.projector.stack_factor": 4
         },
         "storage_disposition": "fail-closed-packed"
       },

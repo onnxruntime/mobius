@@ -12,6 +12,7 @@ import pytest
 
 from mobius.integrations.gguf._mmproj import (
     _interleaved_rope_rows,
+    _preflight_mmproj_quantization_report,
     _preflight_standalone_mmproj,
 )
 from mobius.integrations.gguf._mmproj_mapping import (
@@ -123,7 +124,7 @@ def test_audio_projector_evidence_is_test_only_immutable_and_bounded():
         for path in evidence["converter_paths"].values()
     )
     total_bytes = 0
-    for route in routes.values():
+    for projector_type, route in routes.items():
         source = route["source"]
         assert len(source["revision"]) == 40
         artifact = route["artifact"]
@@ -133,10 +134,17 @@ def test_audio_projector_evidence_is_test_only_immutable_and_bounded():
         assert len(artifact["revision"]) == 40
         assert len(artifact["lfs_sha256"]) == 64
         assert sum(artifact["qtypes"].values()) == artifact["tensor_count"]
+        assert artifact["graph_output_size"] > 0
+        spec = get_projector_spec(projector_type)
+        assert set(spec.required_metadata) <= set(artifact["metadata"])
         total_bytes += artifact["size"]
     assert total_bytes <= 16 * 1024**3
     assert routes["pockettts_spkenc"]["role"] == "speaker_encoder"
     assert routes["voxtral"]["artifact"]["storage_disposition"] == ("fail-closed-packed")
+    assert (
+        routes["ultravox"]["artifact"]["graph_output_size"]
+        != routes["ultravox"]["artifact"]["metadata"]["clip.audio.projection_dim"]
+    )
     assert "pockettts_gen" not in routes
 
 
@@ -341,3 +349,39 @@ def test_public_standalone_dispatch_enforces_declared_model_role(
     )
 
     assert set(package) == {role}
+
+
+def test_standalone_audio_quantization_report_records_only_graph_weights():
+    from gguf import GGMLQuantizationType
+
+    tensors = [
+        SimpleNamespace(
+            name="a.conv1d.1.weight",
+            tensor_type=GGMLQuantizationType.F16,
+            n_bytes=32,
+        ),
+        SimpleNamespace(
+            name="mm.a.mlp.1.weight",
+            tensor_type=GGMLQuantizationType.F32,
+            n_bytes=64,
+        ),
+        SimpleNamespace(
+            name="a.unmapped_processor_asset",
+            tensor_type=GGMLQuantizationType.F32,
+            n_bytes=16,
+        ),
+    ]
+    sidecar = SimpleNamespace(reader_tensors=lambda: tensors)
+
+    report = _preflight_mmproj_quantization_report(
+        sidecar,
+        include_audio=True,
+        standalone_projector_type="ultravox",
+    )
+
+    assert {record.name for record in report.tensor_records} == {
+        "mmproj:a.conv1d.1.weight",
+        "mmproj:mm.a.mlp.1.weight",
+    }
+    assert sum(stat.source_bytes for stat in report.source_qtype_census) == 112
+    assert report.target_storage_format == "float"

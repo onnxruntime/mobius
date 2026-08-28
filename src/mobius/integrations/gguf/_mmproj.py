@@ -2424,6 +2424,7 @@ def _preflight_mmproj_quantization_report(
     mmproj_gguf: Any,
     *,
     include_audio: bool,
+    standalone_projector_type: str | None = None,
 ) -> GGUFQuantizationReport:
     """Classify every mapped mmproj vision/(audio) tensor before conversion.
 
@@ -2443,6 +2444,7 @@ def _preflight_mmproj_quantization_report(
     into the package-level report.
     """
     from mobius.integrations.gguf._mmproj_mapping import (
+        map_mmproj_audio_projector_to_onnx,
         map_mmproj_audio_to_hf,
         map_mmproj_vision_to_hf,
     )
@@ -2485,7 +2487,12 @@ def _preflight_mmproj_quantization_report(
         source_qtypes.append((qtype_name, source_bytes))
 
         hf_name = None
-        if tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
+        if standalone_projector_type is not None:
+            hf_name = map_mmproj_audio_projector_to_onnx(
+                tensor.name,
+                standalone_projector_type,
+            )
+        elif tensor.name.startswith("v.") or tensor.name == "mm.input_projection.weight":
             if vision_projector_type == "gemma4uv":
                 from mobius.integrations.gguf._core_vlm_projector import (
                     map_core_vlm_projector_tensor,
@@ -3187,6 +3194,23 @@ def build_qwen_glm_projector_from_gguf(
     )
 
 
+def _interleaved_rope_rows(values: np.ndarray, head_dim: int) -> np.ndarray:
+    """Convert adjacent-pair Q/K rows to Mobius's half-split RoPE convention."""
+    out_features, in_features = values.shape
+    if out_features % head_dim:
+        raise ValueError(
+            f"RoPE projection with {out_features} rows is not divisible by head_dim={head_dim}."
+        )
+    reshaped = values.reshape(out_features // head_dim, head_dim, in_features)
+    order = np.concatenate(
+        [
+            np.arange(0, head_dim, 2, dtype=np.int64),
+            np.arange(1, head_dim, 2, dtype=np.int64),
+        ]
+    )
+    return reshaped[:, order, :].reshape(values.shape)
+
+
 def _mmproj_audio_projector_to_onnx(
     mmproj_gguf: Any,
     projector_type: str,
@@ -3197,12 +3221,27 @@ def _mmproj_audio_projector_to_onnx(
         map_mmproj_audio_projector_to_onnx,
     )
 
+    head_count = int(mmproj_gguf.metadata["clip.audio.attention.head_count"])
+    hidden_size = int(mmproj_gguf.metadata["clip.audio.embedding_length"])
+    head_dim = hidden_size // head_count
     state_dict: dict[str, torch.Tensor] = {}
     for name in mmproj_gguf.tensor_names:
         mapped = map_mmproj_audio_projector_to_onnx(name, projector_type)
         if mapped is None:
             continue
         values = np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32)
+        if name.startswith("a.conv1d.") and name.endswith(".bias") and values.ndim > 1:
+            values = values.reshape(-1)
+        if (
+            name.endswith(".conv_dw.weight")
+            and values.ndim == 2
+            and "depthwise_conv.weight" in mapped
+        ):
+            values = values[:, None, :]
+        if projector_type == "pockettts_spkenc" and name.endswith(
+            ("attn_q.weight", "attn_k.weight")
+        ):
+            values = _interleaved_rope_rows(values, head_dim)
         state_dict[mapped] = torch.from_numpy(values.copy())
     return state_dict
 
@@ -3245,7 +3284,12 @@ def build_audio_projector_from_gguf(
         AUDIO_PROCESSOR_ABIS,
         create_gguf_audio_projector,
     )
-    from mobius.tasks import GGUFAudioProjectorModel, GGUFAudioProjectorTask
+    from mobius.tasks import (
+        GGUFAudioProjectorModel,
+        GGUFAudioProjectorTask,
+        GGUFSpeakerProjectorModel,
+        GGUFSpeakerProjectorTask,
+    )
 
     resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
     mmproj_gguf = (
@@ -3288,11 +3332,16 @@ def build_audio_projector_from_gguf(
         mmproj_gguf.metadata,
         tensor_shapes,
     )
-    module = GGUFAudioProjectorModel(audio_encoder)
+    if spec.model_roles[0].value == "speaker_encoder":
+        module = GGUFSpeakerProjectorModel(audio_encoder, output_name="speaker_features")
+        task = GGUFSpeakerProjectorTask()
+    else:
+        module = GGUFAudioProjectorModel(audio_encoder)
+        task = GGUFAudioProjectorTask()
     package = build_from_module(
         module,
         config,
-        task=GGUFAudioProjectorTask(),
+        task=task,
         execution_provider=execution_provider,
     )
     package.apply_weights(_mmproj_audio_projector_to_onnx(mmproj_gguf, projector_type))
@@ -3307,11 +3356,23 @@ def build_audio_projector_from_gguf(
         model.metadata_props["mobius.gguf_projector_type"] = projector_type
         model.metadata_props["mobius.gguf_target_architecture"] = target_architecture
         model.metadata_props["mobius.gguf_audio_processor_abi"] = serialized_processor_abi
+        model.metadata_props["mobius.processor_abi"] = serialized_processor_abi
+        model.metadata_props["mobius.projector_output_size"] = str(
+            cast(_ProjectorOutput, audio_encoder).output_size
+        )
         model.metadata_props["mobius.runtime_support"] = (
             "standalone-sidecar-only; paired multimodal runtime unvalidated"
         )
+    package.gguf_quantization_report = _preflight_mmproj_quantization_report(
+        mmproj_gguf,
+        include_audio=True,
+        standalone_projector_type=spec.projector_type,
+    )
     package.gguf_source_path = str(Path(resolved_path).resolve())  # type: ignore[attr-defined]
     package.gguf_projector_type = projector_type  # type: ignore[attr-defined]
+    package.gguf_projector_output_size = cast(  # type: ignore[attr-defined]
+        _ProjectorOutput, audio_encoder
+    ).output_size
     package.gguf_audio_processor_abi = processor_abi  # type: ignore[attr-defined]
     runtime_warning = (
         "Standalone projector graph only; paired text insertion and downstream "
