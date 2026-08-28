@@ -28,6 +28,7 @@ from mobius.components._ocr_encoders import (
     Granite4VisionEncoder,
     Granite4WindowQFormerProjector,
     LightOnOCRVisionEncoder,
+    OCRDynamicVisionRotaryEmbedding,
     PaddleOCRVisionEncoder,
     SigmoidTopKVisionMoE,
     YouTuVLVisionEncoder,
@@ -1032,22 +1033,75 @@ def test_ocr_vision_rotary_long_positions_keep_float32_before_cast(
         task=GGUFVisionProjectorTask(),
     )["vision_encoder"]
 
-    frequency = next(
-        initializer
-        for name, initializer in model.graph.initializers.items()
-        if name.endswith("rotary_pos_emb.freq_table")
-    )
-    assert frequency.dtype == ir.DataType.FLOAT
-    row = np.asarray(frequency.const_value)[511]
-    expected = 511.0 / (10000.0 ** (np.arange(row.size, dtype=np.float32) / row.size))
-    np.testing.assert_allclose(row, expected, rtol=1e-6, atol=1e-6)
+    assert isinstance(module.rotary_pos_emb, OCRDynamicVisionRotaryEmbedding)
     trig_nodes = [node for node in model.graph if node.op_type in {"Cos", "Sin"}]
     assert len(trig_nodes) == 2
+    assert all(node.inputs[0].dtype == ir.DataType.FLOAT for node in trig_nodes)
+    assert not any(
+        initializer.shape and initializer.shape[0] == 512
+        for initializer in model.graph.initializers.values()
+    )
     assert all(
         consumer.op_type == "Cast"
         for node in trig_nodes
         for consumer, _ in node.outputs[0].uses()
     )
+
+
+class _RotaryProbe(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rotary = OCRDynamicVisionRotaryEmbedding(8)
+        self.activation_like = nn.Parameter([1])
+        self.input_schema = (("position_ids", ir.DataType.INT64, ("tokens", 2)),)
+
+    def forward(self, op, position_ids):
+        cos, sin = self.rotary(op, position_ids)
+        cos = op.CastLike(cos, self.activation_like)
+        sin = op.CastLike(sin, self.activation_like)
+        return op.Cast(op.Concat(cos, sin, axis=-1), to=ir.DataType.FLOAT)
+
+
+@pytest.mark.parametrize("dtype", (ir.DataType.FLOAT16, ir.DataType.BFLOAT16))
+@pytest.mark.parametrize(("height", "width"), ((4, 4), (2, 514), (514, 2)))
+def test_dynamic_vision_rotary_executes_long_aspect_grids(dtype, height: int, width: int):
+    config = ArchitectureConfig(
+        vocab_size=1,
+        hidden_size=1,
+        intermediate_size=1,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=1,
+        max_position_embeddings=1,
+        hidden_act="silu",
+        dtype=dtype,
+    )
+    model = build_from_module(
+        GGUFVisionProjectorModel(_RotaryProbe()),
+        config,
+        task=GGUFVisionProjectorTask(),
+    )["vision_encoder"]
+    session = ort.InferenceSession(
+        ir.serde.serialize_model(model).SerializeToString(),
+        providers=["CPUExecutionProvider"],
+    )
+    positions = np.array(
+        [(row, col) for row in range(height) for col in range(width)],
+        dtype=np.int64,
+    )
+    (actual,) = session.run(None, {"position_ids": positions})
+
+    inv_freq = 1.0 / (10000.0 ** (np.arange(4, dtype=np.float32) / 4))
+    freqs = np.concatenate(
+        (positions[:, :1] * inv_freq, positions[:, 1:] * inv_freq),
+        axis=-1,
+    )
+    embedding = np.concatenate((freqs, freqs), axis=-1)
+    expected = np.concatenate((np.cos(embedding), np.sin(embedding)), axis=-1)
+    torch_dtype = torch.float16 if dtype == ir.DataType.FLOAT16 else torch.bfloat16
+    expected = torch.from_numpy(expected).to(torch_dtype).float().numpy()
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=5e-4)
 
 
 class _FeatureStub(nn.Module):

@@ -28,7 +28,6 @@ from mobius.components._pixtral_vision import PixtralVisionTower
 from mobius.components._qwen25_vl_vision import (
     Qwen25VLVisionAttention,
     Qwen25VLVisionModel,
-    Qwen25VLVisionRotaryEmbedding,
 )
 from mobius.components._rms_norm import RMSNorm
 from mobius.components._sam_vision import SAMVisionEncoder
@@ -158,6 +157,27 @@ class FusedQKVVisionAttention(Qwen25VLVisionAttention):
                 seq_len,
             )
         return self.proj(op, output)
+
+
+class OCRDynamicVisionRotaryEmbedding(nn.Module):
+    """Generate unbounded 2-D rotary frequencies in float32."""
+
+    def __init__(self, dim: int, theta: float = 10000.0):
+        super().__init__()
+        half_dim = dim // 2
+        inv_freq = 1.0 / (theta ** (np.arange(half_dim, dtype=np.float32) / half_dim))
+        self.inv_freq = nn.Parameter([half_dim], data=ir.tensor(inv_freq))
+        self.inv_freq._keep_float32 = True  # type: ignore[attr-defined]
+
+    def forward(self, op: OpBuilder, rotary_pos_ids: ir.Value):
+        positions = op.Cast(rotary_pos_ids, to=ir.DataType.FLOAT)
+        height = op.Gather(positions, [0], axis=1)
+        width = op.Gather(positions, [1], axis=1)
+        height_freqs = op.Mul(height, op.Unsqueeze(self.inv_freq, [0]))
+        width_freqs = op.Mul(width, op.Unsqueeze(self.inv_freq, [0]))
+        freqs = op.Concat(height_freqs, width_freqs, axis=-1)
+        embedding = op.Concat(freqs, freqs, axis=-1)
+        return op.Cos(embedding), op.Sin(embedding)
 
 
 class SigmoidTopKVisionMoE(nn.Module):
@@ -339,10 +359,9 @@ class DotsVisionEncoder(Qwen25VLVisionModel):
             bias=True,
         )
         self.pre_layernorm = RMSNorm(hidden_size, eps=norm_eps)
-        self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(
+        self.rotary_pos_emb = OCRDynamicVisionRotaryEmbedding(
             hidden_size // num_heads // 2,
         )
-        self.rotary_pos_emb.freq_table._keep_float32 = True  # type: ignore[attr-defined]
         self.blocks = nn.ModuleList(
             [
                 DotsVisionBlock(
@@ -538,10 +557,9 @@ class PaddleOCRVisionEncoder(Qwen25VLVisionModel):
             bias=True,
         )
         self.position_embedding = nn.Parameter([position_size, hidden_size])
-        self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(
+        self.rotary_pos_emb = OCRDynamicVisionRotaryEmbedding(
             hidden_size // num_heads // 2,
         )
-        self.rotary_pos_emb.freq_table._keep_float32 = True  # type: ignore[attr-defined]
         self.blocks = nn.ModuleList(
             [
                 SplitQKVVisionBlock(
@@ -651,10 +669,9 @@ class YouTuVLVisionEncoder(Qwen25VLVisionModel):
             pixel_size,
             hidden_size,
         )
-        self.rotary_pos_emb = Qwen25VLVisionRotaryEmbedding(
+        self.rotary_pos_emb = OCRDynamicVisionRotaryEmbedding(
             hidden_size // num_heads // 2,
         )
-        self.rotary_pos_emb.freq_table._keep_float32 = True  # type: ignore[attr-defined]
         self.blocks = nn.ModuleList(
             [
                 SplitQKVVisionBlock(
