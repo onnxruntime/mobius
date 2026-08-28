@@ -33,6 +33,7 @@ from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     HierarchicalAudioWorkflowConfig,
+    _validate_reuse_rate_selection,
     write_audio_codec_workflow_metadata,
     write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
@@ -42,11 +43,13 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
+    write_speech_enhancement_workflow_metadata,
     write_speech_to_text_workflow_metadata,
     write_tts_workflow_metadata,
     write_video_diffusion_workflow_metadata,
     write_vlm_workflow_metadata,
 )
+from mobius.models.reuse import ReUseConfig
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -687,6 +690,31 @@ def _looks_like_encoder_embedding(pkg: Any) -> bool:
     return not any(str(name).startswith("past_key_values") for name in inputs)
 
 
+def _looks_like_speech_enhancement(pkg: Any) -> bool:
+    """Detect a spectral speech-enhancement package.
+
+    The signal is structural: a single ``model`` component that consumes a
+    noisy magnitude and phase spectrogram and emits the enhanced pair. There
+    is no ``logits`` port and no KV cache, so nothing about it is generative
+    -- it is a single pure spectrum-to-spectrum call.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if names != {"model"}:
+        return False
+    try:
+        model = pkg["model"]
+        inputs = {str(value.name) for value in model.graph.inputs}
+        outputs = {str(value.name) for value in model.graph.outputs}
+    except (AttributeError, KeyError):
+        return False
+    if not {"noisy_mag", "noisy_pha"} <= inputs:
+        return False
+    return {"denoised_mag", "denoised_pha"} <= outputs
+
+
 def _looks_like_audio_codec(pkg: Any) -> bool:
     """Detect an audio-to-audio neural codec package.
 
@@ -903,6 +931,9 @@ def write_onnx_genai_config(
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
     package_config = getattr(pkg, "config", None)
+    resolved_config = config if config is not None else package_config
+    if isinstance(resolved_config, ReUseConfig):
+        _validate_reuse_rate_selection(resolved_config)
     config_types = {
         getattr(candidate, "model_type", None)
         for candidate in (package_config, config)
@@ -931,7 +962,6 @@ def write_onnx_genai_config(
         return _write_advisory_component_contract(pkg, output_dir, warning=warning)
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
-        resolved_config = config if config is not None else getattr(pkg, "config", None)
         if resolved_config is None:
             raise ValueError("shared-state pixel-flow metadata requires a model config")
         path = write_shared_state_pixel_flow_workflow_metadata(
@@ -1149,6 +1179,15 @@ def write_onnx_genai_config(
             pkg, output_dir, ctc_config, source=source
         )
         return artifacts
+
+    if _looks_like_speech_enhancement(pkg):
+        # A spectral enhancement model has no logits and no cache: one pure
+        # spectrum-to-spectrum call.  Emit before the config requirement below
+        # because nothing here needs a decoder config.
+        path = write_speech_enhancement_workflow_metadata(
+            pkg, output_dir, config if config is not None else getattr(pkg, "config", None)
+        )
+        return {"inference_metadata": path}
 
     if _looks_like_encoder_embedding(pkg):
         # A bidirectional encoder has no logits and no cache: it runs once and

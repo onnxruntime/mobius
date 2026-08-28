@@ -176,6 +176,9 @@ __all__ = [
     "Qwen4ExpCausalLMModel",
     "SenseNovaU1Model",
     "SenseVoiceSmallModel",
+    "ReUseConfig",
+    "SEMambaSpeechEnhancementModel",
+    "build_reuse",
     "SortformerConfig",
     "SortformerDiarizationModel",
     "Qwen3TTSCodePredictorModel",
@@ -432,6 +435,11 @@ from mobius.models.qwen_vl import (
     Qwen25VLEmbeddingModel,
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
+)
+from mobius.models.reuse import (
+    ReUseConfig,
+    SEMambaSpeechEnhancementModel,
+    build_reuse,
 )
 from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel

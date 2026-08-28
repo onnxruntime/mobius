@@ -183,6 +183,8 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
+    input_sampling_rate: int | None = None,
+    bwe_sampling_rate: int | None = None,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -199,18 +201,68 @@ def build_transformers_model(
     their native block-weight representation. Set it to ``False`` only to
     request explicit dense reconstruction.
     """
+    if input_sampling_rate is not None and bwe_sampling_rate is not None:
+        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
+
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,
         _default_task_for_model,
     )
 
+    detection_revision = revision
+    if model_id == "nvidia/RE-USE" and detection_revision is None:
+        # Pin the very first AutoConfig/raw-JSON probe, not only the later
+        # bespoke loader. Otherwise mutable Hub main could change dispatch
+        # before RE-USE's pinned default ever takes effect.
+        from mobius.models.reuse import REUSE_REVISION
+
+        detection_revision = REUSE_REVISION
+
     hf_config, loaded_from_raw_json = _load_transformers_config(
         model_id,
-        revision=revision,
+        revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
+        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+
+        if module_class is None and _is_reuse_checkpoint(model_id, detection_revision):
+            from mobius.tasks import SpeechEnhancementTask
+
+            if task not in (None, "speech-enhancement") and not isinstance(
+                task, SpeechEnhancementTask
+            ):
+                raise ValueError("RE-USE checkpoints only support task='speech-enhancement'.")
+            unsupported = {
+                "output_layer_indices": output_layer_indices is not None,
+                "text_only": text_only,
+                "fp8_kv_cache": fp8_kv_cache,
+                "kv_cache_scales": kv_cache_scales is not None,
+                "prune_prefill_prefix": prune_prefill_prefix,
+                "glm_full_attention": glm_full_attention,
+                "export_paged_attention": export_paged_attention,
+            }
+            selected = sorted(name for name, enabled in unsupported.items() if enabled)
+            if selected:
+                raise ValueError(
+                    "RE-USE checkpoints do not support these decoder-only options: "
+                    + ", ".join(selected)
+                )
+            return build_reuse(
+                model_id,
+                revision=detection_revision,
+                dtype=dtype,
+                execution_provider=execution_provider,
+                load_weights=load_weights,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
+            )
+        if input_sampling_rate is not None or bwe_sampling_rate is not None:
+            raise ValueError(
+                "input_sampling_rate and bwe_sampling_rate are only supported "
+                "for RE-USE speech-enhancement checkpoints"
+            )
         if text_only:
             raise ValueError(
                 f"text_only=True is not supported for '{model_id}': it does not "
@@ -229,6 +281,12 @@ def build_transformers_model(
             dtype=dtype,
             load_weights=load_weights,
             execution_provider=execution_provider,
+        )
+
+    if input_sampling_rate is not None or bwe_sampling_rate is not None:
+        raise ValueError(
+            "input_sampling_rate and bwe_sampling_rate are only supported "
+            "for RE-USE speech-enhancement checkpoints"
         )
 
     hf_config, parent_config, model_type = _select_primary_config(hf_config)

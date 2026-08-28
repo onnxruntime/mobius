@@ -226,6 +226,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     guidance_scale = getattr(args, "guidance_scale", None)
     if guidance_scale is not None and args.runtime != "onnx-genai":
         raise SystemExit("Error: --guidance-scale can only be used with --runtime onnx-genai.")
+    input_sampling_rate = getattr(args, "input_sampling_rate", None)
+    bwe_sampling_rate = getattr(args, "bwe_sampling_rate", None)
+    for option, value in (
+        ("--input-sample-rate", input_sampling_rate),
+        ("--bwe-sample-rate", bwe_sampling_rate),
+    ):
+        if value is not None and value <= 0:
+            raise SystemExit(f"Error: {option} must be a positive integer.")
 
     # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
@@ -304,6 +312,13 @@ def _cmd_build(args: argparse.Namespace) -> None:
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
+    if args.model == "nvidia/RE-USE" and revision is None:
+        # Pin every Hub probe, including the early Diffusers detector. A
+        # mutable model_index.json on Hub main must not reroute this checkpoint
+        # before the bespoke builder applies its immutable default.
+        from mobius.models.reuse import REUSE_REVISION
+
+        revision = REUSE_REVISION
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
     dtype_override = resolve_dtype(args.dtype)
@@ -318,6 +333,11 @@ def _cmd_build(args: argparse.Namespace) -> None:
     if args.model and not args.config and not args.text_only:
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
+            if input_sampling_rate is not None or bwe_sampling_rate is not None:
+                raise SystemExit(
+                    "Error: --input-sample-rate and --bwe-sample-rate are only "
+                    "supported for RE-USE speech-enhancement checkpoints."
+                )
             print(
                 f"Detected diffusers pipeline: {pipeline_index.get('_class_name', 'Unknown')}"
             )
@@ -363,6 +383,31 @@ def _cmd_build(args: argparse.Namespace) -> None:
         import transformers
 
         config_path = args.config
+        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+
+        if _is_reuse_checkpoint(config_path):
+            if task not in (None, "speech-enhancement"):
+                from mobius.tasks import SpeechEnhancementTask
+
+                if not isinstance(task, SpeechEnhancementTask):
+                    raise SystemExit(
+                        "Error: RE-USE checkpoints only support --task speech-enhancement."
+                    )
+            pkg = build_reuse(
+                config_path,
+                dtype=dtype_override,
+                execution_provider=execution_provider,
+                load_weights=load_weights,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
+            )
+            _save_package(pkg, output_dir, args, optimize, component_filter)
+            return
+        if input_sampling_rate is not None or bwe_sampling_rate is not None:
+            raise SystemExit(
+                "Error: --input-sample-rate and --bwe-sample-rate are only "
+                "supported for RE-USE speech-enhancement checkpoints."
+            )
         try:
             hf_config = transformers.AutoConfig.from_pretrained(
                 config_path, trust_remote_code=trust_remote_code
@@ -501,6 +546,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             keep_quantized=keep_quantized,
+            input_sampling_rate=input_sampling_rate,
+            bwe_sampling_rate=bwe_sampling_rate,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -1370,6 +1417,29 @@ def build_parser() -> argparse.ArgumentParser:
             "metadata. Required for conditioned diffusion pipelines so export does "
             "not guess a source pipeline's generation default; pass 1.0 explicitly "
             "for unguided generation."
+        ),
+    )
+    sample_rate_group = build_parser.add_mutually_exclusive_group()
+    sample_rate_group.add_argument(
+        "--input-sample-rate",
+        dest="input_sampling_rate",
+        type=int,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Build RE-USE for a known native input rate with static FFT geometry. "
+            "Omit to preserve native-rate dynamic geometry."
+        ),
+    )
+    sample_rate_group.add_argument(
+        "--bwe-sample-rate",
+        dest="bwe_sampling_rate",
+        type=int,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Build RE-USE with NVIDIA BWE semantics: resample input audio to this "
+            "target rate and use consistently scaled FFT geometry."
         ),
     )
     build_parser.add_argument(

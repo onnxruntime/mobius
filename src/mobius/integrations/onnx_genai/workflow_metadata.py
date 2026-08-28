@@ -9901,6 +9901,8 @@ def write_language_diffusion_workflow_metadata(
 
 _AUDIO_PREPROCESS_ABI = "onnx-genai.audio-preprocess"
 _AUDIO_PREPROCESS_ABI_VERSION = "1"
+_AUDIO_POSTPROCESS_ABI = "onnx-genai.audio-postprocess"
+_AUDIO_POSTPROCESS_ABI_VERSION = "1"
 
 
 def _audio_preprocess_component(
@@ -10361,6 +10363,572 @@ def build_encoder_embedding_workflow_metadata(
         "profiles": {"embedding": profile},
         "pipeline": {"workflow": _publish_workflow_v1(workflow)},
     }
+
+
+#: Graph inputs of a spectral speech-enhancement model, in binding order.
+_SPEECH_ENHANCEMENT_INPUTS: tuple[str, ...] = ("noisy_mag", "noisy_pha")
+
+#: Graph outputs, in the order the enhancement task publishes them.
+_SPEECH_ENHANCEMENT_OUTPUTS: tuple[str, ...] = (
+    "denoised_mag",
+    "denoised_pha",
+    "denoised_com",
+)
+
+
+def _stft_preprocess_component(
+    mag_contract: dict[str, Any],
+    pha_contract: dict[str, Any],
+    waveform_contract: dict[str, Any],
+    sample_rate_contract: dict[str, Any],
+    lengths_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Declare the audio-preprocessing adapter that produces the noisy STFT.
+
+    The enhancement graph consumes a spectrum, not a waveform, so the adapter
+    turns request-supplied encoded audio bytes into the magnitude and phase
+    the model was trained on. Declaring its ports lets a runtime type-check
+    the binding without knowing which model family produced the package.
+    """
+    return {
+        "implementation": {
+            "kind": "adapter",
+            "abi": _AUDIO_PREPROCESS_ABI,
+            "version": _AUDIO_PREPROCESS_ABI_VERSION,
+        },
+        "ports": {
+            "inputs": {
+                "encoded": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+            },
+            "outputs": {
+                "noisy_mag": mag_contract,
+                "noisy_pha": pha_contract,
+                "reference_audio": waveform_contract,
+                "sample_rate": sample_rate_contract,
+                "sample_lengths": lengths_contract,
+            },
+        },
+        "contract": {
+            "id": _AUDIO_PREPROCESS_ABI,
+            "version": _AUDIO_PREPROCESS_ABI_VERSION,
+            "bindings": {
+                "encoded": "encoded",
+                "noisy_mag": "noisy_mag",
+                "noisy_pha": "noisy_pha",
+                "reference_audio": "reference_audio",
+                "sample_rate": "sample_rate",
+                "sample_lengths": "sample_lengths",
+            },
+        },
+        "effects": ["audio_preprocess"],
+    }
+
+
+def _validate_reuse_rate_selection(config: Any) -> tuple[int | None, int | None]:
+    """Validate the mutually exclusive native-rate and BWE selections."""
+    input_rate = getattr(config, "input_sampling_rate", None)
+    bwe_rate = getattr(config, "bwe_sampling_rate", None)
+    for name, value in (("input_sampling_rate", input_rate), ("bwe_sampling_rate", bwe_rate)):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer when provided")
+    if input_rate is not None and bwe_rate is not None:
+        raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
+    return input_rate, bwe_rate
+
+
+def _reuse_stft_geometry(config: Any) -> dict[str, Any] | None:
+    """Resolve native-dynamic, fixed-native, or explicit-BWE STFT geometry."""
+    input_rate, bwe_rate = _validate_reuse_rate_selection(config)
+    raw_reference = {
+        "sample_rate": getattr(config, "sampling_rate", None),
+        "n_fft": getattr(config, "n_fft", None),
+        "hop_length": getattr(config, "hop_size", None),
+        "win_length": getattr(config, "win_size", None),
+    }
+    if any(not isinstance(value, int) or value <= 0 for value in raw_reference.values()):
+        return None
+    reference = {name: int(value) for name, value in raw_reference.items()}
+
+    selected_rate = bwe_rate or input_rate
+    if selected_rate is None:
+        return {
+            "mode": "native_scaled",
+            "reference_sample_rate": reference["sample_rate"],
+            "n_fft": reference["n_fft"],
+            "hop_length": reference["hop_length"],
+            "win_length": reference["win_length"],
+            "rounding": "floor_then_even",
+        }
+
+    def _scaled(value: int) -> int:
+        scaled = value * selected_rate // reference["sample_rate"]
+        return scaled if scaled % 2 == 0 else scaled + 1
+
+    scaled_geometry = {
+        "n_fft": _scaled(reference["n_fft"]),
+        "hop_length": _scaled(reference["hop_length"]),
+        "win_length": _scaled(reference["win_length"]),
+    }
+    if any(value <= 0 for value in scaled_geometry.values()):
+        raise ValueError(
+            f"selected sample rate {selected_rate} is too small for RE-USE STFT geometry"
+        )
+    return {
+        "mode": "bwe" if bwe_rate is not None else "fixed_native",
+        "sample_rate": selected_rate,
+        **scaled_geometry,
+    }
+
+
+def _stft_transforms(config: Any) -> list[dict[str, Any]] | None:
+    """Describe the STFT front-end the enhancement model was trained with.
+
+    Returns ``None`` when the config does not carry the STFT geometry, so a
+    package is never given an invented transform program.
+    """
+    geometry = _reuse_stft_geometry(config)
+    if geometry is None:
+        return None
+
+    transforms: list[dict[str, Any]] = [
+        {
+            "op": "decode",
+            "outputs": ["samples", "sample_rate", "sample_lengths"],
+        },
+        {"op": "downmix", "channels": 1},
+    ]
+    if geometry["mode"] == "bwe":
+        transforms.append(
+            {
+                "op": "resample",
+                "sample_rate": geometry["sample_rate"],
+                "inputs": ["samples"],
+                "outputs": ["samples", "sample_rate", "sample_lengths"],
+            }
+        )
+    elif geometry["mode"] == "fixed_native":
+        # A static native-rate graph must reject a differently sampled input,
+        # not silently analyze it with mismatched geometry.
+        transforms.append(
+            {
+                "op": "require_sample_rate",
+                "sample_rate": geometry["sample_rate"],
+                "inputs": ["sample_rate"],
+            }
+        )
+
+    spectrogram = {
+        "op": "scaled_spectrogram" if geometry["mode"] == "native_scaled" else "spectrogram",
+        "n_fft": geometry["n_fft"],
+        "hop_length": geometry["hop_length"],
+        "win_length": geometry["win_length"],
+        "window": "hann",
+        # NVIDIA uses torch.stft(center=True, pad_mode="reflect",
+        # normalized=False). Keep those coupled semantics explicit rather
+        # than letting an adapter select different defaults.
+        "mode": "center_reflect_unnormalized",
+        "inputs": ["samples"],
+        "outputs": ["magnitude", "phase"],
+    }
+    if geometry["mode"] == "native_scaled":
+        spectrogram.update(
+            {
+                "sample_rate": geometry["reference_sample_rate"],
+                "mode": "native_scaled_floor_then_even_center_reflect_unnormalized",
+            }
+        )
+    transforms.append(spectrogram)
+
+    # RE-USE trains on log1p-compressed magnitudes; a caller that skips the
+    # compression feeds the model a different distribution. The transform
+    # vocabulary is open for extension values, so the compression is declared
+    # rather than left as an undocumented assumption.
+    compression = getattr(config, "compress_factor", None)
+    if isinstance(compression, str) and compression.endswith("log1p"):
+        transforms.append({"op": "log1p", "inputs": ["magnitude"], "outputs": ["magnitude"]})
+    return transforms
+
+
+def _stft_postprocess_component(
+    mag_contract: dict[str, Any],
+    pha_contract: dict[str, Any],
+    waveform_contract: dict[str, Any],
+    sample_rate_contract: dict[str, Any],
+    lengths_contract: dict[str, Any],
+    config: Any,
+) -> dict[str, Any]:
+    """Declare NVIDIA's inverse STFT, artifact suppression, and length alignment."""
+    geometry = _reuse_stft_geometry(config)
+    assert geometry is not None
+    parameters: dict[str, str | int | float | bool | None] = {
+        "geometry_mode": geometry["mode"],
+        "sample_rate": geometry.get("sample_rate") or geometry.get("reference_sample_rate"),
+        "n_fft": geometry["n_fft"],
+        "hop_length": geometry["hop_length"],
+        "win_length": geometry["win_length"],
+        "window": "hann",
+        "stft_mode": "center_reflect_unnormalized",
+        "rounding": geometry.get("rounding"),
+        "magnitude_decompression": getattr(config, "compress_factor", None),
+        "zero_frame_fraction_threshold": 0.5,
+        "length_alignment": "pad_or_trim_to_reference",
+        "pad_value": 1e-8,
+    }
+    return {
+        "implementation": {
+            "kind": "adapter",
+            "abi": _AUDIO_POSTPROCESS_ABI,
+            "version": _AUDIO_POSTPROCESS_ABI_VERSION,
+        },
+        "ports": {
+            "inputs": {
+                "denoised_mag": mag_contract,
+                "denoised_pha": pha_contract,
+                "reference_audio": waveform_contract,
+                "sample_rate": sample_rate_contract,
+                "sample_lengths": lengths_contract,
+            },
+            "outputs": {
+                "audio": waveform_contract,
+                "sample_rate": sample_rate_contract,
+                "sample_lengths": lengths_contract,
+            },
+        },
+        "contract": {
+            "id": _AUDIO_POSTPROCESS_ABI,
+            "version": _AUDIO_POSTPROCESS_ABI_VERSION,
+            "bindings": {
+                "denoised_mag": "denoised_mag",
+                "denoised_pha": "denoised_pha",
+                "reference_audio": "reference_audio",
+                "sample_rate": "sample_rate",
+                "sample_lengths": "sample_lengths",
+                "audio": "audio",
+            },
+            "parameters": parameters,
+        },
+        "effects": ["audio_postprocess"],
+    }
+
+
+def build_speech_enhancement_workflow_metadata(
+    pkg: Any,
+    config: Any = None,
+    *,
+    artifact: str = "model.onnx",
+) -> dict[str, Any]:
+    """Build one-file metadata for a spectral speech-enhancement model.
+
+    An enhancement model such as RE-USE / SEMamba maps a noisy STFT to a clean
+    one. It is not generative: it reads the whole spectrogram at once, carries
+    no state between calls and has no ``logits`` to sample. The workflow is a
+    pure preprocess → enhance → postprocess sequence; describing it with decoder
+    metadata would publish a generation loop the artifact cannot execute.
+
+    The STFT lives outside the graph, so when the config carries the STFT
+    geometry it is published as an audio preprocessing program and the
+    workflow accepts encoded audio. A paired postprocessing adapter declares
+    NVIDIA's magnitude decompression, zero-frame suppression, inverse STFT,
+    and exact input-length alignment.
+
+    Args:
+        pkg: The built :class:`ModelPackage`; must hold a single ``model``.
+        config: The resolved architecture config. When it carries STFT
+            geometry (``sampling_rate``, ``n_fft``, ``hop_size``,
+            ``win_size``) the workflow takes encoded audio and declares the
+            transform program; otherwise the spectra are request-supplied.
+        artifact: Model artifact path relative to the package root.
+
+    Returns:
+        A metadata document with a ``speech_enhancement`` profile and a pure,
+        single-request ``pipeline.workflow``.
+    """
+    _validate_reuse_rate_selection(config)
+    if "model" not in pkg:
+        raise ValueError("speech enhancement workflow requires a 'model' component")
+    model = pkg["model"]
+
+    graph_inputs = {str(value.name): value for value in model.graph.inputs}
+    graph_outputs = {str(value.name): value for value in model.graph.outputs}
+    missing = [n for n in _SPEECH_ENHANCEMENT_INPUTS if n not in graph_inputs]
+    if missing:
+        raise ValueError(f"speech enhancement graph must declare inputs {missing}")
+    emitted = [n for n in _SPEECH_ENHANCEMENT_OUTPUTS if n in graph_outputs]
+    if not emitted:
+        raise ValueError(
+            "speech enhancement graph must declare at least one of "
+            f"{list(_SPEECH_ENHANCEMENT_OUTPUTS)}"
+        )
+    if config is not None and any(
+        name not in graph_outputs for name in ("denoised_mag", "denoised_pha")
+    ):
+        raise ValueError(
+            "speech enhancement audio postprocessing requires denoised_mag and denoised_pha"
+        )
+
+    mag_contract = _contract(graph_inputs["noisy_mag"])
+    pha_contract = _contract(graph_inputs["noisy_pha"])
+    transforms = _stft_transforms(config)
+    waveform_contract = {
+        "dtype": "float32",
+        "rank": 2,
+        "shape": ["batch", "audio_samples"],
+    }
+    sample_rate_contract = {"dtype": "int64", "rank": 0, "shape": []}
+    lengths_contract = {"dtype": "int64", "rank": 1, "shape": ["batch"]}
+    geometry = _reuse_stft_geometry(config)
+    if geometry is not None and geometry["mode"] != "native_scaled":
+        expected_bins = geometry["n_fft"] // 2 + 1
+        for name in _SPEECH_ENHANCEMENT_INPUTS:
+            shape = list(graph_inputs[name].shape or [])
+            if len(shape) > 1 and isinstance(shape[1], int) and shape[1] != expected_bins:
+                raise ValueError(
+                    f"{name} frequency extent {shape[1]} does not match selected "
+                    f"STFT geometry ({expected_bins} bins)"
+                )
+
+    workflow_outputs: dict[str, Any] = {}
+    emit_nodes: list[dict[str, Any]] = []
+    profile_outputs: dict[str, str] = {}
+    for name in emitted:
+        workflow_outputs[name] = {
+            "contract": _contract(graph_outputs[name]),
+            "role": "tensor",
+            "stage": "post_adapter",
+        }
+        emit_nodes.append(
+            {
+                "kind": "emit",
+                "value": f"enhancer.{name}",
+                "output": name,
+                "mode": "replace",
+            }
+        )
+        profile_outputs[name] = name
+    invoke_outputs = {name: f"enhancer.{name}" for name in emitted}
+
+    effects: dict[str, Any] = {
+        # One pure call: the model observes nothing outside its inputs, so a
+        # retry replays it exactly and a speculative clone is safe.
+        "enhance": {"retry": "pure", "speculation_safety": {"kind": "clonable"}},
+    }
+    components: dict[str, Any] = {
+        "enhancer": _component(model, artifact, effects=("enhance",))
+    }
+    initial_effects: dict[str, str] = {"enhance": "enhance.0"}
+    nodes: list[dict[str, Any]] = []
+
+    if transforms is not None:
+        effects["audio_preprocess"] = {
+            "retry": "pure",
+            "speculation_safety": {"kind": "clonable"},
+        }
+        effects["audio_postprocess"] = {
+            "retry": "pure",
+            "speculation_safety": {"kind": "clonable"},
+        }
+        components["audio_preprocess"] = _stft_preprocess_component(
+            mag_contract,
+            pha_contract,
+            waveform_contract,
+            sample_rate_contract,
+            lengths_contract,
+        )
+        components["audio_postprocess"] = _stft_postprocess_component(
+            _contract(graph_outputs["denoised_mag"]),
+            _contract(graph_outputs["denoised_pha"]),
+            waveform_contract,
+            sample_rate_contract,
+            lengths_contract,
+            config,
+        )
+        initial_effects["audio_preprocess"] = "audio_preprocess.0"
+        initial_effects["audio_postprocess"] = "audio_postprocess.0"
+        workflow_inputs = {
+            "request.audio": {
+                "contract": {"dtype": "uint8", "rank": 1, "shape": ["bytes"]},
+                "role": {"kind": "runtime", "version": "1.0", "role": "media"},
+                "source": {"kind": "request", "field": "media"},
+                "required": True,
+            }
+        }
+        nodes.append(
+            _invoke(
+                "audio_preprocess",
+                {"encoded": "request.audio"},
+                {
+                    "noisy_mag": "audio.noisy_mag",
+                    "noisy_pha": "audio.noisy_pha",
+                    "reference_audio": "audio.reference",
+                    "sample_rate": "audio.sample_rate",
+                    "sample_lengths": "audio.sample_lengths",
+                },
+            )
+        )
+        invoke_inputs = {
+            "noisy_mag": "audio.noisy_mag",
+            "noisy_pha": "audio.noisy_pha",
+        }
+    else:
+        # Without the STFT geometry we cannot state how a waveform becomes a
+        # spectrum, so the caller supplies the spectra directly. The portable
+        # role vocabulary has no term for a magnitude or phase spectrogram,
+        # so these stay opaque rather than being mislabelled as audio.
+        workflow_inputs = {
+            f"request.{name}": {
+                "contract": _contract(graph_inputs[name]),
+                "role": {"kind": "opaque"},
+                "source": {"kind": "application", "name": f"request.{name}"},
+                "required": True,
+            }
+            for name in _SPEECH_ENHANCEMENT_INPUTS
+        }
+        invoke_inputs = {name: f"request.{name}" for name in _SPEECH_ENHANCEMENT_INPUTS}
+
+    nodes.append(_invoke("enhancer", invoke_inputs, invoke_outputs))
+    if transforms is not None:
+        nodes.append(
+            _invoke(
+                "audio_postprocess",
+                {
+                    "denoised_mag": "enhancer.denoised_mag",
+                    "denoised_pha": "enhancer.denoised_pha",
+                    "reference_audio": "audio.reference",
+                    "sample_rate": "audio.sample_rate",
+                    "sample_lengths": "audio.sample_lengths",
+                },
+                {
+                    "audio": "enhanced.audio",
+                    "sample_rate": "enhanced.sample_rate",
+                    "sample_lengths": "enhanced.sample_lengths",
+                },
+            )
+        )
+        for name, contract, role in (
+            ("audio", waveform_contract, "audio"),
+            ("sample_rate", sample_rate_contract, "tensor"),
+            ("sample_lengths", lengths_contract, "tensor"),
+        ):
+            workflow_outputs[name] = {
+                "contract": contract,
+                "role": role,
+                "stage": "post_adapter",
+            }
+            profile_outputs[name] = name
+            emit_nodes.append(
+                {
+                    "kind": "emit",
+                    "value": f"enhanced.{name}",
+                    "output": name,
+                    "mode": "replace",
+                }
+            )
+    nodes.extend(emit_nodes)
+
+    workflow = {
+        "manifest": {
+            # Declared only when the STFT adapter is actually shipped. Without
+            # `transforms` the caller supplies the spectra directly, so there is no
+            # adapter for a runtime to version-check.
+            **(
+                {
+                    "adapter_abis": {
+                        _AUDIO_PREPROCESS_ABI: _AUDIO_PREPROCESS_ABI_VERSION,
+                        _AUDIO_POSTPROCESS_ABI: _AUDIO_POSTPROCESS_ABI_VERSION,
+                    }
+                }
+                if transforms is not None
+                else {}
+            ),
+            "capabilities": ["workflow_ssa", "linear_effects", "typed_emit"],
+        },
+        "effects": effects,
+        "inputs": workflow_inputs,
+        "outputs": workflow_outputs,
+        "components": components,
+        "initial_effects": initial_effects,
+        "graph": {"kind": "sequence", "nodes": nodes},
+    }
+
+    profile: dict[str, Any] = {
+        "kind": "speech_enhancement",
+        "version": "1.0",
+        "requirement": "required",
+        "outputs": profile_outputs,
+    }
+
+    metadata: dict[str, Any] = {"schema_version": "v1"}
+    if transforms is not None:
+        metadata["preprocessing"] = {
+            "audio": {
+                "transforms": transforms,
+                # The full contract is published alongside dtype/rank because
+                # this package declares a `pipeline.workflow`, whose binding
+                # the runtime type-checks against these ports.
+                "outputs": [
+                    {
+                        "name": "noisy_mag",
+                        "source": "magnitude",
+                        "content": "features",
+                        "dtype": mag_contract["dtype"],
+                        "rank": mag_contract["rank"],
+                        "contract": mag_contract,
+                    },
+                    {
+                        "name": "noisy_pha",
+                        "source": "phase",
+                        "content": "features",
+                        "dtype": pha_contract["dtype"],
+                        "rank": pha_contract["rank"],
+                        "contract": pha_contract,
+                    },
+                    {
+                        "name": "reference_audio",
+                        "source": "samples",
+                        "content": "waveform",
+                        "dtype": waveform_contract["dtype"],
+                        "rank": waveform_contract["rank"],
+                        "contract": waveform_contract,
+                    },
+                    {
+                        "name": "sample_rate",
+                        "source": "sample_rate",
+                        "content": "sample_rate",
+                        "dtype": sample_rate_contract["dtype"],
+                        "rank": sample_rate_contract["rank"],
+                        "contract": sample_rate_contract,
+                    },
+                    {
+                        "name": "sample_lengths",
+                        "source": "sample_lengths",
+                        "content": "sample_lengths",
+                        "dtype": lengths_contract["dtype"],
+                        "rank": lengths_contract["rank"],
+                        "contract": lengths_contract,
+                    },
+                ],
+            }
+        }
+    metadata["profiles"] = {"speech_enhancement": profile}
+    metadata["pipeline"] = {"workflow": _publish_workflow_v1(workflow)}
+    return metadata
+
+
+def write_speech_enhancement_workflow_metadata(
+    pkg: Any,
+    output_dir: str,
+    config: Any = None,
+) -> str:
+    """Write one-file speech-enhancement metadata into *output_dir*."""
+    _validate_reuse_rate_selection(config)
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = build_speech_enhancement_workflow_metadata(pkg, config)
+    path = os.path.join(output_dir, "inference_metadata.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        _dump_yaml(metadata, handle)
+    return path
 
 
 def write_encoder_embedding_workflow_metadata(

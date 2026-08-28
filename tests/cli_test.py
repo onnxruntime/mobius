@@ -100,6 +100,35 @@ class TestCLIBuild:
 
         assert save_package.call_args.args[2].max_workers == 8
 
+    def test_reuse_revision_is_pinned_before_diffusers_probe(self):
+        from mobius.models.reuse import REUSE_REVISION
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ) as pipeline_probe,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(["build", "--model", "nvidia/RE-USE", tmpdir, "--no-weights"])
+
+        assert pipeline_probe.call_args.kwargs["revision"] == REUSE_REVISION
+        assert build_model.call_args.kwargs["revision"] == REUSE_REVISION
+
+    @pytest.mark.parametrize("option", ["--input-sample-rate", "--bwe-sample-rate"])
+    def test_reuse_rate_options_are_rejected_for_diffusers(self, option):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value={"_class_name": "ExamplePipeline"},
+            ),
+            pytest.raises(SystemExit, match="only supported for RE-USE"),
+        ):
+            main(["build", "--model", "example/diffusers", tmpdir, option, "16000"])
+
     @pytest.mark.parametrize(
         ("extra_args", "expected"),
         [([], True), (["--dequantize"], False)],
