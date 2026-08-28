@@ -503,6 +503,12 @@ def test_graph_package_identity_frames_files_and_rejects_symlinks(tmp_path) -> N
     assert first.files == second.files == ("a.onnx", "b.data")
     assert first.sha256 != second.sha256
 
+    selected = gguf_graph_package_identity(package, files=("a.onnx",))
+    (package / "ignored.txt").write_text("not selected")
+    assert gguf_graph_package_identity(package, files=("a.onnx",)) == selected
+    with pytest.raises(ValueError, match="stay inside"):
+        gguf_graph_package_identity(package, files=("../escape",))
+
     (package / "linked.data").symlink_to(package / "b.data")
     with pytest.raises(ValueError, match="must not contain symlinks"):
         gguf_graph_package_identity(package)

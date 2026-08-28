@@ -4896,6 +4896,7 @@ def _dflash_postprocess(
         vocab_size=len(metadata.get("tokenizer.ggml.tokens", ())),
         target_layer_ids=target_layers,
         block_size=int(metadata["dflash.block_size"]),
+        mask_token_id=int(metadata["tokenizer.ggml.mask_token_id"]),
         num_target_layers=None,
         draft_vocab_size=draft_vocab,
         use_draft_lm_head="output.weight" in model.tensor_names,
@@ -4910,7 +4911,15 @@ def _eagle3_postprocess(
 ) -> Eagle3Config:
     from mobius._configs import Eagle3Config
 
-    target_layers = [int(value) for value in metadata["eagle3.target_layers"]]
+    target_hidden_state_indices = [int(value) for value in metadata["eagle3.target_layers"]]
+    if any(index <= 0 for index in target_hidden_state_indices):
+        raise ValueError(
+            "eagle3.target_layers must use positive HuggingFace hidden-state indices"
+        )
+    # GGUF stores HuggingFace hidden_states[k] indices (and llama.cpp reads
+    # layer-input k). Mobius captures decoder layer outputs, so hidden_states[k]
+    # is output_layer_indices[k - 1].
+    target_layers = [index - 1 for index in target_hidden_state_indices]
     raw_shapes = {name: shape for name, _raw, _qtype, shape in model.tensor_items_raw()}
     target_vocab = len(metadata.get("tokenizer.ggml.tokens", ()))
     draft_vocab = int(raw_shapes["d2t"][0]) if "d2t" in raw_shapes else target_vocab
@@ -4927,6 +4936,7 @@ def _eagle3_postprocess(
         norm_before_fc=bool(metadata.get("eagle3.norm_before_fc")),
         fc_norm=False,
         use_target_lm_head="output.weight" not in model.tensor_names,
+        use_draft_token_embedding="token_embd.weight" in model.tensor_names,
     )
     return Eagle3Config(**fields)
 

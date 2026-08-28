@@ -2649,10 +2649,12 @@ class Eagle3Config(CausalLMConfig):
     eagle_aux_hidden_state_layer_ids: list[int] | None = None
     target_layer_ids: list[int] | None = None
     use_target_lm_head: bool = False
+    use_draft_token_embedding: bool = False
 
     @classmethod
     def from_transformers(cls, config, parent_config=None) -> Eagle3Config:
         layer_cfg = getattr(config, "transformer_layer_config", None)
+        is_speculators_format = layer_cfg is not None
         if layer_cfg is not None:
             # speculators format: arch config nested under transformer_layer_config.
             if isinstance(layer_cfg, dict):
@@ -2673,6 +2675,7 @@ class Eagle3Config(CausalLMConfig):
             eagle_aux_hidden_state_layer_ids=getattr(
                 config, "eagle_aux_hidden_state_layer_ids", None
             ),
+            use_draft_token_embedding=is_speculators_format,
         )
 
 

@@ -398,6 +398,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 | `--runtime-version VERSION` | Exact selected runtime version. Once runtime support exists, this must equal the version in the matching evidence record; compatible-version ranges are not inferred. |
 | `--mmproj PATH` | Exact companion `clip` GGUF. Pairing validates source identity, target architecture, modality, tensor closure, and dimensions before graph construction. |
 | `--target-config PATH` | Exact target config directory for `dflash`/`eagle3`; requires the adjacent complete `tokenizer.json` and emits a target-binding draft manifest. |
+| `--target-gguf PATH` | Exact target GGUF for a `dflash`/`eagle3` pair; emits target/draft graphs, cache namespaces, required shared-weight bridges, and `runtime_unvalidated` manifest/status metadata. |
 | `--release` | Strip build-time debug and provenance metadata before saving while preserving functional `mobius.*` metadata. |
 | `--static-cache` | Build a fixed-width cache where supported. |
 | `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |

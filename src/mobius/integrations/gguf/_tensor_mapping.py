@@ -225,6 +225,7 @@ _DFLASH_MAPPING: dict[str, str] = {
 }
 
 _EAGLE3_MAPPING: dict[str, str] = {
+    "token_embd": "embed_tokens",
     "fc": "fc",
     "enc.output_norm": "input_norm",
     "output_norm": "norm",

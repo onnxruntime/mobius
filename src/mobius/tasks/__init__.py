@@ -32,6 +32,7 @@ __all__ = [
     "ControlNetTask",
     "DeepSeekV4Task",
     "DFlashDraftTask",
+    "DraftTargetCausalLMTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
     "Qwen4ExpCausalLMTask",
@@ -136,6 +137,7 @@ from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
+from mobius.tasks._draft_target import DraftTargetCausalLMTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
 from mobius.tasks._feature_extraction import (

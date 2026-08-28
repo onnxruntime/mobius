@@ -22,7 +22,7 @@ import math
 import re
 import shutil
 from collections import Counter
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -6727,7 +6727,7 @@ def _serialize_route_graph_config(config: Any, gguf_arch: str) -> str:
 def build_from_gguf(
     gguf_path: str | Path,
     *,
-    task: str | None = None,
+    task: str | ModelTask | None = None,
     dtype: str | None = None,
     keep_quantized: bool = True,
     execution_provider: str = "default",
@@ -6738,6 +6738,7 @@ def build_from_gguf(
     allow_dense_moe: bool | None = None,
     reuse_gguf_weights: bool = False,
     target_config: str | Path | Mapping[str, object] | None = None,
+    output_layer_indices: Sequence[int] | None = None,
     _gguf_model: Any | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` from a GGUF file.
@@ -6819,6 +6820,9 @@ def build_from_gguf(
             config mapping for a ``dflash``/``eagle3`` speculative draft. A
             mapping must include the complete ``tokenizer_json`` object. Required for draft GGUFs
             and rejected for standalone architectures.
+        output_layer_indices: Optional zero-based decoder layers to expose as
+            ``hidden_states.{index}`` outputs. This is used by target-coupled
+            draft packages and leaves ordinary decoder exports unchanged.
 
     Returns:
         A :class:`ModelPackage` containing the built model(s).
@@ -7068,6 +7072,13 @@ def build_from_gguf(
         logger.info("GGUF contains no mapped quantized weights; using the float import path")
     # 2. Extract config from GGUF metadata
     config = gguf_to_config(gguf_model)
+    if output_layer_indices is not None:
+        indices = list(output_layer_indices)
+        if any(type(index) is not int for index in indices):
+            raise TypeError("output_layer_indices must contain integers")
+        if len(set(indices)) != len(indices):
+            raise ValueError("output_layer_indices must not contain duplicates")
+        config.output_layer_indices = indices
     spec = get_arch_spec(gguf_arch)
     from mobius.integrations.gguf._draft import (
         is_draft_architecture,
@@ -7611,6 +7622,9 @@ def build_from_gguf(
         prefix_map=prefix_map,
         fold_constants=not reuse_gguf_weights,
     )
+    bind_shared_initializers = getattr(resolved_task, "bind_shared_initializers", None)
+    if callable(bind_shared_initializers):
+        bind_shared_initializers(pkg)
     if reuse_gguf_weights:
         from mobius.integrations.gguf._reuse import attach_reused_initializers
 

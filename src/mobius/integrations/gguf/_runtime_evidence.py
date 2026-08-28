@@ -1132,16 +1132,39 @@ def gguf_artifact_identity(
     )
 
 
-def gguf_graph_package_identity(package_dir: Path) -> GGUFGraphPackageIdentity:
-    """Hash every regular graph-package file with its relative path."""
-    paths: list[Path] = []
-    for root, directories, filenames in os.walk(package_dir, followlinks=False):
-        root_path = Path(root)
-        entries = [root_path / name for name in (*directories, *filenames)]
-        if any(path.is_symlink() for path in entries):
-            raise ValueError("GGUF graph package must not contain symlinks")
-        paths.extend(root_path / name for name in filenames)
-    paths.sort()
+def gguf_graph_package_identity(
+    package_dir: Path,
+    *,
+    files: tuple[str, ...] | None = None,
+) -> GGUFGraphPackageIdentity:
+    """Hash every regular graph-package file, or one exact relative file set."""
+    if package_dir.is_symlink() or not package_dir.is_dir():
+        raise ValueError("GGUF graph package root must be a real directory")
+    paths: list[Path]
+    if files is None:
+        paths = []
+        for root, directories, filenames in os.walk(package_dir, followlinks=False):
+            root_path = Path(root)
+            entries = [root_path / name for name in (*directories, *filenames)]
+            if any(path.is_symlink() for path in entries):
+                raise ValueError("GGUF graph package must not contain symlinks")
+            paths.extend(root_path / name for name in filenames)
+        paths.sort()
+    else:
+        if files != tuple(sorted(files)) or len(files) != len(set(files)):
+            raise ValueError("GGUF graph package file selection must be sorted and unique")
+        relative_paths = [Path(name) for name in files]
+        if any(path.is_absolute() or ".." in path.parts for path in relative_paths):
+            raise ValueError("GGUF graph package file selection must stay inside the package")
+        paths = [package_dir / path for path in relative_paths]
+        for path in paths:
+            current = package_dir
+            for part in path.relative_to(package_dir).parts:
+                current /= part
+                if current.is_symlink():
+                    raise ValueError("GGUF graph package selection must not traverse symlinks")
+        if any(path.is_symlink() or not path.is_file() for path in paths):
+            raise ValueError("GGUF graph package selection must contain regular files")
     if not paths:
         raise ValueError("GGUF graph package must contain regular files and no symlinks")
     digest = hashlib.sha256()

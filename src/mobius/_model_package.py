@@ -347,6 +347,9 @@ class ModelPackage(UserDict[str, ir.Model]):
         mtp_head: Optional nested MTP sidecar package. :meth:`save` records its
             collision-free directory in an explicit package manifest, and
             :meth:`load` restores it automatically.
+        draft_manifest: Optional target/draft orchestration and identity contract.
+        draft_pair_quantization_reports: Per-component GGUF fidelity reports for a
+            target-coupled draft package.
     """
 
     def __init__(
@@ -376,6 +379,13 @@ class ModelPackage(UserDict[str, ir.Model]):
         self.gguf_reuse_plan: Any = None
         self.draft_manifest: Any = None
         self.mtp_head: ModelPackage | None = None
+        self.draft_manifest: dict[str, Any] | None = None
+        self.draft_config: object | None = None
+        self.draft_pair_quantization_reports: dict[str, GGUFQuantizationReport | None] = {}
+        self.gguf_architecture: str | None = None
+        self.gguf_execution_provider: str | None = None
+        self.gguf_source_path: str | None = None
+        self.gguf_target_source_path: str | None = None
         self.policy_components = dict(policy_components or {})
         self.adapter_target_manifest = adapter_target_manifest
         self.adapter_service_options = adapter_service_options or AdapterServiceOptions()
