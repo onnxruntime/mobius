@@ -600,6 +600,25 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    (
+        "minimax_m2_gguf",
+        {
+            "hidden_act": "silu",
+            "head_dim": 16,
+            "partial_rotary_factor": 0.5,
+            "attn_qk_norm": True,
+            "attn_qk_norm_full": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": True,
+            "routing_weight_normalization_floor": 6.103515625e-5,
+            "use_expert_bias": True,
+            "disable_qmoe": True,
+        },
+        True,
+    ),
     # === Mixture of Experts ===
     (
         "phimoe",

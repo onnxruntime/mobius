@@ -94,6 +94,9 @@ def test_route_reasons_are_sourced_from_authoritative_records() -> None:
 def test_known_route_boundaries_are_not_collapsed() -> None:
     by_id = {item.route_id: item for item in iter_remaining_route_work()}
     assert by_id["architecture:bitnet"].category == "evidence-only"
+    assert by_id["architecture:glm-dsa"].category == "evidence-only"
+    assert by_id["architecture:minimax-m2"].category == "evidence-only"
+    assert by_id["architecture:mistral4"].category == "evidence-only"
     assert by_id["architecture:deepseek4"].category == "dependency-or-runtime-abi-blocked"
     assert by_id["architecture:rwkv6"].category == "dependency-or-runtime-abi-blocked"
     assert by_id["architecture:bailingmoe2"].category == "intentionally-rejected"

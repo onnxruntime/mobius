@@ -505,11 +505,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "Q/K permutation, optional long/short RoPE tensors, and a conditional dense-or-MoE "
         "loader. The existing MiniCPM graph does not prove this complete GGUF contract."
     ),
-    "minimax-m2": (
-        "MiniMax-M2 uses full-vector Q/K norms, partial RoPE, and all-layer "
-        "correction-biased routed experts under metadata-selected gating. Mobius has no "
-        "exact graph or suffix-safe expert import for that topology."
-    ),
     "minimax-m3": (
         "MiniMax-M3 adds F32 sparse-indexer tensors and a second index-key cache with "
         "position/cell maps, block masks, rollback, and reorder semantics alongside main "
@@ -583,11 +578,6 @@ _FINAL_CENSUS_DEFERRED_REASONS = {
         "MiMo2 requires fused-QKV dense MTP blocks, attention sinks, interleaved sliding "
         "KV cache, and three chained heads selected by offsets. Mobius permits one head "
         "and cannot preserve that state or FP8 converter transform."
-    ),
-    "mistral4": (
-        "Mistral4 has no NextN metadata or MTP graph; it inherits Mistral3's conditional "
-        "dense/MoE tensor loader and overrides graph construction. It is not llama, "
-        "mistral alias text, or any DeepSeek/Qwen MTP family."
     ),
     "step35": (
         "Step3.5 executes one or more interleaved-SWA NextN heads with optional gates, "
@@ -1332,6 +1322,42 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
             "Graph import is exact, but released ORT GenAI packaging cannot represent "
             "the heterogeneous KV/recurrent state slots or bounded rollback snapshots; "
             "runtime packaging remains tracked by #605."
+        ),
+    ),
+    GGUFArchitectureSpec(
+        gguf_arch="minimax-m2",
+        model_type="minimax_m2_gguf",
+        module_type="minimax_m2_gguf",
+        config_key_map="minimax_m2",
+        config_postprocessor="minimax_m2",
+        tensor_map_recipe=("minimax_m2",),
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_gating_func",
+        ),
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact explicit-float import owns MiniMax-M2's non-square Q/O geometry, "
+            "full-vector Q/K RMSNorm, partial NeoX RoPE, standard dynamic/static KV cache, "
+            "and F32 selection-biased sigmoid MoE routing. Loader-accepted Q/K/V biases "
+            "and fused QKV are rejected because the pinned graph ignores or cannot execute "
+            "them. Packed projection/expert import and runtime packaging remain deferred; "
+            "the smallest immutable public GGUF is 46,514,882,176 bytes, above the "
+            "16 GiB evidence budget. Use keep_quantized=False."
         ),
     ),
     GGUFArchitectureSpec(
@@ -2131,6 +2157,48 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         runtime=Support.DEFERRED,
         reason=_DEEPSEEK4_GGUF_GRAPH_REASON,
     ),
+    GGUFArchitectureSpec(
+        gguf_arch="mistral4",
+        model_type="mistral4_gguf",
+        module_type="mistral4_gguf",
+        config_key_map="mistral4",
+        config_postprocessor="mistral4",
+        tensor_map_recipe=("mistral4",),
+        tensor_processor="mistral4",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.key_length_mla",
+            "attention.value_length_mla",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+        ),
+        rope_interleave=True,
+        runtime=Support.DEFERRED,
+        quantized_import=Support.REJECTED,
+        reason=(
+            "Exact explicit-float import owns Mistral4's DeepSeek-V2 MLA projections, "
+            "dense-prefix plus mandatory shared/routed MoE blocks, YaRN scaling, and one "
+            "graph-visible latent-plus-RoPE K cache per layer. Legacy non-MLA, Q-LoRA-free, "
+            "temperature-scaled, and NextN layouts fail closed. Packed import and runtime "
+            "packaging remain deferred; the smallest immutable public GGUF is "
+            "32,306,941,632 bytes, above the 16 GiB evidence budget. "
+            "Use keep_quantized=False."
+        ),
+    ),
     # GLM-5.2 GGUFs (e.g. unsloth/GLM-5.2-GGUF) tag the architecture 'glm-dsa'
     # (MLA + DeepSeek Sparse Attention + MoE) and mobius's registry key is
     # 'glm_moe_dsa'. The format bridge is keyed on the authoritative
@@ -2142,12 +2210,43 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         model_type="glm_moe_dsa",
         aliases=frozenset({"glm_dsa"}),
         config_key_map="glm_dsa",
-        tensor_map=Support.DEFERRED,
+        config_postprocessor="glm_dsa",
+        tensor_map_recipe=("glm_dsa",),
+        tensor_processor="glm_dsa",
+        required_metadata=(
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "block_count",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.key_length_mla",
+            "attention.value_length_mla",
+            "attention.q_lora_rank",
+            "attention.kv_lora_rank",
+            "attention.layer_norm_rms_epsilon",
+            "rope.freq_base",
+            "rope.dimension_count",
+            "expert_count",
+            "expert_used_count",
+            "expert_feed_forward_length",
+            "expert_shared_count",
+            "attention.indexer.head_count",
+            "attention.indexer.key_length",
+            "attention.indexer.top_k",
+        ),
+        rope_interleave=True,
+        quantized_import=Support.REJECTED,
         reason=(
-            "Config extraction and the glm_moe_dsa graph are both available, but "
-            "no GGUF→HuggingFace tensor-name mapping has been written for GLM-5.2's "
-            "MLA + DSA-indexer tensor families yet, so weights cannot be routed "
-            "into the graph. " + _NO_TENSOR_MAP
+            "Exact explicit-float MLA, DSA indexer, dense-prefix/routed-MoE tensor routing, "
+            "and packed dynamic-cache graph construction are covered. Packed import remains "
+            "rejected because GLM-5.2's rank-3 K/V-B transforms and correction-biased routed "
+            "experts do not have an independently proven storage-preserving runtime path. "
+            "The released GGUF also carries a routed DSA/MLA MTP block outside the current "
+            "sidecar ABI, and representative real-weight runtime evidence exceeds the 16 GiB "
+            "artifact budget. Use keep_quantized=False."
         ),
     ),
     GGUFArchitectureSpec(

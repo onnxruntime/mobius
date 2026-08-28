@@ -266,6 +266,8 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "grok_gguf",
         "grovemoe_gguf",
         "hunyuan_moe_gguf",
+        "minimax_m2_gguf",
+        "mistral4_gguf",
         # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
         # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
         # registered with AutoModelForCausalLM, so a reference model cannot be

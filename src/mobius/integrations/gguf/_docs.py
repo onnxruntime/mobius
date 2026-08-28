@@ -21,6 +21,9 @@ from mobius.integrations.gguf._arch_registry import (
     _RUNTIME_VALIDATION_PENDING,
     iter_arch_specs,
 )
+from mobius.integrations.gguf._artifact_blocker_evidence import (
+    iter_artifact_blocker_evidence,
+)
 from mobius.integrations.gguf._mmproj_registry import (
     MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
@@ -359,6 +362,16 @@ def _runtime_blocker_evidence_table() -> str:
             f"ORT {evidence.onnxruntime_version} / {evidence.execution_provider}; "
             f"{evidence.runtime} {evidence.runtime_version}; {blockers} | {withheld} |"
         )
+    for artifact in iter_artifact_blocker_evidence():
+        files = "<br>".join(
+            f"`{file.path}` {file.size:,} B `{file.lfs_sha256}`" for file in artifact.files
+        )
+        rows.append(
+            f"| `{artifact.evidence_id}` | `{artifact.repository}@{artifact.revision}`<br>"
+            f"{files}<br>total {artifact.total_size:,} B | blocked; "
+            f"{artifact.blocker} | real-weight full-logit parity, runtime packaging, "
+            "deterministic generation |"
+        )
     return "\n".join(rows)
 
 
@@ -686,7 +699,6 @@ network-free selection, budget, exclusions, and fail-closed candidate reasons ar
 {_runtime_evidence_table()}
 
 Runtime support above is independent from tokenizer materialization support below.
-
 ### Fail-closed runtime evidence
 
 {_runtime_blocker_evidence_table()}

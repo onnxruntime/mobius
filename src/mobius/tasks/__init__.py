@@ -63,6 +63,7 @@ __all__ = [
     "ModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
+    "Mistral4GGUFCausalLMTask",
     "MiniCPMVLTask",
     "MuseGlimmerVLTask",
     "MaskedDiffusionTask",
@@ -157,6 +158,7 @@ from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3RVQTask,
     MiniMaxMusic3VocoderTask,
 )
+from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
@@ -270,6 +272,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-unified": Gemma4UnifiedTask,
     "gemma4-assistant": Gemma4AssistantTask,
     "glm-moe-dsa": GlmMoeDsaTask,
+    "mistral4-gguf-text-generation": Mistral4GGUFCausalLMTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "sensenova-u1": SenseNovaU1Task,
     "multimodal": MultiModalTask,
