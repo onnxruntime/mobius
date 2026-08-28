@@ -869,6 +869,171 @@ _WHISPER_AUDIO_TOP = (
     "a.post_ln.bias",
 )
 
+_STANDALONE_AUDIO_METADATA = (
+    "clip.has_audio_encoder",
+    "clip.audio.embedding_length",
+    "clip.audio.feed_forward_length",
+    "clip.audio.block_count",
+    "clip.audio.projection_dim",
+    "clip.audio.attention.head_count",
+    "clip.audio.attention.layer_norm_epsilon",
+    "clip.audio.num_mel_bins",
+)
+
+_WHISPER_AUDIO_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln1.bias",
+    "attn_q.weight",
+    "attn_q.bias",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_v.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "ln2.weight",
+    "ln2.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+)
+
+_WHISPER_AUDIO_TOP = (
+    "a.conv1d.1.weight",
+    "a.conv1d.1.bias",
+    "a.conv1d.2.weight",
+    "a.conv1d.2.bias",
+    "a.position_embd.weight",
+    "a.post_ln.weight",
+    "a.post_ln.bias",
+)
+
+_LFM2A_BLOCK_SUFFIXES = (
+    "ffn_norm.weight",
+    "ffn_norm.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+    "ln1.weight",
+    "ln1.bias",
+    "attn_q.weight",
+    "attn_q.bias",
+    "attn_k.weight",
+    "attn_k.bias",
+    "attn_v.weight",
+    "attn_v.bias",
+    "attn_out.weight",
+    "attn_out.bias",
+    "linear_pos.weight",
+    "pos_bias_u",
+    "pos_bias_v",
+    "norm_conv.weight",
+    "norm_conv.bias",
+    "conv_pw1.weight",
+    "conv_pw1.bias",
+    "conv_dw.weight",
+    "conv_dw.bias",
+    "conv_norm.weight",
+    "conv_norm.bias",
+    "conv_pw2.weight",
+    "conv_pw2.bias",
+    "ffn_norm_1.weight",
+    "ffn_norm_1.bias",
+    "ffn_up_1.weight",
+    "ffn_up_1.bias",
+    "ffn_down_1.weight",
+    "ffn_down_1.bias",
+    "ln2.weight",
+    "ln2.bias",
+)
+
+_PARAKEET_BLOCK_SUFFIXES = (
+    "ffn_norm.weight",
+    "ffn_norm.bias",
+    "ffn_up.weight",
+    "ffn_down.weight",
+    "ln1.weight",
+    "ln1.bias",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_out.weight",
+    "linear_pos.weight",
+    "pos_bias_u",
+    "pos_bias_v",
+    "norm_conv.weight",
+    "norm_conv.bias",
+    "conv_pw1.weight",
+    "conv_dw.weight",
+    "conv_norm.weight",
+    "conv_norm.bias",
+    "conv_norm_mean",
+    "conv_norm_var",
+    "conv_pw2.weight",
+    "ffn_norm_1.weight",
+    "ffn_norm_1.bias",
+    "ffn_up_1.weight",
+    "ffn_down_1.weight",
+    "ln2.weight",
+    "ln2.bias",
+)
+
+_GRANITE_SPEECH_BLOCK_SUFFIXES = (
+    "ffn_norm.weight",
+    "ffn_norm.bias",
+    "ffn_up.weight",
+    "ffn_up.bias",
+    "ffn_down.weight",
+    "ffn_down.bias",
+    "ln1.weight",
+    "ln1.bias",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_out.weight",
+    "attn_out.bias",
+    "attn_rel_pos_emb",
+    "norm_conv.weight",
+    "norm_conv.bias",
+    "conv_pw1.weight",
+    "conv_pw1.bias",
+    "conv_dw.weight",
+    "conv_norm.weight",
+    "conv_norm.bias",
+    "conv_pw2.weight",
+    "conv_pw2.bias",
+    "ffn_norm_1.weight",
+    "ffn_norm_1.bias",
+    "ffn_up_1.weight",
+    "ffn_up_1.bias",
+    "ffn_down_1.weight",
+    "ffn_down_1.bias",
+    "ln2.weight",
+    "ln2.bias",
+)
+
+_MIMO_LOCAL_PATTERN = (
+    r"mm\.a\.local_blk\.\d+\.(?:attn_q|attn_k|attn_v)\.(?:weight|bias)",
+    r"mm\.a\.local_blk\.\d+\.attn_out\.weight",
+    r"mm\.a\.local_blk\.\d+\.(?:ffn_gate|ffn_up|ffn_down|ln1|ln2)\.weight",
+)
+
+_POCKETTTS_BLOCK_SUFFIXES = (
+    "ln1.weight",
+    "ln1.bias",
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_out.weight",
+    "ls1.weight",
+    "ln2.weight",
+    "ln2.bias",
+    "ffn_up.weight",
+    "ffn_down.weight",
+    "ls2.weight",
+)
+
 
 def _deferred(
     projector_type: str,
@@ -1633,11 +1798,42 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         real_artifact_ids=("pixtral-12b-f16",),
     ),
-    _deferred(
-        "ultravox",
-        "PROJECTOR_TYPE_ULTRAVOX",
-        _AUDIO_BASE,
-        "Whisper encoder plus Ultravox stack projector is not implemented.",
+    ProjectorSpec(
+        projector_type="ultravox",
+        enum_name="PROJECTOR_TYPE_ULTRAVOX",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"llama"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact Whisper encoder, frame stacking, swapped-SwiGLU projector, "
+            "processor ABI, and independent numerical parity are covered; paired "
+            "text-runtime insertion remains unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_STANDALONE_AUDIO_METADATA,
+            "clip.projector_type",
+            "clip.audio.projector.stack_factor",
+        ),
+        required_top_tensors=(
+            *_WHISPER_AUDIO_TOP,
+            "mm.a.mlp.1.weight",
+            "mm.a.mlp.2.weight",
+            "mm.a.norm_pre.weight",
+            "mm.a.norm_mid.weight",
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("ultravox-v0.5-f16",),
     ),
     ProjectorSpec(
         projector_type="internvl",
@@ -1866,11 +2062,40 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         real_artifact_ids=("qwen25-omni-projector-f16",),
     ),
-    _deferred(
-        "voxtral",
-        "PROJECTOR_TYPE_VOXTRAL",
-        _AUDIO_BASE,
-        "Voxtral Whisper encoder/projector is not implemented.",
+    ProjectorSpec(
+        projector_type="voxtral",
+        enum_name="PROJECTOR_TYPE_VOXTRAL",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"llama"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact Whisper encoder, average pooling, frame stacking, GELU "
+            "projector, processor ABI, and independent numerical parity are covered; "
+            "the published packed sidecar fails closed and paired runtime is unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_STANDALONE_AUDIO_METADATA,
+            "clip.projector_type",
+            "clip.audio.projector.stack_factor",
+        ),
+        required_top_tensors=(
+            *_WHISPER_AUDIO_TOP,
+            "mm.a.mlp.1.weight",
+            "mm.a.mlp.2.weight",
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("voxtral-mini-3b-source-and-q8-availability",),
     ),
     ProjectorSpec(
         projector_type="meralion",
@@ -1909,11 +2134,38 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         ),
         source_evidence_ids=("meralion-pinned-graph-source",),
     ),
-    _deferred(
-        "musicflamingo",
-        "PROJECTOR_TYPE_MUSIC_FLAMINGO",
-        _AUDIO_BASE,
-        "Music Flamingo audio projector is not implemented.",
+    ProjectorSpec(
+        projector_type="musicflamingo",
+        enum_name="PROJECTOR_TYPE_MUSIC_FLAMINGO",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"qwen2"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact Whisper encoder, average pooling, biased GELU projector, "
+            "processor ABI, and independent numerical parity are covered; paired "
+            "text-runtime insertion remains unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(*_STANDALONE_AUDIO_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            *_WHISPER_AUDIO_TOP,
+            "mm.a.mlp.1.weight",
+            "mm.a.mlp.1.bias",
+            "mm.a.mlp.2.weight",
+            "mm.a.mlp.2.bias",
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("music-flamingo-bf16",),
     ),
     ProjectorSpec(
         projector_type="lfm2",
@@ -2119,11 +2371,54 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         "DeepSeek-OCR2 SAM/projector graph is not implemented.",
         target_architectures=frozenset({"deepseek2-ocr"}),
     ),
-    _deferred(
-        "lfm2a",
-        "PROJECTOR_TYPE_LFM2A",
-        _AUDIO_BASE,
-        "LFM2 conformer audio graph has no GGUF tensor mapping.",
+    ProjectorSpec(
+        projector_type="lfm2a",
+        enum_name="PROJECTOR_TYPE_LFM2A",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"lfm2"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact Conformer subsampler, relative attention, GELU adapter, "
+            "processor ABI, tensor closure, and independent parity are covered; "
+            "paired text-runtime insertion remains unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(*_STANDALONE_AUDIO_METADATA, "clip.projector_type"),
+        required_top_tensors=(
+            "a.conv1d.0.weight",
+            "a.conv1d.0.bias",
+            "a.conv1d.2.weight",
+            "a.conv1d.2.bias",
+            "a.conv1d.3.weight",
+            "a.conv1d.3.bias",
+            "a.conv1d.5.weight",
+            "a.conv1d.5.bias",
+            "a.conv1d.6.weight",
+            "a.conv1d.6.bias",
+            "a.embd_to_logits.weight",
+            "a.position_embd.weight",
+            "a.position_embd_norm.weight",
+            "a.pre_encode.out.weight",
+            "a.pre_encode.out.bias",
+            "mm.a.mlp.0.weight",
+            "mm.a.mlp.0.bias",
+            "mm.a.mlp.1.weight",
+            "mm.a.mlp.1.bias",
+            "mm.a.mlp.3.weight",
+            "mm.a.mlp.3.bias",
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_LFM2A_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        real_artifact_ids=("lfm2.5-audio-1.5b-f16",),
     ),
     ProjectorSpec(
         projector_type="glm4v",
@@ -2463,11 +2758,73 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         real_artifact_ids=("minicpm-v4-6-bf16-header",),
         source_evidence_ids=("minicpmv4-6-pinned-graph-source",),
     ),
-    _deferred(
-        "granite_speech",
-        "PROJECTOR_TYPE_GRANITE_SPEECH",
-        _AUDIO_BASE,
-        "Granite Speech audio encoder/projector is not implemented.",
+    ProjectorSpec(
+        projector_type="granite_speech",
+        enum_name="PROJECTOR_TYPE_GRANITE_SPEECH",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"granite"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact chunked Shaw-relative Conformer, CTC branch, two-layer "
+            "Q-Former, processor ABI, tensor transforms, and independent parity "
+            "are covered; paired text-runtime insertion remains unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_STANDALONE_AUDIO_METADATA,
+            "clip.projector_type",
+            "clip.audio.chunk_size",
+            "clip.audio.conv_kernel_size",
+            "clip.audio.max_pos_emb",
+            "clip.audio.projector.window_size",
+            "clip.audio.projector.downsample_rate",
+            "clip.audio.projector.head_count",
+        ),
+        required_top_tensors=(
+            "a.input_projection.weight",
+            "a.input_projection.bias",
+            "a.enc_ctc_out.weight",
+            "a.enc_ctc_out.bias",
+            "a.enc_ctc_out_mid.weight",
+            "a.enc_ctc_out_mid.bias",
+            "a.proj_query",
+            "a.proj_norm.weight",
+            "a.proj_norm.bias",
+            "a.proj_linear.weight",
+            "a.proj_linear.bias",
+            *(
+                f"a.proj_blk.{layer}.{stem}.{kind}"
+                for layer in range(2)
+                for stem in (
+                    "self_attn_q",
+                    "self_attn_k",
+                    "self_attn_v",
+                    "self_attn_out",
+                    "self_attn_norm",
+                    "cross_attn_q",
+                    "cross_attn_k",
+                    "cross_attn_v",
+                    "cross_attn_out",
+                    "cross_attn_norm",
+                    "ffn_up",
+                    "ffn_down",
+                    "ffn_norm",
+                )
+                for kind in ("weight", "bias")
+            ),
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_GRANITE_SPEECH_BLOCK_SUFFIXES,
+        tensor_roles=(
+            ("a.proj_", MMProjTensorRole.PROJECTOR),
+            ("a.", MMProjTensorRole.ENCODER),
+        ),
+        real_artifact_ids=("granite-speech-4.1-2b-f16",),
     ),
     ProjectorSpec(
         projector_type="mimovl",
@@ -2567,17 +2924,132 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _VISION_BASE,
         "Granite 4 vision sidecar graph is not implemented.",
     ),
-    _deferred(
-        "mimo_audio",
-        "PROJECTOR_TYPE_MIMO_AUDIO",
-        _AUDIO_BASE,
-        "MiMo audio RVQ/local-transformer graph is not implemented.",
+    ProjectorSpec(
+        projector_type="mimo_audio",
+        enum_name="PROJECTOR_TYPE_MIMO_AUDIO",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"mimo2"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact causal audio transformer, RVQ, code-embedding bridge, local "
+            "transformer, projection, processor ABI, and independent parity are "
+            "covered from pinned source; no public compatible mmproj or paired runtime "
+            "evidence is claimed."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_STANDALONE_AUDIO_METADATA,
+            "clip.audio.projector_type",
+            "clip.audio.rvq.num_quantizers",
+            "clip.audio.rvq.codebook_size",
+            "clip.audio.wa_pattern_mode",
+            "clip.audio.window_size",
+            "clip.audio.local_block_count",
+            "clip.audio.local_group_size",
+        ),
+        required_top_tensors=(
+            "a.conv1d.1.weight",
+            "a.conv1d.1.bias",
+            "a.conv1d.2.weight",
+            "a.conv1d.2.bias",
+            "a.post_ln.weight",
+            "a.post_ln.bias",
+            "a.downsample.conv.weight",
+            "a.downsample.norm.weight",
+            "a.downsample.norm.bias",
+            "a.rvq.codebook.weight",
+            "mm.a.code_embd.weight",
+            "mm.a.local_norm.weight",
+            "mm.a.mlp.1.weight",
+            "mm.a.mlp.2.weight",
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_WHISPER_AUDIO_BLOCK_SUFFIXES,
+        auxiliary_tensor_patterns=_MIMO_LOCAL_PATTERN,
+        deferred_companions=(
+            DeferredCompanionSpec(
+                modality=MMProjModality.VISION,
+                projector_type="mimovl",
+                tensor_prefixes=("v.", "mm."),
+                reason=(
+                    "The co-located MiMo vision encoder is a separate route and is "
+                    "quarantined from the audio graph."
+                ),
+            ),
+        ),
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("mimo-v2.5-audio-source",),
     ),
-    _deferred(
-        "parakeet",
-        "PROJECTOR_TYPE_PARAKEET",
-        _AUDIO_BASE,
-        "Parakeet audio encoder graph is not implemented.",
+    ProjectorSpec(
+        projector_type="parakeet",
+        enum_name="PROJECTOR_TYPE_PARAKEET",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"nemotron_h"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact FastConformer encoder, frozen BatchNorm, relative attention, "
+            "squared-ReLU projector, processor ABI, and independent parity are covered "
+            "from pinned source; the published vision-only candidate is not treated as "
+            "audio evidence and paired runtime remains unvalidated."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.AUDIO_ENCODER,),
+        required_metadata=(
+            *_STANDALONE_AUDIO_METADATA,
+            "clip.audio.projector_type",
+            "clip.audio.subsampling_factor",
+            "clip.audio.conv_kernel_size",
+        ),
+        required_top_tensors=(
+            "a.mel_filters",
+            "a.window",
+            "a.conv1d.0.weight",
+            "a.conv1d.0.bias",
+            "a.conv1d.2.weight",
+            "a.conv1d.2.bias",
+            "a.conv1d.3.weight",
+            "a.conv1d.3.bias",
+            "a.conv1d.5.weight",
+            "a.conv1d.5.bias",
+            "a.conv1d.6.weight",
+            "a.conv1d.6.bias",
+            "a.pre_encode.out.weight",
+            "a.pre_encode.out.bias",
+            "mm.a.norm_pre.weight",
+            "mm.a.mlp.1.weight",
+            "mm.a.mlp.2.weight",
+        ),
+        optional_top_tensors=("mm.a.mlp.1.bias", "mm.a.mlp.2.bias"),
+        block_prefix="a.blk.",
+        block_suffixes=_PARAKEET_BLOCK_SUFFIXES,
+        deferred_companions=(
+            DeferredCompanionSpec(
+                modality=MMProjModality.VISION,
+                projector_type="nemotron_v2_vl",
+                tensor_prefixes=("v.", "mm."),
+                reason=(
+                    "The co-located RADIO vision route is independently owned and "
+                    "quarantined from the Parakeet graph."
+                ),
+            ),
+        ),
+        tensor_roles=(
+            ("a.", MMProjTensorRole.ENCODER),
+            ("mm.a.", MMProjTensorRole.PROJECTOR),
+        ),
+        source_evidence_ids=("nemotron-v2-parakeet-source",),
     ),
     ProjectorSpec(
         projector_type="qwen3tts_spkenc",
@@ -2626,11 +3098,58 @@ _SPECS: tuple[ProjectorSpec, ...] = (
         _GEN_AUDIO_BASE,
         "Generated-audio decoder sidecars are not multimodal projectors and cannot be paired with a text target package.",
     ),
-    _deferred(
-        "pockettts_spkenc",
-        "PROJECTOR_TYPE_POCKETTTS_SPKENC",
-        _AUDIO_BASE,
-        "PocketTTS speaker encoder graph is not implemented.",
+    ProjectorSpec(
+        projector_type="pockettts_spkenc",
+        enum_name="PROJECTOR_TYPE_POCKETTTS_SPKENC",
+        modalities=_AUDIO_BASE,
+        target_architectures=frozenset({"pockettts"}),
+        primary_modality=MMProjModality.AUDIO,
+        metadata=Support.SUPPORTED,
+        tensor_map=Support.SUPPORTED,
+        graph=Support.SUPPORTED,
+        runtime=Support.DEFERRED,
+        reason=(
+            "The exact raw-waveform SEANet, causal Mimi transformer, downsampler, "
+            "speaker projection, frame ABI, RoPE transform, and independent parity "
+            "are covered from pinned source; the generated-audio decoder remains "
+            "explicitly quarantined and rejected."
+        ),
+        sidecar_builder="audio_projector",
+        model_roles=(MMProjModelRole.SPEAKER_ENCODER,),
+        required_metadata=(*_STANDALONE_AUDIO_METADATA, "clip.audio.projector_type"),
+        required_top_tensors=(
+            "a.seanet.conv_in.weight",
+            "a.seanet.conv_in.bias",
+            "a.seanet.conv_out.weight",
+            "a.seanet.conv_out.bias",
+            *(
+                f"a.seanet.blk.{layer}.{stem}.{kind}"
+                for layer in range(3)
+                for stem in ("res_conv1", "res_conv2", "scale_conv")
+                for kind in ("weight", "bias")
+            ),
+            "a.downsample.conv.weight",
+            "a.speaker_proj.weight",
+        ),
+        block_prefix="a.blk.",
+        block_suffixes=_POCKETTTS_BLOCK_SUFFIXES,
+        deferred_companions=(
+            DeferredCompanionSpec(
+                modality=MMProjModality.GENERATED_AUDIO,
+                projector_type="pockettts_gen",
+                tensor_prefixes=("a.gen.",),
+                reason=(
+                    "PocketTTS generation is a separate rejected decoder role and is "
+                    "never loaded into the speaker encoder."
+                ),
+            ),
+        ),
+        tensor_roles=(
+            ("a.speaker_proj.", MMProjTensorRole.PROJECTOR),
+            ("a.", MMProjTensorRole.ENCODER),
+            ("a.gen.", MMProjTensorRole.GENERATED_AUDIO),
+        ),
+        source_evidence_ids=("pockettts-speaker-source",),
     ),
     _rejected(
         "pockettts_gen",

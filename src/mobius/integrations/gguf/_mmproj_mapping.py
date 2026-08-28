@@ -739,15 +739,318 @@ _WHISPER_AUDIO_BLOCK_STEMS: dict[str, str] = {
     "ffn_down.bias": "fc2.bias",
 }
 
+_PARAKEET_AUDIO_BLOCK_STEMS = {
+    "ffn_norm.weight": "norm_feed_forward1.weight",
+    "ffn_norm.bias": "norm_feed_forward1.bias",
+    "ffn_up.weight": "feed_forward1.linear1.weight",
+    "ffn_down.weight": "feed_forward1.linear2.weight",
+    "ln1.weight": "norm_self_att.weight",
+    "ln1.bias": "norm_self_att.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_out.weight": "self_attn.o_proj.weight",
+    "linear_pos.weight": "self_attn.relative_k_proj.weight",
+    "pos_bias_u": "self_attn.bias_u",
+    "pos_bias_v": "self_attn.bias_v",
+    "norm_conv.weight": "norm_conv.weight",
+    "norm_conv.bias": "norm_conv.bias",
+    "conv_pw1.weight": "conv.pointwise_conv1.weight",
+    "conv_dw.weight": "conv.depthwise_conv.weight",
+    "conv_norm.weight": "conv.norm.weight",
+    "conv_norm.bias": "conv.norm.bias",
+    "conv_norm_mean": "conv.norm.running_mean",
+    "conv_norm_var": "conv.norm.running_var",
+    "conv_pw2.weight": "conv.pointwise_conv2.weight",
+    "ffn_norm_1.weight": "norm_feed_forward2.weight",
+    "ffn_norm_1.bias": "norm_feed_forward2.bias",
+    "ffn_up_1.weight": "feed_forward2.linear1.weight",
+    "ffn_down_1.weight": "feed_forward2.linear2.weight",
+    "ln2.weight": "norm_out.weight",
+    "ln2.bias": "norm_out.bias",
+}
+_LFM2A_BLOCK_STEMS = {
+    "ffn_norm.weight": "norm_feed_forward1.weight",
+    "ffn_norm.bias": "norm_feed_forward1.bias",
+    "ffn_up.weight": "feed_forward1.up_proj.weight",
+    "ffn_up.bias": "feed_forward1.up_proj.bias",
+    "ffn_down.weight": "feed_forward1.down_proj.weight",
+    "ffn_down.bias": "feed_forward1.down_proj.bias",
+    "ln1.weight": "norm_self_attn.weight",
+    "ln1.bias": "norm_self_attn.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q.bias": "self_attn.q_proj.bias",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k.bias": "self_attn.k_proj.bias",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_v.bias": "self_attn.v_proj.bias",
+    "attn_out.weight": "self_attn.out_proj.weight",
+    "attn_out.bias": "self_attn.out_proj.bias",
+    "linear_pos.weight": "self_attn.linear_pos.weight",
+    "pos_bias_u": "self_attn.pos_bias_u",
+    "pos_bias_v": "self_attn.pos_bias_v",
+    "norm_conv.weight": "norm_conv.weight",
+    "norm_conv.bias": "norm_conv.bias",
+    "conv_pw1.weight": "conv.pointwise_conv1.weight",
+    "conv_pw1.bias": "conv.pointwise_conv1.bias",
+    "conv_dw.weight": "conv.depthwise_conv.weight",
+    "conv_dw.bias": "conv.depthwise_conv.bias",
+    "conv_norm.weight": "conv.conv_norm_weight",
+    "conv_norm.bias": "conv.conv_norm_bias",
+    "conv_pw2.weight": "conv.pointwise_conv2.weight",
+    "conv_pw2.bias": "conv.pointwise_conv2.bias",
+    "ffn_norm_1.weight": "norm_feed_forward2.weight",
+    "ffn_norm_1.bias": "norm_feed_forward2.bias",
+    "ffn_up_1.weight": "feed_forward2.up_proj.weight",
+    "ffn_up_1.bias": "feed_forward2.up_proj.bias",
+    "ffn_down_1.weight": "feed_forward2.down_proj.weight",
+    "ffn_down_1.bias": "feed_forward2.down_proj.bias",
+    "ln2.weight": "norm_out.weight",
+    "ln2.bias": "norm_out.bias",
+}
+_GRANITE_SPEECH_BLOCK_STEMS = {
+    "ffn_norm.weight": "ffn1_norm.weight",
+    "ffn_norm.bias": "ffn1_norm.bias",
+    "ffn_up.weight": "feed_forward1.up_proj.weight",
+    "ffn_up.bias": "feed_forward1.up_proj.bias",
+    "ffn_down.weight": "feed_forward1.down_proj.weight",
+    "ffn_down.bias": "feed_forward1.down_proj.bias",
+    "ln1.weight": "attention_norm.weight",
+    "ln1.bias": "attention_norm.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_out.weight": "self_attn.out_proj.weight",
+    "attn_out.bias": "self_attn.out_proj.bias",
+    "attn_rel_pos_emb": "self_attn.relative_positions",
+    "norm_conv.weight": "conv_norm.weight",
+    "norm_conv.bias": "conv_norm.bias",
+    "conv_pw1.weight": "conv.pointwise_conv1.weight",
+    "conv_pw1.bias": "conv.pointwise_conv1.bias",
+    "conv_dw.weight": "conv.depthwise_conv.weight",
+    "conv_norm.weight": "conv.batch_norm_weight",
+    "conv_norm.bias": "conv.batch_norm_bias",
+    "conv_pw2.weight": "conv.pointwise_conv2.weight",
+    "conv_pw2.bias": "conv.pointwise_conv2.bias",
+    "ffn_norm_1.weight": "ffn2_norm.weight",
+    "ffn_norm_1.bias": "ffn2_norm.bias",
+    "ffn_up_1.weight": "feed_forward2.up_proj.weight",
+    "ffn_up_1.bias": "feed_forward2.up_proj.bias",
+    "ffn_down_1.weight": "feed_forward2.down_proj.weight",
+    "ffn_down_1.bias": "feed_forward2.down_proj.bias",
+    "ln2.weight": "output_norm.weight",
+    "ln2.bias": "output_norm.bias",
+}
+_GRANITE_QFORMER_STEMS = {
+    **{
+        f"{scope}_{stem}.{kind}": f"{scope}.{target}.{kind}"
+        for scope in ("self_attn", "cross_attn")
+        for stem, target in (
+            ("q", "q_proj"),
+            ("k", "k_proj"),
+            ("v", "v_proj"),
+            ("out", "out_proj"),
+        )
+        for kind in ("weight", "bias")
+    },
+    "self_attn_norm.weight": "self_attn_layernorm.weight",
+    "self_attn_norm.bias": "self_attn_layernorm.bias",
+    "cross_attn_norm.weight": "cross_attn_layernorm.weight",
+    "cross_attn_norm.bias": "cross_attn_layernorm.bias",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_up.bias": "mlp.up_proj.bias",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "ffn_down.bias": "mlp.down_proj.bias",
+    "ffn_norm.weight": "mlp_layernorm.weight",
+    "ffn_norm.bias": "mlp_layernorm.bias",
+}
+_MIMO_AUDIO_BLOCK_STEMS = {
+    **_WHISPER_AUDIO_BLOCK_STEMS,
+    "ln1.weight": "norm1.weight",
+    "ln1.bias": "norm1.bias",
+    "ln2.weight": "norm2.weight",
+    "ln2.bias": "norm2.bias",
+}
+_MIMO_LOCAL_BLOCK_STEMS = {
+    "ln1.weight": "norm1.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_q.bias": "self_attn.q_proj.bias",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_k.bias": "self_attn.k_proj.bias",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_v.bias": "self_attn.v_proj.bias",
+    "attn_out.weight": "self_attn.out_proj.weight",
+    "ln2.weight": "norm2.weight",
+    "ffn_gate.weight": "gate_proj.weight",
+    "ffn_up.weight": "up_proj.weight",
+    "ffn_down.weight": "down_proj.weight",
+}
+_POCKETTTS_BLOCK_STEMS = {
+    "ln1.weight": "input_layernorm.weight",
+    "ln1.bias": "input_layernorm.bias",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_out.weight": "self_attn.o_proj.weight",
+    "ls1.weight": "self_attn_layer_scale.scale",
+    "ln2.weight": "post_attention_layernorm.weight",
+    "ln2.bias": "post_attention_layernorm.bias",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "ls2.weight": "mlp_layer_scale.scale",
+}
+
 
 def map_mmproj_audio_projector_to_onnx(
     name: str,
     projector_type: str,
 ) -> str | None:
-    """Map the exact standalone MERaLiON sidecar closure."""
+    """Map one exact standalone audio sidecar tensor to its ONNX initializer."""
+    block = _AUDIO_BLK.match(name)
+    if projector_type in {"ultravox", "voxtral", "musicflamingo"}:
+        if block is not None:
+            index, stem = block.groups()
+            mapped = _WHISPER_AUDIO_BLOCK_STEMS.get(stem)
+            return None if mapped is None else f"audio_encoder.layers.{index}.{mapped}"
+        return {
+            "a.conv1d.1.weight": "audio_encoder.conv1.weight",
+            "a.conv1d.1.bias": "audio_encoder.conv1.bias",
+            "a.conv1d.2.weight": "audio_encoder.conv2.weight",
+            "a.conv1d.2.bias": "audio_encoder.conv2.bias",
+            "a.position_embd.weight": "audio_encoder.position_embeddings",
+            "a.post_ln.weight": "audio_encoder.post_layernorm.weight",
+            "a.post_ln.bias": "audio_encoder.post_layernorm.bias",
+            "mm.a.mlp.1.weight": "audio_encoder.projector.linear_1.weight",
+            "mm.a.mlp.1.bias": "audio_encoder.projector.linear_1.bias",
+            "mm.a.mlp.2.weight": "audio_encoder.projector.linear_2.weight",
+            "mm.a.mlp.2.bias": "audio_encoder.projector.linear_2.bias",
+            "mm.a.norm_pre.weight": "audio_encoder.projector.norm_pre.weight",
+            "mm.a.norm_mid.weight": "audio_encoder.projector.norm_mid.weight",
+        }.get(name)
+    if projector_type == "parakeet":
+        if block is not None:
+            index, stem = block.groups()
+            mapped = _PARAKEET_AUDIO_BLOCK_STEMS.get(stem)
+            return None if mapped is None else f"audio_encoder.encoder.layers.{index}.{mapped}"
+        return {
+            **{
+                f"a.conv1d.{index}.{kind}": f"audio_encoder.encoder.subsampling.layers.{index}.{kind}"
+                for index in (0, 2, 3, 5, 6)
+                for kind in ("weight", "bias")
+            },
+            "a.pre_encode.out.weight": "audio_encoder.encoder.subsampling.linear.weight",
+            "a.pre_encode.out.bias": "audio_encoder.encoder.subsampling.linear.bias",
+            "mm.a.norm_pre.weight": "audio_encoder.projector.norm_pre.weight",
+            "mm.a.mlp.1.weight": "audio_encoder.projector.linear_1.weight",
+            "mm.a.mlp.1.bias": "audio_encoder.projector.linear_1.bias",
+            "mm.a.mlp.2.weight": "audio_encoder.projector.linear_2.weight",
+            "mm.a.mlp.2.bias": "audio_encoder.projector.linear_2.bias",
+        }.get(name)
+    if projector_type == "lfm2a":
+        if block is not None:
+            index, stem = block.groups()
+            mapped = _LFM2A_BLOCK_STEMS.get(stem)
+            return None if mapped is None else f"audio_encoder.layers.{index}.{mapped}"
+        return {
+            **{
+                f"a.conv1d.{index}.{kind}": f"audio_encoder.pre_encode.layers.{index}.{kind}"
+                for index in (0, 2, 3, 5, 6)
+                for kind in ("weight", "bias")
+            },
+            "a.pre_encode.out.weight": "audio_encoder.pre_encode.output.weight",
+            "a.pre_encode.out.bias": "audio_encoder.pre_encode.output.bias",
+            "mm.a.mlp.0.weight": "audio_encoder.projector.norm.weight",
+            "mm.a.mlp.0.bias": "audio_encoder.projector.norm.bias",
+            "mm.a.mlp.1.weight": "audio_encoder.projector.linear_1.weight",
+            "mm.a.mlp.1.bias": "audio_encoder.projector.linear_1.bias",
+            "mm.a.mlp.3.weight": "audio_encoder.projector.linear_2.weight",
+            "mm.a.mlp.3.bias": "audio_encoder.projector.linear_2.bias",
+        }.get(name)
+    if projector_type == "granite_speech":
+        if block is not None:
+            index, stem = block.groups()
+            mapped = _GRANITE_SPEECH_BLOCK_STEMS.get(stem)
+            return None if mapped is None else f"audio_encoder.layers.{index}.{mapped}"
+        qformer = re.match(r"^a\.proj_blk\.(\d+)\.(.+)$", name)
+        if qformer is not None:
+            index, stem = qformer.groups()
+            mapped = _GRANITE_QFORMER_STEMS.get(stem)
+            return (
+                None if mapped is None else f"audio_encoder.projector.layers.{index}.{mapped}"
+            )
+        return {
+            **{
+                f"a.{stem}.{kind}": f"audio_encoder.{target}.{kind}"
+                for stem, target in (
+                    ("input_projection", "input_projection"),
+                    ("enc_ctc_out", "ctc_out"),
+                    ("enc_ctc_out_mid", "ctc_mid"),
+                )
+                for kind in ("weight", "bias")
+            },
+            "a.proj_query": "audio_encoder.projector.query_tokens",
+            "a.proj_norm.weight": "audio_encoder.projector.query_norm.weight",
+            "a.proj_norm.bias": "audio_encoder.projector.query_norm.bias",
+            "a.proj_linear.weight": "audio_encoder.projector.output.weight",
+            "a.proj_linear.bias": "audio_encoder.projector.output.bias",
+        }.get(name)
+    if projector_type == "mimo_audio":
+        if block is not None:
+            index, stem = block.groups()
+            mapped = _MIMO_AUDIO_BLOCK_STEMS.get(stem)
+            return None if mapped is None else f"audio_encoder.layers.{index}.{mapped}"
+        local = re.match(r"^mm\.a\.local_blk\.(\d+)\.(.+)$", name)
+        if local is not None:
+            index, stem = local.groups()
+            mapped = _MIMO_LOCAL_BLOCK_STEMS.get(stem)
+            return None if mapped is None else f"audio_encoder.local_layers.{index}.{mapped}"
+        return {
+            "a.conv1d.1.weight": "audio_encoder.conv1.weight",
+            "a.conv1d.1.bias": "audio_encoder.conv1.bias",
+            "a.conv1d.2.weight": "audio_encoder.conv2.weight",
+            "a.conv1d.2.bias": "audio_encoder.conv2.bias",
+            "a.post_ln.weight": "audio_encoder.post_layernorm.weight",
+            "a.post_ln.bias": "audio_encoder.post_layernorm.bias",
+            "a.downsample.conv.weight": "audio_encoder.downsample_conv.weight",
+            "a.downsample.norm.weight": "audio_encoder.downsample_norm.weight",
+            "a.downsample.norm.bias": "audio_encoder.downsample_norm.bias",
+            "a.rvq.codebook.weight": "audio_encoder.rvq.codebook",
+            "mm.a.code_embd.weight": "audio_encoder.rvq.code_embeddings",
+            "mm.a.local_norm.weight": "audio_encoder.local_norm.weight",
+            "mm.a.mlp.1.weight": "audio_encoder.projector.linear_1.weight",
+            "mm.a.mlp.2.weight": "audio_encoder.projector.linear_2.weight",
+        }.get(name)
+    if projector_type == "pockettts_spkenc":
+        if block is not None:
+            index, stem = block.groups()
+            mapped = _POCKETTTS_BLOCK_STEMS.get(stem)
+            return (
+                None
+                if mapped is None
+                else f"speaker_encoder.transformer.layers.{index}.{mapped}"
+            )
+        seanet = re.match(
+            r"^a\.seanet\.blk\.(\d+)\.(res_conv1|res_conv2|scale_conv)\.(weight|bias)$",
+            name,
+        )
+        if seanet is not None:
+            index, stem, kind = seanet.groups()
+            mapped_stem = {
+                "res_conv1": "residual.conv1",
+                "res_conv2": "residual.conv2",
+                "scale_conv": "scale",
+            }[stem]
+            return f"speaker_encoder.seanet.stages.{index}.{mapped_stem}.{kind}"
+        return {
+            "a.seanet.conv_in.weight": "speaker_encoder.seanet.conv_in.weight",
+            "a.seanet.conv_in.bias": "speaker_encoder.seanet.conv_in.bias",
+            "a.seanet.conv_out.weight": "speaker_encoder.seanet.conv_out.weight",
+            "a.seanet.conv_out.bias": "speaker_encoder.seanet.conv_out.bias",
+            "a.downsample.conv.weight": "speaker_encoder.downsample.weight",
+            "a.speaker_proj.weight": "speaker_encoder.speaker_projection.weight",
+        }.get(name)
     if projector_type != "meralion":
         raise ValueError(f"Unknown standalone GGUF audio projector type {projector_type!r}.")
-    block = _AUDIO_BLK.match(name)
     if block is not None:
         index, stem = block.groups()
         mapped = _WHISPER_AUDIO_BLOCK_STEMS.get(stem)

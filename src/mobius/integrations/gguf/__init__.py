@@ -40,6 +40,7 @@ from mobius.integrations.gguf._config_mapping import (
     resolve_model_type,
 )
 from mobius.integrations.gguf._mmproj import (
+    build_audio_projector_from_gguf,
     build_gemma3_vlm_from_gguf,
     build_gemma4_vlm_from_gguf,
     build_mmproj_from_gguf,
@@ -82,6 +83,7 @@ from mobius.integrations.gguf._tokenizer_census import (
 
 __all__ = [
     "build_from_gguf",
+    "build_audio_projector_from_gguf",
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
     "build_mmproj_from_gguf",
