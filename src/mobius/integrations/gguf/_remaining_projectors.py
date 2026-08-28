@@ -393,6 +393,11 @@ def _create_cog(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.Modu
 def _create_nemotron(metadata: Mapping[str, object], shapes: TensorShapes) -> nn.Module:
     image = _metadata_int(metadata, "clip.vision.image_size")
     patch = _metadata_int(metadata, "clip.vision.patch_size")
+    scale = _metadata_int(metadata, "clip.vision.projector.scale_factor")
+    if scale != 2:
+        raise ValueError(
+            f"nemotron_v2_vl clip.vision.projector.scale_factor must be 2, got {scale}."
+        )
     registers = _shape(shapes, "v.class_embd", 2)[0]
     first = _shape(shapes, "mm.model.mlp.1.weight", 2)
     output = _shape(shapes, "mm.model.mlp.3.weight", 2)[0]
@@ -986,37 +991,39 @@ def map_remaining_projector_weight(name: str, projector_type: str) -> str | None
     return None if local is None else f"vision_encoder.{local}"
 
 
-def _fused_hunyuan_state(mmproj_gguf: Any) -> tuple[dict[str, torch.Tensor], set[str]]:
+def _fused_qkv_state(
+    mmproj_gguf: Any,
+    target_stem: str,
+) -> tuple[dict[str, torch.Tensor], set[str]]:
     state: dict[str, torch.Tensor] = {}
     consumed: set[str] = set()
     layers = _metadata_int(mmproj_gguf.metadata, "clip.vision.block_count")
+    hidden_size = _metadata_int(mmproj_gguf.metadata, "clip.vision.embedding_length")
     for layer in range(layers):
         for kind in ("weight", "bias"):
             names = [f"v.blk.{layer}.attn_{part}.{kind}" for part in ("q", "k", "v")]
             values = [
                 np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32) for name in names
             ]
-            state[f"vision_encoder.layers.{layer}.attn.in_proj.{kind}"] = torch.from_numpy(
-                np.concatenate(values, axis=0).copy()
-            )
-            consumed.update(names)
-    return state, consumed
-
-
-def _fused_cog_state(mmproj_gguf: Any) -> tuple[dict[str, torch.Tensor], set[str]]:
-    state: dict[str, torch.Tensor] = {}
-    consumed: set[str] = set()
-    layers = _metadata_int(mmproj_gguf.metadata, "clip.vision.block_count")
-    for layer in range(layers):
-        for kind in ("weight", "bias"):
-            names = [f"v.blk.{layer}.attn_{part}.{kind}" for part in ("q", "k", "v")]
-            values = [
-                np.asarray(mmproj_gguf.get_tensor(name), dtype=np.float32) for name in names
-            ]
-            target = f"vision_encoder.blocks.{layer}.attention.qkv.{kind}"
+            expected_shape = (hidden_size, hidden_size) if kind == "weight" else (hidden_size,)
+            for name, value in zip(names, values):
+                if value.shape != expected_shape:
+                    raise ValueError(
+                        f"{name} has shape {value.shape}, expected {expected_shape} "
+                        "before QKV fusion."
+                    )
+            target = f"vision_encoder.{target_stem.format(layer=layer)}.{kind}"
             state[target] = torch.from_numpy(np.concatenate(values, axis=0).copy())
             consumed.update(names)
     return state, consumed
+
+
+def _fused_hunyuan_state(mmproj_gguf: Any) -> tuple[dict[str, torch.Tensor], set[str]]:
+    return _fused_qkv_state(mmproj_gguf, "layers.{layer}.attn.in_proj")
+
+
+def _fused_cog_state(mmproj_gguf: Any) -> tuple[dict[str, torch.Tensor], set[str]]:
+    return _fused_qkv_state(mmproj_gguf, "blocks.{layer}.attention.qkv")
 
 
 def remaining_projector_state_dict(mmproj_gguf: Any, projector_type: str) -> dict:

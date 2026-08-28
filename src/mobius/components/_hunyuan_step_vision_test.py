@@ -397,3 +397,52 @@ def test_step3vl_runtime_grid_controls_position_resize_and_downsampling():
             },
         )[0]
         assert actual.shape == (1, math.ceil(h / 4) * math.ceil(w / 4), 3)
+
+
+def test_step3vl_position_resize_matches_torch_antialias_up_and_down():
+    class _PositionResizeProbe(Step3VLClipSidecar):
+        def forward(self, op, pixel_values, pos_h, pos_w):
+            del pixel_values, pos_h, pos_w
+            return self._resize_positions(
+                op,
+                op.Constant(value_int=target_size),
+                op.Constant(value_int=target_size),
+            )
+
+    for source_size, target_size in ((2, 4), (4, 2)):
+        component = _PositionResizeProbe(
+            vision_hidden_size=4,
+            intermediate_size=4,
+            num_heads=1,
+            num_layers=0,
+            patch_size=1,
+            grid_height=4,
+            grid_width=4,
+            position_grid_size=source_size,
+            downsample_hidden_size=4,
+            output_size=3,
+        )
+        _, op, graph = create_test_builder()
+        unused = op.Constant(value_float=0.0)
+        output = component(op, unused, unused, unused)
+        output.name = "positions"
+        graph.outputs.append(output)
+        state, session = _state_and_session(component, graph, 47 + source_size)
+
+        source = torch.from_numpy(state["position_embedding"]).reshape(
+            1, source_size, source_size, 4
+        )
+        expected = functional.interpolate(
+            source.permute(0, 3, 1, 2),
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        ).permute(0, 2, 3, 1)
+        actual = session.run(None, {})[0]
+        np.testing.assert_allclose(
+            actual,
+            expected.reshape(1, target_size * target_size, 4).numpy(),
+            rtol=1e-6,
+            atol=1e-6,
+        )

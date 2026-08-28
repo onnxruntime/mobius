@@ -282,7 +282,10 @@ def test_production_patch_weight_mapping_preserves_values(
     class _Reader:
         def __init__(self) -> None:
             self.tensor_names = (source_name,)
-            self.metadata = {"clip.vision.block_count": 1}
+            self.metadata = {
+                "clip.vision.block_count": 1,
+                "clip.vision.embedding_length": 2,
+            }
 
         def get_tensor(self, name: str) -> np.ndarray:
             if name == source_name:
@@ -310,6 +313,45 @@ def test_minicpm_rejects_unknown_projector_scale() -> None:
             metadata,
             {"v.position_embd.weight": (4, 4)},
         )
+
+
+@pytest.mark.parametrize("projector_type", ["hunyuanvl", "cogvlm"])
+def test_fused_qkv_rejects_compensating_source_row_shapes(projector_type: str) -> None:
+    names = tuple(
+        f"v.blk.0.attn_{part}.{kind}"
+        for kind in ("weight", "bias")
+        for part in ("q", "k", "v")
+    )
+
+    class _Reader:
+        def __init__(self) -> None:
+            self.tensor_names = names
+            self.metadata = {
+                "clip.vision.block_count": 1,
+                "clip.vision.embedding_length": 2,
+            }
+
+        @staticmethod
+        def get_tensor(name: str) -> np.ndarray:
+            if name.endswith(".bias"):
+                return np.zeros((2,), dtype=np.float32)
+            rows = {"attn_q": 3, "attn_k": 1, "attn_v": 2}
+            stem = next(key for key in rows if key in name)
+            return np.zeros((rows[stem], 2), dtype=np.float32)
+
+    with pytest.raises(ValueError, match=r"attn_q\.weight.*expected"):
+        remaining_projector_state_dict(_Reader(), projector_type)
+
+
+@pytest.mark.parametrize("scale", [4, 2.0, True])
+def test_nemotron_rejects_non_exact_merge_scale(scale: object) -> None:
+    metadata = {
+        "clip.vision.image_size": 4,
+        "clip.vision.patch_size": 2,
+        "clip.vision.projector.scale_factor": scale,
+    }
+    with pytest.raises(ValueError, match=r"clip\.vision\.projector\.scale_factor"):
+        create_remaining_vision_projector("nemotron_v2_vl", metadata, {})
 
 
 def test_meralion_factory_and_mapping_preserve_stack_before_norm_contract() -> None:

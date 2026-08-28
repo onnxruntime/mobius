@@ -466,6 +466,7 @@ class Step3VLClipSidecar(nn.Module):
             mode="linear",
             coordinate_transformation_mode="half_pixel",
             antialias=1,
+            exclude_outside=1,
         )
         positions = op.Transpose(positions, perm=[0, 2, 3, 1])
         return op.Reshape(
