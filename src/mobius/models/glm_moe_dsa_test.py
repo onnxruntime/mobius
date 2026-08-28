@@ -374,17 +374,10 @@ class TestGlmMoeDsaGraphBuild:
 class TestPreprocessWeights:
     def _state_dict(self, config: ArchitectureConfig) -> dict[str, torch.Tensor]:
         model = GlmMoeDsaCausalLMModel(config)
-        state = {
+        return {
             name: torch.zeros(tuple(int(d) for d in p.shape))
             for name, p in model.named_parameters()
         }
-        # Convert Mobius's own attribute-path names into the HF-style
-        # ``model.layers.N.*`` names preprocess_weights expects on input.
-        renamed = {
-            f"model.{name}" if not name.startswith("lm_head") else name: v
-            for name, v in state.items()
-        }
-        return renamed
 
     def test_drops_mtp_layer_weights_with_warning(self, caplog):
         config = _glm_config(num_hidden_layers=4)
@@ -419,6 +412,43 @@ class TestPreprocessWeights:
         state = self._state_dict(config)
         out = model.preprocess_weights(state)
         assert any(".self_attn.indexer." in k for k in out)
+
+    @pytest.mark.parametrize("use_dsa", [True, False], ids=["dsa", "dense"])
+    def test_preprocessed_weights_cover_every_graph_parameter(self, use_dsa: bool):
+        config = _glm_config(
+            num_hidden_layers=1,
+            indexer_types=["full"],
+            use_dsa=use_dsa,
+        )
+        model = GlmMoeDsaCausalLMModel(config)
+        graph = build_from_module(model, config, task="glm-moe-dsa")["model"].graph
+        state = {
+            name: torch.zeros(tuple(int(d) for d in initializer.shape))
+            for name, initializer in graph.initializers.items()
+            if initializer.const_value is None
+        }
+        expected = set(state)
+
+        if use_dsa:
+            prefix = "model.layers.0.self_attn."
+            key_rows = state.pop(f"{prefix}k_b_proj.weight").reshape(
+                config.num_attention_heads,
+                config.qk_nope_head_dim,
+                config.kv_lora_rank,
+            )
+            value_rows = state.pop(f"{prefix}v_b_proj.weight").reshape(
+                config.num_attention_heads,
+                config.v_head_dim,
+                config.kv_lora_rank,
+            )
+            state[f"{prefix}kv_b_proj.weight"] = torch.cat(
+                (key_rows, value_rows), dim=1
+            ).reshape(-1, config.kv_lora_rank)
+
+        out = model.preprocess_weights(state)
+
+        assert expected
+        assert set(out) == expected
 
     def test_splits_hf_fused_kv_b_projection(self):
         config = _glm_config(num_hidden_layers=1, indexer_types=["full"])

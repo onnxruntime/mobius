@@ -673,7 +673,7 @@ class GlmMoeDsaCausalLMModel(DeepSeekV3CausalLMModel):
         state_dict = dict(state_dict)
         kv_b_suffix = ".self_attn.kv_b_proj.weight"
         for key in tuple(state_dict):
-            if not key.endswith(kv_b_suffix):
+            if not self.config.use_dsa or not key.endswith(kv_b_suffix):
                 continue
             tensor = state_dict.pop(key)
             expected_rows = self.config.num_attention_heads * (
