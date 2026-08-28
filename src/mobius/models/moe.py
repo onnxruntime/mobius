@@ -585,13 +585,14 @@ class GrokGGUFCausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        logits, present_key_values = super().forward(
+        outputs = super().forward(
             op,
             input_ids,
             attention_mask,
             position_ids,
             past_key_values,
         )
+        logits = outputs[0]
         logits = op.Mul(logits, op.CastLike(self._logit_scale, logits))
         if not math.isclose(
             self._final_logit_softcapping,
@@ -601,7 +602,7 @@ class GrokGGUFCausalLMModel(CausalLMModel):
         ):
             cap = op.CastLike(self._final_logit_softcapping, logits)
             logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
-        return logits, present_key_values
+        return (logits, *outputs[1:])
 
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]

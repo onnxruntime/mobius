@@ -9,7 +9,7 @@ import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from mobius.integrations.gguf._tensor_mapping import is_known_skip
+from mobius.integrations.gguf._tensor_mapping import is_known_skip, map_gguf_to_hf_names
 
 _ARCHITECTURES = frozenset({"grok", "grovemoe", "hunyuan-moe"})
 
@@ -175,6 +175,10 @@ def validate_remaining_moe_tensor_contract(gguf_model) -> None:
         name: tuple(int(dimension) for dimension in shape)
         for name, _raw, _qtype, shape in gguf_model.tensor_items_raw()
         if not is_known_skip(name)
+        and not (
+            name.endswith((".scale", ".input_scale"))
+            and map_gguf_to_hf_names(name, architecture) is not None
+        )
     }
     required: dict[str, tuple[int, ...]] = {
         "token_embd.weight": (vocab, hidden),
@@ -189,6 +193,7 @@ def validate_remaining_moe_tensor_contract(gguf_model) -> None:
             raise ValueError("grok.expert_feed_forward_length must be non-negative")
         expert_width = expert_width or dense_width
         dense_layers: list[bool] = []
+        gated_dense_layers: list[bool] = []
         gated_expert_layers: list[bool] = []
         for layer in range(layers):
             prefix = f"blk.{layer}."
@@ -231,7 +236,6 @@ def validate_remaining_moe_tensor_contract(gguf_model) -> None:
             required[selected_post_norm] = (hidden,)
 
             dense_shapes = {
-                prefix + "ffn_gate.weight": (dense_width, hidden),
                 prefix + "ffn_up.weight": (dense_width, hidden),
                 prefix + "ffn_down.weight": (hidden, dense_width),
             }
@@ -240,11 +244,25 @@ def validate_remaining_moe_tensor_contract(gguf_model) -> None:
                 raise ValueError(
                     f"{architecture} layer {layer} has a partial dense FFN tensor family"
                 )
-            dense_layers.append(bool(present_dense))
+            dense_gate = prefix + "ffn_gate.weight"
+            has_dense = bool(present_dense)
+            has_dense_gate = dense_gate in actual
+            if has_dense_gate and not has_dense:
+                raise ValueError(
+                    f"{architecture} layer {layer} has a dense FFN gate without "
+                    "complete up/down projections"
+                )
+            dense_layers.append(has_dense)
             if present_dense:
                 required.update(dense_shapes)
+                if has_dense_gate:
+                    required[dense_gate] = (dense_width, hidden)
+                    gated_dense_layers.append(True)
+                else:
+                    gated_dense_layers.append(False)
         _require_uniform("grok attention projection biases", attention_biases)
         _require_uniform("grok dense FFN topology", dense_layers)
+        _require_uniform("grok dense FFN gating topology", gated_dense_layers)
         _require_uniform("grok expert gating topology", gated_expert_layers)
         _validate_shapes(architecture, actual, required, optional)
         return

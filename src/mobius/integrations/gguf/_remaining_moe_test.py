@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -143,6 +144,7 @@ def _fixture(architecture: str) -> _FakeGGUF:
         metadata.update(
             {
                 "grok.expert_feed_forward_length": _EXPERT_WIDTH,
+                "grok.attention.layer_norm_epsilon": 1e-12,
                 "grok.embedding_scale": 2.0,
                 "grok.attention.output_scale": 0.5,
                 "grok.logit_scale": 0.25,
@@ -265,10 +267,17 @@ def _fixture(architecture: str) -> _FakeGGUF:
     return _FakeGGUF(architecture, metadata, tensors)
 
 
-def _write_fixture(path: Path, architecture: str) -> None:
+def _write_fixture(
+    path: Path,
+    architecture: str,
+    *,
+    source: _FakeGGUF | None = None,
+) -> None:
     from gguf import GGUFWriter
 
-    source = _fixture(architecture)
+    source = source or _fixture(architecture)
+    if source.architecture != architecture:
+        raise ValueError("Synthetic GGUF source architecture does not match the writer")
     writer = GGUFWriter(str(path), architecture)
     for key, value in source.metadata.items():
         if isinstance(value, bool):
@@ -404,6 +413,11 @@ def test_exact_tensor_closure_config_and_graph(architecture: str) -> None:
         attention = next(node for node in graph if node.op_type == "Attention")
         assert attention.attributes["scale"].value == pytest.approx(0.5)
         assert attention.attributes["softcap"].value == pytest.approx(3.0)
+        assert all(
+            node.attributes["epsilon"].value == pytest.approx(1e-5)
+            for node in graph
+            if node.op_type == "RMSNormalization"
+        )
     elif architecture == "grovemoe":
         assert any("chunk_experts.0" in name for name in graph.initializers)
     else:
@@ -424,14 +438,17 @@ def test_exact_tensor_closure_config_and_graph(architecture: str) -> None:
         assert rotary_index < q_norm_index
 
 
-@pytest.mark.parametrize("architecture", ["grok", "grovemoe", "hunyuan-moe"])
-def test_synthetic_gguf_build_executes_end_to_end(
-    architecture: str,
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / f"{architecture}.gguf"
-    _write_fixture(path, architecture)
-    package = build_from_gguf(path, keep_quantized=False)
+def test_grok_forward_preserves_optional_base_outputs() -> None:
+    config = dataclasses.replace(
+        gguf_to_config(_fixture("grok")),
+        output_final_hidden_state=True,
+    )
+    module = registry.get(get_arch_spec("grok").module_type)(config)
+    graph = CausalLMTask().build(module, config)["model"].graph
+    assert "mtp_seed" in {output.name for output in graph.outputs}
+
+
+def _run_synthetic_package(package) -> np.ndarray:
     session = OnnxModelSession(package["model"], device="cpu")
     feeds = {
         "input_ids": np.array([[1, 2]], dtype=np.int64),
@@ -443,11 +460,65 @@ def test_synthetic_gguf_build_executes_end_to_end(
         feeds[f"past_key_values.{layer}.key"] = np.empty(shape, dtype=np.float32)
         feeds[f"past_key_values.{layer}.value"] = np.empty(shape, dtype=np.float32)
     try:
-        logits = session.run(feeds)["logits"]
+        return session.run(feeds)["logits"]
     finally:
         session.close()
+
+
+@pytest.mark.parametrize("architecture", ["grok", "grovemoe", "hunyuan-moe"])
+def test_synthetic_gguf_build_executes_end_to_end(
+    architecture: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"{architecture}.gguf"
+    _write_fixture(path, architecture)
+    package = build_from_gguf(path, keep_quantized=False)
+    logits = _run_synthetic_package(package)
     assert logits.shape == (1, 2, _VOCAB)
     assert np.isfinite(logits).all()
+
+
+def test_grok_ungated_dense_ffn_builds_applies_weights_and_executes(
+    tmp_path: Path,
+) -> None:
+    source = _fixture("grok")
+    for layer in range(_LAYERS):
+        del source._tensors[f"blk.{layer}.ffn_gate.weight"]
+    validate_remaining_moe_tensor_contract(source)
+    config = gguf_to_config(source)
+    assert config.has_dense_ffn
+    assert not config.has_gated_dense_ffn
+
+    path = tmp_path / "grok-ungated-dense.gguf"
+    _write_fixture(path, "grok", source=source)
+    package = build_from_gguf(path, keep_quantized=False)
+    initializers = package["model"].graph.initializers
+    for layer in range(_LAYERS):
+        prefix = f"model.layers.{layer}.residual_mlp."
+        assert not any(name.startswith(prefix + "gate_proj.") for name in initializers)
+        assert initializers[prefix + "up_proj.weight_t"].const_value is not None
+        assert initializers[prefix + "down_proj.weight_t"].const_value is not None
+    logits = _run_synthetic_package(package)
+    assert logits.shape == (1, 2, _VOCAB)
+    assert np.isfinite(logits).all()
+
+
+def test_grok_dense_ffn_rejects_partial_and_mixed_gating() -> None:
+    partial = _fixture("grok")
+    del partial._tensors["blk.0.ffn_down.weight"]
+    with pytest.raises(ValueError, match="partial dense FFN tensor family"):
+        validate_remaining_moe_tensor_contract(partial)
+
+    gate_only = _fixture("grok")
+    del gate_only._tensors["blk.0.ffn_up.weight"]
+    del gate_only._tensors["blk.0.ffn_down.weight"]
+    with pytest.raises(ValueError, match="gate without complete up/down"):
+        validate_remaining_moe_tensor_contract(gate_only)
+
+    mixed = _fixture("grok")
+    del mixed._tensors["blk.0.ffn_gate.weight"]
+    with pytest.raises(ValueError, match="dense FFN gating topology"):
+        validate_remaining_moe_tensor_contract(mixed)
 
 
 @pytest.mark.parametrize("architecture", ["grok", "grovemoe", "hunyuan-moe"])
@@ -493,9 +564,26 @@ def test_suffix_exact_mapping_rejects_legacy_and_cross_architecture_tensors() ->
     assert map_gguf_to_hf_names("blk.0.ffn_gate_chexps.weight", "hunyuan-moe") is None
 
 
+def test_auxiliary_sidecars_are_owned_by_the_fail_closed_preflight(tmp_path: Path) -> None:
+    source = _fixture("grok")
+    source._tensors["blk.0.ffn_up_exps.scale"] = (_EXPERTS,)
+    validate_remaining_moe_tensor_contract(source)
+
+    path = tmp_path / "grok-sidecar.gguf"
+    _write_fixture(path, "grok", source=source)
+    with pytest.raises(ValueError, match="cannot represent GGUF scale/input_scale sidecars"):
+        build_from_gguf(path, keep_quantized=False)
+
+    unowned = _fixture("grok")
+    unowned._tensors["blk.0.unowned.scale"] = (1,)
+    with pytest.raises(ValueError, match="unexpected"):
+        validate_remaining_moe_tensor_contract(unowned)
+
+
 def test_config_closure_preserves_architecture_semantics() -> None:
     grok = gguf_to_config(_fixture("grok"))
     assert isinstance(grok, GrokGGUFConfig)
+    assert grok.rms_norm_eps == pytest.approx(1e-5)
     assert grok.embedding_scale == pytest.approx(2.0)
     assert grok.attention_output_scale == pytest.approx(0.5)
     assert grok.logit_output_scale == pytest.approx(0.25)
@@ -578,6 +666,7 @@ def test_grok_yarn_defaults_and_fingerprint_isolation() -> None:
     assert config.rope_scaling["beta_slow"] == pytest.approx(1.0)
 
     baseline = _serialize_route_graph_config(config, "grok")
+    assert json.loads(baseline)["rms_norm_eps"] == pytest.approx(1e-5)
     changed_ignored = _serialize_route_graph_config(
         dataclasses.replace(config, router_logit_softcapping=99.0),
         "grok",
@@ -594,7 +683,10 @@ def test_grok_yarn_defaults_and_fingerprint_isolation() -> None:
 
 
 def test_grok_decoder_matches_pinned_synthetic_reference() -> None:
-    config = GrokGGUFConfig(
+    parsed = gguf_to_config(_fixture("grok"))
+    assert isinstance(parsed, GrokGGUFConfig)
+    config = dataclasses.replace(
+        parsed,
         hidden_size=4,
         intermediate_size=6,
         num_hidden_layers=1,
@@ -605,13 +697,13 @@ def test_grok_decoder_matches_pinned_synthetic_reference() -> None:
         num_experts_per_tok=2,
         moe_intermediate_size=3,
         hidden_act="gelu_new",
-        rms_norm_eps=1e-5,
         attention_output_scale=0.5,
         attn_logit_softcapping=2.0,
         has_dense_ffn=True,
         has_gated_dense_ffn=True,
         has_gated_experts=True,
     )
+    eps = config.rms_norm_eps
     layer = GrokGGUFDecoderLayer(config)
     builder, op, graph = create_test_builder()
     hidden = create_test_input(builder, "hidden", [1, 2, 4])
@@ -625,7 +717,7 @@ def test_grok_decoder_matches_pinned_synthetic_reference() -> None:
         dtype=torch.float32,
     )
 
-    normalized = _rms_norm(hidden_value, weights["input_layernorm.weight"], 1e-5)
+    normalized = _rms_norm(hidden_value, weights["input_layernorm.weight"], eps)
     query = _linear(normalized, weights, "self_attn.q_proj")
     key = _linear(normalized, weights, "self_attn.k_proj")
     value = _linear(normalized, weights, "self_attn.v_proj")
@@ -643,13 +735,13 @@ def test_grok_decoder_matches_pinned_synthetic_reference() -> None:
     attention = _rms_norm(
         attention,
         weights["attention_output_layernorm.weight"],
-        1e-5,
+        eps,
     )
     ffn_input = hidden_value + attention
     normalized = _rms_norm(
         ffn_input,
         weights["pre_feedforward_layernorm.weight"],
-        1e-5,
+        eps,
     )
     probabilities = torch.softmax(_linear(normalized, weights, "mlp.gate"), dim=-1)
     routing_weights, selected = torch.topk(probabilities, 2, dim=-1)
@@ -669,7 +761,7 @@ def test_grok_decoder_matches_pinned_synthetic_reference() -> None:
     ffn_output = _rms_norm(
         ffn_output,
         weights["post_feedforward_layernorm.weight"],
-        1e-5,
+        eps,
     )
     expected = ffn_input + ffn_output
 

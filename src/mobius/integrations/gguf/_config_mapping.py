@@ -1630,6 +1630,10 @@ def _grok_postprocess(
         return value
 
     embedding_scale = finite("embedding_scale", 78.38367176906169)
+    rms_norm_eps = finite(
+        "attention.layer_norm_rms_epsilon",
+        config.rms_norm_eps,
+    )
     attention_output_scale = finite(
         "attention.output_scale",
         0.08838834764831845,
@@ -1641,6 +1645,8 @@ def _grok_postprocess(
     temperature_length = int(metadata.get(f"{arch}.attention.temperature_length", 0))
     if math.isclose(logit_output_scale, 0.0, rel_tol=0.0, abs_tol=0.0):
         raise ValueError("grok.logit_scale must be nonzero")
+    if rms_norm_eps <= 0:
+        raise ValueError("grok.attention.layer_norm_rms_epsilon must be positive")
     if attn_softcap <= 0:
         raise ValueError("grok.attn_logit_softcapping must be positive")
     if final_softcap < 0:
@@ -1668,6 +1674,7 @@ def _grok_postprocess(
     fields.update(
         model_type="grok_gguf",
         hidden_act="gelu_new",
+        rms_norm_eps=rms_norm_eps,
         mlp_bias=False,
         norm_topk_prob=True,
         routed_scaling_factor=1.0,
