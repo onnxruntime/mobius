@@ -35,6 +35,7 @@ __all__ = [
     "build_generic_projector_vlm_from_gguf",
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
+    "build_mmproj_from_gguf",
     "build_qwen_vlm_from_gguf",
     "build_vlm_from_gguf",
     "build_muse_glimmer_vlm_from_gguf",
@@ -566,11 +567,18 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
     """Validate the complete sidecar inventory, including deferred companions."""
     names = set(mmproj_gguf.tensor_names)
     top = set(spec.required_top_tensors) | set(spec.optional_top_tensors)
-    block_names, matched = _collect_block_tensors(
-        names,
-        prefix=spec.block_prefix or "",
-        suffixes=spec.block_suffixes,
-    )
+    if spec.block_prefix is None:
+        block_names: dict[int, set[str]] = {}
+        matched: set[str] = set()
+    else:
+        block_names, matched = _collect_block_tensors(
+            names,
+            prefix=spec.block_prefix,
+            suffixes=spec.block_suffixes,
+        )
+    for pattern in spec.auxiliary_tensor_patterns:
+        expression = re.compile(pattern)
+        matched.update(name for name in names if expression.fullmatch(name))
     matched.update(top & names)
 
     active_companions = []
@@ -619,6 +627,31 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
         matched.update(companion_matched)
         active_companions.append(companion)
 
+    quarantined_names: set[str] = set()
+    for companion in spec.deferred_companions:
+        presence_key = f"clip.has_{companion.modality.value.replace('.', '_')}_encoder"
+        if not mmproj_gguf.metadata.get(presence_key):
+            continue
+        actual_type = projector_type_for_modality(
+            mmproj_gguf.metadata,
+            companion.modality,
+        )
+        if actual_type != companion.projector_type:
+            raise ValueError(
+                f"{spec.projector_type} sidecar declares deferred "
+                f"{companion.modality.value} projector {actual_type!r}, expected "
+                f"{companion.projector_type!r}."
+            )
+        for prefix in companion.tensor_prefixes:
+            prefixed = {name for name in names if name.startswith(prefix)}
+            if not prefixed:
+                raise ValueError(
+                    f"{companion.projector_type} deferred companion has no tensors "
+                    f"under required namespace {prefix!r}."
+                )
+            quarantined_names.update(prefixed)
+        matched.update(quarantined_names)
+
     unexpected = sorted(names - matched)
     if unexpected:
         raise ValueError(
@@ -631,16 +664,20 @@ def _validate_mmproj_tensor_closure(mmproj_gguf: Any, spec: ProjectorSpec) -> No
         raise ValueError(
             f"{spec.projector_type} mmproj is missing required tensor(s): {missing_top}"
         )
-    layers = int(mmproj_gguf.metadata["clip.vision.block_count"])
-    _validate_block_tensor_set(
-        projector_type=spec.projector_type,
-        modality=MMProjModality.VISION,
-        blocks=block_names,
-        block_count=layers,
-        required_suffixes=spec.block_suffixes,
-    )
+    if spec.block_prefix is not None:
+        primary_modality = spec.primary_modality
+        layers = int(mmproj_gguf.metadata[f"clip.{primary_modality.value}.block_count"])
+        _validate_block_tensor_set(
+            projector_type=spec.projector_type,
+            modality=primary_modality,
+            blocks=block_names,
+            block_count=layers,
+            required_suffixes=spec.block_suffixes,
+        )
 
     for name in sorted(names):
+        if name in quarantined_names:
+            continue
         qtype = mmproj_gguf.get_tensor_type(name).name
         is_calibration = name.endswith(_CLIPPING_BOUND_SUFFIXES)
         if is_calibration and qtype != "F32":
@@ -734,6 +771,18 @@ def _validate_gemma4_audio_companion_shapes(mmproj_gguf: Any, companion: Any) ->
 
 
 def _validate_supported_mmproj_shapes(mmproj_gguf: Any, spec: ProjectorSpec) -> None:
+    if spec.sidecar_builder == "qwen_glm_projector":
+        from mobius.integrations.gguf._qwen_glm_projector import (
+            validate_qwen_glm_projector_shapes,
+        )
+
+        validate_qwen_glm_projector_shapes(mmproj_gguf, spec.projector_type)
+        return
+    if spec.primary_modality is not MMProjModality.VISION:
+        raise RuntimeError(
+            f"{spec.projector_type} declares a non-vision primary modality without "
+            "an architecture-specific shape validator."
+        )
     md = mmproj_gguf.metadata
     hidden = int(md["clip.vision.embedding_length"])
     intermediate = int(md["clip.vision.feed_forward_length"])
@@ -1038,6 +1087,122 @@ def _preflight_mmproj_pair(
             )
         resolved[modality] = spec
     return resolved
+
+
+def _preflight_standalone_mmproj(
+    mmproj_gguf: Any,
+    *,
+    projector_type: str,
+    target_architecture: str,
+) -> ProjectorSpec:
+    """Validate one explicitly selected standalone sidecar graph route."""
+    if mmproj_gguf.architecture != MMPROJ_ARCHITECTURE:
+        raise ValueError(
+            f"Expected a {MMPROJ_ARCHITECTURE!r} mmproj GGUF, got architecture "
+            f"{mmproj_gguf.architecture!r}."
+        )
+    _validate_mmproj_container_type(mmproj_gguf)
+    spec = get_projector_spec(projector_type)
+    canonical_target = _canonical_text_architecture(target_architecture)
+    if canonical_target not in spec.target_architectures:
+        raise ValueError(
+            f"clip projector {projector_type!r} targets "
+            f"{sorted(spec.target_architectures)}, not text architecture "
+            f"{target_architecture!r}."
+        )
+
+    selected_modalities = []
+    for modality in spec.modalities:
+        presence_key = f"clip.has_{modality.value.replace('.', '_')}_encoder"
+        if not bool(mmproj_gguf.metadata.get(presence_key)):
+            continue
+        if projector_type_for_modality(mmproj_gguf.metadata, modality) == projector_type:
+            selected_modalities.append(modality)
+    if spec.primary_modality not in selected_modalities:
+        raise ValueError(
+            f"mmproj GGUF does not declare {projector_type!r} for its "
+            f"{spec.primary_modality.value} encoder."
+        )
+
+    missing_metadata = [
+        key for key in spec.required_metadata if key not in mmproj_gguf.metadata
+    ]
+    if missing_metadata:
+        raise ValueError(
+            f"{projector_type} mmproj is missing required metadata: {missing_metadata}"
+        )
+    _validate_mmproj_tensor_closure(mmproj_gguf, spec)
+    if not spec.is_importable or spec.sidecar_builder is None:
+        blocked = ", ".join(
+            name
+            for name, verdict in spec.verdicts.items()
+            if name != "runtime" and verdict is not Support.SUPPORTED
+        )
+        raise NotImplementedError(
+            f"clip projector {projector_type!r} has no standalone graph importer at "
+            f"llama.cpp {LLAMA_CPP_MMPROJ_SHA} ({blocked or 'dispatch'} unavailable): "
+            f"{spec.reason}"
+        )
+    return spec
+
+
+def build_mmproj_from_gguf(
+    mmproj_gguf_path: str | Path,
+    *,
+    projector_type: str,
+    target_architecture: str,
+    dtype: str | None = None,
+    execution_provider: str = "default",
+    _mmproj_gguf_model: Any | None = None,
+) -> ModelPackage:
+    """Build explicit standalone encoder/projector components from one sidecar.
+
+    This entry point never synthesizes a text decoder or runtime assembly. The
+    caller names both the serialized projector route and its paired text
+    architecture so a vision, audio, merger, or speaker encoder cannot be
+    mistaken for a generic VLM package.
+    """
+    from mobius.integrations.gguf._builder import _validate_gguf_model
+    from mobius.integrations.gguf._reader import GGUFModel
+
+    resolved_path = _resolve_mmproj_companion_path(mmproj_gguf_path)
+    mmproj_gguf = (
+        _mmproj_gguf_model
+        if _mmproj_gguf_model is not None
+        else GGUFModel(resolved_path)
+    )
+    _validate_gguf_model(
+        mmproj_gguf,
+        source=str(mmproj_gguf_path),
+        allow_mmproj_companion=True,
+    )
+    spec = _preflight_standalone_mmproj(
+        mmproj_gguf,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+    )
+    builder_attribute = _MMPROJ_BUILDERS.get(spec.sidecar_builder or "")
+    if builder_attribute is None:
+        raise RuntimeError(
+            f"Projector registry references unknown standalone builder "
+            f"{spec.sidecar_builder!r}."
+        )
+    builder: Callable[..., ModelPackage] = globals()[builder_attribute]
+    package = builder(
+        resolved_path,
+        projector_type=projector_type,
+        target_architecture=target_architecture,
+        dtype=dtype,
+        execution_provider=execution_provider,
+        _mmproj_gguf_model=mmproj_gguf,
+    )
+    expected_roles = {role.value for role in spec.model_roles}
+    if set(package) != expected_roles:
+        raise RuntimeError(
+            f"{projector_type} standalone builder produced components "
+            f"{sorted(package)}, expected {sorted(expected_roles)}."
+        )
+    return package
 
 
 def _token_id(text_gguf: Any, token: str) -> int | None:
@@ -2882,6 +3047,11 @@ _VLM_BUILDERS: dict[str, str] = {
     "muse_glimmer": "build_muse_glimmer_vlm_from_gguf",
     "qwen_vl": "build_qwen_vlm_from_gguf",
 }
+
+#: Standalone sidecar graph entry points selected by
+#: :attr:`ProjectorSpec.sidecar_builder`. Unlike ``_VLM_BUILDERS``, these
+#: functions never create or silently omit a paired text decoder.
+_MMPROJ_BUILDERS: dict[str, str] = {}
 
 
 def _resolve_vlm_builder(text_arch: str, projector_type: str) -> Callable[..., ModelPackage]:

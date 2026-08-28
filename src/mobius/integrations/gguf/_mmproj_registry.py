@@ -23,8 +23,11 @@ __all__ = [
     "MMPROJ_ARTIFACT_PINS",
     "ClipMetadataField",
     "CompanionTensorSpec",
+    "DeferredCompanionSpec",
     "MMProjArtifactAvailabilityPin",
     "MMProjArtifactPin",
+    "MMProjSourceEvidence",
+    "MMProjModelRole",
     "MMProjModality",
     "MMProjTensorRole",
     "ProjectorSpec",
@@ -59,6 +62,15 @@ class MMProjTensorRole(enum.Enum):
     ENCODER = "encoder"
     PROJECTOR = "projector"
     CALIBRATION = "calibration"
+    GENERATED_AUDIO = "generated_audio"
+
+
+class MMProjModelRole(enum.Enum):
+    """Executable component roles produced from an mmproj sidecar."""
+
+    VISION_ENCODER = "vision_encoder"
+    AUDIO_ENCODER = "audio_encoder"
+    SPEAKER_ENCODER = "speaker_encoder"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -84,6 +96,16 @@ class CompanionTensorSpec:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class DeferredCompanionSpec:
+    """Explicitly quarantined co-resident modality that is not built."""
+
+    modality: MMProjModality
+    projector_type: str
+    tensor_prefixes: tuple[str, ...]
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class ProjectorSpec:
     """Capabilities and exact loader closure for one serialized projector type."""
 
@@ -91,20 +113,28 @@ class ProjectorSpec:
     enum_name: str
     modalities: frozenset[MMProjModality]
     target_architectures: frozenset[str] = frozenset()
+    primary_modality: MMProjModality = MMProjModality.VISION
     metadata: Support = Support.DEFERRED
     tensor_map: Support = Support.DEFERRED
     graph: Support = Support.DEFERRED
     runtime: Support = Support.DEFERRED
     reason: str | None = None
+    # ``builder`` assembles a paired text+sidecar package. ``sidecar_builder``
+    # builds only the explicitly named encoder/projector components.
     builder: str | None = None
+    sidecar_builder: str | None = None
+    model_roles: tuple[MMProjModelRole, ...] = ()
     required_metadata: tuple[str, ...] = ()
     required_top_tensors: tuple[str, ...] = ()
     optional_top_tensors: tuple[str, ...] = ()
     block_prefix: str | None = None
     block_suffixes: tuple[str, ...] = ()
+    auxiliary_tensor_patterns: tuple[str, ...] = ()
     companion_tensors: tuple[CompanionTensorSpec, ...] = ()
+    deferred_companions: tuple[DeferredCompanionSpec, ...] = ()
     tensor_roles: tuple[tuple[str, MMProjTensorRole], ...] = ()
     real_artifact_ids: tuple[str, ...] = ()
+    source_evidence_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         verdicts = (self.metadata, self.tensor_map, self.graph, self.runtime)
@@ -113,31 +143,44 @@ class ProjectorSpec:
         has_loader_data = any(
             (
                 self.builder,
+                self.sidecar_builder,
+                self.model_roles,
                 self.required_metadata,
                 self.required_top_tensors,
                 self.optional_top_tensors,
                 self.block_prefix,
                 self.block_suffixes,
+                self.auxiliary_tensor_patterns,
                 self.companion_tensors,
+                self.deferred_companions,
                 self.tensor_roles,
                 self.real_artifact_ids,
+                self.source_evidence_ids,
             )
         )
         has_supported_schema = (
             self.metadata is Support.SUPPORTED and self.tensor_map is Support.SUPPORTED
         )
         if has_supported_schema and has_loader_data:
-            if not self.builder or not self.target_architectures:
+            if not (self.builder or self.sidecar_builder) or not self.target_architectures:
                 raise ValueError(
-                    f"{self.projector_type}: mapped projector needs builder and target"
+                    f"{self.projector_type}: mapped projector needs a builder and target"
+                )
+            if self.primary_modality not in self.modalities:
+                raise ValueError(
+                    f"{self.projector_type}: primary modality must be one of its modalities"
+                )
+            if self.sidecar_builder and not self.model_roles:
+                raise ValueError(
+                    f"{self.projector_type}: standalone sidecar builder needs model roles"
                 )
             if not self.required_metadata or not self.required_top_tensors:
                 raise ValueError(
                     f"{self.projector_type}: mapped projector needs an exact loader closure"
                 )
-            if not self.real_artifact_ids:
+            if not (self.real_artifact_ids or self.source_evidence_ids):
                 raise ValueError(
-                    f"{self.projector_type}: mapped projector needs real artifact evidence"
+                    f"{self.projector_type}: mapped projector needs artifact or source evidence"
                 )
         elif has_loader_data:
             raise ValueError(
@@ -238,6 +281,26 @@ class MMProjArtifactAvailabilityPin:
             raise ValueError(
                 f"{self.artifact_id}: immutable revision and SHA-256 are required"
             )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MMProjSourceEvidence:
+    """Immutable source-level proof used when no valid converter artifact exists."""
+
+    evidence_id: str
+    sources: tuple[tuple[str, str, str], ...]
+    finding: str
+
+    def __post_init__(self) -> None:
+        if not self.evidence_id or not self.finding:
+            raise ValueError("mmproj source evidence needs an id and finding")
+        if not self.sources:
+            raise ValueError(f"{self.evidence_id}: source evidence cannot be empty")
+        for repository, revision, path in self.sources:
+            if not repository or len(revision) != 40 or not path:
+                raise ValueError(
+                    f"{self.evidence_id}: every source needs repository, commit, and path"
+                )
 
 
 _VISION_BASE = frozenset({MMProjModality.VISION})
