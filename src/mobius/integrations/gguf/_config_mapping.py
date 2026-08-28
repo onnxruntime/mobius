@@ -1542,6 +1542,18 @@ def _qwen3_postprocess(
     return dataclasses.replace(config, attn_qk_norm=True, attn_qk_norm_full=False)
 
 
+def _starcoder2_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any = None,
+) -> ArchitectureConfig:
+    """Restore StarCoder2's architecture-owned uniform sliding window."""
+    del metadata, model
+    if config.sliding_window is not None:
+        return config
+    return dataclasses.replace(config, sliding_window=4096)
+
+
 def _dbrx_postprocess(
     config: ArchitectureConfig,
     metadata: dict[str, Any],
@@ -4726,6 +4738,7 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "pangu_embedded": _pangu_embedded_postprocess,
     "dense_sliding": _dense_sliding_postprocess,
     "qwen3": _qwen3_postprocess,
+    "starcoder2": _starcoder2_postprocess,
     "gemma2": _gemma2_postprocess,
     "baichuan": _baichuan_postprocess,
     "chatglm": _chatglm_postprocess,

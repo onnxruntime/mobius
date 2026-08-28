@@ -36,6 +36,7 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
+    DynamicCache,
     GPTBigCodeForCausalLM,
     GPTNeoXForCausalLM,
     MptConfig,
@@ -903,6 +904,74 @@ def _run_promoted_ort(
     return dict(zip(output_names, session.run(output_names, feeds), strict=True))
 
 
+def _assert_starcoder2_long_context_sliding_window(
+    session: ort.InferenceSession,
+    reference: torch.nn.Module,
+    token_id: int,
+    *,
+    atol: float,
+) -> None:
+    """Prove the exact route applies StarCoder2's window past position 4096."""
+    window = int(reference.config.sliding_window)
+    assert window == 4096
+    past_length = window
+    num_layers = int(reference.config.num_hidden_layers)
+    num_kv_heads = int(reference.config.num_key_value_heads)
+    head_dim = int(reference.config.hidden_size // reference.config.num_attention_heads)
+
+    state: dict[str, np.ndarray] = {}
+    cache_data: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_idx in range(num_layers):
+        key = np.zeros((1, num_kv_heads, past_length, head_dim), dtype=np.float32)
+        value = np.zeros_like(key)
+        # Only the oldest value is nonzero. Sliding attention must exclude it at
+        # position 4096; full causal attention still observes it.
+        value[:, :, 0, :] = 1024.0
+        state[f"past_key_values.{layer_idx}.key"] = key
+        state[f"past_key_values.{layer_idx}.value"] = value
+        cache_data.append((torch.from_numpy(key.copy()), torch.from_numpy(value.copy())))
+
+    input_ids = np.asarray([[token_id]], dtype=np.int64)
+    ort_logits = _run_promoted_ort(session, input_ids, state, past_length)["logits"]
+    attention_mask = torch.ones((1, past_length + 1), dtype=torch.int64)
+    position_ids = torch.asarray([[past_length]], dtype=torch.int64)
+
+    def reference_logits(sliding_window: int | None) -> np.ndarray:
+        reference.config.sliding_window = sliding_window
+        cache = DynamicCache(
+            ((key.clone(), value.clone()) for key, value in cache_data),
+            config=reference.config,
+        )
+        with torch.no_grad():
+            return (
+                reference(
+                    torch.from_numpy(input_ids),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    use_cache=False,
+                )
+                .logits.numpy()
+                .copy()
+            )
+
+    try:
+        expected_logits = reference_logits(window)
+        np.testing.assert_allclose(ort_logits, expected_logits, rtol=1e-4, atol=atol)
+
+        full_causal_logits = reference_logits(None)
+        assert np.max(np.abs(ort_logits - full_causal_logits)) > 1e-3
+        with pytest.raises(AssertionError):
+            np.testing.assert_allclose(
+                ort_logits,
+                full_causal_logits,
+                rtol=1e-4,
+                atol=atol,
+            )
+    finally:
+        reference.config.sliding_window = window
+
+
 def _assert_replay_rollback_and_reorder(
     session: ort.InferenceSession,
     prompt_ids: np.ndarray,
@@ -1679,6 +1748,14 @@ def test_promoted_gguf_full_runtime_evidence(
                 atol=case.atol,
             )
         del mutated, mutated_logits
+
+    if evidence.architecture == "starcoder2":
+        _assert_starcoder2_long_context_sliding_window(
+            session,
+            reference,
+            int(prompt_ids[0, -1]),
+            atol=case.atol,
+        )
 
     state = _next_cache(ort_output)
     generated: list[int] = []

@@ -13,7 +13,7 @@ gguf:
   tensor_count: 36
   tensor_qtypes: {F32: 22, Q2_K: 7, Q3_K: 4, Q4_K: 2, Q6_K: 1}
   execution_provider: "cpu"
-  config_sha256: "fe2d8c7611ab003e9802bc5629f05b98ce3b6c5ce0645cef07023df0604b570e"
+  config_sha256: "25eaa4f5baa4e4725930298aaa921804d1e6f202737a3b10ec32070c4acfcb71"
   preserve_quantization: false
   tokenizer:
     repository: "hyper-accel/tiny-random-starcoder2"

@@ -1423,6 +1423,26 @@ def test_qwen3_qk_norm_weights_have_graph_consumers() -> None:
         assert layer.self_attn.k_norm is not None
 
 
+@pytest.mark.parametrize(
+    ("metadata_window", "expected_window"),
+    [(None, 4096), (2048, 2048)],
+)
+def test_starcoder2_restores_architecture_sliding_window(
+    metadata_window: int | None,
+    expected_window: int,
+) -> None:
+    from mobius.integrations.gguf._config_mapping import gguf_to_config
+
+    metadata = _dense_metadata("starcoder2")
+    if metadata_window is not None:
+        metadata["starcoder2.attention.sliding_window"] = metadata_window
+    config = gguf_to_config(_FakeDenseGGUF("starcoder2", metadata, []))
+
+    assert config.sliding_window == expected_window
+    module = registry.get(config.model_type)(config)
+    assert module.model._sliding_window == expected_window
+
+
 class TestQwen35MtpBlockExclusion:
     """Qwen3.5/3.8 GGUF ``block_count`` includes trailing MTP (nextn) blocks.
 

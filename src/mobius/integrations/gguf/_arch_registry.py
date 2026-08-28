@@ -1613,6 +1613,7 @@ _SPECS: tuple[GGUFArchitectureSpec, ...] = (
         gguf_arch="starcoder2",
         model_type="starcoder2",
         tensor_map_recipe=("llama",),
+        config_postprocessor="starcoder2",
         runtime=Support.SUPPORTED,
         runtime_evidence_ids=("tiny-starcoder2-q2-k-ort-genai-0.15.2",),
         reason=(
