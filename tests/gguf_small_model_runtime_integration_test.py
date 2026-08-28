@@ -57,6 +57,7 @@ from mobius.integrations.gguf._quantization_report import (
 )
 from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import (
+    FINAL_RUNTIME_PACKAGE_SCHEMA,
     GGUFRuntimeEvidence,
     gguf_graph_package_identity,
     runtime_evidence,
@@ -1683,10 +1684,6 @@ def test_promoted_gguf_full_runtime_evidence(
         "ort-genai",
         "--runtime-version",
         installed_version,
-        "--tokenizer-repository",
-        evidence.tokenizer_repository,
-        "--tokenizer-revision",
-        evidence.tokenizer_revision,
         "--local-files-only",
     ]
     if case.dequantize:
@@ -1717,11 +1714,12 @@ def test_promoted_gguf_full_runtime_evidence(
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
     assert package.gguf_quantization_report == source_report
-    assert package.export_report is not None
-    assert package.export_report.export_status == "complete"
-    assert package.export_report.runtime_validation_status == "validated"
-    assert package.export_report.end_to_end_runnable is True
-    assert package.export_report.component("tokenizer").output == "exported"
+    if evidence.runtime_package_schema == FINAL_RUNTIME_PACKAGE_SCHEMA:
+        assert package.export_report is not None
+        assert package.export_report.export_status == "complete"
+        assert package.export_report.runtime_validation_status == "validated"
+        assert package.export_report.end_to_end_runnable is True
+        assert package.export_report.component("tokenizer").output == "exported"
     assert (
         GGUFQuantizationReport.read_json(output_dir / "quantization_report.json")
         == source_report

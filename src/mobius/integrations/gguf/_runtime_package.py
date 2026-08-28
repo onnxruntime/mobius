@@ -383,11 +383,7 @@ def write_gguf_runtime_package(
         )
     evidence = None
     evidence_warning: str | None = None
-    if (
-        tokenizer_repository is not None
-        and tokenizer_revision is not None
-        and architecture_spec.runtime_evidence_ids
-    ):
+    if architecture_spec.runtime_evidence_ids:
         try:
             evidence = matching_runtime_evidence(
                 architecture_spec.runtime_evidence_ids,
@@ -398,11 +394,24 @@ def write_gguf_runtime_package(
                 built_identity=built_identity,
                 import_route=import_route,
                 runtime_version=runtime_version,
-                tokenizer_repository=tokenizer_repository,
-                tokenizer_revision=tokenizer_revision,
+                tokenizer_repository=None,
+                tokenizer_revision=None,
             )
         except RuntimeEvidenceUnavailableError as error:
             evidence_warning = f"{error} Export continues without claiming runtime validation."
+    if (
+        evidence is not None
+        and tokenizer_repository is not None
+        and (
+            tokenizer_repository != evidence.tokenizer_repository
+            or tokenizer_revision != evidence.tokenizer_revision
+        )
+    ):
+        raise ValueError(
+            "The explicit tokenizer source conflicts with exact runtime evidence: "
+            f"requested={tokenizer_repository}@{tokenizer_revision}, "
+            f"evidence={evidence.tokenizer_repository}@{evidence.tokenizer_revision}."
+        )
     if not source_model.source_matches_path():
         raise ValueError(
             "The GGUF source changed while runtime evidence was being matched; "

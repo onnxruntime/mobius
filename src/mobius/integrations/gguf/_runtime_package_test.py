@@ -132,12 +132,14 @@ def _source_model():
 
 
 def _write_runtime(pkg, source, output, **kwargs):
+    tokenizer_repository = kwargs.pop("tokenizer_repository", _TOKENIZER_REPOSITORY)
+    tokenizer_revision = kwargs.pop("tokenizer_revision", _TOKENIZER_REVISION)
     return write_gguf_runtime_package(
         pkg,
         source,
         output,
-        tokenizer_repository=_TOKENIZER_REPOSITORY,
-        tokenizer_revision=_TOKENIZER_REVISION,
+        tokenizer_repository=tokenizer_repository,
+        tokenizer_revision=tokenizer_revision,
         **kwargs,
     )
 
@@ -476,7 +478,15 @@ class TestWriteGgufRuntimePackage:
         assert (out / "export_report.json").is_file()
         assert not list(tmp_path.glob(".out.*.tmp"))
 
-    def test_exact_runtime_evidence_marks_package_validated(self, tmp_path):
+    @pytest.mark.parametrize(
+        "tokenizer_kwargs",
+        (
+            {},
+            {"tokenizer_repository": None, "tokenizer_revision": None},
+        ),
+        ids=("matching-explicit-tokenizer", "evidence-pinned-tokenizer"),
+    )
+    def test_exact_runtime_evidence_marks_package_validated(self, tmp_path, tokenizer_kwargs):
         pkg = _FakePackage()
         blocker = GGUFTokenizerVerdict(
             route="deferred",
@@ -533,7 +543,13 @@ class TestWriteGgufRuntimePackage:
                 ),
             ) as package_identity,
         ):
-            _write_runtime(pkg, tmp_path / "m.gguf", out, runtime_version="0.15.2")
+            _write_runtime(
+                pkg,
+                tmp_path / "m.gguf",
+                out,
+                runtime_version="0.15.2",
+                **tokenizer_kwargs,
+            )
 
         assert package_identity.call_args_list[0].kwargs["files"] == ("model.onnx",)
         assert pkg.export_report is not None
@@ -548,6 +564,24 @@ class TestWriteGgufRuntimePackage:
         compatibility = json.loads((out / "runtime_compatibility.json").read_text())
         assert compatibility["runtime_validation_status"] == "validated"
         assert compatibility["runtime_evidence_id"] == "test-evidence"
+
+    def test_explicit_tokenizer_conflict_rejects_before_package_save(self, tmp_path):
+        pkg = _FakePackage()
+        with (
+            _successful_runtime_dependencies(),
+            pytest.raises(ValueError, match="conflicts with exact runtime evidence"),
+        ):
+            _write_runtime(
+                pkg,
+                tmp_path / "m.gguf",
+                tmp_path / "out",
+                runtime_version="0.15.2",
+                tokenizer_repository="attacker/replacement",
+                tokenizer_revision="d" * 40,
+            )
+
+        assert pkg.saved_to is None
+        assert not (tmp_path / "out").exists()
 
     def test_missing_evidence_runtime_version_does_not_block_export(self, tmp_path):
         pkg = _FakePackage()
@@ -687,13 +721,23 @@ class TestWriteGgufRuntimePackage:
             caplog.at_level("WARNING"),
             _successful_runtime_dependencies(),
             mock.patch(
+                "mobius.integrations.gguf._runtime_package.matching_runtime_evidence",
+                return_value=None,
+            ),
+            mock.patch(
                 "mobius.integrations.gguf._runtime_package.inspect_gguf_tokenizer",
                 return_value=blocker,
             ),
         ):
             pkg.gguf_tokenizer_verdict = blocker
             attach_tokenizer_export_report(pkg, blocker, model_route="llama")
-            artifacts = _write_runtime(pkg, tmp_path / "m.gguf", out)
+            artifacts = _write_runtime(
+                pkg,
+                tmp_path / "m.gguf",
+                out,
+                tokenizer_repository=None,
+                tokenizer_revision=None,
+            )
 
         assert (out / "model.onnx").is_file()
         assert Path(artifacts["export_report"]).is_file()

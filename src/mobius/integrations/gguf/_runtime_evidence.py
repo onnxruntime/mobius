@@ -1059,12 +1059,7 @@ def find_matching_runtime_evidence(
             "The GGUF source no longer matches the exact artifact identity captured during "
             f"graph construction: built={built_identity!r}, current={current_identity!r}."
         )
-    if (
-        not evidence_ids
-        or runtime_version is None
-        or tokenizer_repository is None
-        or tokenizer_revision is None
-    ):
+    if not evidence_ids or runtime_version is None:
         return None
     identity = built_identity
     candidates = [
@@ -1080,8 +1075,14 @@ def find_matching_runtime_evidence(
         and _RUNTIME_EVIDENCE[evidence_id].tensor_count == identity.tensor_count
         and _RUNTIME_EVIDENCE[evidence_id].tensor_qtypes == identity.tensor_qtypes
         and _RUNTIME_EVIDENCE[evidence_id].import_route == import_route
-        and _RUNTIME_EVIDENCE[evidence_id].tokenizer_repository == tokenizer_repository
-        and _RUNTIME_EVIDENCE[evidence_id].tokenizer_revision == tokenizer_revision
+        and (
+            tokenizer_repository is None
+            or _RUNTIME_EVIDENCE[evidence_id].tokenizer_repository == tokenizer_repository
+        )
+        and (
+            tokenizer_revision is None
+            or _RUNTIME_EVIDENCE[evidence_id].tokenizer_revision == tokenizer_revision
+        )
     ]
     if len(candidates) > 1:
         raise RuntimeError(
