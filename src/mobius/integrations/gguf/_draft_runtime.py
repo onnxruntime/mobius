@@ -687,7 +687,7 @@ class DraftPairRunner:
 
         while len(generated) < max_new_tokens:
             start = input_ids.shape[1] + len(generated) - 1
-            base_cache = {name: value.copy() for name, value in draft_cache.items()}
+            base_cache = draft_cache
             proposals: list[int] = []
             recycled = np.zeros((1, 1, hidden_size), dtype=draft_dtype)
             token = generated[-1]
