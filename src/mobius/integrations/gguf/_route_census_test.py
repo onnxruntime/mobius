@@ -46,7 +46,6 @@ def test_remaining_route_census_closes_every_authoritative_registry() -> None:
 
 def test_every_route_has_one_actionable_classification() -> None:
     allowed = {
-        "immediately-implementable",
         "evidence-only",
         "dependency-or-mobius-abi-blocked",
         "artifact-unavailable",
@@ -64,8 +63,7 @@ def test_every_route_has_one_actionable_classification() -> None:
     }
     assert Counter(item.category for item in items) == {
         "dependency-or-mobius-abi-blocked": 99,
-        "evidence-only": 146,
-        "immediately-implementable": 9,
+        "evidence-only": 155,
         "intentionally-rejected": 19,
         "artifact-unavailable": 5,
     }

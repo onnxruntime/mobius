@@ -136,10 +136,18 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "musicflamingo",
         "lfm2",
         "kimivl",
+        "paddleocr",
+        "lightonocr",
         "cogvlm",
         "janus_pro",
+        "dots_ocr",
+        "dots3note_v",
+        "dots3note_a",
+        "deepseekocr",
+        "deepseekocr2",
         "lfm2a",
         "glm4v",
+        "youtuvl",
         "yasa2",
         "kimik25",
         "nemotron_v2_vl",
@@ -149,19 +157,11 @@ def test_graph_import_is_conservative_and_artifact_backed() -> None:
         "granite_speech",
         "mimovl",
         "minimax_m3",
+        "granite4_vision",
         "mimo_audio",
         "parakeet",
         "qwen3tts_spkenc",
         "pockettts_spkenc",
-        "paddleocr",
-        "lightonocr",
-        "dots_ocr",
-        "dots3note_v",
-        "dots3note_a",
-        "deepseekocr",
-        "deepseekocr2",
-        "youtuvl",
-        "granite4_vision",
         "muse-glimmer",
     )
     pins = {pin.artifact_id: pin for pin in MMPROJ_ARTIFACT_PINS}
@@ -409,7 +409,7 @@ def test_every_non_supported_verdict_has_an_actionable_reason() -> None:
 
 
 def test_metadata_schema_captures_the_pinned_absence_of_a_text_encoder() -> None:
-    assert len(CLIP_METADATA_SCHEMA) == 62
+    assert len(CLIP_METADATA_SCHEMA) == 63
     fields = {field.key: field for field in CLIP_METADATA_SCHEMA}
     assert fields["clip.has_vision_encoder"].default is False
     assert fields["clip.has_audio_encoder"].default is False
