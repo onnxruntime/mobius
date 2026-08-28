@@ -12,10 +12,12 @@ import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
 
-from mobius._configs import ArchitectureConfig
+from mobius._configs import ArchitectureConfig, GrokGGUFConfig, GroveMoEGGUFConfig
 from mobius._weight_utils import is_packed_quant_key, preprocess_quantized_weights
 from mobius.components import (
+    FCMLP,
     Attention,
+    Embedding,
     FusedQKVAttention,
     LayerNorm,
     LayerNormNoBias,
@@ -27,9 +29,10 @@ from mobius.components import (
     create_attention_bias,
     initialize_rope,
 )
-from mobius.components._attention import StaticCacheState
+from mobius.components._attention import StaticCacheState, _apply_attention
 from mobius.components._moe import MLP, SigmoidTopKGate, SoftmaxTopKGate
 from mobius.components._quantized_linear import make_quantized_linear_factory
+from mobius.components._rotary_embedding import apply_rotary_pos_emb
 from mobius.models.base import CausalLMModel, embedding_for_config
 from mobius.models.deepseek import DeepSeekMoEGate
 from mobius.models.phi3 import split_fused_qkv
@@ -451,6 +454,323 @@ class ArcticGGUFCausalLMModel(CausalLMModel):
         return _preprocess_moe_weights(self, state_dict)
 
 
+class _GrokScaledEmbedding(Embedding):
+    """Embedding lookup with llama.cpp's zero-as-disabled Grok scale."""
+
+    def __init__(self, config: GrokGGUFConfig):
+        super().__init__(config.vocab_size, config.hidden_size)
+        self._scale = config.embedding_scale
+
+    def forward(self, op: OpBuilder, input_ids: ir.Value):
+        hidden_states = super().forward(op, input_ids)
+        if math.isclose(self._scale, 0.0, rel_tol=0.0, abs_tol=0.0):
+            return hidden_states
+        return op.Mul(hidden_states, op.CastLike(self._scale, hidden_states))
+
+
+def _ungated_gelu_expert(
+    config: ArchitectureConfig,
+    linear_class: type | None,
+) -> nn.Module:
+    """Build the optional ungated GELU form accepted by llama.cpp's Grok loader."""
+    return FCMLP(
+        config.hidden_size,
+        config.intermediate_size,
+        activation=config.hidden_act or "gelu",
+        bias=config.mlp_bias,
+        linear_class=linear_class,
+    )
+
+
+class GrokGGUFDecoderLayer(nn.Module):
+    """Grok sandwich-norm block with optional parallel dense GELU FFN."""
+
+    def __init__(
+        self,
+        config: GrokGGUFConfig,
+        gate: nn.Module | None = None,
+        norm_class: type | None = None,
+    ):
+        super().__init__()
+        del norm_class
+        self.self_attn = Attention(config, scale=config.attention_output_scale)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_output_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.pre_feedforward_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_feedforward_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        expert_factory = None if config.has_gated_experts else _ungated_gelu_expert
+        self.mlp = MoELayer(config, gate=gate, expert_factory=expert_factory)
+        if config.has_dense_ffn:
+            self.residual_mlp: nn.Module | None = (
+                MLP(config)
+                if config.has_gated_dense_ffn
+                else _ungated_gelu_expert(config, None)
+            )
+        else:
+            self.residual_mlp = None
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple | None,
+        past_key_value: tuple | StaticCacheState | None,
+    ):
+        if isinstance(past_key_value, StaticCacheState):
+            static_cache = past_key_value
+            past_key_value = None
+        else:
+            static_cache = None
+
+        # Grok normalizes the projected attention output before its residual add.
+        residual = hidden_states
+        attn_output, present_key_value = self.self_attn(
+            op,
+            self.input_layernorm(op, hidden_states),
+            attention_bias,
+            position_embeddings,
+            past_key_value,
+            static_cache,
+        )
+        attn_output = self.attention_output_layernorm(op, attn_output)
+        ffn_input = op.Add(residual, attn_output)
+
+        # Dense and routed GEGLU branches share the same normalized input.
+        normalized = self.pre_feedforward_layernorm(op, ffn_input)
+        routed_output = self.mlp(op, normalized)
+        if self.residual_mlp is not None:
+            dense_output = self.residual_mlp(op, normalized)
+            routed_output = op.Mul(
+                op.Add(dense_output, routed_output),
+                op.CastLike(math.sqrt(2.0) / 2.0, routed_output),
+            )
+        ffn_output = self.post_feedforward_layernorm(op, routed_output)
+        return op.Add(ffn_input, ffn_output), present_key_value
+
+
+class GrokGGUFTextModel(MoETextModel):
+    """Grok text body with scaled embeddings and sandwich-norm decoder blocks."""
+
+    def __init__(self, config: GrokGGUFConfig):
+        super().__init__(config, layer_class=GrokGGUFDecoderLayer)
+        self.embed_tokens = _GrokScaledEmbedding(config)
+
+
+class GrokGGUFCausalLMModel(CausalLMModel):
+    """Grok causal LM graph matching the pinned llama.cpp GGUF implementation."""
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: GrokGGUFConfig):
+        super().__init__(config)
+        self._replace_text_model(GrokGGUFTextModel(config))
+        self._logit_scale = config.logit_output_scale
+        self._final_logit_softcapping = config.final_logit_softcapping
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        attention_mask: ir.Value | None,
+        position_ids: ir.Value,
+        past_key_values: list | None = None,
+    ):
+        logits, present_key_values = super().forward(
+            op,
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+        )
+        logits = op.Mul(logits, op.CastLike(self._logit_scale, logits))
+        if not math.isclose(
+            self._final_logit_softcapping,
+            0.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            cap = op.CastLike(self._final_logit_softcapping, logits)
+            logits = op.Mul(op.Tanh(op.Div(logits, cap)), cap)
+        return logits, present_key_values
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
+
+
+class GroveMoEBlock(nn.Module):
+    """Two-bank GroveMoE block preserving llama.cpp's adjugate routing semantics."""
+
+    _ROUTING_FLOOR = 6.103515625e-5
+
+    def __init__(self, config: GroveMoEGGUFConfig):
+        super().__init__()
+        num_experts = config.num_local_experts
+        top_k = config.num_experts_per_tok
+        expert_width = config.moe_intermediate_size
+        if num_experts is None or top_k is None or expert_width is None:
+            raise ValueError(
+                "GroveMoE requires num_local_experts, num_experts_per_tok, and "
+                "moe_intermediate_size"
+            )
+        if (
+            config.experts_per_group <= 0
+            or num_experts % config.experts_per_group
+            or config.chunk_expert_intermediate_size <= 0
+            or not math.isfinite(config.expert_group_scale)
+        ):
+            raise ValueError("GroveMoE has invalid chunk-expert geometry")
+        self._num_experts = num_experts
+        self._top_k = top_k
+        self._experts_per_group = config.experts_per_group
+        self._num_chunk_experts = self._num_experts // self._experts_per_group
+        self._chunk_top_k = min(self._top_k, self._num_chunk_experts)
+        self._group_scale = config.expert_group_scale
+        self.gate = Linear(config.hidden_size, self._num_experts, bias=False)
+
+        expert_config = dataclasses.replace(
+            config,
+            intermediate_size=expert_width,
+        )
+        chunk_config = dataclasses.replace(
+            config,
+            intermediate_size=config.chunk_expert_intermediate_size,
+        )
+        self.experts = nn.ModuleList([MLP(expert_config) for _ in range(self._num_experts)])
+        self.chunk_experts = nn.ModuleList(
+            [MLP(chunk_config) for _ in range(self._num_chunk_experts)]
+        )
+
+    def _normalize_selected(self, op: OpBuilder, weights: ir.Value) -> ir.Value:
+        denominator = op.ReduceSum(weights, [-1], keepdims=True)
+        denominator = op.Max(
+            denominator,
+            op.CastLike(self._ROUTING_FLOOR, denominator),
+        )
+        return op.Div(weights, denominator)
+
+    @staticmethod
+    def _dispatch(
+        op: OpBuilder,
+        experts: nn.ModuleList,
+        hidden_states: ir.Value,
+        routing_weights: ir.Value,
+        selected_experts: ir.Value,
+    ) -> ir.Value:
+        result = None
+        for expert_index, expert in enumerate(experts):
+            expert_output = expert(op, hidden_states)
+            matches = op.Equal(selected_experts, op.Constant(value_int=expert_index))
+            weights = op.Mul(routing_weights, op.CastLike(matches, routing_weights))
+            weight = op.ReduceSum(weights, [-1], keepdims=True)
+            contribution = op.Mul(expert_output, weight)
+            result = contribution if result is None else op.Add(result, contribution)
+        if result is None:
+            raise RuntimeError("GroveMoE expert bank cannot be empty")
+        return result
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value:
+        router_logits = self.gate(op, hidden_states)  # (B, S, E)
+        routing_probs = op.Softmax(router_logits, axis=-1)
+        selection_probs = op.Sigmoid(router_logits)
+
+        _, selected_experts = op.TopK(
+            selection_probs,
+            op.Constant(value_ints=[self._top_k]),
+            axis=-1,
+            _outputs=2,
+        )
+        routing_weights = self._normalize_selected(
+            op,
+            op.GatherElements(routing_probs, selected_experts, axis=-1),
+        )
+        main_output = self._dispatch(
+            op,
+            self.experts,
+            hidden_states,
+            routing_weights,
+            selected_experts,
+        )
+
+        # The pinned graph recomputes top-k, maps e -> trunc(e / group_size),
+        # then feeds the primary MoE output (not the original hidden state) to
+        # the chunk bank. This intentionally follows llama.cpp rather than HF.
+        _, chunk_source_experts = op.TopK(
+            selection_probs,
+            op.Constant(value_ints=[self._chunk_top_k]),
+            axis=-1,
+            _outputs=2,
+        )
+        chunk_experts = op.Cast(
+            op.Mul(
+                op.Cast(chunk_source_experts, to=ir.DataType.FLOAT),
+                1.0 / self._experts_per_group,
+            ),
+            to=ir.DataType.INT64,
+        )
+        chunk_weights = self._normalize_selected(
+            op,
+            op.GatherElements(routing_probs, chunk_experts, axis=-1),
+        )
+        chunk_output = self._dispatch(
+            op,
+            self.chunk_experts,
+            main_output,
+            chunk_weights,
+            chunk_experts,
+        )
+        return op.Add(
+            main_output,
+            op.Mul(chunk_output, op.CastLike(self._group_scale, chunk_output)),
+        )
+
+
+class GroveMoEGGUFDecoderLayer(MoEDecoderLayer):
+    """Qwen3-style decoder layer with GroveMoE's two routed expert banks."""
+
+    def __init__(
+        self,
+        config: GroveMoEGGUFConfig,
+        gate: nn.Module | None = None,
+        norm_class: type = RMSNorm,
+    ):
+        super().__init__(config, gate=gate, norm_class=norm_class)
+        self.mlp = GroveMoEBlock(config)
+
+
+class GroveMoEGGUFTextModel(MoETextModel):
+    """GroveMoE text body with per-head Q/K norm and dual expert banks."""
+
+    def __init__(self, config: GroveMoEGGUFConfig):
+        super().__init__(config, layer_class=GroveMoEGGUFDecoderLayer)
+
+
+class GroveMoEGGUFCausalLMModel(CausalLMModel):
+    """GroveMoE causal LM graph matching the pinned llama.cpp GGUF implementation."""
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: GroveMoEGGUFConfig):
+        super().__init__(config)
+        self._replace_text_model(GroveMoEGGUFTextModel(config))
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
+
+
 class Ernie45MoEGGUFDecoderLayer(MoEDecoderLayer):
     """ERNIE 4.5 layer selected as dense or routed by the GGUF schedule."""
 
@@ -753,6 +1073,106 @@ class UngatedSharedMoEDecoderLayer(MoEDecoderLayer):
         self.mlp = UngatedSharedMoELayer(
             config, gate=self.mlp.gate, linear_class=_quantized_linear_class(config)
         )
+
+
+class _PostRoPEQKNormAttention(Attention):
+    """Attention variant that applies per-head Q/K RMSNorm after RoPE."""
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        attention_bias: ir.Value | None,
+        position_embeddings: tuple | None = None,
+        past_key_value: tuple | None = None,
+        static_cache: StaticCacheState | None = None,
+    ):
+        query_states, key_states, value_states = self._project_qkv(op, hidden_states)
+
+        # Hunyuan rotates the projected heads before normalizing their final
+        # per-position values; standard Attention uses the opposite order.
+        if position_embeddings is not None:
+            query_states = apply_rotary_pos_emb(
+                op,
+                query_states,
+                position_embeddings,
+                num_heads=self.num_attention_heads,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                interleaved=self._rope_interleave,
+            )
+            key_states = apply_rotary_pos_emb(
+                op,
+                key_states,
+                position_embeddings,
+                num_heads=self.num_key_value_heads,
+                rotary_embedding_dim=self.rotary_embedding_dim,
+                interleaved=self._rope_interleave,
+            )
+
+        if self.q_norm is None or self.k_norm is None or self._qk_norm_full:
+            raise ValueError("Post-RoPE Q/K attention requires per-head q_norm and k_norm")
+        query_states = op.Reshape(
+            query_states,
+            [0, 0, self.num_attention_heads, self.head_dim],
+        )
+        key_states = op.Reshape(
+            key_states,
+            [0, 0, self.num_key_value_heads, self.head_dim],
+        )
+        query_states = self.q_norm(op, query_states)
+        key_states = self.k_norm(op, key_states)
+        query_states = op.Reshape(query_states, [0, 0, -1])
+        key_states = op.Reshape(key_states, [0, 0, -1])
+
+        attn_output, present_key, present_value = _apply_attention(
+            op,
+            query_states,
+            key_states,
+            value_states,
+            attention_bias,
+            past_key_value[0] if past_key_value is not None else None,
+            past_key_value[1] if past_key_value is not None else None,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            scale=self.scaling,
+            static_cache=static_cache,
+        )
+        return self._project_output(op, attn_output), (present_key, present_value)
+
+
+class HunyuanMoEGGUFDecoderLayer(UngatedSharedMoEDecoderLayer):
+    """Hunyuan-MoE block with post-RoPE Q/K norm and a parallel shared expert."""
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        gate: nn.Module | None = None,
+        norm_class: type = RMSNorm,
+    ):
+        super().__init__(config, gate=gate, norm_class=norm_class)
+        self.self_attn = _PostRoPEQKNormAttention(config)
+
+
+class HunyuanMoEGGUFTextModel(MoETextModel):
+    """Hunyuan-MoE text body matching the GGUF-only attention ordering."""
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config, layer_class=HunyuanMoEGGUFDecoderLayer)
+
+
+class HunyuanMoEGGUFCausalLMModel(CausalLMModel):
+    """Hunyuan-MoE causal LM matching the pinned llama.cpp GGUF graph."""
+
+    category: str = "Mixture of Experts"
+
+    def __init__(self, config: ArchitectureConfig):
+        super().__init__(config)
+        self._replace_text_model(HunyuanMoEGGUFTextModel(config))
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return _preprocess_moe_weights(self, state_dict)
 
 
 def _preprocess_shared_moe_weights(

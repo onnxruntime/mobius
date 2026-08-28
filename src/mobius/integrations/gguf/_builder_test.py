@@ -8168,8 +8168,6 @@ class TestGGUFPreflightGuards:
             "bailingmoe3",
             "deepseek4",
             "gpt-oss",
-            "grok",
-            "grovemoe",
             "chameleon",
             "cogvlm",
             "deepseek2-ocr",

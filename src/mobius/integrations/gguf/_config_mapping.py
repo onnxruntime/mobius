@@ -38,6 +38,8 @@ from mobius._configs import (
     Gemma2Config,
     Gemma4Config,
     GraniteMoeHybridConfig,
+    GrokGGUFConfig,
+    GroveMoEGGUFConfig,
     HyV3Config,
     JambaConfig,
     KimiK3Config,
@@ -1604,6 +1606,171 @@ def _arctic_postprocess(
     )
 
 
+def _grok_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> GrokGGUFConfig:
+    """Restore Grok's defaults, sandwich norms, and optional dense branch."""
+    arch = "grok"
+    _validate_conventional_moe_rope_scaling(metadata, arch)
+    expert_width = int(metadata.get(f"{arch}.expert_feed_forward_length", 0))
+    if expert_width < 0:
+        raise ValueError("grok.expert_feed_forward_length must be non-negative")
+    config = dataclasses.replace(
+        config,
+        moe_intermediate_size=expert_width or config.intermediate_size,
+    )
+    config = _moe_postprocess(config, metadata, model)
+
+    def finite(name: str, default: float) -> float:
+        value = float(metadata.get(f"{arch}.{name}", default))
+        if not math.isfinite(value):
+            raise ValueError(f"{arch}.{name} must be finite")
+        return value
+
+    embedding_scale = finite("embedding_scale", 78.38367176906169)
+    attention_output_scale = finite(
+        "attention.output_scale",
+        0.08838834764831845,
+    )
+    logit_output_scale = finite("logit_scale", 0.5773502691896257)
+    attn_softcap = finite("attn_logit_softcapping", 30.0)
+    router_softcap = finite("router_logit_softcapping", 30.0)
+    final_softcap = finite("final_logit_softcapping", 0.0)
+    temperature_length = int(metadata.get(f"{arch}.attention.temperature_length", 0))
+    if math.isclose(logit_output_scale, 0.0, rel_tol=0.0, abs_tol=0.0):
+        raise ValueError("grok.logit_scale must be nonzero")
+    if attn_softcap <= 0:
+        raise ValueError("grok.attn_logit_softcapping must be positive")
+    if final_softcap < 0:
+        raise ValueError("grok.final_logit_softcapping must be non-negative")
+    if temperature_length < 0:
+        raise ValueError("grok.attention.temperature_length must be non-negative")
+
+    tensor_names = set(model.tensor_names)
+    has_dense_ffn = any(re.match(r"^blk\.\d+\.ffn_up\.weight$", name) for name in tensor_names)
+    has_gated_dense_ffn = any(
+        re.match(r"^blk\.\d+\.ffn_gate\.weight$", name) for name in tensor_names
+    )
+    has_gated_experts = any(
+        re.match(r"^blk\.\d+\.ffn_gate_exps\.weight$", name) for name in tensor_names
+    )
+
+    rope_scaling = dict(config.rope_scaling or {})
+    if config.rope_type == "yarn":
+        rope_scaling.update(
+            beta_fast=finite("rope.scaling.yarn_beta_fast", 8.0),
+            beta_slow=finite("rope.scaling.yarn_beta_slow", 1.0),
+        )
+
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="grok_gguf",
+        hidden_act="gelu_new",
+        mlp_bias=False,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        tie_word_embeddings="output.weight" not in tensor_names,
+        rope_scaling=rope_scaling or None,
+        embedding_scale=embedding_scale,
+        attention_output_scale=attention_output_scale,
+        logit_output_scale=logit_output_scale,
+        attn_logit_softcapping=attn_softcap,
+        router_logit_softcapping=router_softcap,
+        final_logit_softcapping=final_softcap,
+        attention_temperature_length=temperature_length,
+        has_dense_ffn=has_dense_ffn,
+        has_gated_dense_ffn=has_gated_dense_ffn,
+        has_gated_experts=has_gated_experts,
+    )
+    return GrokGGUFConfig(**fields)
+
+
+def _grovemoe_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> GroveMoEGGUFConfig:
+    """Restore GroveMoE's sigmoid-selected primary and chunk expert banks."""
+    arch = "grovemoe"
+    config = _moe_postprocess(config, metadata, model)
+    num_experts = config.num_local_experts
+    if num_experts is None:
+        raise ValueError("grovemoe.expert_count must be positive")
+    chunk_width = int(metadata.get(f"{arch}.expert_chunk_feed_forward_length", 0))
+    if chunk_width == 0:
+        chunk_width = config.head_dim
+    experts_per_group = int(metadata[f"{arch}.experts_per_group"])
+    group_scale = float(metadata[f"{arch}.expert_group_scale"])
+    if chunk_width <= 0:
+        raise ValueError("grovemoe.expert_chunk_feed_forward_length must be positive")
+    if experts_per_group <= 0 or num_experts % experts_per_group:
+        raise ValueError("grovemoe.experts_per_group must be positive and divide expert_count")
+    if not math.isfinite(group_scale):
+        raise ValueError("grovemoe.expert_group_scale must be finite")
+
+    fields = _shallow_fields(config)
+    fields.update(
+        model_type="grovemoe_gguf",
+        hidden_act="silu",
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        mlp_bias=False,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        tie_word_embeddings="output.weight" not in model.tensor_names,
+        chunk_expert_intermediate_size=chunk_width,
+        experts_per_group=experts_per_group,
+        expert_group_scale=group_scale,
+    )
+    return GroveMoEGGUFConfig(**fields)
+
+
+def _hunyuan_moe_gguf_postprocess(
+    config: ArchitectureConfig,
+    metadata: dict[str, Any],
+    model: Any,
+) -> ArchitectureConfig:
+    """Restore Hunyuan-MoE's post-RoPE Q/K norm and shared-expert profile."""
+    arch = "hunyuan-moe"
+    config = _moe_postprocess(config, metadata, model)
+    expert_width = int(metadata[f"{arch}.expert_feed_forward_length"])
+    if expert_width != config.intermediate_size:
+        raise ValueError(
+            "hunyuan-moe.expert_feed_forward_length must equal feed_forward_length "
+            "because the pinned loader uses feed_forward_length for routed expert tensors"
+        )
+    shared_width = (
+        int(metadata.get(f"{arch}.expert_shared_feed_forward_length", 0))
+        or config.intermediate_size
+    )
+    shared_count = int(metadata.get(f"{arch}.expert_shared_count", 1))
+    if shared_width <= 0:
+        raise ValueError(
+            "hunyuan-moe.expert_shared_feed_forward_length must be positive when present"
+        )
+    if shared_count != 1:
+        raise ValueError(
+            "hunyuan-moe.expert_shared_count must be one; the pinned graph owns one "
+            "ungated shared expert"
+        )
+    return dataclasses.replace(
+        config,
+        model_type="hunyuan_moe_gguf",
+        hidden_act="silu",
+        attn_qk_norm=True,
+        attn_qk_norm_full=False,
+        mlp_bias=False,
+        moe_intermediate_size=config.intermediate_size,
+        shared_expert_intermediate_size=shared_width,
+        n_shared_experts=None,
+        norm_topk_prob=True,
+        routed_scaling_factor=1.0,
+        tie_word_embeddings="output.weight" not in model.tensor_names,
+    )
+
+
 def _ernie45_shared_expert_width(
     metadata: dict[str, Any],
     tensor_names: Iterable[str],
@@ -1991,10 +2158,14 @@ def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str)
     if missing:
         raise ValueError(f"{arch} YaRN scaling is missing required metadata: {missing}")
 
+    expected_beta_fast = 8.0 if arch == "grok" else 32.0
     positive_values = {
         "factor": metadata[f"{arch}.rope.scaling.factor"],
         "original_context_length": metadata[f"{arch}.rope.scaling.original_context_length"],
-        "yarn_beta_fast": metadata.get(f"{arch}.rope.scaling.yarn_beta_fast", 32.0),
+        "yarn_beta_fast": metadata.get(
+            f"{arch}.rope.scaling.yarn_beta_fast",
+            expected_beta_fast,
+        ),
         "yarn_beta_slow": metadata.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0),
         "attn_factor": metadata.get(f"{arch}.rope.scaling.attn_factor", 1.0),
     }
@@ -2005,7 +2176,10 @@ def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str)
         raise ValueError(f"{arch} YaRN scaling values must be finite and positive")
     if (
         not math.isclose(
-            float(positive_values["yarn_beta_fast"]), 32.0, rel_tol=0.0, abs_tol=0.0
+            float(positive_values["yarn_beta_fast"]),
+            expected_beta_fast,
+            rel_tol=0.0,
+            abs_tol=0.0,
         )
         or not math.isclose(
             float(positive_values["yarn_beta_slow"]), 1.0, rel_tol=0.0, abs_tol=0.0
@@ -2016,8 +2190,20 @@ def _validate_conventional_moe_rope_scaling(metadata: dict[str, Any], arch: str)
     ):
         raise ValueError(
             f"{arch} YaRN metadata must retain the supported pinned loader defaults "
-            "yarn_beta_fast=32, yarn_beta_slow=1, and attn_factor=1"
+            f"yarn_beta_fast={expected_beta_fast:g}, yarn_beta_slow=1, and attn_factor=1"
         )
+    for suffix in ("yarn_ext_factor", "yarn_attn_factor"):
+        value = metadata.get(f"{arch}.rope.scaling.{suffix}")
+        if value is not None and not math.isclose(
+            float(value),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise ValueError(
+                f"{arch}.rope.scaling.{suffix} must be absent or 1 for the "
+                "supported YaRN graph"
+            )
 
 
 def _conventional_shared_moe_postprocess(
@@ -4728,6 +4914,9 @@ _CONFIG_POSTPROCESSORS: dict[str, Any] = {
     "moe": _moe_postprocess,
     "dbrx": _dbrx_postprocess,
     "arctic": _arctic_postprocess,
+    "grok": _grok_postprocess,
+    "grovemoe": _grovemoe_postprocess,
+    "hunyuan_moe_gguf": _hunyuan_moe_gguf_postprocess,
     "ernie45_moe": _ernie45_moe_postprocess,
     "smallthinker": _smallthinker_postprocess,
     "conventional_shared_moe": _conventional_shared_moe_postprocess,
