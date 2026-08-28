@@ -86,6 +86,8 @@ class TestReUseConfig:
             "hop_size",
             "win_size",
             "sampling_rate",
+            "input_sampling_rate",
+            "bwe_sampling_rate",
             "compress_factor",
         ):
             assert getattr(from_empty, field) == getattr(declared, field), field
@@ -136,6 +138,10 @@ class TestReUseConfig:
         with pytest.raises(ValueError, match="n_fft"):
             ReUseConfig(n_fft=33).validate()
 
+    def test_scaled_geometry_rejects_rate_too_small_for_hop(self):
+        with pytest.raises(ValueError, match="too small"):
+            ReUseConfig().stft_geometry(1)
+
     def test_remote_default_is_pinned(self):
         assert _effective_revision("nvidia/RE-USE", None) == REUSE_REVISION
 
@@ -154,7 +160,7 @@ class TestBuildGraphReUse:
         assert set(pkg) == {"model"}
 
     def test_model_io(self):
-        config, pkg = _build()
+        _config, pkg = _build()
         graph = pkg["model"].graph
 
         assert [inp.name for inp in graph.inputs] == ["noisy_mag", "noisy_pha"]
@@ -163,10 +169,24 @@ class TestBuildGraphReUse:
             "denoised_pha",
             "denoised_com",
         ]
-        # Frequency is fixed by the STFT size; batch and time stay symbolic.
+        # Native-rate export follows the decoded sample rate; all three axes
+        # are dynamic while the complex pair remains fixed.
         for value in (*graph.inputs, *graph.outputs[:2]):
-            assert value.shape[1] == config.num_freq_bins
+            assert str(value.shape[1]) == "freq"
         assert graph.outputs[2].shape[3] == 2
+
+    def test_explicit_input_rate_makes_frequency_static(self):
+        config = _tiny_config()
+        config.input_sampling_rate = 16_000
+        pkg = build_from_module(
+            SEMambaSpeechEnhancementModel(config),
+            config,
+            task=SpeechEnhancementTask(),
+        )
+
+        assert config.analysis_stft_geometry == (64, 8, 64)
+        for value in (*pkg["model"].graph.inputs, *pkg["model"].graph.outputs[:2]):
+            assert value.shape[1] == 33
 
     def test_initializer_names_match_checkpoint_layout(self):
         """Parameter names line up with the nvidia/RE-USE checkpoint."""
@@ -309,6 +329,21 @@ class TestReUseRuntime:
         assert np.isfinite(denoised_mag).all()
         assert np.isfinite(denoised_pha).all()
 
+    @pytest.mark.parametrize("freq_bins", [17, 33, 97])
+    def test_one_native_rate_graph_accepts_scaled_frequency_extents(self, freq_bins):
+        """The default graph follows 8/16/48 kHz FFT geometry at runtime."""
+        _config, session = self._session()
+        rng = np.random.default_rng(freq_bins)
+        shape = (1, freq_bins, 5)
+        outputs = session.run(
+            None,
+            {
+                "noisy_mag": np.abs(rng.standard_normal(shape)).astype(np.float32),
+                "noisy_pha": rng.standard_normal(shape).astype(np.float32),
+            },
+        )
+        assert [output.shape for output in outputs] == [shape, shape, (*shape, 2)]
+
     def test_phase_is_wrapped_and_consistent_with_complex_output(self):
         """Phase stays in (-pi, pi] and denoised_com is its polar form."""
         config, session = self._session()
@@ -432,6 +467,24 @@ class TestBuildReUse:
 
         assert "model" in pkg
 
+    @pytest.mark.parametrize(
+        ("kwargs", "expected_bins"),
+        [
+            ({"input_sampling_rate": 16_000}, 33),
+            ({"bwe_sampling_rate": 48_000}, 97),
+        ],
+    )
+    def test_build_exposes_static_native_and_bwe_rates(self, tmp_path, kwargs, expected_bins):
+        pytest.importorskip("safetensors")
+        pkg = build_reuse(
+            str(self._checkpoint_dir(tmp_path)),
+            load_weights=False,
+            **kwargs,
+        )
+
+        for value in pkg["model"].graph.inputs:
+            assert value.shape[1] == expected_bins
+
     def test_public_build_detects_bespoke_checkpoint(self, tmp_path):
         """The normal API/CLI path detects RE-USE without Transformers metadata."""
         pytest.importorskip("safetensors")
@@ -441,6 +494,19 @@ class TestBuildReUse:
 
         assert set(pkg) == {"model"}
         assert pkg["model"].metadata_props["mobius.source_revision"] == "local"
+
+    def test_public_build_forwards_native_rate_selection(self, tmp_path):
+        pytest.importorskip("safetensors")
+        checkpoint = self._checkpoint_dir(tmp_path)
+
+        pkg = build(
+            str(checkpoint),
+            load_weights=False,
+            input_sampling_rate=16_000,
+        )
+
+        assert pkg.config.input_sampling_rate == 16_000
+        assert pkg["model"].graph.inputs[0].shape[1] == 33
 
     def test_public_build_accepts_task_object(self, tmp_path):
         pytest.importorskip("safetensors")
@@ -483,16 +549,11 @@ class TestBuildReUse:
 
 
 class TestEncoderFreqBins:
-    """The encoder's frequency extent is predicted at build time, not read back.
+    """Frequency is dynamic by default and static for an explicit rate.
 
-    ``TFMambaBlock`` emits ``config.encoder_freq_bins`` as a constant instead of
-    ``Shape(x)[3]``. That prediction duplicates geometry owned by two other
-    places — the frequency tail pad in
-    ``SEMambaSpeechEnhancementModel.forward`` and the strided convolution in
-    ``DenseEncoder`` — so these tests pin it against the graph that is actually
-    built. A wrong constant is a loud failure (the frequency ``Reshape`` gets an
-    incompatible target), never silent corruption, but it should fail here
-    rather than at inference time.
+    NVIDIA scales FFT geometry from the decoded native sample rate. The
+    default graph therefore reads frequency at runtime. Explicit native/BWE
+    exports retain a constant extent for provider partitioning.
     """
 
     @pytest.mark.parametrize("n_fft", [320, 400, 512, 322])
@@ -517,14 +578,15 @@ class TestEncoderFreqBins:
         config = ReUseConfig(n_fft=n_fft)
         assert 2 * config.encoder_freq_bins >= config.num_freq_bins
 
-    def test_prediction_matches_the_built_graph(self):
-        """The constant equals the extent the graph really carries.
+    @pytest.mark.parametrize(
+        ("sample_rate", "expected"),
+        [(8_000, (320, 40, 320)), (16_000, (640, 80, 640)), (48_000, (1920, 240, 1920))],
+    )
+    def test_scaled_geometry_matches_pinned_inference(self, sample_rate, expected):
+        assert ReUseConfig().stft_geometry(sample_rate) == expected
 
-        This is the anti-drift guard: it reads the inferred shape of the
-        frequency Scan's input, so changing the encoder stride, kernel or pad
-        without updating the derivation fails here.
-        """
-        config, pkg = _build()
+    def test_native_graph_reads_frequency_at_runtime(self):
+        _config, pkg = _build()
         scans = [
             node
             for node in pkg["model"].graph
@@ -532,19 +594,18 @@ class TestEncoderFreqBins:
         ]
         assert scans, "no frequency-axis Scan found"
         for scan in scans:
-            # Scan inputs are [initial_state..., scan_input...]; the scan inputs
-            # are time-major, so axis 0 is the swept extent.
             swept = scan.inputs[2].shape
             assert swept is not None
-            assert swept[0] == config.encoder_freq_bins
+            assert not isinstance(swept[0], int)
 
-    def test_frequency_extent_is_not_read_back_at_runtime(self):
-        """No Shape node feeds the frequency axis of a TF block's Reshape.
-
-        Kept as a behavioural assertion rather than a node count so that
-        unrelated Shape nodes elsewhere in the graph do not make it brittle.
-        """
-        _config, pkg = _build()
+    def test_explicit_rate_emits_constant_frequency_extent(self):
+        config = _tiny_config()
+        config.input_sampling_rate = 16_000
+        pkg = build_from_module(
+            SEMambaSpeechEnhancementModel(config),
+            config,
+            task=SpeechEnhancementTask(),
+        )
         graph = pkg["model"].graph
         producers = {v.name: node for node in graph for v in node.outputs}
         for node in graph:
@@ -571,8 +632,7 @@ class TestEncoderFreqBins:
                         saw_shape_on_freq_axis = True
                 frontier.extend(producer.inputs)
             assert not saw_shape_on_freq_axis, (
-                "the frequency extent is derived from Shape(x)[3] again; it is a "
-                "fixed function of n_fft and should be emitted as a constant"
+                "an explicitly selected rate should make frequency static"
             )
 
 

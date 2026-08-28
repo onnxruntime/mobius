@@ -42,9 +42,10 @@ class SpeechEnhancementTask(ModelTask):
     ) -> ModelPackage:
         graph, builder = _make_graph()
 
-        # ``num_freq_bins`` is fixed by the STFT size, so publish it as a
-        # static dimension rather than a symbol a consumer cannot resolve.
-        num_freq = getattr(config, "num_freq_bins", None) or "freq"
+        # Native-rate RE-USE scales its FFT geometry from the decoded sample
+        # rate, so frequency is dynamic by default. An explicit native/BWE
+        # export selects a static geometry for provider partitioning.
+        num_freq = getattr(config, "static_num_freq_bins", None) or "freq"
         shape = ["batch", num_freq, "time"]
 
         noisy_mag = builder.input("noisy_mag", dtype=config.dtype, shape=shape)

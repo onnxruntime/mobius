@@ -111,6 +111,12 @@ class ReUseConfig(BaseModelConfig):
     win_size: int = 320
     #: Audio sample rate the model was trained for.
     sampling_rate: int = 8000
+    #: Known native input rate for a static-frequency export. ``None`` keeps
+    #: frequency dynamic and follows the decoded audio's native rate.
+    input_sampling_rate: int | None = None
+    #: Explicit NVIDIA ``BWE`` target. The workflow resamples to this rate
+    #: before analysis; ``None`` preserves the native input rate.
+    bwe_sampling_rate: int | None = None
     #: Magnitude compression applied before the model. Informational only: it is
     #: applied by the STFT front-end, outside this graph. Note it is declared
     #: under ``model_cfg`` in the checkpoint's config.json, not ``stft_cfg``,
@@ -121,17 +127,63 @@ class ReUseConfig(BaseModelConfig):
 
     @property
     def num_freq_bins(self) -> int:
-        """Number of frequency bins on the model's input/output."""
+        """Number of bins at the checkpoint's reference sample rate."""
         return self.n_fft // 2 + 1
+
+    @staticmethod
+    def _make_even(value: int) -> int:
+        """Match NVIDIA's floor-then-round-up-to-even geometry rule."""
+        return value if value % 2 == 0 else value + 1
+
+    def stft_geometry(self, sample_rate: int) -> tuple[int, int, int]:
+        """Scale reference FFT, hop, and window sizes to *sample_rate*."""
+        if sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        geometry = [
+            self._make_even(value * sample_rate // self.sampling_rate)
+            for value in (self.n_fft, self.hop_size, self.win_size)
+        ]
+        if any(value <= 0 for value in geometry):
+            raise ValueError(
+                f"sample_rate {sample_rate} is too small for reference STFT geometry"
+            )
+        return geometry[0], geometry[1], geometry[2]
+
+    @property
+    def analysis_sampling_rate(self) -> int | None:
+        """Static analysis rate, or ``None`` for native-rate dynamic export."""
+        return self.bwe_sampling_rate or self.input_sampling_rate
+
+    @property
+    def analysis_stft_geometry(self) -> tuple[int, int, int] | None:
+        """Static analysis geometry, or ``None`` when native rate is runtime data."""
+        rate = self.analysis_sampling_rate
+        return self.stft_geometry(rate) if rate is not None else None
+
+    @property
+    def static_num_freq_bins(self) -> int | None:
+        """Static graph frequency extent for an explicitly selected rate."""
+        geometry = self.analysis_stft_geometry
+        return geometry[0] // 2 + 1 if geometry is not None else None
 
     @property
     def encoder_freq_bins(self) -> int:
+        """Reference-rate frequency extent of the encoder output."""
+        return self._encoder_freq_bins(self.num_freq_bins)
+
+    @property
+    def static_encoder_freq_bins(self) -> int | None:
+        """Static encoded extent for an explicitly selected analysis rate."""
+        bins = self.static_num_freq_bins
+        return self._encoder_freq_bins(bins) if bins is not None else None
+
+    @staticmethod
+    def _encoder_freq_bins(num_freq_bins: int) -> int:
         """Frequency extent of the encoder output, i.e. what the TF blocks see.
 
-        Statically derivable, which is the point of computing it here rather than
-        with ``Shape`` at run time: the frequency axis is a fixed function of
-        ``n_fft``, so an execution provider can claim the frequency-axis scans even
-        when the time axis is fully dynamic.
+        This is statically derivable when an export selects a native or BWE
+        sample rate. Native-rate exports leave it dynamic because the decoded
+        sample rate determines the FFT geometry at invocation time.
 
         The derivation mirrors what the graph actually does, in order:
 
@@ -146,7 +198,7 @@ class ReUseConfig(BaseModelConfig):
         The decoder's ``up_conv1`` doubles this back to ``2 * encoder_freq_bins``,
         which is ``>= num_freq_bins``; ``forward`` crops off the overshoot.
         """
-        padded = self.num_freq_bins + _ENCODER_FREQ_TAIL_PAD
+        padded = num_freq_bins + _ENCODER_FREQ_TAIL_PAD
         return (padded - _ENCODER_FREQ_KERNEL) // _ENCODER_FREQ_STRIDE + 1
 
     @property
@@ -166,6 +218,12 @@ class ReUseConfig(BaseModelConfig):
             raise ValueError("num_tfmamba must be positive")
         if self.n_fft <= 0 or self.n_fft % 2 != 0:
             raise ValueError("n_fft must be a positive even number")
+        if self.sampling_rate <= 0:
+            raise ValueError("sampling_rate must be positive")
+        for name in ("input_sampling_rate", "bwe_sampling_rate"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive when provided")
 
     @classmethod
     def from_json(cls, cfg: dict) -> ReUseConfig:
@@ -536,19 +594,20 @@ class TFMambaBlock(nn.Module):
         self.time_mamba = BiMambaBlock(config)
         self.freq_mamba = BiMambaBlock(config)
         self._channels = config.hid_feature
-        self._freq = config.encoder_freq_bins
+        self._freq = config.static_encoder_freq_bins
 
     def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
         channels = op.Constant(value_ints=[self._channels])
         batch = op.Shape(x, start=0, end=1)
         time = op.Shape(x, start=2, end=3)
-        # The frequency extent is a fixed function of n_fft, so it is emitted as a
-        # constant rather than read back with Shape. That keeps the frequency-axis
-        # Scan's extent statically known even when the time axis is dynamic, which
-        # is what lets an execution provider claim it — a Shape-derived extent
-        # leaves the scan unclaimable and, since an unclaimed node is a partition
-        # boundary, fragments the surrounding graph too.
-        freq = op.Constant(value_ints=[self._freq])
+        # An explicitly selected native/BWE rate gives an EP-claimable static
+        # frequency Scan. The faithful default follows the decoded native rate,
+        # so frequency is runtime data just as it is in NVIDIA's PyTorch model.
+        freq = (
+            op.Constant(value_ints=[self._freq])
+            if self._freq is not None
+            else op.Shape(x, start=3, end=4)
+        )
         minus_one = op.Constant(value_ints=[-1])
 
         # --- Time branch: (B, C, T, F) -> (B*F, T, C) ---
@@ -610,7 +669,7 @@ class SEMambaSpeechEnhancementModel(nn.Module):
             ``(batch, freq, time)``, ``(batch, freq, time)`` and
             ``(batch, freq, time, 2)``.
         """
-        num_freq = self.config.num_freq_bins
+        static_num_freq = self.config.static_num_freq_bins
         # Remember the input time extent; the decoders overshoot it and the
         # result is cropped back at the end.
         time = op.Shape(noisy_mag, start=2, end=3)
@@ -646,7 +705,12 @@ class SEMambaSpeechEnhancementModel(nn.Module):
 
         # Crop the upsampled output back to the input (freq, time) extent.
         starts = op.Constant(value_ints=[0, 0])
-        ends = op.Concat(op.Constant(value_ints=[num_freq]), time, axis=0)
+        num_freq = (
+            op.Constant(value_ints=[static_num_freq])
+            if static_num_freq is not None
+            else op.Shape(noisy_mag, start=1, end=2)
+        )
+        ends = op.Concat(num_freq, time, axis=0)
         axes = op.Constant(value_ints=[1, 2])
         denoised_mag = op.Slice(denoised_mag, starts, ends, axes)
         denoised_pha = op.Slice(denoised_pha, starts, ends, axes)
@@ -712,6 +776,8 @@ def build_reuse(
     dtype: str | None = None,
     execution_provider: str = "default",
     load_weights: bool = True,
+    input_sampling_rate: int | None = None,
+    bwe_sampling_rate: int | None = None,
 ) -> ModelPackage:
     """Build an ONNX :class:`ModelPackage` for a RE-USE / SEMamba checkpoint.
 
@@ -730,6 +796,11 @@ def build_reuse(
         execution_provider: Target execution provider for EP-aware
             optimizations.
         load_weights: When false, build the graph structure only.
+        input_sampling_rate: Known native input rate for a static-frequency
+            export. Omit it to preserve NVIDIA's native-rate behavior with a
+            dynamic frequency axis.
+        bwe_sampling_rate: Explicit NVIDIA ``BWE`` target rate. The workflow
+            resamples audio to this rate before analysis.
 
     Returns:
         A :class:`ModelPackage` whose ``"model"`` entry is the enhancement
@@ -739,6 +810,9 @@ def build_reuse(
     from mobius.integrations._weight_loading import apply_weights
 
     config = ReUseConfig.from_pretrained(model_id, revision=revision)
+    config.input_sampling_rate = input_sampling_rate
+    config.bwe_sampling_rate = bwe_sampling_rate
+    config.validate()
     resolved = resolve_dtype(dtype)
     if resolved is not None:
         config.dtype = resolved

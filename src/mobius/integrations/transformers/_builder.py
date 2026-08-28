@@ -183,6 +183,8 @@ def build_transformers_model(
     prune_prefill_prefix: bool = False,
     glm_full_attention: bool = False,
     export_paged_attention: bool = False,
+    input_sampling_rate: int | None = None,
+    bwe_sampling_rate: int | None = None,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -241,6 +243,13 @@ def build_transformers_model(
                 dtype=dtype,
                 execution_provider=execution_provider,
                 load_weights=load_weights,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
+            )
+        if input_sampling_rate is not None or bwe_sampling_rate is not None:
+            raise ValueError(
+                "input_sampling_rate and bwe_sampling_rate are only supported "
+                "for RE-USE speech-enhancement checkpoints"
             )
         if text_only:
             raise ValueError(

@@ -226,6 +226,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
     guidance_scale = getattr(args, "guidance_scale", None)
     if guidance_scale is not None and args.runtime != "onnx-genai":
         raise SystemExit("Error: --guidance-scale can only be used with --runtime onnx-genai.")
+    input_sampling_rate = getattr(args, "input_sampling_rate", None)
+    bwe_sampling_rate = getattr(args, "bwe_sampling_rate", None)
+    for option, value in (
+        ("--input-sample-rate", input_sampling_rate),
+        ("--bwe-sample-rate", bwe_sampling_rate),
+    ):
+        if value is not None and value <= 0:
+            raise SystemExit(f"Error: {option} must be a positive integer.")
 
     # Validate static-cache + --task compatibility.
     if args.static_cache and args.task is not None:
@@ -378,9 +386,16 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 dtype=dtype_override,
                 execution_provider=execution_provider,
                 load_weights=load_weights,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
+        if input_sampling_rate is not None or bwe_sampling_rate is not None:
+            raise SystemExit(
+                "Error: --input-sample-rate and --bwe-sample-rate are only "
+                "supported for RE-USE speech-enhancement checkpoints."
+            )
         try:
             hf_config = transformers.AutoConfig.from_pretrained(
                 config_path, trust_remote_code=trust_remote_code
@@ -519,6 +534,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
             keep_quantized=keep_quantized,
+            input_sampling_rate=input_sampling_rate,
+            bwe_sampling_rate=bwe_sampling_rate,
         )
 
     _save_package(pkg, output_dir, args, optimize, component_filter)
@@ -1388,6 +1405,27 @@ def build_parser() -> argparse.ArgumentParser:
             "metadata. Required for conditioned diffusion pipelines so export does "
             "not guess a source pipeline's generation default; pass 1.0 explicitly "
             "for unguided generation."
+        ),
+    )
+    sample_rate_group = build_parser.add_mutually_exclusive_group()
+    sample_rate_group.add_argument(
+        "--input-sample-rate",
+        type=int,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Build RE-USE for a known native input rate with static FFT geometry. "
+            "Omit to preserve native-rate dynamic geometry."
+        ),
+    )
+    sample_rate_group.add_argument(
+        "--bwe-sample-rate",
+        type=int,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Build RE-USE with NVIDIA BWE semantics: resample input audio to this "
+            "target rate and use consistently scaled FFT geometry."
         ),
     )
     build_parser.add_argument(
