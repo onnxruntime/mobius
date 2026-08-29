@@ -185,6 +185,7 @@ def build_transformers_model(
     export_paged_attention: bool = False,
     input_sampling_rate: int | None = None,
     bwe_sampling_rate: int | None = None,
+    native_csa: bool = False,
 ) -> ModelPackage:
     """Build a model package from a Transformers checkpoint.
 
@@ -311,11 +312,31 @@ def build_transformers_model(
         task,
         allow_parent_architecture_override=not text_only,
     )
-    config = _config_from_hf(
-        hf_config,
-        parent_config=parent_config,
-        module_class=module_class,
-    )
+    if native_csa and model_type != "deepseek_v4":
+        raise ValueError(
+            "native_csa=True (--features native-csa) is only supported for "
+            f"model_type 'deepseek_v4' (got {model_type!r})"
+        )
+    if native_csa:
+        config = _config_from_hf(
+            hf_config,
+            parent_config=parent_config,
+            module_class=module_class,
+            allow_block_fp8_dense_fallback=True,
+        )
+    else:
+        config = _config_from_hf(
+            hf_config,
+            parent_config=parent_config,
+            module_class=module_class,
+        )
+    if native_csa:
+        if not keep_quantized:
+            raise ValueError(
+                "native_csa=True requires keep_quantized=True; dense "
+                "reconstruction is not a CSA capability path"
+            )
+        config = dataclasses.replace(config, native_csa=True)
     if (
         compressed_tensors_config is not None
         and fp8_kv_cache
@@ -403,6 +424,25 @@ def build_transformers_model(
 
     if load_weights:
         if config.block_quant_scheme is not None and hasattr(
+            model_module, "build_block_quant_streaming_plan"
+        ):
+            reports = {}
+            for component_name, model in package.items():
+                reports[component_name] = stream_preprocessed_safetensors_to_model(
+                    model,
+                    model_id,
+                    lambda key_index, initializers, name=component_name: (
+                        model_module.build_block_quant_streaming_plan(
+                            name, key_index, initializers
+                        )
+                    ),
+                    revision=revision,
+                )
+            package.weight_loading_report = {
+                "format": "mobius.weight-loading-report.v1",
+                "components": reports,
+            }
+        elif config.block_quant_scheme is not None and hasattr(
             model_module, "build_fp8_streaming_plan"
         ):
             if len(package) != 1:

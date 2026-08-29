@@ -24,10 +24,8 @@ Why this fusion is separate from :func:`fuse_dense_moe_to_qmoe`:
 * Experts are ``BlockQuantizedMatMul`` (native blocks) not ``MatMulNBits``
   (int4 affine); there are no scale/zero-point inputs to carry.
 * GLM-5.2 UD-IQ1 quantises the ``gate``/``up`` projections and the ``down``
-  projection to *different* native formats (e.g. ``iq1_s`` gate/up, ``iq4_xs``
-  down). ``BlockQuantizedMoE`` expresses this with ``block_layout_version=2``
-  and per-projection ``fc1_format`` / ``fc2_format`` / ``fc3_format`` attributes
-  (a uniform-format layer stays on ``block_layout_version=1``).
+  projection to *different* native formats. The canonical v1 ABI carries
+  per-projection ``fc1_format`` / ``fc2_format`` / ``fc3_format`` attributes.
 * Routing is reconstructed **gate-agnostically** from the already-computed
   ``selected_experts`` / ``routing_weights`` tensors, so a sigmoid+bias+scaling
   GLM gate fuses identically to a plain softmax top-k gate. The routing decision
@@ -42,8 +40,8 @@ is rewired to consume the ``BlockQuantizedMoE`` output.
 
 The rewrite is **property-gated and fails closed**: a layer that is not a native
 dense-expert storm is skipped, and a *routed native-block* storm whose experts
-cannot be expressed as one expert-major bank (mixed native formats, per-expert
-bias, an incomplete/untraceable expert group, ...) raises
+cannot be expressed as one expert-major bank (per-expert bias, an
+incomplete/untraceable expert group, ...) raises
 :class:`~mobius.integrations.gguf.SparseMoEExportError` -- the same typed
 capability error the GGUF builder's sparse-MoE honesty gate raises -- so export
 fails closed rather than silently shipping a dense-all-expert graph. Pass
@@ -477,6 +475,7 @@ def _build_routing(
     weights so that (with ``normalize_routing_weights=0``) the kernel gathers
     exactly those weights. The result is independent of the originating gate.
     """
+    assert layer.routing_weights is not None
     neg_one = _make_initializer(
         graph, f"{prefix}.neg_one", np.array([-1], dtype=np.int64), ir.DataType.INT64
     )
@@ -609,14 +608,8 @@ def _plan_layer(
 ) -> _FusionPlan:
     """Validate and byte-stack one native MoE layer without touching the graph.
 
-    ``allow_perproj_v2_schema`` is a private, test-only switch. A layer that
-    mixes native formats across its fc1/fc2/fc3 banks can only be expressed as a
-    ``block_layout_version=2`` per-projection node, and no shipped onnx-genai
-    runtime executes that ABI yet. It therefore defaults off on every production,
-    CLI, and environment path, and planning fails closed for such a layer (before
-    any graph mutation) rather than emitting an unrunnable node. It is set
-    ``True`` only by schema-construction tests that assert the v2 node's shape;
-    the node they build is not runnable and must never be shipped.
+    ``allow_perproj_v2_schema`` is retained as an ignored compatibility
+    parameter for callers predating the canonical per-projection v1 ABI.
     """
     ids = sorted(layer.experts)
     gate_nodes = [layer.experts[i].gate for i in ids]
@@ -668,29 +661,12 @@ def _plan_layer(
         "normalize_routing_weights": 0,
         "swiglu_fusion": swiglu_fusion,
     }
-    distinct = set(projection_formats.values())
-    if len(distinct) == 1:
-        attributes["format"] = next(iter(distinct))
-    else:
-        if not allow_perproj_v2_schema:
-            raise _UnfusableError(
-                "mixed per-projection native formats "
-                f"{sorted(distinct)} can only be expressed with the "
-                "block_layout_version=2 per-projection BlockQuantizedMoE ABI, "
-                "which no shipped onnx-genai runtime implements -- emitting a v2 "
-                "node would build an unrunnable graph (overclaim), so export "
-                "fails closed. There is no production, CLI, or environment opt-in; "
-                "v2 stays a schema-construction test path until a typed runtime "
-                "capability handshake ships"
-            )
-        attributes["block_layout_version"] = 2
-        # ``format`` is the required base/fallback; per-projection attributes
-        # override it where a projection uses a different native format.
-        attributes["format"] = projection_formats["fc1"]
-        attributes["fc1_format"] = projection_formats["fc1"]
-        attributes["fc2_format"] = projection_formats["fc2"]
-        if "fc3" in projection_formats:
-            attributes["fc3_format"] = projection_formats["fc3"]
+    del allow_perproj_v2_schema
+    attributes["block_layout_version"] = 1
+    attributes["fc1_format"] = projection_formats["fc1"]
+    attributes["fc2_format"] = projection_formats["fc2"]
+    if "fc3" in projection_formats:
+        attributes["fc3_format"] = projection_formats["fc3"]
 
     return _FusionPlan(
         layer=layer,
@@ -708,6 +684,9 @@ def _emit_layer(graph: ir.Graph, plan: _FusionPlan) -> None:
     """Materialise a validated :class:`_FusionPlan` into the graph."""
     prefix = plan.prefix
     layer = plan.layer
+    assert layer.routed_out is not None
+    routed_producer = layer.routed_out.producer()
+    assert routed_producer is not None
 
     fc3_w_v: ir.Value | None = None
     if plan.fc3_w is not None:
@@ -739,6 +718,9 @@ def _emit_layer(graph: ir.Graph, plan: _FusionPlan) -> None:
             fc3_w_v,
             None,
             router_weights,
+            None,
+            None,
+            None,
         ],
         attributes=plan.attributes,
         domain=_NXRT_DOMAIN,
@@ -768,7 +750,7 @@ def _emit_layer(graph: ir.Graph, plan: _FusionPlan) -> None:
     else:
         final_out = moe_out
 
-    graph.insert_after(layer.routed_out.producer(), new_nodes)
+    graph.insert_after(routed_producer, new_nodes)
     layer.routed_out.replace_all_uses_with(final_out)
     graph.opset_imports[_NXRT_DOMAIN] = 1
 
@@ -843,8 +825,8 @@ def fuse_block_quantized_moe(
     (pure expert-major stack/concat, no requantization). Routing is reconstructed
     gate-agnostically from the graph's ``selected_experts`` / ``routing_weights``
     tensors, so softmax, sigmoid+bias+scaling, and other top-k gates all fuse.
-    Mixed per-projection native formats are expressed with
-    ``block_layout_version=2``.
+    Mixed per-projection native formats are expressed by the canonical
+    per-projection ``block_layout_version=1`` attributes.
 
     Every candidate layer is fully validated and byte-stacked *before* any node
     is emitted, so a fail-closed layer never leaves the graph half-rewritten. A
@@ -864,17 +846,7 @@ def fuse_block_quantized_moe(
             ``allow_dense_moe_experts`` flag / ``MOBIUS_ALLOW_DENSE_MOE_EXPERTS``
             environment variable is used. This is a research/correctness path
             only and makes no throughput claim.
-        _allow_perproj_v2_schema: Private, test-only switch. A layer that mixes
-            native formats across its fc1/fc2/fc3 banks (e.g. GLM-5.2 UD-IQ1 with
-            an iq1 gate/up and a higher-bit down) can only be expressed with the
-            ``block_layout_version=2`` per-projection ``BlockQuantizedMoE`` ABI.
-            No shipped onnx-genai runtime implements that ABI, so this defaults to
-            ``False`` (fail closed): the production ``build_from_gguf`` path never
-            sets it, and a mixed-format layer typed-rejects rather than emitting an
-            unrunnable v2 node. It is ``True`` only in schema-construction tests
-            that assert the v2 node's shape; that node is not runnable and must
-            never be shipped. Until a real typed runtime-capability handshake
-            exists there is no production, CLI, or environment path to v2.
+        _allow_perproj_v2_schema: Deprecated compatibility argument; ignored.
 
     Returns:
         The number of MoE layers fused.
@@ -882,6 +854,7 @@ def fuse_block_quantized_moe(
     Raises:
         SparseMoEExportError: A routed native-block MoE layer cannot be sparse
             fused and ``allow_dense_moe`` is not set.
+
     """
     if allow_dense_moe is None:
         from mobius._flags import flags

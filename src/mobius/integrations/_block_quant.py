@@ -696,13 +696,13 @@ def stack_expert_bank(
 # Runtime (nxrt) emission gate — prove representability or typed-reject
 # ---------------------------------------------------------------------------
 
-#: Block formats the onnx-genai ``nxrt`` CPU kernel's ``BlockFormat::parse``
-#: accepts (``crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs``).
-#: MXFP4 here means the *interleaved* llama.cpp ``block_mxfp4`` layout
-#: (``QK=32``, 17 bytes/block: 1 E8M0 byte + 16 nibble bytes) packed into a
-#: single tensor — NOT a planar (separate nibble + separate scale) layout.
+#: Block formats accepted by the canonical onnx-genai ``pkg.nxrt`` v1 ABI.
+#: The planar formats use the dedicated auxiliary-scale input; the remaining
+#: formats are self-describing interleaved blocks.
 NXRT_BLOCK_FORMATS: frozenset[str] = frozenset(
     {
+        "block_fp8",
+        "fp4_planar",
         "mxfp4",
         "iq4_nl",
         "iq4_xs",
@@ -731,24 +731,8 @@ def runtime_representation_gap(
     if desc.kind is QuantKind.ORDINARY:
         return None
 
-    if desc.kind is QuantKind.BLOCK_FP8:
-        return (
-            "nxrt has no block-FP8 BlockFormat: its BlockFormat::parse accepts only "
-            f"{sorted(NXRT_BLOCK_FORMATS)} and there is no E4M3-weight x 2D-UE8M0-block-scale "
-            "dequant path in block_quantized_{matmul,moe}.rs. Emitting a block-fp8 "
-            f"projection ({desc.name}, block {desc.block_shape}) would be unrunnable."
-        )
-
-    if desc.kind is QuantKind.FP4_PACKED:
-        return (
-            "nxrt MXFP4 requires the interleaved single-tensor llama.cpp block_mxfp4 "
-            "layout (QK=32, 17 bytes/block = 1 E8M0 byte + 16 nibble bytes); this "
-            f"checkpoint stores fp4 experts *planar* ({desc.name}: I8 packed "
-            f"{desc.packed_shape} nibbles + a separate F8_E8M0 {desc.scale_shape} block-32 "
-            "micro-scale). No planar-fp4 bank ABI exists, and a planar->interleaved "
-            "transcode is unproven (E2M1 nibble order + E8M0 exponent bias vs llama.cpp "
-            "must be verified). Emitting with the split tensors would be unrunnable."
-        )
+    if desc.kind in (QuantKind.BLOCK_FP8, QuantKind.FP4_PACKED):
+        return None
 
     return f"{desc.name}: unsupported tensor ({desc.unsupported_reason})"
 
@@ -762,16 +746,8 @@ def plan_routed_expert_bank(
     """Prove a routed-expert bank is runtime-representable, else typed-reject.
 
     Validates that every routed expert shares one packed shape / dtype / scale
-    layout, then checks :func:`runtime_representation_gap`. Because *runtime*
-    cannot represent either quantized family today, this raises
-    :class:`BlockQuantExportError` naming the exact gap rather than emitting an
-    unrunnable node. It never falls back to a dense per-expert graph and never
-    dequantizes.
-
-    When (and only when) a future runtime *can* represent the bank, the caller
-    supplies the byte-exact per-expert payloads via *per_expert_bytes* and a
-    :class:`PackedExpertBank` is returned — the signature is stable for that
-    path and for Deckard's #593 integration.
+    layout, then checks :func:`runtime_representation_gap`. The caller supplies
+    byte-exact per-expert payloads; no dense fallback or dequantization occurs.
     """
     if not expert_descriptors:
         raise BlockQuantValidationError("cannot plan an empty routed-expert bank")
@@ -802,12 +778,11 @@ def plan_routed_expert_bank(
             f"Routed-expert bank ({len(expert_descriptors)} x {first.kind.value}) is not "
             f"representable by the {runtime!r} runtime, so no BlockQuantizedMoE node is "
             f"emitted (fail closed, no dense fallback, no dequantization). ABI gap: {gap} "
-            "Resolving this needs a runtime ABI extension (a planar-fp4 / block-fp8 "
-            "BlockFormat) or a proven byte-exact planar->interleaved transcode primitive."
+            "Resolving this needs a runtime ABI extension or a proven byte-exact "
+            "layout conversion primitive."
         )
 
-    # Representable path (not reachable for today's nxrt ABI). Build the bank
-    # only from caller-supplied byte-exact payloads — never from placeholders.
+    # Build the bank only from caller-supplied byte-exact payloads.
     if per_expert_bytes is None:
         raise BlockQuantValidationError(
             "runtime can represent the bank but no per_expert_bytes were supplied to pack it"

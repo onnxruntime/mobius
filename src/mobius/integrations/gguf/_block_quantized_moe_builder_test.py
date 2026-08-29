@@ -7,18 +7,15 @@ These tests exercise the ``build_from_gguf`` post-export integration points
 (:func:`_fuse_native_block_moe`, :func:`_assert_sparse_moe_graph`) on synthetic
 exported packages -- i.e. the graph state the builder hands to the fusion after
 ``pkg.apply_weights``. They are distinct from the rewrite-rule unit tests: the
-focus here is the *builder's* honesty policy (default fail-closed for
-mixed-format per-projection v2 with no environment opt-in, opt-in dense
-retention, and the final-graph-state backstop), byte-preserving expert banks,
-and deterministic external data.
+focus here is the *builder's* honesty policy, canonical per-projection v1
+wiring, byte-preserving expert banks, and deterministic external data.
 
 Native IQ/GGUF blocks are codebook-based and cannot be dequantized in NumPy, so
 correctness is proven structurally (the routed expert storm collapses; the shared
 expert is untouched) and by byte-preservation (the native blocks are stacked
 verbatim). GLM-5.2 UD-IQ1 layers mix native formats across their fc1/fc2/fc3
-banks, so they require the ``block_layout_version=2`` per-projection ABI; until
-that ships in the runtime the builder must typed-reject them rather than emit an
-unrunnable node.
+banks; the canonical v1 ABI represents them with per-projection format
+attributes.
 """
 
 from __future__ import annotations
@@ -60,26 +57,17 @@ def _moe(pkg: ModelPackage) -> ir.Node:
 
 
 # --------------------------------------------------------------------------- #
-# The retired env flag cannot force an unrunnable v2 node through the builder  #
+# The retired env flag cannot change the canonical v1 node                     #
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
-def test_builder_env_flag_cannot_force_v2(monkeypatch, value) -> None:
-    """The retired ``MOBIUS_ENABLE_BQMOE_PERPROJ_V2`` env flag cannot bypass the blocker.
-
-    A mixed-format (v2-only) layer must typed-reject through the builder no matter
-    how the old opt-in env var is set: production never emits an unrunnable v2
-    node from an environment variable. The reject is atomic -- the dense graph is
-    left untouched.
-    """
+def test_builder_env_flag_cannot_change_v1(monkeypatch, value) -> None:
     monkeypatch.setenv(_V2_ENV, value)
     pkg, _ = _pkg(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    equal_before = _count(pkg, "Equal")
-
-    with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        _fuse_native_block_moe(pkg, allow_dense=False)
-
-    assert _count(pkg, "BlockQuantizedMoE") == 0
-    assert _count(pkg, "Equal") == equal_before  # untouched
+    assert _fuse_native_block_moe(pkg, allow_dense=False) == 1
+    attrs = _moe(pkg).attributes
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq1_s"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
 # --------------------------------------------------------------------------- #
@@ -102,58 +90,36 @@ def test_builder_fuses_uniform_native_moe(monkeypatch) -> None:
     # projections survive.
     assert _count(pkg, "BlockQuantizedMatMul") == 3
     attrs = _moe(pkg).attributes
-    assert "block_layout_version" not in attrs  # v1 (uniform)
-    assert attrs["format"].value == "iq4_xs"
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq4_xs"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
-def test_builder_mixed_format_typed_rejects_without_v2_runtime(monkeypatch) -> None:
-    """GLM-5.2-style mixed formats need v2; with no v2 runtime, fail closed.
-
-    The reject must be atomic: the dense graph is left untouched so the caller
-    sees the original storm, never a half-rewritten graph.
-    """
+def test_builder_mixed_format_fuses_with_canonical_v1(monkeypatch) -> None:
     monkeypatch.delenv(_V2_ENV, raising=False)
     pkg, _ = _pkg(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    equal_before = _count(pkg, "Equal")
-
-    with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        _fuse_native_block_moe(pkg, allow_dense=False)
-
-    assert _count(pkg, "BlockQuantizedMoE") == 0
-    assert _count(pkg, "Equal") == equal_before  # untouched
+    assert _fuse_native_block_moe(pkg, allow_dense=False) == 1
+    attrs = _moe(pkg).attributes
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq1_s"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
-def test_builder_env_flag_with_allow_dense_keeps_runnable_fallback(monkeypatch) -> None:
-    """Env flag set + allow_dense keeps the runnable dense storm, never a v2 node.
-
-    The only non-reject escape for a mixed-format layer is the explicit dense
-    fallback (every expert per token, no throughput claim). Even then the builder
-    must not emit a ``block_layout_version=2`` node from the retired env flag.
-    """
+def test_builder_env_flag_with_allow_dense_still_fuses(monkeypatch) -> None:
     monkeypatch.setenv(_V2_ENV, "1")
     pkg, _ = _pkg(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    equal_before = _count(pkg, "Equal")
-
     fused = _fuse_native_block_moe(pkg, allow_dense=True)
-
-    assert fused == 0  # nothing fused
-    assert _count(pkg, "BlockQuantizedMoE") == 0  # no v2 node emitted from the env flag
-    assert _count(pkg, "Equal") == equal_before  # runnable dense fallback preserved
+    assert fused == 1
+    assert _count(pkg, "BlockQuantizedMoE") == 1
 
 
-def test_builder_allow_dense_retains_dense_fallback(monkeypatch) -> None:
-    """Opting into the dense fallback keeps the runnable per-expert storm."""
+def test_builder_allow_dense_does_not_disable_supported_fusion(monkeypatch) -> None:
     monkeypatch.delenv(_V2_ENV, raising=False)
     pkg, _ = _pkg(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    equal_before = _count(pkg, "Equal")
-
     fused = _fuse_native_block_moe(pkg, allow_dense=True)
-    # The gate is a no-op under the opt-in (the fusion already warned).
     _assert_sparse_moe_graph(pkg, source="mixed.gguf", allow_dense=True)
-
-    assert fused == 0
-    assert _count(pkg, "BlockQuantizedMoE") == 0
-    assert _count(pkg, "Equal") == equal_before  # dense fallback preserved
+    assert fused == 1
+    assert _count(pkg, "BlockQuantizedMoE") == 1
 
 
 def test_builder_bank_bytes_are_byte_preserved(monkeypatch) -> None:
@@ -358,50 +324,39 @@ def test_e2e_uniform_native_moe_fuses_through_builder(monkeypatch, tmp_path) -> 
     assert moe == 1
     assert matmul == 4  # attn q/k/v/o only; the 12 routed expert matmuls collapsed
     attrs = _moe(pkg).attributes
-    assert "block_layout_version" not in attrs  # uniform -> v1
-    assert attrs["format"].value == "iq1_s"
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq1_s"
+    assert attrs["fc2_format"].value == "iq1_s"
 
 
-def test_e2e_mixed_format_typed_rejects_through_builder(monkeypatch, tmp_path) -> None:
-    """A GLM-5.2-style per-projection mixed GGUF fails closed end-to-end.
-
-    Without the v2 runtime the builder must raise ``SparseMoEExportError`` rather
-    than emit an unrunnable v2 node -- this is exactly the honest path GLM-5.2
-    UD-IQ1 takes until the per-projection runtime ships.
-    """
+def test_e2e_mixed_format_fuses_through_builder(monkeypatch, tmp_path) -> None:
     from mobius.integrations.gguf import build_from_gguf
 
     monkeypatch.delenv(_V2_ENV, raising=False)
     path = tmp_path / "mixed-moe.gguf"
     _write_native_moe_gguf(path, down_fmt="iq4_xs")
 
-    with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        build_from_gguf(path, keep_quantized=True)
+    pkg = build_from_gguf(path, keep_quantized=True)
+    moe, matmul = _e2e_ops(pkg)
+    assert (moe, matmul) == (1, 4)
+    attrs = _moe(pkg).attributes
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq1_s"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
-def test_e2e_env_flag_cannot_force_v2_through_builder(monkeypatch, tmp_path) -> None:
-    """The retired env flag cannot make ``build_from_gguf`` emit a v2 node.
-
-    End-to-end, a GLM-5.2-style per-projection mixed GGUF must still raise
-    ``SparseMoEExportError`` with the old opt-in env var set: there is no
-    production, CLI, or environment path to an unrunnable v2 node.
-    """
+def test_e2e_env_flag_cannot_change_v1_through_builder(monkeypatch, tmp_path) -> None:
     from mobius.integrations.gguf import build_from_gguf
 
     monkeypatch.setenv(_V2_ENV, "1")
     path = tmp_path / "mixed-moe-env.gguf"
     _write_native_moe_gguf(path, down_fmt="iq4_xs")
 
-    with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        build_from_gguf(path, keep_quantized=True)
+    pkg = build_from_gguf(path, keep_quantized=True)
+    assert _moe(pkg).attributes["block_layout_version"].value == 1
 
 
-def test_e2e_allow_dense_retains_storm_through_builder(monkeypatch, tmp_path) -> None:
-    """``allow_dense_moe=True`` keeps the runnable per-expert dense fallback.
-
-    It must warn+retain, never count as a fused success: the 12 routed expert
-    matmuls stay, so no BlockQuantizedMoE is produced.
-    """
+def test_e2e_allow_dense_still_fuses_supported_layer(monkeypatch, tmp_path) -> None:
     from mobius.integrations.gguf import build_from_gguf
 
     monkeypatch.delenv(_V2_ENV, raising=False)
@@ -410,9 +365,7 @@ def test_e2e_allow_dense_retains_storm_through_builder(monkeypatch, tmp_path) ->
 
     pkg = build_from_gguf(path, keep_quantized=True, allow_dense_moe=True)
     moe, matmul = _e2e_ops(pkg)
-    assert moe == 0
-    # 4 attention + 4 experts * 3 projections all remain as dense BlockQuantizedMatMul.
-    assert matmul == 16
+    assert (moe, matmul) == (1, 4)
 
 
 def test_e2e_shared_expert_survives_fusion_through_builder(monkeypatch, tmp_path) -> None:

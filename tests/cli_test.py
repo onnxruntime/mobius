@@ -596,6 +596,46 @@ class TestCLIBuild:
             )
         assert mock_build.call_args.kwargs.get("prune_prefill_prefix") is True
 
+    def test_features_native_csa_passed_through(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index",
+                return_value=None,
+            ),
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as mock_build,
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--no-weights",
+                    "--features",
+                    "native-csa",
+                ]
+            )
+        assert mock_build.call_args.kwargs.get("native_csa") is True
+
+    def test_features_native_csa_rejects_dequantize(self):
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            pytest.raises(SystemExit, match=r"native-csa.*--dequantize"),
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "some/model",
+                    tmpdir,
+                    "--features",
+                    "native-csa",
+                    "--dequantize",
+                ]
+            )
+
     def test_features_comma_separated_multiple(self):
         """A single --features accepts a comma-separated list."""
         with (

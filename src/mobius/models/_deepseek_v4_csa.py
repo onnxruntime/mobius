@@ -284,6 +284,18 @@ class CsaLayerPlan:
     def selected_indices_name(self) -> str:
         return f"selected_indices.{self.layer_id}"
 
+    @property
+    def past_records_axis_name(self) -> str:
+        return f"past_compressed_records.{self.layer_id}"
+
+    @property
+    def present_records_axis_name(self) -> str:
+        return f"present_compressed_records.{self.layer_id}"
+
+    @property
+    def selected_records_axis_name(self) -> str:
+        return f"selected_records.{self.layer_id}"
+
 
 def _layer_compress_ratio(config: ArchitectureConfig, layer_id: int) -> int:
     ratios = config.compress_ratios or []
@@ -428,13 +440,9 @@ def plan_native_csa(
 # packed-FP4 DeepSeek-V4-Flash checkpoint is allowed to *progress* (the
 # ``ArchitectureConfig`` records the deferred ``block_quant_scheme`` rather than
 # rejecting at config resolution), so the CSA nodes and their compressed state
-# IO are built and inspectable. The *runnable* full export, however, must fail
-# closed until the native ``nxrt`` runtime can actually execute the block-quant
-# weights. That capability is owned by ``mobius.integrations._block_quant``
-# (#602): ``runtime_representation_gap`` returns a precise ABI-gap string while
-# ``nxrt`` lacks a block-FP8 / planar-FP4 ``BlockFormat`` and ``None`` once the
-# real format strings land -- at which point this gate opens automatically with
-# no change here.
+# IO can compose with the canonical planar block-quant producer. Runtime
+# representability remains a property gate owned by
+# ``mobius.integrations._block_quant``.
 
 
 def _representative_block_fp8_descriptor(
@@ -520,11 +528,9 @@ def assert_native_runtime_supports_block_quant(
 ) -> None:
     """Full-export runtime-capability gate for a deferred block-quant scheme.
 
-    No-op unless ``config.block_quant_scheme`` is set (only ``from_transformers``
-    records it, and only when ``native_csa`` deferred #602's config-resolution
-    reject). Raises the typed :class:`BlockQuantExportError` -- fail-closed,
-    never a silent dense fallback -- while *runtime* cannot execute the
-    checkpoint's block-FP8 / planar-FP4 weights.
+    No-op when the canonical runtime represents the recorded scheme. Raises the
+    typed :class:`BlockQuantExportError` for an unknown/unrepresentable runtime;
+    never selects a silent dense fallback.
     """
     scheme = getattr(config, "block_quant_scheme", None)
     gap = native_runtime_block_quant_gap(scheme, runtime=runtime)
@@ -534,8 +540,7 @@ def assert_native_runtime_supports_block_quant(
         "native CSA full export requires a runtime that can execute the "
         f"checkpoint's block-quant weights, but {runtime!r} cannot yet. Graph "
         "construction progressed (CSA nodes + compressed state IO are built), "
-        "but the runnable export is blocked until the native block-FP8 / "
-        "planar-FP4 format strings land (mobius.integrations._block_quant."
+        "and no dense fallback is permitted (mobius.integrations._block_quant."
         "runtime_representation_gap / plan_routed_expert_bank). ABI gap:\n"
         f"{gap}"
     )

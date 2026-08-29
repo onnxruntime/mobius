@@ -26,7 +26,6 @@ from mobius.integrations.transformers._config_resolver import _default_task_for_
 from mobius.models._deepseek_v4_csa import (
     CSA_COMPRESSION_RATIO,
     CSA_DOMAIN,
-    CSA_OP_TYPE,
     HCA_COMPRESSION_RATIO,
     NativeCsaExportError,
     assert_native_runtime_supports_block_quant,
@@ -880,8 +879,16 @@ def test_native_csa_threads_compressed_state_io():
     pres_kv = outputs["present_compressed_kv.1"]
     assert past_kv.dtype == ir.DataType.FLOAT
     assert pres_kv.dtype == ir.DataType.FLOAT
-    assert [str(d) for d in past_kv.shape] == ["batch", "past_compressed_records", "16"]
-    assert [str(d) for d in pres_kv.shape] == ["batch", "present_compressed_records", "16"]
+    assert [str(d) for d in past_kv.shape] == [
+        "batch",
+        "past_compressed_records.1",
+        "16",
+    ]
+    assert [str(d) for d in pres_kv.shape] == [
+        "batch",
+        "present_compressed_records.1",
+        "16",
+    ]
 
     past_carry = inputs["past_compression_carry.1"]
     pres_carry = outputs["present_compression_carry.1"]
@@ -1057,6 +1064,16 @@ def test_native_csa_emits_both_ratios_for_interleaved_schedule():
     assert ratio4.attributes["cache_format"].value == "fp8_e4m3_block64"
     assert ratio128.attributes["index_topk"].value == 0
     assert ratio4.attributes["index_topk"].value == 4
+    inputs = _named(graph.inputs)
+    outputs = _named(graph.outputs)
+    assert (
+        str(inputs["past_compressed_kv.1"].shape[1])
+        == (str(inputs["past_index_key.1"].shape[1]))
+        == "past_compressed_records.1"
+    )
+    assert str(inputs["past_compressed_kv.2"].shape[1]) == "past_compressed_records.2"
+    assert str(outputs["present_compressed_kv.1"].shape[1]) == ("present_compressed_records.1")
+    assert str(outputs["present_compressed_kv.2"].shape[1]) == ("present_compressed_records.2")
 
 
 def test_native_csa_ratio4_threads_index_state_io():
@@ -1273,18 +1290,12 @@ def test_plan_native_csa_ratio4_layer_matches_contract():
 # (E4M3 weight + 2D UE8M0 [128, 128] block scale) with *packed-fp4* routed
 # experts (top-level ``expert_dtype=fp4``).
 #
-# The two slices compose in TWO stages, mandated by the directive
-# "graph construction should progress past the former generic shape mismatch,
-# full export must typed-reject at the runtime capability gate":
+# The two slices compose in two stages:
 #
 #   * A non-native export keeps #602's early, loud config-resolution reject.
-#   * A native-CSA export DEFERS that reject (records ``block_quant_scheme``)
-#     so graph construction PROGRESSES -- CSA nodes + compressed state IO are
-#     built and inspectable -- and the runnable *full export* then fails closed
-#     at the runtime-capability gate (``assert_native_runtime_supports_block_quant``
-#     / ``preprocess_weights``) until nxrt advertises the real block-FP8 /
-#     planar-FP4 format strings. Never a silent dense fallback, never a partial
-#     native + silent dense graph.
+#   * A native-CSA export records ``block_quant_scheme`` and emits canonical
+#     block-FP8 MatMul plus planar-FP4 MoE nodes alongside CSA state IO. Never a
+#     silent dense fallback, never a partial native + silent dense graph.
 # ---------------------------------------------------------------------------
 
 # Frozen verbatim from the official config.json @
@@ -1421,73 +1432,151 @@ def test_native_csa_defers_block_quant_so_graph_construction_can_progress():
     assert config.block_quant_scheme.has_packed_fp4_experts
 
 
-def test_native_csa_full_export_typed_rejects_at_runtime_capability_gate():
-    # The deferred config still fails closed at the runtime-capability gate:
-    # the runnable full export (assert_native_runtime_supports_block_quant, and
-    # therefore preprocess_weights) raises the typed BlockQuantExportError while
-    # nxrt cannot execute block-FP8 / planar-FP4 weights. Never silent dense.
+def test_native_csa_runtime_capability_gate_accepts_planar_v1():
     hf = _v4_hf_config(
         quantization_config=_REAL_BLOCK_FP8_QUANT_CONFIG,
         expert_dtype="fp4",
         native_csa=True,
     )
     config = ArchitectureConfig.from_transformers(hf)
-    with pytest.raises(BlockQuantExportError) as exc:
-        assert_native_runtime_supports_block_quant(config)
-    msg = str(exc.value)
-    assert "block-FP8" in msg or "block-fp8" in msg.lower()
-    assert "planar" in msg.lower()
-    # The gap string is sourced from the #602 runtime contract, so the gate
-    # tracks the real format strings and opens with no change here.
+    assert_native_runtime_supports_block_quant(config)
     gap = native_runtime_block_quant_gap(config.block_quant_scheme)
-    assert gap is not None
-    assert "nxrt" in gap
+    assert gap is None
 
 
-def test_native_csa_graph_construction_progresses_past_block_quant():
-    # With the deferred block-quant scheme present, graph construction PROGRESSES
-    # past the former generic weight-shape mismatch: build_from_module emits the
-    # frozen CSA node and its compressed state IO instead of raising. The gate
-    # lives on the *full export* (weight load), not on construction, so the same
-    # config that builds a graph still rejects the runnable export.
+def test_native_csa_graph_emits_planar_weights_and_sparse_experts():
     scheme = BlockQuantScheme.from_quantization_config(
         _REAL_BLOCK_FP8_QUANT_CONFIG, expert_dtype="fp4"
     )
     assert scheme is not None and scheme.is_owned
-    config = _tiny_config(
-        num_hidden_layers=2,
-        compress_ratios=[0, 128],
+    config = _ratio4_config(
+        num_hidden_layers=1,
+        compress_ratios=[4],
         native_csa=True,
         block_quant_scheme=scheme,
+        moe_intermediate_size=32,
+        num_nextn_predict_layers=0,
     )
     graph = build_from_module(DeepSeekV4CausalLMModel(config), config, task="deepseek-v4")[
         "model"
     ].graph
     csa = [n for n in _csa_nodes(graph) if n.domain == CSA_DOMAIN]
     assert len(csa) == 1
-    assert csa[0].op_type == CSA_OP_TYPE
-    # ... but the runnable full export of that same config still fails closed.
-    with pytest.raises(BlockQuantExportError):
-        assert_native_runtime_supports_block_quant(config)
+    assert csa[0].attributes["compression_ratio"].value == 4
+
+    index_mm = next(
+        node
+        for node in graph
+        if node.domain == "pkg.nxrt"
+        and node.op_type == "BlockQuantizedMatMul"
+        and node.inputs[1].name.endswith("self_attn.indexer.wq_b.weight")
+    )
+    assert len(index_mm.inputs) == 4
+    assert [value.name for value in index_mm.inputs[:3]] == [
+        index_mm.inputs[0].name,
+        "model.layers.0.self_attn.indexer.wq_b.weight",
+        "model.layers.0.self_attn.indexer.wq_b.scale",
+    ]
+    assert index_mm.attributes["format"].value == "block_fp8"
+    assert index_mm.attributes["block_size_out"].value == 128
+    assert index_mm.attributes["block_size_in"].value == 128
+    assert graph.initializers[index_mm.inputs[1].name].dtype == ir.DataType.FLOAT8E4M3FN
+    assert graph.initializers[index_mm.inputs[2].name].dtype == ir.DataType.FLOAT8E8M0
+    index_query_reshape = csa[0].inputs[11].producer()
+    assert index_query_reshape is not None
+    assert index_query_reshape.inputs[0].producer() is index_mm
+    assert "q_a_layernorm" in index_mm.inputs[0].name
+
+    moe = next(
+        node
+        for node in graph
+        if node.domain == "pkg.nxrt" and node.op_type == "BlockQuantizedMoE"
+    )
+    assert len(moe.inputs) == 12
+    assert [moe.inputs[index].name for index in (2, 4, 6, 9, 10, 11)] == [
+        "model.layers.0.mlp.moe.fc1_experts_weights",
+        "model.layers.0.mlp.moe.fc2_experts_weights",
+        "model.layers.0.mlp.moe.fc3_experts_weights",
+        "model.layers.0.mlp.moe.fc1_experts_aux_scale",
+        "model.layers.0.mlp.moe.fc2_experts_aux_scale",
+        "model.layers.0.mlp.moe.fc3_experts_aux_scale",
+    ]
+    assert moe.attributes["fc1_format"].value == "fp4_planar"
+    assert moe.attributes["fc2_format"].value == "fp4_planar"
+    assert moe.attributes["fc3_format"].value == "fp4_planar"
+    assert moe.attributes["block_layout_version"].value == 1
+    assert count_op_type(graph, "QMoE") == 0
+    assert count_op_type(graph, "GroupQueryAttention") == 0
+    assert not any(".mlp.moe.experts." in name for name in graph.initializers)
+    assert_native_runtime_supports_block_quant(config)
 
 
-def test_preprocess_weights_enforces_runtime_capability_gate():
-    # The weight-load hook (full export) enforces the same gate: a native-CSA
-    # module whose config carries a deferred block-quant scheme rejects in
-    # preprocess_weights before mapping a single tensor -- the typed blocker
-    # replaces the former generic "Weight shape mismatch".
+def test_preprocess_weights_maps_real_planar_names_and_banks():
     scheme = BlockQuantScheme.from_quantization_config(
         _REAL_BLOCK_FP8_QUANT_CONFIG, expert_dtype="fp4"
     )
-    config = _tiny_config(
-        num_hidden_layers=2,
-        compress_ratios=[0, 128],
+    config = _ratio4_config(
+        num_hidden_layers=1,
+        compress_ratios=[4],
         native_csa=True,
         block_quant_scheme=scheme,
+        moe_intermediate_size=32,
+        num_nextn_predict_layers=0,
     )
     module = DeepSeekV4CausalLMModel(config)
-    with pytest.raises(BlockQuantExportError):
-        module.preprocess_weights({})
+
+    def e8m0(*shape):
+        return torch.zeros(shape, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+
+    state = {
+        "layers.0.attn.indexer.wq_b.weight": torch.zeros(64, 8, dtype=torch.float8_e4m3fn),
+        "layers.0.attn.indexer.wq_b.scale": e8m0(1, 1),
+    }
+    for expert in range(2):
+        for projection in ("w1", "w2", "w3"):
+            state[f"layers.0.ffn.experts.{expert}.{projection}.weight"] = torch.zeros(
+                32, 16, dtype=torch.int8
+            )
+            state[f"layers.0.ffn.experts.{expert}.{projection}.scale"] = e8m0(32, 1)
+    processed = module.preprocess_weights(state)
+    assert (
+        processed["model.layers.0.self_attn.indexer.wq_b.scale"].dtype == torch.float8_e8m0fnu
+    )
+    assert processed["model.layers.0.mlp.moe.fc1_experts_weights"].shape == (
+        2,
+        32,
+        16,
+    )
+    assert processed["model.layers.0.mlp.moe.fc3_experts_aux_scale"].shape == (
+        2,
+        32,
+        1,
+    )
+
+
+def test_streaming_plan_fails_closed_for_missing_planar_scale():
+    scheme = BlockQuantScheme.from_quantization_config(
+        _REAL_BLOCK_FP8_QUANT_CONFIG, expert_dtype="fp4"
+    )
+    config = _ratio4_config(
+        num_hidden_layers=1,
+        compress_ratios=[4],
+        native_csa=True,
+        block_quant_scheme=scheme,
+        moe_intermediate_size=32,
+        num_nextn_predict_layers=0,
+    )
+    module = DeepSeekV4CausalLMModel(config)
+    graph = build_from_module(module, config, task="deepseek-v4")["model"].graph
+    malformed_header = {
+        "layers.0.attn.indexer.wq_b.weight": (
+            "shard.safetensors",
+            [64, 8],
+            "F8_E4M3",
+        )
+    }
+    with pytest.raises(NativeCsaExportError, match="malformed block-quant checkpoint tensor"):
+        module.build_block_quant_streaming_plan("model", malformed_header, graph.initializers)
 
 
 def test_native_csa_is_property_gated_not_a_blanket_v4_refusal():

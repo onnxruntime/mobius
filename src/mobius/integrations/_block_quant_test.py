@@ -427,7 +427,7 @@ class TestEmissionGate:
         d = classify_tensor("gate.weight", "BF16", (8, 8))
         assert runtime_representation_gap(d) is None
 
-    def test_gap_block_fp8_names_missing_format(self):
+    def test_block_fp8_is_representable_by_planar_v1(self):
         scheme = _real_scheme()
         d = classify_tensor(
             "attn.wq_a.weight",
@@ -437,21 +437,24 @@ class TestEmissionGate:
             scale_shape=(8, 32),
             scheme=scheme,
         )
-        gap = runtime_representation_gap(d)
-        assert gap is not None and "block-FP8" in gap
+        assert runtime_representation_gap(d) is None
 
-    def test_gap_fp4_names_planar_vs_interleaved(self):
+    def test_fp4_planar_is_representable_by_planar_v1(self):
         d = _routed_fp4_descs(1)[0]
-        gap = runtime_representation_gap(d)
-        assert gap is not None
-        assert "planar" in gap and "block_mxfp4" in gap
+        assert runtime_representation_gap(d) is None
 
-    def test_plan_routed_bank_typed_rejects_fp4(self):
-        with pytest.raises(BlockQuantExportError) as ei:
-            plan_routed_expert_bank(_routed_fp4_descs(3))
-        msg = str(ei.value)
-        assert "not representable" in msg
-        assert "no dense fallback" in msg
+    def test_plan_routed_bank_preserves_fp4_bytes(self):
+        descriptors = _routed_fp4_descs(3)
+        payloads = [
+            bytes([expert + 1]) * descriptor.weight_num_bytes
+            for expert, descriptor in enumerate(descriptors)
+        ]
+        bank = plan_routed_expert_bank(
+            descriptors,
+            per_expert_bytes=payloads,
+        )
+        assert bank.num_experts == 3
+        assert [bank.expert_bytes(i) for i in range(3)] == payloads
 
     def test_plan_rejects_mixed_bank(self):
         scheme = _real_scheme()
@@ -529,7 +532,7 @@ class TestRealCheckpointHeaders:
     def _index(self) -> dict:
         return json.loads((REAL_CHECKPOINT / "model.safetensors.index.json").read_text())
 
-    def test_real_layer0_classifies_and_gate_rejects(self):
+    def test_real_layer0_classifies_and_gate_accepts(self):
         scheme = _real_scheme()
         wm = self._index()["weight_map"]
         # Build a header index for layer 0 by reading only shard headers.
@@ -552,8 +555,9 @@ class TestRealCheckpointHeaders:
             d for d in descs.values() if d.is_routed_expert and d.name.endswith("w1.weight")
         ]
         assert routed and all(d.kind is QuantKind.FP4_PACKED for d in routed)
-        with pytest.raises(BlockQuantExportError):
-            plan_routed_expert_bank(routed)
+        payloads = [bytes(descriptor.weight_num_bytes) for descriptor in routed]
+        bank = plan_routed_expert_bank(routed, per_expert_bytes=payloads)
+        assert bank.num_experts == len(routed)
 
     def test_real_expert_bytes_preserved(self):
         wm = self._index()["weight_map"]
@@ -563,6 +567,23 @@ class TestRealCheckpointHeaders:
         _dtype, shape, start, end = _span(shard, key)
         assert len(raw) == end - start
         assert shape == (2048, 2048)
+
+    def test_real_ratio4_index_query_has_canonical_fp8_scale_pair(self):
+        wm = self._index()["weight_map"]
+        weight = "layers.2.attn.indexer.wq_b.weight"
+        scale = "layers.2.attn.indexer.wq_b.scale"
+        header_index = {}
+        for key in (weight, scale):
+            shard = wm[key]
+            entry = read_safetensors_header(REAL_CHECKPOINT / shard)[key]
+            header_index[key] = (entry["dtype"], tuple(entry["shape"]))
+        descriptor = build_descriptors(header_index, _real_scheme())[weight]
+        assert descriptor.kind is QuantKind.BLOCK_FP8
+        assert descriptor.packed_shape == (8192, 1024)
+        assert descriptor.scale_name == scale
+        assert descriptor.scale_dtype == "F8_E8M0"
+        assert descriptor.scale_shape == (64, 8)
+        assert descriptor.block_shape == (128, 128)
 
 
 def _span(path, key):

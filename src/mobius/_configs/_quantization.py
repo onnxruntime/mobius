@@ -117,9 +117,9 @@ class QuantizationConfig:
                 "experts (I8-packed E2M1 nibbles + UE8M0 micro-scale). Parse and "
                 "validate these by property with mobius.integrations._block_quant "
                 "(BlockQuantScheme / classify_tensor / QuantizedTensorDescriptor); "
-                "the routed-expert emission gate (plan_routed_expert_bank) reports "
-                "the exact onnx-genai nxrt ABI gap. Native export is blocked until "
-                "the runtime gains a block-FP8 / planar-FP4 BlockFormat."
+                "the routed-expert emission gate (plan_routed_expert_bank) validates "
+                "the canonical onnx-genai nxrt planar ABI. Use the explicit native "
+                "CSA export path; ordinary dense/INT4 export remains fail-closed."
             )
         if method == "none":
             return None

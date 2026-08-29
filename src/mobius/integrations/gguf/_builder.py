@@ -360,13 +360,8 @@ def _fuse_native_block_moe(pkg, *, allow_dense: bool) -> int:
     :class:`SparseMoEExportError` atomically with the graph untouched, unless
     ``allow_dense`` downgrades it to a warning + dense keep.
 
-    A layer that mixes native formats across its fc1/fc2/fc3 banks (GLM-5.2
-    UD-IQ1) can only be expressed with the ``block_layout_version=2``
-    per-projection ABI, which no shipped onnx-genai runtime executes yet. The
-    production builder therefore never enables v2: such layers always
-    typed-reject here rather than emit an unrunnable node. There is no
-    environment or CLI opt-in -- v2 stays a schema-construction test path until a
-    real typed runtime-capability handshake exists.
+    The canonical v1 ABI carries each projection's block format independently,
+    so mixed-format layers such as GLM-5.2 UD-IQ1 remain sparse and runnable.
     """
     # Imported lazily: the generic rewrite lives in the rewrite_rules package and
     # must not be pulled into the GGUF import graph at module load time.
@@ -374,8 +369,6 @@ def _fuse_native_block_moe(pkg, *, allow_dense: bool) -> int:
 
     fused = 0
     for model in pkg.values():
-        # No ``_allow_perproj_v2_schema`` argument: the production authority path
-        # always fails closed for mixed-format v2 (fail-safe default).
         fused += fuse_block_quantized_moe(model, allow_dense_moe=allow_dense)
     return fused
 
