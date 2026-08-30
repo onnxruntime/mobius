@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import threading
 import types
+from pathlib import Path
 
 import onnx_ir as ir
 import pytest
@@ -273,6 +274,24 @@ class TestComponentExportReport:
         assert isinstance(components, dict)
         assert components["tokenizer"]["export_status"] == "omitted"
         assert components["tokenizer"]["runtime_validation_status"] == "unvalidated"
+
+    def test_report_write_preserves_lf_when_text_writes_translate_newlines(
+        self, tmp_path, monkeypatch
+    ):
+        report = _partial_export_report()
+        report_path = tmp_path / "export_report.json"
+
+        def write_text_with_windows_newlines(
+            path: Path, data: str, encoding: str | None = None, **_kwargs
+        ) -> int:
+            encoded = data.replace("\n", "\r\n").encode(encoding or "utf-8")
+            return path.write_bytes(encoded)
+
+        monkeypatch.setattr(Path, "write_text", write_text_with_windows_newlines)
+        report.write_json(report_path)
+
+        assert report_path.read_bytes() == report.to_bytes()
+        assert b"\r\n" not in report_path.read_bytes()
 
     def test_save_without_report_rejects_stale_report(self, tmp_path):
         report_path = tmp_path / "export_report.json"

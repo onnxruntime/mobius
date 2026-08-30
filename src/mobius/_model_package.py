@@ -650,9 +650,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                             + "\n"
                         ).encode()
                     if self.export_report is not None:
-                        package_metadata[_EXPORT_REPORT] = (
-                            self.export_report.to_json().encode()
-                        )
+                        package_metadata[_EXPORT_REPORT] = self.export_report.to_bytes()
                     if self.draft_manifest is not None:
                         package_metadata["draft_manifest.json"] = (
                             json.dumps(self.draft_manifest, indent=2, sort_keys=True) + "\n"
