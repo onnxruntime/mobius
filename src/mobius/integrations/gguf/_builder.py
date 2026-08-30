@@ -6951,7 +6951,7 @@ def build_from_gguf(
     from mobius.integrations.gguf._tensor_processors import (
         process_tensors,
     )
-    from mobius.integrations.transformers import (
+    from mobius.integrations.transformers._config_resolver import (
         _default_task_for_model,
     )
 

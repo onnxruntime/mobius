@@ -27,10 +27,10 @@ from mobius._builder import (
 )
 from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
-from mobius.integrations.transformers import (
+from mobius.integrations.transformers import build
+from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
-    build,
 )
 
 logger = logging.getLogger(__name__)
