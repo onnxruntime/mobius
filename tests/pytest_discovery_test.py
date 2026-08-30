@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-import fnmatch
-from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -14,15 +14,17 @@ import pytest
 def test_default_discovery_includes_repository_tool_tests(pytestconfig: pytest.Config):
     assert "scripts" in pytestconfig.getini("testpaths")
 
-    python_files = pytestconfig.getini("python_files")
-    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
-    collected_script_modules = {
-        path.name
-        for path in scripts_dir.glob("*.py")
-        if any(fnmatch.fnmatch(path.name, pattern) for pattern in python_files)
-    }
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "--color=no", "scripts"],
+        cwd=pytestconfig.rootpath,
+        capture_output=True,
+        text=True,
+    )
+    collection_output = result.stdout + result.stderr
+    assert result.returncode == 0, collection_output
 
-    assert collected_script_modules == {
+    expected_modules = {
         "detect_affected_models_test.py",
         "generate_golden_test.py",
     }
+    assert all(f"{module}::" in collection_output for module in expected_modules)
