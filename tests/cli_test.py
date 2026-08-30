@@ -159,6 +159,30 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["dtype"] is None
         save_package.assert_called_once()
 
+    def test_local_personaplex_config_bypasses_transformers(self):
+        with (
+            tempfile.TemporaryDirectory() as checkpoint,
+            tempfile.TemporaryDirectory() as output,
+            mock.patch(
+                "mobius.integrations._moshi._is_personaplex_checkpoint",
+                return_value=True,
+            ),
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index"
+            ) as diffusers_probe,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("transformers.AutoConfig.from_pretrained") as transformers_probe,
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(["build", "--config", checkpoint, output, "--no-weights"])
+
+        diffusers_probe.assert_not_called()
+        transformers_probe.assert_not_called()
+        assert build_model.call_args.args == (checkpoint,)
+        assert build_model.call_args.kwargs["revision"] is None
+        assert build_model.call_args.kwargs["load_weights"] is False
+        save_package.assert_called_once()
+
     @pytest.mark.parametrize("option", ["--input-sample-rate", "--bwe-sample-rate"])
     def test_reuse_rate_options_are_rejected_for_diffusers(self, option):
         with (
