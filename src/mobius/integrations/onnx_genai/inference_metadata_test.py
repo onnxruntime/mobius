@@ -18,11 +18,18 @@ import pytest
 import yaml
 
 from mobius._model_package import ModelPackage
-from mobius._pipeline_contract import (
-    declare_component_presence,
-    declare_optional_input,
-)
+from mobius._pipeline_contract import declare_component_presence
 from mobius.generation import build_greedy_sampler
+from mobius.integrations.onnx_genai._test_support import (
+    _decoder_model,
+    _embedding_model,
+    _model,
+    _native_package,
+    _onnx_genai_schema_path,
+    _value,
+    _VisionConfig,
+    _VlmConfig,
+)
 from mobius.integrations.onnx_genai._workflow_contract import (
     _port,
     add_policy_components_to_workflow,
@@ -201,54 +208,6 @@ def test_workflow_policy_components_reference_saved_onnx_artifacts(tmp_path):
     assert (tmp_path / component["implementation"]["artifact"]).is_file()
 
 
-def _onnx_genai_schema_path() -> str:
-    """Locate onnx-genai's published pipeline JSON schema.
-
-    The vendored copy under ``_schema/`` is the default so conformance never
-    skips. A developer checkout is deliberately not consulted implicitly: one
-    that is ahead of or behind ``main`` makes the result machine-dependent. Set
-    ``ONNX_GENAI_SCHEMA`` to validate against a specific revision.
-    """
-    override = os.environ.get("ONNX_GENAI_SCHEMA")
-    if override:
-        return override
-    return os.path.join(os.path.dirname(__file__), "_schema", "inference_metadata.schema.json")
-
-
-def _value(
-    name: str,
-    dtype: ir.DataType,
-    shape: list[int | str],
-) -> ir.Value:
-    return ir.Value(
-        name=name,
-        type=ir.TensorType(dtype),
-        shape=ir.Shape(shape),
-    )
-
-
-def _model(
-    name: str,
-    inputs: list[ir.Value],
-    output_specs: list[tuple[str, ir.DataType, list[int | str]]],
-) -> ir.Model:
-    outputs = [_value(*spec) for spec in output_specs]
-    nodes = [
-        ir.Node("", "Identity", [inputs[0]], outputs=[output], name=f"emit_{output.name}")
-        for output in outputs
-    ]
-    graph = ir.Graph(
-        inputs=inputs,
-        outputs=outputs,
-        nodes=nodes,
-        name=name,
-        opset_imports={"": 21},
-    )
-    model = ir.Model(graph, ir_version=10)
-    assert ir.to_proto(model).graph.name == name
-    return model
-
-
 def test_qwen4_decoder_metadata_preserves_qsa_kv_index_and_four_axis_positions():
     decoder = _model(
         "decoder",
@@ -333,146 +292,6 @@ def test_qwen4_decoder_metadata_preserves_qsa_kv_index_and_four_axis_positions()
         "axes": ["text", "temporal", "height", "width"],
         "sections": [1, 1, 0],
     }
-
-
-@dataclasses.dataclass
-class _VisionConfig:
-    image_size: int = 448
-    patch_size: int = 14
-    temporal_patch_size: int = 2
-    spatial_merge_size: int = 2
-    mm_tokens_per_image: int | None = None
-    image_token_id: int = 200010
-
-
-@dataclasses.dataclass
-class _VlmConfig:
-    num_hidden_layers: int = 4
-    num_attention_heads: int = 8
-    num_key_value_heads: int = 2
-    head_dim: int = 8
-    hidden_size: int = 64
-    vocab_size: int = 128
-    max_position_embeddings: int = 4096
-    image_token_id: int = 200010
-    mm_tokens_per_image: int | None = None
-    mrope_section: list[int] | None = None
-    mrope_interleaved: bool = False
-    layer_types: list[str] | None = None
-    vision: _VisionConfig = dataclasses.field(default_factory=_VisionConfig)
-
-
-def _embedding_model(
-    outputs: list[tuple[str, ir.DataType, list[int | str]]],
-    *,
-    optional_image: bool = False,
-    include_audio: bool = False,
-    optional_audio: bool = False,
-) -> ir.Model:
-    image_features = _value("image_features", ir.DataType.FLOAT, ["image_tokens", 64])
-    if optional_image:
-        declare_optional_input(
-            image_features,
-            presence="image",
-            absent_shape=[0, 64],
-        )
-    inputs = [
-        _value("input_ids", ir.DataType.INT64, ["batch", "sequence"]),
-        image_features,
-    ]
-    if include_audio:
-        audio_features = _value("audio_features", ir.DataType.FLOAT, ["audio_tokens", 64])
-        if optional_audio:
-            declare_optional_input(
-                audio_features,
-                presence="audio",
-                absent_shape=[0, 64],
-            )
-        inputs.append(audio_features)
-    return _model("embedding", inputs, outputs)
-
-
-def _decoder_model(
-    routed_inputs: list[tuple[str, ir.DataType, list[int | str]]],
-    *,
-    position_shape: list[int | str],
-    raw_token_input: bool = False,
-    fixed_state: bool = False,
-    equal_kv_shape: bool = False,
-    kv_head_dims: list[int] | None = None,
-) -> ir.Model:
-    inputs = [_value(name, dtype, shape) for name, dtype, shape in routed_inputs]
-    inputs.extend(
-        [
-            _value(
-                "attention_mask",
-                ir.DataType.INT64,
-                ["batch", "past_sequence + sequence"],
-            ),
-            _value("position_ids", ir.DataType.INT64, position_shape),
-        ]
-    )
-    if raw_token_input:
-        inputs.append(_value("input_ids", ir.DataType.INT64, ["batch", "sequence"]))
-    kv_head_dims = kv_head_dims or [8]
-    for layer, head_dim in enumerate(kv_head_dims):
-        inputs.extend(
-            [
-                _value(
-                    f"past_key_values.{layer}.key",
-                    ir.DataType.FLOAT,
-                    ["batch", 2, "past_sequence", head_dim],
-                ),
-                _value(
-                    f"past_key_values.{layer}.value",
-                    ir.DataType.FLOAT,
-                    ["batch", 2, "past_sequence", head_dim],
-                ),
-            ]
-        )
-    output_specs = [("logits", ir.DataType.FLOAT, ["batch", "sequence", 128])]
-    for layer, head_dim in enumerate(kv_head_dims):
-        output_shape = (
-            ["batch", 2, "past_sequence", head_dim]
-            if equal_kv_shape
-            else ["batch", 2, "total_sequence", head_dim]
-        )
-        output_specs.extend(
-            [
-                (f"present.{layer}.key", ir.DataType.FLOAT, output_shape),
-                (f"present.{layer}.value", ir.DataType.FLOAT, output_shape),
-            ]
-        )
-    if fixed_state:
-        inputs.extend(
-            [
-                _value(
-                    "past_key_values.3.conv_state",
-                    ir.DataType.FLOAT,
-                    ["batch", 16, 3],
-                ),
-                _value(
-                    "past_key_values.3.recurrent_state",
-                    ir.DataType.FLOAT,
-                    ["batch", 2, 4, 8],
-                ),
-            ]
-        )
-        output_specs.extend(
-            [
-                (
-                    "present.3.conv_state",
-                    ir.DataType.FLOAT,
-                    ["batch", 16, 3],
-                ),
-                (
-                    "present.3.recurrent_state",
-                    ir.DataType.FLOAT,
-                    ["batch", 2, 4, 8],
-                ),
-            ]
-        )
-    return _model("decoder", inputs, output_specs)
 
 
 def _static_cache_decoder_model() -> ir.Model:
@@ -610,41 +429,6 @@ class TestCrossAttentionCacheSources:
                 "strategy": strategy,
             }
         }
-
-
-def _native_package(
-    vision_encoder: ir.Model,
-    config: _VlmConfig,
-    *,
-    position_shape: list[int | str] | None = None,
-    equal_kv_shape: bool = False,
-) -> ModelPackage:
-    return ModelPackage(
-        {
-            "decoder": _decoder_model(
-                [
-                    (
-                        "inputs_embeds",
-                        ir.DataType.FLOAT,
-                        ["batch", "sequence", 64],
-                    )
-                ],
-                position_shape=position_shape or ["batch", "sequence"],
-                equal_kv_shape=equal_kv_shape,
-            ),
-            "vision_encoder": vision_encoder,
-            "embedding": _embedding_model(
-                [
-                    (
-                        "inputs_embeds",
-                        ir.DataType.FLOAT,
-                        ["batch", "sequence", 64],
-                    )
-                ]
-            ),
-        },
-        config=config,
-    )
 
 
 def _assert_all_graph_ports_declared(
@@ -2492,7 +2276,7 @@ class TestMtpSpeculatorMetadata:
         of which is an ONNX component, so the verifier can only be identified by
         its declared ``logits`` role.
         """
-        from mobius.integrations.onnx_genai.auto_export_test import _decoder_package
+        from mobius.integrations.onnx_genai._test_support import _decoder_package
         from mobius.integrations.onnx_genai.workflow_metadata import (
             write_decoder_workflow_metadata,
         )

@@ -100,6 +100,45 @@ def test_metadata_modules_keep_one_way_dependencies(
     imports = _import_edges(path.read_text(encoding="utf-8"), _PACKAGE)
     assert imports.isdisjoint(forbidden)
 
+    if filename != "inference_metadata.py":
+        return
+
+    repository_root = Path(__file__).resolve().parents[4]
+    package_path = Path(__file__).parent
+    test_paths = set(package_path.glob("*_test.py"))
+    test_modules = {f"{_PACKAGE}.{path.stem}" for path in test_paths}
+    cross_test_imports = []
+    for python_path in repository_root.rglob("*.py"):
+        relative_path = python_path.relative_to(repository_root).with_suffix("")
+        module_parts = list(relative_path.parts)
+        if module_parts[0] == "src":
+            module_parts.pop(0)
+        if module_parts[-1] == "__init__":
+            module_parts.pop()
+            package_parts = module_parts
+        else:
+            package_parts = module_parts[:-1]
+        package = ".".join(package_parts)
+        imported_tests = _import_edges(
+            python_path.read_text(encoding="utf-8"), package
+        ) & test_modules
+        cross_test_imports.extend(
+            (str(relative_path.with_suffix(".py")), imported_test)
+            for imported_test in imported_tests
+        )
+    assert not cross_test_imports
+
+    support_path = package_path / "_test_support.py"
+    assert support_path not in test_paths
+    support_tree = ast.parse(support_path.read_text(encoding="utf-8"))
+    collected_definitions = {
+        node.name
+        for node in ast.walk(support_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and (node.name.startswith("test_") or node.name.startswith("Test"))
+    }
+    assert not collected_definitions
+
 
 def test_metadata_yaml_is_deterministic_and_suppresses_aliases() -> None:
     shared = [1, 2]
