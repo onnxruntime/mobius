@@ -290,7 +290,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-integration-fast-${{ hashFiles('tests/_integration_support.py', 'tests/*_integration_test.py') }}
+          key: hf-integration-fast-${{ hashFiles('tests/_integration_support.py', 'tests/text_model_integration_test.py', 'tests/generation_integration_test.py', 'tests/encoder_media_seq2seq_integration_test.py', 'tests/architecture_specific_integration_test.py', 'tests/qwen35_vl_integration_test.py', 'tests/gguf_small_model_runtime_integration_test.py') }}
           restore-keys: |
             hf-integration-fast-
       - name: Install PyTorch CUDA
