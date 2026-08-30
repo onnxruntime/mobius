@@ -147,8 +147,6 @@ class TestCLIBuild:
                     "nvidia/personaplex-7b-v1",
                     tmpdir,
                     "--no-weights",
-                    "--dtype",
-                    "f16",
                     "--execution-provider",
                     "cuda",
                 ]
@@ -158,7 +156,7 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["revision"] == _PERSONAPLEX_REVISION
         assert build_model.call_args.kwargs["load_weights"] is False
         assert build_model.call_args.kwargs["execution_provider"] == "cuda"
-        assert build_model.call_args.kwargs["dtype"] == onnx.TensorProto.FLOAT16
+        assert build_model.call_args.kwargs["dtype"] is None
         save_package.assert_called_once()
 
     @pytest.mark.parametrize("option", ["--input-sample-rate", "--bwe-sample-rate"])

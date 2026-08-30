@@ -18,9 +18,8 @@ user audio --> Mimi encoder --> [Moshi temporal + depformer] --> Mimi decoder --
 * **Mimi decoder** `codes (B,8,Tf) -> waveform (B,1,T)`
 
 Each 12.5 Hz frame (1920 samples @ 24 kHz = 80 ms of audio) must be processed
-within 80 ms for real time. On an fp16 LM + CUDA GPU the Moshi LM is
-~27 ms/frame (~3× headroom); CPU fp32 (~1.8 s/frame) is far too slow for the
-streaming/server modes.
+within 80 ms for real time. The unified package currently supports fp32 only
+because the Mimi codec has no validated fp16/bf16 graph and runtime path.
 
 ## Files
 
@@ -32,12 +31,11 @@ streaming/server modes.
 
 ## 1. Build the ONNX models (needs `mobius`)
 
-Build the models once in an environment that has `mobius` installed. For
-real-time speed export the Moshi LM in **fp16** (the Mimi codec stays fp32):
+Build the models once in an environment that has `mobius` installed:
 
 ```bash
 python examples/personaplex/moshi_ort.py \
-    --device cuda --lm-dtype f16 --frames 1 \
+    --device cuda --frames 1 \
     --model-dir output/personaplex/onnx
 ```
 
@@ -59,7 +57,7 @@ python examples/personaplex/server.py \
 
 On Ampere+/H200 GPUs ORT defaults to TF32 for fp32 matmuls, which can flip
 greedy sampling; the server uses `use_tf32=0` for fp32 parity (pass
-`--allow-tf32` to keep the faster default). TF32 does not affect the fp16 LM.
+`--allow-tf32` to keep the faster default).
 
 ### Open it in your browser (SSH port-forward)
 
@@ -117,7 +115,7 @@ python examples/personaplex/moshi_ort.py --audio user.wav --save-to out/personap
 
 # Simulated real-time stream from a wav (reports RTF / per-frame budget)
 python examples/personaplex/moshi_ort.py --skip-build --device cuda \
-    --lm-dtype f16 --stream --audio user.wav --model-dir output/personaplex/onnx
+    --stream --audio user.wav --model-dir output/personaplex/onnx
 
 # Live full-duplex mic -> speaker (needs `sounddevice` + audio hardware)
 python examples/personaplex/moshi_ort.py --skip-build --device cuda --mic \
@@ -126,18 +124,11 @@ python examples/personaplex/moshi_ort.py --skip-build --device cuda --mic \
 
 `--skip-build` reuses an already-exported `--model-dir`.
 
-## Performance reference (H200, fp16 LM + fp32 Mimi, `use_tf32=0`)
-
-`--stream` over 60 frames: RTF ≈ 0.63, per-frame mean 51 / p90 57 / max 65 ms,
-0/60 over the 80 ms budget. The WebSocket server measures a similar RTF
-(≈ 0.77 including network/scheduling) and reports over-budget frame counts on
-client disconnect.
-
 ## Notes
 
 * Mobius detects the native Kyutai checkpoint and builds the flat four-model
   package through `mobius build --model nvidia/personaplex-7b-v1 OUTPUT`.
-* The Mimi codec is built in fp32 by default; pairing an fp16 LM with an fp32
-  Mimi gives exact codec codes with full real-time headroom.
+* The unified package rejects fp16/bf16 rather than silently leaving the Mimi
+  codec in fp32 while casting only the Moshi LM.
 * `MoshiORT.warmup()` runs a few frames at connect time to absorb the
   first-frame CUDA autotune stall (otherwise the first real frame glitches).

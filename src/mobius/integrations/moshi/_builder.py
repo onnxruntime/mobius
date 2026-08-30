@@ -11,6 +11,7 @@ assemble their four graphs into one :class:`~mobius.ModelPackage`.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 from pathlib import Path
@@ -41,11 +42,59 @@ class _PersonaPlexWorkflowConfig:
 
 
 def _is_personaplex_checkpoint(checkpoint: str | Path) -> bool:
-    """Recognize only the explicitly supported native PersonaPlex checkpoint."""
+    """Recognize the canonical Hub ID or a strongly identified local checkpoint."""
+    path = Path(os.path.expanduser(str(checkpoint)))
+    if path.is_dir():
+        return _is_local_personaplex_checkpoint(path)
     return str(checkpoint).casefold() == _PERSONAPLEX_MODEL_ID.casefold()
 
 
+def _is_local_personaplex_checkpoint(path: Path) -> bool:
+    """Identify a native local checkpoint without reading tensor payloads."""
+    config_path = path / "config.json"
+    lm_path = path / _LM_GLOB
+    mimi_paths = sorted(path.glob(_MIMI_GLOB))
+    if not config_path.is_file() or not lm_path.is_file() or len(mimi_paths) != 1:
+        return False
+    from safetensors import SafetensorError, safe_open
+
+    try:
+        with config_path.open(encoding="utf-8") as file:
+            config = json.load(file)
+        if not isinstance(config, dict):
+            return False
+
+        with safe_open(lm_path, framework="pt", device="cpu") as handle:
+            lm_keys = set(handle.keys())
+            lm_shapes = {
+                key: tuple(handle.get_slice(key).get_shape())
+                for key in (
+                    "text_emb.weight",
+                    "text_linear.weight",
+                    "depformer_in.15.weight",
+                )
+                if key in lm_keys
+            }
+        with safe_open(mimi_paths[0], framework="pt", device="cpu") as handle:
+            mimi_keys = set(handle.keys())
+    except (OSError, ValueError, json.JSONDecodeError, SafetensorError):
+        return False
+
+    # The two native files and these independent architecture signatures avoid
+    # hijacking arbitrary Transformers repos that happen to use model.safetensors.
+    return (
+        {"text_emb.weight", "text_linear.weight", "depformer_in.15.weight"} <= lm_keys
+        and lm_shapes["text_emb.weight"] == (32001, 4096)
+        and lm_shapes["text_linear.weight"] == (32000, 4096)
+        and lm_shapes["depformer_in.15.weight"] == (1024, 4096)
+        and any(key.startswith("encoder.model.") for key in mimi_keys)
+        and any(key.startswith("decoder.model.") for key in mimi_keys)
+    )
+
+
 def _personaplex_revision(checkpoint: str | Path, revision: str | None) -> str | None:
+    if Path(os.path.expanduser(str(checkpoint))).is_dir():
+        return None
     if revision is not None:
         return revision
     if _is_personaplex_checkpoint(checkpoint):
@@ -62,16 +111,25 @@ def _build_personaplex(
     load_weights: bool = True,
 ) -> ModelPackage:
     """Build one flat PersonaPlex package for the standard Mobius build route."""
+    from mobius._builder import resolve_dtype
+
+    resolved_dtype = resolve_dtype(dtype) or ir.DataType.FLOAT
+    if resolved_dtype != ir.DataType.FLOAT:
+        raise ValueError(
+            "PersonaPlex only supports dtype='f32': its Mimi codec does not have "
+            "validated fp16/bf16 graph and runtime support"
+        )
     revision = _personaplex_revision(checkpoint, revision)
     mimi = _build_mimi(
         checkpoint,
+        dtype=resolved_dtype,
         execution_provider=execution_provider,
         revision=revision,
         load_weights=load_weights,
     )
     moshi = _build_moshi_lm(
         checkpoint,
-        dtype=dtype,
+        dtype=resolved_dtype,
         execution_provider=execution_provider,
         revision=revision,
         load_weights=load_weights,

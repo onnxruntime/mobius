@@ -6,6 +6,7 @@ from __future__ import annotations
 from unittest import mock
 
 import onnx_ir as ir
+import pytest
 
 from mobius._model_package import ModelPackage
 from mobius.integrations.moshi import _builder
@@ -23,6 +24,42 @@ def _component(name: str) -> ir.Model:
     return ir.Model(graph, ir_version=10)
 
 
+def _local_personaplex_checkpoint(path):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text("{}")
+    (path / "model.safetensors").touch()
+    (path / "tokenizer-test.safetensors").touch()
+    return path
+
+
+class _SafeTensorHeader:
+    def __init__(self, path, **_kwargs):
+        if str(path).endswith("model.safetensors"):
+            self._shapes = {
+                "text_emb.weight": (32001, 4096),
+                "text_linear.weight": (32000, 4096),
+                "depformer_in.15.weight": (1024, 4096),
+            }
+        else:
+            self._shapes = {
+                "encoder.model.0.weight": (1,),
+                "decoder.model.0.weight": (1,),
+            }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def keys(self):
+        return self._shapes.keys()
+
+    def get_slice(self, key):
+        shape = self._shapes[key]
+        return mock.MagicMock(get_shape=mock.MagicMock(return_value=shape))
+
+
 def test_personaplex_builder_returns_one_flat_pinned_package():
     mimi = ModelPackage({"encoder": _component("encoder"), "decoder": _component("decoder")})
     moshi = ModelPackage(
@@ -35,7 +72,7 @@ def test_personaplex_builder_returns_one_flat_pinned_package():
     ):
         package = _builder._build_personaplex(
             _builder._PERSONAPLEX_MODEL_ID,
-            dtype="f16",
+            dtype="f32",
             execution_provider="cuda",
             load_weights=False,
         )
@@ -44,13 +81,14 @@ def test_personaplex_builder_returns_one_flat_pinned_package():
     assert package.config.dep_q == 16
     build_mimi.assert_called_once_with(
         _builder._PERSONAPLEX_MODEL_ID,
+        dtype=ir.DataType.FLOAT,
         execution_provider="cuda",
         revision=_builder._PERSONAPLEX_REVISION,
         load_weights=False,
     )
     build_moshi.assert_called_once_with(
         _builder._PERSONAPLEX_MODEL_ID,
-        dtype="f16",
+        dtype=ir.DataType.FLOAT,
         execution_provider="cuda",
         revision=_builder._PERSONAPLEX_REVISION,
         load_weights=False,
@@ -74,7 +112,7 @@ def test_public_build_dispatches_before_transformers_detection():
     ):
         actual = transformers_builder.build_transformers_model(
             _builder._PERSONAPLEX_MODEL_ID,
-            dtype="f16",
+            dtype="f32",
             execution_provider="cuda",
             load_weights=False,
         )
@@ -83,11 +121,64 @@ def test_public_build_dispatches_before_transformers_detection():
     transformers_probe.assert_not_called()
     native_build.assert_called_once_with(
         _builder._PERSONAPLEX_MODEL_ID,
-        dtype="f16",
+        dtype="f32",
         execution_provider="cuda",
         revision=_builder._PERSONAPLEX_REVISION,
         load_weights=False,
     )
+
+
+def test_local_checkpoint_dispatches_and_records_local_revision(tmp_path, monkeypatch):
+    checkpoint = _local_personaplex_checkpoint(tmp_path / "nvidia" / "personaplex-7b-v1")
+    monkeypatch.chdir(tmp_path)
+    mimi = ModelPackage({"encoder": _component("encoder"), "decoder": _component("decoder")})
+    moshi = ModelPackage(
+        {"temporal": _component("temporal"), "depformer": _component("depformer")}
+    )
+
+    with mock.patch("safetensors.safe_open", side_effect=_SafeTensorHeader):
+        assert _builder._is_personaplex_checkpoint("nvidia/personaplex-7b-v1")
+    assert _builder._personaplex_revision("nvidia/personaplex-7b-v1", "ignored") is None
+    expected = ModelPackage({"encoder": _component("public-encoder")})
+    with (
+        mock.patch("safetensors.safe_open", side_effect=_SafeTensorHeader),
+        mock.patch.object(_builder, "_build_personaplex", return_value=expected),
+        mock.patch.object(
+            transformers_builder, "_load_transformers_config"
+        ) as transformers_probe,
+    ):
+        actual = transformers_builder.build_transformers_model(
+            "nvidia/personaplex-7b-v1",
+            load_weights=False,
+        )
+    assert actual is expected
+    transformers_probe.assert_not_called()
+
+    with (
+        mock.patch.object(_builder, "_build_mimi", return_value=mimi),
+        mock.patch.object(_builder, "_build_moshi_lm", return_value=moshi),
+    ):
+        package = _builder._build_personaplex(checkpoint, revision="ignored")
+
+    assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
+        "local"
+    }
+
+
+def test_local_detection_fails_closed_for_ambiguous_checkpoint(tmp_path):
+    checkpoint = _local_personaplex_checkpoint(tmp_path)
+    (checkpoint / "tokenizer-second.safetensors").touch()
+
+    assert not _builder._is_personaplex_checkpoint(checkpoint)
+
+
+def test_personaplex_rejects_partial_global_dtype_override():
+    with pytest.raises(ValueError, match="only supports dtype='f32'"):
+        transformers_builder.build_transformers_model(
+            _builder._PERSONAPLEX_MODEL_ID,
+            dtype="f16",
+            load_weights=False,
+        )
 
 
 def test_graph_only_native_builders_do_not_resolve_or_load_weights():
