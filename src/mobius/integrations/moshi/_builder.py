@@ -1,11 +1,11 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Build ONNX models from native Kyutai Moshi / Mimi checkpoints.
+"""Build PersonaPlex ONNX packages from native Kyutai Moshi / Mimi checkpoints.
 
-The builder resolves a Mimi codec ``safetensors`` checkpoint (local path or
-HuggingFace Hub reference), constructs the :class:`~mobius.models.MimiModel`
-ONNX graphs, and applies the converted weights.
+Use :func:`mobius.build` with ``nvidia/personaplex-7b-v1``. The private helpers
+in this module resolve the checkpoint's Mimi codec and Moshi LM weights and
+assemble their four graphs into one :class:`~mobius.ModelPackage`.
 """
 
 from __future__ import annotations
@@ -15,9 +15,75 @@ import logging
 import os
 from pathlib import Path
 
+import onnx_ir as ir
+
 from mobius._model_package import ModelPackage
 
 logger = logging.getLogger(__name__)
+
+_PERSONAPLEX_MODEL_ID = "nvidia/personaplex-7b-v1"
+# Immutable Hub identity used by the native builders and the parity fixtures.
+_PERSONAPLEX_REVISION = "fdaf4090a61cb315c138a1faee287ffd6c716309"
+_PERSONAPLEX_DEP_Q = 16
+
+
+@dataclasses.dataclass
+class _PersonaPlexWorkflowConfig:
+    delays: list[int] = dataclasses.field(
+        default_factory=lambda: [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]
+    )
+    dep_q: int = _PERSONAPLEX_DEP_Q
+    n_q: int = 8
+    frame_size: int = 1920
+    context: int = 3000
+    text_initial_token_id: int = 32000
+    initial_token_id: int = 2048
+
+
+def _is_personaplex_checkpoint(checkpoint: str | Path) -> bool:
+    """Recognize only the explicitly supported native PersonaPlex checkpoint."""
+    return str(checkpoint).casefold() == _PERSONAPLEX_MODEL_ID.casefold()
+
+
+def _personaplex_revision(checkpoint: str | Path, revision: str | None) -> str | None:
+    if revision is not None:
+        return revision
+    if _is_personaplex_checkpoint(checkpoint):
+        return _PERSONAPLEX_REVISION
+    return None
+
+
+def _build_personaplex(
+    checkpoint: str | Path,
+    *,
+    dtype: str | ir.DataType | None = None,
+    execution_provider: str = "default",
+    revision: str | None = None,
+    load_weights: bool = True,
+) -> ModelPackage:
+    """Build one flat PersonaPlex package for the standard Mobius build route."""
+    revision = _personaplex_revision(checkpoint, revision)
+    mimi = _build_mimi(
+        checkpoint,
+        execution_provider=execution_provider,
+        revision=revision,
+        load_weights=load_weights,
+    )
+    moshi = _build_moshi_lm(
+        checkpoint,
+        dtype=dtype,
+        execution_provider=execution_provider,
+        revision=revision,
+        load_weights=load_weights,
+        dep_q=_PERSONAPLEX_DEP_Q,
+    )
+    package = ModelPackage({**mimi, **moshi}, config=_PersonaPlexWorkflowConfig())
+    if set(package) != {"encoder", "decoder", "temporal", "depformer"}:
+        raise ValueError("PersonaPlex build did not produce the required four components")
+    for model in package.values():
+        model.metadata_props["mobius.source_revision"] = revision or "local"
+    return package
+
 
 # Default Mimi codec filename inside the personaplex / Moshi HF repos.
 _MIMI_GLOB = "tokenizer-*.safetensors"
@@ -72,12 +138,13 @@ def _resolve_mimi_checkpoint(checkpoint: str | Path, *, revision: str | None) ->
     return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
 
 
-def build_mimi(
+def _build_mimi(
     checkpoint: str | Path,
     *,
-    dtype: str | None = None,
+    dtype: str | ir.DataType | None = None,
     execution_provider: str = "default",
     revision: str | None = None,
+    load_weights: bool = True,
 ) -> ModelPackage:
     """Build the Mimi codec ONNX :class:`ModelPackage` from a Kyutai checkpoint.
 
@@ -90,21 +157,18 @@ def build_mimi(
             optimisations. Defaults to ``"default"`` (portable, no vendor
             fusions).
         revision: Optional HuggingFace Hub revision to pin downloads.
+        load_weights: Load and apply the native checkpoint payload. When false,
+            graph construction uses only the fixed architecture metadata.
 
     Returns:
         A :class:`ModelPackage` with ``encoder`` (waveform -> codes) and
         ``decoder`` (codes -> waveform) graphs.
     """
-    from safetensors.torch import load_file
-
     from mobius._builder import build_from_module, resolve_dtype
-    from mobius.models.mimi import MimiModel, mimi_default_config
+    from mobius.models.mimi import MimiModel, _mimi_default_config
     from mobius.tasks import CodecTask
 
-    ckpt_path = _resolve_mimi_checkpoint(checkpoint, revision=revision)
-    logger.info("Loading Mimi checkpoint: %s", ckpt_path)
-
-    config = mimi_default_config()
+    config = _mimi_default_config()
     if dtype is not None:
         resolved = resolve_dtype(dtype)
         if resolved is not None and resolved != config.dtype:
@@ -113,9 +177,14 @@ def build_mimi(
     module = MimiModel(config)
     pkg = build_from_module(module, config, CodecTask(), execution_provider=execution_provider)
 
-    state_dict = load_file(ckpt_path)
-    logger.info("Loaded %d Mimi parameters", len(state_dict))
-    pkg.apply_weights(module.preprocess_weights(state_dict))
+    if load_weights:
+        from safetensors.torch import load_file
+
+        ckpt_path = _resolve_mimi_checkpoint(checkpoint, revision=revision)
+        logger.info("Loading Mimi checkpoint: %s", ckpt_path)
+        state_dict = load_file(ckpt_path)
+        logger.info("Loaded %d Mimi parameters", len(state_dict))
+        pkg.apply_weights(module.preprocess_weights(state_dict))
     return pkg
 
 
@@ -151,18 +220,19 @@ def _resolve_lm_checkpoint(checkpoint: str | Path, *, revision: str | None) -> s
     return hf_hub_download(repo_id=repo_id, filename=filename, revision=revision)
 
 
-def build_moshi_lm(
+def _build_moshi_lm(
     checkpoint: str | Path,
     *,
-    dtype: str | None = None,
+    dtype: str | ir.DataType | None = None,
     execution_provider: str = "default",
     revision: str | None = None,
-) -> dict[str, ModelPackage]:
+    load_weights: bool = True,
+    dep_q: int | None = None,
+) -> ModelPackage:
     """Build the Moshi LM ONNX graphs from a native Kyutai checkpoint.
 
-    Produces two :class:`ModelPackage` objects: the 7B temporal transformer
-    (``temporal``) and the per-substep depformer (``depformer``).  Both load
-    from the same ``model.safetensors`` checkpoint.
+    Produces one package containing the 7B temporal transformer and per-substep
+    depformer. Both load from the same ``model.safetensors`` checkpoint.
 
     The personaplex checkpoint already ships full 16-step depformer weights
     (``self_attn.in_proj_weight`` is ``[16 * 3 * 1024, 1024]``, ``gating`` /
@@ -177,28 +247,37 @@ def build_moshi_lm(
         execution_provider: Target execution provider for EP-aware
             optimisations. Defaults to ``"default"``.
         revision: Optional HuggingFace Hub revision to pin downloads.
+        load_weights: Load and apply the native checkpoint payload.
+        dep_q: Known depformer width. Required for graph-only construction.
 
     Returns:
-        ``{"temporal": ModelPackage, "depformer": ModelPackage}``.
+        One package with ``temporal`` and ``depformer`` graph entries.
     """
-    from safetensors.torch import load_file
-
     from mobius._builder import build_from_module, resolve_dtype
     from mobius.models.moshi import (
         MoshiDepformerModel,
         MoshiTemporalModel,
-        moshi_depformer_config,
-        moshi_temporal_config,
+        _moshi_depformer_config,
+        _moshi_temporal_config,
     )
     from mobius.tasks import MoshiDepformerTask, MoshiTemporalTask
 
-    ckpt_path = _resolve_lm_checkpoint(checkpoint, revision=revision)
-    logger.info("Loading Moshi LM checkpoint: %s", ckpt_path)
-    state_dict = load_file(ckpt_path)
-    logger.info("Loaded %d Moshi LM parameters", len(state_dict))
-    dep_q = sum(
-        key.startswith("depformer_in.") and key.endswith(".weight") for key in state_dict
-    )
+    state_dict = None
+    if load_weights:
+        from safetensors.torch import load_file
+
+        ckpt_path = _resolve_lm_checkpoint(checkpoint, revision=revision)
+        logger.info("Loading Moshi LM checkpoint: %s", ckpt_path)
+        state_dict = load_file(ckpt_path)
+        logger.info("Loaded %d Moshi LM parameters", len(state_dict))
+        detected_dep_q = sum(
+            key.startswith("depformer_in.") and key.endswith(".weight") for key in state_dict
+        )
+        if dep_q is not None and detected_dep_q != dep_q:
+            raise ValueError(f"Expected {dep_q} Moshi depformer steps, found {detected_dep_q}")
+        dep_q = detected_dep_q
+    if dep_q is None:
+        raise ValueError("dep_q is required when building Moshi without checkpoint weights")
     if dep_q not in (8, 16):
         raise ValueError(
             "Unsupported Moshi depformer step count inferred from checkpoint: "
@@ -213,11 +292,15 @@ def build_moshi_lm(
             config = dataclasses.replace(config, dtype=resolved)
         module = model_cls(config)
         pkg = build_from_module(module, config, task, execution_provider=execution_provider)
-        pkg.apply_weights(module.preprocess_weights(state_dict))
+        if state_dict is not None:
+            pkg.apply_weights(module.preprocess_weights(state_dict))
         return pkg
 
-    temporal = _build(moshi_temporal_config(), MoshiTemporalModel, MoshiTemporalTask())
+    temporal = _build(_moshi_temporal_config(), MoshiTemporalModel, MoshiTemporalTask())
     depformer = _build(
-        moshi_depformer_config(dep_q=dep_q), MoshiDepformerModel, MoshiDepformerTask()
+        _moshi_depformer_config(dep_q=dep_q), MoshiDepformerModel, MoshiDepformerTask()
     )
-    return {"temporal": temporal, "depformer": depformer}
+    return ModelPackage(
+        {"temporal": temporal["model"], "depformer": depformer["model"]},
+        config=temporal.config,
+    )

@@ -312,6 +312,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
+    from mobius.integrations.moshi._builder import (
+        _is_personaplex_checkpoint,
+        _personaplex_revision,
+    )
+
+    is_personaplex = bool(args.model and _is_personaplex_checkpoint(args.model))
+    if is_personaplex:
+        revision = _personaplex_revision(args.model, revision)
     if args.model == "nvidia/RE-USE" and revision is None:
         # Pin every Hub probe, including the early Diffusers detector. A
         # mutable model_index.json on Hub main must not reroute this checkpoint
@@ -330,7 +338,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # that flag only applies to transformers decoder exports, so we let the
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
-    if args.model and not args.config and not args.text_only:
+    if args.model and not args.config and not args.text_only and not is_personaplex:
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             if input_sampling_rate is not None or bwe_sampling_rate is not None:
@@ -383,7 +391,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         import transformers
 
         config_path = args.config
-        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+        from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if _is_reuse_checkpoint(config_path):
             if task not in (None, "speech-enhancement"):
@@ -393,7 +401,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                     raise SystemExit(
                         "Error: RE-USE checkpoints only support --task speech-enhancement."
                     )
-            pkg = build_reuse(
+            pkg = _build_reuse(
                 config_path,
                 dtype=dtype_override,
                 execution_provider=execution_provider,
@@ -521,6 +529,10 @@ def _cmd_build(args: argparse.Namespace) -> None:
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:
+            if is_personaplex:
+                raise SystemExit(
+                    "Error: PersonaPlex does not support --features static-cache."
+                )
             # Detect model type to resolve the correct static cache task.
             import transformers
 

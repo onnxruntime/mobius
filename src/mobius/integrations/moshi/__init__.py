@@ -1,24 +1,18 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Kyutai Moshi / Mimi native checkpoint import support for mobius.
+"""Internal Kyutai Moshi / Mimi native checkpoint support for Mobius.
 
 The Moshi family (incl. ``nvidia/personaplex-7b-v1``) ships native Kyutai
-``safetensors`` checkpoints rather than HuggingFace ``config.json`` bundles.
-This package loads those checkpoints and builds the corresponding ONNX
-:class:`~mobius._model_package.ModelPackage` via the standard
-``build_from_module`` pipeline.
+``safetensors`` checkpoints. Build the supported PersonaPlex package through
+the standard public API or CLI::
 
-Usage::
+    from mobius import build
 
-    from mobius.integrations.moshi import build_mimi
-
-    pkg = build_mimi("nvidia/personaplex-7b-v1")
-    pkg.save("mimi-onnx")
+    pkg = build("nvidia/personaplex-7b-v1")
+    pkg.save("personaplex-onnx")
 """
 
 from __future__ import annotations
 
-from mobius.integrations.moshi._builder import build_mimi, build_moshi_lm
-
-__all__ = ["build_mimi", "build_moshi_lm"]
+__all__: list[str] = []

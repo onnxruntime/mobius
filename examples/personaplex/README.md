@@ -41,7 +41,7 @@ python examples/personaplex/moshi_ort.py \
     --model-dir output/personaplex/onnx
 ```
 
-This writes `mimi_encoder/`, `mimi_decoder/`, `temporal/`, `depformer/` under
+This writes `encoder/`, `decoder/`, `temporal/`, `depformer/` under
 `--model-dir`. (Graph construction runs on CPU even for `--device cuda`, so no
 GPU is needed for the build step.)
 
@@ -135,10 +135,8 @@ client disconnect.
 
 ## Notes
 
-* The Moshi LM uses a native Kyutai `safetensors` loader
-  (`mobius.integrations.moshi.build_moshi_lm`) rather than the standard
-  `build()` path, because the checkpoint has no HuggingFace `config.json` and
-  one checkpoint maps to two heterogeneous graphs (temporal + depformer).
+* Mobius detects the native Kyutai checkpoint and builds the flat four-model
+  package through `mobius build --model nvidia/personaplex-7b-v1 OUTPUT`.
 * The Mimi codec is built in fp32 by default; pairing an fp16 LM with an fp32
   Mimi gives exact codec codes with full real-time headroom.
 * `MoshiORT.warmup()` runs a few frames at connect time to absorb the

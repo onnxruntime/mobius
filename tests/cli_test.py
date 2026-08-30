@@ -9,6 +9,7 @@ require network access. All build tests use ``--no-weights``.
 
 from __future__ import annotations
 
+import argparse
 import os
 import tempfile
 from pathlib import Path
@@ -43,6 +44,17 @@ def _write_gated_gguf(path: Path, *, architecture: str, quantized: bool) -> None
 
 class TestCLIList:
     """Test the ``list`` subcommand."""
+
+    @pytest.mark.parametrize("command", ["reuse", "mimi", "moshi", "personaplex"])
+    def test_native_audio_models_are_not_subcommands(self, command):
+        parser = build_parser()
+        subparsers = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        assert command not in subparsers.choices
 
     def test_list_models(self, capsys):
         main(["list", "models"])
@@ -100,7 +112,7 @@ class TestCLIBuild:
 
         assert save_package.call_args.args[2].max_workers == 8
 
-    def test_reuse_revision_is_pinned_before_diffusers_probe(self):
+    def test_standard_build_dispatches_reuse_through_public_build(self):
         from mobius.models.reuse import REUSE_REVISION
 
         with (
@@ -116,6 +128,38 @@ class TestCLIBuild:
 
         assert pipeline_probe.call_args.kwargs["revision"] == REUSE_REVISION
         assert build_model.call_args.kwargs["revision"] == REUSE_REVISION
+
+    def test_standard_build_dispatches_personaplex_through_public_build(self):
+        from mobius.integrations.moshi._builder import _PERSONAPLEX_REVISION
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            mock.patch(
+                "mobius.integrations.diffusers._builder._load_diffusers_pipeline_index"
+            ) as pipeline_probe,
+            mock.patch("mobius.__main__.build", return_value=mock.MagicMock()) as build_model,
+            mock.patch("mobius.__main__._save_package") as save_package,
+        ):
+            main(
+                [
+                    "build",
+                    "--model",
+                    "nvidia/personaplex-7b-v1",
+                    tmpdir,
+                    "--no-weights",
+                    "--dtype",
+                    "f16",
+                    "--execution-provider",
+                    "cuda",
+                ]
+            )
+
+        pipeline_probe.assert_not_called()
+        assert build_model.call_args.kwargs["revision"] == _PERSONAPLEX_REVISION
+        assert build_model.call_args.kwargs["load_weights"] is False
+        assert build_model.call_args.kwargs["execution_provider"] == "cuda"
+        assert build_model.call_args.kwargs["dtype"] == onnx.TensorProto.FLOAT16
+        save_package.assert_called_once()
 
     @pytest.mark.parametrize("option", ["--input-sample-rate", "--bwe-sample-rate"])
     def test_reuse_rate_options_are_rejected_for_diffusers(self, option):

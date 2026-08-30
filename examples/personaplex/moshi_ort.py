@@ -11,9 +11,8 @@ end with ``onnxruntime``::
     user audio --> Mimi encoder --> [Moshi temporal + depformer] --> Mimi
                                      decoder --> Moshi (assistant) audio
 
-The four models (all built from the native Kyutai ``safetensors`` checkpoints
-via :func:`mobius.integrations.moshi.build_mimi` /
-:func:`~mobius.integrations.moshi.build_moshi_lm`):
+The four models are built together from the native Kyutai checkpoint through
+the standard :func:`mobius.build` API:
 
 * **Mimi encoder** ``waveform (B,1,T) -> codes (B,8,Tf)``
 * **Moshi temporal** ``frame (B,17,S) -> hidden + text_logits + KV``
@@ -227,8 +226,8 @@ class MoshiORT:
         def _load(name: str):
             return ort.InferenceSession(_model_path(model_dir, name), providers=providers)
 
-        self.enc = _load("mimi_encoder")
-        self.dec = _load("mimi_decoder")
+        self.enc = _load("encoder")
+        self.dec = _load("decoder")
         self.temporal = _load("temporal")
         self.depformer = _load("depformer")
 
@@ -563,25 +562,14 @@ def _build_models(model_dir: str, device: str, lm_dtype: str = "f32"):
     Conv dtype mismatch); the Moshi LM honours ``lm_dtype`` (use ``"f16"`` on
     CUDA for real-time streaming).
     """
-    from mobius.integrations.moshi import build_mimi, build_moshi_lm
+    from mobius import build
 
     os.makedirs(model_dir, exist_ok=True)
     ep = "cuda" if device == "cuda" else "default"
-    print(f"[build] Mimi codec (f32) from {_MODEL_ID} ...")
-    mimi = build_mimi(_MODEL_ID, execution_provider=ep)
-    mimi.save(os.path.join(model_dir, "mimi"))
-    # Mimi saves encoder/ and decoder/ subdirs; flatten the names we load.
-    for role in ("encoder", "decoder"):
-        src = os.path.join(model_dir, "mimi", role)
-        dst = os.path.join(model_dir, f"mimi_{role}")
-        if os.path.isdir(src) and not os.path.isdir(dst):
-            os.rename(src, dst)
-
-    print(f"[build] Moshi LM ({lm_dtype}, temporal + depformer) from {_MODEL_ID} ...")
+    print(f"[build] PersonaPlex package (LM {lm_dtype}, codec f32) from {_MODEL_ID} ...")
     dtype = None if lm_dtype == "f32" else lm_dtype
-    lm = build_moshi_lm(_MODEL_ID, dtype=dtype, execution_provider=ep)
-    lm["temporal"].save(os.path.join(model_dir, "temporal"))
-    lm["depformer"].save(os.path.join(model_dir, "depformer"))
+    package = build(_MODEL_ID, dtype=dtype, execution_provider=ep)
+    package.save(model_dir)
     print(f"[build] saved ONNX models under {model_dir}")
 
 

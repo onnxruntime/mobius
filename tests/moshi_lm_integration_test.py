@@ -77,7 +77,10 @@ def _find_onnx(root: str) -> str:
 
 @pytest.mark.integration_slow
 def test_moshi_lm_parity():
-    from mobius.integrations.moshi import build_moshi_lm
+    from mobius.integrations.moshi._builder import (
+        _PERSONAPLEX_REVISION,
+        _build_moshi_lm,
+    )
 
     with open(_GOLDEN) as f:
         golden = json.load(f)
@@ -87,14 +90,13 @@ def test_moshi_lm_parity():
     frames = _make_frames()
     prev_tokens = _make_prev_tokens()
 
-    pkgs = build_moshi_lm(_MODEL_ID)
-    assert set(pkgs.keys()) == {"temporal", "depformer"}
+    pkg = _build_moshi_lm(_MODEL_ID, revision=_PERSONAPLEX_REVISION)
+    assert set(pkg) == {"temporal", "depformer"}
 
     with tempfile.TemporaryDirectory() as td:
+        pkg.save(td)
         tdir = os.path.join(td, "temporal")
         ddir = os.path.join(td, "depformer")
-        pkgs["temporal"].save(tdir)
-        pkgs["depformer"].save(ddir)
 
         # --- Temporal transformer: 17-channel frame -> hidden + text_logits. ---
         tsess = ort.InferenceSession(_find_onnx(tdir), providers=["CPUExecutionProvider"])
