@@ -281,7 +281,7 @@ class TestDetectAffectedModels:
         assert result["affected"] == []
 
     def test_test_file_no_affected(self):
-        result = detect_affected_models(["tests/build_graph_multimodal_test.py"])
+        result = detect_affected_models(["tests/build_graph_speech_test.py"])
         assert result["run_all"] is False
         assert result["affected"] == []
 
