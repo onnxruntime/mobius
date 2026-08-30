@@ -23,30 +23,32 @@ from mobius._pipeline_contract import (
     declare_optional_input,
 )
 from mobius.generation import build_greedy_sampler
+from mobius.integrations.onnx_genai._workflow_contract import (
+    _port,
+    add_policy_components_to_workflow,
+    declare_input_admission,
+    published_value_references,
+    request_batch_layout,
+)
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
     _decoder_io,
     _input_source_map,
     _match_max_token_grid,
-    _port,
     _processor_values,
-    add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_native_vlm_package_metadata,
-    declare_input_admission,
     is_native_vlm_package,
     load_diffusers_scheduler_config,
     load_diffusers_vae_scaling_factor,
-    published_value_references,
-    request_batch_layout,
     validate_executable_closure,
     write_diffusion_pipeline_metadata,
     write_mtp_speculator_metadata,
-    write_native_vlm_package_metadata,
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_vlm_workflow_metadata,
+    write_native_vlm_package_metadata,
 )
 
 
