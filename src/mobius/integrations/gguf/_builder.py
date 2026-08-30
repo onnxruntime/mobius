@@ -88,17 +88,22 @@ class _GGUFPreflightRevision:
 
     revision: str
     header_info: GGUFHeaderInfo
+    complete_payload_downloaded: bool | None = None
 
     def __str__(self) -> str:
         return self.revision
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, _GGUFPreflightRevision):
-            return self.revision == other.revision and self.header_info == other.header_info
+            return (
+                self.revision == other.revision
+                and self.header_info == other.header_info
+                and self.complete_payload_downloaded == other.complete_payload_downloaded
+            )
         return isinstance(other, str) and self.revision == other
 
     def __hash__(self) -> int:
-        return hash((self.revision, self.header_info))
+        return hash((self.revision, self.header_info, self.complete_payload_downloaded))
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -585,9 +590,15 @@ def _preflight_hf_gguf_file(
             error,
         )
         return _GGUFPreflightFallbackRevision(commit_hash)
+    data = b"".join(chunks)
+    remote_size = getattr(metadata, "size", None)
+    if isinstance(remote_size, int) and remote_size >= 0:
+        complete_payload_downloaded: bool | None = len(data) >= remote_size
+    else:
+        complete_payload_downloaded = None
     try:
         header_info = _gguf_header_info_from_header_prefix(
-            b"".join(chunks),
+            data,
             source=source,
         )
     except GGUFHeaderTruncatedError:
@@ -629,8 +640,14 @@ def _preflight_hf_gguf_file(
     if architecture == "qwen4exp" and dispatch_architecture:
         from mobius.integrations.gguf._qwen4_exp import reject_qwen4exp_payload
 
-        reject_qwen4exp_payload(complete_payload_downloaded=False)
-    return _GGUFPreflightRevision(commit_hash, header_info)
+        reject_qwen4exp_payload(
+            complete_payload_downloaded=complete_payload_downloaded,
+        )
+    return _GGUFPreflightRevision(
+        commit_hash,
+        header_info,
+        complete_payload_downloaded,
+    )
 
 
 def _preflight_hf_mmproj_companion_file(
@@ -6348,7 +6365,15 @@ def _select_hf_gguf_set_from_split_headers(
     if primary_architecture == "qwen4exp":
         from mobius.integrations.gguf._qwen4_exp import reject_qwen4exp_payload
 
-        reject_qwen4exp_payload(complete_payload_downloaded=False)
+        download_states = {
+            preflight.complete_payload_downloaded for preflight in preflights.values()
+        }
+        complete_payload_downloaded = (
+            True if True in download_states else False if download_states == {False} else None
+        )
+        reject_qwen4exp_payload(
+            complete_payload_downloaded=complete_payload_downloaded,
+        )
     mismatched_architectures = {
         name: architecture
         for name, architecture in declared_architectures.items()

@@ -278,6 +278,7 @@ def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monk
         lambda _url: SimpleNamespace(
             commit_hash="a" * 40,
             location="https://cdn.example/model.gguf",
+            size=len(bounded_response) + 1,
         ),
     )
     response = mock.MagicMock()
@@ -322,6 +323,49 @@ def test_qwen4exp_hub_preflight_is_source_independent_and_forwards_revision(monk
         "renamed-00001-of-00003.gguf",
         revision="feature/revision",
     )
+
+
+def test_qwen4exp_preflight_reports_complete_file_that_fits_in_range(monkeypatch):
+    from mobius.integrations.gguf import _builder
+
+    complete_file = b"small-complete-gguf"
+    monkeypatch.setattr(_builder, "hf_hub_url", lambda *_args, **_kwargs: "hub-url")
+    monkeypatch.setattr(
+        _builder,
+        "get_hf_file_metadata",
+        lambda _url: SimpleNamespace(
+            commit_hash="c" * 40,
+            location="https://cdn.example/small.gguf",
+            size=len(complete_file),
+        ),
+    )
+    response = mock.MagicMock()
+    response.iter_bytes.return_value = [complete_file]
+    response_context = mock.MagicMock()
+    response_context.__enter__.return_value = response
+    session = mock.MagicMock()
+    session.stream.return_value = response_context
+    monkeypatch.setattr(_builder, "get_session", lambda: session)
+    monkeypatch.setattr(
+        _builder,
+        "_gguf_header_info_from_header_prefix",
+        lambda *_args, **_kwargs: _builder.GGUFHeaderInfo(
+            architecture="qwen4exp",
+            tensor_count=1,
+            split_no=None,
+            split_count=None,
+            split_tensors_count=None,
+        ),
+    )
+
+    with pytest.raises(
+        Qwen4ExpGGUFImportError,
+        match="bounded preflight response contained a complete GGUF file",
+    ):
+        _builder._preflight_hf_gguf_file(
+            "other/Qwen4Exp-GGUF",
+            "small.gguf",
+        )
 
 
 def test_qwen4exp_split_fallback_does_not_claim_complete_payload_was_not_downloaded(

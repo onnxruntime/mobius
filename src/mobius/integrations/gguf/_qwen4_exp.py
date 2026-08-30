@@ -58,6 +58,10 @@ def _payload_blocker(
             "Only bounded GGUF preflight range data was fetched; no complete GGUF "
             "file or shard payload was downloaded."
         )
+    elif complete_payload_downloaded is True:
+        download_detail = (
+            "The bounded preflight response contained a complete GGUF file or shard payload."
+        )
     else:
         download_detail = (
             "This rejection does not imply that no Hub payload was downloaded: "
