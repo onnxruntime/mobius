@@ -67,8 +67,9 @@ reason — before the PR is merged.
       `_test_configs.py`; added automatically for text-generation models)
 - [ ] `python -m pytest tests/synthetic_parity_test.py -k "<model>"` passes
       with `atol=1e-3` / `rtol=1e-3` (or `1e-2` for multimodal)
-- [ ] Real-weight parity also checked via `tests/integration_test.py` (add
-      model to `_TEXT_MODELS` or equivalent if a small checkpoint is available)
+- [ ] Real-weight parity also checked via a focused integration suite (add
+      generic causal LMs to `_TEXT_MODELS` in `tests/_integration_support.py`
+      if a small checkpoint is available)
 
 ### 5. L4 — Golden match
 
@@ -281,7 +282,7 @@ python -m pytest tests/yaml_schema_test.py
 python -m pytest tests/synthetic_parity_test.py -k "<model>" -sv
 
 # L3 – real-weight integration (if small checkpoint available)
-python -m pytest tests/integration_test.py -m integration -k "<model>" -sv
+python -m pytest tests/*_integration_test.py -m integration -k "<model>" -sv
 
 # L4 – generate golden
 python scripts/generate_golden.py --level L4 --filter '<model>*'

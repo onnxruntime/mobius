@@ -220,8 +220,9 @@ Golden files must be committed alongside new test case YAML files.
 
 **L3 — Synthetic parity:**
 1. Add `pytest.param("org/my-model", False, id="my-model")` to the
-   appropriate parametrized list in `tests/integration_test.py`.
-2. Run `python -m pytest tests/integration_test.py -m integration -k "my-model"`.
+   appropriate focused integration suite (or `_TEXT_MODELS` in
+   `tests/_integration_support.py` for a generic causal LM).
+2. Run `python -m pytest tests/*_integration_test.py -m integration -k "my-model"`.
 
 **L4 — Golden match:**
 1. Create/update `testdata/cases/<category>/my-model.yaml` with `level: "L4"`.

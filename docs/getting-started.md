@@ -273,10 +273,10 @@ pytest tests/build_graph -v
 pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (downloads models, requires more time/memory)
-pytest tests/integration_test.py -m integration -v
+pytest tests -m integration -v
 
 # Run a single integration test model
-pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
+pytest tests/text_model_integration_test.py -m integration -k "qwen2.5-0.5b"
 ```
 
 ### Linting

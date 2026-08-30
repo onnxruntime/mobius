@@ -5,7 +5,7 @@
 # tolerance_overrides in their YAML file.
 #
 # Source: parity.py DEFAULT_TOLERANCES and NEAR_TIE_MARGINS,
-# plus integration_test.py baseline (atol=1e-3, rtol=1e-3 for f32).
+# plus the integration parity baseline (atol=1e-3, rtol=1e-3 for f32).
 
 L3:
   # L3 synthetic parity: atol/rtol gate with identical random weights.

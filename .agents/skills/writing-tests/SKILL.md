@@ -46,7 +46,7 @@ without passing L2, or have L4 golden data without passing L3.
 |-------|------|-----------------|-------------|
 | **L1** | Graph builds | ONNX graph builds from a tiny synthetic config | `tests/_test_configs.py` + `tests/build_graph` |
 | **L2** | Config compatible | Full-size HF config produces a valid graph | `test_model_id` in YAML test case (`testdata/cases/`) |
-| **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/integration_test.py` parametrized tests |
+| **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/synthetic_parity_test.py` and focused integration suites |
 | **L4** | Golden match | Real-weight prefill logits match pre-computed reference | `testdata/golden/<cat>/<model>.json` |
 | **L5** | Generation verified | Full multi-token generation matches golden output | `testdata/golden/<cat>/<model>_generation.json` |
 
@@ -70,7 +70,7 @@ python -m pytest tests/build_graph --fast
 python -m pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (slow, downloads models)
-python -m pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
+python -m pytest tests/text_model_integration_test.py -m integration -k "qwen2.5-0.5b"
 
 # L4/L5 golden tests
 python -m pytest tests/e2e_golden_test.py -m golden --level L4 -v
@@ -95,7 +95,8 @@ tests/
 │   ├── speech_test.py
 │   └── vision_language_test.py
 ├── _test_configs.py          # shared model configs for all tests
-├── integration_test.py       # L3: real-weight numerical parity
+├── *_integration_test.py     # focused real-weight and architecture parity suites
+├── _integration_support.py   # shared integration session/feed helpers and text cases
 ├── e2e_golden_test.py        # L4 + L5: golden file comparison
 ├── yaml_schema_test.py       # YAML test case schema validation
 ├── weight_alignment_test.py  # L1: preprocess_weights correctness
@@ -173,9 +174,10 @@ set to a real HF model ID.
 
 ## L3: Integration tests
 
-Located in `tests/integration_test.py`. Parametrized with
-`(model_id, trust_remote_code)`. Prefer models ≤ 1B, publicly accessible,
-one per distinct model class.
+Located in focused `tests/*_integration_test.py` modules. The generic text
+suite is parametrized with `(model_id, trust_remote_code)` from
+`tests/_integration_support.py`. Prefer models ≤ 1B, publicly accessible, one
+per distinct model class.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for
 > full prefill/decode/generation code patterns.
