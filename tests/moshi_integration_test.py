@@ -70,7 +70,7 @@ def _run(path: str, feeds: dict):
 
 @pytest.mark.integration_slow
 def test_mimi_codec_parity():
-    from mobius.integrations.moshi._builder import _PERSONAPLEX_REVISION, _build_mimi
+    from mobius.integrations._moshi import _PERSONAPLEX_REVISION, _build_mimi
 
     with open(_GOLDEN) as f:
         golden = json.load(f)

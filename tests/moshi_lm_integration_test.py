@@ -77,7 +77,7 @@ def _find_onnx(root: str) -> str:
 
 @pytest.mark.integration_slow
 def test_moshi_lm_parity():
-    from mobius.integrations.moshi._builder import (
+    from mobius.integrations._moshi import (
         _PERSONAPLEX_REVISION,
         _build_moshi_lm,
     )

@@ -130,7 +130,7 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["revision"] == REUSE_REVISION
 
     def test_standard_build_dispatches_personaplex_through_public_build(self):
-        from mobius.integrations.moshi._builder import _PERSONAPLEX_REVISION
+        from mobius.integrations._moshi import _PERSONAPLEX_REVISION
 
         with (
             tempfile.TemporaryDirectory() as tmpdir,

@@ -312,7 +312,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
-    from mobius.integrations.moshi._builder import (
+    from mobius.integrations._moshi import (
         _is_personaplex_checkpoint,
         _personaplex_revision,
     )

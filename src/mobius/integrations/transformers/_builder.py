@@ -204,7 +204,7 @@ def build_transformers_model(
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
-    from mobius.integrations.moshi._builder import (
+    from mobius.integrations._moshi import (
         _build_personaplex,
         _is_personaplex_checkpoint,
         _personaplex_revision,

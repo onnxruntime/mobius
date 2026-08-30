@@ -9,8 +9,10 @@ import onnx_ir as ir
 import pytest
 
 from mobius._model_package import ModelPackage
-from mobius.integrations.moshi import _builder
+from mobius.integrations import _moshi
 from mobius.integrations.transformers import _builder as transformers_builder
+
+_builder = _moshi
 
 
 def _component(name: str) -> ir.Model:
@@ -272,13 +274,13 @@ def test_hub_revision_reaches_mimi_probe_and_both_downloads():
     ]
 
 
-def test_special_native_audio_builders_and_configs_are_not_public():
-    import mobius.integrations.moshi as moshi_integration
+def test_special_native_audio_namespace_and_configs_are_not_public():
+    import importlib
+
     import mobius.models as models
 
-    for name in ("build_mimi", "build_moshi_lm"):
-        assert name not in moshi_integration.__all__
-        assert not hasattr(moshi_integration, name)
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("mobius.integrations.moshi")
     for name in (
         "mimi_default_config",
         "moshi_temporal_config",
