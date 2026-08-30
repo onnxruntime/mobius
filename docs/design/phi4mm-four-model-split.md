@@ -226,6 +226,6 @@ Weight tying: copy embed_tokens.weight → lm_head.weight if tie_word_embeddings
 3. Update `preprocess_weights()` with prefix remapping
 4. Create `Phi4MMMultiModalTask` in `tasks/_phi4mm_multimodal.py`
 5. Register in `tasks/__init__.py` and `_registry.py`
-6. Update unit tests in `build_graph_test.py`
+6. Update unit tests in `build_graph_multimodal_test.py`
 7. Update integration tests in `phi4mm_integration_test.py`
 8. Create e2e example in `examples/`

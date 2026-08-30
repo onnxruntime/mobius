@@ -295,10 +295,10 @@ def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
             paths = detect_code_paths(config_overrides)
             models[model_type].code_paths.update(paths)
 
-    # Specialized VLM/audio models have dedicated test methods in
-    # build_graph_test.py but are not in ALL_CONFIGS. They still build a graph.
+    # Specialized models have dedicated graph-construction tests but are not
+    # in ALL_CONFIGS. They still build a graph.
     try:
-        from build_graph_test import _SPECIALIZED_TEST_MODEL_TYPES
+        from _build_graph_support import _SPECIALIZED_TEST_MODEL_TYPES
     except ImportError:
         return
 

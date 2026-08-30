@@ -3,7 +3,7 @@
 
 """Tests for model building — base class and infrastructure unit tests.
 
-Architecture-specific graph construction tests live in tests/build_graph_test.py,
+Architecture-specific graph construction tests live in tests/build_graph_*_test.py,
 which covers every registered model type via ALL_CAUSAL_LM_CONFIGS.  This file
 focuses on the base class contracts and build infrastructure that are not
 exercised by the parametrized tests there.

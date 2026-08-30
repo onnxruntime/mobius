@@ -4177,7 +4177,7 @@ def test_qwen35_deltanet_single_layer_parity():
 # and run a multi-step greedy generation loop via OnnxGenerator.
 # ---------------------------------------------------------------------------
 
-# Tiny dims shared with build_graph_test.py
+# Tiny dimensions shared with the L1 graph-construction tests.
 _GEN_HIDDEN = 64
 _GEN_INTERMEDIATE = 128
 _GEN_HEADS = 4

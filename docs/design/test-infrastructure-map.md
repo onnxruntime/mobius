@@ -26,7 +26,7 @@ Last Updated: 2025-03-09
 
 | File | Classes | Methods | Purpose | Markers |
 |------|---------|---------|---------|---------|
-| `build_graph_test.py` | 33 | 100 | **L1 Unit Tests**: Build ONNX graphs for all supported architectures without weights or network access | `parametrize` |
+| `build_graph_*_test.py` | 33 | 100 | **L1 Unit Tests**: Build ONNX graphs for all supported architectures without weights or network access | `parametrize` |
 | `arch_validation_test.py` | 1 | 4 | **L2 Architecture Validation**: Downloads config.json from HF for registered models, builds full-size ONNX graphs (no weights), validates structure | `arch_validation`, `parametrize` |
 | `synthetic_parity_test.py` | 0 | 1 | **L3 Synthetic Parity**: Builds tiny random-weight models (PyTorch + ONNX), compares logits to detect op-level bugs | `parametrize` |
 | `e2e_golden_test.py` | 2 | 2 | **L4/L5 Golden Comparison**: Data-driven tests from YAML files in `testdata/cases/`; L4 compares single-forward logits, L5 compares generation | `golden`, `generation`, `integration`, `parametrize` |
@@ -141,7 +141,7 @@ def deterministic_seed():
 
 | File | Trigger | Level | Test Command | Purpose |
 |------|---------|-------|--------------|---------|
-| **main.yml** | PR + push to main | L1–L3, selective L4 | `pytest tests/build_graph_test.py -n auto` (L1); `pytest tests/synthetic_parity_test.py -n auto` (L3); `pytest -m 'not integration'` (coverage); selective L4 + L5 | Fast PR feedback; runs on every push |
+| **main.yml** | PR + push to main | L1–L3, selective L4 | `pytest tests/build_graph_*_test.py -n auto` (L1); `pytest tests/synthetic_parity_test.py -n auto` (L3); `pytest -m 'not integration'` (coverage); selective L4 + L5 | Fast PR feedback; runs on every push |
 | **gpu_tests.yml** | push to main + weekly (Mon 4am UTC) | L4–L5 | `pytest tests/e2e_golden_test.py -m golden` (L4); `pytest tests/e2e_golden_test.py -m generation` (L5) | GPU-only golden/generation tests (requires checkpoint verification) |
 | **nightly_l2.yml** | nightly (3am UTC) + l2-* tags | L2 | `pytest tests/arch_validation_test.py -m arch_validation` | Architecture validation with real HF configs |
 | **golden_regen.yml** | weekly (Sun 2am UTC) + manual | — | Regenerates golden files | Updates L4/L5 reference data (before nightly_l2) |
@@ -151,7 +151,7 @@ def deterministic_seed():
 
 **CI Test Levels:**
 ```
-L1 (Smoke)           → build_graph_test.py            (fast, no weights, no network)
+L1 (Smoke)           → build_graph_*_test.py            (fast, no weights, no network)
 L2 (Architecture)    → arch_validation_test.py        (real HF configs, no weights, nightly)
 L3 (Synthetic)       → synthetic_parity_test.py       (tiny random weights, detects op bugs)
 L4 (Golden Logits)   → e2e_golden_test.py -m golden   (checkpoint-verified single-forward)
@@ -295,7 +295,7 @@ def [fixture_name_2]  # Implementation details TBD
 
 | Type | Count | Location | Purpose |
 |------|-------|----------|---------|
-| **Unit (L0/L1)** | ~100 methods | `src/**/*_test.py`, `tests/build_graph_test.py` | Fast, no network |
+| **Unit (L0/L1)** | ~100 methods | `src/**/*_test.py`, `tests/build_graph_*_test.py` | Fast, no network |
 | **Component** | ~379 methods | `src/components/*_test.py` | Individual operator validation |
 | **Integration (L3)** | ~52 methods | `tests/*_integration_test.py`, `tests/synthetic_parity_test.py` | Real weights, network required |
 | **Golden (L4/L5)** | ~2–10 methods | `tests/e2e_golden_test.py`, parametrized via YAML | Data-driven, checkpoint-verified |
@@ -365,10 +365,10 @@ def test_parity_causal_lm():
 
 ```bash
 # L1 Smoke (all architectures)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph_*_test.py -v
 
 # L1 Fast (representative only)
-pytest tests/build_graph_test.py -v --fast
+pytest tests/build_graph_*_test.py -v --fast
 
 # L2 Architecture Validation
 pytest tests/arch_validation_test.py -m arch_validation -v
@@ -389,10 +389,10 @@ pytest tests/integration_test.py -m integration_fast -v -k "smollm or albert"
 pytest -m 'not integration' --cov=src --cov-report=html
 
 # Filter by model type
-pytest tests/build_graph_test.py -v --models "qwen2,llama"
+pytest tests/build_graph_*_test.py -v --models "qwen2,llama"
 
 # Run specific test
-pytest tests/build_graph_test.py::TestQwen2::test_qwen2 -v
+pytest tests/build_graph_core_test.py::TestBuildGraph::test_graph_builds_without_weights[qwen2] -v
 ```
 
 ---
@@ -423,4 +423,3 @@ pytest tests/build_graph_test.py::TestQwen2::test_qwen2 -v
 - Avoids fixture complexity; easier to understand test flow
 
 ---
-

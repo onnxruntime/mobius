@@ -9,7 +9,7 @@ pip install pytest
 
 ## Running tests
 
-Unit tests live in `tests/build_graph_test.py` and verify graph construction
+Unit tests live in `tests/build_graph_*_test.py` and verify graph construction
 for all supported architectures using tiny synthetic configs (no network needed).
 
 Integration tests live in `tests/integration_test.py` and verify numerical
@@ -17,10 +17,10 @@ accuracy against HuggingFace PyTorch models (requires network and memory).
 
 ```bash
 # Unit tests (fast, parallel with -n auto)
-pytest tests/build_graph_test.py -v -n auto
+pytest tests/build_graph_*_test.py -v -n auto
 
 # Run a single model type
-pytest tests/build_graph_test.py -k "phi4mm"
+pytest tests/build_graph_*_test.py -k "phi4mm"
 
 # Integration tests (slow, downloads models)
 pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
@@ -75,7 +75,7 @@ Within the `components/` package itself, private cross-imports
 ### File organization
 
 - **Source**: `src/mobius/`
-- **Unit tests**: `tests/build_graph_test.py` (graph construction, no weights)
+- **Unit tests**: `tests/build_graph_*_test.py` (graph construction, no weights)
 - **Integration tests**: `tests/integration_test.py` (numerical accuracy vs PyTorch)
 - **Test helpers**: `src/mobius/_testing/`
 
@@ -133,7 +133,7 @@ Each model file in `models/` should:
 1. Create `models/<name>.py` with the model class.
 2. Export it from `models/__init__.py`.
 3. Register it in `_registry.py`'s `_create_default_registry()`.
-4. Add a tiny config entry to `_MODEL_CONFIGS` in `tests/build_graph_test.py`.
+4. Add a tiny config entry to the appropriate list in `tests/_test_configs.py`.
 5. Add a small HuggingFace model to `_TEXT_MODELS` in `tests/integration_test.py`.
 
 ### Adding a new task
