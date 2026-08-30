@@ -1977,23 +1977,35 @@ class TestBuildGraphVisionLanguage:
         ],
     )
     def test_gemma4_audio_encoder_strips_padding_in_graph(self, dtype, np_dtype):
-        """The exported audio graph produces ordered rank-2 valid feature rows."""
+        """The exported audio graph produces ordered rank-2 valid feature rows.
+
+        Padding is stripped inside the audio-encoder module (which returns
+        rank-2 ``[num_valid, hidden]`` when a validity mask is supplied), so the
+        task's ``_build_audio`` forwards those rows unchanged. The mock encoder
+        mirrors that contract via a dtype-safe compress.
+        """
         from onnxscript import nn
 
         from mobius._configs import Gemma4AudioConfig, Gemma4Config
         from mobius._testing.ort_inference import OnnxModelSession
+        from mobius.models.gemma4 import _dtype_safe_compress
         from mobius.tasks._gemma4 import Gemma4Task
 
-        class IdentityAudio(nn.Module):
+        class StrippingAudio(nn.Module):
+            """Mimics the real encoder: strip padding frames, return rank-2."""
+
             def forward(self, op, input_features, input_features_mask=None):
-                return op.Identity(input_features), op.Identity(input_features_mask)
+                flat = op.Reshape(input_features, op.Constant(value_ints=[-1, 4]))
+                flat_mask = op.Reshape(input_features_mask, op.Constant(value_ints=[-1]))
+                selected = _dtype_safe_compress(op, flat, flat_mask, axis=0)
+                return selected, op.Identity(input_features_mask)
 
         config = Gemma4Config(
             hidden_size=4,
             dtype=dtype,
             audio=Gemma4AudioConfig(input_size=4),
         )
-        model = Gemma4Task()._build_audio(IdentityAudio(), config)
+        model = Gemma4Task()._build_audio(StrippingAudio(), config)
         features = np.arange(24, dtype=np_dtype).reshape(2, 3, 4)
         mask = np.array([[True, True, False], [True, False, False]])
 
