@@ -306,9 +306,13 @@ class ComponentExportReport:
         """Serialize with deterministic key ordering and a trailing newline."""
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
+    def to_bytes(self) -> bytes:
+        """Serialize to deterministic UTF-8 bytes with LF line endings."""
+        return self.to_json().encode("utf-8")
+
     def write_json(self, path: str | Path) -> None:
-        """Write the deterministic report."""
-        Path(path).write_text(self.to_json(), encoding="utf-8")
+        """Write the deterministic report without platform newline translation."""
+        Path(path).write_bytes(self.to_bytes())
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> ComponentExportReport:
