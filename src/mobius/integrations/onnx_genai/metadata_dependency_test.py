@@ -108,7 +108,17 @@ def test_metadata_modules_keep_one_way_dependencies(
     test_paths = set(package_path.glob("*_test.py"))
     test_modules = {f"{_PACKAGE}.{path.stem}" for path in test_paths}
     cross_test_imports = []
-    for python_path in repository_root.rglob("*.py"):
+    tracked_files = subprocess.run(
+        ["git", "ls-files", "-z", "--", "src", "tests", "scripts"],
+        check=True,
+        cwd=repository_root,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout
+    tracked_python_paths = sorted(
+        repository_root / path for path in tracked_files.split("\0") if path.endswith(".py")
+    )
+    for python_path in tracked_python_paths:
         relative_path = python_path.relative_to(repository_root).with_suffix("")
         module_parts = list(relative_path.parts)
         if module_parts[0] == "src":
