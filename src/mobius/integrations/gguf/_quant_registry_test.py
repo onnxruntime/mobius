@@ -415,7 +415,7 @@ class TestStorageInvariants:
 
 
 class TestDocumentedQuantizationMatrix:
-    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
+    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "gguf-capability-catalog.md"
     _BEGIN = "<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->"
     _END = "<!-- END GGUF QUANTIZATION MATRIX -->"
 

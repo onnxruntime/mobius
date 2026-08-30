@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Generate the authoritative GGUF support census in the API documentation."""
+"""Generate the authoritative GGUF capability and evidence catalog."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ _DRAFT_RUNTIME_EVIDENCE_PATH = (
     Path(__file__).parents[4] / "testdata" / "evidence" / "gguf_draft_runtime_evidence.json"
 )
 
-DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
+DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "gguf-capability-catalog.md"
 
 
 def _cell(value: object) -> str:
@@ -728,7 +728,7 @@ def _draft_runtime_evidence_summary() -> str:
 
 
 def render_document() -> str:
-    """Render the complete concise API document from live registries and evidence."""
+    """Render the complete capability catalog from live registries and evidence."""
     blocks = render_blocks()
     recent_prs = "; ".join(
         f"#{record.number} ({record.state_at_audit}) — {record.dependency}"
@@ -755,97 +755,33 @@ def render_document() -> str:
             "network-free; the alias oracle never calls the production reconstruction.",
         )
     )
-    draft_usage_note = " ".join(
+    draft_evidence_note = " ".join(
         (
-            "For target-coupled DFlash/EAGLE3, use `build_draft_pair_from_gguf`,",
-            "`write_draft_pair_package`, and `DraftPairRunner`; the package carries",
-            "independent caches, required target bridges, and an MTP-aligned",
-            "`draft_runtime_status.json`, while `runtime_unvalidated` warns about",
-            "higher-level runtimes without gating direct ORT. CLI:",
-            "`mobius build-gguf draft.gguf --target-gguf target.gguf",
-            "--target-config target-config --output output`.",
-            "The committed real-pair evidence also uses a test-only direct ORT",
-            "coordinator that reads remapping metadata from the raw immutable draft GGUF",
-            "and does not import `DraftPairRunner` or its transition helpers. Per-round",
-            "DFlash and EAGLE3 traces bind proposal/remap tokens, proposal-logit hashes,",
-            "accepted prefixes, correction tokens, target replay, target/draft cache",
-            "states, final counters, and four execution-mutating discriminators. Target",
-            "replay starts from an empty cache, and final speculative rounds never process",
-            "past the requested token count. Beam reorder is reported unsupported for the",
+            "The committed real-pair evidence uses a test-only direct ORT coordinator",
+            "that reads remapping metadata from the raw immutable draft GGUF and does not",
+            "import `DraftPairRunner` or its transition helpers. Per-round DFlash and",
+            "EAGLE3 traces bind proposal/remap tokens, proposal-logit hashes, accepted",
+            "prefixes, correction tokens, target replay, target/draft cache states, final",
+            "counters, and four execution-mutating discriminators. Target replay starts",
+            "from an empty cache, and final speculative rounds never process past the",
+            "requested token count. Beam reorder is reported unsupported for the",
             "batch-size-one reference coordinator rather than inferred.",
         )
     )
-    return f"""# `build_from_gguf()`
+    return f"""# GGUF Capability and Evidence Catalog
 
-Build ONNX packages directly from GGUF metadata and tensors without tracing PyTorch.
-Support is capability-specific: graph import does not imply runtime packaging.
+This generated reference records exhaustive GGUF capability verdicts, closure statistics,
+immutable artifact identities, and evidence gaps. It is intended for maintainers and
+machine review; see [`build_from_gguf()`](api/build_from_gguf.md) for user instructions.
+
+The [model catalog](model-catalog.md) covers HuggingFace model registrations. It does not
+imply GGUF import or runtime support; those capability-specific claims live only here.
 
 <!-- BEGIN GGUF CLOSURE SUMMARY -->
 
 {blocks["summary"]}
 
 <!-- END GGUF CLOSURE SUMMARY -->
-
-## Usage
-
-```python
-from mobius.integrations.gguf import build_from_gguf
-
-package = build_from_gguf("model.gguf")
-package.save("output")
-```
-
-`keep_quantized=True` requests quantized target storage where supported; it does
-not guarantee source fidelity. An authoritative tokenizer blocker does not invalidate
-a proven graph: the API returns the model, emits one structured warning, omits assets,
-and persists the exact component disposition in `export_report.json`. Lossy qtype
-conversion remains in `quantization_report.json`; use `keep_quantized=False` for float.
-
-{draft_usage_note}
-
-Packed MatMulNBits storage may use a native op or portable nibble unpack,
-`DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
-Use `mmproj=` only for evidenced sidecars; CLI: `mobius build model.gguf -o output`.
-Split shards validate siblings and ownership; Hub references reject partial downloads.
-Standalone projector graphs persist their processor ABI, output width, and runtime warning.
-
-## API
-
-```python
-build_from_gguf(
-    gguf_path,
-    *,
-    task=None,
-    dtype=None,
-    keep_quantized=True,
-    execution_provider="default",
-    mmproj=None,
-    image_token_id=None,
-    static_cache=False,
-    max_seq_len=None,
-    allow_dense_moe=None,
-    reuse_gguf_weights=False,
-    target_config=None,
-    output_layer_indices=None,
-)
-```
-
-The function returns a `ModelPackage`. Mobius-side graph/semantic inability, corruption,
-identity, I/O, malformed tokenizer, and unexpected errors remain fail-closed. Authoritative
-tokenizer blockers become partial exports with exact reasons and no unverified assets.
-Exact tokenizer evidence is matched independently from runtime evidence, so a proven tokenizer
-is exported even when downstream runtime execution remains unvalidated.
-Downstream runtime, version, registry, or executor limitations preserve the accurate model
-package and record distinct `export_status` and `runtime_validation_status` fields instead of
-blocking export. Only exact artifact, graph, tokenizer, version, parity, and state evidence
-covering the final directory bytes (including `export_report.json` and
-`runtime_compatibility.json`) marks a package validated and end-to-end runnable. Existing
-pre-report runtime evidence remains unvalidated until its final-package hashes are regenerated.
-
-Use `build_mmproj_from_gguf("mmproj.gguf", projector_type=..., target_architecture=...)`
-to export a registry-evidenced standalone `vision_encoder`, `audio_encoder`, or
-`speaker_encoder`. It never invents decoder, media-mixing, or generated-audio roles and
-warns while downstream runtime orchestration remains unvalidated.
 
 ## Runtime evidence
 
@@ -857,6 +793,8 @@ network-free selection, budget, exclusions, and fail-closed candidate reasons ar
 {_runtime_evidence_table()}
 
 {_draft_runtime_evidence_summary()}
+
+{draft_evidence_note}
 
 Runtime support above is independent from tokenizer materialization support below.
 ### Fail-closed runtime evidence

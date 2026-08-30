@@ -443,8 +443,8 @@ tensor table. MTP-free `nemotron_h_moe` backbones are supported with exact
 hybrid scheduling and routed/shared/latent expert semantics; quantized sources
 require `--dequantize`. Files with the released combined attention+MoE MTP
 sidecar fail before graph construction, and ORT GenAI packaging remains
-deferred. See
-[`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-h-moe-support-boundary).
+deferred. See the
+[GGUF capability and evidence catalog](gguf-capability-catalog.md).
 
 Runtime packaging materializes a tokenizer only when its source can be represented
 faithfully; opaque processors remain explicit validation warnings and do not block

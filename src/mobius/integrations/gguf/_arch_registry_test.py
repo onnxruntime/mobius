@@ -1684,10 +1684,10 @@ class TestDocumentedSupportMatrix:
 
     ``docs/api/build_from_gguf.md`` previously claimed "Most decoder-only LLM
     architectures are supported", which is not a checkable statement. This test
-    is what makes the replacement checkable.
+    keeps the generated capability catalog checkable without inflating the user guide.
     """
 
-    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
+    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "gguf-capability-catalog.md"
     _BEGIN = "<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->"
     _END = "<!-- END GGUF SUPPORT MATRIX -->"
 
@@ -1717,7 +1717,7 @@ class TestDocumentedSupportMatrix:
         from mobius.integrations.gguf._docs import check_document
 
         assert check_document(), (
-            "docs/api/build_from_gguf.md is out of date; run "
+            "docs/gguf-capability-catalog.md is out of date; run "
             "`python scripts/generate_gguf_support_docs.py`."
         )
 

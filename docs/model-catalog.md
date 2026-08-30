@@ -1,8 +1,10 @@
 # Model Catalog
 
-**mobius** supports 273 registered model types across 10 categories.
-This catalog lists every supported architecture with its module class, task type,
-and example HuggingFace model IDs.
+**mobius** supports 273 registered HuggingFace model types across 10 categories.
+This user-facing catalog lists their module classes, tasks, and example model IDs.
+It does not imply GGUF import or runtime support; see the generated
+[GGUF capability and evidence catalog](gguf-capability-catalog.md) for those
+capability-specific verdicts and statistics.
 
 > **Auto-fallback**: Models not explicitly registered but architecturally
 > compatible with Llama (standard CausalLM transformers) are automatically
