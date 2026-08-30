@@ -59,7 +59,7 @@ Last Updated: 2025-03-09
 | **Building & Export** | 22 | 113 | `_exporter_test.py` (32M), `_model_package_test.py` (29M), `_diffusers_builder_test.py` (21M) |
 | **Components** | 67 | 379 | 23 test files (rotary_embedding 28M, quantized_linear 22M, audio 16M, attention 17M, vision 16M, whisper 20M, etc.) |
 | **Weight Handling** | 17 | 114 | `_weight_utils_test.py` (58M), `_weight_loading_test.py` (27M), `_graph_diff_test.py` (24M) |
-| **GGUF Integration** | 19 | 91 | `_builder_test.py`, `_reader_test.py` (26M), `_repacker_test.py` (30M), `_tensor_mapping_test.py` (18M) |
+| **GGUF Integration** | 19 | 91 | `_builder_core_test.py`, `_builder_architectures_test.py`, `_builder_contracts_test.py`, `_reader_test.py` (26M) |
 | **Testing Utilities** | 9 | 55 | `golden_test.py` (28M), `parity_test.py` (11M), `code_paths_test.py` (16M) |
 | **Tasks Framework** | 15 | 81 | `_task_test.py` (15 classes, 81 methods — core model building logic) |
 | **Other** | 27 | 61 | ORT GenAI auto_export_test (integration marker), rewrite rules (bias/gelu/layer_norm fusion, etc.) |
@@ -270,7 +270,7 @@ def deterministic_seed():
     return seed
 ```
 
-**`src/mobius/integrations/gguf/_builder_test.py`:**
+**`src/mobius/integrations/gguf/_builder_test_utils.py`:**
 ```python
 @pytest.fixture
 def [fixture_name]  # Implementation details TBD
@@ -423,4 +423,3 @@ pytest tests/build_graph_test.py::TestQwen2::test_qwen2 -v
 - Avoids fixture complexity; easier to understand test flow
 
 ---
-

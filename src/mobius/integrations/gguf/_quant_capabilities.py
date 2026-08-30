@@ -112,7 +112,7 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
     ),
     "qkv-split-and-row-permutation": (
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_core_test.py",
             "test_phimoe_fused_qkv_is_split_without_loss",
         ),
         _test_ref(
@@ -136,17 +136,17 @@ _TRANSFORM_EVIDENCE: dict[str, tuple[str, ...]] = {
     ),
     "embedding-and-output-aliases": (
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_core_test.py",
             "test_tied_quantized_embedding_is_shared_with_output_head",
         ),
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_architectures_test.py",
             "test_quantized_untied_output_head_is_preserved",
         ),
     ),
     "expert-stacking-and-3d-experts": (
         _test_ref(
-            "src/mobius/integrations/gguf/_builder_test.py",
+            "src/mobius/integrations/gguf/_builder_contracts_test.py",
             "test_fused_experts_are_split_without_tensor_loss",
         ),
         _test_ref(

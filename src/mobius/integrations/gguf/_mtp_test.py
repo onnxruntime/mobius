@@ -1301,10 +1301,11 @@ class TestMtpAutoDetect:
         assert getattr(pkg, "mtp_head", None) is not None
 
     def test_text_only_gguf_omits_head_sidecar(self, tmp_path: Path):
-        from mobius.integrations.gguf import _builder_test, build_from_gguf
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._builder_test_utils import _write_quantized_gguf
 
         # A plain GGUF with no nextn block -> nothing to emit, byte-identical.
         path = tmp_path / "no_mtp.gguf"
-        _builder_test._write_quantized_gguf(path, projection_quantization="f32")
+        _write_quantized_gguf(path, projection_quantization="f32")
         pkg = build_from_gguf(str(path))
         assert getattr(pkg, "mtp_head", None) is None
