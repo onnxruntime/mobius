@@ -37,6 +37,39 @@ def test_catalog_is_exact_generator_output() -> None:
     assert check_quantization_capability_matrix()
 
 
+def test_each_generated_catalog_block_is_unique_and_exact() -> None:
+    document = Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
+    blocks = render_blocks()
+    markers = {
+        "summary": (
+            "<!-- BEGIN GGUF CLOSURE SUMMARY -->",
+            "<!-- END GGUF CLOSURE SUMMARY -->",
+        ),
+        "architectures": (
+            "<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->",
+            "<!-- END GGUF SUPPORT MATRIX -->",
+        ),
+        "qtypes": (
+            "<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->",
+            "<!-- END GGUF QUANTIZATION MATRIX -->",
+        ),
+        "projectors": (
+            "<!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->",
+            "<!-- END GGUF MMPROJ SUPPORT MATRIX -->",
+        ),
+        "tokenizers": (
+            "<!-- BEGIN GGUF TOKENIZER PRE SUPPORT MATRIX -->",
+            "<!-- END GGUF TOKENIZER PRE SUPPORT MATRIX -->",
+        ),
+    }
+
+    for name, (begin, end) in markers.items():
+        assert document.count(begin) == 1
+        assert document.count(end) == 1
+        documented = document.split(begin, 1)[1].split(end, 1)[0].strip()
+        assert documented == blocks[name]
+
+
 def test_catalog_is_complete_and_reason_coded() -> None:
     document = Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
     assert len(document.splitlines()) < 600
