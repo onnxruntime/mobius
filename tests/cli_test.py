@@ -1066,7 +1066,7 @@ class TestCLIBuildRuntime:
         """A VLM package emits the workflow IR, not a legacy composite pipeline."""
         pkg = mock.MagicMock()
         pkg.items.return_value = []
-        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
+        pkg.__iter__.side_effect = lambda: iter(("vision_encoder", "embedding", "decoder"))
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
@@ -1084,18 +1084,23 @@ class TestCLIBuildRuntime:
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
                 return_value={},
-            ) as writer,
+            ) as generic_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.workflow_metadata."
+                "write_native_vlm_package_metadata",
+                return_value={},
+            ) as vlm_writer,
         ):
             _save_package(pkg, tmpdir, args, None, None)
 
-        writer.assert_called_once_with(
+        vlm_writer.assert_called_once_with(
             pkg,
             tmpdir,
             config=pkg.config,
             source="/models/vlm",
             revision="pinned-revision",
-            guidance_scale=None,
         )
+        generic_writer.assert_not_called()
 
     def test_runtime_onnx_genai_forwards_guidance_scale(self):
         pkg = mock.MagicMock()
@@ -1129,7 +1134,7 @@ class TestCLIBuildRuntime:
     def test_runtime_onnx_genai_does_not_fallback_for_unsupported_vlm(self):
         pkg = mock.MagicMock()
         pkg.items.return_value = []
-        pkg.__iter__.return_value = iter(("vision_encoder", "embedding", "decoder"))
+        pkg.__iter__.side_effect = lambda: iter(("vision_encoder", "embedding", "decoder"))
         pkg.config = object()
         args = SimpleNamespace(
             max_shard_size=None,
@@ -1145,15 +1150,27 @@ class TestCLIBuildRuntime:
             tempfile.TemporaryDirectory() as tmpdir,
             mock.patch(
                 "mobius.integrations.onnx_genai.write_onnx_genai_config",
+                return_value={},
+            ) as generic_writer,
+            mock.patch(
+                "mobius.integrations.onnx_genai.workflow_metadata."
+                "write_native_vlm_package_metadata",
                 side_effect=ValueError(
                     "unsupported VLM signature; regenerate processor assets or register it"
                 ),
-            ) as writer,
+            ) as vlm_writer,
             pytest.raises(SystemExit, match=r"regenerate.*register"),
         ):
             _save_package(pkg, tmpdir, args, None, None)
 
-        writer.assert_called_once()
+        vlm_writer.assert_called_once_with(
+            pkg,
+            tmpdir,
+            config=pkg.config,
+            source="/models/unsupported-vlm",
+            revision=None,
+        )
+        generic_writer.assert_not_called()
 
     def test_no_runtime_does_not_call_write_ort_genai_config(self):
         """Omitting --runtime does NOT call write_ort_genai_config()."""

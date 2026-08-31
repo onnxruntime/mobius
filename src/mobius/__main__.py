@@ -659,6 +659,8 @@ def _save_package(
         from mobius.integrations.onnx_genai import write_onnx_genai_config
         from mobius.integrations.onnx_genai.inference_metadata import (
             is_native_vlm_package,
+        )
+        from mobius.integrations.onnx_genai.workflow_metadata import (
             write_native_vlm_package_metadata,
         )
 
