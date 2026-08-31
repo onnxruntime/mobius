@@ -2235,6 +2235,185 @@ class KimiK3Config(CausalLMConfig):
 
 
 @dataclasses.dataclass
+class Glm5NextConfig(CausalLMConfig):
+    """Exact text and multimodal configuration for GLM-5.3-Flash."""
+
+    mlp_layer_types: list[str] | None = None
+    linear_num_heads: int | None = None
+    linear_head_dim: int | None = None
+    linear_lower_bound: float | None = -5.0
+    index_kpool: int = 4
+    index_kpool_compress: bool = True
+    index_kpool_always_select_tail: bool = True
+    image_start_token_id: int | None = None
+    image_end_token_id: int | None = None
+    video_start_token_id: int | None = None
+    video_end_token_id: int | None = None
+
+    def __post_init__(self) -> None:
+        # Mobius's base validator requires a positive generic head_dim. GLM-5.3
+        # uses this field only for shape metadata; attention itself is NoPE and
+        # reads qk_nope_head_dim explicitly.
+        if self.head_dim <= 0 and self.qk_nope_head_dim is not None:
+            self.head_dim = self.qk_nope_head_dim
+        if self.layer_types is None:
+            self.layer_types = [
+                "linear_attention" if index % 4 != 3 else "deepseek_sparse_attention"
+                for index in range(self.num_hidden_layers)
+            ]
+        else:
+            self.layer_types = [
+                "deepseek_sparse_attention" if value == "full_attention" else value
+                for value in self.layer_types
+            ]
+        if self.mlp_layer_types is None:
+            dense_layers = min(3, self.num_hidden_layers)
+            self.mlp_layer_types = ["dense"] * dense_layers + ["sparse"] * (
+                self.num_hidden_layers - dense_layers
+            )
+        if self.indexer_types is None:
+            self.indexer_types = ["full"] * self.num_hidden_layers
+        if self.linear_num_heads is None:
+            self.linear_num_heads = self.num_attention_heads
+        if self.linear_head_dim is None:
+            self.linear_head_dim = self.qk_nope_head_dim
+
+        if len(self.layer_types) != self.num_hidden_layers:
+            raise ValueError("GLM-5.3 layer_types must match num_hidden_layers")
+        if len(self.mlp_layer_types) != self.num_hidden_layers:
+            raise ValueError("GLM-5.3 mlp_layer_types must match num_hidden_layers")
+        if len(self.indexer_types) != self.num_hidden_layers:
+            raise ValueError("GLM-5.3 indexer_types must match num_hidden_layers")
+        if set(self.layer_types) - {"linear_attention", "deepseek_sparse_attention"}:
+            raise ValueError(f"Unsupported GLM-5.3 layer types: {self.layer_types}")
+        if set(self.mlp_layer_types) - {"dense", "sparse"}:
+            raise ValueError(f"Unsupported GLM-5.3 MLP layer types: {self.mlp_layer_types}")
+        if set(self.indexer_types) - {"full", "shared"}:
+            raise ValueError(f"Unsupported GLM-5.3 indexer types: {self.indexer_types}")
+        if any(value != "full" for value in self.indexer_types):
+            raise ValueError(
+                "Mobius currently supports the pinned GLM-5.3 all-full DSA "
+                "indexer schedule; shared cross-layer selections are not exposed "
+                "by zai-org/GLM-5.3-Flash"
+            )
+        if self.num_attention_heads != self.num_key_value_heads:
+            raise ValueError("GLM-5.3 requires equal attention and key/value head counts")
+        if self.qk_rope_head_dim not in (None, 0):
+            raise ValueError("GLM-5.3 uses NoPE and requires qk_rope_head_dim=0")
+        if self.q_lora_rank is None or self.kv_lora_rank is None:
+            raise ValueError("GLM-5.3 requires Q-LoRA and KV-LoRA ranks")
+        if self.qk_nope_head_dim is None or self.v_head_dim is None:
+            raise ValueError("GLM-5.3 requires MLA key and value dimensions")
+        if self.linear_num_heads is None or self.linear_num_heads <= 0:
+            raise ValueError("GLM-5.3 requires a positive linear_num_heads")
+        if self.linear_head_dim is None or self.linear_head_dim <= 0:
+            raise ValueError("GLM-5.3 requires a positive linear_head_dim")
+        if self.linear_conv_kernel_dim < 2:
+            raise ValueError("GLM-5.3 linear_conv_kernel_dim must be at least 2")
+        if self.linear_lower_bound is None or self.linear_lower_bound >= 0:
+            raise ValueError("GLM-5.3 linear_lower_bound must be negative")
+        if self.index_kpool < 1 or (self.index_topk or 0) % self.index_kpool:
+            raise ValueError("GLM-5.3 index_topk must be divisible by index_kpool")
+        if not self.index_kpool_compress:
+            raise ValueError("GLM-5.3 requires compressed k-pool DSA indexing")
+        if self.hc_mult <= 1 or self.hc_sinkhorn_iters < 1:
+            raise ValueError(
+                "GLM-5.3 requires mHC with at least two streams and one iteration"
+            )
+        if not self.num_local_experts or not self.num_experts_per_tok:
+            raise ValueError("GLM-5.3 requires routed experts")
+        if self.num_experts_per_tok > self.num_local_experts:
+            raise ValueError("GLM-5.3 top-k cannot exceed num_local_experts")
+        if self.swiglu_limit <= 0:
+            raise ValueError("GLM-5.3 requires a positive SwiGLU clamp")
+        if self.tie_word_embeddings:
+            raise ValueError("GLM-5.3 uses an untied LM head")
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> Glm5NextConfig:
+        composite = parent_config or config
+        text = _as_attribute_config(getattr(config, "text_config", None)) or config
+        if getattr(composite, "model_type", None) == "glm5_next":
+            parent = composite
+        else:
+            parent = parent_config
+        base = ArchitectureConfig.from_transformers(
+            text,
+            parent,
+            allow_block_fp8_dense_fallback=True,
+        )
+        linear = _as_attribute_config(getattr(text, "linear_attn_config", None))
+        linear_num_heads = int(
+            getattr(
+                linear,
+                "num_heads",
+                getattr(text, "linear_num_heads", base.num_attention_heads),
+            )
+        )
+        linear_head_dim = int(
+            getattr(
+                linear,
+                "head_dim",
+                getattr(text, "linear_head_dim", base.qk_nope_head_dim or 0),
+            )
+        )
+        linear_conv_kernel_dim = int(
+            getattr(
+                linear,
+                "short_conv_kernel_size",
+                getattr(text, "linear_conv_kernel_dim", 4),
+            )
+        )
+        linear_lower_bound = float(
+            getattr(
+                linear,
+                "gate_lower_bound",
+                getattr(text, "linear_lower_bound", -5.0),
+            )
+        )
+        layer_types = getattr(text, "layer_types", None)
+        if layer_types is not None:
+            layer_types = list(layer_types)
+        mlp_layer_types = getattr(text, "mlp_layer_types", None)
+        if mlp_layer_types is not None:
+            mlp_layer_types = list(mlp_layer_types)
+        indexer_types = getattr(text, "indexer_types", None)
+        if indexer_types is not None:
+            indexer_types = list(indexer_types)
+
+        fields = _shallow_fields(base)
+        fields.update(
+            model_type=getattr(composite, "model_type", getattr(text, "model_type", None)),
+            head_dim=base.qk_nope_head_dim,
+            layer_types=layer_types,
+            mlp_layer_types=mlp_layer_types,
+            indexer_types=indexer_types,
+            linear_num_heads=linear_num_heads,
+            linear_head_dim=linear_head_dim,
+            linear_conv_kernel_dim=linear_conv_kernel_dim,
+            linear_lower_bound=linear_lower_bound,
+            index_kpool=int(getattr(text, "index_kpool", 4)),
+            index_kpool_compress=bool(getattr(text, "index_kpool_compress", True)),
+            index_kpool_always_select_tail=bool(
+                getattr(text, "index_kpool_always_select_tail", True)
+            ),
+            image_start_token_id=getattr(composite, "image_start_token_id", None),
+            image_end_token_id=getattr(composite, "image_end_token_id", None),
+            video_start_token_id=getattr(composite, "video_start_token_id", None),
+            video_end_token_id=getattr(composite, "video_end_token_id", None),
+            scoring_func="sigmoid",
+            topk_method="noaux_tc",
+            use_expert_bias=True,
+            rope_type=None,
+            rope_theta=None,
+            rope_scaling=None,
+            partial_rotary_factor=None,
+            tie_word_embeddings=False,
+        )
+        return cls(**fields)
+
+
+@dataclasses.dataclass
 class EncoderConfig(ArchitectureConfig):
     """Configuration for encoder-only models (BERT, ViT, etc.)."""
 

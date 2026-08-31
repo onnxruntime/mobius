@@ -317,6 +317,19 @@ def build_transformers_model(
         module_class=module_class,
     )
     if (
+        load_weights
+        and model_type in {"glm5_next", "glm5_next_text"}
+        and config.block_quant_scheme is not None
+    ):
+        raise NotImplementedError(
+            "The pinned GLM-5.3 checkpoint is a 328 GB block-FP8 package. "
+            "A transactional multi-component streaming loader is required before "
+            "Mobius can bind the complete checkpoint without downloading or "
+            "materializing it eagerly. Use --no-weights for the production-shape "
+            "package; reduced real-weight range-read evidence is committed under "
+            "testdata/evidence/vision-language/glm5-next-reduced-real-weights.*."
+        )
+    if (
         compressed_tensors_config is not None
         and fp8_kv_cache
         and compressed_tensors_config.kv_cache_scheme is not None

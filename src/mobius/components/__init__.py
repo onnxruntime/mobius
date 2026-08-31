@@ -51,6 +51,7 @@ __all__ = [
     "Gemma3nMultimodalEmbedder",
     "GlmOcrVisionModel",
     "Glm4VVisionModel",
+    "Glm5NextVisionModel",
     "Granite4VisionEncoder",
     "Granite4WindowQFormerProjector",
     "GatedShortConv",
@@ -268,7 +269,7 @@ from mobius.components._gguf_audio_projectors import (
     GGUFQwen2AudioProjector,
     GGUFWhisperAudioTower,
 )
-from mobius.components._glm4v_vision import Glm4VVisionModel
+from mobius.components._glm4v_vision import Glm4VVisionModel, Glm5NextVisionModel
 from mobius.components._glm_ocr_vision import GlmOcrVisionModel
 from mobius.components._hunyuan_step_vision import (
     HunyuanVLClipSidecar,

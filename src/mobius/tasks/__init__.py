@@ -58,6 +58,8 @@ __all__ = [
     "Gemma4Task",
     "Gemma4UnifiedTask",
     "Gemma4TextCausalLMTask",
+    "Glm5NextTextTask",
+    "Glm5NextVisionLanguageTask",
     "GlmMoeDsaTask",
     "GlmOcrVLTask",
     "HybridCausalLMTask",
@@ -164,6 +166,7 @@ from mobius.tasks._gguf_projector import (
     GGUFVisionProjectorModel,
     GGUFVisionProjectorTask,
 )
+from mobius.tasks._glm5_next import Glm5NextTextTask, Glm5NextVisionLanguageTask
 from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
 from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
@@ -295,6 +298,8 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-unified": Gemma4UnifiedTask,
     "gemma4-assistant": Gemma4AssistantTask,
     "glm-moe-dsa": GlmMoeDsaTask,
+    "glm5-next-text-generation": Glm5NextTextTask,
+    "glm5-next-vision-language": Glm5NextVisionLanguageTask,
     "mistral4-gguf-text-generation": Mistral4GGUFCausalLMTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "sensenova-u1": SenseNovaU1Task,

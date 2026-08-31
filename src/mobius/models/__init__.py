@@ -77,6 +77,8 @@ __all__ = [
     "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
     "GlmCausalLMModel",
+    "Glm5NextCausalLMModel",
+    "Glm5NextForConditionalGeneration",
     "GlmMoeDsaCausalLMModel",
     "GlmOcrForConditionalGeneration",
     "GraniteCausalLMModel",
@@ -295,6 +297,10 @@ from mobius.models.gguf_minimax_m2 import MiniMaxM2GGUFCausalLMModel
 from mobius.models.gguf_mistral4 import Mistral4GGUFCausalLMModel
 from mobius.models.gguf_plamo import PlamoGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
+from mobius.models.glm5_next import (
+    Glm5NextCausalLMModel,
+    Glm5NextForConditionalGeneration,
+)
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
 from mobius.models.glm_moe_dsa import GlmMoeDsaCausalLMModel
 from mobius.models.glm_ocr import GlmOcrForConditionalGeneration
