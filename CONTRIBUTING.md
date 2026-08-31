@@ -134,7 +134,7 @@ Each model file in `models/` should:
 2. Export it from `models/__init__.py`.
 3. Register it in `_registry.py`'s `_create_default_registry()`.
 4. Add a tiny config entry to the appropriate list in `tests/_test_configs.py`.
-5. Add a small HuggingFace model to `_TEXT_MODELS` in
+5. Add a small HuggingFace model to `TEXT_MODELS` in
    `tests/integration/_support.py`.
 
 ### Adding a new task

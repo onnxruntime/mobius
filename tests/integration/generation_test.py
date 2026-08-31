@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from integration._support import (
-    _TEXT_MODELS,
+    TEXT_MODELS,
     _fill_random_weights,
     _get_config,
     _make_session,
@@ -27,7 +27,7 @@ from mobius._testing.torch_reference import (
 
 @pytest.mark.integration
 @pytest.mark.integration_fast
-@pytest.mark.parametrize("model_id,trust_remote_code", _TEXT_MODELS)
+@pytest.mark.parametrize("model_id,trust_remote_code", TEXT_MODELS)
 class TestGreedyGeneration:
     """Compare greedy text generation between ONNX and PyTorch."""
 

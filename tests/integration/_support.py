@@ -37,7 +37,7 @@ def _model_accessible(model_id: str) -> bool:
         return True
 
 
-_TEXT_MODELS = [
+TEXT_MODELS = [
     # CausalLMModel (base: llama/mistral/qwen2 architecture)
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
     pytest.param("LiquidAI/LFM2.5-230M", False, id="lfm2.5-230m"),

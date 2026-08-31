@@ -334,7 +334,7 @@ def test_build_model(model_type, config_overrides):
 ```python
 @pytest.mark.integration
 @pytest.mark.integration_fast
-@pytest.mark.parametrize("model_id,trust_remote_code", _TEXT_MODELS)
+@pytest.mark.parametrize("model_id,trust_remote_code", TEXT_MODELS)
 def test_export_and_run(model_id, trust_remote_code):
     # Downloads weights, compares logits
 ```

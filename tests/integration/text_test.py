@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from integration._support import (
-    _TEXT_MODELS,
+    TEXT_MODELS,
     _get_config,
     _make_decode_feeds,
     _make_prefill_feeds,
@@ -27,7 +27,7 @@ from mobius._testing.torch_reference import (
 
 @pytest.mark.integration
 @pytest.mark.integration_fast
-@pytest.mark.parametrize("model_id,trust_remote_code", _TEXT_MODELS)
+@pytest.mark.parametrize("model_id,trust_remote_code", TEXT_MODELS)
 class TestForwardNumerical:
     """Compare single forward pass logits between ONNX and PyTorch."""
 

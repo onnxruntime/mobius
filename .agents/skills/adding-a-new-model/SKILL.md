@@ -246,7 +246,7 @@ See the **writing-tests** skill for full details.  At minimum:
 
 2. **Add a small model to the appropriate focused integration suite** if a
    small checkpoint exists (< 1B parameters preferred). Generic causal LMs
-   use `_TEXT_MODELS` in `tests/integration/_support.py`.
+   use `TEXT_MODELS` in `tests/integration/_support.py`.
 
 3. **Testing large models with random weights:** Create a reduced HF model:
    ```python

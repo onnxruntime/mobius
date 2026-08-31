@@ -315,7 +315,7 @@ config (64 hidden dimensions, 2 layers, no weights).
 ### 4.2. Integration tests (mandatory for new architectures)
 
 Add the smallest available checkpoint to the appropriate focused integration
-suite. Generic causal LMs use `_TEXT_MODELS` in
+suite. Generic causal LMs use `TEXT_MODELS` in
 `tests/integration/_support.py`:
 
 ```python

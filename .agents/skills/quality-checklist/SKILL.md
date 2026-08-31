@@ -68,7 +68,7 @@ reason — before the PR is merged.
 - [ ] `python -m pytest tests/synthetic_parity_test.py -k "<model>"` passes
       with `atol=1e-3` / `rtol=1e-3` (or `1e-2` for multimodal)
 - [ ] Real-weight parity also checked via a focused integration suite (add
-      generic causal LMs to `_TEXT_MODELS` in `tests/integration/_support.py`
+      generic causal LMs to `TEXT_MODELS` in `tests/integration/_support.py`
       if a small checkpoint is available)
 
 ### 5. L4 — Golden match
