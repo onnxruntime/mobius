@@ -183,6 +183,7 @@ def test_other_existing_local_directory_forms_do_not_use_hub_revision(tmp_path, 
     checkpoint = tmp_path / "checkpoints" / "personaplex"
     checkpoint.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
     local_forms = [
         checkpoint,
