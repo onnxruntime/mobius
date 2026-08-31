@@ -141,8 +141,9 @@ def test_granite_speech5_graph_contract_and_weight_names():
 
 
 def test_granite_speech5_audio_processor_forwards_revision(tmp_path, monkeypatch):
-    from mobius.integrations.ort_genai.auto_export import _write_audio_processor_config
     from transformers import AutoFeatureExtractor
+
+    from mobius.integrations.ort_genai.auto_export import _write_audio_processor_config
 
     calls = []
 

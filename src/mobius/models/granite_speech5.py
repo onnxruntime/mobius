@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
@@ -220,9 +218,7 @@ class _Float32BatchNorm1d(nn.Module):
         hidden_states = op.Cast(hidden_states, to=ir.DataType.FLOAT)
         channel_shape = op.Constant(value_ints=[1, -1, 1])
         mean = op.Cast(op.Reshape(self.running_mean, channel_shape), to=ir.DataType.FLOAT)
-        variance = op.Cast(
-            op.Reshape(self.running_var, channel_shape), to=ir.DataType.FLOAT
-        )
+        variance = op.Cast(op.Reshape(self.running_var, channel_shape), to=ir.DataType.FLOAT)
         scale = op.Cast(op.Reshape(self.weight, channel_shape), to=ir.DataType.FLOAT)
         bias = op.Cast(op.Reshape(self.bias, channel_shape), to=ir.DataType.FLOAT)
         hidden_states = op.Div(
@@ -334,9 +330,7 @@ class _GraniteSpeech5EncoderBlock(nn.Module):
     ) -> ir.Value:
         half = _scalar_like(op, 0.5, hidden_states)
         residual = hidden_states
-        hidden_states = self.feed_forward1(
-            op, self.norm_feed_forward1(op, hidden_states)
-        )
+        hidden_states = self.feed_forward1(op, self.norm_feed_forward1(op, hidden_states))
         hidden_states = op.Add(residual, op.Mul(hidden_states, half))
 
         residual = hidden_states
@@ -366,9 +360,7 @@ class _GraniteSpeech5EncoderBlock(nn.Module):
         hidden_states = op.Add(residual, conv_output)
 
         residual = hidden_states
-        hidden_states = self.feed_forward2(
-            op, self.norm_feed_forward2(op, hidden_states)
-        )
+        hidden_states = self.feed_forward2(op, self.norm_feed_forward2(op, hidden_states))
         hidden_states = op.Add(residual, op.Mul(hidden_states, half))
         return self.norm_out(op, hidden_states)
 
