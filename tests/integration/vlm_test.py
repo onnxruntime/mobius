@@ -50,6 +50,7 @@ def test_nemotron_parse_real_weight_cuda_parity():
     image_path = os.path.join(
         os.path.dirname(__file__),
         "..",
+        "..",
         "testdata",
         "nemotron-parse-document.png",
     )
