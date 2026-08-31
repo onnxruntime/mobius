@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-import os
+import ntpath
+from pathlib import Path
 from unittest import mock
 
 import onnx_ir as ir
@@ -180,15 +181,21 @@ def test_personaplex_hub_id_uses_pinned_revision(tmp_path, monkeypatch):
 
 
 def test_other_existing_local_directory_forms_do_not_use_hub_revision(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     checkpoint = tmp_path / "checkpoints" / "personaplex"
     checkpoint.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
+    # Keep the relative form anchored to the temporary cwd, not the repository checkout.
+    relative_checkpoint = checkpoint.relative_to(Path.cwd())
+    assert relative_checkpoint == Path("checkpoints/personaplex")
+    assert ntpath.normpath(relative_checkpoint.as_posix()) == r"checkpoints\personaplex"
+
     local_forms = [
         checkpoint,
         str(checkpoint),
-        os.path.relpath(checkpoint),
+        relative_checkpoint,
         "~/checkpoints/personaplex",
     ]
     for local_form in local_forms:
