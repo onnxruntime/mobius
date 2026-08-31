@@ -14,6 +14,7 @@ import onnx_ir as ir
 _COMPONENT_PRESENCE = "mobius.pipeline.when_present"
 _OPTIONAL_INPUT_PRESENCE = "mobius.pipeline.optional_input.presence"
 _OPTIONAL_INPUT_ABSENT_SHAPE = "mobius.pipeline.optional_input.absent_shape"
+_ARBITRARY_ATTENTION_MASK = "mobius.attention.requires_arbitrary_mask"
 
 
 def declare_component_presence(graph: ir.Graph, presence: str) -> None:
@@ -73,3 +74,13 @@ def optional_input_contract(value: Any) -> dict[str, Any] | None:
             "shape": shape,
         },
     }
+
+
+def declare_arbitrary_attention_mask(graph: ir.Graph) -> None:
+    """Prevent attention fusions that only support prefix-valid masks."""
+    graph.metadata_props[_ARBITRARY_ATTENTION_MASK] = "true"
+
+
+def requires_arbitrary_attention_mask(graph: Any) -> bool:
+    """Return whether a decoder needs its full additive attention mask."""
+    return getattr(graph, "metadata_props", {}).get(_ARBITRARY_ATTENTION_MASK) == "true"

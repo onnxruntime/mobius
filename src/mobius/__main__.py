@@ -616,6 +616,19 @@ def _cmd_build(args: argparse.Namespace) -> None:
     _save_package(pkg, output_dir, args, optimize, component_filter)
 
 
+def _runtime_source_revision(pkg, explicit_revision: str | None) -> str | None:
+    """Recover the effective build revision for runtime asset downloads."""
+    if explicit_revision is not None:
+        return explicit_revision
+    revisions = {
+        revision
+        for model in pkg.values()
+        if (revision := getattr(model, "metadata_props", {}).get("mobius.source_revision"))
+        not in {None, "unpinned"}
+    }
+    return next(iter(revisions)) if len(revisions) == 1 else None
+
+
 def _save_package(
     pkg, output_dir: str, args, optimize: str | None, component_filter: str | None
 ) -> None:
@@ -667,6 +680,10 @@ def _save_package(
         # When --config (local dir) is used instead of --model, copy tokenizer
         # files from the local directory rather than downloading from HF.
         local_config_dir = getattr(args, "config", None)
+        runtime_revision = _runtime_source_revision(
+            pkg,
+            getattr(args, "revision", None),
+        )
         artifacts = write_ort_genai_config(
             pkg,
             output_dir,
@@ -674,7 +691,7 @@ def _save_package(
             ep=ep,
             local_config_dir=local_config_dir,
             trust_remote_code=getattr(args, "trust_remote_code", False),
-            revision=getattr(args, "revision", None),
+            revision=runtime_revision,
         )
         for name, path in artifacts.items():
             print(f"  {name}: {path}")
@@ -689,7 +706,7 @@ def _save_package(
 
         config = getattr(pkg, "config", None)
         source = getattr(args, "config", None) or getattr(args, "model", None)
-        revision = getattr(args, "revision", None)
+        revision = _runtime_source_revision(pkg, getattr(args, "revision", None))
         if is_native_vlm_package(pkg):
             try:
                 artifacts = write_native_vlm_package_metadata(

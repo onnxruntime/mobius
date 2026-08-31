@@ -46,6 +46,13 @@ from mobius.tasks import get_task
 logger = logging.getLogger(__name__)
 
 
+def test_vibevoice_synthetic_pipeline_parity():
+    """Run the dedicated eight-stage continuous-token parity harness."""
+    from mobius.models.vibevoice_test import test_vibevoice_synthetic_stage_parity
+
+    test_vibevoice_synthetic_stage_parity()
+
+
 # ---------------------------------------------------------------------------
 # Model types that cannot be tested with HF synthetic parity.
 # Each entry maps a model_type to a reason for skipping.
