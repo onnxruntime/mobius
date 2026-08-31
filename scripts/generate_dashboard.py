@@ -298,7 +298,7 @@ def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
     # Specialized models have dedicated graph-construction tests but are not
     # in ALL_CONFIGS. They still build a graph.
     try:
-        from _build_graph_support import _SPECIALIZED_TEST_MODEL_TYPES
+        from build_graph._support import _SPECIALIZED_TEST_MODEL_TYPES
     except ImportError:
         return
 

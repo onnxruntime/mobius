@@ -49,7 +49,7 @@ reason — before the PR is merged.
       for VLM / audio models)
 - [ ] `is_representative=True` if the model has unique behaviour (custom
       class, special attention, MoE, hybrid layers, etc.)
-- [ ] `python -m pytest tests/build_graph_*_test.py -k "<model_type>"` passes
+- [ ] `python -m pytest tests/build_graph -k "<model_type>"` passes
 - [ ] Weight-alignment test passes:
       `python -m pytest tests/weight_alignment_test.py -k "<model_type>"`
 
@@ -269,7 +269,7 @@ lintrunner f --output oneline --all-files
 lintrunner -a
 
 # L1 – graph build
-python -m pytest tests/build_graph_*_test.py -k "<model_type>"
+python -m pytest tests/build_graph -k "<model_type>"
 
 # L1 – weight alignment
 python -m pytest tests/weight_alignment_test.py -k "<model_type>"

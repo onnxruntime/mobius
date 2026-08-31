@@ -3,7 +3,7 @@
 
 """Diffusion, audio encoder, VAE, codec, and audio-language L1 tests.
 
-Run the complete L1 suite with ``pytest tests/build_graph_*_test.py``.
+Run the complete L1 suite with ``pytest tests/build_graph``.
 """
 
 from __future__ import annotations
@@ -290,7 +290,7 @@ class TestBuildMMSGraph:
         assert logits.shape[1] > 0  # num_frames (after CNN downsampling)
         assert logits.shape[2] == config.vocab_size  # CTC vocab
 
-    """Verify UNet2DConditionModel graph construction."""
+    # UNet2DConditionModel graph construction.
 
     def _unet_config(self):
         from mobius.integrations.diffusers._configs import UNet2DConfig

@@ -3,7 +3,7 @@
 
 """Static-cache, KV-sharing, GQA, sliding-window, and RoPE L1 tests.
 
-Run the complete L1 suite with ``pytest tests/build_graph_*_test.py``.
+Run the complete L1 suite with ``pytest tests/build_graph``.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import pytest
-from _build_graph_support import _assert_outputs_have_shapes_and_dtypes
+from ._support import _assert_outputs_have_shapes_and_dtypes
 from _test_configs import (
     TINY_HEAD_DIM,
     TINY_HEADS,

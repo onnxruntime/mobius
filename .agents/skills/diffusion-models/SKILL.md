@@ -340,7 +340,7 @@ new task in `tasks/`. Most denoisers use the standard `DenoisingTask`.
 
 ### 5. Add unit test
 
-In the appropriate `tests/build_graph_*_test.py` domain file, add a tiny graph test:
+In the appropriate `tests/build_graph` domain file, add a tiny graph test:
 
 ```python
 ("my_denoiser", MyDenoiser2DModel, MyDenoiserConfig(

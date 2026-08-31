@@ -67,7 +67,7 @@ class TestClassifyFile:
         assert classify_file("src/mobius/models/_models_test.py") == "test"
 
     def test_test_file_in_tests(self):
-        assert classify_file("tests/build_graph_core_test.py") == "test"
+        assert classify_file("tests/build_graph/core_test.py") == "test"
 
     def test_test_infra_conftest(self):
         assert classify_file("tests/conftest.py") == "shared_infra"
@@ -281,7 +281,7 @@ class TestDetectAffectedModels:
         assert result["affected"] == []
 
     def test_test_file_no_affected(self):
-        result = detect_affected_models(["tests/build_graph_speech_test.py"])
+        result = detect_affected_models(["tests/build_graph/speech_test.py"])
         assert result["run_all"] is False
         assert result["affected"] == []
 

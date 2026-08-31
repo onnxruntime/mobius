@@ -9,7 +9,7 @@ pip install pytest
 
 ## Running tests
 
-Unit tests live in `tests/build_graph_*_test.py` and verify graph construction
+Unit tests live in `tests/build_graph` and verify graph construction
 for all supported architectures using tiny synthetic configs (no network needed).
 
 Integration tests live in `tests/integration_test.py` and verify numerical
@@ -17,10 +17,10 @@ accuracy against HuggingFace PyTorch models (requires network and memory).
 
 ```bash
 # Unit tests (fast, parallel with -n auto)
-pytest tests/build_graph_*_test.py -v -n auto
+pytest tests/build_graph -v -n auto
 
 # Run a single model type
-pytest tests/build_graph_*_test.py -k "phi4mm"
+pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (slow, downloads models)
 pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
@@ -75,7 +75,7 @@ Within the `components/` package itself, private cross-imports
 ### File organization
 
 - **Source**: `src/mobius/`
-- **Unit tests**: `tests/build_graph_*_test.py` (graph construction, no weights)
+- **Unit tests**: `tests/build_graph` (graph construction, no weights)
 - **Integration tests**: `tests/integration_test.py` (numerical accuracy vs PyTorch)
 - **Test helpers**: `src/mobius/_testing/`
 

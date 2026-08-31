@@ -80,7 +80,7 @@ def _assert_outputs_have_shapes_and_dtypes(
                 f"{model_type}/{sub_name}: output '{output.name}' "
                 f"has no shape after shape inference"
             )
-            assert output.type is not None, (
+            assert output.dtype is not None, (
                 f"{model_type}/{sub_name}: output '{output.name}' "
                 f"has no dtype after shape inference"
             )

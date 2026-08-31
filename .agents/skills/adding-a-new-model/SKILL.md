@@ -242,7 +242,7 @@ See the **writing-tests** skill for full details.  At minimum:
    - `is_representative=True` if the model has unique behaviour
    - `is_representative=False` if it's an alias with no special config
 
-   Then verify: `pytest tests/build_graph_*_test.py -k "my_model_type"`
+   Then verify: `pytest tests/build_graph -k "my_model_type"`
 
 2. **Add a small model to `tests/integration_test.py`** if a small
    checkpoint exists (< 1B parameters preferred).

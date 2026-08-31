@@ -3,7 +3,7 @@
 
 """Vision-language and multimodal L1 graph-construction tests.
 
-Run the complete L1 suite with ``pytest tests/build_graph_*_test.py``.
+Run the complete L1 suite with ``pytest tests/build_graph``.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import pytest
-from _build_graph_support import (
+from ._support import (
     _assert_outputs_have_shapes_and_dtypes,
     _make_params,
     _run_onnx_checker,

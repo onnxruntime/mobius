@@ -358,7 +358,7 @@ If building manually, ensure the body graph has opset imports.
 
 ## Testing Scan-based code
 
-Unit tests (`build_graph_*_test.py`) verify graph construction only.  To
+Unit tests (`tests/build_graph/`) verify graph construction only.  To
 verify Scan correctness at runtime, build the vision model, fill
 initializers with random weights, and run with ORT:
 
