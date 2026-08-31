@@ -18,6 +18,7 @@ from unittest import mock
 
 import numpy as np
 import onnx
+import onnx_ir as ir
 import pytest
 
 from mobius.__main__ import _save_package, build_parser, main
@@ -147,6 +148,8 @@ class TestCLIBuild:
                     "nvidia/personaplex-7b-v1",
                     tmpdir,
                     "--no-weights",
+                    "--dtype",
+                    "f16",
                     "--execution-provider",
                     "cuda",
                 ]
@@ -156,7 +159,7 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["revision"] == _PERSONAPLEX_REVISION
         assert build_model.call_args.kwargs["load_weights"] is False
         assert build_model.call_args.kwargs["execution_provider"] == "cuda"
-        assert build_model.call_args.kwargs["dtype"] is None
+        assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT16
         save_package.assert_called_once()
 
     def test_local_personaplex_config_bypasses_transformers(self):
