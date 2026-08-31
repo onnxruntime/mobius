@@ -9,12 +9,12 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from _integration_support import (
+from PIL import Image
+
+from integration._support import (
     _make_session,
     _model_accessible,
 )
-from PIL import Image
-
 from mobius._testing.comparison import (
     assert_logits_close,
 )

@@ -15,7 +15,7 @@ python -m pytest tests/build_graph tests/cli_test.py src/ -q \
 python -m pytest tests/build_graph -k "qwen2"
 
 # Run integration tests (requires HuggingFace model downloads)
-python -m pytest tests/*_integration_test.py -m integration -k "prefill" -sv
+python -m pytest tests/integration -m integration -k "prefill" -sv
 
 # Lint and auto-format
 lintrunner f --output oneline --all-files
@@ -89,7 +89,7 @@ and wrapper modules for nesting. See the `weight-name-alignment` skill.
 - Co-located tests: `src/mobius/**/*_test.py` (unit tests next
   to source)
 - Top-level tests: `tests/build_graph/` (graph construction),
-  `tests/*_integration_test.py` (numerical accuracy vs HuggingFace)
+  `tests/integration/` (numerical accuracy vs HuggingFace)
 - Skills: `.agents/skills/<name>/SKILL.md`
 
 ### Code style

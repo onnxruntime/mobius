@@ -316,7 +316,7 @@ config (64 hidden dimensions, 2 layers, no weights).
 
 Add the smallest available checkpoint to the appropriate focused integration
 suite. Generic causal LMs use `_TEXT_MODELS` in
-`tests/_integration_support.py`:
+`tests/integration/_support.py`:
 
 ```python
 pytest.param("org/model-name", False, id="model-name"),

@@ -36,7 +36,7 @@ we fully control and that run fast in CI with no model downloads.
 | Build benchmarks | `tests/benchmark_build.py` | Graph construction time, peak memory, node count (10 models) |
 | ORT session wrapper | `src/mobius/_testing/ort_inference.py` | `OnnxModelSession`: saves model → creates ORT session → runs inference |
 | Generation loop | `src/mobius/_testing/generation.py` | `OnnxGenerator`: autoregressive generation with KV cache |
-| Integration tests | `tests/*_integration_test.py` | Numerical accuracy vs HuggingFace (prefill, decode, generation) |
+| Integration tests | `tests/integration/` | Numerical accuracy vs HuggingFace (prefill, decode, generation) |
 | CI workflow | `.github/workflows/main.yml` | Lint + unit tests + fast integration tests |
 | Pytest marker | `pyproject.toml` | `benchmark` marker registered |
 

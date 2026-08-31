@@ -13,10 +13,10 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from _integration_support import (
+
+from integration._support import (
     _make_session,
 )
-
 from mobius import models
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius._testing.comparison import (

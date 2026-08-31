@@ -70,7 +70,7 @@ python -m pytest tests/build_graph --fast
 python -m pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (slow, downloads models)
-python -m pytest tests/text_model_integration_test.py -m integration -k "qwen2.5-0.5b"
+python -m pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
 
 # L4/L5 golden tests
 python -m pytest tests/e2e_golden_test.py -m golden --level L4 -v
@@ -95,8 +95,11 @@ tests/
 │   ├── speech_test.py
 │   └── vision_language_test.py
 ├── _test_configs.py          # shared model configs for all tests
-├── *_integration_test.py     # focused real-weight and architecture parity suites
-├── _integration_support.py   # shared integration session/feed helpers and text cases
+├── integration/             # focused real-weight and architecture parity suites
+│   ├── _support.py          # shared session/feed helpers and text cases
+│   ├── text_test.py
+│   ├── generation_test.py
+│   └── ...                  # VLM, encoder/media, architecture, and heavy suites
 ├── e2e_golden_test.py        # L4 + L5: golden file comparison
 ├── yaml_schema_test.py       # YAML test case schema validation
 ├── weight_alignment_test.py  # L1: preprocess_weights correctness
@@ -174,9 +177,9 @@ set to a real HF model ID.
 
 ## L3: Integration tests
 
-Located in focused `tests/*_integration_test.py` modules. The generic text
+Located in focused `tests/integration/*_test.py` modules. The generic text
 suite is parametrized with `(model_id, trust_remote_code)` from
-`tests/_integration_support.py`. Prefer models ≤ 1B, publicly accessible, one
+`tests/integration/_support.py`. Prefer models ≤ 1B, publicly accessible, one
 per distinct model class.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for

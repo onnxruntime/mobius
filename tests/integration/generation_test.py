@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from _integration_support import (
+
+from integration._support import (
     _TEXT_MODELS,
     _fill_random_weights,
     _get_config,
     _make_session,
 )
-
 from mobius import build
 from mobius._configs import ArchitectureConfig
 from mobius._testing.comparison import (

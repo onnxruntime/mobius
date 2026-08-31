@@ -30,14 +30,14 @@ Last Updated: 2025-03-09
 | `arch_validation_test.py` | 1 | 4 | **L2 Architecture Validation**: Downloads config.json from HF for registered models, builds full-size ONNX graphs (no weights), validates structure | `arch_validation`, `parametrize` |
 | `synthetic_parity_test.py` | 0 | 1 | **L3 Synthetic Parity**: Builds tiny random-weight models (PyTorch + ONNX), compares logits to detect op-level bugs | `parametrize` |
 | `e2e_golden_test.py` | 2 | 2 | **L4/L5 Golden Comparison**: Data-driven tests from YAML files in `testdata/cases/`; L4 compares single-forward logits, L5 compares generation | `golden`, `generation`, `integration`, `parametrize` |
-| `text_model_integration_test.py` | 1 | 2 | **Text parity**: Generic real-weight causal-LM prefill and decode | `integration`, `integration_fast`, `parametrize` |
-| `generation_integration_test.py` | 2 | 6 | **Generation**: Real-weight token comparison and synthetic generation loops | `integration`, `integration_fast`, `parametrize` |
-| `vlm_model_integration_test.py` | 5 | 15 | **VLM parity**: Real-checkpoint text, vision, and 3-model pipelines | `integration`, `integration_slow`, `parametrize` |
-| `encoder_media_seq2seq_integration_test.py` | 5 | 8 | **Non-causal parity**: Encoder, vision, audio, seq2seq, and Whisper matrices | `integration`, `integration_fast`, `parametrize` |
-| `architecture_specific_integration_test.py` | 1 | 2 | **Architecture-specific parity**: Custom references, routing, and artifact paths | `integration`, `integration_fast`, `integration_slow` |
-| `qwen35_vl_integration_test.py` | 0 | 5 | **Qwen3.5-VL**: Three-model and hybrid-state parity | `integration`, `integration_fast` |
-| `multimodal_pipeline_integration_test.py` | 1 | 4 | **Synthetic multimodal pipelines**: Gemma3, BLIP-2, and InternVL2 | `integration`, `integration_fast` |
-| `gemma4_integration_test.py` | 0 | 5 | **Gemma4**: Heavyweight text, multimodal, BF16, and mask parity | `integration`, `integration_slow` |
+| `integration/text_test.py` | 1 | 2 | **Text parity**: Generic real-weight causal-LM prefill and decode | `integration`, `integration_fast`, `parametrize` |
+| `integration/generation_test.py` | 2 | 6 | **Generation**: Real-weight token comparison and synthetic generation loops | `integration`, `integration_fast`, `parametrize` |
+| `integration/vlm_test.py` | 5 | 15 | **VLM parity**: Real-checkpoint text, vision, and 3-model pipelines | `integration`, `integration_slow`, `parametrize` |
+| `integration/encoder_media_seq2seq_test.py` | 5 | 8 | **Non-causal parity**: Encoder, vision, audio, seq2seq, and Whisper matrices | `integration`, `integration_fast`, `parametrize` |
+| `integration/architectures_test.py` | 1 | 2 | **Architecture-specific parity**: Custom references, routing, and artifact paths | `integration`, `integration_fast`, `integration_slow` |
+| `integration/qwen3_5_vl_test.py` | 0 | 5 | **Qwen3.5-VL**: Three-model and hybrid-state parity | `integration`, `integration_fast` |
+| `integration/multimodal_pipeline_test.py` | 1 | 4 | **Synthetic multimodal pipelines**: Gemma3, BLIP-2, and InternVL2 | `integration`, `integration_fast` |
+| `integration/gemma4_test.py` | 0 | 5 | **Gemma4**: Heavyweight text, multimodal, BF16, and mask parity | `integration`, `integration_slow` |
 | `weight_alignment_test.py` | 5 | 5 | **Weight Alignment Tests**: Verifies preprocess_weights() doesn't corrupt ONNX names; catches renaming bugs | `parametrize` |
 | `onnx_checker_test.py` | 1 | 1 | **ONNX Checker Tests**: Runs CheckerPass on all built models; detects op errors, malformed protos (~30s) | `parametrize` |
 | `cli_test.py` | 3 | 8 | **CLI Tests**: Invokes `main()` directly; no network access, all build tests use `--no-weights` | None |
@@ -55,7 +55,7 @@ Last Updated: 2025-03-09
 **Support Files:**
 - `conftest.py` (141 lines) — Shared fixtures, marker registration, CLI flags, test filtering
 - `_test_configs.py` (38KB) — Config data for parametrized tests
-- `_integration_support.py` — Shared integration session/feed helpers and text cases
+- `integration/_support.py` — Shared integration session/feed helpers and text cases
 
 ### 1.2 `src/` Test Files (54 total)
 
@@ -305,7 +305,7 @@ def [fixture_name_2]  # Implementation details TBD
 |------|-------|----------|---------|
 | **Unit (L0/L1)** | ~100 methods | `src/**/*_test.py`, `tests/build_graph` | Fast, no network |
 | **Component** | ~379 methods | `src/components/*_test.py` | Individual operator validation |
-| **Integration (L3)** | ~52 methods | `tests/*_integration_test.py`, `tests/synthetic_parity_test.py` | Real weights, network required |
+| **Integration (L3)** | ~52 methods | `tests/integration/`, `tests/synthetic_parity_test.py` | Real weights, network required |
 | **Golden (L4/L5)** | ~2–10 methods | `tests/e2e_golden_test.py`, parametrized via YAML | Data-driven, checkpoint-verified |
 | **Architecture (L2)** | 4 methods | `tests/arch_validation_test.py` | Real HF configs, no weights |
 | **Infrastructure** | ~55 methods | `src/*_testing*/*_test.py` | Golden/parity utils testing |
@@ -391,7 +391,7 @@ pytest tests/e2e_golden_test.py -m golden -v
 pytest tests/e2e_golden_test.py -m generation -v
 
 # Integration (small models only)
-pytest tests/*_integration_test.py -m integration_fast -v -k "smollm or albert"
+pytest tests/integration -m integration_fast -v -k "smollm or albert"
 
 # All non-integration tests with coverage
 pytest -m 'not integration' --cov=src --cov-report=html

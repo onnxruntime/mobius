@@ -7,14 +7,14 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from _integration_support import (
+
+from integration._support import (
     _TEXT_MODELS,
     _get_config,
     _make_decode_feeds,
     _make_prefill_feeds,
     _make_session,
 )
-
 from mobius import build
 from mobius._testing.comparison import (
     assert_logits_close,

@@ -8,11 +8,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
-from _integration_support import (
+
+from integration._support import (
     _fill_random_weights,
     _make_session,
 )
-
 from mobius import models
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius._testing.comparison import (

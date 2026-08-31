@@ -9,12 +9,12 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from _integration_support import (
-    _make_session,
-)
 from PIL import Image
 from transformers.cache_utils import DynamicCache
 
+from integration._support import (
+    _make_session,
+)
 from mobius import models
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius._constants import OPSET_VERSION

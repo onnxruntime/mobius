@@ -339,9 +339,9 @@ assert_logits_close(onnx_logits, hf_logits, rtol=2e-2, atol=2e-1)
 > extraction, integration test patterns, tolerance guidelines, weight
 > loading verification, and HD multi-crop verification.
 
-- **Integration tests:** `tests/vlm_model_integration_test.py`
+- **Integration tests:** `tests/integration/vlm_test.py`
   (`TestVLTextForward`, `TestQwen25VL3Model`),
-  `tests/multimodal_pipeline_integration_test.py`,
+  `tests/integration/multimodal_pipeline_test.py`,
   `tests/phi4mm_integration_test.py`
 - **ORT GenAI tests:** `tests/ort_genai_test.py`
 - **Example scripts:** `examples/qwen25_vl_ort_genai.py`,

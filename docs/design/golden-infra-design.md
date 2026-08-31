@@ -1247,7 +1247,7 @@ jobs:
 
 ## Appendix B: Migration Path from Live Integration Tests
 
-The focused `*_integration_test.py` suites run HF inference live. The golden
+The focused `tests/integration/` suites run HF inference live. The golden
 file infrastructure replaces this for daily CI:
 
 | Before (live integration suites) | After (e2e_golden_test.py) |

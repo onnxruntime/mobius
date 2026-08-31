@@ -9,10 +9,10 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from _integration_support import (
+
+from integration._support import (
     _make_session,
 )
-
 from mobius import build, models
 from mobius._configs import ArchitectureConfig
 from mobius._testing.comparison import (

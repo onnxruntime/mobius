@@ -5,7 +5,7 @@
 
 These build the mobius module + the matching diffusers module with the *same*
 random weights (no checkpoint download) and compare outputs — the pattern used
-by ``tests/architecture_specific_integration_test.py`` for the QwenImage VAE.
+by ``tests/integration/architectures_test.py`` for the QwenImage VAE.
 Guarded on diffusers.
 """
 

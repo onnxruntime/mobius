@@ -255,7 +255,7 @@ unpacks these into per-expert tensors and also renames
 Integration tests use a random-weight HF model with reduced layers and
 experts (e.g. 4 layers, 4 experts, top-2 routing).  See
 `test_qwen35_moe_prefill_logits_match` in
-`tests/architecture_specific_integration_test.py`.
+`tests/integration/architectures_test.py`.
 
 ## Testing MoE models
 

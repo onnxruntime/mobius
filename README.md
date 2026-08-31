@@ -178,7 +178,7 @@ See the [design document](https://onnxruntime.github.io/mobius/design.html) for 
 pytest tests/build_graph -v
 
 # Integration tests (downloads models)
-pytest tests -m integration -v
+pytest tests/integration -m integration -v
 
 # All unit tests (components, configs, tasks, models)
 pytest src tests -m "not integration" -v

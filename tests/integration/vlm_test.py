@@ -12,7 +12,10 @@ import numpy as np
 import pytest
 import torch
 import transformers
-from _integration_support import (
+from PIL import Image
+from transformers.cache_utils import DynamicCache
+
+from integration._support import (
     _get_config,
     _get_test_device,
     _make_decode_feeds,
@@ -20,9 +23,6 @@ from _integration_support import (
     _make_session,
     _model_accessible,
 )
-from PIL import Image
-from transformers.cache_utils import DynamicCache
-
 from mobius import build, models
 from mobius._testing.comparison import (
     assert_generation_match,

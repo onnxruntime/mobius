@@ -290,7 +290,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
-          key: hf-integration-fast-${{ hashFiles('tests/_integration_support.py', 'tests/text_model_integration_test.py', 'tests/generation_integration_test.py', 'tests/encoder_media_seq2seq_integration_test.py', 'tests/architecture_specific_integration_test.py', 'tests/qwen35_vl_integration_test.py', 'tests/gguf_small_model_runtime_integration_test.py') }}
+          key: hf-integration-fast-${{ hashFiles('tests/integration/_support.py', 'tests/integration/text_test.py', 'tests/integration/generation_test.py', 'tests/integration/encoder_media_seq2seq_test.py', 'tests/integration/architectures_test.py', 'tests/integration/qwen3_5_vl_test.py', 'tests/gguf_small_model_runtime_integration_test.py') }}
           restore-keys: |
             hf-integration-fast-
       - name: Install PyTorch CUDA
@@ -307,10 +307,10 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          pytest tests/text_model_integration_test.py tests/generation_integration_test.py \
-            tests/encoder_media_seq2seq_integration_test.py \
-            tests/architecture_specific_integration_test.py \
-            tests/qwen35_vl_integration_test.py \
+          pytest tests/integration/text_test.py tests/integration/generation_test.py \
+            tests/integration/encoder_media_seq2seq_test.py \
+            tests/integration/architectures_test.py \
+            tests/integration/qwen3_5_vl_test.py \
             tests/gguf_small_model_runtime_integration_test.py -m integration_fast -v \
             -k "smollm-135m or smollm2-135m-instruct-f16 or albert-base or t5-small or dinov2-small or wav2vec2-base or whisper-tiny or test_gemma3_multimodal or test_qwen35 or test_qwen3_next or test_deepseek or test_sam_vit or test_ocr2" \
             --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
