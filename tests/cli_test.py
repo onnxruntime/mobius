@@ -149,7 +149,7 @@ class TestCLIBuild:
                     tmpdir,
                     "--no-weights",
                     "--dtype",
-                    "f16",
+                    "f32",
                     "--execution-provider",
                     "cuda",
                 ]
@@ -159,7 +159,7 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["revision"] == _PERSONAPLEX_REVISION
         assert build_model.call_args.kwargs["load_weights"] is False
         assert build_model.call_args.kwargs["execution_provider"] == "cuda"
-        assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT16
+        assert build_model.call_args.kwargs["dtype"] == ir.DataType.FLOAT
         save_package.assert_called_once()
 
     def test_local_personaplex_config_bypasses_transformers(self):
