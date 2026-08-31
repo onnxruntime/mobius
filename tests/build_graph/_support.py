@@ -268,3 +268,13 @@ _KNOWN_UNTESTED_MODEL_TYPES: set[str] = {
     "deepseek_v2_moe",  # Alias for deepseek_v2 — tested via deepseek_v2
     "qwen3_5_vl_text",  # VL text decoder — tested via parent VL model
 }
+
+
+def specialized_test_model_types() -> frozenset[str]:
+    """Return model types covered by dedicated graph-construction tests."""
+    return frozenset(_SPECIALIZED_TEST_MODEL_TYPES)
+
+
+def known_untested_model_types() -> frozenset[str]:
+    """Return registered model types explicitly excluded from L1 coverage."""
+    return frozenset(_KNOWN_UNTESTED_MODEL_TYPES)

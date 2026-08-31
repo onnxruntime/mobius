@@ -14,11 +14,6 @@ import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import pytest
-from ._support import (
-    _assert_outputs_have_shapes_and_dtypes,
-    _make_params,
-    _run_onnx_checker,
-)
 from _test_configs import (
     LONGROPE_FACTORS,
     VL_CONFIGS,
@@ -26,6 +21,11 @@ from _test_configs import (
     vl_overrides,
 )
 
+from build_graph._support import (
+    _assert_outputs_have_shapes_and_dtypes,
+    _make_params,
+    _run_onnx_checker,
+)
 from mobius._builder import DTYPE_MAP, build_from_module
 from mobius._configs import (
     AudioConfig,

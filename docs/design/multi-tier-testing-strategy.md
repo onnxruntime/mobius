@@ -568,7 +568,7 @@ See [Performance Benchmarking](perf-benchmarking.md) for full details.
 | Tier | Status | Coverage | File |
 |------|--------|----------|------|
 | L0 | ✅ Implicit via registry | 273 types | `_registry.py` |
-| L1 | ✅ Full coverage (273) | 273 types | `tests/build_graph/` + `_SPECIALIZED_TEST_MODEL_TYPES` |
+| L1 | ✅ Full coverage (273) | 273 types | `tests/build_graph/` + `specialized_test_model_types()` |
 | L2 | ✅ YAML-driven | ~105 types (YAML cases with `test_model_id`) | `arch_validation_test.py` |
 | L3 | ✅ Causal LM + integration tests | ~116 types | `integration_test.py` + `*_integration_test.py` |
 | L4 | ✅ ~45 checkpoints | 45 golden JSON files | `e2e_golden_test.py` |
@@ -608,14 +608,14 @@ Dashboard level counts are **per-flag**, not exclusive or hierarchical:
 - **L5 count** = models with `l5_generation_golden=True`
 
 A model is counted at every level it passes.  Because every registered
-model type has either a parametrized config entry or a `_SPECIALIZED_TEST_MODEL_TYPES`
+model type has either a parametrized config entry or a `specialized_test_model_types()`
 entry, L1 equals the total number of registered models.
 
 ### Detection sources
 
 | Level | Dashboard scanner | Data source |
 |-------|------------------|-------------|
-| L1 | `_scan_l1_configs` | `tests/_test_configs.py::ALL_CONFIGS` + `tests/build_graph/_support.py::_SPECIALIZED_TEST_MODEL_TYPES` |
+| L1 | `_scan_l1_configs` | `tests/_test_configs.py::ALL_CONFIGS` + `tests/build_graph/_support.py::specialized_test_model_types()` |
 | L2 | `_scan_l2_arch_tests` | `test_model_id` field in `testdata/cases/**/*.yaml` |
 | L3 | `_scan_l3_synthetic_parity` | Model type presence in `tests/integration_test.py` and related files |
 | L4 | `_scan_l4_golden_files` | `testdata/golden/<cat>/<model>.json` existence |

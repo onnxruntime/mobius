@@ -272,7 +272,7 @@ def _scan_registry() -> dict[str, ModelInfo]:
 def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
     """Mark L1 coverage from test config presence in _test_configs.py.
 
-    Also marks models in ``_SPECIALIZED_TEST_MODEL_TYPES`` (VLM/audio models
+    Also marks models from ``specialized_test_model_types()`` (VLM/audio models
     tested via dedicated test methods rather than the parametrized config loop).
     """
     from mobius._testing.code_paths import (
@@ -298,11 +298,11 @@ def _scan_l1_configs(models: dict[str, ModelInfo]) -> None:
     # Specialized models have dedicated graph-construction tests but are not
     # in ALL_CONFIGS. They still build a graph.
     try:
-        from build_graph._support import _SPECIALIZED_TEST_MODEL_TYPES
+        from build_graph._support import specialized_test_model_types
     except ImportError:
         return
 
-    for model_type in _SPECIALIZED_TEST_MODEL_TYPES:
+    for model_type in specialized_test_model_types():
         if model_type in models:
             models[model_type].l1_graph_build = True
 

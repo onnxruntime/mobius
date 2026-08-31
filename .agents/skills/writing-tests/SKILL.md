@@ -147,7 +147,7 @@ The framework checks: inputs exist (`input_ids`, `attention_mask`,
 are present.
 
 Models with dedicated test methods are tracked in
-`tests/build_graph/_support.py::_SPECIALIZED_TEST_MODEL_TYPES`.
+`tests/build_graph/_support.py::specialized_test_model_types()`.
 
 ### Weight alignment tests
 

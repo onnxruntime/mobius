@@ -11,11 +11,6 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import pytest
-from ._support import (
-    _assert_outputs_have_shapes_and_dtypes,
-    _make_params,
-    _run_onnx_checker,
-)
 from _test_configs import (
     SPEECH_CONFIGS,
     TINY_HEAD_DIM,
@@ -28,6 +23,11 @@ from _test_configs import (
     _base_config,
 )
 
+from build_graph._support import (
+    _assert_outputs_have_shapes_and_dtypes,
+    _make_params,
+    _run_onnx_checker,
+)
 from mobius._builder import build_from_module
 from mobius._configs import (
     AudioConfig,

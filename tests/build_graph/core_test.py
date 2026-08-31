@@ -11,13 +11,6 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import pytest
-from ._support import (
-    _KNOWN_UNTESTED_MODEL_TYPES,
-    _SPECIALIZED_TEST_MODEL_TYPES,
-    _assert_outputs_have_shapes_and_dtypes,
-    _make_params,
-    _run_onnx_checker,
-)
 from _test_configs import (
     ALL_CAUSAL_LM_CONFIGS,
     ALL_CONFIGS,
@@ -30,6 +23,13 @@ from _test_configs import (
     _base_config,
 )
 
+from build_graph._support import (
+    _assert_outputs_have_shapes_and_dtypes,
+    _make_params,
+    _run_onnx_checker,
+    known_untested_model_types,
+    specialized_test_model_types,
+)
 from mobius._builder import DTYPE_MAP, build_from_module
 from mobius._configs import AudioConfig, VisionConfig
 from mobius._registry import registry
@@ -38,15 +38,9 @@ from mobius.tasks import CausalLMTask, Phi4MMMultiModalTask, get_task
 
 _MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in ALL_CAUSAL_LM_CONFIGS]
 _MODEL_PARAMS = _make_params(ALL_CAUSAL_LM_CONFIGS)
-_ENCODER_MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in ENCODER_CONFIGS]
 _ENCODER_MODEL_PARAMS = _make_params(ENCODER_CONFIGS)
-_SEQ2SEQ_MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in SEQ2SEQ_CONFIGS]
 _SEQ2SEQ_MODEL_PARAMS = _make_params(SEQ2SEQ_CONFIGS)
-_VISION_MODEL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, _ in VISION_CONFIGS]
 _VISION_MODEL_PARAMS = _make_params(VISION_CONFIGS)
-_DETECTION_MODEL_CONFIGS: list[tuple[str, dict]] = [
-    (mt, ov) for mt, ov, _ in DETECTION_CONFIGS
-]
 _DETECTION_MODEL_PARAMS = _make_params(DETECTION_CONFIGS)
 
 
@@ -862,11 +856,13 @@ class TestRegistryCompleteness:
         the known-untested allowlist.  New registrations that aren't
         covered anywhere will cause this test to fail.
         """
+        specialized = specialized_test_model_types()
+        known_untested = known_untested_model_types()
         all_covered = (
             {mt for mt, _, _ in ALL_CONFIGS}
             | {mt for mt, _, _ in AUTO_GENERATED_CONFIGS}
-            | _SPECIALIZED_TEST_MODEL_TYPES
-            | _KNOWN_UNTESTED_MODEL_TYPES
+            | specialized
+            | known_untested
         )
         registered = set(registry.architectures())
         missing = registered - all_covered
@@ -886,7 +882,7 @@ class TestRegistryCompleteness:
         _SPECIALIZED_TEST_MODEL_TYPES.
         """
         registered = set(registry.architectures())
-        stale = _KNOWN_UNTESTED_MODEL_TYPES - registered
+        stale = known_untested_model_types() - registered
         assert not stale, (
             f"Entries in _KNOWN_UNTESTED_MODEL_TYPES that are no longer "
             f"registered: {sorted(stale)}. Remove them."

@@ -11,7 +11,6 @@ from __future__ import annotations
 import numpy as np
 import onnx_ir as ir
 import pytest
-from ._support import _assert_outputs_have_shapes_and_dtypes
 from _test_configs import (
     TINY_HEAD_DIM,
     TINY_HEADS,
@@ -23,6 +22,7 @@ from _test_configs import (
     _base_config,
 )
 
+from build_graph._support import _assert_outputs_have_shapes_and_dtypes
 from mobius._builder import build_from_module
 from mobius._configs import ArchitectureConfig
 from mobius._registry import registry

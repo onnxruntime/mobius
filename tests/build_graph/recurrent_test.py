@@ -9,11 +9,6 @@ Run the complete L1 suite with ``pytest tests/build_graph``.
 from __future__ import annotations
 
 import pytest
-from ._support import (
-    _assert_outputs_have_shapes_and_dtypes,
-    _make_params,
-    _run_onnx_checker,
-)
 from _test_configs import (
     SSM_CONFIGS,
     TINY_HEAD_DIM,
@@ -26,6 +21,11 @@ from _test_configs import (
     _base_config,
 )
 
+from build_graph._support import (
+    _assert_outputs_have_shapes_and_dtypes,
+    _make_params,
+    _run_onnx_checker,
+)
 from mobius._registry import registry
 from mobius.integrations.transformers._config_resolver import _default_task_for_model
 from mobius.tasks import get_task
