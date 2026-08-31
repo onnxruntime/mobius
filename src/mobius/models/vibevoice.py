@@ -359,7 +359,10 @@ class VibeVoiceTokenizerEncoder(nn.Module):
         allocator = _CacheAllocator()
         self.stem = _EncoderStem(config, allocator)
         self.conv_layers = nn.ModuleList(
-            [_EncoderLayer(config, allocator, index) for index in range(len(config.downsampling_ratios))]
+            [
+                _EncoderLayer(config, allocator, index)
+                for index in range(len(config.downsampling_ratios))
+            ]
         )
         self.head = _CausalConv1d(
             allocator,

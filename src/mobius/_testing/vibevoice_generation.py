@@ -62,9 +62,7 @@ class _DiskSession:
             if name in self.input_info
         }
         outputs = self._session(**ort_feeds)
-        return dict(
-            zip(self.output_names, (_ort_value_to_numpy(value) for value in outputs))
-        )
+        return dict(zip(self.output_names, (_ort_value_to_numpy(value) for value in outputs)))
 
     def close(self) -> None:
         del self._session
@@ -104,7 +102,9 @@ class VibeVoiceDiskGenerator:
         try:
             self._numpy_dtype, self._torch_dtype = dtype_map[config.dtype]
         except KeyError as error:
-            raise ValueError(f"Unsupported VibeVoice generation dtype: {config.dtype}") from error
+            raise ValueError(
+                f"Unsupported VibeVoice generation dtype: {config.dtype}"
+            ) from error
         self._control_tokens = (
             config.audio_bos_token_id,
             config.audio_eos_token_id,
@@ -273,15 +273,9 @@ class VibeVoiceDiskGenerator:
                 timestep_batch = timestep.repeat(combined.shape[0]).to(combined)
                 velocity = session.run(
                     {
-                        "noisy_audio_latents": _torch_to_numpy(
-                            combined, self._numpy_dtype
-                        ),
-                        "timesteps": _torch_to_numpy(
-                            timestep_batch, self._numpy_dtype
-                        ),
-                        "condition": _torch_to_numpy(
-                            condition_torch, self._numpy_dtype
-                        ),
+                        "noisy_audio_latents": _torch_to_numpy(combined, self._numpy_dtype),
+                        "timesteps": _torch_to_numpy(timestep_batch, self._numpy_dtype),
+                        "condition": _torch_to_numpy(condition_torch, self._numpy_dtype),
                     }
                 )["velocity"]
                 velocity_torch = _numpy_to_torch(
@@ -479,15 +473,9 @@ class VibeVoiceDiskGenerator:
                     semantic_cache = self._next_conv(semantic_outputs)
                     with self._stage("semantic_projection") as session:
                         semantic_embed = session.run(
-                            {
-                                "semantic_latents": semantic_outputs[
-                                    "semantic_latents"
-                                ]
-                            }
+                            {"semantic_latents": semantic_outputs["semantic_latents"]}
                         )["semantic_embeds"]
-                    next_inputs_embeds = self._model_array(
-                        acoustic_embed + semantic_embed
-                    )
+                    next_inputs_embeds = self._model_array(acoustic_embed + semantic_embed)
 
                 if token == int(self.config.eos_token_id):
                     break

@@ -73,16 +73,12 @@ class VibeVoiceTask(ModelTask):
         self._validate_components(module)
         models = {
             "audio_encoder": self._build_audio_encoder(module.audio_encoder, config),
-            "audio_projection": self._build_audio_projection(
-                module.audio_projection, config
-            ),
+            "audio_projection": self._build_audio_projection(module.audio_projection, config),
             "embedding": self._build_embedding(module.embedding, config),
             "decoder": self._build_decoder(module.decoder, config),
             "diffusion_head": self._build_diffusion_head(module.diffusion_head, config),
             "audio_decoder": self._build_audio_decoder(module.audio_decoder, config),
-            "semantic_encoder": self._build_semantic_encoder(
-                module.semantic_encoder, config
-            ),
+            "semantic_encoder": self._build_semantic_encoder(module.semantic_encoder, config),
             "semantic_projection": self._build_semantic_projection(
                 module.semantic_projection, config
             ),

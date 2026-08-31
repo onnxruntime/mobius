@@ -215,9 +215,7 @@ def test_vibevoice_synthetic_stage_parity():
         expected_embeds = hf_model.model.language_model.embed_tokens(
             torch.from_numpy(input_ids)
         )
-        expected_embeds[torch.from_numpy(input_ids) == 60] = torch.from_numpy(
-            audio_embeds
-        )
+        expected_embeds[torch.from_numpy(input_ids) == 60] = torch.from_numpy(audio_embeds)
     embedding_outputs = _run(
         package,
         "embedding",
@@ -294,8 +292,7 @@ def test_vibevoice_synthetic_stage_parity():
     generated_latent = rng.standard_normal((1, 1, 4)).astype(np.float32)
     with torch.no_grad():
         unscaled_latent = (
-            torch.from_numpy(generated_latent)
-            / hf_model.model.latent_scaling_factor
+            torch.from_numpy(generated_latent) / hf_model.model.latent_scaling_factor
             - hf_model.model.latent_bias_factor
         )
         reference_waveform = (
@@ -372,9 +369,7 @@ def test_vibevoice_text_only_embedding_accepts_empty_audio_rows():
         },
     )
     with torch.no_grad():
-        expected = hf_model.model.language_model.embed_tokens(
-            torch.from_numpy(input_ids)
-        )
+        expected = hf_model.model.language_model.embed_tokens(torch.from_numpy(input_ids))
     np.testing.assert_array_equal(outputs["inputs_embeds"], expected.cpu().numpy())
 
 

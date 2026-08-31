@@ -58,9 +58,7 @@ def _tokenizer_config(config, *, default_hidden_size: int) -> VibeVoiceTokenizer
         hidden_size=int(getattr(config, "hidden_size", default_hidden_size)),
         kernel_size=int(getattr(config, "kernel_size", 7)),
         num_filters=int(getattr(config, "num_filters", 32)),
-        downsampling_ratios=list(
-            getattr(config, "downsampling_ratios", [2, 2, 4, 5, 5, 8])
-        ),
+        downsampling_ratios=list(getattr(config, "downsampling_ratios", [2, 2, 4, 5, 5, 8])),
         depths=list(getattr(config, "depths", [3, 3, 3, 3, 3, 3, 8])),
         ffn_expansion=int(getattr(config, "ffn_expansion", 4)),
         hidden_act=str(getattr(config, "hidden_act", "gelu")),
@@ -113,9 +111,7 @@ class VibeVoiceConfig(ArchitectureConfig):
             getattr(parent, "semantic_model_config", None),
             default_hidden_size=128,
         )
-        diffusion_config = _as_attribute_config(
-            getattr(parent, "diffusion_head_config", None)
-        )
+        diffusion_config = _as_attribute_config(getattr(parent, "diffusion_head_config", None))
         diffusion = VibeVoiceDiffusionConfig(
             hidden_size=int(getattr(diffusion_config, "hidden_size", result.hidden_size)),
             intermediate_size=int(

@@ -32,7 +32,6 @@ from mobius.models.vibevoice import (
     VibeVoiceForConditionalGeneration,
 )
 
-
 _ROOT = Path(__file__).parents[1]
 _GOLDEN_DIR = _ROOT / "testdata" / "golden" / "audio"
 _AUDIO_PATH = _ROOT / "testdata" / "652-129742-0006-24khz.wav"
@@ -321,9 +320,7 @@ def test_vibevoice_real_weight_stage_parity(
     latent_noise = torch.randn_like(raw_latents)
     expected_latents = (
         raw_latents
-        + config.acoustic_tokenizer.vae_std
-        * sample_noise[:, None, None]
-        * latent_noise
+        + config.acoustic_tokenizer.vae_std * sample_noise[:, None, None] * latent_noise
     )
     encoder.cpu()
     torch.cuda.empty_cache()
@@ -350,9 +347,7 @@ def test_vibevoice_real_weight_stage_parity(
 
     projector = model.model.multi_modal_projector.to("cuda")
     with torch.no_grad():
-        scaled = (
-            expected_latents + latent_bias
-        ) * latent_scale
+        scaled = (expected_latents + latent_bias) * latent_scale
         expected_audio_embeds = projector(scaled).float().cpu().numpy()[0]
     projector.cpu()
     projection_output, session = run_stage(
@@ -438,11 +433,16 @@ def test_vibevoice_real_weight_stage_parity(
     condition = rng.standard_normal((2, config.hidden_size)).astype(np.float16)
     diffusion = model.model.diffusion_head.to("cuda")
     with torch.no_grad():
-        expected_velocity = diffusion(
-            torch.from_numpy(noisy).cuda(),
-            torch.from_numpy(timesteps).cuda(),
-            torch.from_numpy(condition).cuda(),
-        ).float().cpu().numpy()
+        expected_velocity = (
+            diffusion(
+                torch.from_numpy(noisy).cuda(),
+                torch.from_numpy(timesteps).cuda(),
+                torch.from_numpy(condition).cuda(),
+            )
+            .float()
+            .cpu()
+            .numpy()
+        )
     diffusion.cpu()
     diffusion_output, session = run_stage(
         "diffusion_head",
@@ -463,15 +463,16 @@ def test_vibevoice_real_weight_stage_parity(
     generated_latent = rng.standard_normal((1, 1, 64)).astype(np.float16)
     acoustic_decoder = model.model.audio_tower.decoder.to("cuda")
     with torch.no_grad():
-        unscaled = (
-            torch.from_numpy(generated_latent).cuda()
-            / latent_scale
-            - latent_bias
+        unscaled = torch.from_numpy(generated_latent).cuda() / latent_scale - latent_bias
+        expected_waveform = (
+            acoustic_decoder(
+                unscaled.transpose(1, 2),
+                use_cache=True,
+            )
+            .audio.float()
+            .cpu()
+            .numpy()
         )
-        expected_waveform = acoustic_decoder(
-            unscaled.transpose(1, 2),
-            use_cache=True,
-        ).audio.float().cpu().numpy()
     acoustic_decoder.cpu()
     audio_session = _DiskSession(
         vibevoice_package_dir / "audio_decoder" / "model.onnx",
@@ -494,10 +495,15 @@ def test_vibevoice_real_weight_stage_parity(
 
     semantic_encoder = model.model.semantic_tokenizer_encoder.to("cuda")
     with torch.no_grad():
-        expected_semantic = semantic_encoder(
-            torch.from_numpy(audio_output["waveform"]).cuda(),
-            use_cache=True,
-        ).latents.float().cpu().numpy()
+        expected_semantic = (
+            semantic_encoder(
+                torch.from_numpy(audio_output["waveform"]).cuda(),
+                use_cache=True,
+            )
+            .latents.float()
+            .cpu()
+            .numpy()
+        )
     semantic_encoder.cpu()
     semantic_session = _DiskSession(
         vibevoice_package_dir / "semantic_encoder" / "model.onnx",
@@ -520,9 +526,12 @@ def test_vibevoice_real_weight_stage_parity(
 
     semantic_projector = model.model.semantic_connector.to("cuda")
     with torch.no_grad():
-        expected_semantic_embeds = semantic_projector(
-            torch.from_numpy(semantic_output["semantic_latents"]).cuda()
-        ).float().cpu().numpy()
+        expected_semantic_embeds = (
+            semantic_projector(torch.from_numpy(semantic_output["semantic_latents"]).cuda())
+            .float()
+            .cpu()
+            .numpy()
+        )
     semantic_projector.cpu()
     semantic_projection, session = run_stage(
         "semantic_projection",
