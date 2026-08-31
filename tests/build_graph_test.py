@@ -4782,10 +4782,10 @@ class TestBuildMimiCodec:
 
     def test_package_builds_2_models(self):
         """Build the Mimi codec and verify a 2-model (encoder+decoder) package."""
-        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.models.mimi import MimiModel, _mimi_default_config
         from mobius.tasks import CodecTask
 
-        config = mimi_default_config()
+        config = _mimi_default_config()
         module = MimiModel(config)
         pkg = build_from_module(module, config, task=CodecTask())
 
@@ -4794,10 +4794,10 @@ class TestBuildMimiCodec:
 
     def test_encoder_io(self):
         """Verify the Mimi encoder I/O contract: waveform -> codes."""
-        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.models.mimi import MimiModel, _mimi_default_config
         from mobius.tasks import CodecTask
 
-        config = mimi_default_config()
+        config = _mimi_default_config()
         pkg = build_from_module(MimiModel(config), config, task=CodecTask())
         encoder = pkg["encoder"]
 
@@ -4806,10 +4806,10 @@ class TestBuildMimiCodec:
 
     def test_decoder_io(self):
         """Verify the Mimi decoder I/O contract: codes -> waveform."""
-        from mobius.models.mimi import MimiModel, mimi_default_config
+        from mobius.models.mimi import MimiModel, _mimi_default_config
         from mobius.tasks import CodecTask
 
-        config = mimi_default_config()
+        config = _mimi_default_config()
         pkg = build_from_module(MimiModel(config), config, task=CodecTask())
         decoder = pkg["decoder"]
 
@@ -4824,9 +4824,9 @@ class TestBuildMoshiLM:
     def _temporal_tiny_config():
         import dataclasses
 
-        from mobius.models.moshi import moshi_temporal_config
+        from mobius.models.moshi import _moshi_temporal_config
 
-        cfg = moshi_temporal_config()
+        cfg = _moshi_temporal_config()
         return dataclasses.replace(
             cfg,
             hidden_size=64,
@@ -4866,10 +4866,10 @@ class TestBuildMoshiLM:
 
         import onnx_ir as ir
 
-        from mobius.models.moshi import MoshiTemporalModel, moshi_temporal_config
+        from mobius.models.moshi import MoshiTemporalModel, _moshi_temporal_config
         from mobius.tasks import MoshiTemporalTask
 
-        full_window = moshi_temporal_config().sliding_window
+        full_window = _moshi_temporal_config().sliding_window
         assert full_window and full_window > 0, "Moshi temporal must be sliding"
 
         config = dataclasses.replace(self._temporal_tiny_config(), dtype=ir.DataType.FLOAT16)
@@ -4887,10 +4887,10 @@ class TestBuildMoshiLM:
     @pytest.mark.parametrize("dep_q", [8, 16])
     def test_depformer_io(self, dep_q):
         """Depformer model I/O: hidden + prev_token + substep_index -> logits."""
-        from mobius.models.moshi import MoshiDepformerModel, moshi_depformer_config
+        from mobius.models.moshi import MoshiDepformerModel, _moshi_depformer_config
         from mobius.tasks import MoshiDepformerTask
 
-        config = moshi_depformer_config(dep_q=dep_q)
+        config = _moshi_depformer_config(dep_q=dep_q)
         pkg = build_from_module(MoshiDepformerModel(config), config, task=MoshiDepformerTask())
         model = pkg["model"]
         inputs = {inp.name for inp in model.graph.inputs}
@@ -4904,10 +4904,10 @@ class TestBuildMoshiLM:
 
     @pytest.mark.parametrize("dep_q", [0, 1, 2, 7, 9, 17])
     def test_depformer_rejects_unsupported_width(self, dep_q):
-        from mobius.models.moshi import moshi_depformer_config
+        from mobius.models.moshi import _moshi_depformer_config
 
         with pytest.raises(ValueError, match=r"dep_q must be 8 .* or 16"):
-            moshi_depformer_config(dep_q)
+            _moshi_depformer_config(dep_q)
 
 
 class TestBuildCodecGraph:

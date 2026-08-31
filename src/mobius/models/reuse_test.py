@@ -17,8 +17,8 @@ from mobius.models.reuse import (
     ReUseConfig,
     SEMambaSpeechEnhancementModel,
     _atan2,
+    _build_reuse,
     _effective_revision,
-    build_reuse,
 )
 from mobius.tasks import SpeechEnhancementTask, get_task
 
@@ -47,6 +47,13 @@ def _build():
     config = _tiny_config()
     module = SEMambaSpeechEnhancementModel(config)
     return config, build_from_module(module, config, task=SpeechEnhancementTask())
+
+
+def test_model_specific_builder_is_private():
+    import mobius.models as models
+
+    assert "build_reuse" not in models.__all__
+    assert not hasattr(models, "build_reuse")
 
 
 class TestReUseConfig:
@@ -463,7 +470,7 @@ class TestBuildReUse:
     def test_builds_and_fills_every_initializer(self, tmp_path):
         """A full local build leaves no initializer unpopulated."""
         pytest.importorskip("safetensors")
-        pkg = build_reuse(str(self._checkpoint_dir(tmp_path)))
+        pkg = _build_reuse(str(self._checkpoint_dir(tmp_path)))
 
         graph = pkg["model"].graph
         unfilled = [
@@ -474,7 +481,7 @@ class TestBuildReUse:
 
     def test_structure_only_build_skips_weights(self, tmp_path):
         pytest.importorskip("safetensors")
-        pkg = build_reuse(str(self._checkpoint_dir(tmp_path)), load_weights=False)
+        pkg = _build_reuse(str(self._checkpoint_dir(tmp_path)), load_weights=False)
 
         assert "model" in pkg
 
@@ -487,7 +494,7 @@ class TestBuildReUse:
     )
     def test_build_exposes_static_native_and_bwe_rates(self, tmp_path, kwargs, expected_bins):
         pytest.importorskip("safetensors")
-        pkg = build_reuse(
+        pkg = _build_reuse(
             str(self._checkpoint_dir(tmp_path)),
             load_weights=False,
             **kwargs,
@@ -506,7 +513,7 @@ class TestBuildReUse:
         bwe_rate,
     ):
         with pytest.raises(ValueError, match="mutually exclusive"):
-            build_reuse(
+            _build_reuse(
                 "config-must-not-be-read",
                 load_weights=False,
                 input_sampling_rate=input_rate,

@@ -204,6 +204,42 @@ def build_transformers_model(
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
+    from mobius.integrations._moshi import (
+        _build_personaplex,
+        _is_personaplex_checkpoint,
+        _personaplex_revision,
+    )
+
+    if _is_personaplex_checkpoint(model_id):
+        unsupported = {
+            "task": task is not None,
+            "module_class": module_class is not None,
+            "output_layer_indices": output_layer_indices is not None,
+            "trace_optimization": trace_optimization,
+            "dequantize": not keep_quantized,
+            "text_only": text_only,
+            "fp8_kv_cache": fp8_kv_cache,
+            "kv_cache_scales": kv_cache_scales is not None,
+            "prune_prefill_prefix": prune_prefill_prefix,
+            "glm_full_attention": glm_full_attention,
+            "export_paged_attention": export_paged_attention,
+            "input_sampling_rate": input_sampling_rate is not None,
+            "bwe_sampling_rate": bwe_sampling_rate is not None,
+        }
+        selected = sorted(name for name, enabled in unsupported.items() if enabled)
+        if selected:
+            raise ValueError(
+                "PersonaPlex checkpoints do not support these build options: "
+                + ", ".join(selected)
+            )
+        return _build_personaplex(
+            model_id,
+            dtype=dtype,
+            execution_provider=execution_provider,
+            revision=_personaplex_revision(model_id, revision),
+            load_weights=load_weights,
+        )
+
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,
@@ -225,7 +261,7 @@ def build_transformers_model(
         trust_remote_code=trust_remote_code,
     )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
-        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+        from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if module_class is None and _is_reuse_checkpoint(model_id, detection_revision):
             from mobius.tasks import SpeechEnhancementTask
@@ -249,7 +285,7 @@ def build_transformers_model(
                     "RE-USE checkpoints do not support these decoder-only options: "
                     + ", ".join(selected)
                 )
-            return build_reuse(
+            return _build_reuse(
                 model_id,
                 revision=detection_revision,
                 dtype=dtype,
