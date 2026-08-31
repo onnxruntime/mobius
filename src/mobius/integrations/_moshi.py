@@ -43,10 +43,16 @@ class _PersonaPlexWorkflowConfig:
 
 def _is_personaplex_checkpoint(checkpoint: str | Path) -> bool:
     """Recognize the canonical Hub ID or a strongly identified local checkpoint."""
-    path = Path(os.path.expanduser(str(checkpoint)))
-    if path.is_dir():
+    path = _local_checkpoint_path(checkpoint)
+    if path is not None:
         return _is_local_personaplex_checkpoint(path)
     return str(checkpoint).casefold() == _PERSONAPLEX_MODEL_ID.casefold()
+
+
+def _local_checkpoint_path(checkpoint: str | Path) -> Path | None:
+    """Resolve an existing local checkpoint directory before interpreting Hub IDs."""
+    path = Path(os.path.expanduser(str(checkpoint)))
+    return path if path.is_dir() else None
 
 
 def _is_local_personaplex_checkpoint(path: Path) -> bool:
@@ -93,7 +99,7 @@ def _is_local_personaplex_checkpoint(path: Path) -> bool:
 
 
 def _personaplex_revision(checkpoint: str | Path, revision: str | None) -> str | None:
-    if Path(os.path.expanduser(str(checkpoint))).is_dir():
+    if _local_checkpoint_path(checkpoint) is not None:
         return None
     if revision is not None:
         return revision
