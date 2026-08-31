@@ -129,9 +129,9 @@ def test_metadata_modules_keep_one_way_dependencies(
         else:
             package_parts = module_parts[:-1]
         package = ".".join(package_parts)
-        imported_tests = _import_edges(
-            python_path.read_text(encoding="utf-8"), package
-        ) & test_modules
+        imported_tests = (
+            _import_edges(python_path.read_text(encoding="utf-8"), package) & test_modules
+        )
         cross_test_imports.extend(
             (str(relative_path.with_suffix(".py")), imported_test)
             for imported_test in imported_tests
