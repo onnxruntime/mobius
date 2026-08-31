@@ -443,7 +443,7 @@ class TestSkipListIntegrity:
 class TestL1L3GraphBuildCoverage:
     """L1 + L3: every model needs a test config in _test_configs.py.
 
-    The config enables ``build_graph_test.py`` to exercise the model.
+    The config enables the L1 graph-construction suite to exercise the model.
     For causal-LM models, it also enables ``synthetic_parity_test.py``.
     """
 

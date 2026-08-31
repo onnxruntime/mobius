@@ -208,7 +208,7 @@ Golden files must be committed alongside new test case YAML files.
 **L1 — Graph builds:**
 1. Add `("my_model", {config_overrides}, True)` to the appropriate list in
    `tests/_test_configs.py` (or add a dedicated method if the model is a VLM/audio).
-2. Run `python -m pytest tests/build_graph_test.py -k "my_model"`.
+2. Run `python -m pytest tests/build_graph -k "my_model"`.
 
 **L2 — Config compatible:**
 1. Create `testdata/cases/<category>/my-model.yaml`.

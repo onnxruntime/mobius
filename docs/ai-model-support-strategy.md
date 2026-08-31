@@ -303,7 +303,7 @@ The agent should look for structural similarities with existing models:
 
 ### 4.1. Unit tests (mandatory)
 
-Add a tiny config entry to `tests/build_graph_test.py`:
+Add a tiny config entry to the appropriate list in `tests/_test_configs.py`:
 
 ```python
 ("new_model_type", {"hidden_act": "silu"}),

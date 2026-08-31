@@ -2901,7 +2901,7 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # Vision-Language configs  (task: vision-language and variants)
 # ---------------------------------------------------------------------------
 # NOTE: These models build multi-model packages (decoder + vision + embedding).
-# The test parametrization in build_graph_test.py uses specialised test
+# The L1 graph-test parametrization uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
     (

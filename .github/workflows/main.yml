@@ -104,7 +104,7 @@ jobs:
           pip install -e '.[testing]'
       - name: Run L1 smoke tests (all model configs)
         run: |
-          pytest tests/build_graph_test.py -v --tb=short -n auto \
+          pytest tests/build_graph -v --tb=short -n auto \
             --cov=src --cov-report=xml --cov-branch --junitxml junit.xml
         timeout-minutes: 10
       - name: Upload coverage to Codecov

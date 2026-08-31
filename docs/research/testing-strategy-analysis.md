@@ -391,7 +391,7 @@ FAILED: qwen3_moe prefill parity
 When a contributor adds a new variant, the system should guide them:
 
 ```
-$ python -m pytest tests/build_graph_test.py -k "qwen3_moe"
+$ python -m pytest tests/build_graph -k "qwen3_moe"
 PASSED: Graph builds successfully
 
 Dashboard preview:

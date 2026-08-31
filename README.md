@@ -175,7 +175,7 @@ See the [design document](https://onnxruntime.github.io/mobius/design.html) for 
 
 ```bash
 # Unit tests (fast, no network needed)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # Integration tests (downloads models)
 pytest tests/integration_test.py -m integration -v
