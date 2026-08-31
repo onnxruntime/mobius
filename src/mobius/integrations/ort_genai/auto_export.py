@@ -1394,16 +1394,38 @@ def _write_vision_processor_config(
 def _write_audio_processor_config(
     config: Any,
     output_dir: str,
+    *,
+    hf_model_id: str | None = None,
+    revision: str | None = None,
+    trust_remote_code: bool = False,
 ) -> str | None:
     """Write audio_processor.json for models with audio encoders.
 
     Returns the path if written, None otherwise.
     """
+    model_type = getattr(config, "model_type", "")
+
+    if model_type == "granite_speech5_ctc":
+        if hf_model_id is None:
+            logger.warning(
+                "Granite Speech 5 audio_processor.json requires the source model id "
+                "or directory; no processor metadata was emitted."
+            )
+            return None
+        from transformers import AutoFeatureExtractor
+
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
+            hf_model_id,
+            revision=revision,
+            trust_remote_code=trust_remote_code,
+        )
+        path = os.path.join(output_dir, "audio_processor.json")
+        feature_extractor.to_json_file(path)
+        return path
+
     audio = getattr(config, "audio", None)
     if audio is None:
         return None
-
-    model_type = getattr(config, "model_type", "")
 
     if model_type in _GEMMA4_UNIFIED_MODEL_TYPES:
         # Encoder-free unified model: raw 640-dim waveform frames, not the
@@ -1583,6 +1605,10 @@ def _write_genai_config(
     # --- Discover decoder inputs from the ONNX graph ---
     decoder_key = "decoder" if "decoder" in pkg else "model"
     decoder_model = pkg.get(decoder_key)
+    is_feature_ctc = getattr(config, "model_type", None) in {
+        "granite_speech5_ctc",
+        "parakeet_ctc",
+    }
     decoder_abi: _DecoderAbi | None = None
     if _is_single_model_decoder_package(pkg):
         if decoder_model is None:
@@ -1592,8 +1618,8 @@ def _write_genai_config(
         decoder_outputs = decoder_abi.outputs
     else:
         decoder_inputs = _introspect_inputs(pkg, decoder_key)
-        decoder_outputs = None
-        if decoder_inputs is not None:
+        decoder_outputs = _introspect_outputs(pkg, decoder_key) if is_feature_ctc else None
+        if decoder_inputs is not None and not is_feature_ctc:
             # Multimodal runtime types retain their architecture-specific cache contract.
             decoder_inputs["past_key_names"] = "past_key_values.%d.key"
             decoder_inputs["past_value_names"] = "past_key_values.%d.value"
@@ -1894,7 +1920,7 @@ def _runtime_capability_warnings(pkg: ModelPackage) -> tuple[str, ...]:
             "four-axis position state or heterogeneous per-layer PLE/QSA state "
             "membership; use the graph's mobius.state_manifest metadata."
         )
-    if getattr(config, "model_type", None) == "parakeet_ctc":
+    if getattr(config, "model_type", None) in {"granite_speech5_ctc", "parakeet_ctc"}:
         warnings.append(
             "onnxruntime-genai 0.15.2 does not define a feature-input CTC ASR pipeline."
         )
@@ -2358,7 +2384,13 @@ def write_ort_genai_config(
         result["processor_config"] = processor_path
 
     # Write audio_processor.json for models with audio encoders
-    audio_proc_path = _write_audio_processor_config(config, directory)
+    audio_proc_path = _write_audio_processor_config(
+        config,
+        directory,
+        hf_model_id=hf_model_id,
+        revision=revision,
+        trust_remote_code=trust_remote_code,
+    )
     if audio_proc_path:
         result["audio_processor"] = audio_proc_path
 

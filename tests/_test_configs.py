@@ -32,6 +32,7 @@ from mobius._configs import (
     Gemma4Config,
     GlmAsrConfig,
     GraniteMoeHybridConfig,
+    GraniteSpeech5CTCConfig,
     GrokGGUFConfig,
     GroveMoEGGUFConfig,
     HyV3Config,
@@ -3525,6 +3526,23 @@ def vl_overrides(model_type: str) -> dict:
 # Speech / TTS / Codec configs
 # ---------------------------------------------------------------------------
 SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    # --- Granite Speech 5 (chunked Shaw Conformer with self-conditioned CTC) ---
+    (
+        "granite_speech5_ctc",
+        {
+            "_config_cls": GraniteSpeech5CTCConfig,
+            "num_mel_bins": 4,
+            "input_feature_size": 16,
+            "context_size": 8,
+            "max_position_embeddings": 16,
+            "conv_kernel_size": 3,
+            "conv_expansion_factor": 2,
+            "subsample_layers": (0, 1),
+            "attention_bias": True,
+            "layer_norm_eps": 1e-5,
+        },
+        True,
+    ),
     # --- Parakeet CTC (feature-input offline FastConformer) ---
     (
         "parakeet_ctc",

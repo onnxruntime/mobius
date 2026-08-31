@@ -78,8 +78,8 @@ class FeatureCTCAsrTask(ModelTask):
     """Build feature-input CTC ASR (log-mel features → frame logits).
 
     Inputs:
-        ``input_features`` — (batch, frames, mel_bins) normalized log-mel values
-        ``attention_mask`` — (batch, frames) BOOL valid-frame mask
+        ``input_features`` — (batch, frames, feature_size) normalized audio features
+        ``attention_mask`` — (batch, frames) valid-frame mask
 
     Output:
         ``logits`` — (batch, subsampled_frames, vocab_size) CTC scores
@@ -97,14 +97,19 @@ class FeatureCTCAsrTask(ModelTask):
         frames = ir.SymbolicDim("frames")
 
         graph, builder = _make_graph(name="feature_ctc_asr")
+        input_feature_size = getattr(config, "input_feature_size", config.num_mel_bins)
+        input_dtype = getattr(config, "feature_input_dtype", config.dtype)
+        attention_mask_dtype = getattr(
+            config, "feature_attention_mask_dtype", ir.DataType.BOOL
+        )
         input_features = builder.input(
             "input_features",
-            dtype=config.dtype,
-            shape=[batch, frames, config.num_mel_bins],
+            dtype=input_dtype,
+            shape=[batch, frames, input_feature_size],
         )
         attention_mask = builder.input(
             "attention_mask",
-            dtype=ir.DataType.BOOL,
+            dtype=attention_mask_dtype,
             shape=[batch, frames],
         )
 
@@ -114,4 +119,9 @@ class FeatureCTCAsrTask(ModelTask):
             attention_mask=attention_mask,
         )
         builder.add_output(logits, "logits")
+
+        frame_lengths_fn = getattr(module, "frame_lengths", None)
+        if callable(frame_lengths_fn):
+            frame_lengths = frame_lengths_fn(builder.op, attention_mask)
+            builder.add_output(frame_lengths, "frame_lengths")
         return ModelPackage({"model": _make_model(graph)}, config=config)

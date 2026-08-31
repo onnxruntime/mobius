@@ -960,7 +960,9 @@ def _prepare_feature_ctc_feeds(
     )
     return {
         "input_features": processed["input_features"].astype(np.float32),
-        "attention_mask": processed["attention_mask"].astype(bool),
+        "attention_mask": processed["attention_mask"].astype(
+            np.int64 if case.model_type == "granite_speech5_ctc" else bool
+        ),
     }
 
 
@@ -3090,6 +3092,9 @@ class TestL5GenerationE2E:
         expected_len = len(expected_tokens)
         actual_len = len(new_tokens)
         if case.generation_params.get("exact_match", False):
+            actual_token_ids = (
+                new_tokens.tolist() if hasattr(new_tokens, "tolist") else list(new_tokens)
+            )
             assert actual_len == expected_len, (
                 f"L5 FAIL: exact length mismatch for {case.case_id}: "
                 f"expected {expected_len}, got {actual_len}"
@@ -3097,7 +3102,7 @@ class TestL5GenerationE2E:
             assert np.array_equal(new_tokens, expected_tokens), (
                 f"L5 FAIL: exact token mismatch for {case.case_id}\n"
                 f"  Expected: {expected_tokens.tolist()}\n"
-                f"  Got:      {new_tokens.tolist()}"
+                f"  Got:      {actual_token_ids}"
             )
             with open(gen_path, encoding="utf-8") as f:
                 expected_text = json.load(f)["generated_text"]
@@ -3108,7 +3113,7 @@ class TestL5GenerationE2E:
                 revision=case.revision,
                 trust_remote_code=case.trust_remote_code,
             )
-            actual_text = processor.decode(new_tokens.tolist(), skip_special_tokens=True)
+            actual_text = processor.decode(actual_token_ids, skip_special_tokens=True)
             assert actual_text == expected_text, (
                 f"L5 FAIL: exact transcript mismatch for {case.case_id}\n"
                 f"  Expected: {expected_text!r}\n"
