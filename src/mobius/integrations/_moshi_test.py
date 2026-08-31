@@ -167,6 +167,20 @@ def test_local_checkpoint_dispatches_and_records_local_revision(tmp_path, monkey
     }
 
 
+def test_canonical_hub_id_uses_pinned_revision_when_path_does_not_exist(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    assert not (tmp_path / "nvidia" / "personaplex-7b-v1").exists()
+    assert (
+        _builder._personaplex_revision(_builder._PERSONAPLEX_MODEL_ID, None)
+        == _builder._PERSONAPLEX_REVISION
+    )
+    assert (
+        _builder._personaplex_revision(_builder._PERSONAPLEX_MODEL_ID, "explicit")
+        == "explicit"
+    )
+
+
 def test_local_detection_fails_closed_for_ambiguous_checkpoint(tmp_path):
     checkpoint = _local_personaplex_checkpoint(tmp_path)
     (checkpoint / "tokenizer-second.safetensors").touch()

@@ -17,10 +17,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
-import onnx
+import onnx_ir as ir
 import pytest
 
 from mobius.__main__ import _save_package, build_parser, main
+from mobius._builder import resolve_dtype
 
 
 def _write_gated_gguf(path: Path, *, architecture: str, quantized: bool) -> None:
@@ -147,6 +148,8 @@ class TestCLIBuild:
                     "nvidia/personaplex-7b-v1",
                     tmpdir,
                     "--no-weights",
+                    "--dtype",
+                    "f32",
                     "--execution-provider",
                     "cuda",
                 ]
@@ -156,7 +159,7 @@ class TestCLIBuild:
         assert build_model.call_args.kwargs["revision"] == _PERSONAPLEX_REVISION
         assert build_model.call_args.kwargs["load_weights"] is False
         assert build_model.call_args.kwargs["execution_provider"] == "cuda"
-        assert build_model.call_args.kwargs["dtype"] is None
+        assert build_model.call_args.kwargs["dtype"] == resolve_dtype("f32")
         save_package.assert_called_once()
 
     def test_local_personaplex_config_bypasses_transformers(self):
@@ -433,7 +436,6 @@ class TestCLIBuild:
         carrying the write cursor and the port carrying the non-pad length, and
         the component those ports belong to declares both.
         """
-        import onnx_ir as ir
         import yaml
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -566,9 +568,9 @@ class TestCLIBuild:
                     "static-cache",
                 ]
             )
-            model = onnx.load(os.path.join(tmpdir, "model.onnx"))
+            model = ir.load(os.path.join(tmpdir, "model.onnx"))
             cache_inputs = [
-                inp for inp in model.graph.input if inp.name.startswith("key_cache.")
+                inp for inp in model.graph.inputs if inp.name.startswith("key_cache.")
             ]
             assert len(cache_inputs) > 0, "static cache not applied via --features"
 
@@ -867,12 +869,12 @@ class TestCLIBuild:
 
             # Verify the cache input has the expected max_seq_len
             # dimension. Static cache shape: [batch, max_seq_len, kv_hidden]
-            model = onnx.load(model_path)
+            model = ir.load(model_path)
             cache_inputs = [
-                inp for inp in model.graph.input if inp.name.startswith("key_cache.")
+                inp for inp in model.graph.inputs if inp.name.startswith("key_cache.")
             ]
             assert len(cache_inputs) > 0, "No key_cache inputs found"
-            seq_dim = cache_inputs[0].type.tensor_type.shape.dim[1].dim_value
+            seq_dim = cache_inputs[0].shape[1]
             assert seq_dim == max_seq_len, (
                 f"key_cache.0 seq dimension is {seq_dim}, expected {max_seq_len}"
             )
