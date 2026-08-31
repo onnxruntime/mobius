@@ -510,6 +510,7 @@ def _scan_integration_tests(models: dict[str, ModelInfo]) -> None:
     """Mark models that have integration tests."""
     tests_dir = _REPO_ROOT / "tests"
     integration_files = list(tests_dir.glob("*integration*.py"))
+    integration_files.extend((tests_dir / "integration").glob("*_test.py"))
 
     for test_file in integration_files:
         content = test_file.read_text(encoding="utf-8")

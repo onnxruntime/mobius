@@ -244,8 +244,9 @@ See the **writing-tests** skill for full details.  At minimum:
 
    Then verify: `pytest tests/build_graph -k "my_model_type"`
 
-2. **Add a small model to `tests/integration_test.py`** if a small
-   checkpoint exists (< 1B parameters preferred).
+2. **Add a small model to the appropriate focused integration suite** if a
+   small checkpoint exists (< 1B parameters preferred). Generic causal LMs
+   use `TEXT_MODELS` in `tests/integration/_support.py`.
 
 3. **Testing large models with random weights:** Create a reduced HF model:
    ```python
@@ -283,7 +284,7 @@ see the [quality-checklist skill](../quality-checklist/SKILL.md).
 - [ ] Tiny config in `tests/_test_configs.py` (with `is_representative` flag)
 - [ ] L2 YAML test case in `testdata/cases/` with `test_model_id`
 - [ ] L3 synthetic parity passes (`tests/synthetic_parity_test.py -k "<model_type>"`)
-- [ ] Integration test in `tests/integration_test.py` (if small checkpoint available)
+- [ ] Focused integration test in `tests/integration/` (if small checkpoint available)
 - [ ] L4 golden file generated and committed (`testdata/golden/`)
 - [ ] L5 generation golden file generated and committed
 - [ ] Graph-derived ORT GenAI metadata is tested; downstream load/generation is

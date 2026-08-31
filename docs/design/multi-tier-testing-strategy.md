@@ -493,8 +493,8 @@ characteristics.
 1. Create model class + register in _registry.py
 2. Add config entry in tests/_test_configs.py  → L1
 3. Run:  python -m pytest tests/build_graph -k "my_model"        → L1
-4. Add to integration_test.py parametrized list                          → L3
-5. Run:  python -m pytest tests/integration_test.py -m integration -k "my_model"
+4. Add to the focused integration suite                                 → L3
+5. Run:  python -m pytest tests/integration -m integration -k "my_model"
 6. Create testdata/cases/<cat>/my-model.yaml with test_model_id          → L2
 7. Run:  python scripts/generate_golden.py --filter 'my-model*'          → L4/L5
 8. Commit testdata/golden/<cat>/my-model.json + my-model_generation.json
@@ -570,7 +570,7 @@ See [Performance Benchmarking](perf-benchmarking.md) for full details.
 | L0 | ✅ Implicit via registry | 273 types | `_registry.py` |
 | L1 | ✅ Full coverage (273) | 273 types | `tests/build_graph/` + `specialized_test_model_types()` |
 | L2 | ✅ YAML-driven | ~105 types (YAML cases with `test_model_id`) | `arch_validation_test.py` |
-| L3 | ✅ Causal LM + integration tests | ~116 types | `integration_test.py` + `*_integration_test.py` |
+| L3 | ✅ Causal LM + integration tests | ~116 types | `synthetic_parity_test.py` + `tests/integration/` |
 | L4 | ✅ ~45 checkpoints | 45 golden JSON files | `e2e_golden_test.py` |
 | L5 | ✅ ~32 checkpoints | 32 generation JSON files | `e2e_golden_test.py` |
 | Perf | ⚠️ Script exists, CI not wired | — | `benchmark_build.py` |
@@ -617,7 +617,7 @@ entry, L1 equals the total number of registered models.
 |-------|------------------|-------------|
 | L1 | `_scan_l1_configs` | `tests/_test_configs.py::ALL_CONFIGS` + `tests/build_graph/_support.py::specialized_test_model_types()` |
 | L2 | `_scan_l2_arch_tests` | `test_model_id` field in `testdata/cases/**/*.yaml` |
-| L3 | `_scan_l3_synthetic_parity` | Model type presence in `tests/integration_test.py` and related files |
+| L3 | `_scan_l3_synthetic_parity` | Model type presence in `tests/*integration*.py` |
 | L4 | `_scan_l4_golden_files` | `testdata/golden/<cat>/<model>.json` existence |
 | L5 | `_scan_l5_generation_golden` | `testdata/golden/<cat>/<model>_generation.json` existence |
 
