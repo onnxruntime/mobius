@@ -308,6 +308,40 @@ def test_quantize_embeddings_only_rewrites_input_token_table():
     assert type(module.embed_positions) is Embedding
 
 
+def test_existing_quantized_embedding_retargets_component_layout():
+    class _EmbeddingModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = QuantizedEmbedding(
+                256,
+                64,
+                bits=8,
+                block_size=32,
+                has_zero_point=True,
+            )
+
+    quantization = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        sym=True,
+        quantize_embeddings=True,
+    )
+    config = ArchitectureConfig(
+        quantization=quantization,
+        component_quantization={"model": quantization},
+    )
+    module = _EmbeddingModule()
+    original = module.embed_tokens
+
+    configure_component_quantization(module, config, _SingleTask())
+
+    assert module.embed_tokens is not original
+    assert isinstance(module.embed_tokens, QuantizedEmbedding)
+    assert (module.embed_tokens._bits, module.embed_tokens._block_size) == (4, 16)
+    assert module.embed_tokens.zero_points is None
+
+
 def test_projection_name_containing_embedding_is_not_a_token_table():
     class _Embeddings(nn.Module):
         def __init__(self):

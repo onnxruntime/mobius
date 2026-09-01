@@ -891,10 +891,18 @@ class TestBuildGraphVisionLanguage:
                 "google/gemma-4-12B", load_weights=False, text_only=True
             )
 
-        # model_type was remapped to the text sibling before module lookup
-        mock_get.assert_called_once_with("gemma4_unified_text")
-        # config stripping invoked with the remapped (text) model_type
-        mock_strip.assert_called_once_with(raw_config, "gemma4_unified_text")
+        # The multimodal class supplies source paths for component plans, then
+        # the remapped text sibling supplies the decoder implementation.
+        assert mock_get.call_args_list == [
+            mock.call("gemma4_unified"),
+            mock.call("gemma4_unified_text"),
+        ]
+        # Config stripping receives the source paths resolved above.
+        mock_strip.assert_called_once_with(
+            raw_config,
+            "gemma4_unified_text",
+            decoder_source_paths=(),
+        )
         # the stripped config (not the raw multimodal one) is what gets built
         assert mock_build_mod.call_args.args[1] is stripped_config
         assert pkg is fake_pkg
