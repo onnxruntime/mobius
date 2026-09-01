@@ -1976,7 +1976,7 @@ def main() -> int:
         label = f"{case.yaml_path.parent.name}/{case.case_id}"
 
         if case.skip_reason:
-            print(f"  SKIP: {label} — {case.skip_reason}")
+            print(f"  SKIP: {label} - {case.skip_reason}")
             skipped += 1
             continue
 
@@ -1986,7 +1986,7 @@ def main() -> int:
             continue
 
         if args.dry_run:
-            print(f"  DRY-RUN: {label} → {json_path}")
+            print(f"  DRY-RUN: {label} -> {json_path}")
             skipped += 1
             continue
 
