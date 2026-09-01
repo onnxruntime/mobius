@@ -423,8 +423,8 @@ def test_input_wiring_matches_runtime_abi() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
     fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
-    # 9-input BlockQuantizedMoE ABI order (fused SwiGLU: no fc3).
-    assert len(moe.inputs) == 9
+    # Canonical 12-input BlockQuantizedMoE ABI (fused SwiGLU: no fc3/scales).
+    assert len(moe.inputs) == 12
     assert moe.inputs[0].name == "hidden"  # input
     assert moe.inputs[1].name.endswith("router_logits")  # router_logits
     assert moe.inputs[2].name.endswith("fc1_experts_weights")
@@ -434,6 +434,9 @@ def test_input_wiring_matches_runtime_abi() -> None:
     assert moe.inputs[6] is None  # fc3 (fused -> absent)
     assert moe.inputs[7] is None  # fc3 bias
     assert moe.inputs[8].name.endswith("router_weights")
+    assert moe.inputs[9] is None  # interleaved fc1 has no auxiliary scale
+    assert moe.inputs[10] is None  # interleaved fc2 has no auxiliary scale
+    assert moe.inputs[11] is None  # absent fc3 has no auxiliary scale
 
 
 # --------------------------------------------------------------------------- #
@@ -477,27 +480,27 @@ def test_expert_major_bank_dtype_is_uint8() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Per-projection format attributes (v1 vs v2)                                 #
+# Per-projection format attributes (canonical v1)                             #
 # --------------------------------------------------------------------------- #
 def test_uniform_format_stays_layout_version_1() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq4_xs", up_fmt="iq4_xs", down_fmt="iq4_xs")
     fuse_block_quantized_moe(model)
     moe = _moe(model.graph)
     attrs = moe.attributes
-    assert "block_layout_version" not in attrs  # defaults to v1
-    assert attrs["format"].value == "iq4_xs"
-    assert "fc1_format" not in attrs
-    assert "fc2_format" not in attrs
+    assert attrs["block_layout_version"].value == 1
+    assert "format" not in attrs
+    assert attrs["fc1_format"].value == "iq4_xs"
+    assert attrs["fc2_format"].value == "iq4_xs"
     assert "fc3_format" not in attrs
 
 
-def test_fused_mixed_format_emits_layout_version_2() -> None:
+def test_fused_mixed_format_emits_canonical_layout_version_1() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
     fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     attrs = moe.attributes
-    assert attrs["block_layout_version"].value == 2
-    assert attrs["format"].value == "iq1_s"  # base/fallback
+    assert attrs["block_layout_version"].value == 1
+    assert "format" not in attrs
     assert attrs["fc1_format"].value == "iq1_s"
     assert attrs["fc2_format"].value == "iq4_xs"
     assert "fc3_format" not in attrs  # fused -> no fc3
@@ -509,7 +512,7 @@ def test_unfused_mixed_format_emits_all_projection_formats() -> None:
     fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True)
     moe = _moe(model.graph)
     attrs = moe.attributes
-    assert attrs["block_layout_version"].value == 2
+    assert attrs["block_layout_version"].value == 1
     assert attrs["fc1_format"].value == "iq1_s"
     assert attrs["fc3_format"].value == "iq3_xxs"
     assert attrs["fc2_format"].value == "iq4_xs"
@@ -526,22 +529,15 @@ def test_core_attributes_match_bqmoe_abi() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Per-projection (block_layout_version=2): fail-closed default + schema hook   #
+# Per-projection canonical-v1 production path                                 #
 # --------------------------------------------------------------------------- #
-def test_mixed_format_rejects_v2_by_default() -> None:
-    """A direct public call rejects a mixed-format (v2-only) layer by default.
-
-    No shipped onnx-genai runtime executes the ``block_layout_version=2``
-    per-projection ABI, so ``fuse_block_quantized_moe`` fails closed for a
-    mixed-format layer with no opt-in of any kind. The reject is atomic: the
-    dense graph is left untouched.
-    """
+def test_mixed_format_fuses_to_v1_by_default() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
-    graph = model.graph
-    with pytest.raises(SparseMoEExportError, match=r"block_layout_version=2"):
-        fuse_block_quantized_moe(model)
-    assert _count(graph, "BlockQuantizedMoE") == 0
-    assert _count(graph, "Equal") == E  # dense graph left untouched
+    assert fuse_block_quantized_moe(model) == 1
+    attrs = _moe(model.graph).attributes
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq1_s"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
 def test_uniform_format_still_fuses_to_v1() -> None:
@@ -549,22 +545,16 @@ def test_uniform_format_still_fuses_to_v1() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq4_xs", up_fmt="iq4_xs", down_fmt="iq4_xs")
     assert fuse_block_quantized_moe(model) == 1
     attrs = _moe(model.graph).attributes
-    assert "block_layout_version" not in attrs  # v1
-    assert attrs["format"].value == "iq4_xs"
+    assert attrs["block_layout_version"].value == 1
+    assert attrs["fc1_format"].value == "iq4_xs"
+    assert attrs["fc2_format"].value == "iq4_xs"
 
 
-def test_perproj_v2_schema_hook_is_test_only() -> None:
-    """The private ``_allow_perproj_v2_schema`` hook builds the v2 node shape.
-
-    This is the schema-construction test path only: the emitted v2 node is not
-    runnable on any shipped runtime and is unreachable from the production
-    builder, the CLI, or an environment variable. It exists so the per-projection
-    v2 schema stays covered until a real typed runtime-capability handshake ships.
-    """
+def test_legacy_schema_hook_still_emits_canonical_v1() -> None:
     model, _ = _build_dense_graph(gate_fmt="iq1_s", up_fmt="iq1_s", down_fmt="iq4_xs")
     assert fuse_block_quantized_moe(model, _allow_perproj_v2_schema=True) == 1
     attrs = _moe(model.graph).attributes
-    assert attrs["block_layout_version"].value == 2
+    assert attrs["block_layout_version"].value == 1
     assert attrs["fc1_format"].value == "iq1_s"
     assert attrs["fc2_format"].value == "iq4_xs"
 

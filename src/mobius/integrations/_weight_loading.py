@@ -59,6 +59,9 @@ _SAFETENSORS_DTYPE_BYTES = {
     "F64": 8,
     "F8_E4M3": 1,
     "F8_E5M2": 1,
+    "F8_E8M0": 1,
+    "I8": 1,
+    "I32": 4,
     "I64": 8,
 }
 _SAFETENSORS_TO_IR_DTYPE = {
@@ -66,6 +69,8 @@ _SAFETENSORS_TO_IR_DTYPE = {
     "F16": ir.DataType.FLOAT16,
     "F32": ir.DataType.FLOAT,
     "F8_E4M3": ir.DataType.FLOAT8E4M3FN,
+    "F8_E8M0": ir.DataType.FLOAT8E8M0,
+    "I8": ir.DataType.INT8,
 }
 
 
@@ -74,7 +79,7 @@ class StreamingWeightSource:
     """One checkpoint tensor bound to one dense ONNX initializer."""
 
     source_name: str
-    mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
+    mode: Literal["direct", "native", "fp8_scalar", "fp8_block_128"] = "direct"
     scale_name: str | None = None
     expected_scale: float | None = None
 
@@ -614,6 +619,14 @@ def _materialize_preprocessed_source(
                 "classified as scaled FP8"
             )
         return tensor if tensor.dtype == target_dtype else tensor.to(target_dtype)
+    if source.mode == "native":
+        if tensor.dtype != target_dtype:
+            raise ValueError(
+                f"Native source '{source.source_name}' has torch dtype "
+                f"{tensor.dtype}, expected {target_dtype}; native storage is "
+                "never cast or reconstructed"
+            )
+        return tensor
     raise AssertionError(f"Unknown streaming weight mode: {source.mode}")
 
 
@@ -804,18 +817,29 @@ def stream_preprocessed_safetensors_to_model(
         target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
         if isinstance(source, StreamingWeightSource):
             source_shape, source_bytes, scale_bytes = validate_source(source)
+            if source.mode == "native":
+                source_dtype = key_index[source.source_name][2]
+                if _SAFETENSORS_TO_IR_DTYPE.get(source_dtype) != initializer.dtype:
+                    raise ValueError(
+                        f"Native source '{source.source_name}' has dtype "
+                        f"{source_dtype}, but initializer '{target_name}' expects "
+                        f"{initializer.dtype}"
+                    )
             if expected_shape != source_shape:
                 raise ValueError(
                     f"Weight shape mismatch for '{target_name}': model expects "
                     f"{expected_shape}, checkpoint source '{source.source_name}' has "
                     f"{source_shape}"
                 )
-            bf16_bytes = math.prod(source_shape) * 2
-            cast_bytes = target_bytes if initializer.dtype != ir.DataType.BFLOAT16 else 0
             largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+            if source.mode == "native":
+                working_set_bytes = source_bytes
+            else:
+                bf16_bytes = math.prod(source_shape) * 2
+                cast_bytes = target_bytes if initializer.dtype != ir.DataType.BFLOAT16 else 0
+                working_set_bytes = source_bytes + bf16_bytes + cast_bytes + scale_bytes
             largest_reconstruction_working_set_bytes = max(
-                largest_reconstruction_working_set_bytes,
-                source_bytes + bf16_bytes + cast_bytes + scale_bytes,
+                largest_reconstruction_working_set_bytes, working_set_bytes
             )
         else:
             if len(expected_shape) != 3 or len(source.experts) != expected_shape[0]:
@@ -828,31 +852,45 @@ def stream_preprocessed_safetensors_to_model(
                 rows = 0
                 for projection in projections:
                     source_shape, source_bytes, scale_bytes = validate_source(projection)
+                    if projection.mode == "native":
+                        source_dtype = key_index[projection.source_name][2]
+                        if _SAFETENSORS_TO_IR_DTYPE.get(source_dtype) != initializer.dtype:
+                            raise ValueError(
+                                f"Native expert source '{projection.source_name}' has "
+                                f"dtype {source_dtype}, but initializer "
+                                f"'{target_name}' expects {initializer.dtype}"
+                            )
                     if len(source_shape) != 2 or source_shape[1] != expected_shape[2]:
                         raise ValueError(
                             f"Expert source '{projection.source_name}' has shape "
                             f"{source_shape}; expected [rows, {expected_shape[2]}]"
                         )
                     rows += source_shape[0]
-                    dense_projection_bytes = (
-                        math.prod(source_shape) * initializer.dtype.bitwidth + 7
-                    ) // 8
-                    bf16_projection_bytes = math.prod(source_shape) * 2
-                    cast_projection_bytes = (
-                        dense_projection_bytes
-                        if initializer.dtype != ir.DataType.BFLOAT16
-                        else 0
-                    )
                     largest_source_tensor_bytes = max(
                         largest_source_tensor_bytes,
                         source_bytes,
                     )
+                    if projection.mode == "native":
+                        projection_working_set = source_bytes
+                    else:
+                        dense_projection_bytes = (
+                            math.prod(source_shape) * initializer.dtype.bitwidth + 7
+                        ) // 8
+                        bf16_projection_bytes = math.prod(source_shape) * 2
+                        cast_projection_bytes = (
+                            dense_projection_bytes
+                            if initializer.dtype != ir.DataType.BFLOAT16
+                            else 0
+                        )
+                        projection_working_set = (
+                            source_bytes
+                            + bf16_projection_bytes
+                            + cast_projection_bytes
+                            + scale_bytes
+                        )
                     max_transient_bytes = max(
                         max_transient_bytes,
-                        source_bytes
-                        + bf16_projection_bytes
-                        + cast_projection_bytes
-                        + scale_bytes,
+                        projection_working_set,
                     )
                 if rows != expected_shape[1]:
                     raise ValueError(
@@ -1819,7 +1857,7 @@ def stream_safetensors_to_model(
 
 
 def external_data_checksums(
-    output_dir: str | pathlib.PathLike,
+    output_dir: str | pathlib.Path,
     *,
     pattern: str = "*.onnx.data",
     chunk_size: int = 1 << 20,

@@ -707,12 +707,9 @@ class ArchitectureConfig(BaseModelConfig):
     # Deferred block-scaled FP8 / packed-FP4 scheme (DeepSeek-V4-Flash native
     # CSA). Recorded by ``from_transformers`` when ``native_csa`` opts into
     # deferring #602's config-resolution block-quant reject so that graph
-    # construction can progress past the former generic weight-shape mismatch.
-    # The runtime-capability gate
-    # (``mobius.models._deepseek_v4_csa.assert_native_runtime_supports_block_quant``)
-    # then fails closed on the *runnable* full export until nxrt advertises real
-    # block-FP8 / planar-FP4 format strings. ``None`` for every ordinary,
-    # per-tensor-fp8, or non-native path.
+    # construction can select the canonical block-FP8 / planar-FP4 nxrt v1
+    # producer instead of the ordinary dense/INT4 factories. ``None`` for every
+    # ordinary, per-tensor-fp8, or non-native path.
     block_quant_scheme: BlockQuantScheme | None = None
     # HuggingFace model_type and special token IDs — populated by from_transformers()
     # so that genai_config.json can be written without re-fetching the HF config.
@@ -1359,11 +1356,8 @@ class ArchitectureConfig(BaseModelConfig):
         # ``BlockQuantExportError`` (the INT4/per-tensor path cannot load them).
         # For a native-CSA export we *defer* that reject so graph construction
         # can progress past the former generic weight-shape mismatch; the
-        # runtime-capability gate
-        # (``mobius.models._deepseek_v4_csa.assert_native_runtime_supports_block_quant``,
-        # invoked at weight-load / full-export) then fails closed until nxrt
-        # advertises real block-FP8 / planar-FP4 format strings. Every non-native
-        # path keeps #602's early, loud reject.
+        # canonical planar block-quant producer consumes the recorded scheme.
+        # Every non-native path keeps #602's early, loud reject.
         from mobius.integrations._block_quant import (
             BlockQuantExportError,
             BlockQuantScheme,

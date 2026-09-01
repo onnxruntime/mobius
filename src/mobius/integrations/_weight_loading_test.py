@@ -33,7 +33,14 @@ from huggingface_hub.utils import EntryNotFoundError
 from mobius._builder import build_from_module
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
-from mobius.integrations._weight_loading import _download_weights, apply_weights
+from mobius.integrations._weight_loading import (
+    StreamingExpertBankSource,
+    StreamingWeightPlan,
+    StreamingWeightSource,
+    _download_weights,
+    apply_weights,
+    stream_preprocessed_safetensors_to_model,
+)
 from mobius.models.base import CausalLMModel
 from mobius.tasks import CausalLMTask, ModelTask
 
@@ -60,6 +67,73 @@ class MockWeightProvider:
 
     def get_state_dict(self) -> dict[str, torch.Tensor]:
         return self.state_dict
+
+
+def test_native_streaming_preserves_fp8_scale_and_fp4_bank(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    weight = torch.arange(8, dtype=torch.uint8).reshape(2, 4).view(torch.float8_e4m3fn)
+    scale = torch.tensor([127], dtype=torch.uint8).reshape(1, 1).view(torch.float8_e8m0fnu)
+    expert0 = torch.arange(8, dtype=torch.int8).reshape(2, 4)
+    expert1 = expert0 + 8
+    safetensors.torch.save_file(
+        {
+            "w.weight": weight,
+            "w.scale": scale,
+            "experts.0.weight": expert0,
+            "experts.1.weight": expert1,
+        },
+        checkpoint / "model.safetensors",
+    )
+
+    graph = ir.Graph([], [], nodes=[], name="native_stream")
+    graph.initializers["weight"] = ir.Value(
+        name="weight",
+        type=ir.TensorType(ir.DataType.FLOAT8E4M3FN),
+        shape=ir.Shape([2, 4]),
+    )
+    graph.initializers["scale"] = ir.Value(
+        name="scale",
+        type=ir.TensorType(ir.DataType.FLOAT8E8M0),
+        shape=ir.Shape([1, 1]),
+    )
+    graph.initializers["bank"] = ir.Value(
+        name="bank",
+        type=ir.TensorType(ir.DataType.INT8),
+        shape=ir.Shape([2, 2, 4]),
+    )
+    model = ir.Model(graph, ir_version=11)
+
+    def planner(_index, _initializers):
+        return StreamingWeightPlan(
+            targets={
+                "weight": StreamingWeightSource("w.weight", mode="native"),
+                "scale": StreamingWeightSource("w.scale", mode="native"),
+                "bank": StreamingExpertBankSource(
+                    experts=(
+                        (StreamingWeightSource("experts.0.weight", mode="native"),),
+                        (StreamingWeightSource("experts.1.weight", mode="native"),),
+                    )
+                ),
+            },
+            report={"output_weight_format": "native_planar_block_quant"},
+        )
+
+    report = stream_preprocessed_safetensors_to_model(model, str(checkpoint), planner)
+    assert report["output_weight_format"] == "native_planar_block_quant"
+    assert report["largest_reconstruction_working_set_bytes"] == 24
+    assert (
+        model.graph.initializers["weight"].const_value.numpy().view("uint8").tobytes()
+        == weight.view(torch.uint8).numpy().tobytes()
+    )
+    assert (
+        model.graph.initializers["scale"].const_value.numpy().view("uint8").tobytes()
+        == scale.view(torch.uint8).numpy().tobytes()
+    )
+    assert torch.equal(
+        torch.from_numpy(model.graph.initializers["bank"].const_value.numpy()),
+        torch.stack([expert0, expert1]),
+    )
 
 
 def _build_model_with_weights() -> tuple[ir.Model, list[str]]:

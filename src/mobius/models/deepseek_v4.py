@@ -1,16 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""DeepSeek-V4 export with a sink-aware dense CSA fallback and MTP sidecar.
+"""DeepSeek-V4 export with native compressed sparse attention and MTP sidecar.
 
 The released V4 architecture replaces V3 MLA with compressed sparse attention
 and adds Hyper-Connections. This module implements the V4 projections,
-Hyper-Connections, hash/sqrt-softplus MoE routing, and a dense causal-attention
-fallback with the learned attention sinks. The official per-layer compression
-schedule is represented by exported compressor/indexer tensors, and the
-checkpoint's MTP block is exported as a standalone sidecar. Executing learned
-KV compression and sparse selection still requires runtime cache/sparse ops;
-until those land, the target and MTP graphs attend densely for correctness.
+Hyper-Connections, hash/sqrt-softplus MoE routing, and optional native
+``CompressedSparseAttention``. The official per-layer compression schedule is
+represented by live compressor/indexer projections, while non-native exports
+retain the sink-aware dense fallback. The checkpoint's MTP block is exported as
+a standalone sidecar.
 """
 
 from __future__ import annotations
@@ -34,6 +33,7 @@ from mobius.components import (
     Embedding,
     Linear,
     MoELayer,
+    PlanarBlockQuantizedLinear,
     QuantizedEmbedding,
     RMSNorm,
     create_attention_bias,
@@ -109,6 +109,27 @@ def _gqa_kv_lengths(op: OpBuilder, attention_mask: ir.Value) -> tuple[ir.Value, 
 
 
 def _projection_class(config: ArchitectureConfig):
+    scheme = config.block_quant_scheme
+    if scheme is not None:
+        if not scheme.is_block_scaled_fp8 or len(scheme.weight_block_size) != 2:
+            raise NativeCsaExportError(
+                "native DeepSeek-V4 block-quant projections require block-scaled "
+                f"FP8 with a 2-D block geometry; got {scheme}"
+            )
+        block_out, block_in = scheme.weight_block_size
+
+        def planar_projection(in_features: int, out_features: int, bias: bool = False):
+            return PlanarBlockQuantizedLinear(
+                in_features,
+                out_features,
+                format="block_fp8",
+                block_size_out=block_out,
+                block_size_in=block_in,
+                model_dtype=config.dtype,
+                bias=bias,
+            )
+
+        return planar_projection
     quantization = config.quantization
     if quantization is None or quantization.quant_method == "none":
         return Linear
@@ -254,6 +275,114 @@ def _validate_hash_routing_tables(state_dict: dict[str, torch.Tensor]) -> None:
             )
 
 
+def _pack_planar_expert_weights(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Stack per-expert FP4 weight/scale planes into canonical nxrt banks."""
+    grouped: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+    passthrough: dict[str, torch.Tensor] = {}
+    marker = ".mlp.experts."
+    for key, value in state_dict.items():
+        if marker not in key:
+            passthrough[key] = value
+            continue
+        prefix, suffix = key.split(marker, 1)
+        parts = suffix.split(".")
+        if (
+            len(parts) != 3
+            or parts[1]
+            not in {
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            }
+            or parts[2] not in {"weight", "scale"}
+        ):
+            raise NativeCsaExportError(f"malformed planar routed-expert tensor name {key!r}")
+        try:
+            expert = int(parts[0])
+        except ValueError as exc:
+            raise NativeCsaExportError(f"invalid routed-expert index in {key!r}") from exc
+        grouped.setdefault(prefix, {}).setdefault(expert, {})[f"{parts[1]}.{parts[2]}"] = value
+
+    required = {
+        "gate_proj.weight",
+        "gate_proj.scale",
+        "up_proj.weight",
+        "up_proj.scale",
+        "down_proj.weight",
+        "down_proj.scale",
+    }
+    for prefix, experts in grouped.items():
+        ids = sorted(experts)
+        if ids != list(range(len(ids))):
+            raise NativeCsaExportError(
+                f"{prefix} planar expert ids must be contiguous 0..E-1, got {ids}"
+            )
+        for expert, tensors in experts.items():
+            missing = sorted(required - set(tensors))
+            extra = sorted(set(tensors) - required)
+            if missing or extra:
+                raise NativeCsaExportError(
+                    f"{prefix} expert {expert} malformed planar tensor set: "
+                    f"missing={missing}, extra={extra}"
+                )
+        passthrough[f"{prefix}.mlp.moe.fc1_experts_weights"] = torch.stack(
+            [experts[i]["gate_proj.weight"] for i in ids]
+        )
+        passthrough[f"{prefix}.mlp.moe.fc2_experts_weights"] = torch.stack(
+            [experts[i]["down_proj.weight"] for i in ids]
+        )
+        passthrough[f"{prefix}.mlp.moe.fc3_experts_weights"] = torch.stack(
+            [experts[i]["up_proj.weight"] for i in ids]
+        )
+        passthrough[f"{prefix}.mlp.moe.fc1_experts_aux_scale"] = torch.stack(
+            [experts[i]["gate_proj.scale"] for i in ids]
+        )
+        passthrough[f"{prefix}.mlp.moe.fc2_experts_aux_scale"] = torch.stack(
+            [experts[i]["down_proj.scale"] for i in ids]
+        )
+        passthrough[f"{prefix}.mlp.moe.fc3_experts_aux_scale"] = torch.stack(
+            [experts[i]["up_proj.scale"] for i in ids]
+        )
+    return passthrough
+
+
+def _map_checkpoint_weight_name(key: str) -> str:
+    """Map one official DeepSeek-V4 tensor name to the exported module name."""
+    new_key = key
+    if new_key == "embed.weight":
+        return "model.embed_tokens.weight"
+    if new_key == "head.weight":
+        return "lm_head.weight"
+    if new_key == "norm.weight":
+        return "model.norm.weight"
+    if new_key.startswith("hc_head_"):
+        return f"model.{new_key}.weight" if new_key == "hc_head_fn" else f"model.{new_key}"
+    if new_key.startswith("layers."):
+        new_key = f"model.{new_key}"
+    if new_key.startswith(("model.layers.", "mtp.")):
+        new_key = new_key.replace(".attn.wq_a.", ".self_attn.q_a_proj.")
+        new_key = new_key.replace(".attn.q_norm.", ".self_attn.q_a_layernorm.")
+        new_key = new_key.replace(".attn.wq_b.", ".self_attn.q_b_proj.")
+        new_key = new_key.replace(".attn.wkv.", ".self_attn.kv_proj.")
+        new_key = new_key.replace(".attn.kv_norm.", ".self_attn.kv_layernorm.")
+        new_key = new_key.replace(".attn.wo_a.", ".self_attn.o_a_proj.")
+        new_key = new_key.replace(".attn.wo_b.", ".self_attn.o_b_proj.")
+        new_key = new_key.replace(".attn.", ".self_attn.")
+        new_key = new_key.replace(".attn_norm.", ".input_layernorm.")
+        new_key = new_key.replace(".ffn_norm.", ".post_attention_layernorm.")
+        new_key = new_key.replace(".ffn.gate.", ".mlp.moe.gate.")
+        new_key = new_key.replace(".ffn.experts.", ".mlp.experts.")
+        new_key = new_key.replace(".ffn.shared_experts.", ".mlp.shared_experts.")
+        new_key = new_key.replace(".w1.", ".gate_proj.")
+        new_key = new_key.replace(".w2.", ".down_proj.")
+        new_key = new_key.replace(".w3.", ".up_proj.")
+        if ".hc_" in new_key and new_key.endswith("_fn"):
+            new_key = f"{new_key}.weight"
+    return new_key
+
+
 class DeepSeekV4Gate(nn.Module):
     """V4 sqrt-softplus router with hash routing for the first layers."""
 
@@ -369,6 +498,126 @@ class _DeepSeekV4Expert(nn.Module):
         return self.down_proj(op, op.Mul(op.Swish(gate), up))
 
 
+class _DeepSeekV4PlanarMoE(nn.Module):
+    """Sparse routed experts using the canonical 12-input nxrt v1 ABI."""
+
+    def __init__(self, config: ArchitectureConfig, gate: DeepSeekV4Gate):
+        super().__init__()
+        assert config.num_local_experts is not None
+        assert config.num_experts_per_tok is not None
+        assert config.moe_intermediate_size is not None
+        scheme = config.block_quant_scheme
+        if scheme is None or not scheme.has_packed_fp4_experts:
+            raise NativeCsaExportError(
+                "planar DeepSeek-V4 MoE requires packed FP4 routed experts"
+            )
+        self.gate = gate
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.model_dtype = config.dtype
+        self.swiglu_limit = config.swiglu_limit
+
+        packed_hidden = config.hidden_size // 2
+        packed_intermediate = config.moe_intermediate_size // 2
+        scale_hidden = config.hidden_size // 32
+        scale_intermediate = config.moe_intermediate_size // 32
+        if config.hidden_size % 32 or config.moe_intermediate_size % 32:
+            raise NativeCsaExportError(
+                "fp4_planar routed experts require hidden/intermediate widths "
+                "divisible by 32; got "
+                f"{config.hidden_size}/{config.moe_intermediate_size}"
+            )
+        self.fc1_experts_weights = nn.Parameter(
+            [self.num_experts, self.intermediate_size, packed_hidden],
+            dtype=ir.DataType.INT8,
+        )
+        self.fc2_experts_weights = nn.Parameter(
+            [self.num_experts, self.hidden_size, packed_intermediate],
+            dtype=ir.DataType.INT8,
+        )
+        self.fc3_experts_weights = nn.Parameter(
+            [self.num_experts, self.intermediate_size, packed_hidden],
+            dtype=ir.DataType.INT8,
+        )
+        self.fc1_experts_aux_scale = nn.Parameter(
+            [self.num_experts, self.intermediate_size, scale_hidden],
+            dtype=ir.DataType.FLOAT8E8M0,
+        )
+        self.fc2_experts_aux_scale = nn.Parameter(
+            [self.num_experts, self.hidden_size, scale_intermediate],
+            dtype=ir.DataType.FLOAT8E8M0,
+        )
+        self.fc3_experts_aux_scale = nn.Parameter(
+            [self.num_experts, self.intermediate_size, scale_hidden],
+            dtype=ir.DataType.FLOAT8E8M0,
+        )
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        input_ids: ir.Value,
+    ) -> ir.Value:
+        routing_weights, selected_experts = self.gate(op, hidden_states, input_ids)
+        routing_weights = op.CastLike(routing_weights, hidden_states)
+        router_logits, router_weights = _scatter_selected_to_full(
+            op, routing_weights, selected_experts, self.num_experts
+        )
+        router_logits = op.Cast(
+            op.Reshape(router_logits, [-1, self.num_experts]),
+            to=ir.DataType.FLOAT,
+        )
+        router_weights = op.Cast(
+            op.Reshape(router_weights, [-1, self.num_experts]),
+            to=ir.DataType.FLOAT,
+        )
+        activation = (
+            hidden_states
+            if hidden_states.dtype == ir.DataType.FLOAT
+            else op.Cast(hidden_states, to=ir.DataType.FLOAT)
+        )
+        op.builder.graph.opset_imports["pkg.nxrt"] = 1
+        result = op.BlockQuantizedMoE(
+            activation,
+            router_logits,
+            self.fc1_experts_weights,
+            None,
+            self.fc2_experts_weights,
+            None,
+            self.fc3_experts_weights,
+            None,
+            router_weights,
+            self.fc1_experts_aux_scale,
+            self.fc2_experts_aux_scale,
+            self.fc3_experts_aux_scale,
+            k=self.top_k,
+            activation_type="swiglu",
+            normalize_routing_weights=0,
+            swiglu_fusion=0,
+            swiglu_limit=(self.swiglu_limit if self.swiglu_limit > 0 else float("inf")),
+            fc1_format="fp4_planar",
+            fc2_format="fp4_planar",
+            fc3_format="fp4_planar",
+            fc1_block_size_out=1,
+            fc1_block_size_in=32,
+            fc2_block_size_out=1,
+            fc2_block_size_in=32,
+            fc3_block_size_out=1,
+            fc3_block_size_in=32,
+            block_layout_version=1,
+            _domain="pkg.nxrt",
+        )
+        result.dtype = ir.DataType.FLOAT
+        result.shape = hidden_states.shape
+        if self.model_dtype != ir.DataType.FLOAT:
+            result = op.Cast(result, to=self.model_dtype)
+            result.dtype = self.model_dtype
+            result.shape = hidden_states.shape
+        return result
+
+
 class DeepSeekV4MoE(nn.Module):
     def __init__(self, config: ArchitectureConfig, layer_id: int):
         super().__init__()
@@ -381,16 +630,19 @@ class DeepSeekV4MoE(nn.Module):
         # swiglu_limit=0.0 as "clip to zero" -- math.inf is required to
         # disable clipping at the op level.
         swiglu_limit = config.swiglu_limit if config.swiglu_limit > 0 else math.inf
-        self.moe = MoELayer(
-            config,
-            gate=gate,
-            expert_factory=lambda expert_config, _linear_class: _DeepSeekV4Expert(
-                expert_config, expert_config.intermediate_size
-            ),
-            activation_alpha=1.0,
-            activation_beta=0.0,
-            swiglu_limit=swiglu_limit,
-        )
+        if config.block_quant_scheme is not None:
+            self.moe = _DeepSeekV4PlanarMoE(config, gate)
+        else:
+            self.moe = MoELayer(
+                config,
+                gate=gate,
+                expert_factory=lambda expert_config, _linear_class: _DeepSeekV4Expert(
+                    expert_config, expert_config.intermediate_size
+                ),
+                activation_alpha=1.0,
+                activation_beta=0.0,
+                swiglu_limit=swiglu_limit,
+            )
         shared_size = config.moe_intermediate_size * (config.n_shared_experts or 1)
         self.shared_experts = _DeepSeekV4Expert(config, shared_size)
 
@@ -458,11 +710,18 @@ class DeepSeekV4IndexerTensors(nn.Module):
         assert config.index_head_dim is not None
         self.index_n_heads = config.index_n_heads
         self.index_head_dim = config.index_head_dim
-        self.wq_b = DeepSeekV4DeferredProjection(
-            config,
-            config.q_lora_rank,
-            config.index_n_heads * config.index_head_dim,
-        )
+        if config.block_quant_scheme is not None:
+            self.wq_b = _projection_class(config)(
+                config.q_lora_rank,
+                config.index_n_heads * config.index_head_dim,
+                bias=False,
+            )
+        else:
+            self.wq_b = DeepSeekV4DeferredProjection(
+                config,
+                config.q_lora_rank,
+                config.index_n_heads * config.index_head_dim,
+            )
         self.weights_proj = DeepSeekV4DeferredProjection(
             config, config.hidden_size, config.index_n_heads
         )
@@ -748,8 +1007,10 @@ class DeepSeekV4Attention(nn.Module):
         # parameters. Routed through the compressor's ``__call__`` so every
         # compressor parameter is realized (named + registered as an
         # initializer) rather than left dangling.
+        assert self.compressor is not None
         compressor_kv, compressor_gate, ape, norm_weight = self.compressor(op, hidden_states)
 
+        present_compressed: tuple
         common = dict(
             query=_cast_to_f32(op, query_4d, self._dtype),
             current_kv=_cast_to_f32(op, current_kv, self._dtype),
@@ -1361,7 +1622,7 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         nn.Module.__init__(self)
-        if any(config.compress_ratios or ()):
+        if any(config.compress_ratios or ()) and not config.native_csa:
             logger.warning(
                 "DeepSeek-V4 sparse cache execution requires runtime support; "
                 "exporting sink-aware dense attention with CSA/HCA tensors retained."
@@ -1400,78 +1661,185 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
         )
         return self.lm_head(op, hidden_states), presents
 
+    def build_block_quant_streaming_plan(
+        self,
+        component_name: str,
+        key_index: dict[str, tuple[str, list[int], str]],
+        initializers: dict[str, ir.Value],
+    ):
+        """Build a complete header-validated native planar weight plan."""
+        from mobius.integrations._block_quant import (
+            QuantKind,
+            build_descriptors,
+        )
+        from mobius.integrations._weight_loading import (
+            StreamingExpertBankSource,
+            StreamingWeightPlan,
+            StreamingWeightSource,
+        )
+
+        assert_native_runtime_supports_block_quant(self.config)
+        if self.config.block_quant_scheme is None:
+            raise NativeCsaExportError(
+                "native block-quant streaming requested without a block-quant scheme"
+            )
+        if component_name not in {"model", "mtp"}:
+            raise NativeCsaExportError(
+                f"unknown DeepSeek-V4 package component {component_name!r}"
+            )
+        descriptors = build_descriptors(
+            {name: (dtype, tuple(shape)) for name, (_path, shape, dtype) in key_index.items()},
+            self.config.block_quant_scheme,
+        )
+        malformed = [
+            descriptor
+            for descriptor in descriptors.values()
+            if descriptor.kind is QuantKind.UNSUPPORTED
+        ]
+        if malformed:
+            sample = malformed[0]
+            raise NativeCsaExportError(
+                f"malformed block-quant checkpoint tensor {sample.name!r}: "
+                f"{sample.unsupported_reason}"
+            )
+
+        mtp_component = component_name == "mtp"
+        targets: dict[str, StreamingWeightSource | StreamingExpertBankSource] = {}
+        ignored: dict[str, str] = {}
+
+        def owned(source_name: str) -> bool:
+            return source_name.startswith("mtp.") == mtp_component
+
+        def native(source_name: str) -> StreamingWeightSource:
+            if source_name not in key_index:
+                raise NativeCsaExportError(
+                    f"missing required planar checkpoint tensor {source_name!r}"
+                )
+            return StreamingWeightSource(source_name, mode="native")
+
+        expert_prefixes: set[str] = set()
+        for source_name in key_index:
+            if not owned(source_name):
+                ignored[source_name] = (
+                    "target decoder tensor" if mtp_component else "MTP sidecar tensor"
+                )
+                continue
+            if ".ffn.experts." in source_name:
+                expert_prefixes.add(source_name.split(".ffn.experts.", 1)[0])
+                continue
+
+            target_name = _map_checkpoint_weight_name(source_name)
+            if target_name not in initializers:
+                # Hash-routed layers consume the gate matrix to compute routing
+                # weights, but their checkpoint bias is intentionally unused.
+                if (
+                    source_name.endswith(".ffn.gate.bias")
+                    and source_name.startswith("layers.")
+                    and int(source_name.split(".", 2)[1]) < self.config.num_hash_layers
+                ):
+                    ignored[source_name] = "unused hash-router bias"
+                    continue
+                raise NativeCsaExportError(
+                    f"checkpoint tensor {source_name!r} maps to missing "
+                    f"{component_name} initializer {target_name!r}"
+                )
+            source_dtype = key_index[source_name][2]
+            if source_dtype in {"F8_E4M3", "F8_E8M0", "I8"}:
+                targets[target_name] = StreamingWeightSource(source_name, mode="native")
+            else:
+                targets[target_name] = StreamingWeightSource(source_name, mode="direct")
+
+        experts = self.config.num_local_experts
+        if experts is None or experts <= 0:
+            raise NativeCsaExportError(
+                f"invalid routed expert count {experts} for native planar export"
+            )
+        for source_prefix in sorted(expert_prefixes):
+            target_prefix = _map_checkpoint_weight_name(
+                f"{source_prefix}.ffn.experts.0.w1.weight"
+            ).split(".mlp.experts.", 1)[0]
+            bank_sources = {
+                f"{target_prefix}.mlp.moe.fc1_experts_weights": (("w1", "weight"),),
+                f"{target_prefix}.mlp.moe.fc2_experts_weights": (("w2", "weight"),),
+                f"{target_prefix}.mlp.moe.fc3_experts_weights": (("w3", "weight"),),
+                f"{target_prefix}.mlp.moe.fc1_experts_aux_scale": (("w1", "scale"),),
+                f"{target_prefix}.mlp.moe.fc2_experts_aux_scale": (("w2", "scale"),),
+                f"{target_prefix}.mlp.moe.fc3_experts_aux_scale": (("w3", "scale"),),
+            }
+            for target_name, projections in bank_sources.items():
+                if target_name not in initializers:
+                    raise NativeCsaExportError(
+                        f"planar expert bank maps to missing {component_name} "
+                        f"initializer {target_name!r}"
+                    )
+                targets[target_name] = StreamingExpertBankSource(
+                    experts=tuple(
+                        tuple(
+                            native(f"{source_prefix}.ffn.experts.{expert}.{projection}.{kind}")
+                            for projection, kind in projections
+                        )
+                        for expert in range(experts)
+                    )
+                )
+
+        missing_targets = sorted(
+            name
+            for name, initializer in initializers.items()
+            if initializer.const_value is None and name not in targets
+        )
+        if missing_targets:
+            raise NativeCsaExportError(
+                f"{len(missing_targets)} {component_name} initializer(s) have no "
+                f"checkpoint mapping (e.g. {missing_targets[:5]})"
+            )
+
+        return StreamingWeightPlan(
+            targets=targets,
+            ignored=ignored,
+            report={
+                "output_weight_format": "native_planar_block_quant",
+                "native_fp8": True,
+                "native_planar_fp4": True,
+                "runtime_execution_proven": False,
+                "runtime_dependency": "justinchuby/onnx-genai#2321",
+                "component": component_name,
+            },
+        )
+
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """Map the official DeepSeek checkpoint names to mobius modules."""
         # Full-export runtime-capability gate. When a native-CSA export deferred
         # #602's block-quant reject (so graph construction could progress), the
-        # runnable export still fails closed here -- before any weight is
-        # mapped/assigned, replacing the former generic "Weight shape mismatch"
-        # with a typed, actionable blocker -- until nxrt advertises the real
-        # block-FP8 / planar-FP4 format strings. No-op on every ordinary path.
+        # canonical planar producer is representable before any weight is
+        # mapped/assigned. No-op on every ordinary path.
         assert_native_runtime_supports_block_quant(self.config)
         # Same predicate as MoELayer/_supported_qmoe_quantization so the
         # repacked weights and the emitted graph never disagree.
         use_qmoe = supported_qmoe_quantization(self.config.quantization) is not None
+        use_planar = self.config.block_quant_scheme is not None
         renamed: dict[str, torch.Tensor] = {}
         skipped = 0
         for key, value in state_dict.items():
             if key.startswith("mtp.") and len(self.mtp) == 0:
                 skipped += 1
                 continue
-            new_key = key
-            if new_key == "embed.weight":
-                new_key = "model.embed_tokens.weight"
-            elif new_key == "head.weight":
-                new_key = "lm_head.weight"
-            elif new_key == "norm.weight":
-                new_key = "model.norm.weight"
-            elif new_key.startswith("hc_head_"):
-                new_key = (
-                    f"model.{new_key}.weight"
-                    if new_key == "hc_head_fn"
-                    else f"model.{new_key}"
-                )
-            elif new_key.startswith("layers."):
-                new_key = f"model.{new_key}"
-            elif new_key.startswith("mtp."):
+            if key.startswith("mtp."):
                 try:
-                    mtp_index = int(new_key.split(".", 2)[1])
+                    mtp_index = int(key.split(".", 2)[1])
                 except (IndexError, ValueError):
                     skipped += 1
                     continue
                 if mtp_index >= len(self.mtp):
                     skipped += 1
                     continue
-            if new_key.startswith(("model.layers.", "mtp.")):
-                new_key = new_key.replace(".attn.wq_a.", ".self_attn.q_a_proj.")
-                new_key = new_key.replace(".attn.q_norm.", ".self_attn.q_a_layernorm.")
-                new_key = new_key.replace(".attn.wq_b.", ".self_attn.q_b_proj.")
-                new_key = new_key.replace(".attn.wkv.", ".self_attn.kv_proj.")
-                new_key = new_key.replace(".attn.kv_norm.", ".self_attn.kv_layernorm.")
-                new_key = new_key.replace(".attn.wo_a.", ".self_attn.o_a_proj.")
-                new_key = new_key.replace(".attn.wo_b.", ".self_attn.o_b_proj.")
-                new_key = new_key.replace(".attn.", ".self_attn.")
-                new_key = new_key.replace(".attn_norm.", ".input_layernorm.")
-                new_key = new_key.replace(".ffn_norm.", ".post_attention_layernorm.")
-                # DeepSeekV4MoE composes the shared MoELayer, so the gate
-                # lives at mlp.moe.gate.* (see DeepSeekV4MoE.__init__).
-                new_key = new_key.replace(".ffn.gate.", ".mlp.moe.gate.")
-                new_key = new_key.replace(".ffn.experts.", ".mlp.experts.")
-                new_key = new_key.replace(".ffn.shared_experts.", ".mlp.shared_experts.")
-                new_key = new_key.replace(".w1.", ".gate_proj.")
-                new_key = new_key.replace(".w2.", ".down_proj.")
-                new_key = new_key.replace(".w3.", ".up_proj.")
-                if ".hc_" in new_key and new_key.endswith("_fn"):
-                    new_key = f"{new_key}.weight"
-                # Dense fallback (unquantized or non-QMoE-eligible): experts
-                # are a plain ModuleList under moe.experts.{i}.*. Skipped for
-                # the QMoE path -- stack_per_expert_moe_weights below expects
-                # this same per-index ".mlp.experts.{i}.*" layout as input,
-                # fusing it into the tensors pack_qmoe_expert_weights expects.
-                if not use_qmoe:
-                    new_key = new_key.replace(".mlp.experts.", ".mlp.moe.experts.")
+            new_key = _map_checkpoint_weight_name(key)
+            # Dense fallback (unquantized or non-QMoE-eligible): experts are a
+            # ModuleList under ``mlp.moe.experts``. Fused QMoE/planar paths
+            # consume the intermediate ``mlp.experts`` names as banks.
+            if not use_qmoe and not use_planar:
+                new_key = new_key.replace(".mlp.experts.", ".mlp.moe.experts.")
             renamed[new_key] = value
         if skipped:
             logger.warning(
@@ -1480,7 +1848,10 @@ class DeepSeekV4CausalLMModel(CausalLMModel):
                 skipped,
             )
         processed = super().preprocess_weights(renamed)
-        if use_qmoe:
+        if use_planar:
+            _validate_hash_routing_tables(processed)
+            processed = _pack_planar_expert_weights(processed)
+        elif use_qmoe:
             _validate_hash_routing_tables(processed)
             # DeepSeek-V4 checkpoints store routed experts per-index
             # (".mlp.experts.{i}.gate_proj/up_proj/down_proj.*"), unlike

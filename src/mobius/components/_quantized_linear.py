@@ -295,7 +295,7 @@ class BlockQuantizedLinear(nn.Module):
         op.builder.graph.opset_imports[_NXRT_DOMAIN] = 1
         output_dtype = x.dtype
         activation = x if x.dtype == ir.DataType.FLOAT else op.Cast(x, to=ir.DataType.FLOAT)
-        inputs: list[ir.Value | None] = [activation, self.weight]
+        inputs: list[ir.Value | None] = [activation, self.weight, None]
         if self.bias is not None:
             bias = (
                 self.bias
@@ -303,6 +303,8 @@ class BlockQuantizedLinear(nn.Module):
                 else op.Cast(self.bias, to=ir.DataType.FLOAT)
             )
             inputs.append(bias)
+        else:
+            inputs.append(op.Constant(value=ir.tensor(np.zeros(self._n, dtype=np.float32))))
 
         result = op.BlockQuantizedMatMul(
             *inputs,
@@ -310,6 +312,85 @@ class BlockQuantizedLinear(nn.Module):
             N=self._n,
             format=self._format,
             block_layout_version=1,
+            _domain=_NXRT_DOMAIN,
+        )
+        result.dtype = ir.DataType.FLOAT
+        if x.shape is not None:
+            result.shape = ir.Shape([*x.shape[:-1], self._n])
+        if output_dtype not in (None, ir.DataType.FLOAT):
+            result = op.Cast(result, to=output_dtype)
+            result.dtype = output_dtype
+            if x.shape is not None:
+                result.shape = ir.Shape([*x.shape[:-1], self._n])
+        return result
+
+
+class PlanarBlockQuantizedLinear(nn.Module):
+    """Linear layer backed by the canonical nxrt planar block-quantized ABI."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        format: str,
+        block_size_out: int,
+        block_size_in: int,
+        model_dtype: ir.DataType,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if format not in {"block_fp8", "fp4_planar"}:
+            raise ValueError(f"format must be 'block_fp8' or 'fp4_planar', got {format!r}")
+        if block_size_out <= 0 or block_size_in <= 0:
+            raise ValueError(
+                f"block geometry must be positive, got [{block_size_out}, {block_size_in}]"
+            )
+        if format == "fp4_planar" and (block_size_out, block_size_in) != (1, 32):
+            raise ValueError(
+                "fp4_planar requires block geometry [1, 32], got "
+                f"[{block_size_out}, {block_size_in}]"
+            )
+        if format == "fp4_planar" and in_features % 2:
+            raise ValueError(f"fp4_planar requires an even K, got {in_features}")
+
+        self._k = in_features
+        self._n = out_features
+        self._format = format
+        self._block_size_out = block_size_out
+        self._block_size_in = block_size_in
+        self._model_dtype = model_dtype
+        packed_k = in_features if format == "block_fp8" else in_features // 2
+        weight_dtype = ir.DataType.FLOAT8E4M3FN if format == "block_fp8" else ir.DataType.INT8
+        self.weight = nn.Parameter([out_features, packed_k], dtype=weight_dtype)
+        self.scale = nn.Parameter(
+            [
+                math.ceil(out_features / block_size_out),
+                math.ceil(in_features / block_size_in),
+            ],
+            dtype=ir.DataType.FLOAT8E8M0,
+        )
+        self.bias = nn.Parameter([out_features], dtype=ir.DataType.FLOAT) if bias else None
+
+    def forward(self, op: OpBuilder, x: ir.Value) -> ir.Value:
+        op.builder.graph.opset_imports[_NXRT_DOMAIN] = 1
+        output_dtype = x.dtype or self._model_dtype
+        activation = x if x.dtype == ir.DataType.FLOAT else op.Cast(x, to=ir.DataType.FLOAT)
+        result = op.BlockQuantizedMatMul(
+            activation,
+            self.weight,
+            self.scale,
+            (
+                self.bias
+                if self.bias is not None
+                else op.Constant(value=ir.tensor(np.zeros(self._n, dtype=np.float32)))
+            ),
+            K=self._k,
+            N=self._n,
+            format=self._format,
+            block_layout_version=1,
+            block_size_out=self._block_size_out,
+            block_size_in=self._block_size_in,
             _domain=_NXRT_DOMAIN,
         )
         result.dtype = ir.DataType.FLOAT

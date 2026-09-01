@@ -31,6 +31,84 @@ class _DummyFp8Module(_DummyModule):
         raise AssertionError("mock streaming function should own planning")
 
 
+class _DummyNativeCsaModule(_DummyModule):
+    def build_block_quant_streaming_plan(self, *_args):
+        return "native-plan"
+
+
+def test_native_csa_activates_planar_streaming(monkeypatch) -> None:
+    hf_config = SimpleNamespace(model_type="deepseek_v4")
+    scheme = BlockQuantScheme.from_quantization_config(
+        {"quant_method": "fp8", "weight_block_size": [128, 128]},
+        expert_dtype="fp4",
+    )
+    assert scheme is not None
+    model = ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)
+    package = ModelPackage({"model": model})
+    built_configs = []
+    loader_calls = []
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *_args, **_kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *_args, **_kwargs: (
+            _DummyNativeCsaModule,
+            "deepseek-v4",
+            "deepseek_v4",
+        ),
+    )
+
+    def resolve_config(
+        primary,
+        *,
+        parent_config,
+        module_class,
+        allow_block_fp8_dense_fallback,
+    ):
+        assert primary is hf_config
+        assert parent_config is hf_config
+        assert module_class is _DummyNativeCsaModule
+        assert allow_block_fp8_dense_fallback is True
+        return make_config(
+            model_type="deepseek_v4",
+            block_quant_scheme=scheme,
+        )
+
+    monkeypatch.setattr(_config_resolver, "_config_from_hf", resolve_config)
+
+    def build_module(_module, config, *_args, **_kwargs):
+        built_configs.append(config)
+        package.config = config
+        return package
+
+    monkeypatch.setattr(transformers_builder, "build_from_module", build_module)
+
+    def stream(_model, _model_id, planner, **kwargs):
+        loader_calls.append((planner({}, {}), kwargs))
+        return {"output_weight_format": "native_planar_block_quant"}
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "stream_preprocessed_safetensors_to_model",
+        stream,
+    )
+
+    result = transformers_builder.build_transformers_model(
+        "deepseek-ai/DeepSeek-V4-Flash",
+        native_csa=True,
+    )
+    assert result is package
+    assert built_configs[0].native_csa is True
+    assert loader_calls == [
+        ("native-plan", {"revision": None}),
+    ]
+
+
 @pytest.mark.parametrize(
     ("keep_quantized", "expected_loader"),
     [(True, "qdq"), (False, "dense")],

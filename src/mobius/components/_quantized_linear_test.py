@@ -20,6 +20,7 @@ from mobius._testing import (
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
     NVFP4QuantizedLinear,
+    PlanarBlockQuantizedLinear,
     QuantizedLinear,
 )
 
@@ -360,7 +361,8 @@ class TestBlockQuantizedLinear:
         node = next(node for node in graph if node.op_type == "BlockQuantizedMatMul")
         assert node.domain == "pkg.nxrt"
         assert graph.opset_imports["pkg.nxrt"] == 1
-        assert len(node.inputs) == 3
+        assert len(node.inputs) == 4
+        assert node.inputs[2] is None
         attrs = {attribute.name: attribute.value for attribute in node.attributes.values()}
         assert attrs == {
             "K": IN_FEATURES,
@@ -372,6 +374,69 @@ class TestBlockQuantizedLinear:
     def test_rejects_runtime_unsupported_iq_format(self):
         with pytest.raises(ValueError, match="format must be one of"):
             BlockQuantizedLinear(IN_FEATURES, OUT_FEATURES, format="q4_k")
+
+
+class TestPlanarBlockQuantizedLinear:
+    def test_emits_canonical_block_fp8_contract(self):
+        linear = PlanarBlockQuantizedLinear(
+            128,
+            256,
+            format="block_fp8",
+            block_size_out=128,
+            block_size_in=128,
+            model_dtype=ir.DataType.BFLOAT16,
+        )
+        assert linear.weight.shape == [256, 128]
+        assert linear.weight.dtype == ir.DataType.FLOAT8E4M3FN
+        assert linear.scale.shape == [2, 1]
+        assert linear.scale.dtype == ir.DataType.FLOAT8E8M0
+
+        builder, op, graph = create_test_builder()
+        x = create_test_input(
+            builder,
+            "x",
+            [1, 4, 128],
+            dtype=ir.DataType.BFLOAT16,
+        )
+        result = linear(op, x)
+        builder._adapt_outputs([result], "")
+
+        node = next(node for node in graph if node.op_type == "BlockQuantizedMatMul")
+        assert node.domain == "pkg.nxrt"
+        assert len(node.inputs) == 4
+        assert node.inputs[1].name == "weight"
+        assert node.inputs[2].name == "scale"
+        assert node.inputs[3].producer().op_type == "Constant"
+        assert {name: attr.value for name, attr in node.attributes.items()} == {
+            "K": 128,
+            "N": 256,
+            "format": "block_fp8",
+            "block_layout_version": 1,
+            "block_size_out": 128,
+            "block_size_in": 128,
+        }
+
+    def test_fp4_planar_packed_shape_and_geometry(self):
+        linear = PlanarBlockQuantizedLinear(
+            64,
+            32,
+            format="fp4_planar",
+            block_size_out=1,
+            block_size_in=32,
+            model_dtype=ir.DataType.FLOAT,
+        )
+        assert linear.weight.shape == [32, 32]
+        assert linear.weight.dtype == ir.DataType.INT8
+        assert linear.scale.shape == [32, 2]
+        with pytest.raises(ValueError, match=r"\[1, 32\]"):
+            PlanarBlockQuantizedLinear(
+                64,
+                32,
+                format="fp4_planar",
+                block_size_out=128,
+                block_size_in=128,
+                model_dtype=ir.DataType.FLOAT,
+            )
 
 
 class TestMakeQuantizedLinearFactory:

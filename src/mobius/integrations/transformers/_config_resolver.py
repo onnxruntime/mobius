@@ -16,6 +16,7 @@ __all__ = [
     "_try_load_config_json",
 ]
 
+import inspect
 import logging
 
 from mobius._configs import (
@@ -28,7 +29,13 @@ from mobius._registry import registry
 logger = logging.getLogger(__name__)
 
 
-def _config_from_hf(hf_config, parent_config=None, module_class=None) -> BaseModelConfig:
+def _config_from_hf(
+    hf_config,
+    parent_config=None,
+    module_class=None,
+    *,
+    allow_block_fp8_dense_fallback: bool = False,
+) -> BaseModelConfig:
     """Select the right config class for a HuggingFace config object.
 
     Resolution order:
@@ -66,6 +73,15 @@ def _config_from_hf(hf_config, parent_config=None, module_class=None) -> BaseMod
 
     # Call from_transformers — pass parent_config for ArchitectureConfig tree
     if issubclass(config_cls, ArchitectureConfig):
+        if (
+            "allow_block_fp8_dense_fallback"
+            in inspect.signature(config_cls.from_transformers).parameters
+        ):
+            return config_cls.from_transformers(
+                hf_config,
+                parent_config=parent_config,
+                allow_block_fp8_dense_fallback=allow_block_fp8_dense_fallback,
+            )
         return config_cls.from_transformers(hf_config, parent_config=parent_config)
     return config_cls.from_transformers(hf_config)
 

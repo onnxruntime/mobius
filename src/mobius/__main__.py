@@ -46,6 +46,7 @@ _BUILD_FEATURES: dict[str, str] = {
     "text-only": "text_only",
     "glm-full-attention": "glm_full_attention",
     "paged-attention": "export_paged_attention",
+    "native-csa": "native_csa",
 }
 
 
@@ -298,6 +299,22 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # caller-owned page buffers. It is a distinct cache authority, so it cannot
     # be combined with the static-cache task or an explicit --task.
     export_paged_attention = getattr(args, "export_paged_attention", False)
+    native_csa = getattr(args, "native_csa", False)
+    if native_csa:
+        if static_cache_params is not None:
+            raise SystemExit(
+                "Error: --features native-csa cannot be combined with --features static-cache."
+            )
+        if task is not None:
+            raise SystemExit(
+                "Error: --features native-csa cannot be combined with --task. "
+                "The DeepSeek-V4 task owns the compressed-state ABI."
+            )
+        if not keep_quantized:
+            raise SystemExit(
+                "Error: --features native-csa cannot be combined with "
+                "--dequantize; dense reconstruction is not a CSA capability path."
+            )
     if export_paged_attention:
         if static_cache_params is not None:
             raise SystemExit(
@@ -478,7 +495,24 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
         compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
-        config = _config_from_hf(hf_config, parent_config=parent_config)
+        if native_csa and model_type != "deepseek_v4":
+            raise SystemExit(
+                "Error: --features native-csa is only supported for model_type "
+                f"'deepseek_v4' (got {model_type!r})."
+            )
+        if native_csa:
+            config = _config_from_hf(
+                hf_config,
+                parent_config=parent_config,
+                allow_block_fp8_dense_fallback=True,
+            )
+        else:
+            config = _config_from_hf(
+                hf_config,
+                parent_config=parent_config,
+            )
+        if native_csa:
+            config = dataclasses.replace(config, native_csa=True)
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
         elif compressed_tensors_config is not None and keep_quantized:
@@ -528,7 +562,34 @@ def _cmd_build(args: argparse.Namespace) -> None:
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
-            if compressed_tensors_config is not None:
+            if config.block_quant_scheme is not None and hasattr(
+                model_module, "build_block_quant_streaming_plan"
+            ):
+                from mobius.integrations._weight_loading import (
+                    stream_preprocessed_safetensors_to_model,
+                )
+
+                checkpoint_dir = (
+                    os.path.dirname(config_path)
+                    if os.path.basename(config_path) == "config.json"
+                    else config_path
+                )
+                reports = {}
+                for component_name, model in pkg.items():
+                    reports[component_name] = stream_preprocessed_safetensors_to_model(
+                        model,
+                        checkpoint_dir,
+                        lambda key_index, initializers, name=component_name: (
+                            model_module.build_block_quant_streaming_plan(
+                                name, key_index, initializers
+                            )
+                        ),
+                    )
+                pkg.weight_loading_report = {
+                    "format": "mobius.weight-loading-report.v1",
+                    "components": reports,
+                }
+            elif compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
                 # The same loader owns both faithful native storage and the
                 # explicit keep_quantized=False dense reconstruction policy.
@@ -585,6 +646,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
             prune_prefill_prefix=prune_prefill_prefix,
             glm_full_attention=args.glm_full_attention,
             export_paged_attention=export_paged_attention,
+            native_csa=native_csa,
             keep_quantized=keep_quantized,
             input_sampling_rate=input_sampling_rate,
             bwe_sampling_rate=bwe_sampling_rate,

@@ -9,6 +9,7 @@ __all__ = [
     "BatchNorm2d",
     "BertEmbeddings",
     "BlockQuantizedLinear",
+    "PlanarBlockQuantizedLinear",
     "CausalConv1d",
     "CausalConvNd",
     "CausalDepthwiseConv1d",
@@ -381,6 +382,7 @@ from mobius.components._qformer import (
 from mobius.components._quantized_linear import (
     BlockQuantizedLinear,
     NVFP4QuantizedLinear,
+    PlanarBlockQuantizedLinear,
     QuantizedEmbedding,
     QuantizedLinear,
     TiedQuantizedLMHead,

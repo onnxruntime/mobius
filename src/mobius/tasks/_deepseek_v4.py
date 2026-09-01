@@ -84,17 +84,17 @@ class DeepSeekV4Task(ModelTask):
 
         When ``config.native_csa`` is off every plan is ``None``, so no inputs
         are created and the returned list is all-``None`` (byte-identical to
-        the pre-CSA graph). The compressed-record axis is a shared dynamic
-        symbolic dim because a layer's attention cache and index cache advance
-        in lockstep, and every CSA layer advances its cache together.
+        the pre-CSA graph). Each layer has a distinct dynamic record axis;
+        within a ratio-4 layer its compressed and index caches still advance in
+        lockstep.
         """
-        records = ir.SymbolicDim("past_compressed_records")
         past_compressed_states: list = []
         for layer in module.model.layers:
             plan = layer.self_attn.csa_plan
             if plan is None:
                 past_compressed_states.append(None)
                 continue
+            records = ir.SymbolicDim(plan.past_records_axis_name)
             past_compressed_kv = builder.input(
                 plan.past_compressed_kv_name,
                 dtype=plan.cache_dtype,
@@ -152,12 +152,12 @@ class DeepSeekV4Task(ModelTask):
         top-k result ``[batch, index_num_heads, sequence, min(records, topk)]``
         (inspection-only; not threaded back as state).
         """
-        present_records = ir.SymbolicDim("present_compressed_records")
-        selected_records = ir.SymbolicDim("selected_records")
         for layer, present in zip(module.model.layers, present_compressed_states):
             plan = layer.self_attn.csa_plan
             if plan is None:
                 continue
+            present_records = ir.SymbolicDim(plan.present_records_axis_name)
+            selected_records = ir.SymbolicDim(plan.selected_records_axis_name)
             present_compressed_kv = present[0]
             present_compression_carry = present[1]
             present_compressed_kv.shape = ir.Shape([batch, present_records, plan.stored_width])
