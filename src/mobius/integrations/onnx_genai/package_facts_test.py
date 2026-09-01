@@ -24,12 +24,14 @@ import yaml
 from mobius._configs import MMSConfig
 from mobius._model_package import ModelPackage
 from mobius.integrations.onnx_genai import SpecialTokenFact
-from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
-from mobius.integrations.onnx_genai.auto_export_test import _vlm_package, _VlmCfg
-from mobius.integrations.onnx_genai.inference_metadata_test import (
+from mobius.integrations.onnx_genai._test_support import (
     _decoder_model,
     _onnx_genai_schema_path,
+    _speculative_package,
+    _vlm_package,
+    _VlmCfg,
 )
+from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
 from mobius.integrations.onnx_genai.package_facts import (
     IMAGE_PLACEHOLDER_ROLE,
     _byte_level_alphabet,
@@ -43,7 +45,6 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
 )
-from mobius.integrations.onnx_genai.workflow_metadata_test import _speculative_package
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
 from mobius.tasks._ctc_asr import CTCAsrTask
 

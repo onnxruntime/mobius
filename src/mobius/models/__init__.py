@@ -71,6 +71,8 @@ __all__ = [
     "Gemma4UnifiedModel",
     "GemmaCausalLMModel",
     "GemmaEmbeddingGGUFModel",
+    "MiniMaxM2GGUFCausalLMModel",
+    "Mistral4GGUFCausalLMModel",
     "Glm4CausalLMModel",
     "GlmAsrForConditionalGeneration",
     "Glm4MoECausalLMModel",
@@ -80,6 +82,9 @@ __all__ = [
     "GraniteCausalLMModel",
     "GraniteMoECausalLMModel",
     "GraniteMoeHybridCausalLMModel",
+    "GrokGGUFCausalLMModel",
+    "GroveMoEGGUFCausalLMModel",
+    "HunyuanMoEGGUFCausalLMModel",
     "HunYuanMoEV1CausalLMModel",
     "HunYuanV1DenseCausalLMModel",
     "HyV3CausalLMModel",
@@ -171,6 +176,8 @@ __all__ = [
     "Qwen4ExpCausalLMModel",
     "SenseNovaU1Model",
     "SenseVoiceSmallModel",
+    "ReUseConfig",
+    "SEMambaSpeechEnhancementModel",
     "SortformerConfig",
     "SortformerDiarizationModel",
     "Qwen3TTSCodePredictorModel",
@@ -209,9 +216,6 @@ __all__ = [
     "XLMCausalLMModel",
     "XverseCausalLMModel",
     "Zamba2CausalLMModel",
-    "mimi_default_config",
-    "moshi_depformer_config",
-    "moshi_temporal_config",
     "Plamo2ForCausalLM",
     "PLMCausalLMModel",
     "TalkieForCausalLM",
@@ -283,6 +287,8 @@ from mobius.models.gguf_encoders import (
     NomicBertMoEGGUFModel,
 )
 from mobius.models.gguf_legacy_decoders import ExactLegacyGGUFCausalLMModel
+from mobius.models.gguf_minimax_m2 import MiniMaxM2GGUFCausalLMModel
+from mobius.models.gguf_mistral4 import Mistral4GGUFCausalLMModel
 from mobius.models.gguf_plamo import PlamoGGUFCausalLMModel
 from mobius.models.glm import Glm4CausalLMModel, GlmCausalLMModel
 from mobius.models.glm_asr import GlmAsrForConditionalGeneration
@@ -319,7 +325,7 @@ from mobius.models.longcat_flash import LongcatFlashCausalLMModel
 from mobius.models.mage_vl import MageVLForConditionalGeneration
 from mobius.models.maincoder import MaincoderCausalLMModel
 from mobius.models.mamba import Mamba2CausalLMModel, MambaCausalLMModel
-from mobius.models.mimi import MimiModel, mimi_default_config
+from mobius.models.mimi import MimiModel
 from mobius.models.minicpm import MiniCPM3CausalLMModel, MiniCPMCausalLMModel
 from mobius.models.minicpmv4_6 import MiniCPMV46ForConditionalGeneration
 from mobius.models.minimax import MiniMaxCausalLMModel
@@ -336,6 +342,9 @@ from mobius.models.moe import (
     Ernie45MoECausalLMModel,
     Ernie45MoEGGUFCausalLMModel,
     Glm4MoECausalLMModel,
+    GrokGGUFCausalLMModel,
+    GroveMoEGGUFCausalLMModel,
+    HunyuanMoEGGUFCausalLMModel,
     HunYuanMoEV1CausalLMModel,
     MoECausalLMModel,
     Phi3MoECausalLMModel,
@@ -346,8 +355,6 @@ from mobius.models.moonshine import MoonshineForConditionalGeneration
 from mobius.models.moshi import (
     MoshiDepformerModel,
     MoshiTemporalModel,
-    moshi_depformer_config,
-    moshi_temporal_config,
 )
 from mobius.models.muse_glimmer import (
     MuseGlimmerForConditionalGeneration,
@@ -422,6 +429,10 @@ from mobius.models.qwen_vl import (
     Qwen25VLEmbeddingModel,
     Qwen25VLTextModel,
     Qwen25VLVisionEncoderModel,
+)
+from mobius.models.reuse import (
+    ReUseConfig,
+    SEMambaSpeechEnhancementModel,
 )
 from mobius.models.sensenova_u1 import SenseNovaU1Model
 from mobius.models.sensevoice_small import SenseVoiceSmallModel

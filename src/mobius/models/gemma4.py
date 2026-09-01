@@ -3145,7 +3145,7 @@ class _Gemma4AudioEncoderModel(nn.Module):
         self.encoder = Gemma4AudioEncoder(
             input_size=input_size,
             hidden_size=hidden_size,
-            num_heads=8,  # fixed per Gemma4 audio_config
+            num_heads=(ac.attention_heads if ac and ac.attention_heads else 8),
             num_layers=num_layers,
             conv_kernel_size=5,  # fixed per Gemma4 audio_config
             conv_channels=conv_channels,

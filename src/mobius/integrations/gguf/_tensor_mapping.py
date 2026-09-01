@@ -225,6 +225,7 @@ _DFLASH_MAPPING: dict[str, str] = {
 }
 
 _EAGLE3_MAPPING: dict[str, str] = {
+    "token_embd": "embed_tokens",
     "fc": "fc",
     "enc.output_norm": "input_norm",
     "output_norm": "norm",
@@ -924,6 +925,73 @@ _MOE_QK_NORM_EXTRAS: dict[str, str] = {
     "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
 }
 
+_GROK_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.attn_output_norm": "model.layers.{bid}.attention_output_layernorm",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.pre_feedforward_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.residual_mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.residual_mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.residual_mlp.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.layer_output_norm": "model.layers.{bid}.post_feedforward_layernorm",
+    "blk.{bid}.post_ffw_norm": "model.layers.{bid}.post_feedforward_layernorm",
+}
+
+_GROVEMOE_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_chexps": "model.layers.{bid}.mlp.chunk_experts.gate_proj",
+    "blk.{bid}.ffn_up_chexps": "model.layers.{bid}.mlp.chunk_experts.up_proj",
+    "blk.{bid}.ffn_down_chexps": "model.layers.{bid}.mlp.chunk_experts.down_proj",
+}
+
+_HUNYUAN_MOE_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_qkv": "model.layers.{bid}.self_attn.qkv_proj",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_expert.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_expert.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_expert.down_proj",
+}
+
 _DEEPSEEK_SHARED_MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
     "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias@",
@@ -997,6 +1065,73 @@ _ARCTIC_EXTRAS: dict[str, str] = {
 
 _ERNIE45_MOE_EXTRAS: dict[str, str] = {
     "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias@",
+}
+
+_RECURRENT_SUFFIXES["grok"] = {
+    "token_embd": _WEIGHT,
+    "output": _PROJECTION,
+    "output_norm": _WEIGHT,
+    "blk.{bid}.attn_norm": _WEIGHT,
+    "blk.{bid}.attn_qkv": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q": _BIASED_PROJECTION,
+    "blk.{bid}.attn_k": _BIASED_PROJECTION,
+    "blk.{bid}.attn_v": _BIASED_PROJECTION,
+    "blk.{bid}.attn_output": _PROJECTION,
+    "blk.{bid}.attn_output_norm": _WEIGHT,
+    "blk.{bid}.ffn_norm": _WEIGHT,
+    "blk.{bid}.ffn_gate": _PROJECTION,
+    "blk.{bid}.ffn_up": _PROJECTION,
+    "blk.{bid}.ffn_down": _PROJECTION,
+    "blk.{bid}.ffn_gate_inp": _WEIGHT,
+    "blk.{bid}.ffn_gate_exps": _PROJECTION,
+    "blk.{bid}.ffn_up_exps": _PROJECTION,
+    "blk.{bid}.ffn_down_exps": _PROJECTION,
+    "blk.{bid}.layer_output_norm": _WEIGHT,
+    "blk.{bid}.post_ffw_norm": _WEIGHT,
+}
+
+_RECURRENT_SUFFIXES["grovemoe"] = {
+    "token_embd": _WEIGHT,
+    "output": _PROJECTION,
+    "output_norm": _WEIGHT,
+    "blk.{bid}.attn_norm": _WEIGHT,
+    "blk.{bid}.attn_qkv": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q": _BIASED_PROJECTION,
+    "blk.{bid}.attn_k": _BIASED_PROJECTION,
+    "blk.{bid}.attn_v": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q_norm": _WEIGHT,
+    "blk.{bid}.attn_k_norm": _WEIGHT,
+    "blk.{bid}.attn_output": _PROJECTION,
+    "blk.{bid}.ffn_norm": _WEIGHT,
+    "blk.{bid}.ffn_gate_inp": _WEIGHT,
+    "blk.{bid}.ffn_gate_exps": _PROJECTION,
+    "blk.{bid}.ffn_up_exps": _PROJECTION,
+    "blk.{bid}.ffn_down_exps": _PROJECTION,
+    "blk.{bid}.ffn_gate_chexps": _WEIGHT,
+    "blk.{bid}.ffn_up_chexps": _WEIGHT,
+    "blk.{bid}.ffn_down_chexps": _WEIGHT,
+}
+
+_RECURRENT_SUFFIXES["hunyuan-moe"] = {
+    "token_embd": _WEIGHT,
+    "output": _PROJECTION,
+    "output_norm": _WEIGHT,
+    "blk.{bid}.attn_norm": _WEIGHT,
+    "blk.{bid}.attn_qkv": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q": _BIASED_PROJECTION,
+    "blk.{bid}.attn_k": _BIASED_PROJECTION,
+    "blk.{bid}.attn_v": _BIASED_PROJECTION,
+    "blk.{bid}.attn_q_norm": _WEIGHT,
+    "blk.{bid}.attn_k_norm": _WEIGHT,
+    "blk.{bid}.attn_output": _PROJECTION,
+    "blk.{bid}.ffn_norm": _WEIGHT,
+    "blk.{bid}.ffn_gate_inp": _WEIGHT,
+    "blk.{bid}.ffn_gate_exps": _PROJECTION,
+    "blk.{bid}.ffn_up_exps": _PROJECTION,
+    "blk.{bid}.ffn_down_exps": _PROJECTION,
+    "blk.{bid}.ffn_gate_shexp": _PROJECTION,
+    "blk.{bid}.ffn_up_shexp": _PROJECTION,
+    "blk.{bid}.ffn_down_shexp": _PROJECTION,
 }
 
 # Qwen3.5 hybrid extensions: DeltaNet (SSM) + full-attention.
@@ -1134,6 +1269,25 @@ _MINIMAX_MAPPING: dict[str, str] = {
     "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
 }
 
+_MINIMAX_M2_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q": "model.layers.{bid}.self_attn.q_proj",
+    "blk.{bid}.attn_k": "model.layers.{bid}.self_attn.k_proj",
+    "blk.{bid}.attn_v": "model.layers.{bid}.self_attn.v_proj",
+    "blk.{bid}.attn_q_norm": "model.layers.{bid}.self_attn.q_norm",
+    "blk.{bid}.attn_k_norm": "model.layers.{bid}.self_attn.k_norm",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": ("model.layers.{bid}.mlp.gate.e_score_correction_bias@"),
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+}
+
 _KIMI_LINEAR_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
     "output": "lm_head",
@@ -1191,6 +1345,65 @@ _KIMI_K3_MAPPING: dict[str, str] = {
 }
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_a"]
 del _KIMI_K3_MAPPING["blk.{bid}.ssm_g_b"]
+
+_GLM_DSA_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_k_b": "model.layers.{bid}.self_attn.k_b_proj",
+    "blk.{bid}.attn_v_b": "model.layers.{bid}.self_attn.v_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": "model.layers.{bid}.mlp.gate.e_score_correction_bias@",
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
+    "blk.{bid}.indexer.attn_k": "model.layers.{bid}.self_attn.indexer.wk",
+    "blk.{bid}.indexer.attn_q_b": "model.layers.{bid}.self_attn.indexer.wq_b",
+    "blk.{bid}.indexer.k_norm": "model.layers.{bid}.self_attn.indexer.k_norm",
+    "blk.{bid}.indexer.proj": "model.layers.{bid}.self_attn.indexer.weights_proj",
+}
+
+_MISTRAL4_MAPPING: dict[str, str] = {
+    "token_embd": "model.embed_tokens",
+    "output": "lm_head",
+    "output_norm": "model.norm",
+    "blk.{bid}.attn_norm": "model.layers.{bid}.input_layernorm",
+    "blk.{bid}.attn_q_a": "model.layers.{bid}.self_attn.q_a_proj",
+    "blk.{bid}.attn_q_a_norm": "model.layers.{bid}.self_attn.q_a_layernorm",
+    "blk.{bid}.attn_q_b": "model.layers.{bid}.self_attn.q_b_proj",
+    "blk.{bid}.attn_kv_a_mqa": "model.layers.{bid}.self_attn.kv_a_proj_with_mqa",
+    "blk.{bid}.attn_kv_a_norm": "model.layers.{bid}.self_attn.kv_a_layernorm",
+    "blk.{bid}.attn_k_b": "model.layers.{bid}.self_attn.k_b_proj",
+    "blk.{bid}.attn_v_b": "model.layers.{bid}.self_attn.v_b_proj",
+    "blk.{bid}.attn_output": "model.layers.{bid}.self_attn.o_proj",
+    "blk.{bid}.ffn_norm": "model.layers.{bid}.post_attention_layernorm",
+    "blk.{bid}.ffn_gate": "model.layers.{bid}.mlp.gate_proj",
+    "blk.{bid}.ffn_up": "model.layers.{bid}.mlp.up_proj",
+    "blk.{bid}.ffn_down": "model.layers.{bid}.mlp.down_proj",
+    "blk.{bid}.ffn_gate_inp": "model.layers.{bid}.mlp.gate",
+    "blk.{bid}.exp_probs_b": ("model.layers.{bid}.mlp.gate.e_score_correction_bias@"),
+    "blk.{bid}.ffn_gate_exps": "model.layers.{bid}.mlp.experts.gate_proj",
+    "blk.{bid}.ffn_up_exps": "model.layers.{bid}.mlp.experts.up_proj",
+    "blk.{bid}.ffn_down_exps": "model.layers.{bid}.mlp.experts.down_proj",
+    "blk.{bid}.ffn_gate_up_exps": "model.layers.{bid}.mlp.experts.gate_up_proj",
+    "blk.{bid}.ffn_gate_shexp": "model.layers.{bid}.mlp.shared_experts.gate_proj",
+    "blk.{bid}.ffn_up_shexp": "model.layers.{bid}.mlp.shared_experts.up_proj",
+    "blk.{bid}.ffn_down_shexp": "model.layers.{bid}.mlp.shared_experts.down_proj",
+}
 
 _MINICPM3_MAPPING: dict[str, str] = {
     "token_embd": "model.embed_tokens",
@@ -1306,6 +1519,9 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "gemma4_extras": _GEMMA4_EXTRAS,
         "moe_extras": _MOE_EXTRAS,
         "moe_qk_norm_extras": _MOE_QK_NORM_EXTRAS,
+        "grok": _GROK_MAPPING,
+        "grovemoe": _GROVEMOE_MAPPING,
+        "hunyuan_moe": _HUNYUAN_MOE_MAPPING,
         "deepseek_shared_moe_extras": _DEEPSEEK_SHARED_MOE_EXTRAS,
         "smallthinker": _SMALLTHINKER_MAPPING,
         "hy_v3_extras": _HY_V3_EXTRAS,
@@ -1320,8 +1536,11 @@ _MAPPING_TABLES: MappingProxyType[str, dict[str, str]] = MappingProxyType(
         "hunyuan_extras": _HUNYUAN_EXTRAS,
         "muse_glimmer_extras": _MUSE_GLIMMER_EXTRAS,
         "minimax": _MINIMAX_MAPPING,
+        "minimax_m2": _MINIMAX_M2_MAPPING,
+        "mistral4": _MISTRAL4_MAPPING,
         "kimi_linear": _KIMI_LINEAR_MAPPING,
         "kimi_k3": _KIMI_K3_MAPPING,
+        "glm_dsa": _GLM_DSA_MAPPING,
         "minicpm3": _MINICPM3_MAPPING,
     }
 )

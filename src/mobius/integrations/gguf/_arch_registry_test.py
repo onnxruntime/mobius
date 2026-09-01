@@ -60,7 +60,7 @@ from mobius.integrations.gguf._upstream import upstream_architectures
 #: Number of importable architectures. Pinned so that adding support is a
 #: deliberate act that also updates the documented support matrix, and so that
 #: accidentally losing an architecture is a failure rather than a silence.
-_EXPECTED_SUPPORTED_COUNT = 99
+_EXPECTED_SUPPORTED_COUNT = 105
 _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
     {
         "bitnet",
@@ -69,6 +69,7 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "ernie4_5",
         "gptneox",
         "granite",
+        "hunyuan-moe",
         "hy_v3",
         "jais",
         "jais2",
@@ -84,6 +85,8 @@ _PROMOTED_CONVENTIONAL_DECODERS = frozenset(
         "gemma-embedding",
         "llama-embed",
         "maincoder",
+        "minimax-m2",
+        "mistral4",
         "starcoder",
         "xverse",
     }
@@ -327,6 +330,8 @@ class TestCapabilityClosure:
             "mamba",
             "mamba2",
             "maincoder",
+            "minimax-m2",
+            "mistral4",
             "nemotron_h",
             "nemotron_h_moe",
             "neo-bert",
@@ -339,6 +344,10 @@ class TestCapabilityClosure:
             "gpt2",
             "codeshell",
             "gptneox",
+            "grok",
+            "grovemoe",
+            "hunyuan-moe",
+            "glm-dsa",
             "hy_v3",
             "jais",
             "mpt",
@@ -1105,7 +1114,7 @@ class TestPinnedRemainingConventionalMoECohort:
     _DEFERRED_ARCHITECTURES = tuple(
         architecture
         for architecture in _ARCHITECTURES
-        if architecture not in {"arctic", "dbrx"}
+        if architecture not in {"arctic", "dbrx", "grok", "grovemoe"}
     )
     _EXPECTED_TENSOR_COUNTS: ClassVar[dict[str, int]] = {
         "arctic": 22,
@@ -1243,8 +1252,6 @@ class TestPinnedRemainingConventionalMoECohort:
         ("architecture", "reason_terms"),
         [
             ("gpt-oss", ("MXFP4", "expert biases", "attention sinks")),
-            ("grok", ("softcaps", "sqrt(2)/2", "dense-plus-routed")),
-            ("grovemoe", ("separate selections", "adjugate", "Q/K RMSNorm")),
         ],
     )
     def test_graph_and_routing_mismatch_is_explicit(
@@ -1263,9 +1270,18 @@ class TestPinnedRemainingConventionalMoECohort:
             get_arch_spec(architecture)
 
     def test_valid_hugging_face_registrations_are_not_reused_as_gguf_aliases(self) -> None:
-        assert {"arctic", "dbrx", "gpt_oss"} <= set(_REGISTRATIONS)
+        assert {
+            "arctic",
+            "dbrx",
+            "gpt_oss",
+            "grok_gguf",
+            "grovemoe_gguf",
+            "hunyuan_moe_gguf",
+        } <= set(_REGISTRATIONS)
         assert try_get_arch_spec("arctic").module_type == "arctic_gguf"
         assert try_get_arch_spec("dbrx").module_type == "dbrx_gguf"
+        assert try_get_arch_spec("grok").module_type == "grok_gguf"
+        assert try_get_arch_spec("grovemoe").module_type == "grovemoe_gguf"
         assert try_get_arch_spec("gpt-oss").model_type is None
 
 

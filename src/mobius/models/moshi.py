@@ -18,7 +18,7 @@ This module builds the ONNX graphs for the Moshi LM used by
   builds both variants and maps their native per-step weights.
 
 The checkpoint is the native Kyutai ``safetensors`` format (no HuggingFace
-``config.json``); :func:`moshi_temporal_config` reproduces the fixed
+``config.json``); :func:`_moshi_temporal_config` reproduces the fixed
 dimensions and :func:`_preprocess_moshi_temporal_weights` maps the native
 parameter names onto the mobius component tree.
 
@@ -148,7 +148,7 @@ class MoshiTemporalModel(nn.Module):
         return _preprocess_moshi_temporal_weights(state_dict)
 
 
-def moshi_temporal_config() -> ArchitectureConfig:
+def _moshi_temporal_config() -> ArchitectureConfig:
     """Fixed :class:`ArchitectureConfig` for the Moshi temporal transformer.
 
     The native Kyutai checkpoint ships no ``config.json``; all dimensions are
@@ -410,7 +410,7 @@ class MoshiDepformerModel(nn.Module):
         return _preprocess_moshi_depformer_weights(state_dict, dep_q=self.dep_q)
 
 
-def moshi_depformer_config(dep_q: int = _D_Q) -> ArchitectureConfig:
+def _moshi_depformer_config(dep_q: int = _D_Q) -> ArchitectureConfig:
     """Return the fixed-size Moshi (8) or PersonaPlex (16) depformer config."""
     if dep_q not in (8, 16):
         raise ValueError(f"dep_q must be 8 (Moshi/Moshiko) or 16 (PersonaPlex), got {dep_q}")

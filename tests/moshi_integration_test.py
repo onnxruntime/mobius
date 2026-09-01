@@ -70,7 +70,7 @@ def _run(path: str, feeds: dict):
 
 @pytest.mark.integration_slow
 def test_mimi_codec_parity():
-    from mobius.integrations.moshi import build_mimi
+    from mobius.integrations._moshi import _PERSONAPLEX_REVISION, _build_mimi
 
     with open(_GOLDEN) as f:
         golden = json.load(f)
@@ -78,8 +78,8 @@ def test_mimi_codec_parity():
     gold_head = np.array([float.fromhex(x) for x in golden["dec_head_hex"]])
     gold_tail = np.array([float.fromhex(x) for x in golden["dec_tail_hex"]])
 
-    pkg = build_mimi(_MODEL_ID)
-    assert set(pkg.keys()) == {"encoder", "decoder"}
+    pkg = _build_mimi(_MODEL_ID, revision=_PERSONAPLEX_REVISION)
+    assert set(pkg) == {"encoder", "decoder"}
 
     with tempfile.TemporaryDirectory() as td:
         pkg.save(td)

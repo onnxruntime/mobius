@@ -585,10 +585,14 @@ class TestBuildMtpHead:
     ):
         from mobius._model_package import ModelPackage
         from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._runtime_evidence import (
+            gguf_graph_package_identity,
+        )
 
         package = build_from_gguf(qwen35_mtp_gguf)
         target_dir = tmp_path / "target"
         package.save(target_dir, progress_bar=False, check_weights=True)
+        combined_identity = gguf_graph_package_identity(target_dir)
         reloaded = ModelPackage.load(target_dir)
         target = reloaded["model"]
         assert reloaded.mtp_head is not None
@@ -602,6 +606,93 @@ class TestBuildMtpHead:
         assert "model.embed_tokens.weight" in target.graph.initializers
         assert "embed_tokens.weight" not in sidecar.graph.initializers
         assert not any("nextn" in name for name in target.graph.initializers)
+        assert ".mobius-package.json" in combined_identity.files
+        assert ".mobius-mtp/model.onnx" in combined_identity.files
+
+        # The target and MTP graphs both use local cache slot 0. Their package
+        # component is therefore part of the state identity; flattening names
+        # would alias the two independently advanced caches.
+        target_cache = {
+            value.name
+            for value in target.graph.inputs
+            if value.name and value.name.startswith("past_key_values.")
+        }
+        mtp_cache = {
+            value.name
+            for value in sidecar.graph.inputs
+            if value.name and value.name.startswith("past_key_values.")
+        }
+        assert target_cache & mtp_cache == {
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+        }
+        assert {("target", name) for name in target_cache}.isdisjoint(
+            {("mtp", name) for name in mtp_cache}
+        )
+
+        package.mtp_head = None
+        target_only_dir = tmp_path / "target-only"
+        package.save(target_only_dir, progress_bar=False, check_weights=True)
+        target_only_identity = gguf_graph_package_identity(target_only_dir)
+        assert ".mobius-package.json" not in target_only_identity.files
+        assert not any(path.startswith(".mobius-mtp/") for path in target_only_identity.files)
+        assert combined_identity.sha256 != target_only_identity.sha256
+
+    def test_gguf_ort_package_emits_hashes_and_mtp_contract_without_allowlist(
+        self, qwen35_mtp_gguf: Path, tmp_path: Path
+    ):
+        from mobius.integrations.gguf import (
+            build_from_gguf,
+            write_gguf_runtime_package,
+        )
+        from mobius.integrations.gguf._mtp_runtime_evidence import (
+            iter_mtp_runtime_evidence,
+        )
+
+        package = build_from_gguf(qwen35_mtp_gguf)
+        assert package.gguf_tokenizer_verdict.metadata_sha256 is None
+        evidenced_hashes = {
+            artifact.lfs_sha256
+            for evidence in iter_mtp_runtime_evidence()
+            for layout in evidence.layouts
+            for artifact in layout.artifacts
+        }
+        assert package.gguf_artifact_identity.sha256 not in evidenced_hashes
+        output = tmp_path / "ort-package"
+        artifacts = write_gguf_runtime_package(
+            package,
+            qwen35_mtp_gguf,
+            output,
+            runtime="ort-genai",
+            runtime_version="0.15.2",
+            progress_bar=False,
+        )
+
+        with open(artifacts["mtp_config"], encoding="utf-8") as handle:
+            mtp_config = json.load(handle)
+        with open(artifacts["runtime_compatibility"], encoding="utf-8") as handle:
+            compatibility = json.load(handle)
+        with open(artifacts["mtp_runtime_status"], encoding="utf-8") as handle:
+            status = json.load(handle)
+        assert (output / ".mobius-mtp" / "model.onnx").is_file()
+        assert mtp_config["model"]["filename"] == ".mobius-mtp/model.onnx"
+        assert mtp_config["status"] == "runtime_unvalidated"
+        assert set(mtp_config["cache_namespaces"]) == {"target", "mtp"}
+        assert (
+            mtp_config["cache_namespaces"]["target"]["namespace"]
+            != mtp_config["cache_namespaces"]["mtp"]["namespace"]
+        )
+        assert compatibility["runtime_validation_status"] == "unvalidated"
+        assert compatibility["tested_versions"] == ["0.15.2"]
+        assert status["status"] == "runtime_unvalidated"
+        assert status["artifact"]["sha256"] == package.gguf_artifact_identity.sha256
+        assert status["graph_package"]["sha256"]
+        assert status["runtime_payload"]["sha256"]
+        assert status["config_sha256"]["genai_config.json"]
+        assert status["config_sha256"]["mtp_config.json"]
+        assert status["tokenizer"]["status"] == "not_provided"
+        assert status["validated_claims"]["cache_namespace_separation"]
+        assert not status["validated_claims"]["runtime_execution"]
 
     def test_asymmetric_dedicated_head_is_reported_as_float(self, tmp_path: Path):
         import onnxruntime as ort
@@ -753,6 +844,298 @@ class TestMtpAutoDetect:
         )
         np.testing.assert_allclose(mtp_seed, expected, rtol=1e-5, atol=1e-5)
         assert not np.allclose(mtp_seed, pre_norm)
+
+    def test_direct_ort_target_acceptance_threads_and_rolls_back_both_caches(
+        self, tmp_path: Path
+    ):
+        """Exercise the coordinator contract without claiming real-artifact evidence."""
+        import onnxruntime as ort
+        from gguf import GGUFReader
+
+        from mobius.integrations.gguf import build_from_gguf
+
+        np.random.seed(0)
+        source = tmp_path / "coordinator.gguf"
+        _write_qwen35_mtp_gguf(source)
+        package = build_from_gguf(source, keep_quantized=False)
+        output = tmp_path / "coordinator"
+        package.save(output, progress_bar=False)
+        target = ort.InferenceSession(
+            str(output / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+        mtp = ort.InferenceSession(
+            str(output / ".mobius-mtp" / "model.onnx"),
+            providers=["CPUExecutionProvider"],
+        )
+
+        # The coordinator reads the source GGUF table directly. It does not call
+        # Mobius's tensor mapper or processor to recover shared embedding/head values.
+        reader = GGUFReader(str(source))
+        embedding = np.array(
+            next(
+                tensor.data for tensor in reader.tensors if tensor.name == "token_embd.weight"
+            ),
+            copy=True,
+        )
+
+        def empty_cache(batch: int = 1):
+            return {
+                f"past_key_values.0.{kind}": np.empty(
+                    (batch, _NKV, 0, _HD),
+                    dtype=np.float32,
+                )
+                for kind in ("key", "value")
+            }
+
+        def cache_from(outputs):
+            return {
+                name.replace("present.", "past_key_values."): value
+                for name, value in outputs.items()
+                if name.startswith("present.")
+            }
+
+        def run_target(tokens, cache):
+            tokens = np.asarray(tokens, dtype=np.int64)
+            if tokens.ndim == 1:
+                tokens = tokens[None, :]
+            past = next(iter(cache.values())).shape[2]
+            positions = np.broadcast_to(
+                np.arange(past, past + tokens.shape[1], dtype=np.int64),
+                tokens.shape,
+            )
+            values = target.run(
+                None,
+                {
+                    "input_ids": tokens,
+                    "attention_mask": np.ones(
+                        (tokens.shape[0], past + tokens.shape[1]),
+                        dtype=np.int64,
+                    ),
+                    "position_ids": positions,
+                    **cache,
+                },
+            )
+            outputs = dict(zip((value.name for value in target.get_outputs()), values))
+            return outputs, cache_from(outputs)
+
+        def run_mtp(tokens, hidden_states, cache, position_start: int):
+            tokens = np.asarray(tokens, dtype=np.int64)
+            if tokens.ndim == 1:
+                tokens = tokens[None, :]
+            past = next(iter(cache.values())).shape[2]
+            positions = np.broadcast_to(
+                np.arange(
+                    position_start,
+                    position_start + tokens.shape[1],
+                    dtype=np.int64,
+                ),
+                tokens.shape,
+            )
+            values = mtp.run(
+                None,
+                {
+                    "inputs_embeds": embedding[tokens].astype(np.float32),
+                    "hidden_states": np.asarray(hidden_states, dtype=np.float32),
+                    "attention_mask": np.ones(
+                        (tokens.shape[0], past + tokens.shape[1]),
+                        dtype=np.int64,
+                    ),
+                    "position_ids": positions,
+                    **cache,
+                },
+            )
+            outputs = dict(zip((value.name for value in mtp.get_outputs()), values))
+            logits = outputs["mtp_hidden"] @ embedding.T
+            return logits, outputs, cache_from(outputs)
+
+        def assert_cache_equal(left, right):
+            assert left.keys() == right.keys()
+            for name in left:
+                np.testing.assert_array_equal(left[name], right[name])
+
+        prompt = np.array([[1, 2, 3]], dtype=np.int64)
+        initial_target, initial_target_cache = run_target(prompt, empty_cache())
+        _, _, initial_mtp_cache = run_mtp(
+            prompt[:, 1:],
+            initial_target["mtp_seed"][:, :-1],
+            empty_cache(),
+            1,
+        )
+
+        # Target-only is the distribution oracle for this coordinator test.
+        baseline: list[int] = []
+        baseline_outputs = initial_target
+        baseline_cache = initial_target_cache
+        for _ in range(102):
+            token = int(baseline_outputs["logits"][0, -1].argmax())
+            baseline.append(token)
+            baseline_outputs, baseline_cache = run_target([token], baseline_cache)
+
+        generated: list[int] = []
+        accepted = 0
+        rejected = 0
+        rollbacks = 0
+        target_outputs = initial_target
+        target_cache = initial_target_cache
+        mtp_cache = initial_mtp_cache
+        hidden = initial_target["mtp_seed"][:, -1:]
+        for _ in range(51):
+            target_snapshot = {name: value.copy() for name, value in target_cache.items()}
+            mtp_snapshot = {name: value.copy() for name, value in mtp_cache.items()}
+            position = next(iter(target_snapshot.values())).shape[2]
+            first = int(target_outputs["logits"][0, -1].argmax())
+
+            target_first, target_after_first = run_target([first], target_snapshot)
+            draft_logits, _, mtp_after_first = run_mtp(
+                [first],
+                hidden,
+                mtp_snapshot,
+                position,
+            )
+            proposal = int(draft_logits[0, -1].argmax())
+            target_second = int(target_first["logits"][0, -1].argmax())
+
+            # Advance both sessions optimistically. A rejected proposal must
+            # discard both cache transactions before replaying the target token.
+            target_trial, target_after_trial = run_target(
+                [proposal],
+                target_after_first,
+            )
+            _, _, mtp_after_trial = run_mtp(
+                [proposal],
+                target_first["mtp_seed"][:, -1:],
+                mtp_after_first,
+                position + 1,
+            )
+            if proposal == target_second:
+                accepted += 1
+                second = proposal
+                accepted_first, accepted_target_cache = run_target(
+                    [first],
+                    target_snapshot,
+                )
+                accepted_logits, _, accepted_mtp_cache = run_mtp(
+                    [first],
+                    hidden,
+                    mtp_snapshot,
+                    position,
+                )
+                accepted_second, accepted_target_cache = run_target(
+                    [second],
+                    accepted_target_cache,
+                )
+                _, _, accepted_mtp_cache = run_mtp(
+                    [second],
+                    accepted_first["mtp_seed"][:, -1:],
+                    accepted_mtp_cache,
+                    position + 1,
+                )
+                np.testing.assert_array_equal(accepted_logits, draft_logits)
+                np.testing.assert_array_equal(
+                    accepted_second["logits"],
+                    target_trial["logits"],
+                )
+                assert_cache_equal(accepted_target_cache, target_after_trial)
+                assert_cache_equal(accepted_mtp_cache, mtp_after_trial)
+                target_outputs = target_trial
+                target_cache = target_after_trial
+                mtp_cache = mtp_after_trial
+            else:
+                rejected += 1
+                rollbacks += 1
+                replay_first, replay_target_cache = run_target(
+                    [first],
+                    target_snapshot,
+                )
+                replay_logits, _, replay_mtp_cache = run_mtp(
+                    [first],
+                    hidden,
+                    mtp_snapshot,
+                    position,
+                )
+                np.testing.assert_array_equal(
+                    replay_first["logits"],
+                    target_first["logits"],
+                )
+                np.testing.assert_array_equal(replay_logits, draft_logits)
+                assert_cache_equal(replay_target_cache, target_after_first)
+                assert_cache_equal(replay_mtp_cache, mtp_after_first)
+                second = target_second
+                target_outputs, target_cache = run_target(
+                    [second],
+                    replay_target_cache,
+                )
+                _, _, mtp_cache = run_mtp(
+                    [second],
+                    replay_first["mtp_seed"][:, -1:],
+                    replay_mtp_cache,
+                    position + 1,
+                )
+            hidden = target_outputs["mtp_seed"][:, -1:]
+            generated.extend((first, second))
+
+        assert generated == baseline
+        assert (accepted, rejected, rollbacks) == (1, 50, 50)
+        np.testing.assert_array_equal(
+            target_outputs["logits"],
+            baseline_outputs["logits"],
+        )
+        assert_cache_equal(target_cache, baseline_cache)
+
+        # Reorder two distinguishable request rows together with both cache
+        # namespaces; each graph's result must be the exact row permutation.
+        other_prompt = np.array([[4, 5, 6]], dtype=np.int64)
+        other_target, other_target_cache = run_target(other_prompt, empty_cache())
+        _, _, other_mtp_cache = run_mtp(
+            other_prompt[:, 1:],
+            other_target["mtp_seed"][:, :-1],
+            empty_cache(),
+            1,
+        )
+        target_batch_cache = {
+            name: np.concatenate((initial_target_cache[name], other_target_cache[name]))
+            for name in initial_target_cache
+        }
+        mtp_batch_cache = {
+            name: np.concatenate((initial_mtp_cache[name], other_mtp_cache[name]))
+            for name in initial_mtp_cache
+        }
+        next_tokens = np.array(
+            [
+                [int(initial_target["logits"][0, -1].argmax())],
+                [int(other_target["logits"][0, -1].argmax())],
+            ],
+            dtype=np.int64,
+        )
+        target_ordered, _ = run_target(next_tokens, target_batch_cache)
+        target_reordered, _ = run_target(
+            next_tokens[::-1],
+            {name: value[::-1] for name, value in target_batch_cache.items()},
+        )
+        np.testing.assert_array_equal(
+            target_reordered["logits"],
+            target_ordered["logits"][::-1],
+        )
+        hidden_batch = np.concatenate(
+            (
+                initial_target["mtp_seed"][:, -1:],
+                other_target["mtp_seed"][:, -1:],
+            )
+        )
+        mtp_ordered, _, _ = run_mtp(
+            next_tokens,
+            hidden_batch,
+            mtp_batch_cache,
+            3,
+        )
+        mtp_reordered, _, _ = run_mtp(
+            next_tokens[::-1],
+            hidden_batch[::-1],
+            {name: value[::-1] for name, value in mtp_batch_cache.items()},
+            3,
+        )
+        np.testing.assert_array_equal(mtp_reordered, mtp_ordered[::-1])
 
     def test_moe_mtp_is_rejected_before_graph_build(self, tmp_path: Path, monkeypatch):
         from mobius import _builder as core_builder

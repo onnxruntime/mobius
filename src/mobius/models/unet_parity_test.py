@@ -5,7 +5,8 @@
 
 These build the mobius module + the matching diffusers module with the *same*
 random weights (no checkpoint download) and compare outputs — the pattern used
-by ``tests/integration_test.py`` for the QwenImage VAE. Guarded on diffusers.
+by ``tests/integration/architectures_test.py`` for the QwenImage VAE.
+Guarded on diffusers.
 """
 
 from __future__ import annotations

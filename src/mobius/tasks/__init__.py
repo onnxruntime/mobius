@@ -32,6 +32,7 @@ __all__ = [
     "ControlNetTask",
     "DeepSeekV4Task",
     "DFlashDraftTask",
+    "DraftTargetCausalLMTask",
     "Eagle3DraftTask",
     "Qwen35MtpTask",
     "Qwen4ExpCausalLMTask",
@@ -40,8 +41,16 @@ __all__ = [
     "DiarizationTask",
     "FeatureExtractionTask",
     "GGUFEncoderFeatureExtractionTask",
+    "GGUFAudioProjectorModel",
+    "GGUFAudioProjectorTask",
     "GGUFEmbeddingFeatureExtractionTask",
     "GGUFProjectorVisionLanguageTask",
+    "GGUFSpeakerProjectorModel",
+    "GGUFSpeakerProjectorTask",
+    "GGUFVisionProjectorModel",
+    "GGUFVisionProjectorTask",
+    "GGUFVisionAudioProjectorModel",
+    "GGUFVisionAudioProjectorTask",
     "FunASRSpeechLanguageTask",
     "Gemma3VisionLanguageTask",
     "Gemma3nTask",
@@ -63,6 +72,7 @@ __all__ = [
     "ModelTask",
     "MllamaVisionLanguageTask",
     "MageVLTask",
+    "Mistral4GGUFCausalLMTask",
     "MiniCPMVLTask",
     "MuseGlimmerVLTask",
     "MaskedDiffusionTask",
@@ -89,6 +99,7 @@ __all__ = [
     "SSM2CausalLMTask",
     "SSMCausalLMTask",
     "Seq2SeqTask",
+    "SpeechEnhancementTask",
     "SpeechLanguageTask",
     "SpeechToTextTask",
     "TASK_REGISTRY",
@@ -127,6 +138,7 @@ from mobius.tasks._deepseek_v4 import DeepSeekV4Task
 from mobius.tasks._denoising import DenoisingTask
 from mobius.tasks._dflash import DFlashDraftTask
 from mobius.tasks._diarization import DiarizationTask
+from mobius.tasks._draft_target import DraftTargetCausalLMTask
 from mobius.tasks._eagle3 import Eagle3DraftTask
 from mobius.tasks._falcon_h1 import FalconH1CausalLMTask
 from mobius.tasks._feature_extraction import (
@@ -142,6 +154,16 @@ from mobius.tasks._gemma4 import (
     Gemma4UnifiedTask,
 )
 from mobius.tasks._gemma4_assistant import Gemma4AssistantTask
+from mobius.tasks._gguf_projector import (
+    GGUFAudioProjectorModel,
+    GGUFAudioProjectorTask,
+    GGUFSpeakerProjectorModel,
+    GGUFSpeakerProjectorTask,
+    GGUFVisionAudioProjectorModel,
+    GGUFVisionAudioProjectorTask,
+    GGUFVisionProjectorModel,
+    GGUFVisionProjectorTask,
+)
 from mobius.tasks._glm_moe_dsa import GlmMoeDsaTask
 from mobius.tasks._glmasr_speech_language import GlmAsrSpeechLanguageTask
 from mobius.tasks._hunyuan_vl_mot import HunYuanVLMoTTask
@@ -157,6 +179,7 @@ from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3RVQTask,
     MiniMaxMusic3VocoderTask,
 )
+from mobius.tasks._mistral4_gguf import Mistral4GGUFCausalLMTask
 from mobius.tasks._moshi import MoshiDepformerTask, MoshiTemporalTask
 from mobius.tasks._multimodal import MultiModalTask
 from mobius.tasks._object_detection import ObjectDetectionTask
@@ -174,6 +197,7 @@ from mobius.tasks._qwen_image_vae import QwenImageEditVAETask, QwenImageVAETask
 from mobius.tasks._rnnt import RNNTTask
 from mobius.tasks._sensenova_u1 import SenseNovaU1Task
 from mobius.tasks._seq2seq import Seq2SeqTask
+from mobius.tasks._speech_enhancement import SpeechEnhancementTask
 from mobius.tasks._speech_language import SpeechLanguageTask
 from mobius.tasks._speech_to_text import SpeechToTextTask
 from mobius.tasks._ssm_causal_lm import SSM2CausalLMTask, SSMCausalLMTask
@@ -218,6 +242,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "feature-extraction": FeatureExtractionTask,
     "gguf-encoder-feature-extraction": GGUFEncoderFeatureExtractionTask,
     "gguf-embedding-feature-extraction": GGUFEmbeddingFeatureExtractionTask,
+    "gguf-audio-projector": GGUFAudioProjectorTask,
     "masked-diffusion": MaskedDiffusionTask,
     "minimax-music3-condition": MiniMaxMusic3ConditionTask,
     "minimax-music3-denoising": MiniMaxMusic3DenoisingTask,
@@ -270,6 +295,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gemma4-unified": Gemma4UnifiedTask,
     "gemma4-assistant": Gemma4AssistantTask,
     "glm-moe-dsa": GlmMoeDsaTask,
+    "mistral4-gguf-text-generation": Mistral4GGUFCausalLMTask,
     "hunyuan-vl-mot": HunYuanVLMoTTask,
     "sensenova-u1": SenseNovaU1Task,
     "multimodal": MultiModalTask,
@@ -277,6 +303,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "fun-asr-speech-language": FunASRSpeechLanguageTask,
     "glmasr-speech-language": GlmAsrSpeechLanguageTask,
     "fastconformer-rnnt": RNNTTask,
+    "speech-enhancement": SpeechEnhancementTask,
     "speech-language": SpeechLanguageTask,
     "speech-to-text": SpeechToTextTask,
     "ssm-text-generation": SSMCausalLMTask,

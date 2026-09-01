@@ -58,6 +58,42 @@ def test_runtime_blocker_candidate_is_metadata_only_and_not_budgeted_as_support(
     )
 
 
+def test_mtp_runtime_status_is_machine_readable_and_never_selected() -> None:
+    matrix = quantization_capability_matrix()
+    records = matrix["mtp_runtime_evidence"]
+    selected_artifacts = matrix["selected_artifacts"]
+    assert isinstance(records, list)
+    assert isinstance(selected_artifacts, list)
+    assert {record["architecture"] for record in records} == {"hy_v3", "qwen35"}
+
+    selected_hashes = {artifact["lfs_sha256"] for artifact in selected_artifacts}
+    for record in records:
+        assert record["result"] == "runtime_unvalidated"
+        assert record["graph_sha256"] is None
+        assert record["runtime_package_sha256"] is None
+        assert record["source_fidelity"] is False
+        assert record["storage_fidelity"] is False
+        assert record["tokenizer"]["status"] == "separately-deferred"
+        assert record["cache_topology"]["target_namespace"] == "target"
+        assert record["cache_topology"]["mtp_namespace"] == "mtp"
+        assert record["runtime"]["version"] == "0.15.2"
+        assert record["runtime"]["onnxruntime_version"] == "1.29.0"
+        assert record["runtime"]["execution_provider"] == "CPUExecutionProvider"
+        assert "two_model_draft_target_binding" in record["runtime"]["missing_capabilities"]
+        for layout in record["layouts"]:
+            for artifact in layout["artifacts"]:
+                assert artifact["lfs_sha256"] not in selected_hashes
+    qwen = next(record for record in records if record["architecture"] == "qwen35")
+    assert qwen["synthetic_coordinator"]["acceptance_statistics"] == {
+        "accepted": 1,
+        "proposal_steps": 51,
+        "rejected": 50,
+        "rollbacks": 50,
+    }
+    hy_v3 = next(record for record in records if record["architecture"] == "hy_v3")
+    assert hy_v3["synthetic_coordinator"] is None
+
+
 def test_every_stored_qtype_and_tensor_role_is_explicit() -> None:
     matrix = quantization_capability_matrix()
     qtypes = _qtypes(matrix)
@@ -167,10 +203,10 @@ def test_selected_real_artifacts_stay_within_global_budget() -> None:
     assert isinstance(policy, dict)
     assert isinstance(artifacts, list)
     assert isinstance(lossy, list)
-    assert len(artifacts) == 10
+    assert len(artifacts) == 11
     assert len(lossy) == 1
     selected = sum(int(record["size"]) for record in [*artifacts, *lossy])
-    assert selected == 2_724_371_296
+    assert selected == 5_752_423_904
     assert selected == policy["selected_artifact_bytes"]
     assert selected <= policy["max_selected_artifact_bytes"]
     assert lossy[0]["lfs_sha256"] == (

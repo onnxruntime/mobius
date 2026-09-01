@@ -33,6 +33,7 @@ from mobius.integrations.onnx_genai.shared_state_flow_metadata import (
 )
 from mobius.integrations.onnx_genai.workflow_metadata import (
     HierarchicalAudioWorkflowConfig,
+    _validate_reuse_rate_selection,
     write_audio_codec_workflow_metadata,
     write_ctc_asr_workflow_metadata,
     write_decoder_workflow_metadata,
@@ -42,11 +43,13 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
+    write_speech_enhancement_workflow_metadata,
     write_speech_to_text_workflow_metadata,
     write_tts_workflow_metadata,
     write_video_diffusion_workflow_metadata,
     write_vlm_workflow_metadata,
 )
+from mobius.models.reuse import ReUseConfig
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -622,7 +625,7 @@ def _looks_like_speech_to_text(pkg: Any) -> bool:
         names = set(pkg.keys())
     except AttributeError:
         return False
-    if not {"encoder", "decoder"} <= names:
+    if names != {"encoder", "decoder"}:
         return False
     decoder = pkg["decoder"]
     try:
@@ -687,6 +690,31 @@ def _looks_like_encoder_embedding(pkg: Any) -> bool:
     return not any(str(name).startswith("past_key_values") for name in inputs)
 
 
+def _looks_like_speech_enhancement(pkg: Any) -> bool:
+    """Detect a spectral speech-enhancement package.
+
+    The signal is structural: a single ``model`` component that consumes a
+    noisy magnitude and phase spectrogram and emits the enhanced pair. There
+    is no ``logits`` port and no KV cache, so nothing about it is generative
+    -- it is a single pure spectrum-to-spectrum call.
+    """
+    try:
+        names = set(pkg.keys())
+    except AttributeError:
+        return False
+    if names != {"model"}:
+        return False
+    try:
+        model = pkg["model"]
+        inputs = {str(value.name) for value in model.graph.inputs}
+        outputs = {str(value.name) for value in model.graph.outputs}
+    except (AttributeError, KeyError):
+        return False
+    if not {"noisy_mag", "noisy_pha"} <= inputs:
+        return False
+    return {"denoised_mag", "denoised_pha"} <= outputs
+
+
 def _looks_like_audio_codec(pkg: Any) -> bool:
     """Detect an audio-to-audio neural codec package.
 
@@ -700,7 +728,7 @@ def _looks_like_audio_codec(pkg: Any) -> bool:
         names = set(pkg.keys())
     except AttributeError:
         return False
-    if not {"encoder", "decoder"} <= names:
+    if names != {"encoder", "decoder"}:
         return False
     try:
         encoder_outputs = {value.name for value in pkg["encoder"].graph.outputs}
@@ -805,6 +833,59 @@ def _diffusion_component_kwargs(pkg: Any) -> dict[str, Any]:
     return derived
 
 
+def _write_advisory_component_contract(
+    pkg: Any,
+    output_dir: str,
+    *,
+    warning: str,
+) -> dict[str, str]:
+    """Write exact component metadata for a package unsupported by the tested runtime."""
+    try:
+        package_items = list(pkg.items())
+    except (AttributeError, TypeError) as error:
+        raise ValueError("Package must expose named model components.") from error
+    if not package_items:
+        raise ValueError("Package must contain at least one model component.")
+
+    components: dict[str, dict[str, Any]] = {}
+    for name, model in package_items:
+        if not isinstance(name, str) or not name:
+            raise ValueError("Package component names must be non-empty strings.")
+        graph = getattr(model, "graph", None)
+        if graph is None:
+            raise ValueError(f"Package component {name!r} has no graph contract.")
+        inputs = [value.name for value in graph.inputs]
+        outputs = [value.name for value in graph.outputs]
+        if any(not isinstance(value, str) or not value for value in (*inputs, *outputs)):
+            raise ValueError(f"Package component {name!r} has unnamed graph ports.")
+        if not outputs:
+            raise ValueError(f"Package component {name!r} has no graph outputs.")
+        components[name] = {
+            "filename": ("model.onnx" if len(package_items) == 1 else f"{name}/model.onnx"),
+            "inputs": inputs,
+            "outputs": outputs,
+            "metadata": dict(getattr(model, "metadata_props", {})),
+        }
+
+    os.makedirs(output_dir, exist_ok=True)
+    metadata = {
+        "runtime_validation_status": "unsupported-by-tested-runtime",
+        "warnings": [warning],
+        "components": components,
+    }
+    inference_path = os.path.join(output_dir, "inference_metadata.yaml")
+    compatibility_path = os.path.join(output_dir, "runtime_compatibility.json")
+    for path in (inference_path, compatibility_path):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+            handle.write("\n")
+    _LOGGER.warning("%s", warning)
+    return {
+        "inference_metadata": inference_path,
+        "runtime_compatibility": compatibility_path,
+    }
+
+
 def write_onnx_genai_config(
     pkg: Any,
     output_dir: str,
@@ -850,6 +931,9 @@ def write_onnx_genai_config(
     ``scheduler`` / ``guidance_scale`` set the loop.
     """
     package_config = getattr(pkg, "config", None)
+    resolved_config = config if config is not None else package_config
+    if isinstance(resolved_config, ReUseConfig):
+        _validate_reuse_rate_selection(resolved_config)
     config_types = {
         getattr(candidate, "model_type", None)
         for candidate in (package_config, config)
@@ -861,15 +945,23 @@ def write_onnx_genai_config(
     )
     qwen4_signature = {"ple_input_ids", "past_position_ids"} <= decoder_inputs
     if config_types & {"qwen4_exp", "qwen4_exp_text"} or qwen4_signature:
-        raise ValueError(
-            "onnx-genai cannot represent Qwen4-Exp's required ple_input_ids "
-            "and four-axis position state. Use ModelPackage.save() and the "
-            "decoder's mobius.state_manifest metadata; refusing to write an "
-            "incomplete workflow."
+        warning = (
+            "The tested onnx-genai runtime cannot orchestrate Qwen4-Exp's ple_input_ids "
+            "and four-axis position state; component graphs and their exact contracts "
+            "are exported without claiming runtime validation."
         )
+        return _write_advisory_component_contract(pkg, output_dir, warning=warning)
+    component_names = set(pkg)
+    if component_names in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
+        pkg, "gguf_projector_type", None
+    ):
+        warning = (
+            "The tested onnx-genai runtime has no standalone GGUF audio/speaker "
+            "sidecar orchestrator; exact component and processor contracts are advisory."
+        )
+        return _write_advisory_component_contract(pkg, output_dir, warning=warning)
     os.makedirs(output_dir, exist_ok=True)
     if is_shared_state_pixel_flow_package(pkg):
-        resolved_config = config if config is not None else getattr(pkg, "config", None)
         if resolved_config is None:
             raise ValueError("shared-state pixel-flow metadata requires a model config")
         path = write_shared_state_pixel_flow_workflow_metadata(
@@ -1088,6 +1180,15 @@ def write_onnx_genai_config(
         )
         return artifacts
 
+    if _looks_like_speech_enhancement(pkg):
+        # A spectral enhancement model has no logits and no cache: one pure
+        # spectrum-to-spectrum call.  Emit before the config requirement below
+        # because nothing here needs a decoder config.
+        path = write_speech_enhancement_workflow_metadata(
+            pkg, output_dir, config if config is not None else getattr(pkg, "config", None)
+        )
+        return {"inference_metadata": path}
+
     if _looks_like_encoder_embedding(pkg):
         # A bidirectional encoder has no logits and no cache: it runs once and
         # returns one hidden vector per position.  Emit before the config
@@ -1114,8 +1215,27 @@ def write_onnx_genai_config(
         )
         return {"inference_metadata": path}
 
+    try:
+        component_names = sorted(pkg.keys())
+    except (AttributeError, TypeError):
+        component_names = []
     resolved_config = config if config is not None else getattr(pkg, "config", None)
     if resolved_config is None:
+        known_config_topology = (
+            _looks_like_multimodal(pkg)
+            or _looks_like_speech_to_text(pkg)
+            or _looks_like_multi_decoder_tts(pkg)
+        )
+        if len(component_names) > 1 and not known_config_topology:
+            return _write_advisory_component_contract(
+                pkg,
+                output_dir,
+                warning=(
+                    "The tested onnx-genai runtime does not recognize this multi-component "
+                    f"package topology (components: {component_names}); exact component "
+                    "contracts are exported without runtime orchestration."
+                ),
+            )
         raise ValueError(
             "onnx-genai decoder metadata requires a model config (pass config=... "
             "or a package carrying `.config`)"
@@ -1199,20 +1319,18 @@ def write_onnx_genai_config(
         path = write_tts_workflow_metadata(pkg, output_dir, resolved_config)
         return {"inference_metadata": path}
 
-    # Fallback: a single-component decoder language model. A multi-component
-    # package that matched none of the composite shapes above would be silently
-    # mis-emitted as a bare decoder — fail loudly instead so an unsupported shape
-    # is obvious rather than producing wrong metadata.
-    try:
-        component_names = sorted(pkg.keys())
-    except (AttributeError, TypeError):
-        component_names = []
+    # Fallback: a single-component decoder language model. Preserve unknown
+    # multi-component packages as exact component contracts without claiming that
+    # the tested runtime can orchestrate them.
     if len(component_names) > 1:
-        raise ValueError(
-            "onnx-genai config emission does not recognize this multi-component "
-            f"package shape (components: {component_names}). Supported composite "
-            "shapes: diffusion, audio codec, multimodal VLM, speech-to-text. "
-            "Multi-decoder pipelines such as TTS require a dedicated emitter."
+        return _write_advisory_component_contract(
+            pkg,
+            output_dir,
+            warning=(
+                "The tested onnx-genai runtime does not recognize this multi-component "
+                f"package topology (components: {component_names}); exact component contracts "
+                "are exported without runtime orchestration."
+            ),
         )
 
     if kv_native_dtype is not None:

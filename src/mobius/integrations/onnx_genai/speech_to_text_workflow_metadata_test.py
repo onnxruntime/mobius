@@ -14,12 +14,12 @@ import pytest
 import yaml
 
 from mobius._model_package import ModelPackage
-from mobius.integrations.onnx_genai.auto_export import _audio_preprocessing_program
-from mobius.integrations.onnx_genai.inference_metadata_test import (
+from mobius.integrations.onnx_genai._test_support import (
     _model,
     _onnx_genai_schema_path,
     _value,
 )
+from mobius.integrations.onnx_genai.auto_export import _audio_preprocessing_program
 from mobius.integrations.onnx_genai.workflow_metadata import (
     build_speech_to_text_workflow_metadata,
     write_speech_to_text_workflow_metadata,

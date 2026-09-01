@@ -32,6 +32,8 @@ from mobius._configs import (
     Gemma4Config,
     GlmAsrConfig,
     GraniteMoeHybridConfig,
+    GrokGGUFConfig,
+    GroveMoEGGUFConfig,
     HyV3Config,
     JambaConfig,
     JetMoeConfig,
@@ -61,7 +63,7 @@ from mobius._configs import (
     YolosConfig,
     Zamba2Config,
 )
-from mobius.models import EsmConfig
+from mobius.models import EsmConfig, ReUseConfig
 
 # ---------------------------------------------------------------------------
 # Tiny model dimensions shared by all configs
@@ -598,6 +600,25 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
         },
         True,
     ),
+    (
+        "minimax_m2_gguf",
+        {
+            "hidden_act": "silu",
+            "head_dim": 16,
+            "partial_rotary_factor": 0.5,
+            "attn_qk_norm": True,
+            "attn_qk_norm_full": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": True,
+            "routing_weight_normalization_floor": 6.103515625e-5,
+            "use_expert_bias": True,
+            "disable_qmoe": True,
+        },
+        True,
+    ),
     # === Mixture of Experts ===
     (
         "phimoe",
@@ -1111,6 +1132,47 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
             "tie_word_embeddings": False,
         },
         False,
+    ),
+    (
+        "grok_gguf",
+        {
+            "_config_cls": GrokGGUFConfig,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "hidden_act": "gelu_new",
+            "has_dense_ffn": True,
+            "has_gated_dense_ffn": True,
+            "has_gated_experts": True,
+        },
+        True,
+    ),
+    (
+        "grovemoe_gguf",
+        {
+            "_config_cls": GroveMoEGGUFConfig,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "chunk_expert_intermediate_size": 16,
+            "experts_per_group": 2,
+            "expert_group_scale": 0.05,
+            "attn_qk_norm": True,
+            "hidden_act": "silu",
+        },
+        True,
+    ),
+    (
+        "hunyuan_moe_gguf",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE,
+            "attn_qk_norm": True,
+            "hidden_act": "silu",
+        },
+        True,
     ),
     (
         "jetmoe",
@@ -2839,7 +2901,7 @@ _TINY_MUSE_GLIMMER_VISION = VisionConfig(
 # Vision-Language configs  (task: vision-language and variants)
 # ---------------------------------------------------------------------------
 # NOTE: These models build multi-model packages (decoder + vision + embedding).
-# The test parametrization in build_graph_test.py uses specialised test
+# The L1 graph-test parametrization uses specialised test
 # methods that invoke the correct task and assert the right output models.
 VL_CONFIGS: list[tuple[str, dict, bool]] = [
     (
@@ -3673,6 +3735,25 @@ SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
                 num_blocks=3,
                 tp_num_blocks=2,
             ),
+        },
+        True,
+    ),
+    # --- RE-USE / SEMamba (spectral speech enhancement) ---
+    # Bidirectional Mamba over time and frequency; consumes a noisy STFT
+    # magnitude/phase pair rather than audio features.
+    (
+        "reuse",
+        {
+            "_config_cls": ReUseConfig,
+            "hid_feature": 8,
+            "num_tfmamba": 1,
+            "d_state": 4,
+            "d_conv": 4,
+            "expand": 2,
+            "n_fft": 32,
+            "hop_size": 4,
+            "win_size": 32,
+            "sampling_rate": 8000,
         },
         True,
     ),

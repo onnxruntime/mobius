@@ -11,7 +11,7 @@ import torch
 
 from mobius._builder import _cast_module_dtype
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.integrations.transformers import _config_from_hf
+from mobius.integrations.transformers._config_resolver import _config_from_hf
 from mobius.models.glm_ocr import GlmOcrForConditionalGeneration
 from mobius.tasks import GlmOcrVLTask
 
