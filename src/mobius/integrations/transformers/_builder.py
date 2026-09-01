@@ -13,6 +13,7 @@ import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._builder import build_from_module, resolve_dtype
+from mobius._configs import QuantizedWeightFormat
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
@@ -27,6 +28,40 @@ from mobius.integrations.compressed_tensors import (
 from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
+
+
+def _is_native_gptoss_mxfp4(config) -> bool:
+    quantization = getattr(config, "quantization", None)
+    return bool(
+        getattr(config, "model_type", None) == "gpt_oss"
+        and quantization is not None
+        and quantization.weight_format is QuantizedWeightFormat.MXFP4
+    )
+
+
+def _validate_native_gptoss_build_contract(
+    config,
+    *,
+    execution_provider: str,
+) -> None:
+    """Fail before weight I/O when native FP4 QMoE cannot be exported."""
+    if not _is_native_gptoss_mxfp4(config):
+        return
+    if execution_provider != "cuda":
+        raise ValueError(
+            "Native GPT-OSS MXFP4 requires explicit CUDA export. Pass "
+            "--execution-provider cuda and --dtype f16 (or bf16); the default/CPU "
+            "provider has no lossless fallback. ORT must be built with FP4 QMoE "
+            "enabled (CUDA >=12.8); pre-Blackwell GPUs such as A100 may require "
+            "the available SM80 fallback/runtime configuration."
+        )
+    if config.dtype not in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16}:
+        raise ValueError(
+            "Native GPT-OSS MXFP4 requires dtype='f16' or 'bf16' with "
+            "--execution-provider cuda. ORT must be built with FP4 QMoE enabled "
+            "(CUDA >=12.8); pre-Blackwell GPUs such as A100 may require the "
+            "available SM80 fallback/runtime configuration."
+        )
 
 
 def _is_qwen4_exp_composite(config) -> bool:
@@ -395,6 +430,10 @@ def build_transformers_model(
             "for the Microsoft W4A16/W8A16 custom-op ABI. Use dtype='f16' or "
             "set keep_quantized=False (--dequantize)."
         )
+    _validate_native_gptoss_build_contract(
+        config,
+        execution_provider=execution_provider,
+    )
     if output_layer_indices is not None:
         config = dataclasses.replace(
             config,
@@ -438,7 +477,18 @@ def build_transformers_model(
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
-        if config.block_quant_scheme is not None and hasattr(
+        if _is_native_gptoss_mxfp4(config):
+            from mobius.integrations.transformers._gptoss_weights import (
+                stream_gptoss_mxfp4_safetensors_to_package,
+            )
+
+            stream_gptoss_mxfp4_safetensors_to_package(
+                package,
+                model_id,
+                config,
+                revision=revision,
+            )
+        elif config.block_quant_scheme is not None and hasattr(
             model_module, "build_fp8_streaming_plan"
         ):
             if len(package) != 1:

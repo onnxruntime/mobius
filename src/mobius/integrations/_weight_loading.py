@@ -16,6 +16,7 @@ from __future__ import annotations
 
 __all__ = [
     "StreamingExpertBankSource",
+    "StreamingTransformedWeightSource",
     "StreamingWeightPlan",
     "StreamingWeightSource",
     "apply_weights",
@@ -33,7 +34,7 @@ import logging
 import math
 import pathlib
 from collections.abc import Callable, Mapping
-from typing import Literal
+from typing import Literal, cast
 
 import onnx_ir as ir
 import safetensors.torch
@@ -60,6 +61,7 @@ _SAFETENSORS_DTYPE_BYTES = {
     "F8_E4M3": 1,
     "F8_E5M2": 1,
     "I64": 8,
+    "U8": 1,
 }
 _SAFETENSORS_TO_IR_DTYPE = {
     "BF16": ir.DataType.BFLOAT16,
@@ -87,12 +89,34 @@ class StreamingExpertBankSource:
 
 
 @dataclasses.dataclass(frozen=True)
+class StreamingTransformedWeightSource:
+    """One source tensor transformed lazily into a differently laid-out target.
+
+    The planner declares the exact source header contract. ``validate_tensor``
+    may cheaply inspect source values during preflight; ``transform`` runs when
+    ONNX external data is serialized, so only one source tensor and one final
+    destination are live at a time.
+    """
+
+    source_name: str
+    expected_source_shape: tuple[int, ...]
+    expected_source_dtype: str
+    transform: Callable[[torch.Tensor, str], torch.Tensor]
+    validate_tensor: Callable[[torch.Tensor, str], None] | None = None
+    scratch_bytes: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
 class StreamingWeightPlan:
     """Complete fail-closed source classification for a streaming export."""
 
-    targets: Mapping[str, StreamingWeightSource | StreamingExpertBankSource]
+    targets: Mapping[
+        str,
+        StreamingWeightSource | StreamingExpertBankSource | StreamingTransformedWeightSource,
+    ]
     ignored: Mapping[str, str] = dataclasses.field(default_factory=dict)
     constants: Mapping[str, torch.Tensor] = dataclasses.field(default_factory=dict)
+    target_constants: Mapping[str, torch.Tensor] = dataclasses.field(default_factory=dict)
     report: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
@@ -124,6 +148,7 @@ def _assign_weight(
 
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
+    assert initializer.shape is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
     if tensor.dtype != target_dtype:
@@ -547,6 +572,7 @@ def _assign_lazy_from_shard(
     """
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
+    assert initializer.shape is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
     def tensor_func(
@@ -626,6 +652,7 @@ def _assign_lazy_preprocessed(
     """Bind a direct or dense-dequantized source with one-tensor working memory."""
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
+    assert initializer.shape is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
 
     def tensor_func(
@@ -644,6 +671,51 @@ def _assign_lazy_preprocessed(
     )
 
 
+def _assign_lazy_transformed(
+    initializer: ir.Value,
+    source: StreamingTransformedWeightSource,
+    key_index: Mapping[str, tuple[str, list[int], str]],
+    target_name: str,
+) -> None:
+    """Bind an architecture callback with a one-source bounded working set."""
+    onnx_dtype = initializer.dtype
+    assert onnx_dtype is not None
+    assert initializer.shape is not None
+    target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
+    target_shape = tuple(cast(int, dim) for dim in initializer.shape)
+    source_path = key_index[source.source_name][0]
+
+    def tensor_func(
+        source_spec: StreamingTransformedWeightSource = source,
+        path: str = source_path,
+        dtype: torch.dtype = target_dtype,
+        shape: tuple[int, ...] = target_shape,
+        name: str = target_name,
+    ) -> tensor_adapters.TorchTensor:
+        with safe_open(path, framework="pt") as handle:
+            source_tensor = handle.get_tensor(source_spec.source_name)
+        transformed = source_spec.transform(source_tensor, source_spec.source_name)
+        del source_tensor
+        if tuple(transformed.shape) != shape:
+            raise ValueError(
+                f"Streaming transform for '{name}' produced shape "
+                f"{tuple(transformed.shape)}; expected {shape}"
+            )
+        if transformed.dtype != dtype:
+            raise TypeError(
+                f"Streaming transform for '{name}' produced dtype "
+                f"{transformed.dtype}; expected {dtype}"
+            )
+        return tensor_adapters.TorchTensor(transformed, name=name)
+
+    initializer.const_value = ir.LazyTensor(
+        tensor_func,
+        dtype=onnx_dtype,
+        shape=ir.Shape(target_shape),
+        name=target_name,
+    )
+
+
 def _assign_lazy_expert_bank(
     initializer: ir.Value,
     source: StreamingExpertBankSource,
@@ -653,8 +725,9 @@ def _assign_lazy_expert_bank(
     """Pack independently scaled expert matrices into one dense rank-3 bank."""
     onnx_dtype = initializer.dtype
     assert onnx_dtype is not None
+    assert initializer.shape is not None
     target_dtype = tensor_adapters.to_torch_dtype(onnx_dtype)
-    target_shape = tuple(int(dim) for dim in initializer.shape)
+    target_shape = tuple(cast(int, dim) for dim in initializer.shape)
 
     def tensor_func(
         source_spec: StreamingExpertBankSource = source,
@@ -711,7 +784,9 @@ def stream_preprocessed_safetensors_to_model(
     bindings: list[
         tuple[
             ir.Value,
-            StreamingWeightSource | StreamingExpertBankSource,
+            StreamingWeightSource
+            | StreamingExpertBankSource
+            | StreamingTransformedWeightSource,
             str,
         ]
     ] = []
@@ -800,9 +875,42 @@ def stream_preprocessed_safetensors_to_model(
         if initializer.const_value is not None:
             raise ValueError(f"Streaming plan targets constant initializer '{target_name}'")
         assert initializer.dtype is not None
+        assert initializer.shape is not None
         expected_shape = [int(dim) for dim in initializer.shape]
         target_bytes = (math.prod(expected_shape) * initializer.dtype.bitwidth + 7) // 8
-        if isinstance(source, StreamingWeightSource):
+        if isinstance(source, StreamingTransformedWeightSource):
+            if source.source_name not in key_index:
+                raise ValueError(f"Streaming source '{source.source_name}' does not exist")
+            source_path, source_shape, source_dtype = key_index[source.source_name]
+            if tuple(source_shape) != source.expected_source_shape:
+                raise ValueError(
+                    f"Transformed source '{source.source_name}' has shape "
+                    f"{source_shape}; expected {list(source.expected_source_shape)}"
+                )
+            if source_dtype != source.expected_source_dtype:
+                raise ValueError(
+                    f"Transformed source '{source.source_name}' has dtype "
+                    f"{source_dtype}; expected {source.expected_source_dtype}"
+                )
+            source_element_bytes = _SAFETENSORS_DTYPE_BYTES.get(source_dtype)
+            if source_element_bytes is None:
+                raise ValueError(
+                    f"Transformed source '{source.source_name}' has unsupported "
+                    f"byte-size dtype {source_dtype}"
+                )
+            source_bytes = math.prod(source_shape) * source_element_bytes
+            if source.validate_tensor is not None:
+                with safe_open(source_path, framework="pt") as handle:
+                    tensor = handle.get_tensor(source.source_name)
+                source.validate_tensor(tensor, source.source_name)
+                del tensor
+            consumed.add(source.source_name)
+            largest_source_tensor_bytes = max(largest_source_tensor_bytes, source_bytes)
+            largest_reconstruction_working_set_bytes = max(
+                largest_reconstruction_working_set_bytes,
+                source_bytes + target_bytes + source.scratch_bytes,
+            )
+        elif isinstance(source, StreamingWeightSource):
             source_shape, source_bytes, scale_bytes = validate_source(source)
             if expected_shape != source_shape:
                 raise ValueError(
@@ -880,10 +988,27 @@ def stream_preprocessed_safetensors_to_model(
                 f"Deterministic source '{source_name}' does not match the graph constant"
             )
 
+    for target_name, tensor in plan.target_constants.items():
+        initializer = model.graph.initializers.get(target_name)
+        if initializer is None:
+            raise ValueError(f"Streaming plan synthesizes unknown initializer '{target_name}'")
+        if initializer.const_value is not None or target_name in assigned:
+            raise ValueError(
+                f"Streaming plan assigns initializer '{target_name}' more than once"
+            )
+        assert initializer.shape is not None
+        if list(initializer.shape) != list(tensor.shape):
+            raise ValueError(
+                f"Synthesized initializer '{target_name}' has shape "
+                f"{list(tensor.shape)}; expected {list(initializer.shape)}"
+            )
+
     missing_targets = sorted(
         name
         for name, initializer in model.graph.initializers.items()
-        if initializer.const_value is None and name not in assigned
+        if initializer.const_value is None
+        and name not in assigned
+        and name not in plan.target_constants
     )
     if missing_targets:
         raise ValueError(
@@ -897,8 +1022,15 @@ def stream_preprocessed_safetensors_to_model(
             f"streaming plan (e.g. {unclassified[:5]})"
         )
 
+    for target_name, tensor in plan.target_constants.items():
+        initializer = model.graph.initializers[target_name]
+        _assign_weight(initializer, tensor, target_name)
+        assigned.add(target_name)
+
     for initializer, source, target_name in bindings:
-        if isinstance(source, StreamingWeightSource):
+        if isinstance(source, StreamingTransformedWeightSource):
+            _assign_lazy_transformed(initializer, source, key_index, target_name)
+        elif isinstance(source, StreamingWeightSource):
             _assign_lazy_preprocessed(initializer, source, key_index, target_name)
         else:
             _assign_lazy_expert_bank(initializer, source, key_index, target_name)
@@ -911,6 +1043,7 @@ def stream_preprocessed_safetensors_to_model(
         "native_fp8": False,
         "assigned_tensors": len(assigned),
         "validated_constants": len(plan.constants),
+        "synthesized_tensors": len(plan.target_constants),
         "ignored_tensors": len(plan.ignored),
         "largest_source_tensor_bytes": largest_source_tensor_bytes,
         "largest_reconstruction_working_set_bytes": (largest_reconstruction_working_set_bytes),

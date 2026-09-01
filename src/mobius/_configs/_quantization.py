@@ -6,6 +6,19 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
+
+
+class QuantizedWeightFormat(str, enum.Enum):
+    """Storage semantics of quantized checkpoint weights.
+
+    ``INTEGER_AFFINE`` is the existing GPTQ/AWQ/Olive representation. ``MXFP4``
+    denotes native E2M1 codes with one E8M0 scale per 32-value block; it must
+    never be interpreted as affine INT4.
+    """
+
+    INTEGER_AFFINE = "integer_affine"
+    MXFP4 = "mxfp4"
 
 
 @dataclasses.dataclass
@@ -40,6 +53,26 @@ class QuantizationConfig:
     # RTN records this in its own config (``tie_word_embeddings``) and may clear
     # the model's top-level flag, so it is tracked here independently.
     tie_word_embeddings: bool = False
+    # Keep this field last: QuantizationConfig has historically supported
+    # positional construction, so inserting a field earlier would silently
+    # change the meaning of existing callers' arguments.
+    weight_format: QuantizedWeightFormat = QuantizedWeightFormat.INTEGER_AFFINE
+
+    def __post_init__(self) -> None:
+        """Normalize serialized enum values without inferring storage semantics."""
+        if isinstance(self.weight_format, str):
+            try:
+                self.weight_format = QuantizedWeightFormat(self.weight_format)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unknown quantized weight format {self.weight_format!r}; "
+                    f"expected one of {[item.value for item in QuantizedWeightFormat]}"
+                ) from exc
+        elif not isinstance(self.weight_format, QuantizedWeightFormat):
+            raise TypeError(
+                "weight_format must be a QuantizedWeightFormat or its serialized "
+                f"string value, got {type(self.weight_format).__name__}"
+            )
 
     @classmethod
     def from_transformers(cls, hf_config) -> QuantizationConfig | None:
@@ -128,11 +161,19 @@ class QuantizationConfig:
         # fp8 was already routed to the typed blocker above.)
         if method == "fp8":
             return None
+        if method == "mxfp4":
+            return cls(
+                bits=4,
+                group_size=32,
+                quant_method="mxfp4",
+                sym=True,
+                weight_format=QuantizedWeightFormat.MXFP4,
+            )
         return cls(
             bits=qc.get("bits", 4),
             group_size=qc.get("group_size", 128),
             quant_method=method,
-            sym=qc.get("sym", qc.get("symmetric", True)),
+            sym=bool(qc.get("sym", qc.get("symmetric", True))),
             quantize_embeddings=bool(qc.get("embeds", False)),
             quantize_lm_head=bool(qc.get("lm_head", False)),
             quantize_vision=bool(qc.get("quantize_vision", False)),
