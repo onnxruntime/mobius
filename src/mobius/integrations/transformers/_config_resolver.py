@@ -122,11 +122,14 @@ def _try_load_config_json(model_id: str, revision: str | None = None):
 
     model_type = config_dict.get("model_type")
     if not model_type:
-        model_type = _model_type_from_architectures(config_dict.get("architectures"))
+        model_type = _model_type_from_architectures(
+            config_dict.get("architectures")
+        ) or _model_type_from_config_signature(config_dict)
         if not model_type:
             return None
         logger.info(
-            "config.json for %s declares no model_type; inferred '%s' from architectures=%s",
+            "config.json for %s declares no model_type; inferred '%s' "
+            "from architectures=%s or its config schema",
             model_id,
             model_type,
             config_dict.get("architectures"),
@@ -134,6 +137,24 @@ def _try_load_config_json(model_id: str, revision: str | None = None):
         config_dict = {**config_dict, "model_type": model_type}
 
     return _dict_to_pretrained_config(config_dict)
+
+
+def _model_type_from_config_signature(config: dict) -> str | None:
+    """Identify non-Transformers checkpoints with an unambiguous config schema."""
+    transformer = config.get("transformer_config")
+    residual = config.get("residual_block_config")
+    if (
+        config.get("input_patch_len") is not None
+        and config.get("output_patch_len") is not None
+        and config.get("quantiles") is not None
+        and config.get("use_iterative_cpm_revin") is not None
+        and config.get("use_variate_attention") is not None
+        and isinstance(transformer, dict)
+        and isinstance(transformer.get("transformer"), dict)
+        and isinstance(residual, dict)
+    ):
+        return "timesfm3"
+    return None
 
 
 def _model_type_from_architectures(architectures) -> str | None:
