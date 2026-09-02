@@ -14,6 +14,7 @@ import pytest
 import safetensors.torch
 import torch
 from onnx_ir import tensor_adapters
+from onnx_ir.serde import SerdeError
 
 from mobius._builder import build_from_module
 from mobius._configs import QuantizationConfig, QuantizedWeightFormat
@@ -131,6 +132,17 @@ def _save_cross_sharded(state, directory):
     )
 
 
+def _replace_source_shard(state, directory, source_name):
+    index = json.loads((directory / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    filename = weight_map[source_name]
+    shard_names = [name for name, shard in weight_map.items() if shard == filename]
+    safetensors.torch.save_file(
+        {name: state[name] for name in shard_names},
+        str(directory / filename),
+    )
+
+
 def test_cross_shard_pairs_transform_and_bind_final_initializers(tmp_path, monkeypatch):
     config, package, state = _package_and_state()
     _save_cross_sharded(state, tmp_path)
@@ -182,6 +194,85 @@ def test_cross_shard_pairs_transform_and_bind_final_initializers(tmp_path, monke
     global_scales = model.graph.initializers[f"{_ROOT}.fc1_global_scales"].const_value
     assert global_scales is not None
     assert global_scales.dtype == ir.DataType.FLOAT
+
+
+def test_mxfp4_package_save_uses_bounded_serial_serializer(tmp_path, monkeypatch):
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, tmp_path)
+    report = _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(tmp_path), config
+    )
+    calls = []
+
+    def save(
+        model,
+        path,
+        *,
+        external_data,
+        max_shard_size_bytes,
+        callback,
+        max_workers,
+    ):
+        calls.append((external_data, max_shard_size_bytes, max_workers))
+
+    monkeypatch.setattr(ir, "save", save)
+
+    package.save(
+        str(tmp_path / "output"),
+        max_workers=8,
+        progress_bar=False,
+        check_weights=False,
+    )
+
+    assert report["streaming_external_data"] is True
+    assert calls == [("model.onnx.data", 1 << 30, 1)]
+    assert package.weight_loading_report is not None
+    assert package.weight_loading_report["external_data_shard_limit_bytes"] == 1 << 30
+    assert package.weight_loading_report["serializer_max_workers"] == 1
+    assert (
+        "forced to one worker" in package.weight_loading_report["serialization_memory_bound"]
+    )
+
+
+@pytest.mark.parametrize("replacement_byte", [0x00, 0xFE])
+def test_lazy_scale_materialization_accepts_finite_boundaries_byte_exactly(
+    tmp_path, replacement_byte
+):
+    config, package, state = _package_and_state()
+    scale_name = f"{_ROOT}.experts.gate_up_proj_scales"
+    state[scale_name].fill_(0x01)
+    _save_cross_sharded(state, tmp_path)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(package, str(tmp_path), config)
+
+    state[scale_name].fill_(replacement_byte)
+    _replace_source_shard(state, tmp_path, scale_name)
+    output = tmp_path / "output"
+    package.save(str(output), progress_bar=False)
+
+    loaded = ir.load(str(output / "model.onnx"))
+    scales = loaded.graph.initializers[f"{_ROOT}.fc1_scales"].const_value
+    assert scales is not None
+    actual = torch.from_numpy(scales.numpy().view("uint8").copy())
+    torch.testing.assert_close(actual, state[scale_name])
+
+
+def test_lazy_scale_materialization_revalidates_replaced_source_shard(tmp_path):
+    config, package, state = _package_and_state()
+    scale_name = f"{_ROOT}.experts.gate_up_proj_scales"
+    state[scale_name].fill_(0x01)
+    _save_cross_sharded(state, tmp_path)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(package, str(tmp_path), config)
+
+    state[scale_name].fill_(0xFF)
+    _replace_source_shard(state, tmp_path, scale_name)
+
+    with pytest.raises(SerdeError) as exc_info:
+        package.save(str(tmp_path / "output"), progress_bar=False)
+    cause: BaseException = exc_info.value
+    while cause.__cause__ is not None:
+        cause = cause.__cause__
+    assert isinstance(cause, ValueError)
+    assert "0xff (NaN)" in str(cause)
 
 
 @pytest.mark.parametrize("malformation", ["missing_pair", "invalid_scale"])

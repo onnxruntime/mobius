@@ -493,7 +493,7 @@ class TestOnnxShardedSave:
             callback,
             max_workers,
         ):
-            calls.append(max_workers)
+            calls.append((max_shard_size_bytes, max_workers))
 
         monkeypatch.setattr(ir, "save", save)
 
@@ -501,7 +501,7 @@ class TestOnnxShardedSave:
             str(tmp_path), progress_bar=False, check_weights=False
         )
 
-        assert calls == [8]
+        assert calls == [(None, 8)]
 
     def test_forwards_serial_worker_override(self, tmp_path, monkeypatch):
         calls = []

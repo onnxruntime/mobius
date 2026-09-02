@@ -211,6 +211,7 @@ def build_gptoss_mxfp4_streaming_plan(
         report={
             "output_weight_format": "mxfp4",
             "native_mxfp4": True,
+            "streaming_external_data": True,
             "streaming_unit": "one_moe_projection",
             "num_moe_layers": config.num_hidden_layers,
         },

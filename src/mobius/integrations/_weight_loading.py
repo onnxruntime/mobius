@@ -93,8 +93,9 @@ class StreamingTransformedWeightSource:
     """One source tensor transformed lazily into a differently laid-out target.
 
     The planner declares the exact source header contract. ``validate_tensor``
-    may cheaply inspect source values during preflight; ``transform`` runs when
-    ONNX external data is serialized, so only one source tensor and one final
+    may cheaply inspect source values during preflight and is repeated on the
+    bytes loaded immediately before ``transform``. The transform runs when ONNX
+    external data is serialized, so only one source tensor and one final
     destination are live at a time.
     """
 
@@ -694,6 +695,8 @@ def _assign_lazy_transformed(
     ) -> tensor_adapters.TorchTensor:
         with safe_open(path, framework="pt") as handle:
             source_tensor = handle.get_tensor(source_spec.source_name)
+        if source_spec.validate_tensor is not None:
+            source_spec.validate_tensor(source_tensor, source_spec.source_name)
         transformed = source_spec.transform(source_tensor, source_spec.source_name)
         del source_tensor
         if tuple(transformed.shape) != shape:
