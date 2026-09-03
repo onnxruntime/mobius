@@ -14,10 +14,12 @@ than a HuggingFace intermediate.
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import librosa
 import numpy as np
+import onnx_ir as ir
 import pytest
 import torch
 import transformers
@@ -798,14 +800,7 @@ class TestMoonshineStreamingRealWeightParity:
         assert processor.decode(content, skip_special_tokens=True)
 
     def test_float16_cpu_parity_and_transcript(self, real_audio_inputs, real_models):
-        """fp16 keeps full-logit parity and an identical transcript on ORT CPU.
-
-        fp16 on CUDA is semantically exact too, but ORT's CUDA fp16 fused
-        attention kernel zeroes the first encoder frame — the sparsest masked
-        query row, which sees only 4 of 456 keys under the ``(16, 4)`` window.
-        That is an execution-provider defect, not a graph defect: the identical
-        graph is accurate here on CPU, and fp32/bf16 are accurate on CUDA.
-        """
+        """fp16 keeps full-logit parity and an identical transcript on ORT CPU."""
         hf_model, processor, _package, _config = real_models
         package = build(_MODEL_ID, dtype="f16", load_weights=True, revision=_REVISION)
         config = package.config
@@ -854,6 +849,67 @@ class TestMoonshineStreamingRealWeightParity:
         assert len(content) == len(golden)
         assert content == golden
         assert processor.decode(content, skip_special_tokens=True)
+
+    def test_float16_cuda_encoder_first_frame_matches_torch(
+        self, real_audio_inputs, real_models
+    ):
+        """CUDA fp16 preserves the sparse-window first encoder frame."""
+        ort = pytest.importorskip("onnxruntime")
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            pytest.skip("CUDAExecutionProvider is not available")
+        ort.preload_dlls()
+
+        hf_model, _processor, _package, _config = real_models
+        package = build(
+            _MODEL_ID,
+            dtype="f16",
+            load_weights=True,
+            revision=_REVISION,
+            execution_provider="cuda",
+        )
+        with torch.no_grad():
+            expected = hf_model.get_encoder()(
+                input_values=torch.from_numpy(real_audio_inputs["input_values"]),
+                attention_mask=torch.from_numpy(
+                    real_audio_inputs["attention_mask"].astype(np.int64)
+                ),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "encoder.onnx")
+            ir.save(package["encoder"], path)
+            session = ort.InferenceSession(path, providers=["CUDAExecutionProvider"])
+            if session.get_providers()[0] != "CUDAExecutionProvider":
+                pytest.skip("CUDAExecutionProvider could not initialize on this host")
+            outputs = dict(
+                zip(
+                    [output.name for output in session.get_outputs()],
+                    session.run(
+                        None,
+                        {
+                            "input_values": real_audio_inputs["input_values"].astype(
+                                np.float16
+                            ),
+                            "attention_mask": real_audio_inputs["attention_mask"].astype(
+                                np.int64
+                            ),
+                        },
+                    ),
+                )
+            )
+            actual_hidden = outputs["encoder_hidden_states"]
+            actual_mask = outputs["encoder_attention_mask"]
+
+        np.testing.assert_array_equal(
+            actual_mask.astype(bool), expected.attention_mask.numpy()
+        )
+        # The first (16, 4)-window query sees only its four lookahead keys.
+        np.testing.assert_allclose(
+            actual_hidden[:, 0].astype(np.float32),
+            expected.last_hidden_state.numpy()[:, 0],
+            rtol=1e-2,
+            atol=1e-1,
+        )
 
     def test_real_generation_matches_huggingface(self, real_models, real_audio_inputs):
         """Full ONNX pipeline transcribes identically to HuggingFace generate()."""
