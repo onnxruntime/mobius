@@ -1863,7 +1863,8 @@ def test_seq2seq_decoder_synthetic_parity(model_type: str, config_overrides: dic
     )
 
 
-def test_granite_speech5_ctc_synthetic_parity():
+@pytest.mark.parametrize("tie_word_embeddings", [True, False], ids=["tied", "untied"])
+def test_granite_speech5_ctc_synthetic_parity(tie_word_embeddings: bool):
     """L3: compare every padded-batch CTC logit against native Transformers."""
     import transformers
 
@@ -1905,7 +1906,7 @@ def test_granite_speech5_ctc_synthetic_parity():
         encoder_config=encoder_config,
         vocab_size=32,
         pad_token_id=0,
-        tie_word_embeddings=True,
+        tie_word_embeddings=tie_word_embeddings,
     )
     hf_model = transformers.GraniteSpeech5ForCTC(hf_config).float().eval()
     hf_model.tie_weights()

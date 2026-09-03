@@ -140,6 +140,24 @@ def test_granite_speech5_graph_contract_and_weight_names():
     assert op_types.count("Swish") == 3 * config.num_hidden_layers
 
 
+def test_granite_speech5_keeps_untied_ctc_head_weights():
+    _, module, package = _build_tiny(_tiny_config(tie_word_embeddings=False))
+    model = package["model"]
+
+    parameter_names = {
+        name
+        for name, initializer in model.graph.initializers.items()
+        if initializer.const_value is None
+    }
+    assert "encoder.out.weight" in parameter_names
+    assert "ctc_head.weight" in parameter_names
+    assert "ctc_head.bias" in parameter_names
+
+    state_dict = {name: object() for name in parameter_names}
+    state_dict["encoder.layers.0.conv.norm.num_batches_tracked"] = object()
+    assert set(module.preprocess_weights(state_dict)) == parameter_names
+
+
 def test_granite_speech5_audio_processor_forwards_revision(tmp_path, monkeypatch):
     from transformers import AutoFeatureExtractor
 

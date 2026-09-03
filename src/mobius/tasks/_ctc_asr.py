@@ -81,8 +81,10 @@ class FeatureCTCAsrTask(ModelTask):
         ``input_features`` — (batch, frames, feature_size) normalized audio features
         ``attention_mask`` — (batch, frames) valid-frame mask
 
-    Output:
+    Outputs:
         ``logits`` — (batch, subsampled_frames, vocab_size) CTC scores
+        ``frame_lengths`` — (batch,) INT64 valid CTC frames, when the model
+        provides a frame-length calculation
     """
 
     name = "feature-ctc-asr"

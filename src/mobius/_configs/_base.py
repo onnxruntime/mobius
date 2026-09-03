@@ -4812,6 +4812,8 @@ class ParakeetCTCConfig(ArchitectureConfig):
 class GraniteSpeech5CTCConfig(ArchitectureConfig):
     """Configuration for native Hugging Face Granite Speech 5 CTC models."""
 
+    # Match GraniteSpeech5CTCConfig, whose CTC head reuses encoder.out by default.
+    tie_word_embeddings: bool = True
     num_mel_bins: int = 80
     input_feature_size: int = 320
     context_size: int = 128

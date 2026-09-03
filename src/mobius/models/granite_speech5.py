@@ -467,6 +467,13 @@ class GraniteSpeech5ForCTCModel(nn.Module):
         self._dtype = config.dtype
         self._subsample_count = len(config.subsample_layers)
         self.encoder = _GraniteSpeech5Encoder(config)
+        # HF ties the final CTC projection to the encoder's mid-layer
+        # self-conditioning projection only when the config explicitly enables it.
+        self.ctc_head = (
+            None
+            if config.tie_word_embeddings
+            else Linear(config.hidden_size, config.vocab_size, bias=True)
+        )
 
     def forward(
         self,
@@ -481,9 +488,9 @@ class GraniteSpeech5ForCTCModel(nn.Module):
         valid_frames = op.Cast(attention_mask, to=ir.DataType.BOOL)
         hidden_states, _ = self.encoder(op, input_features, valid_frames)
 
-        # The top-level ctc_head is tied to encoder.out in Transformers, so reuse
-        # the same module and initializer for final logits.
-        return self.encoder.out(op, hidden_states)  # (B, floor(T/4), vocab)
+        if self.ctc_head is None:
+            return self.encoder.out(op, hidden_states)  # (B, floor(T/4), vocab)
+        return self.ctc_head(op, hidden_states)  # (B, floor(T/4), vocab)
 
     def frame_lengths(self, op: OpBuilder, attention_mask: ir.Value) -> ir.Value:
         """Return valid CTC frame counts after pairwise block subsampling."""
@@ -498,9 +505,12 @@ class GraniteSpeech5ForCTCModel(nn.Module):
         return lengths
 
     def preprocess_weights(self, state_dict: dict[str, object]) -> dict[str, object]:
-        """Keep native ``encoder.*`` names and remove tied/runtime-only entries."""
+        """Keep native weights and remove only tied/runtime-only entries."""
         return {
             name: value
             for name, value in state_dict.items()
-            if not name.startswith("ctc_head.") and not name.endswith(".num_batches_tracked")
+            if (
+                (self.ctc_head is not None or not name.startswith("ctc_head."))
+                and not name.endswith(".num_batches_tracked")
+            )
         }

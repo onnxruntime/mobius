@@ -57,7 +57,7 @@ def _hf_logits(
     model = transformers.AutoModelForCTC.from_pretrained(
         _MODEL_ID,
         revision=_REVISION,
-        dtype=dtype,
+        torch_dtype=dtype,
     ).eval()
     model.cuda()
     try:
