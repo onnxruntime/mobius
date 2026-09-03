@@ -453,21 +453,12 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     )
 
 
-def _runtime_version_tuple(version: str) -> tuple[int, int, int] | None:
-    match = re.match(r"^([0-9]+)\.([0-9]+)\.([0-9]+)", version)
-    if match is None:
-        return None
-    major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch)
-
-
 def _write_runtime_compatibility(
     output_dir: str,
     *,
     model_type: str,
     runtime_version: str | None,
     pkg: ModelPackage | None = None,
-    capability_warnings: tuple[str, ...] = (),
 ) -> str:
     minimum_versions = {
         "decoder": _GENERIC_DECODER_MIN_VERSION,
@@ -478,32 +469,6 @@ def _write_runtime_compatibility(
         "decoder": list(_GENERIC_DECODER_TESTED_VERSIONS),
         "lfm2": ["0.15.2"],
     }
-    warnings = list(capability_warnings)
-    parsed_version = _runtime_version_tuple(runtime_version) if runtime_version else None
-    if runtime_version is not None and parsed_version is None:
-        warnings.append(
-            f"Requested onnxruntime-genai version {runtime_version!r} is not a recognized "
-            "MAJOR.MINOR.PATCH version; runtime compatibility is unvalidated."
-        )
-    if (
-        minimum_version is not None
-        and parsed_version is not None
-        and parsed_version < minimum_version
-    ):
-        warnings.append(
-            f"Tested runtime support for model type {model_type!r} starts at "
-            f"{'.'.join(map(str, minimum_version))}; requested {runtime_version}."
-        )
-    if capability_warnings or (
-        minimum_version is not None
-        and parsed_version is not None
-        and parsed_version < minimum_version
-    ):
-        validation_status = "unsupported-by-tested-runtime"
-    else:
-        # This writer has runtime-version coverage, not exact package evidence.
-        # A caller with artifact-bound evidence may promote the completed package.
-        validation_status = "unvalidated"
     graph_contract = None
     if pkg is not None:
         graph_contract = {
@@ -521,8 +486,10 @@ def _write_runtime_compatibility(
         "runtime": "onnxruntime-genai",
         "model_type": model_type,
         "requested_version": runtime_version,
-        "runtime_validation_status": validation_status,
-        "warnings": warnings,
+        # Export metadata describes the package's graph contract, not what a
+        # particular downstream runtime version can execute.
+        "runtime_validation_status": "unvalidated",
+        "warnings": [],
         "minimum_version": (
             ".".join(map(str, minimum_version)) if minimum_version is not None else None
         ),
@@ -535,8 +502,6 @@ def _write_runtime_compatibility(
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
         handle.write("\n")
-    for warning in warnings:
-        logger.warning("%s Export continues with faithful graph metadata.", warning)
     return path
 
 
@@ -1884,85 +1849,6 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
-def _runtime_capability_warnings(pkg: ModelPackage) -> tuple[str, ...]:
-    """Describe tested-runtime limitations without making them export gates."""
-    config = getattr(pkg, "config", None)
-    warnings: list[str] = []
-    if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
-        warnings.append(
-            "onnxruntime-genai 0.15.2 cannot represent Qwen4-Exp's explicit "
-            "four-axis position state or heterogeneous per-layer PLE/QSA state "
-            "membership; use the graph's mobius.state_manifest metadata."
-        )
-    if getattr(config, "model_type", None) == "parakeet_ctc":
-        warnings.append(
-            "onnxruntime-genai 0.15.2 does not define a feature-input CTC ASR pipeline."
-        )
-    if getattr(config, "model_type", None) in _GLMASR_MODEL_TYPES:
-        warnings.append(
-            "onnxruntime-genai 0.15.2 does not register a GLM-ASR multimodal model type."
-        )
-    if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
-        model_type = getattr(config, "model_type", "unknown")
-        warnings.append(
-            "onnxruntime-genai 0.15.2 does not support generic vision encoder-decoder "
-            f"packages such as {model_type!r}."
-        )
-    if getattr(config, "model_type", None) == "mage_vl":
-        warnings.append(
-            "onnxruntime-genai 0.15.2 does not support Mage-VL's patch_positions "
-            "vision input and 1D decoder position_ids contract."
-        )
-    decoder_key = "decoder" if "decoder" in pkg else "model"
-    decoder_model = pkg.get(decoder_key)
-    if decoder_model is not None:
-        input_names = [
-            value.name for value in decoder_model.graph.inputs if value.name is not None
-        ]
-        output_names = [
-            value.name for value in decoder_model.graph.outputs if value.name is not None
-        ]
-        input_cache = _cache_names(input_names)
-        output_cache = _cache_names(output_names)
-        unsupported_state_kinds = (set(input_cache) | set(output_cache)) - {
-            "key",
-            "value",
-            "conv_state",
-            "recurrent_state",
-        }
-        if unsupported_state_kinds:
-            warnings.append(
-                "onnxruntime-genai 0.15.2 cannot orchestrate decoder state kinds "
-                f"{sorted(unsupported_state_kinds)}; exact names remain in graph_contract."
-            )
-        if _is_single_model_decoder_package(pkg):
-            cache_input_names = {
-                name
-                for indexed_names in input_cache.values()
-                for name in indexed_names.values()
-            }
-            additional_inputs = set(input_names) - cache_input_names - _DECODER_SEMANTIC_INPUTS
-            if additional_inputs:
-                warnings.append(
-                    "onnxruntime-genai 0.15.2 cannot automatically supply decoder inputs "
-                    f"{sorted(additional_inputs)}; exact names remain in graph_contract."
-                )
-        has_recurrent_state = any(
-            node.op_type == "LinearAttention" and node.domain == "com.microsoft"
-            for node in decoder_model.graph
-        )
-        has_standard_attention = any(
-            node.op_type == "Attention" and node.domain in ("", "ai.onnx")
-            for node in decoder_model.graph
-        )
-        if has_recurrent_state and has_standard_attention:
-            warnings.append(
-                "onnxruntime-genai 0.15.2 cannot orchestrate a shared cache for mixed "
-                "LinearAttention and standard Attention nodes."
-            )
-    return tuple(warnings)
-
-
 def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
     """Return exact local cache port pairs from one target or MTP graph."""
     output_names = {value.name for value in model.graph.outputs if value.name is not None}
@@ -2134,8 +2020,8 @@ def write_ort_genai_config(
             directory rather than a HuggingFace model ID.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
-        runtime_version: Optional onnxruntime-genai version that will consume the
-            package. Generic decoder packages reject versions older than 0.14.0.
+        runtime_version: Optional onnxruntime-genai version recorded in
+            ``runtime_compatibility.json``.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -2157,23 +2043,16 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
-    capability_warnings = _runtime_capability_warnings(pkg)
-
     os.makedirs(directory, exist_ok=True)
     component_names = set(pkg)
     if component_names in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
         pkg, "gguf_projector_type", None
     ):
-        warning = (
-            "The tested onnxruntime-genai runtime cannot orchestrate a standalone GGUF "
-            "audio/speaker sidecar; no genai_config.json was emitted."
-        )
         compatibility_path = _write_runtime_compatibility(
             directory,
             model_type=str(getattr(config, "model_type", "unknown")),
             runtime_version=runtime_version,
             pkg=pkg,
-            capability_warnings=(warning,),
         )
         return {"runtime_compatibility": compatibility_path}
 
@@ -2243,14 +2122,6 @@ def write_ort_genai_config(
                 is_decoder_only=is_decoder_only,
                 rope_type=getattr(config, "rope_type", None),
             )
-        if ort_model_type == "unknown":
-            logger.warning(
-                "Could not determine ORT-GenAI model type: pkg.config.model_type "
-                "is missing, None, or not mapped to an ORT-GenAI type (got %r). "
-                "Pass hf_model_id to resolve it from the HuggingFace config, or "
-                "the generated genai_config.json may not load correctly.",
-                raw_type,
-            )
         # Read token IDs from ArchitectureConfig (populated by from_transformers()
         # when --config is used with a local directory).
         bos_token_id = getattr(config, "bos_token_id", None)
@@ -2284,10 +2155,6 @@ def write_ort_genai_config(
     mtp_path = _write_mtp_config(pkg, directory)
     if mtp_path is not None:
         result["mtp_config"] = mtp_path
-        logger.warning(
-            "Wrote external MTP coordination metadata. The ONNX target and MTP graphs are "
-            "exported, but onnxruntime-genai orchestration remains runtime_unvalidated."
-        )
 
     # Copy tokenizer files. A local hf_model_id is a local model directory, not a
     # Hub repo id; copy directly instead of calling hf_hub_download.
@@ -2337,7 +2204,6 @@ def write_ort_genai_config(
         model_type=ort_model_type,
         runtime_version=runtime_version,
         pkg=pkg,
-        capability_warnings=capability_warnings,
     )
     result["runtime_compatibility"] = compatibility_path
 
