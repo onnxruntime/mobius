@@ -80,11 +80,16 @@ def _source_file(cls: type) -> str:
 
 
 def _class_description(cls: type) -> str:
-    """Extract the full class docstring for the generated model page."""
+    """Extract the first paragraph of the class docstring."""
     doc = inspect.getdoc(cls)
     if not doc:
         return ""
-    return doc
+    lines = []
+    for line in doc.split("\n"):
+        if not line.strip() and lines:
+            break
+        lines.append(line.strip())
+    return " ".join(lines)
 
 
 def _class_details(cls: type) -> str:
