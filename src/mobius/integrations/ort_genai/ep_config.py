@@ -67,6 +67,9 @@ def make_provider_options(
     if ep == "webgpu":
         options["enableGraphCapture"] = "1" if graph_capture else "0"
         options["validationMode"] = "disabled" if graph_capture else "basic"
+    elif ep == "dml" and enable_graph_capture is False:
+        # ORT GenAI enables DML graph capture when this option is omitted.
+        options["enable_graph_capture"] = "0"
     elif ep in ("cuda", "trt-rtx"):
         # CUDA and TRT-RTX (NvTensorRtRtx) use the CUDA-graph option key.
         options["enable_cuda_graph"] = "1" if graph_capture else "0"

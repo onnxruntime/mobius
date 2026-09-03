@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import numpy as np
 import onnx
 import onnx_ir as ir
 import pytest
@@ -87,6 +88,160 @@ def _native_expert_state(layer: str = _LAYER) -> dict[str, torch.Tensor]:
         f"{layer}.router.weight": torch.randn(_E, _H),
         f"{layer}.router.bias": torch.randn(_E),
     }
+
+
+def _make_gqa_parity_model(*, decode: bool) -> onnx.ModelProto:
+    """Create an in-memory FP16 GQA graph for the runtime sink/window parity test."""
+    batch = 2
+    query_length = 1 if decode else 4
+    past_length = 4 if decode else 0
+    total_length = past_length + query_length
+    num_heads = 2
+    num_kv_heads = 1
+    head_dim = 8
+    tensor = onnx.helper.make_tensor_value_info
+    inputs = [
+        tensor("query", onnx.TensorProto.FLOAT16, [batch, query_length, 16]),
+        tensor("key", onnx.TensorProto.FLOAT16, [batch, query_length, 8]),
+        tensor("value", onnx.TensorProto.FLOAT16, [batch, query_length, 8]),
+        tensor(
+            "past_key",
+            onnx.TensorProto.FLOAT16,
+            [batch, num_kv_heads, past_length, head_dim],
+        ),
+        tensor(
+            "past_value",
+            onnx.TensorProto.FLOAT16,
+            [batch, num_kv_heads, past_length, head_dim],
+        ),
+    ]
+    node_inputs = ["query", "key", "value", "past_key", "past_value"]
+    inputs.extend(
+        [
+            tensor("seqlens_k", onnx.TensorProto.INT32, [batch]),
+            tensor("total_sequence_length", onnx.TensorProto.INT32, []),
+            tensor("head_sink", onnx.TensorProto.FLOAT16, [num_heads]),
+        ]
+    )
+    node_inputs.extend(
+        [
+            "seqlens_k",
+            "total_sequence_length",
+            "",  # cos_cache
+            "",  # sin_cache
+            "",  # position_ids
+            "",  # attention_bias
+            "head_sink",
+        ]
+    )
+    node = onnx.helper.make_node(
+        "GroupQueryAttention",
+        node_inputs,
+        ["output", "present_key", "present_value"],
+        domain="com.microsoft",
+        num_heads=num_heads,
+        kv_num_heads=num_kv_heads,
+        scale=head_dim**-0.5,
+        local_window_size=2,
+        do_rotary=0,
+    )
+    outputs = [
+        tensor("output", onnx.TensorProto.FLOAT16, [batch, query_length, 16]),
+        tensor(
+            "present_key",
+            onnx.TensorProto.FLOAT16,
+            [batch, num_kv_heads, total_length, head_dim],
+        ),
+        tensor(
+            "present_value",
+            onnx.TensorProto.FLOAT16,
+            [batch, num_kv_heads, total_length, head_dim],
+        ),
+    ]
+    graph = onnx.helper.make_graph([node], "gptoss_gqa_parity", inputs, outputs)
+    model = onnx.helper.make_model(
+        graph,
+        opset_imports=[
+            onnx.helper.make_opsetid("", 24),
+            onnx.helper.make_opsetid("com.microsoft", 1),
+        ],
+        ir_version=10,
+    )
+    onnx.checker.check_model(model)
+    return model
+
+
+def _manual_sink_attention(
+    query: np.ndarray,
+    key: np.ndarray,
+    value: np.ndarray,
+    head_sink: np.ndarray,
+    *,
+    past_key: np.ndarray,
+    past_value: np.ndarray,
+    sequence_lengths: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Reference sink attention for right-padded cache rows and a local window."""
+    batch, query_length, _ = query.shape
+    num_heads = 2
+    num_kv_heads = 1
+    head_dim = 8
+    query_4d = query.astype(np.float32).reshape(batch, query_length, num_heads, head_dim)
+    query_4d = query_4d.transpose(0, 2, 1, 3)
+    key_4d = key.astype(np.float32).reshape(batch, query_length, num_kv_heads, head_dim)
+    value_4d = value.astype(np.float32).reshape(batch, query_length, num_kv_heads, head_dim)
+    key_4d = key_4d.transpose(0, 2, 1, 3)
+    value_4d = value_4d.transpose(0, 2, 1, 3)
+    past_key = past_key.astype(np.float32)
+    past_value = past_value.astype(np.float32)
+    present_width = past_key.shape[2] + query_length
+    present_key = np.zeros((batch, num_kv_heads, present_width, head_dim), np.float32)
+    present_value = np.zeros_like(present_key)
+    output = np.empty((batch, num_heads, query_length, head_dim), np.float32)
+    is_prefill = past_key.shape[2] == 0
+
+    for batch_index, sequence_length in enumerate(sequence_lengths):
+        past_length = 0 if is_prefill else int(sequence_length) - query_length
+        present_key[batch_index, :, :past_length] = past_key[batch_index, :, :past_length]
+        present_value[batch_index, :, :past_length] = past_value[batch_index, :, :past_length]
+        present_key[batch_index, :, past_length : past_length + query_length] = key_4d[
+            batch_index
+        ]
+        present_value[batch_index, :, past_length : past_length + query_length] = value_4d[
+            batch_index
+        ]
+
+        expanded_key = np.repeat(present_key[batch_index], num_heads // num_kv_heads, axis=0)
+        expanded_value = np.repeat(
+            present_value[batch_index], num_heads // num_kv_heads, axis=0
+        )
+        causal_past_length = 0 if is_prefill else past_length
+        for query_index in range(query_length):
+            visible_length = min(
+                causal_past_length + query_index + 1,
+                int(sequence_length),
+            )
+            window_start = max(0, visible_length - 2)
+            scores = np.einsum(
+                "hd,hkd->hk",
+                query_4d[batch_index, :, query_index],
+                expanded_key[:, window_start:visible_length],
+            )
+            scores *= head_dim**-0.5
+            combined = np.concatenate(
+                [scores, head_sink.astype(np.float32)[:, None]],
+                axis=-1,
+            )
+            probabilities = np.exp(combined - np.max(combined, axis=-1, keepdims=True))
+            probabilities /= np.sum(probabilities, axis=-1, keepdims=True)
+            output[batch_index, :, query_index] = np.einsum(
+                "hk,hkd->hd",
+                probabilities[:, :-1],
+                expanded_value[:, window_start:visible_length],
+            )
+
+    output = output.transpose(0, 2, 1, 3).reshape(batch, query_length, -1)
+    return output, present_key, present_value
 
 
 class TestRepackGPTOSSMXFP4:
@@ -249,7 +404,13 @@ class TestGPTOSSNativeMXFP4Preprocess:
 
     @pytest.mark.parametrize("failure", ["missing_bias", "malformed_bias", "invalid_scale"])
     def test_late_validation_failure_leaves_caller_state_unchanged(self, failure):
-        model = GPTOSSCausalLMModel(_gptoss_config(native_mxfp4=True, num_hidden_layers=2))
+        model = GPTOSSCausalLMModel(
+            _gptoss_config(
+                native_mxfp4=True,
+                num_hidden_layers=2,
+                layer_types=["sliding_attention", "full_attention"],
+            )
+        )
         late_layer = "model.layers.1.mlp"
         state = {**_native_expert_state(), **_native_expert_state(late_layer)}
         if failure == "missing_bias":
@@ -270,7 +431,13 @@ class TestGPTOSSNativeMXFP4Preprocess:
             torch.testing.assert_close(tensor, original_values[key])
 
     def test_wholly_missing_expected_layer_fails_locally_without_mutation(self):
-        model = GPTOSSCausalLMModel(_gptoss_config(native_mxfp4=True, num_hidden_layers=2))
+        model = GPTOSSCausalLMModel(
+            _gptoss_config(
+                native_mxfp4=True,
+                num_hidden_layers=2,
+                layer_types=["sliding_attention", "full_attention"],
+            )
+        )
         state = _native_expert_state()
         original = dict(state)
 
@@ -336,7 +503,7 @@ class TestGPTOSSNativeMXFP4Graph:
 
     @pytest.mark.parametrize("build_dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
     def test_emits_one_qmoe_with_native_inputs_biases_and_semantics(self, build_dtype):
-        config = _gptoss_config(native_mxfp4=True)
+        config = _gptoss_config(native_mxfp4=True, dtype=build_dtype)
         module = GPTOSSCausalLMModel(config)
 
         with build_context(EpCapabilities(name="cuda"), build_dtype):
@@ -388,11 +555,75 @@ class TestGPTOSSNativeMXFP4Graph:
         assert qmoe.inputs[1].producer().op_type == "Reshape"
         assert any(node.op_type == "Add" for node in graph)
 
+    @pytest.mark.parametrize("build_dtype", [ir.DataType.FLOAT16, ir.DataType.BFLOAT16])
+    def test_missing_layer_types_derives_model_builder_gqa_alternation(self, build_dtype):
+        config = _gptoss_config(
+            native_mxfp4=True,
+            num_hidden_layers=4,
+            layer_types=None,
+            sliding_window=17,
+            dtype=build_dtype,
+            rope_type="yarn",
+            rope_scaling={
+                "rope_type": "yarn",
+                "factor": 2.0,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 16,
+            },
+        )
+
+        with build_context(EpCapabilities(name="cuda"), build_dtype):
+            graph = CausalLMTask().build(GPTOSSCausalLMModel(config), config)["model"].graph
+
+        gqa_nodes = [node for node in graph if node.op_type == "GroupQueryAttention"]
+        assert len(gqa_nodes) == config.num_hidden_layers
+        assert all(node.domain == "com.microsoft" for node in gqa_nodes)
+        for node in gqa_nodes:
+            attrs = {name: attr.value for name, attr in node.attributes.items()}
+            assert attrs["num_heads"] == config.num_attention_heads
+            assert attrs["kv_num_heads"] == config.num_key_value_heads
+            assert attrs["scale"] == pytest.approx(config.head_dim**-0.5)
+            assert attrs["do_rotary"] == 0
+            assert len(node.inputs) == 12
+            assert node.inputs[0].producer().op_type == "RotaryEmbedding"
+            assert node.inputs[0].producer().inputs[0].producer().op_type == "Add"
+            assert node.inputs[1].producer().op_type == "RotaryEmbedding"
+            assert node.inputs[1].producer().inputs[0].producer().op_type == "Add"
+            assert node.inputs[2].producer().op_type == "Add"
+            assert node.inputs[5].dtype == ir.DataType.INT32
+            assert node.inputs[5].producer().inputs[0].producer().op_type == "Sub"
+            assert node.inputs[6].dtype == ir.DataType.INT32
+            assert node.inputs[6].producer().inputs[0].producer().op_type == "Gather"
+            assert all(value is None for value in node.inputs[7:11])
+            assert node.inputs[11] is not None
+            assert node.inputs[11].dtype == build_dtype
+            assert node.inputs[11].producer().inputs[0].name.endswith(".self_attn.sinks")
+
+        for layer_id, node in enumerate(gqa_nodes):
+            if layer_id % 2 == 0:
+                assert node.attributes["local_window_size"].as_int() == 17
+            else:
+                assert "local_window_size" not in node.attributes
+        assert sum(name.endswith(".self_attn.sinks") for name in graph.initializers) == 4
+        cache_outputs = [value for value in graph.outputs if value.name != "logits"]
+        assert all(
+            value.producer().op_type == "GroupQueryAttention" for value in cache_outputs
+        )
+        # QMoE owns router normalization and GQA owns sink-aware attention:
+        # no manual attention Softmax core can remain in this supported slice.
+        assert not any(node.op_type == "Softmax" for node in graph)
+
     def test_native_ir12_serialization_does_not_bump_unquantized_model(self, tmp_path):
         packages = {}
         with build_context(EpCapabilities(name="cuda"), ir.DataType.FLOAT16):
             for name, native_mxfp4 in (("native", True), ("unquantized", False)):
-                config = _gptoss_config(native_mxfp4=native_mxfp4)
+                config = _gptoss_config(
+                    native_mxfp4=native_mxfp4,
+                    dtype=ir.DataType.FLOAT16,
+                )
                 packages[name] = CausalLMTask().build(GPTOSSCausalLMModel(config), config)
 
         expected_versions = {"native": 12, "unquantized": 11}
@@ -464,8 +695,165 @@ class TestGPTOSSNativeMXFP4Graph:
         assert supported_qmoe_quantization(quantization) is None
         assert linear_class_for_config(config) is None
 
+    @pytest.mark.parametrize("decode", [False, True], ids=["prefill", "decode"])
+    def test_cuda_gqa_matches_manual_sink_attention_with_local_window(self, decode):
+        ort = pytest.importorskip("onnxruntime")
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            pytest.skip("CUDAExecutionProvider is not available")
+        try:
+            session = ort.InferenceSession(
+                _make_gqa_parity_model(decode=decode).SerializeToString(),
+                providers=["CUDAExecutionProvider"],
+            )
+        except Exception as error:
+            pytest.skip(f"CUDAExecutionProvider could not initialize: {error}")
+        if session.get_providers()[0] != "CUDAExecutionProvider":
+            pytest.skip("CUDAExecutionProvider could not initialize on this host")
+
+        rng = np.random.default_rng(5 if decode else 4)
+        query_length = 1 if decode else 4
+        query = rng.normal(size=(2, query_length, 16)).astype(np.float16)
+        key = rng.normal(size=(2, query_length, 8)).astype(np.float16)
+        value = rng.normal(size=(2, query_length, 8)).astype(np.float16)
+        sequence_lengths = np.array([5, 3] if decode else [4, 2], dtype=np.int32)
+        if not decode:
+            query[1, 2:] = 0
+            key[1, 2:] = 0
+            value[1, 2:] = 0
+        # Both heads have nonzero sink logits, including opposite signs.
+        head_sink = np.array([-0.4, 0.7], dtype=np.float16)
+        if decode:
+            past_key = rng.normal(size=(2, 1, 4, 8)).astype(np.float16)
+            past_value = rng.normal(size=(2, 1, 4, 8)).astype(np.float16)
+            past_key[1, :, 2:] = 0
+            past_value[1, :, 2:] = 0
+        else:
+            # ORT GenAI's emitted prefill ABI supplies cache inputs with a
+            # zero-width sequence axis rather than omitting optional inputs.
+            past_key = np.empty((2, 1, 0, 8), dtype=np.float16)
+            past_value = np.empty((2, 1, 0, 8), dtype=np.float16)
+        feeds = {
+            "query": query,
+            "key": key,
+            "value": value,
+            "past_key": past_key,
+            "past_value": past_value,
+            "seqlens_k": sequence_lengths - 1,
+            "total_sequence_length": np.array(5 if decode else 4, dtype=np.int32),
+            "head_sink": head_sink,
+        }
+
+        actual_output, actual_key, actual_value = session.run(None, feeds)
+        expected_output, expected_key, expected_value = _manual_sink_attention(
+            query,
+            key,
+            value,
+            head_sink,
+            past_key=past_key,
+            past_value=past_value,
+            sequence_lengths=sequence_lengths,
+        )
+
+        for batch_index, sequence_length in enumerate(sequence_lengths):
+            valid_query_length = query_length if decode else int(sequence_length)
+            np.testing.assert_allclose(
+                actual_output[batch_index, :valid_query_length],
+                expected_output[batch_index, :valid_query_length],
+                atol=1e-3,
+                rtol=1e-3,
+            )
+            np.testing.assert_allclose(
+                actual_key[batch_index, :, :sequence_length],
+                expected_key[batch_index, :, :sequence_length],
+                atol=1e-3,
+                rtol=1e-3,
+            )
+            np.testing.assert_allclose(
+                actual_value[batch_index, :, :sequence_length],
+                expected_value[batch_index, :, :sequence_length],
+                atol=1e-3,
+                rtol=1e-3,
+            )
+
 
 class TestGPTOSSUnquantized:
+    def test_missing_layer_types_uses_model_builder_alternation(self):
+        model = GPTOSSCausalLMModel(
+            _gptoss_config(
+                num_hidden_layers=4,
+                layer_types=None,
+                sliding_window=17,
+            )
+        )
+
+        assert model.model._layer_types == [
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        assert [layer.self_attn.local_window_size for layer in model.model.layers] == [
+            17,
+            -1,
+            17,
+            -1,
+        ]
+
+    def test_rejects_explicit_empty_layer_types(self):
+        config = _gptoss_config(
+            num_hidden_layers=2,
+            layer_types=[],
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"exactly one layer_types entry.*got 0 for num_hidden_layers=2",
+        ):
+            GPTOSSCausalLMModel(config)
+
+    def test_rejects_layer_types_length_mismatch(self):
+        config = _gptoss_config(
+            num_hidden_layers=2,
+            layer_types=["sliding_attention"],
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"exactly one layer_types entry.*got 1 for num_hidden_layers=2",
+        ):
+            GPTOSSCausalLMModel(config)
+
+    def test_rejects_unknown_layer_type(self):
+        config = _gptoss_config(layer_types=["slidding_attention"])
+
+        with pytest.raises(
+            ValueError,
+            match=r"only supports sliding_attention and full_attention.*slidding_attention",
+        ):
+            GPTOSSCausalLMModel(config)
+
+    @pytest.mark.parametrize("sliding_window", [None, 0, -1])
+    def test_rejects_non_positive_sliding_window(self, sliding_window):
+        config = _gptoss_config(sliding_window=sliding_window)
+
+        with pytest.raises(ValueError, match="require a positive sliding_window"):
+            GPTOSSCausalLMModel(config)
+
+    def test_missing_layer_types_requires_positive_sliding_window(self):
+        config = _gptoss_config(layer_types=None, sliding_window=None)
+
+        with pytest.raises(ValueError, match="require a positive sliding_window"):
+            GPTOSSCausalLMModel(config)
+
+    def test_cuda_full_precision_fallback_keeps_decomposed_attention(self):
+        config = _gptoss_config()
+
+        with build_context(EpCapabilities(name="cuda"), ir.DataType.FLOAT16):
+            graph = CausalLMTask().build(GPTOSSCausalLMModel(config), config)["model"].graph
+
+        assert not any(node.op_type == "GroupQueryAttention" for node in graph)
+        assert any(node.op_type == "Softmax" for node in graph)
+
     def test_full_precision_experts_still_use_dense_loop_and_split_weights(self):
         config = _gptoss_config()
         model = GPTOSSCausalLMModel(config)

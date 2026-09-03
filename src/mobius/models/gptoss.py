@@ -45,6 +45,33 @@ _MXFP4_REPACK_OUTPUT_PAIRS_PER_CHUNK = 64
 _MXFP4_SCALE_VALIDATION_ELEMENTS_PER_CHUNK = 1 << 20
 
 
+def _is_native_mxfp4(config: ArchitectureConfig) -> bool:
+    quantization = config.quantization
+    return bool(
+        quantization is not None and quantization.weight_format is QuantizedWeightFormat.MXFP4
+    )
+
+
+def _gqa_kv_lengths(op: OpBuilder, attention_mask: ir.Value) -> tuple[ir.Value, ir.Value]:
+    """Build GQA lengths from a right-padded decoder mask and dense cache.
+
+    ``seqlens_k`` is the zero-based index of each row's last valid token,
+    while ``total_sequence_length`` is the shared padded width. This assumes
+    valid tokens and cached states precede padding; left-padded inputs are not
+    supported by this conversion.
+    """
+    one_i64 = op.Constant(value_int=1)
+    seqlens_k = op.Cast(
+        op.Sub(op.ReduceSum(attention_mask, [1], keepdims=0), one_i64),
+        to=ir.DataType.INT32,
+    )
+    total_sequence_length = op.Cast(
+        op.Gather(op.Shape(attention_mask), 1),
+        to=ir.DataType.INT32,
+    )
+    return seqlens_k, total_sequence_length
+
+
 def repack_gptoss_mxfp4_blocks(blocks: torch.Tensor) -> torch.Tensor:
     """Losslessly repack GPT-OSS MXFP4 codes for QMoE.
 
@@ -364,11 +391,7 @@ class _GptOssMoELayer(nn.Module):
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.gate = _GptOssGate(config.hidden_size, self.num_experts, self.top_k)
-        quantization = config.quantization
-        native_mxfp4 = bool(
-            quantization is not None
-            and quantization.weight_format is QuantizedWeightFormat.MXFP4
-        )
+        native_mxfp4 = _is_native_mxfp4(config)
         if native_mxfp4:
             if config.disable_qmoe:
                 raise ValueError(
@@ -531,10 +554,12 @@ class _GptOssAttention(nn.Module):
         probs    = softmax(combined, dim=-1)[..., :-1]           # drop sink, [B, H, S, S_kv]
         out      = probs @ V
 
-    Implements this manually (cannot use fused op.Attention with sinks).
+    Native MXFP4 CUDA builds use ``com.microsoft::GroupQueryAttention`` and
+    its ``head_sink`` input. Portable/full-precision builds retain the
+    equivalent decomposed formulation.
     """
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, local_window_size: int = -1):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
@@ -542,6 +567,8 @@ class _GptOssAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_kv_groups = config.num_attention_heads // config.num_key_value_heads
         self.scale = config.head_dim**-0.5
+        self._use_direct_gqa = _is_native_mxfp4(config)
+        self.local_window_size = local_window_size
         partial_rotary_factor = config.partial_rotary_factor
         if partial_rotary_factor is None:
             raise ValueError("GPT-OSS requires partial_rotary_factor")
@@ -576,6 +603,50 @@ class _GptOssAttention(nn.Module):
 
         # Learnable sink logit: one scalar per attention head [num_heads]
         self.sinks = nn.Parameter([config.num_attention_heads])
+
+    def _forward_gqa(
+        self,
+        op: OpBuilder,
+        query: ir.Value,
+        key: ir.Value,
+        value: ir.Value,
+        past_key_value: tuple | None,
+        gqa_lengths: tuple[ir.Value, ir.Value],
+    ):
+        """Emit sink-aware GQA over explicitly YaRN-rotated Q/K tensors."""
+        past_key = past_key_value[0] if past_key_value is not None else None
+        past_value = past_key_value[1] if past_key_value is not None else None
+        seqlens_k, total_sequence_length = gqa_lengths
+        attributes: dict = {
+            "num_heads": self.num_attention_heads,
+            "kv_num_heads": self.num_key_value_heads,
+            "scale": self.scale,
+            # GPT-OSS keeps Mobius's explicit YaRN implementation above. The
+            # full RoPE caches and position_ids are therefore intentionally
+            # absent from this GQA call.
+            "do_rotary": 0,
+        }
+        if self.local_window_size > 0:
+            attributes["local_window_size"] = self.local_window_size
+
+        output, present_key, present_value = op.GroupQueryAttention(
+            query,
+            key,
+            value,
+            past_key,
+            past_value,
+            seqlens_k,
+            total_sequence_length,
+            None,  # cos_cache
+            None,  # sin_cache
+            None,  # position_ids
+            None,  # attention_bias: GQA applies causal/padding masking from lengths
+            op.Cast(self.sinks, to=get_build_dtype()),  # head_sink
+            _domain="com.microsoft",
+            _outputs=3,
+            **attributes,
+        )
+        return self.o_proj(op, output), (present_key, present_value)
 
     def _expand_kv_for_gqa(
         self,
@@ -617,11 +688,8 @@ class _GptOssAttention(nn.Module):
         attention_bias: ir.Value | None,
         position_embeddings: tuple | None = None,
         past_key_value: tuple | None = None,
+        gqa_lengths: tuple[ir.Value, ir.Value] | None = None,
     ):
-        # hidden_states: [B, S, H]
-        batch_1d = op.Shape(hidden_states, start=0, end=1)  # 1D tensor containing B
-        seq_1d = op.Shape(hidden_states, start=1, end=2)  # 1D tensor containing S
-
         # QKV projections: [B, S, heads * d]
         query = self.q_proj(op, hidden_states)
         key = self.k_proj(op, hidden_states)
@@ -645,6 +713,25 @@ class _GptOssAttention(nn.Module):
                 rotary_embedding_dim=self._rotary_embedding_dim,
                 interleaved=self._rope_interleave,
             )
+
+        if self._use_direct_gqa:
+            if gqa_lengths is None:
+                raise ValueError(
+                    "Native GPT-OSS MXFP4 attention requires an attention_mask "
+                    "to derive GroupQueryAttention sequence lengths."
+                )
+            return self._forward_gqa(
+                op,
+                query,
+                key,
+                value,
+                past_key_value,
+                gqa_lengths,
+            )
+
+        # Portable decomposed attention starts by materializing dynamic shapes.
+        batch_1d = op.Shape(hidden_states, start=0, end=1)  # 1D tensor containing B
+        seq_1d = op.Shape(hidden_states, start=1, end=2)  # 1D tensor containing S
 
         # Reshape to 4D and transpose: [B, S, heads, d] → [B, heads, S, d]
         query = op.Transpose(
@@ -729,9 +816,9 @@ class _GptOssAttention(nn.Module):
 class _GptOssDecoderLayer(nn.Module):
     """GPT-OSS decoder layer: pre-norm attention (with sinks) + pre-norm MoE FFN."""
 
-    def __init__(self, config: ArchitectureConfig):
+    def __init__(self, config: ArchitectureConfig, local_window_size: int = -1):
         super().__init__()
-        self.self_attn = _GptOssAttention(config)
+        self.self_attn = _GptOssAttention(config, local_window_size=local_window_size)
         self.mlp = _GptOssMoELayer(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -743,12 +830,18 @@ class _GptOssDecoderLayer(nn.Module):
         attention_bias: ir.Value | None,
         position_embeddings: tuple,
         past_key_value: tuple | None,
+        gqa_lengths: tuple[ir.Value, ir.Value] | None,
     ):
         # Pre-norm attention block
         residual = hidden_states
         hidden_states = self.input_layernorm(op, hidden_states)
         attn_out, present_kv = self.self_attn(
-            op, hidden_states, attention_bias, position_embeddings, past_key_value
+            op,
+            hidden_states,
+            attention_bias,
+            position_embeddings,
+            past_key_value,
+            gqa_lengths,
         )
         hidden_states = op.Add(residual, attn_out)
 
@@ -767,13 +860,53 @@ class _GptOssTextModel(nn.Module):
     def __init__(self, config: ArchitectureConfig):
         super().__init__()
         self._dtype = config.dtype
-        self._layer_types = config.layer_types  # list of 'sliding_attention'/'full_attention'
+        configured_layer_types = getattr(config, "layer_types", None)
+        if configured_layer_types is None:
+            normalized_layer_types = [
+                "sliding_attention" if layer_id % 2 == 0 else "full_attention"
+                for layer_id in range(config.num_hidden_layers)
+            ]
+        else:
+            normalized_layer_types = list(configured_layer_types)
+        if len(normalized_layer_types) != config.num_hidden_layers:
+            raise ValueError(
+                "GPT-OSS requires exactly one layer_types entry per decoder layer, "
+                f"got {len(normalized_layer_types)} for num_hidden_layers="
+                f"{config.num_hidden_layers}."
+            )
+        unsupported = sorted(
+            set(normalized_layer_types) - {"sliding_attention", "full_attention"}
+        )
+        if unsupported:
+            raise ValueError(
+                "GPT-OSS only supports sliding_attention and full_attention layer "
+                f"types, got {unsupported}."
+            )
+        self._layer_types = normalized_layer_types
         self._sliding_window = config.sliding_window
+        if "sliding_attention" in self._layer_types and (
+            self._sliding_window is None or self._sliding_window <= 0
+        ):
+            raise ValueError(
+                "GPT-OSS sliding-attention layers require a positive sliding_window."
+            )
+        self._use_direct_gqa = _is_native_mxfp4(config)
         self.embed_tokens = Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [_GptOssDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [
+                _GptOssDecoderLayer(
+                    config,
+                    local_window_size=(
+                        int(self._sliding_window)
+                        if layer_type == "sliding_attention"
+                        and self._sliding_window is not None
+                        else -1
+                    ),
+                )
+                for layer_type in self._layer_types
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         rotary_emb = initialize_rope(config)
@@ -791,33 +924,48 @@ class _GptOssTextModel(nn.Module):
     ):
         hidden_states = self.embed_tokens(op, input_ids)
         position_embeddings = self.rotary_emb(op, position_ids)
+        if self._use_direct_gqa:
+            if attention_mask is None:
+                raise ValueError(
+                    "Native GPT-OSS MXFP4 requires attention_mask for direct "
+                    "GroupQueryAttention export."
+                )
+            gqa_lengths = _gqa_kv_lengths(op, attention_mask)
+        else:
+            gqa_lengths = None
 
-        # Create attention biases (full and sliding window) for dynamic dispatch
-        full_attn_bias = (
-            create_attention_bias(
-                op,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                dtype=self._dtype,
+        # Biases are only consumed by the portable decomposed path. Direct GQA
+        # carries causal/padding semantics in its sequence-length inputs and
+        # local attention in the per-layer local_window_size attribute.
+        if self._use_direct_gqa:
+            full_attn_bias = None
+            sliding_attn_bias = None
+        else:
+            full_attn_bias = (
+                create_attention_bias(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    dtype=self._dtype,
+                )
+                if attention_mask is not None
+                else None
             )
-            if attention_mask is not None
-            else None
-        )
-        sliding_attn_bias = None
-        if self._sliding_window is not None and attention_mask is not None:
-            sliding_attn_bias = create_attention_bias(
-                op,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                sliding_window=self._sliding_window,
-                dtype=self._dtype,
-            )
+            sliding_attn_bias = None
+            if self._sliding_window is not None and attention_mask is not None:
+                sliding_attn_bias = create_attention_bias(
+                    op,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    sliding_window=self._sliding_window,
+                    dtype=self._dtype,
+                )
 
         present_key_values = []
         past_kvs = past_key_values or [None] * len(self.layers)
         for i, (layer, past_kv) in enumerate(zip(self.layers, past_kvs)):
             # Select bias: sliding window for 'sliding_attention' layers, full for others
-            layer_type = self._layer_types[i] if self._layer_types else "full_attention"
+            layer_type = self._layer_types[i]
             if layer_type == "sliding_attention" and sliding_attn_bias is not None:
                 attn_bias = sliding_attn_bias
             else:
@@ -829,6 +977,7 @@ class _GptOssTextModel(nn.Module):
                 attention_bias=attn_bias,
                 position_embeddings=position_embeddings,
                 past_key_value=past_kv,
+                gqa_lengths=gqa_lengths,
             )
             present_key_values.append(present_kv)
 
@@ -877,10 +1026,7 @@ class GPTOSSCausalLMModel(CausalLMModel):
         Their E2M1 nibbles are losslessly rearranged for QMoE, while E8M0 scale
         bytes are reinterpreted as FLOAT8E8M0 without numerical conversion.
         """
-        native_mxfp4 = bool(
-            self.config.quantization is not None
-            and self.config.quantization.weight_format is QuantizedWeightFormat.MXFP4
-        )
+        native_mxfp4 = _is_native_mxfp4(self.config)
         mxfp4_blocks = {
             key.removesuffix("_blocks"): key
             for key in state_dict

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from mobius.integrations.ort_genai.ep_config import (
     make_genai_decoder_config,
     make_kv_cache_dim_name,
@@ -43,10 +45,19 @@ class TestMakeProviderOptions:
         finally:
             ep_registry.register(original, overwrite=True)
 
-    def test_dml(self):
-        result = make_provider_options("dml")
+    def test_dml_explicit_false_disables_graph_capture(self):
+        result = make_provider_options("dml", enable_graph_capture=False)
         assert len(result) == 1
-        assert "dml" in result[0]
+        assert result[0]["dml"]["enable_graph_capture"] == "0"
+
+    @pytest.mark.parametrize("enable_graph_capture", [None, True])
+    def test_dml_default_and_true_use_runtime_default(self, enable_graph_capture):
+        result = make_provider_options(
+            "dml",
+            enable_graph_capture=enable_graph_capture,
+        )
+
+        assert result == [{"dml": {}}]
 
     def test_webgpu_default(self):
         # WebGPU registers enable_graph_capture=True, so graph capture is on by

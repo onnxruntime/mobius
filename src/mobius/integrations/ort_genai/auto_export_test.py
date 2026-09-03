@@ -1598,8 +1598,9 @@ class TestExportForOrtGenai:
             model["decoder"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "enable_cuda_graph"
             ]
-            == "1"
+            == "0"
         )
+        assert data["search"]["past_present_share_buffer"] is False
         assert (
             model["vision"]["session_options"]["provider_options"][0]["NvTensorRtRtx"][
                 "enable_cuda_graph"
@@ -4109,6 +4110,36 @@ def test_generic_decoder_schema_is_architecture_and_weight_agnostic(
         "present_value_names": "present.%d.value",
     }
     assert config["search"]["past_present_share_buffer"] is False
+
+
+@pytest.mark.parametrize(
+    ("has_gqa", "share_buffer", "enable_cuda_graph"),
+    [
+        (True, True, "1"),
+        (False, False, "0"),
+    ],
+)
+def test_cuda_decoder_capture_tracks_graph_kv_cache_contract(
+    tmp_path, has_gqa, share_buffer, enable_cuda_graph
+):
+    pkg = _make_fake_llm_pkg("gpt_oss")
+    if has_gqa:
+        pkg["model"].graph.append(
+            ir.Node(
+                op_type="GroupQueryAttention",
+                domain="com.microsoft",
+                inputs=[],
+                num_outputs=1,
+            )
+        )
+
+    result = write_ort_genai_config(pkg, str(tmp_path), ep="cuda")
+    with open(result["genai_config"], encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    cuda_options = config["model"]["decoder"]["session_options"]["provider_options"][0]["cuda"]
+    assert config["search"]["past_present_share_buffer"] is share_buffer
+    assert cuda_options["enable_cuda_graph"] == enable_cuda_graph
 
 
 @pytest.mark.parametrize("runtime_version", ["0.13.0", "unknown-development-build"])
