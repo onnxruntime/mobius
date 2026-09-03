@@ -190,49 +190,6 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 
-#### Moonshine Streaming caller contract
-
-The `moonshine_streaming` export contains an `encoder` and a cached `decoder`.
-It is compatible with FP16 CUDA builds (`execution_provider="cuda"`) as well
-as CPU builds.
-
-The encoder consumes a rolling **raw-audio window**, not precomputed features:
-
-| Tensor | Type | Shape | Meaning |
-|---|---|---|---|
-| `input_values` | graph dtype (`float32` or `float16`) | `(batch, audio_samples)` | Raw 16 kHz waveform. The sample dimension must be a multiple of 80: the model frames 80 samples (5 ms) at a time. |
-| `attention_mask` | `int64` | `(batch, audio_samples)` | `1` for real samples and `0` for right padding. It must match `input_values`. |
-| `encoder_hidden_states` | graph dtype | `(batch, encoder_frames, hidden_size)` | Encoder output for the decoder. |
-| `encoder_attention_mask` | `int64` | `(batch, encoder_frames)` | Downsampled validity mask for encoder frames. |
-
-The causal convolution front end downsamples four 5-ms input frames into each
-encoder frame. Encoder attention has bounded right lookahead, so frames near a
-window's right edge can change after more audio arrives. The pinned tiny
-checkpoint has four layers with a right window of four encoder frames, for a
-maximum 16-frame (320-ms) composed lookahead. The export does not expose a
-stable-frame count; retain that tail when displaying a provisional result.
-
-This is a streaming *architecture*, not a stateful streaming inference API.
-Neither the export nor Hugging Face's `MoonshineStreamingForConditionalGeneration`
-provides encoder cache, encoder offset, `predict`, `commit`, or `finalize`
-inputs/outputs. Each encoder invocation is independent, so callers cannot
-faithfully commit newly stable tokens by chaining ONNX encoder state. The
-supported protocol is to retain the raw waveform, periodically re-run the
-encoder and normal seq2seq decoder for an uncommitted hypothesis, and publish
-the final transcript only after end-of-stream. At end-of-stream, pad the final
-raw window to an 80-sample boundary, set its padding mask entries to zero,
-re-run on the complete buffered waveform, and decode normally; there is no
-separate flush operation or finalization token.
-
-To decode, pass `decoder_input_ids`, the current encoder outputs, and
-`position_ids`, with zero-length `past_key_values.*.{key,value}` tensors for
-the first token. Feed every `present.*.{key,value}` output back as the
-corresponding `past_key_values.*.{key,value}` input for each later token while
-keeping the encoder outputs and mask for that decode fixed. If an application
-chooses to display partial hypotheses, it must compare and de-duplicate those
-ordinary decoded token sequences at the application layer; they are not model
-commit events.
-
 ### Text-to-Speech
 
 | Model Type | Module Class | Task | Example HuggingFace Model |
