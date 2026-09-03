@@ -36,7 +36,7 @@ from mobius.models.granite_swa import (
     GraniteSwaTextModel,
     resolve_layer_rope_theta,
 )
-from mobius.tasks import get_task
+from mobius.tasks import CausalLMTask, get_task
 
 # The pinned ``ibm-granite/granite-swash-2b`` config.json contents at revision
 # af1e3227100b61088eead48389ab5409b5d0e39c, inlined so the extraction test
@@ -294,6 +294,14 @@ class TestModuleStructure:
             output.name for output in graph.outputs if output.name.startswith("hidden_states.")
         ]
         assert hidden_outputs == ["hidden_states.2", "hidden_states.0"]
+
+    def test_static_cache_is_rejected_before_graph_construction(self):
+        config = _tiny_config()
+        module = GraniteSwaCausalLMModel(config)
+        with pytest.raises(
+            ValueError, match="GraniteSwaCausalLMModel does not support static cache"
+        ):
+            CausalLMTask(static_cache=True).build(module, config)
 
     def test_nope_layer_skips_rotary_embedding(self):
         """Three RoPE layers, two RotaryEmbedding nodes each (q, k) = 6, not 8."""

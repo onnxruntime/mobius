@@ -237,6 +237,10 @@ class GraniteSwaCausalLMModel(CausalLMModel):
     # check requires the two to agree, and inheriting CausalLMConfig would
     # silently drop ``layer_rope_theta``.
     config_class: type = GraniteSwaConfig
+    # SinkAttention needs an explicit score matrix to include the virtual sink
+    # in its softmax denominator; the external static-cache Attention path
+    # cannot represent that extra logit.
+    _supports_static_cache: bool = False
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
