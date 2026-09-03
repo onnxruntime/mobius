@@ -162,9 +162,7 @@ tokenizer files to the output directory:
   directory.
 
 For a graph-representable, single-model decoder-only text graph, Mobius emits the
-architecture-neutral `model.type: "decoder"` contract. Validation currently targets
-onnxruntime-genai 0.15.2, but the tested runtime version and registry are evidence,
-not export admission checks.
+architecture-neutral `model.type: "decoder"` contract.
 The graph determines the exact semantic input names, output names, cache templates,
 and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
 architecture names do not need a runtime registry entry.
@@ -186,21 +184,6 @@ which selects `Gpt_Model`, `LFM2_Model`, `WhisperModel`, `MarianModel`,
 its [dedicated runtime model](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/models/qwen_vl_model.cpp).
 The Phi-3 LongRoPE threshold dispatch is in the released
 [`Generator`](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/generators.cpp).
-
-Mobius preserves graph-derived recurrent and heterogeneous state names even when the
-tested runtime cannot orchestrate them. The generated compatibility sidecar records
-the complete component input/output contract and marks such packages
-`unsupported-by-tested-runtime`; the state-manifest work is tracked by
-[#605](https://github.com/onnxruntime/mobius/issues/605).
-
-Each export also writes `runtime_compatibility.json` with
-`runtime_validation_status`, warnings, the requested and tested versions, and the
-graph-derived component contract. `validated` means the exact requested runtime was
-exercised; `unvalidated` means no matching evidence exists; and
-`unsupported-by-tested-runtime` records a known downstream limitation without
-blocking export. GGUF runtime evidence remains an independent exact-artifact matrix.
-Source identity and tokenizer semantic mismatches still fail because they would make
-the package metadata incorrect.
 
 #### Example
 

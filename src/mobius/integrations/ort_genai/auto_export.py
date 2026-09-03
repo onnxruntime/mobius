@@ -164,8 +164,6 @@ _UNWRAPPED_VLM_MODEL_TYPES = {
     "qwen3_5_moe_text": "qwen3_5_moe",
 }
 _LONGROPE_TEXT_TYPES = frozenset({"phi3", "phi3small", "phimoe"})
-_GENERIC_DECODER_MIN_VERSION = (0, 14, 0)
-_GENERIC_DECODER_TESTED_VERSIONS = ("0.15.2",)
 _DECODER_SEMANTIC_INPUTS = frozenset(
     {
         "input_ids",
@@ -436,8 +434,8 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
             _name_template(output_cache["conv_state"], label="present-convolution"),
             _name_template(output_cache["recurrent_state"], label="present-recurrent"),
         }
-        # Preserve graph-derived names in the compatibility sidecar even when a
-        # tested runtime derives different names from the key-cache templates.
+        # Preserve graph-derived names even when a runtime derives different
+        # names from the key-cache templates.
         del (
             expected_input_prefix,
             expected_output_prefix,
@@ -451,58 +449,6 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
         cache_slots=max(all_indices) + 1,
         has_recurrent_state=has_recurrent_state,
     )
-
-
-def _write_runtime_compatibility(
-    output_dir: str,
-    *,
-    model_type: str,
-    runtime_version: str | None,
-    pkg: ModelPackage | None = None,
-) -> str:
-    minimum_versions = {
-        "decoder": _GENERIC_DECODER_MIN_VERSION,
-        "lfm2": (0, 15, 2),
-    }
-    minimum_version = minimum_versions.get(model_type)
-    tested_versions = {
-        "decoder": list(_GENERIC_DECODER_TESTED_VERSIONS),
-        "lfm2": ["0.15.2"],
-    }
-    graph_contract = None
-    if pkg is not None:
-        graph_contract = {
-            name: {
-                "inputs": [
-                    value.name for value in model.graph.inputs if value.name is not None
-                ],
-                "outputs": [
-                    value.name for value in model.graph.outputs if value.name is not None
-                ],
-            }
-            for name, model in pkg.items()
-        }
-    metadata = {
-        "runtime": "onnxruntime-genai",
-        "model_type": model_type,
-        "requested_version": runtime_version,
-        # Export metadata describes the package's graph contract, not what a
-        # particular downstream runtime version can execute.
-        "runtime_validation_status": "unvalidated",
-        "warnings": [],
-        "minimum_version": (
-            ".".join(map(str, minimum_version)) if minimum_version is not None else None
-        ),
-        "tested_versions": tested_versions.get(model_type, []),
-        "uses_main_only_state_groups": False,
-        "heterogeneous_state_manifest": "deferred: https://github.com/onnxruntime/mobius/issues/605",
-        "graph_contract": graph_contract,
-    }
-    path = os.path.join(output_dir, "runtime_compatibility.json")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-        handle.write("\n")
-    return path
 
 
 def _load_generation_config(model_id: str):
@@ -1983,7 +1929,6 @@ def write_ort_genai_config(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
-    runtime_version: str | None = None,
 ) -> dict[str, str]:
     """Generate ORT-GenAI config artifacts for an already-built ModelPackage.
 
@@ -2020,8 +1965,6 @@ def write_ort_genai_config(
             directory rather than a HuggingFace model ID.
         trust_remote_code: Allow custom HuggingFace configuration code when
             resolving token IDs and model type.
-        runtime_version: Optional onnxruntime-genai version recorded in
-            ``runtime_compatibility.json``.
 
     Returns:
         Dict mapping artifact name to file path, e.g.::
@@ -2044,18 +1987,6 @@ def write_ort_genai_config(
             "Diffusion models (which have no config) are not supported."
         )
     os.makedirs(directory, exist_ok=True)
-    component_names = set(pkg)
-    if component_names in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
-        pkg, "gguf_projector_type", None
-    ):
-        compatibility_path = _write_runtime_compatibility(
-            directory,
-            model_type=str(getattr(config, "model_type", "unknown")),
-            runtime_version=runtime_version,
-            pkg=pkg,
-        )
-        return {"runtime_compatibility": compatibility_path}
-
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
     # that carry no EP-specific session options → treat as CPU.
     if ep in ("default", "onnx-standard"):
@@ -2199,13 +2130,6 @@ def write_ort_genai_config(
         has_speech=has_speech,
     )
     result["genai_config"] = genai_path
-    compatibility_path = _write_runtime_compatibility(
-        directory,
-        model_type=ort_model_type,
-        runtime_version=runtime_version,
-        pkg=pkg,
-    )
-    result["runtime_compatibility"] = compatibility_path
 
     # Write processor config for VLMs
     processor_path = _write_vision_processor_config(
@@ -2251,7 +2175,6 @@ def export_package(
     context_length: int = 4096,
     local_config_dir: str | None = None,
     trust_remote_code: bool = False,
-    runtime_version: str | None = None,
     external_data: str = "onnx",
     progress_bar: bool = True,
 ) -> dict[str, str]:
@@ -2295,8 +2218,6 @@ def export_package(
             resolving token IDs and model type.
         revision: Optional immutable HuggingFace revision used for remote
             configuration, tokenizer, and processor requests.
-        runtime_version: Optional onnxruntime-genai version that will consume
-            the package.
         external_data: External-data format passed to :meth:`ModelPackage.save`
             (``"onnx"`` or ``"safetensors"``).
         progress_bar: Whether to show the save progress bar.
@@ -2353,7 +2274,6 @@ def export_package(
         context_length=context_length,
         local_config_dir=local_config_dir,
         trust_remote_code=trust_remote_code,
-        runtime_version=runtime_version,
     )
 
     # 3. Add ONNX paths to the manifest
