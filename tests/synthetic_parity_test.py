@@ -48,9 +48,9 @@ logger = logging.getLogger(__name__)
 
 def test_vibevoice_synthetic_pipeline_parity():
     """Run the dedicated eight-stage continuous-token parity harness."""
-    from mobius.models.vibevoice_test import test_vibevoice_synthetic_stage_parity
+    from mobius.models.vibevoice_test import run_vibevoice_synthetic_stage_parity
 
-    test_vibevoice_synthetic_stage_parity()
+    run_vibevoice_synthetic_stage_parity()
 
 
 # ---------------------------------------------------------------------------

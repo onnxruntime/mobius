@@ -131,7 +131,7 @@ def _zero_conv_cache(
     }
 
 
-def test_vibevoice_synthetic_stage_parity():
+def run_vibevoice_synthetic_stage_parity():
     """Every ONNX boundary matches HF, including ONNX-to-ONNX audio feedback."""
     hf_model, module, package = _make_tiny_models()
     rng = np.random.default_rng(1)
