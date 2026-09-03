@@ -173,7 +173,14 @@ def _resolve_hf_config(hf_config, registration=None):
     owns_composite = (
         registration is not None and getattr(registration, "config_class", None) is not None
     )
-    if hasattr(hf_config, "talker_config"):
+    architectures = getattr(hf_config, "architectures", None) or []
+    if (
+        getattr(hf_config, "model_type", None) == "vibevoice"
+        and architectures == ["VibeVoiceForASRStreamingTraining"]
+        and hasattr(hf_config, "decoder_config")
+    ):
+        hf_config = hf_config.decoder_config
+    elif hasattr(hf_config, "talker_config"):
         talker = hf_config.talker_config
         # Qwen3-Omni talker nests the real model config under text_config
         if hasattr(talker, "text_config"):

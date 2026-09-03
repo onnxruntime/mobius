@@ -242,6 +242,39 @@ def test_vibevoice_asr_checkpoint_index_routes_every_native_tensor_once(tmp_path
     )
 
 
+@pytest.mark.arch_validation
+def test_vibevoice_streaming_asr_pinned_weight_index_routes_every_inference_tensor_once():
+    """Audit streaming-ASR checkpoint routing without downloading its weights."""
+    import json
+
+    from huggingface_hub import hf_hub_download
+
+    from mobius import build
+    from mobius.models.vibevoice import VibeVoiceASRStreamingForConditionalGeneration
+
+    model_id = "microsoft/VibeVoice-ASR-Streaming-7B"
+    revision = "60d858b518b4e19d404af3737f848fc185b30177"
+    with open(
+        hf_hub_download(model_id, "model.safetensors.index.json", revision=revision),
+        encoding="utf-8",
+    ) as handle:
+        checkpoint_names = set(json.load(handle)["weight_map"])
+
+    package = build(model_id, revision=revision, load_weights=False)
+    module = VibeVoiceASRStreamingForConditionalGeneration(package.config)
+    routed = module.preprocess_weights({name: torch.zeros(1) for name in checkpoint_names})
+    parameter_names = _collect_parameter_names(package)
+    intentionally_unused = {
+        name
+        for name in checkpoint_names
+        if name.startswith(module.INTENTIONALLY_UNUSED_WEIGHT_PREFIXES)
+    }
+
+    assert len(checkpoint_names) == len(routed) + len(intentionally_unused)
+    assert parameter_names == set(routed)
+    assert len(intentionally_unused) == 276
+
+
 # ---------------------------------------------------------------------------
 # Causal LM weight alignment
 # ---------------------------------------------------------------------------

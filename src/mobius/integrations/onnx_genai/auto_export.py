@@ -769,7 +769,7 @@ def _looks_like_vibevoice_tts(pkg: Any) -> bool:
     } <= names
 
 
-def _looks_like_vibevoice_asr(pkg: Any) -> bool:
+def _looks_like_vibevoice_offline_asr(pkg: Any) -> bool:
     """Detect the offline VibeVoice-ASR dual-encoder component topology."""
     try:
         names = set(pkg.keys())
@@ -782,6 +782,23 @@ def _looks_like_vibevoice_asr(pkg: Any) -> bool:
         "embedding",
         "decoder",
     } <= names
+
+
+def _looks_like_vibevoice_streaming_asr(pkg: Any) -> bool:
+    """Detect the stateful three-stage VibeVoice streaming-ASR topology."""
+    try:
+        if set(pkg.keys()) != {"audio_encoder", "embedding", "decoder"}:
+            return False
+        audio_inputs = {value.name for value in pkg["audio_encoder"].graph.inputs}
+    except AttributeError:
+        return False
+    return {
+        "speech_tensors",
+        "speech_masks",
+        "is_final_chunk",
+        "past_acoustic_conv.0",
+        "past_semantic_conv.0",
+    } <= audio_inputs
 
 
 def _write_vibevoice_asr_processor_contract(output_dir: str, config: Any) -> str:
@@ -1039,6 +1056,39 @@ def write_onnx_genai_config(
             "runtime configuration is claimed."
         )
         return _write_advisory_component_contract(pkg, output_dir, warning=warning)
+    if _looks_like_vibevoice_streaming_asr(pkg):
+        if kv_native_dtype is not None:
+            raise ValueError(
+                "workflow VibeVoice streaming ASR export derives KV and convolution state "
+                "dtypes from ONNX ports; kv_native_dtype overrides are unsupported"
+            )
+        artifacts = _write_text_runtime_assets(output_dir, source, revision=revision)
+        artifacts.update(
+            _copy_runtime_assets(
+                output_dir,
+                source,
+                ("processor_config.json", "preprocessor_config.json", "generation_config.json"),
+                revision=revision,
+            )
+        )
+        audio_processor_path = _write_hf_audio_processor(output_dir, source, revision=revision)
+        if audio_processor_path is not None:
+            artifacts["audio_processor"] = audio_processor_path
+        artifacts.update(
+            _write_advisory_component_contract(
+                pkg,
+                output_dir,
+                warning=(
+                    "The tested onnx-genai runtime cannot orchestrate VibeVoice streaming "
+                    "ASR's dual causal convolution states, flattened speech-placeholder "
+                    "replacement with arbitrary left-padded attention masks, forced "
+                    "<|text_chunk_end|> control tokens, or host-side hotword and speaker "
+                    "JSON handling. Exact graph and pinned processor contracts are exported "
+                    "without claiming downstream runtime support."
+                ),
+            )
+        )
+        return artifacts
     decoder = pkg.get("decoder") or pkg.get("model")
     decoder_inputs = (
         {value.name for value in decoder.graph.inputs} if decoder is not None else set()
@@ -1376,7 +1426,7 @@ def write_onnx_genai_config(
         )
         return artifacts
 
-    if _looks_like_vibevoice_asr(pkg):
+    if _looks_like_vibevoice_offline_asr(pkg):
         if kv_native_dtype is not None:
             raise ValueError(
                 "VibeVoice-ASR derives KV and convolution state dtypes from ONNX ports; "

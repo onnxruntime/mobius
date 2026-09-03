@@ -5,16 +5,25 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
+import onnx_ir as ir
 import pytest
 import torch
 
 from mobius._builder import build_from_module
-from mobius._configs import VibeVoiceASRConfig
+from mobius._configs import (
+    VibeVoiceASRConfig,
+    VibeVoiceASRStreamingConfig,
+    VibeVoiceTokenizerConfig,
+)
 from mobius._model_package import ModelPackage
+from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
-from mobius.tasks import VibeVoiceASRTask
+from mobius.models.vibevoice import VibeVoiceASRStreamingForConditionalGeneration
+from mobius.tasks import VibeVoiceASRStreamingTask, VibeVoiceASRTask
 
 
 def _make_tiny_hf_config():
@@ -224,3 +233,70 @@ def test_staged_asr_matches_transformers_with_batch_chunking_and_left_padding():
         },
     )
     np.testing.assert_allclose(decoded["logits"], source_logits, rtol=3e-4, atol=3e-5)
+
+
+def _streaming_config() -> VibeVoiceASRStreamingConfig:
+    tokenizer = VibeVoiceTokenizerConfig(
+        hidden_size=4,
+        kernel_size=3,
+        num_filters=4,
+        downsampling_ratios=[2, 2],
+        depths=[1, 1, 1],
+        ffn_expansion=2,
+        vae_std=0.5,
+    )
+    return VibeVoiceASRStreamingConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=64,
+        max_position_embeddings=128,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        attn_qkv_bias=True,
+        rope_type="default",
+        acoustic_tokenizer=tokenizer,
+        semantic_tokenizer=dataclasses.replace(
+            tokenizer, hidden_size=6, std_dist_type="none"
+        ),
+    )
+
+
+def test_streaming_asr_stage_contract_and_registration():
+    """Keep streaming ASR's three-stage ABI distinct from offline native ASR."""
+    config = _streaming_config()
+    package = VibeVoiceASRStreamingTask().build(
+        VibeVoiceASRStreamingForConditionalGeneration(config), config
+    )
+
+    assert set(package) == {"audio_encoder", "embedding", "decoder"}
+    audio_inputs = {value.name for value in package["audio_encoder"].graph.inputs}
+    assert {
+        "speech_tensors",
+        "speech_masks",
+        "acoustic_sample_noise",
+        "acoustic_latent_noise",
+        "is_final_chunk",
+        "past_acoustic_conv.0",
+        "past_semantic_conv.0",
+    } <= audio_inputs
+    decoder_nodes = list(
+        build_from_module(
+            VibeVoiceASRStreamingForConditionalGeneration(
+                dataclasses.replace(config, dtype=ir.DataType.FLOAT16)
+            ),
+            dataclasses.replace(config, dtype=ir.DataType.FLOAT16),
+            task=VibeVoiceASRStreamingTask(),
+            execution_provider="cuda",
+        )["decoder"].graph.all_nodes()
+    )
+    assert any(node.op_type == "Attention" for node in decoder_nodes)
+    assert not any(node.op_type == "GroupQueryAttention" for node in decoder_nodes)
+
+    registration = registry.get_registration("VibeVoiceForASRStreamingTraining")
+    assert registration.module_class is VibeVoiceASRStreamingForConditionalGeneration
+    assert registration.task == "vibevoice-asr-streaming"
+    assert registration.config_class is VibeVoiceASRStreamingConfig

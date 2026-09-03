@@ -19,6 +19,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import (
+    VibeVoiceASRStreamingConfig,
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
     VibeVoiceTokenizerConfig,
@@ -619,6 +620,21 @@ class VibeVoiceMultiModalProjector(nn.Module):
         return self.linear_2(op, hidden_states)
 
 
+class VibeVoiceSpeechConnector(nn.Module):
+    """ASR connector matching the public source ``fc1``/``norm``/``fc2`` weights."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        self.fc1 = Linear(input_dim, output_dim)
+        self.norm = RMSNorm(output_dim, eps=1e-6)
+        self.fc2 = Linear(output_dim, output_dim)
+
+    def forward(self, op: OpBuilder, audio_features: ir.Value):
+        hidden_states = self.fc1(op, audio_features)
+        hidden_states = self.norm(op, hidden_states)
+        return self.fc2(op, hidden_states)
+
+
 class VibeVoiceAcousticProjector(nn.Module):
     """Scale reference latents or accept generated scaled latents, then project."""
 
@@ -1020,4 +1036,179 @@ class VibeVoiceForConditionalGeneration(nn.Module):
                 routed[f"audio_decoder.{suffix}"] = value
             elif key == "lm_head.weight":
                 routed["decoder.lm_head.weight"] = value
+        return routed
+
+
+VIBEVOICE_ASR_STREAMING_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-7B"
+VIBEVOICE_ASR_STREAMING_REVISION = "60d858b518b4e19d404af3737f848fc185b30177"
+VIBEVOICE_ASR_STREAMING_SOURCE_REVISION = "505653d3873b065a488aea551c6ee3dc51d3062f"
+
+
+class VibeVoiceASRStreamingAudioEncoder(nn.Module):
+    """Encode waveform chunks with streaming ASR's two causal tokenizers."""
+
+    def __init__(self, config: VibeVoiceASRStreamingConfig):
+        super().__init__()
+        self.acoustic_tokenizer = VibeVoiceTokenizerEncoder(config.acoustic_tokenizer)
+        self.semantic_tokenizer = VibeVoiceTokenizerEncoder(config.semantic_tokenizer)
+        self.acoustic_connector = VibeVoiceSpeechConnector(
+            config.acoustic_tokenizer.hidden_size,
+            config.hidden_size,
+        )
+        self.semantic_connector = VibeVoiceSpeechConnector(
+            config.semantic_tokenizer.hidden_size,
+            config.hidden_size,
+        )
+        self.acoustic_cache_specs = self.acoustic_tokenizer.cache_specs
+        self.semantic_cache_specs = self.semantic_tokenizer.cache_specs
+        self._acoustic_std_scale = config.acoustic_tokenizer.vae_std / 0.8
+        self._dtype = config.dtype
+
+    def forward(
+        self,
+        op: OpBuilder,
+        speech_tensors: ir.Value,
+        speech_masks: ir.Value,
+        acoustic_sample_noise: ir.Value,
+        acoustic_latent_noise: ir.Value,
+        acoustic_past_conv_states: Sequence[ir.Value],
+        semantic_past_conv_states: Sequence[ir.Value],
+        is_final_chunk: ir.Value,
+    ):
+        # The processor emits mono [batch, samples] waveforms, while tokenizer
+        # convolutions consume [batch, channels, samples].
+        waveform = op.Cast(op.Unsqueeze(speech_tensors, [1]), to=self._dtype)
+        acoustic_mean, acoustic_present = self.acoustic_tokenizer(
+            op, waveform, acoustic_past_conv_states, is_final_chunk
+        )
+        acoustic_std = op.Mul(acoustic_sample_noise, self._acoustic_std_scale)
+        acoustic_latents = op.Add(
+            acoustic_mean,
+            op.Mul(op.Unsqueeze(acoustic_std, [1, 2]), acoustic_latent_noise),
+        )  # (batch, frames, acoustic_dim)
+        semantic_latents, semantic_present = self.semantic_tokenizer(
+            op, waveform, semantic_past_conv_states, is_final_chunk
+        )
+        speech_embeds = op.Add(
+            self.acoustic_connector(op, acoustic_latents),
+            self.semantic_connector(op, semantic_latents),
+        )  # (batch, frames, hidden)
+        speech_indices = op.Transpose(op.NonZero(speech_masks), perm=[1, 0])
+        return op.GatherND(speech_embeds, speech_indices), acoustic_present, semantic_present
+
+
+class VibeVoiceASRStreamingEmbeddingModel(nn.Module):
+    """Replace streaming-ASR speech-placeholder embeddings with encoded frames."""
+
+    def __init__(self, config: VibeVoiceASRStreamingConfig):
+        super().__init__()
+        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        speech_embeds: ir.Value,
+        acoustic_input_mask: ir.Value,
+    ):
+        inputs_embeds = self.embed_tokens(op, input_ids)
+        placeholder_indices = op.Transpose(op.NonZero(acoustic_input_mask), perm=[1, 0])
+        return op.ScatterND(inputs_embeds, placeholder_indices, speech_embeds)
+
+
+class VibeVoiceASRStreamingForConditionalGeneration(nn.Module):
+    """Streaming ASR package for ``VibeVoiceForASRStreamingTraining`` checkpoints.
+
+    Unlike native offline ASR, this architecture executes two cached causal
+    tokenizers and their connectors in one ``audio_encoder`` stage. The host
+    supplies speech masks and reproducible acoustic noise, inserts flattened
+    speech embeddings at placeholder positions, then caches Qwen2 decoding.
+    """
+
+    default_task = "vibevoice-asr-streaming"
+    category = "Speech-to-Text"
+    config_class = VibeVoiceASRStreamingConfig
+
+    INTENTIONALLY_UNUSED_WEIGHT_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "model.acoustic_tokenizer.decoder.",
+    )
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "audio_encoder": (
+            "model.acoustic_tokenizer.encoder",
+            "model.semantic_tokenizer.encoder",
+            "model.acoustic_connector",
+            "model.semantic_connector",
+        ),
+        "embedding": ("model.language_model.embed_tokens",),
+        "decoder": ("model.language_model.layers", "model.language_model.norm", "lm_head"),
+    }
+
+    def __init__(self, config: VibeVoiceASRStreamingConfig):
+        super().__init__()
+        self.config = config
+        self.audio_encoder = VibeVoiceASRStreamingAudioEncoder(config)
+        self.embedding = VibeVoiceASRStreamingEmbeddingModel(config)
+        self.decoder = VibeVoiceDecoderModel(config)
+
+    def forward(self, op: OpBuilder, *args, **kwargs):
+        raise NotImplementedError("VibeVoiceASRStreamingTask exports each ASR stage independently")
+
+    @staticmethod
+    def _encoder_weight_suffix(suffix: str) -> str:
+        """Map source encoder fields to the shared tokenizer hierarchy."""
+        if suffix.startswith("downsample_layers."):
+            _, index_text, zero, remainder = suffix.split(".", maxsplit=3)
+            if zero != "0":
+                raise ValueError(f"Unsupported VibeVoice streaming ASR downsample path: {suffix}")
+            prefix = "stem" if int(index_text) == 0 else f"conv_layers.{int(index_text) - 1}"
+            return f"{prefix}.{remainder}"
+        if suffix.startswith("stages."):
+            _, index_text, remainder = suffix.split(".", maxsplit=2)
+            prefix = "stem.stage" if int(index_text) == 0 else f"conv_layers.{int(index_text) - 1}.stage"
+            return f"{prefix}.{remainder}".replace(".mixer.conv.conv.conv.", ".mixer.conv.")
+        if suffix.startswith("head."):
+            return suffix.replace("head.conv.conv.", "head.conv.")
+        raise ValueError(f"Unsupported VibeVoice streaming ASR encoder weight: {suffix}")
+
+    def preprocess_weights(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Route used streaming-ASR tensors and reject unknown checkpoint fields."""
+        routed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("audio_encoder.") or key.startswith("embedding.") or key.startswith("decoder."):
+                routed[key] = value
+            elif key.startswith("model.acoustic_tokenizer.encoder."):
+                suffix = key.removeprefix("model.acoustic_tokenizer.encoder.")
+                routed[
+                    f"audio_encoder.acoustic_tokenizer.{self._encoder_weight_suffix(suffix)}"
+                ] = value
+            elif key.startswith("model.semantic_tokenizer.encoder."):
+                suffix = key.removeprefix("model.semantic_tokenizer.encoder.")
+                routed[
+                    f"audio_encoder.semantic_tokenizer.{self._encoder_weight_suffix(suffix)}"
+                ] = value
+            elif key.startswith("model.acoustic_connector."):
+                routed[
+                    f"audio_encoder.acoustic_connector.{key.removeprefix('model.acoustic_connector.')}"
+                ] = value
+            elif key.startswith("model.semantic_connector."):
+                routed[
+                    f"audio_encoder.semantic_connector.{key.removeprefix('model.semantic_connector.')}"
+                ] = value
+            elif key.startswith("model.language_model.embed_tokens."):
+                suffix = key.removeprefix("model.language_model.embed_tokens.")
+                routed[f"embedding.embed_tokens.{suffix}"] = value
+                if suffix == "weight" and self.config.tie_word_embeddings:
+                    routed["decoder.lm_head.weight"] = value
+            elif key.startswith("model.language_model.layers.") or key.startswith(
+                "model.language_model.norm."
+            ):
+                routed[f"decoder.{key.removeprefix('model.language_model.')}"] = value
+            elif key == "lm_head.weight":
+                routed["decoder.lm_head.weight"] = value
+            elif key.startswith(self.INTENTIONALLY_UNUSED_WEIGHT_PREFIXES):
+                continue
+            else:
+                raise ValueError(f"Unexpected VibeVoice streaming ASR checkpoint tensor: {key}")
         return routed
