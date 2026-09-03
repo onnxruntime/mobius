@@ -72,13 +72,17 @@ def test_hrm_text_1b_real_weight_prefill_and_decode_parity():
             token_type_ids=torch.from_numpy(prefix_token_type_ids),
             use_cache=True,
         )
-        hf_causal_logits = torch_model(
-            input_ids=torch.from_numpy(input_ids),
-            attention_mask=torch.from_numpy(attention_mask),
-            position_ids=torch.from_numpy(position_ids),
-            token_type_ids=torch.from_numpy(generated_token_type_ids(input_ids)),
-            use_cache=False,
-        ).logits.float().numpy()
+        hf_causal_logits = (
+            torch_model(
+                input_ids=torch.from_numpy(input_ids),
+                attention_mask=torch.from_numpy(attention_mask),
+                position_ids=torch.from_numpy(position_ids),
+                token_type_ids=torch.from_numpy(generated_token_type_ids(input_ids)),
+                use_cache=False,
+            )
+            .logits.float()
+            .numpy()
+        )
     hf_prefill_logits = hf_prefill.logits.float().numpy()
     assert float(np.abs(hf_prefill_logits - hf_causal_logits).max()) > 1.0
 
@@ -86,14 +90,18 @@ def test_hrm_text_1b_real_weight_prefill_and_decode_parity():
     decode_mask = np.ones((1, seq_len + 1), dtype=np.int64)
     decode_position_ids = np.array([[seq_len]], dtype=np.int64)
     with torch.no_grad():
-        hf_decode_logits = torch_model(
-            input_ids=torch.from_numpy(next_token),
-            attention_mask=torch.from_numpy(decode_mask),
-            position_ids=torch.from_numpy(decode_position_ids),
-            token_type_ids=torch.from_numpy(generated_token_type_ids(next_token)),
-            past_key_values=hf_prefill.past_key_values,
-            use_cache=True,
-        ).logits.float().numpy()
+        hf_decode_logits = (
+            torch_model(
+                input_ids=torch.from_numpy(next_token),
+                attention_mask=torch.from_numpy(decode_mask),
+                position_ids=torch.from_numpy(decode_position_ids),
+                token_type_ids=torch.from_numpy(generated_token_type_ids(next_token)),
+                past_key_values=hf_prefill.past_key_values,
+                use_cache=True,
+            )
+            .logits.float()
+            .numpy()
+        )
     del torch_model, hf_prefill
     gc.collect()
 
@@ -106,9 +114,9 @@ def test_hrm_text_1b_real_weight_prefill_and_decode_parity():
     session = _make_session(package["model"])
     try:
         assert "token_type_ids" in session.input_names
-        assert len([name for name in session.input_names if name.startswith("past_key_values.")]) == (
-            2 * config.num_hidden_layers
-        )
+        assert len(
+            [name for name in session.input_names if name.startswith("past_key_values.")]
+        ) == (2 * config.num_hidden_layers)
 
         prefill_feeds = _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
         prefill_feeds["token_type_ids"] = prefix_token_type_ids

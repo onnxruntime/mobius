@@ -33,7 +33,7 @@ from mobius.models.hrm_text import (
     HrmTextCausalLMModel,
     _resolve_layers_per_stack,
 )
-from mobius.tasks import get_task
+from mobius.tasks import CausalLMTask, get_task
 
 _HIDDEN = 64
 _HEADS = 4
@@ -242,6 +242,14 @@ def test_prefix_lm_forward_requires_token_type_ids():
         get_task("text-generation").build(_StripTokenTypeIds(module), config)
 
 
+def test_prefix_lm_static_cache_reports_unsupported_mode():
+    """Static-cache builds fail for the PrefixLM limitation, not a missing input."""
+    config = _mobius_config()
+    module = HrmTextCausalLMModel(config)
+    with pytest.raises(NotImplementedError, match="not supported with the static KV cache"):
+        CausalLMTask(static_cache=True, max_seq_len=128).build(module, config)
+
+
 class _StripTokenTypeIds:
     """Wrap a module so the task's ``token_type_ids`` never reaches forward()."""
 
@@ -393,9 +401,13 @@ def test_recurrence_matches_huggingface_prefill_and_decode():
     apply_weights(pkg["model"], module.preprocess_weights(dict(hf_model.state_dict())))
 
     rng = np.random.default_rng(11)
-    input_ids = rng.integers(1, _VOCAB, size=(1, 6)).astype(np.int64)
+    # Two rows verify that z_L_init is broadcast to the actual batch rather
+    # than accidentally initialized like a zero-length dynamic KV cache.
+    input_ids = rng.integers(1, _VOCAB, size=(2, 6)).astype(np.int64)
     attention_mask = np.ones_like(input_ids)
-    position_ids = np.arange(input_ids.shape[1], dtype=np.int64)[np.newaxis, :]
+    position_ids = np.broadcast_to(
+        np.arange(input_ids.shape[1], dtype=np.int64), input_ids.shape
+    ).copy()
 
     session = OnnxModelSession(pkg["model"])
     try:
@@ -407,7 +419,7 @@ def test_recurrence_matches_huggingface_prefill_and_decode():
                 "position_ids": position_ids,
                 "token_type_ids": token_type_ids,
             }
-            empty = np.zeros((1, _HEADS, 0, _HEAD_DIM), dtype=np.float32)
+            empty = np.zeros((input_ids.shape[0], _HEADS, 0, _HEAD_DIM), dtype=np.float32)
             for slot in range(_TOTAL_SLOTS):
                 feeds[f"past_key_values.{slot}.key"] = empty
                 feeds[f"past_key_values.{slot}.value"] = empty
@@ -445,9 +457,9 @@ def test_recurrence_matches_huggingface_prefill_and_decode():
         assert onnx_delta == pytest.approx(hf_delta, rel=1e-2, abs=1e-5)
 
         # Cached decode: the generated token is NOT part of the prefix block.
-        next_id = np.array([[int(hf_prefix_logits[0, -1].argmax())]], dtype=np.int64)
-        decode_mask = np.ones((1, input_ids.shape[1] + 1), dtype=np.int64)
-        decode_pos = np.array([[input_ids.shape[1]]], dtype=np.int64)
+        next_id = np.argmax(hf_prefix_logits[:, -1], axis=-1, keepdims=True).astype(np.int64)
+        decode_mask = np.ones((input_ids.shape[0], input_ids.shape[1] + 1), dtype=np.int64)
+        decode_pos = np.full((input_ids.shape[0], 1), input_ids.shape[1], dtype=np.int64)
         decode_feeds: dict[str, np.ndarray] = {
             "input_ids": next_id,
             "attention_mask": decode_mask,

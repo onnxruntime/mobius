@@ -459,7 +459,6 @@ class Attention(nn.Module):
         gqa_ctx: GQAContext,
         past_key_value: tuple | None,
         hidden_states: ir.Value | None = None,
-        hidden_states: ir.Value | None = None,
     ):
         """Emit ``com.microsoft::GroupQueryAttention`` directly.
 

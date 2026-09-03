@@ -245,13 +245,6 @@ class HrmTextModel(TextModel):
         :class:`HrmTextAttention` runs with ``is_causal=0``; that also rules out
         ``GroupQueryAttention``, whose mask model is causal/local-window only.
         """
-        if token_type_ids is None:
-            raise ValueError(
-                "HRM-Text was built with config.prefix_lm=True, which requires a "
-                "token_type_ids input. The task supplies it via the module's "
-                "requires_token_type_ids hook; a caller invoking forward() "
-                "directly must pass token_type_ids explicitly."
-            )
         if attention_mask is None:
             # Static cache passes attention_mask=None and relies on
             # is_causal=1 + nonpad_kv_seqlen, which cannot express the
@@ -262,6 +255,13 @@ class HrmTextModel(TextModel):
                 "attention_mask to build its float additive bias. Build with "
                 "the default dynamic cache, or set config.prefix_lm=False for a "
                 "fully causal export."
+            )
+        if token_type_ids is None:
+            raise ValueError(
+                "HRM-Text was built with config.prefix_lm=True, which requires a "
+                "token_type_ids input. The task supplies it via the module's "
+                "requires_token_type_ids hook; a caller invoking forward() "
+                "directly must pass token_type_ids explicitly."
             )
 
         position_embeddings = self.rotary_emb(op, position_ids)
