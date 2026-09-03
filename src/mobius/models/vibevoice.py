@@ -826,10 +826,14 @@ class VibeVoiceForConditionalGeneration(nn.Module):
         Text[Text tokens] --> Emb[Embedding mixer]
         AP --> Emb
         Emb --> Qwen[Qwen2 decoder]
-        Qwen --> Pos[Positive KV cache]
-        Qwen --> Neg[Negative CFG KV cache]
-        Pos --> Diff[DPM-Solver diffusion head]
-        Neg --> Diff
+        Qwen --> PosCond[Positive decoder condition]
+        Qwen --> NegCond[Negative decoder condition]
+        PosCond --> Diff[DPM-Solver diffusion head]
+        NegCond --> Diff
+        Qwen --> PosKV[Positive KV cache]
+        Qwen --> NegKV[Negative CFG KV cache]
+        PosKV --> Qwen
+        NegKV --> Qwen
         Diff --> Latent[64-D acoustic latent]
         Latent --> AD[Streaming audio decoder]
         AD --> Wave[3200-sample waveform chunk]
