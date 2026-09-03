@@ -285,6 +285,16 @@ class TestModuleStructure:
         graph = get_task("text-generation").build(module, config)["model"].graph
         assert count_op_type(graph, "MatMulNBits") > 0
 
+    def test_output_layer_indices_emit_requested_hidden_states_in_order(self):
+        config = _tiny_config(output_layer_indices=[2, 0])
+        module = GraniteSwaCausalLMModel(config)
+        graph = get_task("text-generation").build(module, config)["model"].graph
+
+        hidden_outputs = [
+            output.name for output in graph.outputs if output.name.startswith("hidden_states.")
+        ]
+        assert hidden_outputs == ["hidden_states.2", "hidden_states.0"]
+
     def test_nope_layer_skips_rotary_embedding(self):
         """Three RoPE layers, two RotaryEmbedding nodes each (q, k) = 6, not 8."""
         config = _tiny_config()

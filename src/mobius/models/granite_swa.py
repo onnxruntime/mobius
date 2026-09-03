@@ -85,6 +85,9 @@ class GraniteSwaTextModel(nn.Module):
         self._layer_rope_theta = resolve_layer_rope_theta(config)
         self._sliding_window = config.sliding_window
         self.embedding_multiplier = config.embedding_multiplier
+        self.output_layer_indices: list[int] | None = (
+            list(config.output_layer_indices or []) or None
+        )
 
         self.embed_tokens = embedding_for_config(config)
         linear_class = linear_class_for_config(config)
@@ -174,6 +177,22 @@ class GraniteSwaTextModel(nn.Module):
         }
 
         present_key_values = []
+        if self.output_layer_indices is not None:
+            num_layers = len(self.layers)
+            if len(set(self.output_layer_indices)) != len(self.output_layer_indices):
+                raise ValueError(
+                    "output_layer_indices must not contain duplicates: "
+                    f"{self.output_layer_indices}"
+                )
+            out_of_range = [
+                index for index in self.output_layer_indices if not 0 <= index < num_layers
+            ]
+            if out_of_range:
+                raise ValueError(
+                    f"output_layer_indices {out_of_range} out of range [0, {num_layers})"
+                )
+        capture_set = set(self.output_layer_indices or ())
+        captured_by_index: dict[int, ir.Value] = {}
         past_kvs = past_key_values or [None] * len(self.layers)
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_kvs)):
             is_sliding = self._layer_types[layer_idx] == "sliding_attention"
@@ -186,8 +205,15 @@ class GraniteSwaTextModel(nn.Module):
                 past_key_value=past_key_value,
             )
             present_key_values.append(present_key_value)
+            if layer_idx in capture_set:
+                # Capture the post-residual layer output before final RMSNorm,
+                # matching TextModel and the draft-target hidden-state contract.
+                captured_by_index[layer_idx] = hidden_states
 
         hidden_states = self.norm(op, hidden_states)
+        if self.output_layer_indices is not None:
+            ordered = [captured_by_index[index] for index in self.output_layer_indices]
+            return hidden_states, present_key_values, ordered
         return hidden_states, present_key_values
 
 
