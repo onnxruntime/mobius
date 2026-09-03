@@ -447,7 +447,9 @@ class TestVibeVoiceGraphContracts:
         assert {value.name for value in audio_encoder.graph.outputs} == {"audio_latents"}
 
         embedding_audio = next(
-            value for value in package["embedding"].graph.inputs if value.name == "audio_embeds"
+            value
+            for value in package["embedding"].graph.inputs
+            if value.name == "audio_embeds"
         )
         assert optional_input_contract(embedding_audio) == {
             "presence": "audio",

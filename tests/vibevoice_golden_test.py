@@ -36,6 +36,29 @@ _ROOT = Path(__file__).parents[1]
 _GOLDEN_DIR = _ROOT / "testdata" / "golden" / "audio"
 _AUDIO_PATH = _ROOT / "testdata" / "652-129742-0006-24khz.wav"
 _SEED = 20260831
+_L4_CASES = [
+    "vibevoice-1.5b-text-only",
+    "vibevoice-1.5b-reference",
+    "vibevoice-1.5b-multispeaker",
+]
+_L5_CASES = ["vibevoice-1.5b-text-only", "vibevoice-1.5b-reference"]
+
+
+def _selected_cases(cases: list[str]) -> list[str]:
+    """Select exact VibeVoice golden cases requested by the GPU workflow."""
+    requested = os.environ.get("MOBIUS_VIBEVOICE_GOLDEN_CASES")
+    if requested is None:
+        return cases
+    try:
+        selected = json.loads(requested)
+    except json.JSONDecodeError as error:
+        raise ValueError("MOBIUS_VIBEVOICE_GOLDEN_CASES must be a JSON array") from error
+    if not isinstance(selected, list) or not all(isinstance(case, str) for case in selected):
+        raise ValueError("MOBIUS_VIBEVOICE_GOLDEN_CASES must be a JSON array of case IDs")
+    unknown = sorted(set(selected) - set(_L4_CASES) - set(_L5_CASES))
+    if unknown:
+        raise ValueError(f"Unknown VibeVoice golden case(s): {unknown}")
+    return [case for case in cases if case in selected]
 
 
 def _config():
@@ -154,11 +177,7 @@ def _run(
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "case",
-    [
-        "vibevoice-1.5b-text-only",
-        "vibevoice-1.5b-reference",
-        "vibevoice-1.5b-multispeaker",
-    ],
+    _selected_cases(_L4_CASES),
 )
 def test_vibevoice_l4_real_weight_prefill(
     vibevoice_package_dir,
@@ -185,10 +204,11 @@ def test_vibevoice_l4_real_weight_prefill(
 
 
 @pytest.mark.golden
+@pytest.mark.generation
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "case",
-    ["vibevoice-1.5b-text-only", "vibevoice-1.5b-reference"],
+    _selected_cases(_L5_CASES),
 )
 def test_vibevoice_l5_generation(
     vibevoice_package_dir,
