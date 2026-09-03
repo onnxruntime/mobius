@@ -27,7 +27,7 @@ _CATEGORY_DESCRIPTIONS: dict[str, str] = {
     "Text Generation": "Standard autoregressive language models (CausalLM).",
     "Mixture of Experts": "Models that route tokens to a subset of expert MLPs.",
     "Multimodal": "Models that process images, audio, or other modalities alongside text.",
-    "Speech-to-Text": "Encoder-decoder models for speech recognition.",
+    "Speech-to-Text": "Encoder-decoder and CTC models for speech recognition.",
     "Audio": "Audio encoder models for feature extraction (Wav2Vec2, HuBERT, WavLM).",
     "encoder-only": "Encoder-only models for embeddings and classification (BERT, RoBERTa).",
     "encoder-decoder": "Encoder-decoder sequence-to-sequence models (BART, T5, mBART).",

@@ -1096,7 +1096,11 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
     }
     model_kwargs: dict[str, object] = {
         "revision": case.revision,
-        "torch_dtype": torch.float32,
+        "torch_dtype": {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }[case.dtype],
         "device_map": device,
         "trust_remote_code": case.trust_remote_code,
     }
@@ -1128,7 +1132,7 @@ def _generate_ctc_asr(case: TestCase, json_path: Path, device: str) -> None:
 
     # CTC logits: (batch, num_frames, vocab_size). Use last frame for top-K.
     logits = outputs.logits[0]  # (num_frames, vocab_size)
-    last_logits = logits[-1].cpu().numpy()
+    last_logits = logits[-1].float().cpu().numpy()
     golden = _extract_logits_golden(last_logits)
 
     save_golden_ref(

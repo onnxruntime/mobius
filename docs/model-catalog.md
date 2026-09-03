@@ -184,6 +184,8 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 
 | Model Type | Module Class | Task | Example HuggingFace Model |
 |---|---|---|---|
+| `granite_speech5_ctc` | `GraniteSpeech5ForCTCModel` | `feature-ctc-asr` | `ibm-granite/granite-speech-5.0-470m-turboctc` |
+| `parakeet_ctc` | `ParakeetForCTCModel` | `feature-ctc-asr` | `nvidia/parakeet-ctc-1.1b` |
 | `whisper` | `WhisperForConditionalGeneration` | `speech-to-text` | `openai/whisper-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |

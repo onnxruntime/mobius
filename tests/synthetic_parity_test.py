@@ -1861,3 +1861,95 @@ def test_seq2seq_decoder_synthetic_parity(model_type: str, config_overrides: dic
     assert report.result != ParityResult.FAIL, (
         f"{model_type}: seq2seq decoder L3 FAIL: {report.message}"
     )
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [True, False], ids=["tied", "untied"])
+def test_granite_speech5_ctc_synthetic_parity(tie_word_embeddings: bool):
+    """L3: compare every padded-batch CTC logit against native Transformers."""
+    import transformers
+
+    required = (
+        "GraniteSpeech5CTCConfig",
+        "GraniteSpeech5EncoderConfig",
+        "GraniteSpeech5ForCTC",
+    )
+    if not all(hasattr(transformers, name) for name in required):
+        pytest.skip("Granite Speech 5 requires Transformers 5.16.0 or newer")
+
+    from mobius._configs import GraniteSpeech5CTCConfig
+    from mobius._testing.ort_inference import OnnxModelSession
+    from mobius.models import GraniteSpeech5ForCTCModel
+    from mobius.tasks import FeatureCTCAsrTask
+
+    seed = 42
+    torch.manual_seed(seed)
+    encoder_config = transformers.GraniteSpeech5EncoderConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        num_mel_bins=4,
+        hidden_act="silu",
+        max_position_embeddings=16,
+        context_size=8,
+        conv_kernel_size=3,
+        conv_expansion_factor=2,
+        subsample_layers=[0, 1],
+        attention_bias=True,
+        attention_dropout=0.0,
+        activation_dropout=0.0,
+    )
+    hf_config = transformers.GraniteSpeech5CTCConfig(
+        encoder_config=encoder_config,
+        vocab_size=32,
+        pad_token_id=0,
+        tie_word_embeddings=tie_word_embeddings,
+    )
+    hf_model = transformers.GraniteSpeech5ForCTC(hf_config).float().eval()
+    hf_model.tie_weights()
+
+    config = GraniteSpeech5CTCConfig.from_transformers(hf_config)
+    config.dtype = ir.DataType.FLOAT
+    module = GraniteSpeech5ForCTCModel(config)
+    package = FeatureCTCAsrTask().build(module, config)
+    apply_weights(
+        package["model"],
+        module.preprocess_weights(dict(hf_model.state_dict())),
+    )
+
+    rng = np.random.default_rng(123)
+    input_features = rng.standard_normal((2, 16, 16)).astype(np.float32)
+    attention_mask = np.ones((2, 16), dtype=np.int64)
+    attention_mask[1, 13:] = 0
+    input_features[1, 13:] = 0.0
+
+    with torch.no_grad():
+        expected = hf_model(
+            input_features=torch.from_numpy(input_features),
+            attention_mask=torch.from_numpy(attention_mask),
+        ).logits.numpy()
+
+    session = OnnxModelSession(package["model"], device="cpu")
+    try:
+        outputs = session.run(
+            {
+                "input_features": input_features,
+                "attention_mask": attention_mask,
+            }
+        )
+    finally:
+        session.close()
+
+    actual = outputs["logits"]
+    expected_lengths = np.array([4, 3])
+    np.testing.assert_array_equal(outputs["frame_lengths"], expected_lengths)
+    for row, length in enumerate(expected_lengths):
+        np.testing.assert_allclose(
+            actual[row, :length],
+            expected[row, :length],
+            atol=1e-5,
+            rtol=1e-5,
+        )

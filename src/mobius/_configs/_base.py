@@ -4806,3 +4806,68 @@ class ParakeetCTCConfig(ArchitectureConfig):
             scale_input=getattr(encoder, "scale_input", True),
             layer_norm_eps=getattr(encoder, "layer_norm_eps", 1e-5),
         )
+
+
+@dataclasses.dataclass
+class GraniteSpeech5CTCConfig(ArchitectureConfig):
+    """Configuration for native Hugging Face Granite Speech 5 CTC models."""
+
+    # Match GraniteSpeech5CTCConfig, whose CTC head reuses encoder.out by default.
+    tie_word_embeddings: bool = True
+    num_mel_bins: int = 80
+    input_feature_size: int = 320
+    context_size: int = 128
+    conv_kernel_size: int = 7
+    conv_expansion_factor: int = 2
+    subsample_layers: tuple[int, ...] = (0, 1)
+    attention_bias: bool = True
+    layer_norm_eps: float = 1e-5
+    feature_input_dtype: ir.DataType = ir.DataType.FLOAT
+    feature_attention_mask_dtype: ir.DataType = ir.DataType.INT64
+
+    def __post_init__(self):
+        if self.input_feature_size != self.num_mel_bins * 4:
+            raise ValueError(
+                "Granite Speech 5 input_feature_size must equal num_mel_bins * 4 "
+                "(static+delta channels with pairwise frame stacking)"
+            )
+        if self.context_size <= 0 or self.context_size > self.max_position_embeddings:
+            raise ValueError(
+                "Granite Speech 5 context_size must be in "
+                f"(0, max_position_embeddings={self.max_position_embeddings}]"
+            )
+        if self.conv_kernel_size % 2 == 0:
+            raise ValueError("Granite Speech 5 conv_kernel_size must be odd")
+        if any(
+            index < 0 or index >= self.num_hidden_layers for index in self.subsample_layers
+        ):
+            raise ValueError("Granite Speech 5 subsample_layers must index existing layers")
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> GraniteSpeech5CTCConfig:
+        """Extract the nested encoder and parent CTC fields without losing bf16."""
+        encoder = getattr(config, "encoder_config", config)
+        parent = config if encoder is not config else parent_config
+        base = ArchitectureConfig.from_transformers(encoder, parent_config=parent)
+        fields = _shallow_fields(base)
+        fields.update(
+            vocab_size=getattr(parent, "vocab_size", fields["vocab_size"]),
+            pad_token_id=getattr(parent, "pad_token_id", fields["pad_token_id"]),
+            tie_word_embeddings=getattr(parent, "tie_word_embeddings", True),
+            model_type=getattr(parent, "model_type", fields["model_type"]),
+        )
+        resolved_dtype = _resolve_dtype(parent)
+        if resolved_dtype is not None:
+            fields["dtype"] = resolved_dtype
+        num_mel_bins = getattr(encoder, "num_mel_bins", 80)
+        return cls(
+            **fields,
+            num_mel_bins=num_mel_bins,
+            input_feature_size=num_mel_bins * 4,
+            context_size=getattr(encoder, "context_size", 128),
+            conv_kernel_size=getattr(encoder, "conv_kernel_size", 7),
+            conv_expansion_factor=getattr(encoder, "conv_expansion_factor", 2),
+            subsample_layers=tuple(getattr(encoder, "subsample_layers", None) or (0, 1)),
+            attention_bias=getattr(encoder, "attention_bias", True),
+            layer_norm_eps=getattr(encoder, "layer_norm_eps", 1e-5),
+        )

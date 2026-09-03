@@ -1,0 +1,22 @@
+model_id: "ibm-granite/granite-speech-5.0-470m-turboctc"
+model_type: "granite_speech5_ctc"
+revision: "7e74c6438b7cfb5090cb6a131538f5e8515a7de3"
+task_type: "feature-ctc-asr"
+dtype: "bfloat16"
+
+inputs:
+  audio:
+    - "652-129742-0006.flac"
+
+level: "L4+L5"
+
+generation:
+  do_sample: false
+  exact_match: true
+
+notes: >
+  IBM Granite Speech 5.0 470M Turbo CTC. Native Transformers architecture with
+  128-frame chunk-local Shaw attention, two in-block 2x subsampling stages, and
+  mid-encoder self-conditioned CTC. The nonzero 165,592-byte LibriSpeech fixture
+  is 652-129742-0006.flac from OpenSLR 12 test-clean.tar.gz, pinned by SHA-256
+  081f8aed018bb8324cf490f95df9efbeab37e002d81b4400a66e3166c4b6c21c.
