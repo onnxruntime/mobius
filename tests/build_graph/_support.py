@@ -205,6 +205,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "sew",
     "sew-d",
     "sortformer",
+    # TimesFM 3 patched-input forecasting (co-located models/timesfm3_test.py).
+    "timesfm3",
     "speecht5",
     "unispeech",
     "unispeech-sat",

@@ -156,6 +156,8 @@ from mobius.models import (
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
+    TimesFM3Config,
+    TimesFM3Model,
     WhisperForConditionalGeneration,
     XverseCausalLMModel,
 )
@@ -1068,6 +1070,13 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
     "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
+    "timesfm3": ModelRegistration(
+        TimesFM3Model,
+        task="time-series-forecasting",
+        config_class=TimesFM3Config,
+        family="timesfm",
+        variant="3.0",
+    ),
     "reuse": ModelRegistration(
         SEMambaSpeechEnhancementModel,
         task="speech-enhancement",
