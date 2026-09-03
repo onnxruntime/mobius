@@ -307,6 +307,23 @@ def test_hy_v3_gguf_builds_trunk_and_independent_mtp(
     assert len([value for value in mtp.graph.inputs if "past_key_values" in value.name]) == 2
     assert "model.layers.1.mlp.e_score_correction_bias" in trunk.graph.initializers
     assert "layers.0.mlp.e_score_correction_bias" in mtp.graph.initializers
+    trunk_cache = {
+        value.name
+        for value in trunk.graph.inputs
+        if value.name and value.name.startswith("past_key_values.")
+    }
+    mtp_cache = {
+        value.name
+        for value in mtp.graph.inputs
+        if value.name and value.name.startswith("past_key_values.")
+    }
+    assert trunk_cache & mtp_cache == {
+        "past_key_values.0.key",
+        "past_key_values.0.value",
+    }
+    assert {("target", name) for name in trunk_cache}.isdisjoint(
+        {("mtp", name) for name in mtp_cache}
+    )
 
 
 def test_hy_v3_target_only_split_builds_without_sidecar(tmp_path: Path) -> None:

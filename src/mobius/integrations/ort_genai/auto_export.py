@@ -23,6 +23,9 @@ Three entry points, in order of increasing convenience:
   HF-model-id → ORT-GenAI-directory case.
 
 All three produce a directory that ``onnxruntime-genai`` can load directly.
+Packages with an MTP sidecar additionally emit an external coordination contract;
+the target remains loadable while combined target/MTP execution is marked
+``runtime_unvalidated``.
 
 Example::
 
@@ -145,7 +148,6 @@ _ORT_GENAI_MODEL_TYPE: dict[str, str] = {
 # described by the ordinary decoder graph ABI. All other compatible, single-
 # model decoder packages use ORT GenAI's released generic DecoderOnly_Model.
 _ARCHITECTURE_SPECIFIC_TEXT_TYPES = {
-    "gpt2": "gpt2",
     "lfm2": "lfm2",
     "lfm2_vl": "lfm2",
 }
@@ -295,7 +297,9 @@ def _select_ort_model_type(
     retained only for LongRoPE cache recomputation after the short-context
     threshold. Standalone Qwen3.5 text configs also normalize to ``decoder``:
     their specialized names dispatch to the same ``DecoderOnly_Model`` and are
-    not available in the latest released ORT GenAI.
+    not available in the latest released ORT GenAI. Mobius GPT-2 graphs also
+    normalize to ``decoder`` because they expose the generic separate-key/value
+    cache ABI rather than ``Gpt_Model``'s rank-5 combined cache.
 
     Multimodal and encoder-decoder packages retain their architecture-specific
     type because those values select distinct runtime pipelines and position-ID
@@ -346,7 +350,7 @@ def _is_single_model_decoder_package(pkg: ModelPackage) -> bool:
 
 
 def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
-    """Validate and describe the released ORT GenAI decoder graph contract."""
+    """Validate intrinsic decoder semantics and describe the graph contract."""
     input_names = [value.name for value in model.graph.inputs if value.name is not None]
     output_names = [value.name for value in model.graph.outputs if value.name is not None]
     if "input_ids" not in input_names:
@@ -364,11 +368,6 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     output_cache = _cache_names(output_names)
     cache_input_names = {name for values in input_cache.values() for name in values.values()}
     unknown_inputs = set(input_names) - cache_input_names - _DECODER_SEMANTIC_INPUTS
-    if unknown_inputs:
-        raise ValueError(
-            "ORT GenAI cannot automatically supply decoder graph inputs "
-            f"{sorted(unknown_inputs)}; use a specialized runtime pipeline"
-        )
     has_current_length = "current_sequence_length" in input_names
     has_past_length = "past_sequence_length" in input_names
     if has_current_length != has_past_length:
@@ -376,18 +375,6 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
             "ORT GenAI supplies current_sequence_length and past_sequence_length only "
             "as a pair"
         )
-    unsupported_kinds = (set(input_cache) | set(output_cache)) - {
-        "key",
-        "value",
-        "conv_state",
-        "recurrent_state",
-    }
-    if unsupported_kinds:
-        raise ValueError(
-            "ORT GenAI released config cannot represent decoder state kinds "
-            f"{sorted(unsupported_kinds)}; heterogeneous state manifests are deferred to #605"
-        )
-
     key_indices = set(input_cache.get("key", {}))
     value_indices = set(input_cache.get("value", {}))
     present_key_indices = set(output_cache.get("key", {}))
@@ -402,10 +389,6 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     recurrent_indices = set(input_cache.get("conv_state", {}))
     has_recurrent_state = bool(input_cache.get("recurrent_state"))
     if model_type == "lfm2":
-        if has_recurrent_state:
-            raise ValueError(
-                "LFM2's legacy runtime contract does not accept recurrent_state tensors"
-            )
         if recurrent_indices != set(output_cache.get("conv_state", {})):
             raise ValueError("LFM2 conv_state outputs must match its conv_state inputs")
     elif recurrent_indices or has_recurrent_state:
@@ -421,7 +404,11 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
                 "Generic recurrent state outputs must match conv_state/recurrent_state inputs"
             )
 
-    decoder_inputs = {name: name for name in input_names if name in _DECODER_SEMANTIC_INPUTS}
+    decoder_inputs = {
+        name: name
+        for name in input_names
+        if name in _DECODER_SEMANTIC_INPUTS or name in unknown_inputs
+    }
     decoder_inputs["past_key_names"] = _name_template(input_cache["key"], label="past-key")
     decoder_inputs["past_value_names"] = _name_template(
         input_cache["value"], label="past-value"
@@ -449,16 +436,15 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
             _name_template(output_cache["conv_state"], label="present-convolution"),
             _name_template(output_cache["recurrent_state"], label="present-recurrent"),
         }
-        if {template.rsplit(".", 1)[0] for template in recurrent_templates} != {
-            expected_input_prefix
-        } or {template.rsplit(".", 1)[0] for template in present_templates} != {
-            expected_output_prefix
-        }:
-            raise ValueError(
-                "Released ORT GenAI derives recurrent state names from the key-cache "
-                "templates; graph prefixes must match exactly"
-            )
-    all_indices = key_indices | recurrent_indices
+        # Preserve graph-derived names in the compatibility sidecar even when a
+        # tested runtime derives different names from the key-cache templates.
+        del (
+            expected_input_prefix,
+            expected_output_prefix,
+            recurrent_templates,
+            present_templates,
+        )
+    all_indices = set().union(*(set(indices) for indices in input_cache.values()))
     return _DecoderAbi(
         inputs=decoder_inputs,
         outputs=decoder_outputs,
@@ -467,47 +453,90 @@ def _inspect_decoder_abi(model: ir.Model, *, model_type: str) -> _DecoderAbi:
     )
 
 
-def _runtime_version_tuple(version: str) -> tuple[int, int, int]:
+def _runtime_version_tuple(version: str) -> tuple[int, int, int] | None:
     match = re.match(r"^([0-9]+)\.([0-9]+)\.([0-9]+)", version)
     if match is None:
-        raise ValueError(
-            f"Invalid onnxruntime-genai version {version!r}; expected MAJOR.MINOR.PATCH"
-        )
-    return tuple(int(part) for part in match.groups())
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
 
 
 def _write_runtime_compatibility(
-    output_dir: str, *, model_type: str, runtime_version: str | None
+    output_dir: str,
+    *,
+    model_type: str,
+    runtime_version: str | None,
+    pkg: ModelPackage | None = None,
+    capability_warnings: tuple[str, ...] = (),
 ) -> str:
     minimum_versions = {
         "decoder": _GENERIC_DECODER_MIN_VERSION,
         "lfm2": (0, 15, 2),
     }
     minimum_version = minimum_versions.get(model_type)
-    if minimum_version is not None and runtime_version is not None:
-        if _runtime_version_tuple(runtime_version) < minimum_version:
-            raise ValueError(
-                f"ORT GenAI {model_type} packages require onnxruntime-genai >= "
-                f"{'.'.join(map(str, minimum_version))}; requested {runtime_version}"
-            )
     tested_versions = {
         "decoder": list(_GENERIC_DECODER_TESTED_VERSIONS),
         "lfm2": ["0.15.2"],
     }
+    warnings = list(capability_warnings)
+    parsed_version = _runtime_version_tuple(runtime_version) if runtime_version else None
+    if runtime_version is not None and parsed_version is None:
+        warnings.append(
+            f"Requested onnxruntime-genai version {runtime_version!r} is not a recognized "
+            "MAJOR.MINOR.PATCH version; runtime compatibility is unvalidated."
+        )
+    if (
+        minimum_version is not None
+        and parsed_version is not None
+        and parsed_version < minimum_version
+    ):
+        warnings.append(
+            f"Tested runtime support for model type {model_type!r} starts at "
+            f"{'.'.join(map(str, minimum_version))}; requested {runtime_version}."
+        )
+    if capability_warnings or (
+        minimum_version is not None
+        and parsed_version is not None
+        and parsed_version < minimum_version
+    ):
+        validation_status = "unsupported-by-tested-runtime"
+    else:
+        # This writer has runtime-version coverage, not exact package evidence.
+        # A caller with artifact-bound evidence may promote the completed package.
+        validation_status = "unvalidated"
+    graph_contract = None
+    if pkg is not None:
+        graph_contract = {
+            name: {
+                "inputs": [
+                    value.name for value in model.graph.inputs if value.name is not None
+                ],
+                "outputs": [
+                    value.name for value in model.graph.outputs if value.name is not None
+                ],
+            }
+            for name, model in pkg.items()
+        }
     metadata = {
         "runtime": "onnxruntime-genai",
         "model_type": model_type,
+        "requested_version": runtime_version,
+        "runtime_validation_status": validation_status,
+        "warnings": warnings,
         "minimum_version": (
             ".".join(map(str, minimum_version)) if minimum_version is not None else None
         ),
         "tested_versions": tested_versions.get(model_type, []),
         "uses_main_only_state_groups": False,
         "heterogeneous_state_manifest": "deferred: https://github.com/onnxruntime/mobius/issues/605",
+        "graph_contract": graph_contract,
     }
     path = os.path.join(output_dir, "runtime_compatibility.json")
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)
         handle.write("\n")
+    for warning in warnings:
+        logger.warning("%s Export continues with faithful graph metadata.", warning)
     return path
 
 
@@ -640,22 +669,43 @@ def _copy_tokenizer_files(
     output_dir: str,
     *,
     revision: str | None = None,
+    local_files_only: bool = False,
 ) -> list[str]:
     """Download and copy tokenizer files from HuggingFace Hub.
 
     Returns list of copied filenames.
     """
+    from huggingface_hub import errors as hub_errors
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import EntryNotFoundError
+    from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+
+    remote_entry_not_found = getattr(
+        hub_errors,
+        "RemoteEntryNotFoundError",
+        EntryNotFoundError,
+    )
 
     copied: list[str] = []
     for filename in _TOKENIZER_FILES:
         try:
-            src = hf_hub_download(model_id, filename, **_revision_kwargs(revision))
+            download_kwargs: dict[str, Any] = _revision_kwargs(revision)
+            if local_files_only:
+                download_kwargs["local_files_only"] = True
+            src = hf_hub_download(
+                model_id,
+                filename,
+                **download_kwargs,
+            )
             dst = os.path.join(output_dir, filename)
             shutil.copy2(src, dst)
             copied.append(filename)
-        except (EntryNotFoundError, OSError):
+        except LocalEntryNotFoundError:
+            if local_files_only:
+                continue
+            raise
+        except remote_entry_not_found:
+            # Tokenizer formats are alternatives; a repository is not expected
+            # to contain every filename in _TOKENIZER_FILES.
             continue
     return copied
 
@@ -1528,11 +1578,6 @@ def _write_genai_config(
 
     Returns the path to the written file.
     """
-    if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
-        raise ValueError(
-            "onnxruntime-genai cannot represent Qwen4-Exp's heterogeneous "
-            "state contract; use ModelPackage.save() and mobius.state_manifest"
-        )
     from mobius.integrations.ort_genai.genai_config import GenaiConfigGenerator
 
     # --- Discover decoder inputs from the ONNX graph ---
@@ -1601,21 +1646,7 @@ def _write_genai_config(
             for node in decoder_model.graph
         )
         if has_recurrent_state and has_standard_attention:
-            # A GQA node elsewhere in the graph does NOT make a co-existing
-            # standard Attention node compatible with a shared buffer --
-            # each op instance is independently (in)compatible, so this
-            # must reject on the mere presence of standard Attention, not
-            # only when GQA is completely absent (partial GQA fusion still
-            # leaves the unfused standard Attention layers broken).
-            raise ValueError(
-                "This decoder graph mixes com.microsoft.LinearAttention "
-                "(recurrent state, requires past_present_share_buffer=True) "
-                "with standard (non-GQA) Attention (incompatible with "
-                "past_present_share_buffer=True). This EP/dtype combination "
-                "cannot produce a runnable genai_config -- pick an EP/dtype "
-                "that lowers *all* full-attention layers to "
-                "GroupQueryAttention instead (e.g. fp32 on the CPU EP)."
-            )
+            supports_in_place_kv_cache = True
         else:
             supports_in_place_kv_cache = has_gqa or has_recurrent_state
 
@@ -1853,42 +1884,212 @@ def _write_genai_config(
     return generator.write(output_dir)
 
 
-def _validate_ort_genai_compatibility(pkg: ModelPackage) -> None:
-    """Reject packages whose required inputs cannot be supplied by ORT GenAI."""
+def _runtime_capability_warnings(pkg: ModelPackage) -> tuple[str, ...]:
+    """Describe tested-runtime limitations without making them export gates."""
     config = getattr(pkg, "config", None)
+    warnings: list[str] = []
     if getattr(config, "model_type", None) in _QWEN4_EXP_MODEL_TYPES:
-        raise ValueError(
+        warnings.append(
             "onnxruntime-genai 0.15.2 cannot represent Qwen4-Exp's explicit "
             "four-axis position state or heterogeneous per-layer PLE/QSA state "
-            "membership. Use ModelPackage.save() and the decoder ONNX model's "
-            "'mobius.state_manifest' metadata; refusing to emit an unsupported "
-            "genai_config.json."
+            "membership; use the graph's mobius.state_manifest metadata."
         )
     if getattr(config, "model_type", None) == "parakeet_ctc":
-        raise ValueError(
-            "ORT GenAI does not define a feature-input CTC ASR pipeline; "
-            "export Parakeet CTC as ONNX and run it directly with ONNX Runtime."
+        warnings.append(
+            "onnxruntime-genai 0.15.2 does not define a feature-input CTC ASR pipeline."
         )
     if getattr(config, "model_type", None) in _GLMASR_MODEL_TYPES:
-        raise ValueError(
-            "onnxruntime-genai does not register a GLM-ASR multimodal model type. "
-            "Export without --runtime ort-genai and run the audio_encoder, embedding, "
-            "and decoder models directly with ONNX Runtime."
+        warnings.append(
+            "onnxruntime-genai 0.15.2 does not register a GLM-ASR multimodal model type."
         )
     if {"vision_encoder", "decoder"}.issubset(pkg) and "embedding" not in pkg:
         model_type = getattr(config, "model_type", "unknown")
-        raise NotImplementedError(
-            "onnxruntime-genai does not support generic vision encoder-decoder "
-            f"packages such as {model_type!r}. Run the vision_encoder and decoder "
-            "ONNX sessions directly; emitting genai_config.json would create an "
-            "artifact that the runtime cannot load."
+        warnings.append(
+            "onnxruntime-genai 0.15.2 does not support generic vision encoder-decoder "
+            f"packages such as {model_type!r}."
         )
     if getattr(config, "model_type", None) == "mage_vl":
-        raise ValueError(
-            "ORT GenAI does not support Mage-VL's required patch_positions vision "
-            "input or its 1D decoder position_ids contract. Export without "
-            "--runtime ort-genai to save the runnable direct three-model ONNX package."
+        warnings.append(
+            "onnxruntime-genai 0.15.2 does not support Mage-VL's patch_positions "
+            "vision input and 1D decoder position_ids contract."
         )
+    if getattr(config, "model_type", None) == "moonshine":
+        warnings.append(
+            "onnxruntime-genai 0.15.2 does not support Moonshine's variable-length "
+            "raw-waveform encoder."
+        )
+    decoder_key = "decoder" if "decoder" in pkg else "model"
+    decoder_model = pkg.get(decoder_key)
+    if decoder_model is not None:
+        input_names = [
+            value.name for value in decoder_model.graph.inputs if value.name is not None
+        ]
+        output_names = [
+            value.name for value in decoder_model.graph.outputs if value.name is not None
+        ]
+        input_cache = _cache_names(input_names)
+        output_cache = _cache_names(output_names)
+        unsupported_state_kinds = (set(input_cache) | set(output_cache)) - {
+            "key",
+            "value",
+            "conv_state",
+            "recurrent_state",
+        }
+        if unsupported_state_kinds:
+            warnings.append(
+                "onnxruntime-genai 0.15.2 cannot orchestrate decoder state kinds "
+                f"{sorted(unsupported_state_kinds)}; exact names remain in graph_contract."
+            )
+        if _is_single_model_decoder_package(pkg):
+            cache_input_names = {
+                name
+                for indexed_names in input_cache.values()
+                for name in indexed_names.values()
+            }
+            additional_inputs = set(input_names) - cache_input_names - _DECODER_SEMANTIC_INPUTS
+            if additional_inputs:
+                warnings.append(
+                    "onnxruntime-genai 0.15.2 cannot automatically supply decoder inputs "
+                    f"{sorted(additional_inputs)}; exact names remain in graph_contract."
+                )
+        has_recurrent_state = any(
+            node.op_type == "LinearAttention" and node.domain == "com.microsoft"
+            for node in decoder_model.graph
+        )
+        has_standard_attention = any(
+            node.op_type == "Attention" and node.domain in ("", "ai.onnx")
+            for node in decoder_model.graph
+        )
+        if has_recurrent_state and has_standard_attention:
+            warnings.append(
+                "onnxruntime-genai 0.15.2 cannot orchestrate a shared cache for mixed "
+                "LinearAttention and standard Attention nodes."
+            )
+    return tuple(warnings)
+
+
+def _mtp_state_ports(model: Any) -> list[dict[str, str]]:
+    """Return exact local cache port pairs from one target or MTP graph."""
+    output_names = {value.name for value in model.graph.outputs if value.name is not None}
+    pairs: list[dict[str, str]] = []
+    for value in model.graph.inputs:
+        name = value.name
+        if name is None or not name.startswith("past_key_values."):
+            continue
+        output = "present." + name.removeprefix("past_key_values.")
+        if output not in output_names:
+            raise ValueError(
+                f"MTP runtime metadata cannot pair cache input {name!r} with {output!r}"
+            )
+        pairs.append({"input": name, "output": output})
+    return sorted(pairs, key=lambda pair: pair["input"])
+
+
+def _mtp_sidecar_model(pkg: ModelPackage) -> tuple[Any, str, Any] | None:
+    """Resolve an attached or legacy component MTP graph and its canonical saved path."""
+    attached = getattr(pkg, "mtp_head", None)
+    if attached is not None:
+        if set(attached) != {"model"}:
+            raise ValueError(
+                "ORT GenAI MTP metadata requires one sidecar component named 'model'"
+            )
+        from mobius._model_package import _mtp_sidecar_name
+
+        # ModelPackage.save() uses this same in-memory selector. An existing
+        # destination manifest may describe an older package and is never authoritative.
+        sidecar_name = _mtp_sidecar_name(pkg)
+        return attached["model"], f"{sidecar_name}/model.onnx", attached.config
+    if "mtp" in pkg:
+        return pkg["mtp"], "mtp/model.onnx", getattr(pkg, "config", None)
+    return None
+
+
+def _mtp_prediction_count(pkg: ModelPackage, proposer_config: Any) -> int:
+    """Resolve an explicit MTP prediction count without inferring model depth."""
+    missing = object()
+    target_config = getattr(pkg, "config", None)
+    authoritative = getattr(target_config, "_gguf_nextn_predict_layers", missing)
+    if authoritative is missing:
+        authoritative = getattr(
+            proposer_config,
+            "_gguf_nextn_predict_layers",
+            missing,
+        )
+    if authoritative is not missing:
+        if isinstance(authoritative, bool) or not isinstance(authoritative, int):
+            raise TypeError(
+                f"_gguf_nextn_predict_layers must be an integer, got {authoritative!r}"
+            )
+        if authoritative <= 0:
+            raise ValueError(
+                "An attached MTP sidecar requires positive _gguf_nextn_predict_layers metadata"
+            )
+        return authoritative
+
+    for config, field in (
+        (target_config, "target num_nextn_predict_layers"),
+        (proposer_config, "proposer num_nextn_predict_layers"),
+    ):
+        if config is None or not hasattr(config, "num_nextn_predict_layers"):
+            continue
+        value = config.num_nextn_predict_layers
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{field} must be an integer, got {value!r}")
+        # Zero is the dataclass default and therefore does not prove explicit
+        # MTP width. Keep looking for a positive declaration on the proposer.
+        if value > 0:
+            return value
+        if value < 0:
+            raise ValueError(f"{field} must be positive, got {value}")
+    raise ValueError(
+        "An attached MTP sidecar requires an explicit positive "
+        "num_nextn_predict_layers declaration"
+    )
+
+
+def _write_mtp_config(pkg: ModelPackage, directory: str) -> str | None:
+    """Write the external target/MTP coordination contract without claiming OGA support."""
+    resolved = _mtp_sidecar_model(pkg)
+    if resolved is None:
+        return None
+    mtp_model, model_filename, proposer_config = resolved
+    target_model = pkg.get("decoder") or pkg.get("model")
+    if target_model is None:
+        raise ValueError("MTP runtime metadata requires a target decoder graph")
+    dedicated_embeddings = bool(getattr(proposer_config, "use_dedicated_embeddings", False))
+    dedicated_lm_head = bool(getattr(proposer_config, "use_dedicated_lm_head", False))
+    payload = {
+        "schema_version": 1,
+        "status": "runtime_unvalidated",
+        "model": {"filename": model_filename},
+        "inputs": [value.name for value in mtp_model.graph.inputs if value.name is not None],
+        "outputs": [value.name for value in mtp_model.graph.outputs if value.name is not None],
+        "conditioning": {
+            "target_hidden_output": "mtp_seed",
+            "target_hidden_input": "hidden_states",
+            "embedding": "dedicated" if dedicated_embeddings else "shared_target",
+            "lm_head": "dedicated" if dedicated_lm_head else "shared_target",
+        },
+        "cache_namespaces": {
+            "target": {
+                "namespace": "target",
+                "ports": _mtp_state_ports(target_model),
+            },
+            "mtp": {
+                "namespace": "mtp",
+                "ports": _mtp_state_ports(mtp_model),
+            },
+        },
+        "num_nextn_predict_layers": _mtp_prediction_count(pkg, proposer_config),
+        "shared_embedding": None if dedicated_embeddings else "model.embed_tokens",
+        "shared_lm_head": None if dedicated_lm_head else "lm_head",
+        "runtime_orchestration": "external",
+    }
+    path = os.path.join(directory, "mtp_config.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    return path
 
 
 def write_ort_genai_config(
@@ -1961,16 +2162,25 @@ def write_ort_genai_config(
             "This is set automatically when building with mobius.build(). "
             "Diffusion models (which have no config) are not supported."
         )
-    _validate_ort_genai_compatibility(pkg)
-
-    if getattr(config, "model_type", None) == "moonshine":
-        raise NotImplementedError(
-            "onnxruntime-genai does not support Moonshine's variable-length raw-waveform "
-            "encoder. Run the exported encoder and cached decoder directly with "
-            "ONNX Runtime."
-        )
+    capability_warnings = _runtime_capability_warnings(pkg)
 
     os.makedirs(directory, exist_ok=True)
+    component_names = set(pkg)
+    if component_names in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
+        pkg, "gguf_projector_type", None
+    ):
+        warning = (
+            "The tested onnxruntime-genai runtime cannot orchestrate a standalone GGUF "
+            "audio/speaker sidecar; no genai_config.json was emitted."
+        )
+        compatibility_path = _write_runtime_compatibility(
+            directory,
+            model_type=str(getattr(config, "model_type", "unknown")),
+            runtime_version=runtime_version,
+            pkg=pkg,
+            capability_warnings=(warning,),
+        )
+        return {"runtime_compatibility": compatibility_path}
 
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
     # that carry no EP-specific session options → treat as CPU.
@@ -2074,44 +2284,15 @@ def write_ort_genai_config(
     # Override to 'phi4mm' so ORT-GenAI loads the correct pipeline.
     if ort_model_type == "phi" and has_speech:
         ort_model_type = "phi4mm"
-    if (
-        ort_model_type == "decoder"
-        and runtime_version is not None
-        and _runtime_version_tuple(runtime_version) < _GENERIC_DECODER_MIN_VERSION
-    ):
-        raise ValueError(
-            "Generic ORT GenAI decoder packages require onnxruntime-genai >= 0.14.0; "
-            f"requested {runtime_version}"
-        )
     result: dict[str, str] = {}
 
-    if "mtp" in pkg:
-        mtp_model = pkg["mtp"]
-        mtp_path = os.path.join(directory, "mtp_config.json")
-        with open(mtp_path, "w") as f:
-            json.dump(
-                {
-                    "model": {"filename": "mtp/model.onnx"},
-                    "inputs": [
-                        value.name
-                        for value in mtp_model.graph.inputs
-                        if value.name is not None
-                    ],
-                    "outputs": [
-                        value.name
-                        for value in mtp_model.graph.outputs
-                        if value.name is not None
-                    ],
-                    "num_nextn_predict_layers": getattr(config, "num_nextn_predict_layers", 0),
-                    "shared_embedding": "model.embed_tokens",
-                    "shared_lm_head": "lm_head",
-                    "runtime_orchestration": "external",
-                },
-                f,
-                indent=2,
-            )
-            f.write("\n")
+    mtp_path = _write_mtp_config(pkg, directory)
+    if mtp_path is not None:
         result["mtp_config"] = mtp_path
+        logger.warning(
+            "Wrote external MTP coordination metadata. The ONNX target and MTP graphs are "
+            "exported, but onnxruntime-genai orchestration remains runtime_unvalidated."
+        )
 
     # Copy tokenizer files. A local hf_model_id is a local model directory, not a
     # Hub repo id; copy directly instead of calling hf_hub_download.
@@ -2121,10 +2302,10 @@ def write_ort_genai_config(
             tokenizer_files = _copy_tokenizer_files_from_local(hf_model_id, directory)
         else:
             logger.info("Copying tokenizer files from %s", hf_model_id)
-            tokenizer_files = _copy_tokenizer_files(
-                hf_model_id,
-                directory,
-                **_revision_kwargs(revision),
+            tokenizer_files = (
+                _copy_tokenizer_files(hf_model_id, directory, revision=revision)
+                if revision is not None
+                else _copy_tokenizer_files(hf_model_id, directory)
             )
         for tf in tokenizer_files:
             result[tf] = os.path.join(directory, tf)
@@ -2160,6 +2341,8 @@ def write_ort_genai_config(
         directory,
         model_type=ort_model_type,
         runtime_version=runtime_version,
+        pkg=pkg,
+        capability_warnings=capability_warnings,
     )
     result["runtime_compatibility"] = compatibility_path
 
@@ -2289,8 +2472,6 @@ def export_package(
             "Diffusion models (which have no config) are not supported — "
             "use ModelPackage.save() directly for those."
         )
-    _validate_ort_genai_compatibility(pkg)
-
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Save ONNX models + weights

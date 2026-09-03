@@ -13,7 +13,9 @@ from typing import Literal
 
 from mobius.integrations.gguf._tokenizer_alias_evidence import tokenizer_alias_evidence
 from mobius.integrations.gguf._tokenizer_evidence import (
+    GGUFTokenizerBlockerEvidence,
     GGUFTokenizerEvidence,
+    iter_tokenizer_blocker_evidence,
     iter_tokenizer_evidence,
 )
 from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
@@ -21,6 +23,7 @@ from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 TokenizerAuditStatus = Literal[
     "validated-pinned-source",
     "deferred-pinned-artifact-evidence",
+    "deferred-pinned-artifact-mismatch",
     "deferred-compiled-semantics",
 ]
 TokenizerBlocker = Literal[
@@ -29,6 +32,7 @@ TokenizerBlocker = Literal[
     "pinned-candidate-effective-pre-mismatch",
     "pinned-candidate-incomplete-shard",
     "pinned-candidate-source-merge-mismatch",
+    "pinned-candidate-source-semantic-mismatch",
     "pinned-candidate-source-token-mismatch",
     "compiled-llama.cpp-semantic-dependency",
 ]
@@ -57,6 +61,7 @@ class GGUFTokenizerRouteAudit:
     artifact_architecture: str | None = None
     declared_pre_identifier: str | None = None
     effective_pre_identifier: str | None = None
+    blocker_evidence_id: str | None = None
 
 
 _PINNED_CANDIDATE_DISPOSITIONS = {
@@ -254,6 +259,36 @@ def _evidenced_route(
     )
 
 
+def _blocked_route(
+    identifier: str, evidence: GGUFTokenizerBlockerEvidence
+) -> GGUFTokenizerRouteAudit:
+    policy = tokenizer_pre_policies()[identifier]
+    return GGUFTokenizerRouteAudit(
+        identifier=policy.identifier,
+        semantic_group=policy.canonical,
+        pre_type=policy.pre_type,
+        default_policy=policy.default_route,
+        current_status="deferred-pinned-artifact-mismatch",
+        evidence_id=None,
+        artifact_repository=evidence.repository,
+        artifact_revision=evidence.revision,
+        artifact_filename=evidence.filename,
+        artifact_size=evidence.size,
+        artifact_sha256=evidence.lfs_sha256,
+        tokenizer_repository=evidence.tokenizer_repository,
+        tokenizer_revision=evidence.tokenizer_revision,
+        tokenizer_assets=tuple(
+            sorted((evidence.source_config_asset, *evidence.tokenizer_assets))
+        ),
+        blocker_category="pinned-candidate-source-semantic-mismatch",
+        candidate_disposition=evidence.disposition,
+        artifact_architecture=evidence.architecture,
+        declared_pre_identifier=evidence.pre_identifier,
+        effective_pre_identifier=evidence.pre_identifier,
+        blocker_evidence_id=evidence.evidence_id,
+    )
+
+
 @functools.lru_cache(maxsize=1)
 def tokenizer_route_census() -> tuple[GGUFTokenizerRouteAudit, ...]:
     """Return all exact routes, including aliases, in identifier order."""
@@ -267,11 +302,23 @@ def tokenizer_route_census() -> tuple[GGUFTokenizerRouteAudit, ...]:
     )
     if len(evidenced) != expected_count:
         raise RuntimeError("Tokenizer evidence contains duplicate validated identifiers")
+    blocked = {
+        identifier: _blocked_route(identifier, evidence)
+        for evidence in iter_tokenizer_blocker_evidence()
+        for identifier in evidence.blocked_identifiers
+    }
+    expected_blocked_count = sum(
+        len(evidence.blocked_identifiers) for evidence in iter_tokenizer_blocker_evidence()
+    )
+    if len(blocked) != expected_blocked_count:
+        raise RuntimeError("Tokenizer blocker evidence contains duplicate identifiers")
+    if set(evidenced) & set(blocked):
+        raise RuntimeError("Tokenizer identifiers cannot be both validated and blocked")
 
     records = []
     alias_proofs = tokenizer_alias_evidence()
     for identifier, policy in sorted(tokenizer_pre_policies().items()):
-        record = evidenced.get(identifier)
+        record = evidenced.get(identifier) or blocked.get(identifier)
         if record is None:
             record = _PINNED_CANDIDATE_DISPOSITIONS.get(identifier)
         if record is None:

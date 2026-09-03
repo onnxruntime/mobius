@@ -24,6 +24,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, MllamaConfig
 from mobius._weight_utils import (
+    is_packed_quant_key,
     vlm_decoder_weights,
     vlm_embedding_weights,
     vlm_vision_weights,
@@ -38,6 +39,7 @@ from mobius.components import (
     create_attention_bias,
     initialize_rope,
 )
+from mobius.models.base import effective_tie_word_embeddings
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -387,9 +389,51 @@ class MllamaCausalLMModel(nn.Module):
     def preprocess_weights(
         self, state_dict: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        if self.config.tie_word_embeddings:
-            embed_key = "language_model.model.embed_tokens.weight"
-            head_key = "language_model.lm_head.weight"
-            if head_key not in state_dict and embed_key in state_dict:
-                state_dict[head_key] = state_dict[embed_key]
-        return state_dict
+        tied_embeddings = effective_tie_word_embeddings(self.config)
+        if self.config.component_quantization is None:
+            if tied_embeddings:
+                embed_key = "language_model.model.embed_tokens.weight"
+                head_key = "language_model.lm_head.weight"
+                if head_key not in state_dict and embed_key in state_dict:
+                    state_dict[head_key] = state_dict[embed_key]
+            return state_dict
+
+        if tied_embeddings and any(
+            key.removeprefix("model.").startswith("language_model.model.embed_tokens.")
+            and is_packed_quant_key(key)
+            for key in state_dict
+        ):
+            raise NotImplementedError(
+                "Packed tied Mllama embeddings require an explicit LM-head copy; "
+                "the generic component loader cannot synthesize it safely."
+            )
+
+        renamed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            stripped = key.removeprefix("model.")
+            if stripped.startswith("language_model.model.embed_tokens."):
+                suffix = stripped[len("language_model.model.") :]
+                if not is_packed_quant_key(stripped):
+                    renamed[f"decoder.model.{suffix}"] = value
+                renamed[f"embedding.{suffix}"] = value
+            elif stripped.startswith("language_model."):
+                suffix = stripped[len("language_model.") :]
+                renamed[f"decoder.{suffix}"] = value
+            elif stripped.startswith("vision_model."):
+                target = f"vision_encoder.vision_model.{stripped}"
+                target = target.replace(".mlp.fc1.", ".mlp.up_proj.").replace(
+                    ".mlp.fc2.", ".mlp.down_proj."
+                )
+                renamed[target] = value
+            elif stripped.startswith("multi_modal_projector."):
+                renamed[f"vision_encoder.{stripped}"] = value
+            elif stripped.startswith("lm_head."):
+                renamed[f"decoder.{stripped}"] = value
+            else:
+                renamed[key] = value
+
+        if tied_embeddings:
+            embedding = renamed.get("embedding.embed_tokens.weight")
+            if embedding is not None:
+                renamed.setdefault("decoder.lm_head.weight", embedding)
+        return renamed

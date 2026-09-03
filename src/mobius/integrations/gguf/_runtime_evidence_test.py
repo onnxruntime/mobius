@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import onnx_ir as ir
@@ -17,12 +19,14 @@ import pytest
 from mobius._builder import build_from_module
 from mobius._configs import NemotronHConfig
 from mobius.integrations.gguf import _runtime_evidence
+from mobius.integrations.gguf._arch_registry import get_arch_spec
 from mobius.integrations.gguf._reader import _descriptor_identity
 from mobius.integrations.gguf._runtime_blocker_evidence import (
     iter_runtime_blocker_evidence,
     runtime_blocker_evidence,
 )
 from mobius.integrations.gguf._runtime_evidence import (
+    FINAL_RUNTIME_PACKAGE_SCHEMA,
     GGUFRuntimeEvidence,
     gguf_artifact_identity,
     gguf_graph_package_identity,
@@ -115,6 +119,7 @@ def _record(payload: bytes) -> GGUFRuntimeEvidence:
         onnxruntime_version="1.29.0",
         runtime="onnx-genai",
         runtime_version="1.0.0",
+        runtime_package_schema=FINAL_RUNTIME_PACKAGE_SCHEMA,
     )
 
 
@@ -132,6 +137,55 @@ def _model():
 def test_runtime_evidence_rejects_non_hex_tokenizer_metadata_digest() -> None:
     with pytest.raises(ValueError, match="immutable 40-hex revisions and LFS SHA-256"):
         replace(_record(b"pinned-gguf"), tokenizer_metadata_sha256="g" * 64)
+
+
+def test_production_runtime_evidence_requires_final_package_regeneration() -> None:
+    from mobius.integrations.gguf._runtime_evidence import iter_runtime_evidence
+
+    records = iter_runtime_evidence()
+    assert records
+    assert [
+        record.evidence_id
+        for record in records
+        if record.runtime_package_schema == FINAL_RUNTIME_PACKAGE_SCHEMA
+    ] == ["apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2"]
+
+
+def test_low_cost_runtime_batch_manifest_is_closed_and_within_budget() -> None:
+    manifest = json.loads(
+        Path("testdata/evidence/gguf_low_cost_runtime_batch.json").read_text(encoding="utf-8")
+    )
+    selected = manifest["selected"]
+    assert 6 <= len(selected) <= 10
+    assert len({item["architecture"] for item in selected}) == len(selected)
+    assert len({item["evidence_id"] for item in selected}) == len(selected)
+    assert all(item["storage_mode"] == "explicit-float" for item in selected)
+
+    artifact_bytes = sum(item["artifact_size"] for item in selected)
+    tokenizer_bytes = sum(item["tokenizer_payload_size"] for item in selected)
+    assert manifest["totals"] == {
+        "artifact_bytes": artifact_bytes,
+        "tokenizer_bytes": tokenizer_bytes,
+        "download_bytes": artifact_bytes + tokenizer_bytes,
+    }
+    assert manifest["totals"]["download_bytes"] <= manifest["policy"]["maximum_download_bytes"]
+
+    for item in selected:
+        evidence = _runtime_evidence.runtime_evidence(item["evidence_id"])
+        assert evidence is not None
+        assert evidence.architecture == item["architecture"]
+        assert evidence.size == item["artifact_size"]
+        assert evidence.lfs_sha256 == item["artifact_sha256"]
+        assert (
+            sum(size for _, size, _ in evidence.tokenizer_assets)
+            == item["tokenizer_payload_size"]
+        )
+        spec = get_arch_spec(item["architecture"])
+        assert item["evidence_id"] in spec.runtime_evidence_ids
+
+    assert all(item["result"] == "blocked" for item in manifest["fail_closed"])
+    assert all(item["reason_code"] for item in manifest["fail_closed"])
+    assert {item.get("pull_request") for item in manifest["excluded"]} >= {672, 674}
 
 
 def test_nemotron_h_runtime_blocker_is_pinned_without_support_claim() -> None:
@@ -229,6 +283,21 @@ def test_matching_evidence_binds_arch_runtime_source_qtypes_and_route(
             runtime_version="1.0.0",
             tokenizer_repository=record.tokenizer_repository,
             tokenizer_revision=record.tokenizer_revision,
+        )
+        is record
+    )
+    assert (
+        matching_runtime_evidence(
+            (record.evidence_id,),
+            architecture="llama",
+            runtime="onnx-genai",
+            source_path=source,
+            gguf_model=_model(),
+            built_identity=gguf_artifact_identity(source, _model(), architecture="llama"),
+            import_route=record.import_route,
+            runtime_version="1.0.0",
+            tokenizer_repository=None,
+            tokenizer_revision=None,
         )
         is record
     )
@@ -450,6 +519,12 @@ def test_graph_package_identity_frames_files_and_rejects_symlinks(tmp_path) -> N
     second = gguf_graph_package_identity(package)
     assert first.files == second.files == ("a.onnx", "b.data")
     assert first.sha256 != second.sha256
+
+    selected = gguf_graph_package_identity(package, files=("a.onnx",))
+    (package / "ignored.txt").write_text("not selected")
+    assert gguf_graph_package_identity(package, files=("a.onnx",)) == selected
+    with pytest.raises(ValueError, match="stay inside"):
+        gguf_graph_package_identity(package, files=("../escape",))
 
     (package / "linked.data").symlink_to(package / "b.data")
     with pytest.raises(ValueError, match="must not contain symlinks"):

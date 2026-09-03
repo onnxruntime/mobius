@@ -486,6 +486,84 @@ def _process_kimi_linear(
     return state_dict
 
 
+def _process_split_mla_kv(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    fuse_for_expanded_graph: bool,
+) -> dict[str, torch.Tensor]:
+    """Restore split MLA K/V-B matrices to flat Linear row order."""
+    k_suffix = ".k_b_proj.weight"
+    v_suffix = ".v_b_proj.weight"
+    k_by_prefix = {
+        name[: -len(k_suffix)]: tensor
+        for name, tensor in state_dict.items()
+        if name.endswith(k_suffix)
+    }
+    v_by_prefix = {
+        name[: -len(v_suffix)]: tensor
+        for name, tensor in state_dict.items()
+        if name.endswith(v_suffix)
+    }
+    if set(k_by_prefix) != set(v_by_prefix):
+        missing_k = sorted(set(v_by_prefix) - set(k_by_prefix))
+        missing_v = sorted(set(k_by_prefix) - set(v_by_prefix))
+        raise ValueError(
+            "GLM-5.2 split K/V-B projections must be paired per layer: "
+            f"missing_k={missing_k}, missing_v={missing_v}"
+        )
+
+    for prefix in sorted(k_by_prefix):
+        key = k_by_prefix[prefix]
+        value = v_by_prefix[prefix]
+        if key.dim() != 3 or value.dim() != 3:
+            raise ValueError(
+                "GLM-5.2 split K/V-B tensors must both be rank 3, got "
+                f"{prefix + k_suffix!r} rank {key.dim()} and "
+                f"{prefix + v_suffix!r} rank {value.dim()}"
+            )
+        key = key.transpose(1, 2)
+        if not fuse_for_expanded_graph:
+            state_dict[prefix + k_suffix] = key.reshape(
+                key.shape[0] * key.shape[1], key.shape[2]
+            )
+            state_dict[prefix + v_suffix] = value.reshape(
+                value.shape[0] * value.shape[1], value.shape[2]
+            )
+            continue
+
+        if key.shape[0] != value.shape[0] or key.shape[2] != value.shape[2]:
+            raise ValueError(
+                f"GLM-5.2 split K/V-B tensors for {prefix!r} have incompatible shapes "
+                f"{tuple(key.shape)} and {tuple(value.shape)}"
+            )
+        del state_dict[prefix + k_suffix]
+        del state_dict[prefix + v_suffix]
+        state_dict[prefix + ".kv_b_proj.weight"] = torch.cat((key, value), dim=1).reshape(
+            -1, key.shape[2]
+        )
+    return state_dict
+
+
+def _process_glm_dsa(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore GLM-DSA split MLA weights for sparse or dense graph selection."""
+    return _process_split_mla_kv(
+        state_dict,
+        fuse_for_expanded_graph=not getattr(config, "use_dsa", True),
+    )
+
+
+def _process_mistral4(
+    state_dict: dict[str, torch.Tensor],
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Restore Mistral4 K/V-B matrices while retaining its split latent graph."""
+    del config
+    return _process_split_mla_kv(state_dict, fuse_for_expanded_graph=False)
+
+
 def _process_kimi_k3(
     state_dict: dict[str, torch.Tensor],
     config: Any,
@@ -678,6 +756,8 @@ _PROCESSOR_IMPLS: dict[str, Any] = {
     "plamo": _process_plamo,
     "plamo2": _process_plamo2,
     "granitehybrid": _process_granitehybrid,
+    "glm_dsa": _process_glm_dsa,
+    "mistral4": _process_mistral4,
     "kimi_linear": _process_kimi_linear,
     "kimi_k3": _process_kimi_k3,
     "bloom": _process_bloom,

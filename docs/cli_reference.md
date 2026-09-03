@@ -162,18 +162,18 @@ tokenizer files to the output directory:
   directory.
 
 For a graph-representable, single-model decoder-only text graph, Mobius emits the
-architecture-neutral `model.type: "decoder"` contract supported by
-onnxruntime-genai 0.14.0 and newer. Validation targets only the latest stable
-release, currently 0.15.2.
+architecture-neutral `model.type: "decoder"` contract. Validation currently targets
+onnxruntime-genai 0.15.2, but the tested runtime version and registry are evidence,
+not export admission checks.
 The graph determines the exact semantic input names, output names, cache templates,
 and global cache indices, so dense, MoE, tied-weight, quantized, and unknown
 architecture names do not need a runtime registry entry.
 
 Architecture-specific types remain only where the runtime selects different
-behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` selects
-`Gpt_Model`, but Mobius's separate rank-4 key/value cache ABI does not match that
-runtime's rank-5 combined-cache contract, so config generation currently fails
-closed. `phi3`, `phimoe`, and `phi3small` retain their names only when their config selects
+behavior. `lfm2` uses its legacy convolution-cache implementation. `gpt2` uses the
+generic decoder because Mobius exports separate rank-4 key/value caches rather than
+the specialized `Gpt_Model` rank-5 combined-cache contract. `phi3`, `phimoe`, and
+`phi3small` retain their names only when their config selects
 LongRoPE, because the released generator uses those names to recompute caches when
 generation crosses the short-context threshold. Ordinary Phi-3-family graphs use
 `decoder`. Multimodal, audio, encoder-decoder, special-position-ID,
@@ -187,20 +187,20 @@ its [dedicated runtime model](https://github.com/microsoft/onnxruntime-genai/blo
 The Phi-3 LongRoPE threshold dispatch is in the released
 [`Generator`](https://github.com/microsoft/onnxruntime-genai/blob/v0.15.2/src/generators.cpp).
 
-Released generic recurrent state is enabled only when the optimized graph exposes
-matching `conv_state` and `recurrent_state` names derived from the same cache
-template. Mobius rejects static-cache names and heterogeneous state layouts that
-the released config schema cannot represent rather than emitting a misleading
-dense cache. The deferred state-manifest work is tracked by
+Mobius preserves graph-derived recurrent and heterogeneous state names even when the
+tested runtime cannot orchestrate them. The generated compatibility sidecar records
+the complete component input/output contract and marks such packages
+`unsupported-by-tested-runtime`; the state-manifest work is tracked by
 [#605](https://github.com/onnxruntime/mobius/issues/605).
 
-Each export also writes `runtime_compatibility.json`. Generic decoder metadata
-records the minimum runtime version and the latest stable release exercised by
-Mobius (0.15.2); it never emits the unreleased `decoder.state_groups` field.
-Generic config availability does not promote a GGUF runtime verdict: the only
-runtime-supported GGUF route remains the exact pinned SmolLM F16/CPU package, while
-SmolLM2 remains rejected because its GGUF padding-token metadata conflicts with the
-official pinned tokenizer.
+Each export also writes `runtime_compatibility.json` with
+`runtime_validation_status`, warnings, the requested and tested versions, and the
+graph-derived component contract. `validated` means the exact requested runtime was
+exercised; `unvalidated` means no matching evidence exists; and
+`unsupported-by-tested-runtime` records a known downstream limitation without
+blocking export. GGUF runtime evidence remains an independent exact-artifact matrix.
+Source identity and tokenizer semantic mismatches still fail because they would make
+the package metadata incorrect.
 
 #### Example
 
@@ -398,6 +398,7 @@ mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]
 | `--runtime-version VERSION` | Exact selected runtime version. Once runtime support exists, this must equal the version in the matching evidence record; compatible-version ranges are not inferred. |
 | `--mmproj PATH` | Exact companion `clip` GGUF. Pairing validates source identity, target architecture, modality, tensor closure, and dimensions before graph construction. |
 | `--target-config PATH` | Exact target config directory for `dflash`/`eagle3`; requires the adjacent complete `tokenizer.json` and emits a target-binding draft manifest. |
+| `--target-gguf PATH` | Exact target GGUF for a `dflash`/`eagle3` pair; emits target/draft graphs, cache namespaces, required shared-weight bridges, and `runtime_unvalidated` manifest/status metadata. |
 | `--release` | Strip build-time debug and provenance metadata before saving while preserving functional `mobius.*` metadata. |
 | `--static-cache` | Build a fixed-width cache where supported. |
 | `--max-seq-len N` | Set the fixed cache length; requires `--static-cache`. |
@@ -445,13 +446,13 @@ sidecar fail before graph construction, and ORT GenAI packaging remains
 deferred. See
 [`build_from_gguf()`](api/build_from_gguf.md#nvidia-nemotron-h-moe-support-boundary).
 
-Runtime packaging requires a validated embedded `tokenizer.huggingface.json`;
-opaque tokenizer pre-types are never reconstructed. Deferred/rejected
-architecture, tokenizer, draft-pairing, or mmproj checks run before durable
-output. Multimodal packages use `decoder`, `vision_encoder`, optional
-`audio_encoder`, and `embedding`. Graph-only exports persist an admitted
-trailing MTP head under `mtp/`; runtime packaging currently rejects packages
-with an attached MTP sidecar.
+Runtime packaging materializes a tokenizer only when its source can be represented
+faithfully; opaque processors remain explicit validation warnings and do not block
+graph/config/package export. Intrinsic graph, tensor, source-identity, and storage
+errors still fail before durable output. Multimodal packages use `decoder`,
+`vision_encoder`, optional `audio_encoder`, and `embedding`. MTP exports persist the
+target and sidecar in separate manifest-selected namespaces and emit exact external
+cache bindings plus `runtime_unvalidated` metadata.
 
 ---
 

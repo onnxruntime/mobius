@@ -11,7 +11,13 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius._configs import AudioConfig, Gemma4Config, QuantizationConfig
+from mobius._configs import (
+    AudioConfig,
+    Gemma4AudioConfig,
+    Gemma4Config,
+    QuantizationConfig,
+    QuantizationOverride,
+)
 from mobius.models.gemma4 import Gemma4CausalLMModel, Gemma4EmbeddingModel, Gemma4Model
 
 
@@ -212,6 +218,41 @@ class TestGemma4ModelPreprocessWeights:
         assert result["vision_encoder.projector.weight"].shape == (64, 2, 8)
         assert result["vision_encoder.projector.scales"].shape == (64, 2)
 
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq"])
+    def test_gptq_awq_clippable_vision_sidecars_drop_linear_wrapper(self, quant_method):
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method=quant_method,
+                sym=True,
+                quantize_vision=True,
+            ),
+        )
+        model = Gemma4Model(config)
+        fake_sd = {
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.qweight": torch.zeros(
+                4, 32, dtype=torch.int32
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.scales": torch.ones(
+                2, 32
+            ),
+        }
+
+        result = model.preprocess_weights(fake_sd)
+
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            2,
+            8,
+        )
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.scales"].shape == (
+            32,
+            2,
+        )
+        assert not any(".linear." in name for name in result)
+
     def test_top_level_lm_head_routes_to_decoder(self):
         model = Gemma4Model(_tiny_gemma4_config(tie_word_embeddings=False))
         weight = torch.randn(256, 64)
@@ -347,6 +388,202 @@ class TestGemma4VisionQuantization:
         graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
 
         assert not any(node.op_type == "MatMulNBits" for node in graph)
+
+    def test_unrelated_module_plan_does_not_quantize_vision(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                modules_to_not_convert=("lm_head",),
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+
+        assert not any(node.op_type == "MatMulNBits" for node in graph)
+
+    def test_top_level_vision_override_does_not_enable_vision_quantization(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = _tiny_gemma4_config(
+            enable_moe_block=False,
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                sym=True,
+                quantize_vision=False,
+                overrides={
+                    "model.vision_tower": {
+                        "bits": 4,
+                        "group_size": 16,
+                        "sym": True,
+                    }
+                },
+            ),
+        )
+
+        graph = Gemma4Task().build(Gemma4Model(config), config)["vision_encoder"].graph
+
+        assert not any(node.op_type == "MatMulNBits" for node in graph)
+
+
+class TestGemma4PerComponentQuantization:
+    @staticmethod
+    def _config() -> Gemma4Config:
+        decoder = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            sym=True,
+        )
+        return _tiny_gemma4_config(
+            enable_moe_block=False,
+            hidden_size_per_layer_input=16,
+            vocab_size_per_layer_input=256,
+            audio=Gemma4AudioConfig(
+                input_size=32,
+                num_layers=1,
+                hidden_size=32,
+                output_proj_dims=64,
+                subsampling_conv_channels=[16, 8],
+                audio_token_id=254,
+            ),
+            quantization=decoder,
+            component_quantization={
+                "decoder": decoder,
+                "vision_encoder": QuantizationConfig(
+                    bits=8,
+                    group_size=32,
+                    quant_method="olive",
+                    sym=True,
+                ),
+                "audio_encoder": QuantizationConfig(
+                    bits=2,
+                    group_size=16,
+                    quant_method="olive",
+                    sym=True,
+                ),
+                "embedding": QuantizationConfig(
+                    bits=8,
+                    group_size=16,
+                    quant_method="olive",
+                    sym=True,
+                ),
+            },
+        )
+
+    @staticmethod
+    def _layouts(graph) -> set[tuple[int, int]]:
+        return {
+            (
+                node.attributes["bits"].as_int(),
+                node.attributes["block_size"].as_int(),
+            )
+            for node in graph
+            if node.op_type == "MatMulNBits"
+        }
+
+    def test_each_component_emits_its_own_layout(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        config = self._config()
+        package = Gemma4Task().build(Gemma4Model(config), config)
+
+        assert self._layouts(package["decoder"].graph) == {(4, 16)}
+        assert self._layouts(package["vision_encoder"].graph) == {(8, 32)}
+        assert self._layouts(package["audio_encoder"].graph) == {(2, 16)}
+        assert self._layouts(package["embedding"].graph) == {(8, 16)}
+
+    def test_preprocesses_each_component_with_its_own_layout(self):
+        model = Gemma4Model(self._config())
+        state_dict = {
+            "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
+                64, 32, dtype=torch.uint8
+            ),
+            "model.language_model.layers.0.self_attn.q_proj.weight_scales": torch.ones(64, 4),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                32, 32, dtype=torch.uint8
+            ),
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                32, 1
+            ),
+            "model.audio_tower.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                32, 8, dtype=torch.uint8
+            ),
+            "model.audio_tower.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                32, 2
+            ),
+            "model.language_model.per_layer_model_projection.weight_qweight": torch.zeros(
+                32, 64, dtype=torch.uint8
+            ),
+            "model.language_model.per_layer_model_projection.weight_scales": torch.ones(32, 4),
+        }
+
+        result = model.preprocess_weights(state_dict)
+
+        assert result["decoder.model.layers.0.self_attn.q_proj.weight"].shape == (
+            64,
+            4,
+            8,
+        )
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            1,
+            32,
+        )
+        assert result["audio_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            2,
+            4,
+        )
+        assert result["embedding.per_layer_model_projection.weight"].shape == (
+            32,
+            4,
+            16,
+        )
+
+    def test_component_override_uses_same_layout_for_graph_and_weights(self):
+        from mobius.tasks._gemma4 import Gemma4Task
+
+        override = QuantizationOverride(bits=8, group_size=32)
+        vision_quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            sym=True,
+            overrides={
+                "model.vision_tower": override,
+                "model.embed_vision": override,
+            },
+        )
+        config = self._config()
+        config.component_quantization["vision_encoder"] = vision_quantization
+        model = Gemma4Model(config)
+        graph = Gemma4Task().build(model, config)["vision_encoder"].graph
+
+        result = model.preprocess_weights(
+            {
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_qweight": torch.zeros(
+                    32, 32, dtype=torch.uint8
+                ),
+                "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight_scales": torch.ones(
+                    32, 1
+                ),
+            }
+        )
+
+        assert self._layouts(graph) == {(8, 32)}
+        assert result["vision_encoder.encoder.layers.0.self_attn.q_proj.weight"].shape == (
+            32,
+            1,
+            32,
+        )
 
 
 class TestScaleFreeRMSNormOverflow:

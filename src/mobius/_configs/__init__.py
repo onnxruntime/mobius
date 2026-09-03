@@ -40,6 +40,8 @@ from mobius._configs._base import (
     Gemma4Config,
     GlmAsrConfig,
     GraniteMoeHybridConfig,
+    GrokGGUFConfig,
+    GroveMoEGGUFConfig,
     HyV3Config,
     HyV3MtpConfig,
     Jais2Config,
@@ -90,7 +92,7 @@ from mobius._configs._base import (
     _shallow_fields,
     _shared_expert_size,
 )
-from mobius._configs._quantization import QuantizationConfig
+from mobius._configs._quantization import QuantizationConfig, QuantizationOverride
 from mobius._configs._sub_configs import (
     AudioConfig,
     CodecDecoderConfig,
@@ -127,6 +129,8 @@ __all__ = [
     "Gemma4AudioConfig",
     "Gemma4Config",
     "GlmAsrConfig",
+    "GrokGGUFConfig",
+    "GroveMoEGGUFConfig",
     "GraniteMoeHybridConfig",
     "HyV3Config",
     "HyV3MtpConfig",
@@ -153,6 +157,7 @@ __all__ = [
     "Plamo2Config",
     "QuantizationConfig",
     "Qwen4ExpConfig",
+    "QuantizationOverride",
     "Qwen35MtpConfig",
     "RoPEConfig",
     "Sam2Config",

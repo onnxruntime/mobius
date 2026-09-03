@@ -24,6 +24,7 @@ from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
 from mobius.integrations.gguf._tokenizer_evidence import (
     iter_tokenizer_blocker_evidence,
     iter_tokenizer_evidence,
+    matching_tokenizer_blocker_evidence,
     matching_tokenizer_evidence,
     tokenizer_blocker_evidence,
     tokenizer_evidence,
@@ -82,8 +83,11 @@ def test_first_tokenizer_evidence_batch_is_complete_and_artifact_scoped() -> Non
 def test_plm_tokenizer_blocker_is_exact_and_architecture_scoped() -> None:
     blockers = iter_tokenizer_blocker_evidence()
     assert [record.evidence_id for record in blockers] == [
+        "glm4-7-flash-iq2-xxs-tokenizer-semantic-blocker",
+        "llada-moe-iq1-s-tokenizer-semantic-blocker",
         "minicpm-2b-q2-k-tokenizer-mismatch",
         "minicpm3-4b-q4-k-m-tokenizer-mismatch",
+        "north-mini-code-iq1-s-tokenizer-semantic-blocker",
         "plm-1.8b-instruct-q4-k-m-tokenizer-blocker",
     ]
     blocker = tokenizer_blocker_evidence("plm-1.8b-instruct-q4-k-m-tokenizer-blocker")
@@ -142,6 +146,29 @@ def test_tokenizer_blocker_requires_complete_sorted_qtype_inventory() -> None:
         dataclasses.replace(blocker, tensor_qtypes=tuple(reversed(blocker.tensor_qtypes)))
     with pytest.raises(ValueError, match="qtypes must be sorted and cover every tensor"):
         dataclasses.replace(blocker, tensor_qtypes=(("F32", 1),))
+
+
+def test_alias_blocker_requires_exact_dispatch_and_detokenization_evidence() -> None:
+    blocker = tokenizer_blocker_evidence("llada-moe-iq1-s-tokenizer-semantic-blocker")
+    assert blocker is not None
+
+    with pytest.raises(ValueError, match="alias oracle identities disagree"):
+        dataclasses.replace(
+            blocker, dispatch_oracles=tuple(reversed(blocker.dispatch_oracles))
+        )
+    with pytest.raises(ValueError, match="route discriminator is invalid"):
+        dataclasses.replace(
+            blocker,
+            dispatch_discriminator=(
+                "bailingmoe2",
+                blocker.dispatch_discriminator[1],
+                blocker.dispatch_discriminator[2],
+            ),
+        )
+    with pytest.raises(ValueError, match="detokenization mismatch counts disagree"):
+        dataclasses.replace(blocker, oracle_detokenize_mismatch_count=8)
+    with pytest.raises(ValueError, match="complete materialized and semantic evidence"):
+        dataclasses.replace(blocker, materialized_tokenizer_sha256=None)
 
 
 def test_plm_llamacpp_oracle_hashes_are_derived_from_committed_cases() -> None:
@@ -227,7 +254,8 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
     }
     assert statuses == {
         "deferred-compiled-semantics": 45,
-        "deferred-pinned-artifact-evidence": 11,
+        "deferred-pinned-artifact-evidence": 4,
+        "deferred-pinned-artifact-mismatch": 7,
         "validated-pinned-source": 31,
     }
     for record in census:
@@ -239,11 +267,18 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
             assert (record.tokenizer_repository is None) == (
                 record.candidate_disposition is None
             )
+            if record.blocker_evidence_id is not None:
+                blocker = tokenizer_blocker_evidence(record.blocker_evidence_id)
+                assert blocker is not None
+                assert record.current_status == "deferred-pinned-artifact-mismatch"
+                assert record.artifact_sha256 == blocker.lfs_sha256
+                assert record.tokenizer_revision == blocker.tokenizer_revision
         else:
             assert record.artifact_revision is not None
             assert record.tokenizer_revision is not None
             assert record.tokenizer_assets
             assert record.candidate_disposition is None
+            assert record.blocker_evidence_id is None
 
     jina_v1 = next(record for record in census if record.identifier == "jina-v1-en")
     assert jina_v1.blocker_category == "pinned-candidate-source-token-mismatch"
@@ -321,6 +356,46 @@ def test_registry_derived_census_has_a_concrete_disposition_for_every_alias() ->
         444,
         "ca7875445f21a03eb9a480c6aa96251bf4a8951a6e284dc480ef32eaedb796f5",
     )
+
+    requested = {
+        record.identifier: record
+        for record in census
+        if record.identifier
+        in {
+            "bailingmoe",
+            "bailingmoe2",
+            "chatglm-bpe",
+            "cohere2moe",
+            "glm4",
+            "llada-moe",
+            "tiny_aya",
+        }
+    }
+    assert set(requested) == {
+        "bailingmoe",
+        "bailingmoe2",
+        "chatglm-bpe",
+        "cohere2moe",
+        "glm4",
+        "llada-moe",
+        "tiny_aya",
+    }
+    assert {record.current_status for record in requested.values()} == {
+        "deferred-pinned-artifact-mismatch"
+    }
+    assert {record.blocker_category for record in requested.values()} == {
+        "pinned-candidate-source-semantic-mismatch"
+    }
+    assert {
+        requested[identifier].blocker_evidence_id
+        for identifier in ("bailingmoe", "bailingmoe2", "llada-moe")
+    } == {"llada-moe-iq1-s-tokenizer-semantic-blocker"}
+    assert {
+        requested[identifier].blocker_evidence_id for identifier in ("chatglm-bpe", "glm4")
+    } == {"glm4-7-flash-iq2-xxs-tokenizer-semantic-blocker"}
+    assert {
+        requested[identifier].blocker_evidence_id for identifier in ("cohere2moe", "tiny_aya")
+    } == {"north-mini-code-iq1-s-tokenizer-semantic-blocker"}
 
 
 def test_batch2_alias_fixture_matches_dispatch_proof_and_census() -> None:
@@ -724,6 +799,14 @@ def test_matching_plm_blocker_reports_exact_normalizer_mismatch(tmp_path, monkey
         get_tensor_shape=lambda _name: (2, 4),
     )
 
+    assert (
+        matching_tokenizer_blocker_evidence(
+            tmp_path / "tiny.gguf",
+            model,
+            metadata_sha256=tiny.tokenizer_metadata_sha256,
+        )
+        is tiny
+    )
     with pytest.raises(ValueError, match=r"explicitly blocked.*NFC normalization"):
         matching_tokenizer_evidence(
             tmp_path / "tiny.gguf",

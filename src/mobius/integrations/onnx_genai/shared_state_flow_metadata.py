@@ -9,7 +9,6 @@ import os
 from typing import Any
 
 import onnx_ir as ir
-import yaml
 
 from mobius.generation import (
     PolicyCapabilities,
@@ -30,17 +29,15 @@ from mobius.generation import (
     build_tensor_scale,
     build_x0_flow_velocity,
 )
-from mobius.integrations.onnx_genai.inference_metadata import (
-    add_policy_components_to_workflow,
-)
-from mobius.integrations.onnx_genai.workflow_metadata import (
+from mobius.integrations.onnx_genai._metadata_io import _dump_yaml
+from mobius.integrations.onnx_genai._workflow_contract import (
     _component,
     _contract,
     _effect,
     _invoke,
     _model_cache_pairs,
-    _NoAliasSafeDumper,
     _publish_workflow_v1,
+    add_policy_components_to_workflow,
 )
 
 
@@ -937,5 +934,5 @@ def write_shared_state_pixel_flow_workflow_metadata(
     pkg.save_policy_components(output_dir)
     path = os.path.join(output_dir, "inference_metadata.yaml")
     with open(path, "w", encoding="utf-8") as handle:
-        yaml.dump(metadata, handle, Dumper=_NoAliasSafeDumper, sort_keys=False)
+        _dump_yaml(metadata, handle)
     return path

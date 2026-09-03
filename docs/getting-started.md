@@ -267,16 +267,16 @@ mobius info meta-llama/Llama-3.2-1B
 
 ```bash
 # Unit tests (fast, no network needed)
-pytest tests/build_graph_test.py -v
+pytest tests/build_graph -v
 
 # Run a single model type
-pytest tests/build_graph_test.py -k "phi4mm"
+pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (downloads models, requires more time/memory)
-pytest tests/integration_test.py -m integration -v
+pytest tests/integration -m integration -v
 
 # Run a single integration test model
-pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
+pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
 ```
 
 ### Linting

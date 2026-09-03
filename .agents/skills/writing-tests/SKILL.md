@@ -44,9 +44,9 @@ without passing L2, or have L4 golden data without passing L3.
 
 | Level | Name | What it verifies | Data source |
 |-------|------|-----------------|-------------|
-| **L1** | Graph builds | ONNX graph builds from a tiny synthetic config | `tests/_test_configs.py` + `tests/build_graph_test.py` |
+| **L1** | Graph builds | ONNX graph builds from a tiny synthetic config | `tests/_test_configs.py` + `tests/build_graph` |
 | **L2** | Config compatible | Full-size HF config produces a valid graph | `test_model_id` in YAML test case (`testdata/cases/`) |
-| **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/integration_test.py` parametrized tests |
+| **L3** | Synthetic parity | Random-weight forward pass matches HF numerically | `tests/synthetic_parity_test.py` and focused integration suites |
 | **L4** | Golden match | Real-weight prefill logits match pre-computed reference | `testdata/golden/<cat>/<model>.json` |
 | **L5** | Generation verified | Full multi-token generation matches golden output | `testdata/golden/<cat>/<model>_generation.json` |
 
@@ -60,17 +60,17 @@ models.
 
 ```bash
 # All non-integration tests (fast, no downloads)
-python -m pytest tests/build_graph_test.py tests/cli_test.py src/ -q \
+python -m pytest tests/build_graph tests/cli_test.py src/ -q \
   -k "not phi4mm and not apply_weights_unknown" --tb=short
 
 # Representative models only (~5 seconds)
-python -m pytest tests/build_graph_test.py --fast
+python -m pytest tests/build_graph --fast
 
 # Single model type
-python -m pytest tests/build_graph_test.py -k "phi4mm"
+python -m pytest tests/build_graph -k "phi4mm"
 
 # Integration tests (slow, downloads models)
-python -m pytest tests/integration_test.py -m integration -k "qwen2.5-0.5b"
+python -m pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
 
 # L4/L5 golden tests
 python -m pytest tests/e2e_golden_test.py -m golden --level L4 -v
@@ -86,9 +86,20 @@ python scripts/generate_golden.py --level L4 --filter 'my-model*'
 
 ```
 tests/
-├── build_graph_test.py       # L1: graph construction (no weights)
+├── build_graph/               # L1: graph construction by model domain
+│   ├── _support.py            # shared helpers and coverage inventory
+│   ├── core_test.py
+│   ├── cache_test.py
+│   ├── diffusion_audio_test.py
+│   ├── recurrent_test.py
+│   ├── speech_test.py
+│   └── vision_language_test.py
 ├── _test_configs.py          # shared model configs for all tests
-├── integration_test.py       # L3: real-weight numerical parity
+├── integration/             # focused real-weight and architecture parity suites
+│   ├── _support.py          # shared session/feed helpers and text cases
+│   ├── text_test.py
+│   ├── generation_test.py
+│   └── ...                  # VLM, encoder/media, architecture, and heavy suites
 ├── e2e_golden_test.py        # L4 + L5: golden file comparison
 ├── yaml_schema_test.py       # YAML test case schema validation
 ├── weight_alignment_test.py  # L1: preprocess_weights correctness
@@ -132,15 +143,15 @@ CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
 
 ## L1: Graph build tests
 
-Located in `tests/build_graph_test.py`. Uses tiny synthetic configs
+Located in `tests/build_graph`. Uses tiny synthetic configs
 (64 hidden, 2 layers, 256 vocab) — no weights, no network.
 
 The framework checks: inputs exist (`input_ids`, `attention_mask`,
 `position_ids`), outputs exist (`logits`, KV cache), and initializers
 are present.
 
-VLM/audio models use dedicated test methods tracked in
-`_SPECIALIZED_TEST_MODEL_TYPES`.
+Models with dedicated test methods are tracked in
+`tests/build_graph/_support.py::specialized_test_model_types()`.
 
 ### Weight alignment tests
 
@@ -166,9 +177,10 @@ set to a real HF model ID.
 
 ## L3: Integration tests
 
-Located in `tests/integration_test.py`. Parametrized with
-`(model_id, trust_remote_code)`. Prefer models ≤ 1B, publicly accessible,
-one per distinct model class.
+Located in focused `tests/integration/*_test.py` modules. The generic text
+suite is parametrized with `(model_id, trust_remote_code)` from
+`tests/integration/_support.py`. Prefer models ≤ 1B, publicly accessible, one
+per distinct model class.
 
 > Read [`references/test-examples.md`](references/test-examples.md) for
 > full prefill/decode/generation code patterns.

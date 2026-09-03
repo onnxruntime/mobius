@@ -64,6 +64,11 @@ class TestEagle3ModelParams:
         names = [n for n, _ in model.named_parameters()]
         assert not any("embed_tokens" in n for n in names)
 
+    def test_head_can_own_embed_tokens(self):
+        model = Eagle3DraftModel(_eagle3_config(use_draft_token_embedding=True))
+        names = [n for n, _ in model.named_parameters()]
+        assert "embed_tokens.weight" in names
+
     def test_projection_shapes(self):
         cfg = _eagle3_config()
         model = Eagle3DraftModel(cfg)
@@ -147,6 +152,15 @@ class TestEagle3PreprocessWeights:
             "self_attn.q_proj.weight",
         }
 
+    def test_speculators_layout_retains_draft_owned_embedding(self):
+        cfg = _eagle3_config(use_draft_token_embedding=True)
+        model = Eagle3DraftModel(cfg)
+        embedding = torch.zeros(cfg.vocab_size, cfg.hidden_size)
+
+        out = model.preprocess_weights({"embed_tokens.weight": embedding})
+
+        assert out == {"embed_tokens.weight": embedding}
+
 
 class TestEagle3SpeculatorsConfig:
     def test_nested_transformer_layer_config(self):
@@ -174,6 +188,7 @@ class TestEagle3SpeculatorsConfig:
         assert cfg.hidden_size == 64
         assert cfg.num_hidden_layers == 1
         assert cfg.rope_theta == 1_000_000
+        assert cfg.use_draft_token_embedding is True
 
     def test_norm_before_residual_builds(self):
         cfg = _eagle3_config(norm_before_residual=True)
@@ -224,6 +239,12 @@ class TestEagle3TaskGraph:
         ):
             assert name in names
         assert "input_ids" not in names
+
+    def test_draft_owned_embedding_uses_input_ids(self):
+        _cfg, model = self._build(use_draft_token_embedding=True)
+        names = [value.name for value in model.graph.inputs]
+        assert "input_ids" in names
+        assert "inputs_embeds" not in names
 
     def test_outputs(self):
         _cfg, model = self._build()

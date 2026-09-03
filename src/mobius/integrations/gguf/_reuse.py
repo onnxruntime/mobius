@@ -34,9 +34,19 @@ _MANIFEST_NAME = "gguf-reuse.json"
 _SIDECAR_NAME = "model.onnx.data"
 _TRANSACTION_NAME = ".gguf-reuse.transaction.json"
 _LOCK_NAME = ".gguf-reuse.lock"
+_OPTIONAL_PACKAGE_METADATA = frozenset(
+    {"draft_manifest.json", "export_report.json", "quantization_report.json"}
+)
 _EXTERNAL_WEIGHT_THRESHOLD = 256
 _GENERATED_NAMES = frozenset(
-    {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME, _TRANSACTION_NAME, _LOCK_NAME}
+    {
+        "model.onnx",
+        _SIDECAR_NAME,
+        _MANIFEST_NAME,
+        _TRANSACTION_NAME,
+        _LOCK_NAME,
+        *_OPTIONAL_PACKAGE_METADATA,
+    }
 )
 _FLOAT_QTYPE_DTYPES = {
     "F32": ir.DataType.FLOAT,
@@ -462,6 +472,17 @@ def _write_json_exclusive(path: Path, payload: Mapping[str, object]) -> None:
         os.close(descriptor)
 
 
+def _write_bytes_exclusive(path: Path, payload: bytes) -> None:
+    descriptor = _open_exclusive(path)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+
+
 def _require_regular_or_missing(path: Path, *, artifact: str) -> None:
     """Reject links, directories, devices, and sockets at generated paths."""
     try:
@@ -745,14 +766,15 @@ def _validated_transaction_journal(path: Path) -> _TransactionJournal:
     managed = journal.get("managed")
     staged = journal.get("staged")
     phase = journal.get("phase", "replacing")
-    expected_finals = {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME}
+    required_finals = {"model.onnx", _SIDECAR_NAME, _MANIFEST_NAME}
+    allowed_finals = required_finals | _OPTIONAL_PACKAGE_METADATA
     if (
         phase not in {"replacing", "committed"}
         or not isinstance(managed, list)
         or not isinstance(staged, list)
     ):
         raise TypeError("Invalid GGUF transaction journal.")
-    if len(managed) != len(expected_finals):
+    if not len(required_finals) <= len(managed) <= len(allowed_finals):
         raise ValueError("Invalid GGUF transaction journal managed artifact set.")
 
     validated_managed: list[_TransactionEntry] = []
@@ -765,7 +787,7 @@ def _validated_transaction_journal(path: Path) -> _TransactionJournal:
         had_existing = entry.get("had_existing")
         if (
             not isinstance(final, str)
-            or final not in expected_finals
+            or final not in allowed_finals
             or final in seen_finals
             or not isinstance(backup, str)
             or re.fullmatch(
@@ -780,7 +802,7 @@ def _validated_transaction_journal(path: Path) -> _TransactionJournal:
         validated_managed.append(
             {"final": final, "backup": backup, "had_existing": had_existing}
         )
-    if seen_finals != expected_finals:
+    if not required_finals.issubset(seen_finals) or not seen_finals.issubset(allowed_finals):
         raise ValueError("Invalid GGUF transaction journal managed artifact set.")
 
     validated_staged: list[str] = []
@@ -791,7 +813,7 @@ def _validated_transaction_journal(path: Path) -> _TransactionJournal:
         matched_final = next(
             (
                 final
-                for final in expected_finals
+                for final in allowed_finals
                 if re.fullmatch(
                     rf"\.{re.escape(final)}\.[0-9a-f]{{32}}\.tmp",
                     staged_name,
@@ -814,6 +836,7 @@ def save_reuse_package(
     plan: GGUFReusePlan,
     *,
     callback=None,
+    package_metadata: Mapping[str, bytes] | None = None,
 ) -> tuple[str, ...]:
     """Transactionally save mixed GGUF references plus a converted sidecar."""
     path = Path(path)
@@ -829,7 +852,23 @@ def save_reuse_package(
         staged_manifest = path.with_name(f".{_MANIFEST_NAME}.{token}.tmp")
         final_sidecar = path.parent / _SIDECAR_NAME
         final_manifest = path.parent / _MANIFEST_NAME
-        for staged_path in (staged_model, staged_sidecar, staged_manifest):
+        package_metadata = dict(package_metadata or {})
+        if not set(package_metadata).issubset(_OPTIONAL_PACKAGE_METADATA):
+            raise ValueError("GGUF reuse package metadata contains an unsupported filename.")
+        staged_metadata = {
+            name: (
+                path.parent / f".{name}.{token}.tmp",
+                path.parent / name,
+            )
+            for name in sorted(package_metadata)
+        }
+        all_staged = (
+            staged_model,
+            staged_sidecar,
+            staged_manifest,
+            *(staged for staged, _ in staged_metadata.values()),
+        )
+        for staged_path in all_staged:
             _require_regular_or_missing(staged_path, artifact="staged")
             if staged_path.exists():
                 raise ValueError(f"Unexpected GGUF staged artifact: {staged_path}")
@@ -869,6 +908,8 @@ def save_reuse_package(
             ir.save(model, staged_model)
             _fsync_file(staged_model)
             _write_json_exclusive(staged_manifest, _manifest_payload(plan, converted_names))
+            for name, (staged_path, _) in staged_metadata.items():
+                _write_bytes_exclusive(staged_path, package_metadata[name])
             verify_gguf_reuse_manifest(
                 path.parent,
                 model_path=staged_model,
@@ -882,15 +923,26 @@ def save_reuse_package(
             }
             if memory_initializers:
                 replacements[final_sidecar] = staged_sidecar
+            replacements.update(
+                {
+                    final_path: staged_path
+                    for staged_path, final_path in staged_metadata.values()
+                }
+            )
             _require_source_identity(plan)
             _replace_artifacts_locked(
                 replacements,
-                (path, final_sidecar, final_manifest),
+                (
+                    path,
+                    final_sidecar,
+                    final_manifest,
+                    *(path.parent / name for name in sorted(_OPTIONAL_PACKAGE_METADATA)),
+                ),
             )
         finally:
             for value, tensor in zip(memory_initializers, original_tensors, strict=True):
                 value.const_value = tensor
-            for staged_path in (staged_model, staged_sidecar, staged_manifest):
+            for staged_path in all_staged:
                 _require_regular_or_missing(staged_path, artifact="staged")
                 staged_path.unlink(missing_ok=True)
 

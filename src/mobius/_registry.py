@@ -90,6 +90,9 @@ from mobius.models import (
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
+    GrokGGUFCausalLMModel,
+    GroveMoEGGUFCausalLMModel,
+    HunyuanMoEGGUFCausalLMModel,
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
@@ -108,6 +111,8 @@ from mobius.models import (
     Llama4CausalLMModel,
     MageVLForConditionalGeneration,
     MaincoderCausalLMModel,
+    MiniMaxM2GGUFCausalLMModel,
+    Mistral4GGUFCausalLMModel,
     MoECausalLMModel,
     MoonshineForConditionalGeneration,
     NanoChatCausalLMModel,
@@ -145,7 +150,9 @@ from mobius.models import (
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
+    ReUseConfig,
     RND1Model,
+    SEMambaSpeechEnhancementModel,
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
@@ -489,6 +496,17 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_model_id="Maincode/Maincoder-1B",
         test_revision="088ec98640bdeb105f46a9ef6a1370ed5d0d2ea5",
     ),
+    "minimax_m2_gguf": ModelRegistration(
+        MiniMaxM2GGUFCausalLMModel,
+        family="minimax",
+        variant="gguf",
+    ),
+    "mistral4_gguf": ModelRegistration(
+        Mistral4GGUFCausalLMModel,
+        task="mistral4-gguf-text-generation",
+        family="mistral",
+        variant="gguf",
+    ),
     "bloom": ModelRegistration(BloomCausalLMModel),
     "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
@@ -681,6 +699,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "granitemoe": ModelRegistration(GraniteMoECausalLMModel),
     "granitemoehybrid": ModelRegistration(GraniteMoeHybridCausalLMModel),
     "granitemoeshared": ModelRegistration(GraniteMoECausalLMModel),
+    "grok_gguf": ModelRegistration(GrokGGUFCausalLMModel),
+    "grovemoe_gguf": ModelRegistration(GroveMoEGGUFCausalLMModel),
+    "hunyuan_moe_gguf": ModelRegistration(HunyuanMoEGGUFCausalLMModel),
     "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
     "jetmoe": ModelRegistration(JetMoeCausalLMModel),
     "kimi_linear": ModelRegistration(
@@ -1047,6 +1068,16 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
     "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
+    "reuse": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
+    "semamba": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
 }
 
 

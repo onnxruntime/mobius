@@ -12,7 +12,7 @@ from mobius._testing import (
     create_test_builder,
     create_test_input,
 )
-from mobius.components._ssm import SelectiveScan
+from mobius.components._ssm import SelectiveScan, SequenceSelectiveScan
 
 
 class TestSelectiveScan:
@@ -99,3 +99,87 @@ class TestSelectiveScan:
 
         y, _new_state = ssm(op, x, state)
         assert y is not None
+
+
+class TestSequenceSelectiveScan:
+    """Tests for the full-sequence selective scan."""
+
+    def test_shares_parameters_with_decode_variant(self):
+        """Parameter names and shapes match the single-token SelectiveScan."""
+        decode = SelectiveScan(d_inner=64, d_state=16, dt_rank=4)
+        sequence = SequenceSelectiveScan(d_inner=64, d_state=16, dt_rank=4)
+
+        def spec(module):
+            return {name: list(p.shape) for name, p in module.named_parameters()}
+
+        assert spec(sequence) == spec(decode)
+
+    def test_forward_builds_graph(self):
+        """Forward pass constructs a graph with no carried state."""
+        ssm = SequenceSelectiveScan(d_inner=32, d_state=8, dt_rank=2)
+        test_builder, op, graph = create_test_builder()
+        x = create_test_input(test_builder, "x", [2, 5, 32])
+
+        y = ssm(op, x)
+
+        assert y is not None
+        # The recurrence is expressed as a single Scan over the sequence.
+        assert count_op_type(graph, "Scan") == 1
+
+    def test_scan_body_carries_state_and_decay(self):
+        """The Scan body takes 2 carries + 4 per-step inputs and emits 3 values."""
+        ssm = SequenceSelectiveScan(d_inner=16, d_state=4, dt_rank=2)
+        test_builder, op, graph = create_test_builder()
+        x = create_test_input(test_builder, "x", [1, 3, 16])
+
+        ssm(op, x)
+
+        scan = next(node for node in graph if node.op_type == "Scan")
+        assert scan.attributes["num_scan_inputs"].value == 4
+        body = scan.attributes["body"].value
+        # ssm_state + a_neg carries, then dt/B/C/x scan inputs.
+        assert len(body.inputs) == 6
+        # ssm_state_out + a_neg_out carries, then the per-step output.
+        assert len(body.outputs) == 3
+
+    def test_scan_iterates_over_axis_zero(self):
+        """Inputs are made time-major so the Scan iterates axis 0.
+
+        Several execution providers (e.g. the MLX plugin EP) only claim
+        Scan nodes with the default axes; naming axis 1 instead would send
+        the whole recurrence back to CPU.
+        """
+        ssm = SequenceSelectiveScan(d_inner=16, d_state=4, dt_rank=2)
+        test_builder, op, graph = create_test_builder()
+        x = create_test_input(test_builder, "x", [1, 3, 16])
+
+        ssm(op, x)
+
+        scan = next(node for node in graph if node.op_type == "Scan")
+        assert "scan_input_axes" not in scan.attributes
+        assert "scan_output_axes" not in scan.attributes
+        # Each scan input arrives through a batch<->time transpose.
+        for scan_input in scan.inputs[2:]:
+            producer = scan_input.producer()
+            assert producer.op_type == "Transpose"
+            assert list(producer.attributes["perm"].value) == [1, 0, 2]
+
+    def test_recurrence_runs_in_float32(self):
+        """The scan body stays in float32 even for a float16 activation."""
+        ssm = SequenceSelectiveScan(d_inner=16, d_state=4, dt_rank=2)
+        test_builder, op, graph = create_test_builder()
+        x = create_test_input(test_builder, "x", [1, 3, 16], ir.DataType.FLOAT16)
+
+        ssm(op, x)
+
+        scan = next(node for node in graph if node.op_type == "Scan")
+        for inp in scan.inputs:
+            producer = inp.producer()
+            if producer is not None and producer.op_type == "Cast":
+                assert producer.attributes["to"].value == ir.DataType.FLOAT
+            else:
+                # ConstantOfShape / Neg / Softplus already operate on float32.
+                assert inp.dtype in (ir.DataType.FLOAT, None)
+
+        # The scan result is handed back in the activation's dtype.
+        assert count_op_type(graph, "CastLike") >= 1

@@ -34,6 +34,9 @@ The core model/task/component layers remain runtime-agnostic; all onnx-genai
 specific code lives here.
 """
 
+from mobius.integrations.onnx_genai._workflow_contract import (
+    add_policy_components_to_workflow,
+)
 from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
 from mobius.integrations.onnx_genai.comfyui import (
     ComfyUIWorkflow,
@@ -55,7 +58,6 @@ from mobius.integrations.onnx_genai.decoder_metadata import (
 )
 from mobius.integrations.onnx_genai.inference_metadata import (
     SchedulerConfig,
-    add_policy_components_to_workflow,
     build_diffusion_pipeline_metadata,
     build_multimodal_pipeline_metadata,
     build_speech_to_text_pipeline_metadata,
@@ -92,6 +94,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     build_image_edit_workflow_metadata,
     build_language_diffusion_pipeline_metadata,
     build_speculative_workflow_metadata,
+    build_speech_enhancement_workflow_metadata,
     build_tts_workflow_metadata,
     build_video_diffusion_workflow_metadata,
     build_vlm_workflow_metadata,
@@ -103,6 +106,7 @@ from mobius.integrations.onnx_genai.workflow_metadata import (
     write_image_edit_workflow_metadata,
     write_language_diffusion_workflow_metadata,
     write_speculative_workflow_metadata,
+    write_speech_enhancement_workflow_metadata,
     write_tts_workflow_metadata,
     write_video_diffusion_workflow_metadata,
     write_vlm_workflow_metadata,
@@ -138,6 +142,7 @@ __all__ = [
     "build_speculative_workflow_metadata",
     "build_speech_to_text_pipeline_metadata",
     "build_shared_state_pixel_flow_workflow_metadata",
+    "build_speech_enhancement_workflow_metadata",
     "build_tokenizer_facts",
     "build_tts_workflow_metadata",
     "build_video_diffusion_workflow_metadata",
@@ -165,6 +170,7 @@ __all__ = [
     "write_speculative_workflow_metadata",
     "write_speech_to_text_pipeline_metadata",
     "write_shared_state_pixel_flow_workflow_metadata",
+    "write_speech_enhancement_workflow_metadata",
     "write_tts_workflow_metadata",
     "write_video_diffusion_workflow_metadata",
     "write_vlm_workflow_metadata",

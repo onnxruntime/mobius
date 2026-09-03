@@ -10,6 +10,8 @@ merger, a second MLP spatial merger, and the Qwen3.5 hybrid text decoder.
 
 from __future__ import annotations
 
+from typing import cast
+
 import onnx_ir as ir
 import torch
 from onnxscript import OpBuilder, nn
@@ -36,7 +38,7 @@ class MiniCPMV46Config(ArchitectureConfig):
         result.model_type = "minicpmv4_6"
         result.video_token_id = getattr(composite, "video_token_id", None)
         result.downsample_mode = getattr(composite, "downsample_mode", "16x")
-        return result
+        return cast(MiniCPMV46Config, result)
 
 
 def _grid_columns(op: OpBuilder, target_sizes: ir.Value) -> tuple[ir.Value, ir.Value]:
@@ -522,7 +524,7 @@ class _MiniCPMMerger(nn.Module):
             self.hidden_size if i < self.merger_times - 1 else config.hidden_size
             for i in range(self.merger_times)
         ]
-        mlps = [
+        mlps: list[nn.Module] = [
             _MiniCPMDownsampleMLP(
                 self.hidden_size,
                 self.output_sizes[i],
@@ -618,6 +620,10 @@ class _MiniCPMVisionEncoderModel(nn.Module):
         pixel_values: ir.Value,
         target_sizes: ir.Value,
     ):
+        pixel_values = op.CastLike(
+            pixel_values,
+            self.vision_tower.embeddings.patch_embedding,
+        )
         hidden_states = self.vision_tower(op, pixel_values, target_sizes)
         return self.merger(op, hidden_states, target_sizes)
 

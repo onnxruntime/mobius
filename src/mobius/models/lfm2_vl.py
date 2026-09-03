@@ -215,6 +215,10 @@ class _Lfm2VlVisionEncoderModel(nn.Module):
         pixel_attention_mask: ir.Value,
         spatial_shapes: ir.Value,
     ) -> ir.Value:
+        pixel_values = op.CastLike(
+            pixel_values,
+            self.vision_tower.embeddings.patch_embedding.weight,
+        )
         hidden_states = self.vision_tower(
             op,
             pixel_values=pixel_values,

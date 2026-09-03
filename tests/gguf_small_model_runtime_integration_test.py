@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib.metadata import packages_distributions, version
 from pathlib import Path
@@ -31,7 +32,16 @@ import pytest
 import torch
 import yaml
 from huggingface_hub import get_hf_file_metadata, hf_hub_download, hf_hub_url
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DynamicCache,
+    GPTBigCodeForCausalLM,
+    GPTNeoXForCausalLM,
+    MptConfig,
+    MptForCausalLM,
+)
 
 from mobius import ModelPackage, build_from_gguf
 from mobius.__main__ import main
@@ -47,6 +57,8 @@ from mobius.integrations.gguf._quantization_report import (
 )
 from mobius.integrations.gguf._reader import GGUFModel
 from mobius.integrations.gguf._runtime_evidence import (
+    FINAL_RUNTIME_PACKAGE_SCHEMA,
+    GGUFRuntimeEvidence,
     gguf_graph_package_identity,
     runtime_evidence,
 )
@@ -86,7 +98,7 @@ _CASES = (
         reference_revision="1d461723eec654e65efdc40cf49301c89c0c92f4",
         prompt="Once upon a time,",
         tensor_qtypes={"F16": 211, "F32": 61},
-        config_sha256="d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886",
+        config_sha256="9f917f4a59c907325a069735b9a5d07177f3d665b5e812c10b626ecf1c94708e",
         generated_tokens=(
             665,
             436,
@@ -144,7 +156,7 @@ _CASES = (
         reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
         prompt="Here is my poem:",
         tensor_qtypes={"F16": 211, "F32": 61},
-        config_sha256="f9ceb816433d5aa32918761944be76ecdb090df8cce7cdb64d5d8f9186f7117f",
+        config_sha256="089d097c1394a74ee386c1d6e2651474bee77d38a8bc0b5d813594c1fede3054",
         generated_tokens=(
             198,
             198,
@@ -204,7 +216,7 @@ _Q4_K_M_CASE = _RuntimeCase(
     reference_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
     prompt="Here is my poem:",
     tensor_qtypes={"F32": 61, "Q4_K": 16, "Q5_0": 166, "Q6_K": 14, "Q8_0": 15},
-    config_sha256="f9ceb816433d5aa32918761944be76ecdb090df8cce7cdb64d5d8f9186f7117f",
+    config_sha256="089d097c1394a74ee386c1d6e2651474bee77d38a8bc0b5d813594c1fede3054",
     generated_tokens=(198, 198, 18, 504, 2388, 13685, 284, 5208, 28, 198),
     tokenizer_repository="HuggingFaceTB/SmolLM2-135M-Instruct",
     tokenizer_revision="12fd25f77366fa6b3b4b768ec3050bf629380bac",
@@ -239,6 +251,9 @@ class _PromotedRuntimeCase:
     prompt: str
     generated_tokens: tuple[int, ...]
     atol: float
+    cache_atol: float
+    execution_provider: str = "cpu"
+    reference_kind: str = "direct"
     dequantize: bool = False
     release: bool = False
     allow_dense_moe: bool = False
@@ -246,6 +261,223 @@ class _PromotedRuntimeCase:
 
 
 _PROMOTED_RUNTIME_CASES = (
+    _PromotedRuntimeCase(
+        name="apertus-v1.1-1.5b-instruct-bf16",
+        evidence_id="apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",
+        prompt="Hello",
+        generated_tokens=(
+            1044,
+            1362,
+            4525,
+            1875,
+            1317,
+            1278,
+            4304,
+            1307,
+            19466,
+            1321,
+            1362,
+            6483,
+            2151,
+            6370,
+            1317,
+            8178,
+            17616,
+            1046,
+            1362,
+            6483,
+        ),
+        atol=2e-4,
+        cache_atol=4e-5,
+        reference_kind="apertus",
+        required_free_bytes=13_000_000_000,
+    ),
+    _PromotedRuntimeCase(
+        name="gpt2-q2-k",
+        evidence_id="gpt2-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            262,
+            717,
+            284,
+            307,
+            262,
+            717,
+            284,
+            307,
+            262,
+            6342,
+            286,
+            262,
+            1578,
+            1829,
+            13,
+            198,
+            198,
+            464,
+            1578,
+            1829,
+        ),
+        atol=1e-4,
+        cache_atol=1e-4,
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="pythia-70m-q2-k",
+        evidence_id="pythia-70m-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            253,
+            187,
+            2097,
+            273,
+            253,
+            987,
+            273,
+            697,
+            987,
+            273,
+            187,
+            187,
+            510,
+            187,
+            187,
+            187,
+            10,
+            187,
+            187,
+            187,
+        ),
+        atol=0.015,
+        cache_atol=0.012,
+        execution_provider="default",
+        reference_kind="gptneox",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-mpt-q2-k",
+        evidence_id="tiny-mpt-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            16322,
+            29093,
+            23684,
+            45373,
+            18311,
+            20725,
+            47672,
+            43521,
+            33057,
+            20725,
+            47672,
+            43521,
+            33057,
+            18888,
+            31622,
+            2306,
+            16644,
+            15903,
+            4251,
+            33057,
+        ),
+        atol=1e-5,
+        cache_atol=1e-6,
+        execution_provider="default",
+        reference_kind="mpt",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-olmo-q2-k",
+        evidence_id="tiny-olmo-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            34423,
+            35007,
+            32269,
+            13481,
+            30755,
+            16833,
+            3137,
+            4002,
+            34423,
+            25900,
+            31879,
+            15216,
+            4390,
+            33762,
+            4390,
+            33762,
+            4390,
+            4390,
+            4390,
+            4390,
+        ),
+        atol=1e-5,
+        cache_atol=2e-6,
+        reference_kind="olmo",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-starcoder-q2-k",
+        evidence_id="tiny-starcoder-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            225,
+            35,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+            34,
+        ),
+        atol=5e-5,
+        cache_atol=3e-5,
+        reference_kind="starcoder",
+        dequantize=True,
+    ),
+    _PromotedRuntimeCase(
+        name="tiny-starcoder2-q2-k",
+        evidence_id="tiny-starcoder2-q2-k-ort-genai-0.15.2",
+        prompt="The capital of France is",
+        generated_tokens=(
+            21284,
+            47755,
+            47755,
+            10004,
+            10004,
+            10004,
+            10004,
+            10004,
+            34798,
+            34798,
+            12046,
+            12046,
+            12046,
+            12046,
+            16273,
+            16273,
+            16273,
+            13231,
+            16273,
+            13231,
+        ),
+        atol=1e-5,
+        cache_atol=2e-6,
+        dequantize=True,
+    ),
     _PromotedRuntimeCase(
         name="qwen2.5-0.5b-instruct-q8",
         evidence_id="qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
@@ -273,6 +505,7 @@ _PROMOTED_RUNTIME_CASES = (
             5109,
         ),
         atol=4e-4,
+        cache_atol=4e-4,
     ),
     _PromotedRuntimeCase(
         name="lfm2-350m-f16",
@@ -301,6 +534,7 @@ _PROMOTED_RUNTIME_CASES = (
             4600,
         ),
         atol=3e-4,
+        cache_atol=3e-4,
     ),
     _PromotedRuntimeCase(
         name="qwen3.5-moe-0.87b-q2-k",
@@ -329,6 +563,7 @@ _PROMOTED_RUNTIME_CASES = (
             198,
         ),
         atol=0.35,
+        cache_atol=0.35,
         dequantize=True,
         release=True,
         allow_dense_moe=True,
@@ -502,6 +737,218 @@ def _load_qwen35moe_same_value_reference(
     return reference.to(dtype=torch.float32).eval()
 
 
+def _load_low_cost_same_value_reference(
+    gguf_path: Path,
+    evidence: GGUFRuntimeEvidence,
+    reference_kind: str,
+) -> torch.nn.Module:
+    """Load the exact dequantized GGUF values into an independent Transformers graph."""
+    if reference_kind == "direct":
+        config = AutoConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+        return AutoModelForCausalLM.from_pretrained(
+            evidence.repository,
+            revision=evidence.revision,
+            gguf_file=evidence.filename,
+            config=config,
+            dtype=torch.float32,
+        ).eval()
+
+    hf_config = (
+        MptConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+        if reference_kind == "mpt"
+        else AutoConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+    )
+    from gguf import GGMLQuantizationType, GGUFReader, dequantize
+
+    # The oracle reads and maps upstream GGUF tensors directly. It deliberately
+    # shares no Mobius tensor loader, name mapping, value processor, or normalizer.
+    source: dict[str, torch.Tensor] = {}
+    reader = GGUFReader(gguf_path)
+    for tensor in reader.tensors:
+        shape = tuple(int(dimension) for dimension in reversed(tensor.shape))
+        if tensor.tensor_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
+            value = tensor.data.reshape(shape)
+        else:
+            value = dequantize(tensor.data, tensor.tensor_type).reshape(shape)
+        source[tensor.name] = torch.from_numpy(np.array(value, copy=True)).float()
+
+    def qkv_to_gptneox(value: torch.Tensor) -> torch.Tensor:
+        q, k, v = value.chunk(3, dim=0)
+        heads = int(hf_config.num_attention_heads)
+        head_dim = q.shape[0] // heads
+        tail = q.shape[1:]
+        return (
+            torch.stack(
+                (
+                    q.reshape(heads, head_dim, *tail),
+                    k.reshape(heads, head_dim, *tail),
+                    v.reshape(heads, head_dim, *tail),
+                ),
+                dim=1,
+            )
+            .reshape(value.shape)
+            .contiguous()
+        )
+
+    def undo_llama_qk_permutation(value: torch.Tensor, heads: int) -> torch.Tensor:
+        head_half = value.shape[0] // heads // 2
+        return (
+            value.reshape(heads, head_half, 2, *value.shape[1:])
+            .swapaxes(1, 2)
+            .reshape(value.shape)
+        )
+
+    renamed: dict[str, torch.Tensor] = {}
+    global_names = {
+        "apertus": {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output_norm.weight": "model.norm.weight",
+            "output.weight": "lm_head.weight",
+        },
+        "gptneox": {
+            "token_embd.weight": "gpt_neox.embed_in.weight",
+            "output_norm.weight": "gpt_neox.final_layer_norm.weight",
+            "output_norm.bias": "gpt_neox.final_layer_norm.bias",
+            "output.weight": "lm_head.weight",
+        },
+        "mpt": {
+            "token_embd.weight": "transformer.wte.weight",
+            "output_norm.weight": "transformer.norm_f.weight",
+        },
+        "olmo": {
+            "token_embd.weight": "model.embed_tokens.weight",
+            "output.weight": "lm_head.weight",
+        },
+        "starcoder": {
+            "token_embd.weight": "transformer.wte.weight",
+            "position_embd.weight": "transformer.wpe.weight",
+            "output_norm.weight": "transformer.ln_f.weight",
+            "output_norm.bias": "transformer.ln_f.bias",
+        },
+    }[reference_kind]
+    layer_names = {
+        "apertus": {
+            "attn_norm": "attention_layernorm",
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_output": "self_attn.o_proj",
+            "attn_q_norm": "self_attn.q_norm",
+            "attn_k_norm": "self_attn.k_norm",
+            "ffn_norm": "feedforward_layernorm",
+            "ffn_up": "mlp.up_proj",
+            "ffn_down": "mlp.down_proj",
+        },
+        "gptneox": {
+            "attn_norm": "input_layernorm",
+            "attn_qkv": "attention.query_key_value",
+            "attn_output": "attention.dense",
+            "ffn_norm": "post_attention_layernorm",
+            "ffn_up": "mlp.dense_h_to_4h",
+            "ffn_down": "mlp.dense_4h_to_h",
+        },
+        "mpt": {
+            "attn_norm": "norm_1",
+            "attn_qkv": "attn.Wqkv",
+            "attn_output": "attn.out_proj",
+            "ffn_norm": "norm_2",
+            "ffn_up": "ffn.up_proj",
+            "ffn_down": "ffn.down_proj",
+        },
+        "olmo": {
+            "attn_q": "self_attn.q_proj",
+            "attn_k": "self_attn.k_proj",
+            "attn_v": "self_attn.v_proj",
+            "attn_output": "self_attn.o_proj",
+            "ffn_gate": "mlp.gate_proj",
+            "ffn_up": "mlp.up_proj",
+            "ffn_down": "mlp.down_proj",
+        },
+        "starcoder": {
+            "attn_norm": "ln_1",
+            "attn_qkv": "attn.c_attn",
+            "attn_output": "attn.c_proj",
+            "ffn_norm": "ln_2",
+            "ffn_up": "mlp.c_fc",
+            "ffn_down": "mlp.c_proj",
+        },
+    }[reference_kind]
+    layer_prefix = {
+        "apertus": "model.layers",
+        "gptneox": "gpt_neox.layers",
+        "mpt": "transformer.blocks",
+        "olmo": "model.layers",
+        "starcoder": "transformer.h",
+    }[reference_kind]
+    for name, value in source.items():
+        target = global_names.get(name)
+        if target is None:
+            parts = name.split(".")
+            assert parts[0] == "blk" and len(parts) == 4, name
+            target_stem = layer_names[parts[2]]
+            target = f"{layer_prefix}.{int(parts[1])}.{target_stem}.{parts[3]}"
+            if reference_kind == "gptneox" and parts[2] == "attn_qkv":
+                value = qkv_to_gptneox(value)
+            elif reference_kind == "olmo" and parts[2] in {"attn_q", "attn_k"}:
+                heads = int(
+                    hf_config.num_attention_heads
+                    if parts[2] == "attn_q"
+                    else hf_config.num_key_value_heads
+                )
+                value = undo_llama_qk_permutation(value, heads)
+        renamed[target] = value
+
+    if reference_kind == "apertus":
+        for suffix in ("alpha_p", "alpha_n", "beta", "eps"):
+            field = reader.fields[f"xielu.{suffix}"]
+            values = [float(field.parts[index][0]) for index in field.data]
+            assert len(values) == int(hf_config.num_hidden_layers)
+            for layer, value in enumerate(values):
+                target = f"model.layers.{layer}.mlp.act_fn.{suffix}"
+                renamed[target] = torch.tensor(
+                    [value] if suffix in {"alpha_p", "alpha_n"} else value,
+                    dtype=torch.float32,
+                )
+    expected_metadata_parameters = (
+        4 * int(hf_config.num_hidden_layers) if reference_kind == "apertus" else 0
+    )
+    assert len(renamed) == len(source) + expected_metadata_parameters
+
+    if reference_kind == "apertus":
+        reference = AutoModelForCausalLM.from_config(hf_config)
+        reference.load_state_dict(renamed, assign=True, strict=True)
+    elif reference_kind == "gptneox":
+        reference = GPTNeoXForCausalLM(hf_config)
+        reference.load_state_dict(renamed, strict=True)
+    elif reference_kind == "starcoder":
+        reference = GPTBigCodeForCausalLM(hf_config)
+        missing, unexpected = reference.load_state_dict(renamed, strict=False)
+        assert missing == ["lm_head.weight"]
+        assert not unexpected
+        reference.tie_weights()
+    elif reference_kind == "mpt":
+        reference = MptForCausalLM(hf_config)
+        missing, unexpected = reference.load_state_dict(renamed, strict=False)
+        assert missing == ["lm_head.weight"]
+        assert not unexpected
+        reference.tie_weights()
+    elif reference_kind == "olmo":
+        reference = AutoModelForCausalLM.from_config(hf_config)
+        reference.load_state_dict(renamed, strict=True)
+    else:
+        raise AssertionError(f"Unknown same-value reference kind: {reference_kind}")
+    return reference.to(dtype=torch.float32).eval()
+
+
 def _run_promoted_ort(
     session: ort.InferenceSession,
     input_ids: np.ndarray,
@@ -524,6 +971,74 @@ def _run_promoted_ort(
     output_names = [value.name for value in session.get_outputs()]
     feeds = {name: value for name, value in candidates.items() if name in input_names}
     return dict(zip(output_names, session.run(output_names, feeds), strict=True))
+
+
+def _assert_starcoder2_long_context_sliding_window(
+    session: ort.InferenceSession,
+    reference: torch.nn.Module,
+    token_id: int,
+    *,
+    atol: float,
+) -> None:
+    """Prove the exact route applies StarCoder2's window past position 4096."""
+    window = int(reference.config.sliding_window)
+    assert window == 4096
+    past_length = window
+    num_layers = int(reference.config.num_hidden_layers)
+    num_kv_heads = int(reference.config.num_key_value_heads)
+    head_dim = int(reference.config.hidden_size // reference.config.num_attention_heads)
+
+    state: dict[str, np.ndarray] = {}
+    cache_data: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for layer_idx in range(num_layers):
+        key = np.zeros((1, num_kv_heads, past_length, head_dim), dtype=np.float32)
+        value = np.zeros_like(key)
+        # Only the oldest value is nonzero. Sliding attention must exclude it at
+        # position 4096; full causal attention still observes it.
+        value[:, :, 0, :] = 1024.0
+        state[f"past_key_values.{layer_idx}.key"] = key
+        state[f"past_key_values.{layer_idx}.value"] = value
+        cache_data.append((torch.from_numpy(key.copy()), torch.from_numpy(value.copy())))
+
+    input_ids = np.asarray([[token_id]], dtype=np.int64)
+    ort_logits = _run_promoted_ort(session, input_ids, state, past_length)["logits"]
+    attention_mask = torch.ones((1, past_length + 1), dtype=torch.int64)
+    position_ids = torch.asarray([[past_length]], dtype=torch.int64)
+
+    def reference_logits(sliding_window: int | None) -> np.ndarray:
+        reference.config.sliding_window = sliding_window
+        cache = DynamicCache(
+            ((key.clone(), value.clone()) for key, value in cache_data),
+            config=reference.config,
+        )
+        with torch.no_grad():
+            return (
+                reference(
+                    torch.from_numpy(input_ids),
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=cache,
+                    use_cache=False,
+                )
+                .logits.numpy()
+                .copy()
+            )
+
+    try:
+        expected_logits = reference_logits(window)
+        np.testing.assert_allclose(ort_logits, expected_logits, rtol=1e-4, atol=atol)
+
+        full_causal_logits = reference_logits(None)
+        assert np.max(np.abs(ort_logits - full_causal_logits)) > 1e-3
+        with pytest.raises(AssertionError):
+            np.testing.assert_allclose(
+                ort_logits,
+                full_causal_logits,
+                rtol=1e-4,
+                atol=atol,
+            )
+    finally:
+        reference.config.sliding_window = window
 
 
 def _assert_replay_rollback_and_reorder(
@@ -1164,15 +1679,11 @@ def test_promoted_gguf_full_runtime_evidence(
         "--dtype",
         "f32",
         "--execution-provider",
-        "cpu",
+        case.execution_provider,
         "--runtime",
         "ort-genai",
         "--runtime-version",
         installed_version,
-        "--tokenizer-repository",
-        evidence.tokenizer_repository,
-        "--tokenizer-revision",
-        evidence.tokenizer_revision,
         "--local-files-only",
     ]
     if case.dequantize:
@@ -1203,6 +1714,12 @@ def test_promoted_gguf_full_runtime_evidence(
     package = ModelPackage.load(output_dir)
     assert tuple(package) == ("model",)
     assert package.gguf_quantization_report == source_report
+    if evidence.runtime_package_schema == FINAL_RUNTIME_PACKAGE_SCHEMA:
+        assert package.export_report is not None
+        assert package.export_report.export_status == "complete"
+        assert package.export_report.runtime_validation_status == "validated"
+        assert package.export_report.end_to_end_runnable is True
+        assert package.export_report.component("tokenizer").output == "exported"
     assert (
         GGUFQuantizationReport.read_json(output_dir / "quantization_report.json")
         == source_report
@@ -1228,6 +1745,13 @@ def test_promoted_gguf_full_runtime_evidence(
     packaged_tokenizer = AutoTokenizer.from_pretrained(output_dir, local_files_only=True)
     prompt_ids = tokenizer(case.prompt, return_tensors="pt").input_ids
     assert packaged_tokenizer(case.prompt).input_ids == prompt_ids.tolist()[0]
+    source_vocab = tokenizer.get_vocab()
+    packaged_vocab = packaged_tokenizer.get_vocab()
+    assert all(packaged_vocab[token] == token_id for token, token_id in source_vocab.items())
+    extra_vocab = packaged_vocab.keys() - source_vocab.keys()
+    assert all(token == f"[PAD{packaged_vocab[token]}]" for token in extra_vocab)
+    assert packaged_tokenizer.all_special_ids == tokenizer.all_special_ids
+    assert packaged_tokenizer.model_input_names == tokenizer.model_input_names
     if evidence.architecture == "qwen35moe":
         reference = _load_qwen35moe_same_value_reference(
             gguf_path,
@@ -1235,34 +1759,29 @@ def test_promoted_gguf_full_runtime_evidence(
             revision=evidence.config_revision,
         )
     else:
-        reference = AutoModelForCausalLM.from_pretrained(
-            evidence.repository,
-            revision=evidence.revision,
-            gguf_file=evidence.filename,
-            dtype=torch.float32,
-        ).eval()
-    input_ids = prompt_ids.numpy()
-    reference_logits: list[np.ndarray] = []
-    with torch.no_grad():
-        reference_output = reference(prompt_ids, use_cache=True)
-    reference_logits.append(reference_output.logits.numpy().copy())
-    reference_state = reference_output.past_key_values
-    reference_generated: list[int] = []
-    for _ in case.generated_tokens:
-        token = int(reference_output.logits[0, -1].argmax())
-        reference_generated.append(token)
-        token_ids = torch.tensor([[token]], dtype=torch.int64)
-        with torch.no_grad():
-            reference_output = reference(
-                token_ids,
-                past_key_values=reference_state,
-                use_cache=True,
+        with ExitStack() as reference_guard:
+            if case.reference_kind in {"apertus", "gptneox", "mpt", "olmo", "starcoder"}:
+                for helper in (
+                    "mobius.integrations.gguf._builder._load_dequantized_state_dict",
+                    "mobius.integrations.gguf._builder._normalize_gguf_weights",
+                    "mobius.integrations.gguf._tensor_processors.process_tensors",
+                ):
+                    reference_guard.enter_context(
+                        mock.patch(
+                            helper,
+                            side_effect=AssertionError(
+                                "same-artifact reference reused the production weight path"
+                            ),
+                        )
+                    )
+            reference = _load_low_cost_same_value_reference(
+                gguf_path,
+                evidence,
+                case.reference_kind,
             )
-        reference_state = reference_output.past_key_values
-        reference_logits.append(reference_output.logits.numpy().copy())
-    assert reference_generated == list(case.generated_tokens)
-    del reference, reference_output, reference_state
-    gc.collect()
+    input_ids = prompt_ids.numpy()
+    with torch.no_grad():
+        reference_logits = reference(prompt_ids, use_cache=False).logits.numpy()
 
     session = ort.InferenceSession(
         str(output_dir / "model.onnx"), providers=["CPUExecutionProvider"]
@@ -1275,29 +1794,81 @@ def test_promoted_gguf_full_runtime_evidence(
     )
     np.testing.assert_allclose(
         ort_output["logits"],
-        reference_logits[0],
+        reference_logits,
         rtol=1e-4,
         atol=case.atol,
     )
+    if evidence.architecture in {"gpt2", "starcoder2"}:
+        mutated_config = AutoConfig.from_pretrained(
+            evidence.config_repository,
+            revision=evidence.config_revision,
+        )
+        if evidence.architecture == "gpt2":
+            mutated_config.activation_function = "gelu"
+        else:
+            mutated_config.hidden_act = "gelu"
+        mutated = AutoModelForCausalLM.from_config(mutated_config).eval()
+        mutated.load_state_dict(reference.state_dict(), assign=True, strict=True)
+        with torch.no_grad():
+            mutated_logits = mutated(prompt_ids, use_cache=False).logits.numpy()
+        with pytest.raises(AssertionError):
+            np.testing.assert_allclose(
+                ort_output["logits"],
+                mutated_logits,
+                rtol=1e-4,
+                atol=case.atol,
+            )
+        del mutated, mutated_logits
+
+    if evidence.architecture == "starcoder2":
+        _assert_starcoder2_long_context_sliding_window(
+            session,
+            reference,
+            int(prompt_ids[0, -1]),
+            atol=case.atol,
+        )
 
     state = _next_cache(ort_output)
     generated: list[int] = []
+    reference_generated: list[int] = []
+    full_ids = input_ids.copy()
     for step in range(len(case.generated_tokens)):
         token = int(ort_output["logits"][0, -1].argmax())
         generated.append(token)
+        reference_generated.append(int(reference_logits[0, -1].argmax()))
         token_ids = np.asarray([[token]], dtype=np.int64)
+        full_ids = np.concatenate((full_ids, token_ids), axis=1)
         ort_output = _run_promoted_ort(session, token_ids, state, input_ids.shape[1] + step)
         state = _next_cache(ort_output)
+        with torch.no_grad():
+            reference_logits = (
+                reference(torch.from_numpy(full_ids), use_cache=False)
+                .logits[:, -1:, :]
+                .numpy()
+            )
+        full_ort_logits = _run_promoted_ort(
+            session,
+            full_ids,
+            _empty_promoted_state(session, batch_size=1),
+            0,
+        )["logits"][:, -1:, :]
         np.testing.assert_allclose(
-            ort_output["logits"],
-            reference_logits[step + 1],
+            full_ort_logits,
+            reference_logits,
             rtol=1e-4,
             atol=case.atol,
         )
+        np.testing.assert_allclose(
+            ort_output["logits"],
+            full_ort_logits,
+            rtol=1e-4,
+            atol=case.cache_atol,
+        )
     assert len(generated) == len(case.generated_tokens)
     assert generated == list(case.generated_tokens)
+    assert reference_generated == list(case.generated_tokens)
     _assert_replay_rollback_and_reorder(session, input_ids)
-    del session, ort_output, state, reference_logits
+    del session, ort_output, state, reference, reference_logits
     gc.collect()
 
     compatibility = json.loads(
