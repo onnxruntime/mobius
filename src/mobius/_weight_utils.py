@@ -61,6 +61,78 @@ def is_packed_quant_key(name: str) -> bool:
     return name.endswith(PACKED_QUANT_SUFFIXES)
 
 
+def materialize_split_tied_olive_lm_head(
+    state_dict: dict[str, torch.Tensor],
+    *,
+    embed_key: str,
+    head_key: str,
+    embedding_quantization: QuantizationConfig | None,
+    head_quantization: QuantizationConfig | None,
+) -> None:
+    """Copy a tied Olive token table into a separately exported LM head.
+
+    A single-model graph can share packed embedding parameters with
+    ``TiedQuantizedLMHead``. Split decoder/embedding graphs cannot share ONNX
+    initializers, so the raw Olive sidecars must be duplicated before each
+    component applies its own shape normalization.
+    """
+    source_qweight = f"{embed_key}_qweight"
+    target_qweight = f"{head_key}_qweight"
+    if source_qweight not in state_dict or target_qweight in state_dict:
+        return
+
+    if (
+        embedding_quantization is None
+        or embedding_quantization.quant_method != "olive"
+        or not embedding_quantization.quantize_embeddings
+    ):
+        raise ValueError(
+            f"Packed tied embedding {source_qweight!r} does not match the "
+            "embedding component quantization configuration."
+        )
+    if (
+        head_quantization is None
+        or head_quantization.quant_method != "olive"
+        or not head_quantization.quantize_lm_head
+    ):
+        raise NotImplementedError(
+            "A packed tied embedding in split component graphs requires "
+            "quantize_lm_head=True for the decoder component."
+        )
+
+    embedding_layout = (
+        embedding_quantization.bits,
+        embedding_quantization.group_size,
+        embedding_quantization.sym,
+    )
+    head_layout = (
+        head_quantization.bits,
+        head_quantization.group_size,
+        head_quantization.sym,
+    )
+    if embedding_layout != head_layout:
+        raise ValueError(
+            "A packed tied embedding and its split LM head must use the same "
+            f"quantization layout, got {embedding_layout!r} and {head_layout!r}."
+        )
+
+    required_suffixes = ["_qweight", "_scales"]
+    if not embedding_quantization.sym:
+        required_suffixes.append("_qzeros")
+    missing = [
+        suffix for suffix in required_suffixes if f"{embed_key}{suffix}" not in state_dict
+    ]
+    if missing:
+        raise ValueError(
+            f"Packed tied embedding {embed_key!r} is missing Olive sidecars {missing!r}."
+        )
+
+    for suffix in ("_qweight", "_scales", "_qzeros"):
+        source = f"{embed_key}{suffix}"
+        if source in state_dict:
+            state_dict[f"{head_key}{suffix}"] = state_dict[source]
+
+
 def supported_qmoe_quantization(
     quantization: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
@@ -885,12 +957,11 @@ def preprocess_olive_weights(
     [N, n_blocks, blob_size]; scales and zero-points already match the
     expected orientation, so they are renamed but not transposed.
 
-    The input embedding table (``*.embed_tokens.weight_qweight``) instead
-    targets ``GatherBlockQuantized``, which consumes the **2-D** uint8
-    ``qweight`` directly — so it is renamed to ``*.embed_tokens.qweight``
-    (dropping only the redundant ``weight`` component, not the ``qweight``
-    name itself); ``qzeros``/``scales`` are renamed the same way as the
-    general case below.
+    The input embedding table identified by ``embed_key`` instead targets
+    ``GatherBlockQuantized``, which consumes the **2-D** uint8 ``qweight``
+    directly. Its sidecars are renamed beneath the same owning module while
+    preserving the table layout; similarly named linear projections continue
+    through the ordinary MatMulNBits conversion.
 
     Tied LM head: Olive RTN drops ``lm_head.*`` when the head is tied. When the
     head is **quantized**, no ``lm_head`` weights are produced here — the model
@@ -931,10 +1002,13 @@ def preprocess_olive_weights(
             stem = stem[: -len(".weight")]
         return f"{stem}.{dotted_name}"
 
+    embed_qweight_key = f"{embed_key}_qweight"
+    embed_qzeros_key = f"{embed_key}_qzeros"
+    embed_scales_key = f"{embed_key}_scales"
     for key, value in state_dict.items():
-        is_embed_qweight = key.endswith("embed_tokens.weight_qweight")
-        is_embed_qzeros = key.endswith("embed_tokens.weight_qzeros")
-        is_embed_scales = key.endswith("embed_tokens.weight_scales")
+        is_embed_qweight = key == embed_qweight_key
+        is_embed_qzeros = key == embed_qzeros_key
+        is_embed_scales = key == embed_scales_key
         if (
             is_embed_qweight or is_embed_qzeros or is_embed_scales
         ) and not quantize_embeddings:

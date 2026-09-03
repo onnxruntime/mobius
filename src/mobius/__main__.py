@@ -25,6 +25,7 @@ from mobius._builder import (
     build_from_module,
     resolve_dtype,
 )
+from mobius._component_quantization import attach_hf_component_sources
 from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
 from mobius.integrations.transformers import build
@@ -463,6 +464,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         parent_config = hf_config
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
+            _reject_unsupported_affine_qwen4,
         )
 
         if _is_qwen4_exp_composite(parent_config):
@@ -478,7 +480,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
         compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
-        config = _config_from_hf(hf_config, parent_config=parent_config)
+        module_class = registry.get(model_type)
+        config = _config_from_hf(
+            hf_config,
+            parent_config=parent_config,
+            module_class=module_class,
+        )
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
         elif compressed_tensors_config is not None and keep_quantized:
@@ -514,8 +521,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
             task = _default_task_for_model(model_type)
-        module_class = registry.get(model_type)
         model_module = module_class(config)
+        attach_hf_component_sources(
+            model_module,
+            model_type=model_type,
+            hf_config=parent_config,
+        )
         pkg = build_from_module(
             model_module,
             config,
@@ -528,6 +539,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
+            _reject_unsupported_affine_qwen4(model_type, config)
             if compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
                 # The same loader owns both faithful native storage and the
@@ -553,6 +565,17 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = _load_weights_from_dir(config_path)
                 if hasattr(model_module, "preprocess_weights"):
                     state_dict = model_module.preprocess_weights(state_dict)
+                from mobius._component_quantization import (
+                    preprocess_component_quantized_state_dict,
+                )
+
+                state_dict = preprocess_component_quantized_state_dict(
+                    state_dict,
+                    model_module,
+                    config,
+                    task,
+                    pkg.keys(),
+                )
                 pkg.apply_weights(state_dict)
     else:
         model_id_or_path = args.model

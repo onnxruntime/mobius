@@ -347,6 +347,99 @@ class TestCLIBuild:
                 ]
             )
 
+    def test_local_config_resolves_model_config_with_module_class(self, tmp_path):
+        from mobius._model_package import ModelPackage
+        from mobius._registry import registry
+        from mobius._testing import make_config
+
+        hf_config = SimpleNamespace(model_type="qwen2")
+        output_dir = tmp_path / "output"
+
+        def resolve_config(config, *, parent_config, module_class):
+            assert config is hf_config
+            assert parent_config is hf_config
+            assert module_class is registry.get("qwen2")
+            return make_config(model_type="qwen2")
+
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=hf_config,
+            ),
+            mock.patch(
+                "mobius.__main__._config_from_hf",
+                side_effect=resolve_config,
+            ) as resolve,
+            mock.patch(
+                "mobius.__main__.build_from_module",
+                return_value=ModelPackage({}),
+            ),
+            mock.patch("mobius.__main__._save_package"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(output_dir),
+                    "--no-weights",
+                ]
+            )
+
+        resolve.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "model_type",
+        ["qwen4_exp_text", "Qwen4ExpForConditionalGeneration"],
+    )
+    def test_local_qwen4_affine_checkpoint_fails_before_loading_weights(
+        self, tmp_path, model_type
+    ):
+        from mobius._configs import QuantizationConfig
+        from mobius._model_package import ModelPackage
+        from mobius._testing import make_config
+
+        class _LocalModule:
+            def __init__(self, config):
+                self.config = config
+
+        hf_config = SimpleNamespace(model_type=model_type)
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+        )
+        config = make_config(
+            model_type=model_type,
+            quantization=quantization,
+            component_quantization={"decoder": quantization},
+        )
+
+        with (
+            mock.patch(
+                "transformers.AutoConfig.from_pretrained",
+                return_value=hf_config,
+            ),
+            mock.patch("mobius.__main__.registry.get", return_value=_LocalModule),
+            mock.patch("mobius.__main__._config_from_hf", return_value=config),
+            mock.patch(
+                "mobius.__main__.build_from_module",
+                return_value=ModelPackage({}),
+            ),
+            mock.patch("mobius.__main__._load_weights_from_dir") as load_weights,
+            pytest.raises(NotImplementedError, match="Affine per-component Qwen4-Exp"),
+        ):
+            main(
+                [
+                    "build",
+                    "--config",
+                    str(tmp_path),
+                    str(tmp_path / "output"),
+                ]
+            )
+
+        load_weights.assert_not_called()
+
     def test_text_only_with_component_errors(self):
         """The text-only feature is rejected when combined with --component."""
         with (
