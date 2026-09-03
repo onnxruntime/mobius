@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Graph contracts for the staged, offline VibeVoice ASR pipeline."""
+"""Graph contracts for the staged offline and streaming VibeVoice ASR pipelines."""
 
 from __future__ import annotations
 
@@ -26,7 +26,10 @@ from mobius.tasks._base import (
     build_embedding_from_features,
 )
 from mobius.tasks._vibevoice import _make_conv_cache_inputs, _register_conv_cache_outputs
-from mobius.tasks._streaming_convolution import make_conv_cache_inputs, register_conv_cache_outputs
+from mobius.tasks._streaming_convolution import (
+    make_conv_cache_inputs,
+    register_conv_cache_outputs,
+)
 
 
 class VibeVoiceASRTask(ModelTask):
@@ -186,13 +189,19 @@ class VibeVoiceASRStreamingTask(ModelTask):
         frames = ir.SymbolicDim("audio_frames")
         graph, builder = _make_graph(name="vibevoice_asr_streaming_audio_encoder")
         speech_tensors = builder.input(
-            "speech_tensors", dtype=ir.DataType.FLOAT, shape=[batch, samples]
+            "speech_tensors",
+            dtype=ir.DataType.FLOAT,
+            shape=[batch, samples],
         )
         speech_masks = builder.input(
-            "speech_masks", dtype=ir.DataType.BOOL, shape=[batch, frames]
+            "speech_masks",
+            dtype=ir.DataType.BOOL,
+            shape=[batch, frames],
         )
         acoustic_sample_noise = builder.input(
-            "acoustic_sample_noise", dtype=config.dtype, shape=[batch]
+            "acoustic_sample_noise",
+            dtype=config.dtype,
+            shape=[batch],
         )
         acoustic_latent_noise = builder.input(
             "acoustic_latent_noise",
@@ -226,8 +235,16 @@ class VibeVoiceASRStreamingTask(ModelTask):
         )
         speech_embeds.shape = ir.Shape(["valid_speech_frames", config.hidden_size])
         builder.add_output(speech_embeds, "speech_embeds")
-        register_conv_cache_outputs(builder, acoustic_present, prefix="present_acoustic_conv")
-        register_conv_cache_outputs(builder, semantic_present, prefix="present_semantic_conv")
+        register_conv_cache_outputs(
+            builder,
+            acoustic_present,
+            prefix="present_acoustic_conv",
+        )
+        register_conv_cache_outputs(
+            builder,
+            semantic_present,
+            prefix="present_semantic_conv",
+        )
         declare_component_presence(graph, "audio")
         return _make_model(graph)
 
@@ -236,7 +253,9 @@ class VibeVoiceASRStreamingTask(ModelTask):
     ) -> ir.Model:
         graph, builder = _make_graph(name="vibevoice_asr_streaming_embedding")
         input_ids = builder.input(
-            "input_ids", dtype=ir.DataType.INT64, shape=["batch", "sequence_length"]
+            "input_ids",
+            dtype=ir.DataType.INT64,
+            shape=["batch", "sequence_length"],
         )
         speech_embeds = builder.input(
             "speech_embeds",
@@ -244,14 +263,21 @@ class VibeVoiceASRStreamingTask(ModelTask):
             shape=["valid_speech_frames", config.hidden_size],
         )
         declare_optional_input(
-            speech_embeds, presence="audio", absent_shape=[0, config.hidden_size]
+            speech_embeds,
+            presence="audio",
+            absent_shape=[0, config.hidden_size],
         )
         acoustic_input_mask = builder.input(
             "acoustic_input_mask",
             dtype=ir.DataType.BOOL,
             shape=["batch", "sequence_length"],
         )
-        inputs_embeds = module(builder.op, input_ids, speech_embeds, acoustic_input_mask)
+        inputs_embeds = module(
+            builder.op,
+            input_ids,
+            speech_embeds,
+            acoustic_input_mask,
+        )
         builder.add_output(inputs_embeds, "inputs_embeds")
         return _make_model(graph)
 
@@ -262,10 +288,13 @@ class VibeVoiceASRStreamingTask(ModelTask):
         sequence = ir.SymbolicDim("sequence_length")
         past_sequence = ir.SymbolicDim("past_sequence_length")
         graph, builder = _make_graph(name="vibevoice_asr_streaming_decoder")
-        # The processor left-pads batches, so the generic prefix-valid GQA ABI is invalid.
+        # The processor left-pads batches, making valid tokens a suffix. The
+        # generic GQA ABI only represents valid prefixes, so it must stay unfused.
         declare_arbitrary_attention_mask(graph)
         inputs_embeds = builder.input(
-            "inputs_embeds", dtype=config.dtype, shape=[batch, sequence, config.hidden_size]
+            "inputs_embeds",
+            dtype=config.dtype,
+            shape=[batch, sequence, config.hidden_size],
         )
         attention_mask = builder.input(
             "attention_mask",
@@ -273,7 +302,9 @@ class VibeVoiceASRStreamingTask(ModelTask):
             shape=[batch, "past_sequence_length + sequence_length"],
         )
         position_ids = builder.input(
-            "position_ids", dtype=ir.DataType.INT64, shape=[batch, sequence]
+            "position_ids",
+            dtype=ir.DataType.INT64,
+            shape=[batch, sequence],
         )
         past = _make_kv_cache_inputs(
             builder,
@@ -285,7 +316,11 @@ class VibeVoiceASRStreamingTask(ModelTask):
             past_sequence,
         )
         logits, hidden_states, present = module(
-            builder.op, inputs_embeds, attention_mask, position_ids, past
+            builder.op,
+            inputs_embeds,
+            attention_mask,
+            position_ids,
+            past,
         )
         builder.add_output(logits, "logits")
         builder.add_output(hidden_states, "last_hidden_state")
