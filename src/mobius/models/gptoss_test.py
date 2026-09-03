@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import onnx
 import onnx_ir as ir
 import pytest
 import torch
@@ -386,6 +387,26 @@ class TestGPTOSSNativeMXFP4Graph:
         # selected-logit softmax normalization.
         assert qmoe.inputs[1].producer().op_type == "Reshape"
         assert any(node.op_type == "Add" for node in graph)
+
+    def test_native_ir12_serialization_does_not_bump_unquantized_model(self, tmp_path):
+        packages = {}
+        with build_context(EpCapabilities(name="cuda"), ir.DataType.FLOAT16):
+            for name, native_mxfp4 in (("native", True), ("unquantized", False)):
+                config = _gptoss_config(native_mxfp4=native_mxfp4)
+                packages[name] = CausalLMTask().build(GPTOSSCausalLMModel(config), config)
+
+        expected_versions = {"native": 12, "unquantized": 11}
+        for name, package in packages.items():
+            assert package["model"].ir_version == expected_versions[name]
+            output = tmp_path / name
+            package.save(str(output), check_weights=False, progress_bar=False)
+            proto = onnx.load_model(output / "model.onnx", load_external_data=False)
+
+            assert proto.ir_version == expected_versions[name]
+            assert {item.domain: item.version for item in proto.opset_import} == {
+                "": 24,
+                "com.microsoft": 1,
+            }
 
     @pytest.mark.parametrize(
         ("num_experts", "profile"),

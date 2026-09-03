@@ -31,6 +31,7 @@ import threading
 from collections import UserDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +41,7 @@ import torch
 import tqdm
 
 from mobius._export_report import ComponentExportReport
+from mobius._ir_utils import iter_graph_tensor_dtypes
 from mobius._optimizations import fold_initializers_after_weights
 from mobius.adapters import (
     AdapterArtifact,
@@ -62,6 +64,42 @@ _EXPORT_REPORT = "export_report.json"
 _WEIGHT_LOADING_REPORT = "weight-loading-report.json"
 _DEFAULT_STREAMING_DENSE_SHARD_BYTES = 1 << 30
 _MAX_STREAMING_DENSE_SHARD_BYTES = 5_000_000_000
+_SAFETENSORS_SAVE_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class _ComponentSaveLayout:
+    """An immutable component selection and its corresponding directory layout."""
+
+    components: tuple[tuple[str, ir.Model], ...]
+    filter_applied: bool
+
+    @property
+    def uses_subdirectories(self) -> bool:
+        return len(self.components) > 1
+
+
+def _select_component_save_layout(
+    package: ModelPackage,
+    components: Callable[[str], bool] | None,
+) -> _ComponentSaveLayout:
+    """Evaluate a component predicate once and freeze its selected models."""
+    selected: list[tuple[str, ir.Model]] = []
+    for name, model in package.data.items():
+        if components is None or components(name):
+            selected.append((name, model))
+    return _ComponentSaveLayout(tuple(selected), filter_applied=components is not None)
+
+
+def _component_output_directory(
+    directory: str | Path,
+    component_name: str,
+    *,
+    uses_subdirectories: bool,
+) -> Path:
+    """Return the directory where a selected component's files are written."""
+    root = Path(directory)
+    return root / component_name if uses_subdirectories else root
 
 
 def _read_mtp_sidecar_name(directory: str) -> str | None:
@@ -157,6 +195,78 @@ def _validate_mtp_chain(package: ModelPackage) -> None:
         current = sidecar
 
 
+def _validate_streaming_safetensors_destination(
+    package: ModelPackage,
+    directory: str,
+    *,
+    external_data: str,
+    component_layout: _ComponentSaveLayout,
+) -> None:
+    """Reject model output directories that could overwrite lazy source shards."""
+    if external_data != "safetensors":
+        return
+
+    output_directories: set[Path] = set()
+    source_directories: set[Path] = set()
+    source_files: set[Path] = set()
+    current_package = package
+    current_directory = Path(directory)
+    current_layout = component_layout
+    while True:
+        output_directories.update(
+            _component_output_directory(
+                current_directory,
+                name,
+                uses_subdirectories=current_layout.uses_subdirectories,
+            ).resolve()
+            for name, _ in current_layout.components
+        )
+
+        source_directories.update(
+            Path(path).resolve()
+            for path in getattr(current_package, "_native_streaming_source_directories", ())
+        )
+        source_files.update(
+            Path(path).resolve()
+            for path in getattr(current_package, "_native_streaming_source_files", ())
+        )
+        if current_package.mtp_head is None:
+            break
+        current_directory /= _mtp_sidecar_name(current_package)
+        current_package = current_package.mtp_head
+        # MTP sidecars are always saved in full by the recursive save call.
+        current_layout = _select_component_save_layout(current_package, None)
+
+    collisions = output_directories & source_directories
+    if collisions:
+        collision = min(collisions, key=str)
+        raise ValueError(
+            "A native streaming package cannot save safetensors external data "
+            f"into source checkpoint directory {str(collision)!r}: output shards "
+            "could overwrite weights that are still read lazily. Choose a separate "
+            "output directory."
+        )
+
+    for output_directory in output_directories:
+        if not output_directory.is_dir():
+            continue
+        for output_file in output_directory.iterdir():
+            if not output_file.is_file() or output_file.is_symlink():
+                continue
+            for source_file in source_files:
+                try:
+                    aliases_source = os.path.samefile(output_file, source_file)
+                except FileNotFoundError:
+                    aliases_source = False
+                if aliases_source:
+                    raise ValueError(
+                        "A native streaming package cannot overwrite an output file "
+                        f"{str(output_file)!r} that is hard-linked to lazy source shard "
+                        f"{str(source_file)!r}. Remove the hard link or choose a new "
+                        "empty output directory."
+                    )
+
+
 def _validate_output_directory(
     directory: str, *, kind: str, inspect_contents: bool = True
 ) -> None:
@@ -173,7 +283,7 @@ def _validate_output_directory(
 def _validate_mtp_save_paths(
     package: ModelPackage,
     directory: str,
-    components: Callable[[str], bool] | None = None,
+    component_layout: _ComponentSaveLayout,
     *,
     external_data: str = "onnx",
     include_policy_components: bool = True,
@@ -181,7 +291,7 @@ def _validate_mtp_save_paths(
 ) -> None:
     """Reject unsafe output paths throughout the package chain before any writes."""
     _validate_output_directory(directory, kind="package", inspect_contents=False)
-    if package.export_report is not None and components is not None:
+    if package.export_report is not None and component_layout.filter_applied:
         raise ValueError(
             "Component-filtered saves cannot preserve an attached export report; "
             "save the complete package or detach and replace the report."
@@ -237,7 +347,7 @@ def _validate_mtp_save_paths(
     ):
         raise ValueError("ModelPackage weight-loading report output must be a real file.")
     previous_sidecar_name = _read_mtp_sidecar_name(directory)
-    selected = [name for name in package if components is None or components(name)]
+    selected = [name for name, _ in component_layout.components]
     if len(selected) > 1:
         reserved = {"policies", "adapters"}.intersection(name.casefold() for name in selected)
         if reserved:
@@ -296,6 +406,7 @@ def _validate_mtp_save_paths(
     _validate_mtp_save_paths(
         package.mtp_head,
         sidecar_directory,
+        _select_component_save_layout(package.mtp_head, None),
         external_data=external_data,
         include_policy_components=include_policy_components,
         include_adapter_artifacts=include_adapter_artifacts,
@@ -327,6 +438,47 @@ def _adapter_source_file(artifact: AdapterArtifact) -> str:
         f"adapter {artifact.name!r} source format {artifact.source.format!r} "
         "cannot be preserved"
     )
+
+
+def _save_safetensors(model: ir.Model, path: str, **kwargs: Any) -> None:
+    """Save safetensors with the spelling required by its zero-copy writer."""
+    contains_e8m0 = any(
+        dtype == ir.DataType.FLOAT8E8M0 for dtype in iter_graph_tensor_dtypes(model.graph)
+    )
+    if not contains_e8m0:
+        ir.save_safetensors(model, path, **kwargs)
+        return
+
+    import safetensors
+    from onnx_ir import _safetensors as onnx_ir_safetensors
+
+    # Every Mobius E8M0 save takes this lock before inspecting onnx-ir's map.
+    # This temporary private-global mutation is removable once our minimum
+    # onnx-ir maps E8M0 to safetensors 0.8's "float8_e8m0fnu" spelling (or
+    # safetensors accepts the old alias). Unrelated direct onnx-ir callers
+    # cannot participate in this lock.
+    with _SAFETENSORS_SAVE_LOCK:
+        dtype_mapping = getattr(onnx_ir_safetensors, "_IR_DTYPE_TO_SAFETENSORS_DTYPE", None)
+        old_e8m0_name = (
+            dtype_mapping.get(ir.DataType.FLOAT8E8M0) if dtype_mapping is not None else None
+        )
+        needs_e8m0_compatibility = (
+            # This is onnx-ir's writer feature probe: TensorSpec arrived with
+            # safetensors 0.8, alongside the E8M0 spelling transition.
+            hasattr(safetensors, "TensorSpec")
+            and dtype_mapping is not None
+            and old_e8m0_name == "float8_e8m0"
+        )
+        if not needs_e8m0_compatibility:
+            ir.save_safetensors(model, path, **kwargs)
+            return
+
+        assert dtype_mapping is not None
+        dtype_mapping[ir.DataType.FLOAT8E8M0] = "float8_e8m0fnu"
+        try:
+            ir.save_safetensors(model, path, **kwargs)
+        finally:
+            dtype_mapping[ir.DataType.FLOAT8E8M0] = old_e8m0_name
 
 
 class ModelPackage(UserDict[str, ir.Model]):
@@ -375,6 +527,10 @@ class ModelPackage(UserDict[str, ir.Model]):
         self.export_report: ComponentExportReport | None = None
         self.quantization_report: object | None = None
         self.weight_loading_report: dict[str, object] | None = None
+        # Canonical source shard parent directories used only to protect lazy
+        # native streaming serialization. They are intentionally never persisted.
+        self._native_streaming_source_directories: frozenset[Path] = frozenset()
+        self._native_streaming_source_files: frozenset[Path] = frozenset()
         # Optional persistence policy attached by the GGUF importer.
         self.gguf_reuse_plan: Any = None
         self.draft_manifest: Any = None
@@ -427,6 +583,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         include_policy_components: bool = True,
         include_adapter_artifacts: bool = True,
         _atomic_export_report: bool = True,
+        _component_layout: _ComponentSaveLayout | None = None,
     ) -> None:
         """Save all component models to a directory.
 
@@ -491,20 +648,29 @@ class ModelPackage(UserDict[str, ir.Model]):
                 *check_weights* is ``True`` and any initializer is missing its
                 ``const_value``.
         """
-        _validate_mtp_chain(self)
-        _validate_mtp_save_paths(
-            self,
-            directory,
-            components,
-            external_data=external_data,
-            include_policy_components=include_policy_components,
-            include_adapter_artifacts=include_adapter_artifacts,
-        )
+        # Freeze the caller-controlled predicate before validation so every
+        # validation and write observes exactly the same root save layout.
+        component_layout = _component_layout or _select_component_save_layout(self, components)
         if external_data not in {"onnx", "safetensors"}:
             raise ValueError(
                 f"Unknown external_data format {external_data!r}. "
                 "Expected 'onnx' or 'safetensors'."
             )
+        _validate_mtp_chain(self)
+        _validate_streaming_safetensors_destination(
+            self,
+            directory,
+            external_data=external_data,
+            component_layout=component_layout,
+        )
+        _validate_mtp_save_paths(
+            self,
+            directory,
+            component_layout,
+            external_data=external_data,
+            include_policy_components=include_policy_components,
+            include_adapter_artifacts=include_adapter_artifacts,
+        )
         if max_workers <= 0:
             raise ValueError(f"max_workers must be positive, got {max_workers}.")
         reuse_plan = getattr(self, "gguf_reuse_plan", None)
@@ -528,12 +694,12 @@ class ModelPackage(UserDict[str, ir.Model]):
                     external_data=external_data,
                     max_shard_size_bytes=max_shard_size_bytes,
                     max_workers=max_workers,
-                    components=components,
                     progress_bar=progress_bar,
                     check_weights=check_weights,
                     include_policy_components=include_policy_components,
                     include_adapter_artifacts=include_adapter_artifacts,
                     _atomic_export_report=False,
+                    _component_layout=component_layout,
                 )
                 if self.draft_manifest is not None:
                     from mobius.integrations.gguf._draft import write_draft_manifest
@@ -565,11 +731,7 @@ class ModelPackage(UserDict[str, ir.Model]):
         if self.gguf_quantization_report is not None and reuse_plan is None:
             self.gguf_quantization_report.write_json(quantization_report_path)
         export_report_path = os.path.join(directory, _EXPORT_REPORT)
-        selected = {
-            name: model
-            for name, model in self.data.items()
-            if components is None or components(name)
-        }
+        selected = dict(component_layout.components)
         report = self.weight_loading_report
         dense_stream = (
             report is not None
@@ -621,7 +783,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                     "external-data serialization is forced to one worker"
                 ),
             }
-        use_subfolders = len(selected) > 1
+        use_subfolders = component_layout.uses_subdirectories
         if reuse_plan is not None and (len(selected) != 1 or use_subfolders):
             raise ValueError("GGUF weight reuse currently supports one flat ONNX model only.")
 
@@ -629,11 +791,15 @@ class ModelPackage(UserDict[str, ir.Model]):
             callback = _make_progress_callback() if progress_bar else None
             if check_weights:
                 _check_weights(name, model)
+            model_dir = os.fspath(
+                _component_output_directory(
+                    directory,
+                    name,
+                    uses_subdirectories=component_layout.uses_subdirectories,
+                )
+            )
             if use_subfolders:
-                model_dir = os.path.join(directory, name)
                 os.makedirs(model_dir, exist_ok=True)
-            else:
-                model_dir = directory
             path = os.path.join(model_dir, "model.onnx")
             with _namespaced_symbolic_dimensions(model, f"component.{name}") as saved_model:
                 if reuse_plan is not None:
@@ -663,7 +829,7 @@ class ModelPackage(UserDict[str, ir.Model]):
                         package_metadata=package_metadata,
                     )
                 elif external_data == "safetensors":
-                    ir.save_safetensors(
+                    _save_safetensors(
                         saved_model,
                         path,
                         max_shard_size_bytes=max_shard_size_bytes,

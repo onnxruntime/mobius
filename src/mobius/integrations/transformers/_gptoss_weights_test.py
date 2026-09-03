@@ -8,7 +8,9 @@ from __future__ import annotations
 import gc
 import json
 import weakref
+from pathlib import Path
 
+import onnx
 import onnx_ir as ir
 import pytest
 import safetensors.torch
@@ -18,8 +20,10 @@ from onnx_ir.serde import SerdeError
 
 from mobius._builder import build_from_module
 from mobius._configs import QuantizationConfig, QuantizedWeightFormat
+from mobius._model_package import ModelPackage
 from mobius._testing import make_config
-from mobius.integrations.transformers import _gptoss_weights
+from mobius.integrations.transformers import _builder as transformers_builder
+from mobius.integrations.transformers import _config_resolver, _gptoss_weights
 from mobius.models.gptoss import GPTOSSCausalLMModel, repack_gptoss_mxfp4_blocks
 
 _E = 2
@@ -132,6 +136,43 @@ def _save_cross_sharded(state, directory):
     )
 
 
+def _save_single_file(state, directory):
+    safetensors.torch.save_file(state, str(directory / "model.safetensors"))
+
+
+def test_lazy_source_parent_aliases_include_snapshot_and_blob_directories(tmp_path):
+    snapshot = tmp_path / "snapshots" / "revision"
+    blobs = tmp_path / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    blob = blobs / "hash"
+    blob.write_bytes(b"shard")
+    shard = snapshot / "model.safetensors"
+    try:
+        shard.symlink_to(blob)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+
+    aliases = _gptoss_weights._lazy_safetensors_source_parent_aliases([str(shard)])
+
+    assert aliases == frozenset({snapshot.resolve(), blobs.resolve()})
+
+
+def _directory_snapshot(directory: Path) -> tuple[tuple[str, ...], dict[str, bytes]]:
+    entries = tuple(
+        sorted(
+            f"{path.relative_to(directory)}{'/' if path.is_dir() else ''}"
+            for path in directory.rglob("*")
+        )
+    )
+    contents = {
+        str(path.relative_to(directory)): path.read_bytes()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+    return entries, contents
+
+
 def _replace_source_shard(state, directory, source_name):
     index = json.loads((directory / "model.safetensors.index.json").read_text())
     weight_map = index["weight_map"]
@@ -232,6 +273,295 @@ def test_mxfp4_package_save_uses_bounded_serial_serializer(tmp_path, monkeypatch
     assert (
         "forced to one worker" in package.weight_loading_report["serialization_memory_bound"]
     )
+
+
+@pytest.mark.parametrize(
+    ("layout", "alias"),
+    [
+        ("sharded", "direct"),
+        ("single", "relative"),
+        ("sharded", "symlink"),
+    ],
+)
+def test_safetensors_save_rejects_source_directory_alias_before_mutation(
+    tmp_path, monkeypatch, layout, alias
+):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    config, package, state = _package_and_state()
+    if layout == "sharded":
+        _save_cross_sharded(state, checkpoint)
+    else:
+        _save_single_file(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+    assert package._native_streaming_source_directories == frozenset({checkpoint.resolve()})
+
+    if alias == "direct":
+        destination = checkpoint
+    elif alias == "relative":
+        monkeypatch.chdir(tmp_path)
+        destination = Path("checkpoint")
+    else:
+        destination = tmp_path / "checkpoint-alias"
+        try:
+            destination.symlink_to(checkpoint, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlinks are unavailable: {error}")
+
+    source_before = _directory_snapshot(checkpoint)
+    parent_listing_before = tuple(sorted(path.name for path in tmp_path.iterdir()))
+    with pytest.raises(ValueError, match="separate output directory"):
+        package.save(
+            str(destination),
+            external_data="safetensors",
+            progress_bar=False,
+        )
+
+    assert _directory_snapshot(checkpoint) == source_before
+    assert tuple(sorted(path.name for path in tmp_path.iterdir())) == parent_listing_before
+
+
+def test_safetensors_save_rejects_hard_link_to_lazy_source_before_mutation(tmp_path):
+    checkpoint = tmp_path / "checkpoint"
+    output = tmp_path / "output"
+    checkpoint.mkdir()
+    output.mkdir()
+    config, package, state = _package_and_state()
+    _save_single_file(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+    source = checkpoint / "model.safetensors"
+    hard_link = output / "model.safetensors"
+    try:
+        hard_link.hardlink_to(source)
+    except OSError as error:
+        pytest.skip(f"hard links are unavailable: {error}")
+
+    source_before = _directory_snapshot(checkpoint)
+    output_before = _directory_snapshot(output)
+    with pytest.raises(ValueError, match="hard-linked to lazy source shard"):
+        package.save(
+            str(output),
+            external_data="safetensors",
+            progress_bar=False,
+        )
+
+    assert _directory_snapshot(checkpoint) == source_before
+    assert _directory_snapshot(output) == output_before
+
+
+def test_added_component_cannot_redirect_output_into_lazy_source_before_any_write(
+    tmp_path,
+):
+    parent = tmp_path / "parent"
+    checkpoint = parent / "model"
+    checkpoint.mkdir(parents=True)
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+    # Streaming started with one flat "model" component. Adding another
+    # component changes "model" to a subdirectory output at the source path.
+    package["auxiliary"] = ir.Model(
+        ir.Graph([], [], nodes=[], name="auxiliary"),
+        ir_version=11,
+    )
+    source_before = _directory_snapshot(checkpoint)
+    parent_listing_before = tuple(sorted(path.name for path in parent.iterdir()))
+
+    with pytest.raises(ValueError, match="still read lazily"):
+        package.save(
+            str(parent),
+            external_data="safetensors",
+            progress_bar=False,
+        )
+
+    assert _directory_snapshot(checkpoint) == source_before
+    assert tuple(sorted(path.name for path in parent.iterdir())) == parent_listing_before
+
+
+def test_stateful_component_filter_is_frozen_before_streaming_collision_validation(
+    tmp_path,
+):
+    parent = tmp_path / "parent"
+    checkpoint = parent / "model"
+    checkpoint.mkdir(parents=True)
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+    package["auxiliary"] = ir.Model(
+        ir.Graph([], [], nodes=[], name="auxiliary"),
+        ir_version=11,
+    )
+    calls: list[str] = []
+
+    def stateful_filter(name: str) -> bool:
+        calls.append(name)
+        # A later evaluation would switch from a two-component/subdirectory
+        # layout to a one-component/flat layout.
+        return len(calls) <= len(package) or name == "model"
+
+    source_before = _directory_snapshot(checkpoint)
+    parent_listing_before = tuple(sorted(path.name for path in parent.iterdir()))
+
+    with pytest.raises(ValueError, match="still read lazily"):
+        package.save(
+            str(parent),
+            external_data="safetensors",
+            components=stateful_filter,
+            progress_bar=False,
+        )
+
+    assert calls == list(package)
+    assert _directory_snapshot(checkpoint) == source_before
+    assert tuple(sorted(path.name for path in parent.iterdir())) == parent_listing_before
+
+
+def test_component_filter_excludes_colliding_streaming_output_directory(tmp_path):
+    parent = tmp_path / "parent"
+    checkpoint = parent / "model"
+    checkpoint.mkdir(parents=True)
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+    package["auxiliary"] = ir.Model(
+        ir.Graph([], [], nodes=[], name="auxiliary"),
+        ir_version=11,
+    )
+    source_before = _directory_snapshot(checkpoint)
+
+    package.save(
+        str(parent),
+        external_data="safetensors",
+        components=lambda name: name == "auxiliary",
+        progress_bar=False,
+    )
+
+    assert _directory_snapshot(checkpoint) == source_before
+    assert (parent / "model.onnx").is_file()
+
+
+def test_safetensors_save_to_separate_directory_roundtrips_without_source_path(
+    tmp_path,
+):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, checkpoint)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(
+        package, str(checkpoint), config
+    )
+
+    output = tmp_path / "output"
+    package.save(
+        str(output),
+        external_data="safetensors",
+        progress_bar=False,
+    )
+    loaded = ModelPackage.load(str(output))
+
+    source_path = str(checkpoint.resolve())
+    report_bytes = (output / "weight-loading-report.json").read_bytes()
+    metadata = loaded["model"].metadata_props["mobius.weight_loading"]
+    assert source_path.encode() not in report_bytes
+    assert source_path not in metadata
+    assert loaded.weight_loading_report is not None
+    assert loaded.weight_loading_report["source"] == "local-safetensors-checkpoint"
+    assert loaded["model"].ir_version == 12
+    onnx.checker.check_model(str(output / "model.onnx"))
+    scale = loaded["model"].graph.initializers[f"{_ROOT}.fc1_scales"].const_value
+    assert scale is not None
+    torch.testing.assert_close(
+        torch.from_numpy(scale.numpy().view("uint8").copy()),
+        state[f"{_ROOT}.experts.gate_up_proj_scales"],
+    )
+
+
+def test_transformers_builder_keeps_local_checkpoint_path_out_of_portable_fields(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint = tmp_path / "absolute-local-checkpoint"
+    checkpoint.mkdir()
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, checkpoint)
+    hf_config = type("HFConfig", (), {"model_type": "gpt_oss"})()
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (hf_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (value, value, "gpt_oss"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            GPTOSSCausalLMModel,
+            "text-generation",
+            "gpt_oss",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda *args, **kwargs: package,
+    )
+
+    result = transformers_builder.build_transformers_model(
+        str(checkpoint.resolve()),
+        execution_provider="cuda",
+    )
+
+    source_path = str(checkpoint.resolve())
+    model = result["model"]
+    assert model.graph.name == "gpt_oss/model"
+    assert source_path not in model.graph.name
+    assert source_path not in json.dumps(result.weight_loading_report, sort_keys=True)
+    assert source_path not in json.dumps(dict(model.metadata_props), sort_keys=True)
+
+
+def test_non_streaming_package_can_save_safetensors_in_existing_directory(tmp_path):
+    package = ModelPackage(
+        {"model": ir.Model(ir.Graph([], [], nodes=[], name="model"), ir_version=11)}
+    )
+
+    package.save(
+        str(tmp_path),
+        external_data="safetensors",
+        progress_bar=False,
+    )
+
+    assert (tmp_path / "model.onnx").is_file()
+
+
+def test_native_streaming_allows_onnx_external_data_in_source_directory(tmp_path):
+    config, package, state = _package_and_state()
+    _save_cross_sharded(state, tmp_path)
+    _gptoss_weights.stream_gptoss_mxfp4_safetensors_to_package(package, str(tmp_path), config)
+    source_contents = _directory_snapshot(tmp_path)[1]
+
+    package.save(str(tmp_path), external_data="onnx", progress_bar=False)
+
+    for relative_path, contents in source_contents.items():
+        assert (tmp_path / relative_path).read_bytes() == contents
+    assert (tmp_path / "model.onnx").is_file()
 
 
 @pytest.mark.parametrize("replacement_byte", [0x00, 0xFE])

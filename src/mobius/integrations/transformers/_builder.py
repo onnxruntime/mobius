@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import pathlib
 from typing import Any
 
 import onnx_ir as ir
@@ -471,8 +472,13 @@ def build_transformers_model(
         kv_cache_scales=kv_cache_scales,
         prune_prefill_prefix=prune_prefill_prefix,
     )
+    graph_source_name = (
+        model_type
+        if _is_native_gptoss_mxfp4(config) and pathlib.Path(model_id).is_dir()
+        else model_id
+    )
     for name, model in package.items():
-        model.graph.name = f"{model_id}/{name}"
+        model.graph.name = f"{graph_source_name}/{name}"
         if model_type in {"qwen4_exp", "qwen4_exp_text"}:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 

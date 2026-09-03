@@ -769,6 +769,7 @@ def stream_preprocessed_safetensors_to_model(
     ],
     *,
     revision: str | None = None,
+    _resolved_paths: list[str] | None = None,
 ) -> dict[str, object]:
     """Stream a fully classified transformed checkpoint into a dense ONNX graph.
 
@@ -778,7 +779,11 @@ def stream_preprocessed_safetensors_to_model(
     fails before serialization. The resulting package is dense; this path never
     claims native FP8 preservation.
     """
-    paths = _resolve_shard_paths(model_id, revision)
+    paths = (
+        list(_resolved_paths)
+        if _resolved_paths is not None
+        else _resolve_shard_paths(model_id, revision)
+    )
     key_index = _shard_key_index(paths)
     plan = planner(key_index, model.graph.initializers)
 

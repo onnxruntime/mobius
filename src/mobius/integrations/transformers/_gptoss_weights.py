@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 from collections.abc import Mapping
 
@@ -19,6 +20,7 @@ from mobius.integrations._weight_loading import (
     StreamingWeightPlan,
     StreamingWeightSource,
     _local_weight_paths,
+    _resolve_shard_paths,
     stream_preprocessed_safetensors_to_model,
 )
 from mobius.models.gptoss import (
@@ -29,6 +31,17 @@ from mobius.models.gptoss import (
 )
 
 _FLOAT_DTYPES = frozenset({"BF16", "F16", "F32"})
+
+
+def _lazy_safetensors_source_parent_aliases(paths: list[str]) -> frozenset[pathlib.Path]:
+    """Return both directory identities from which lazy shards may be read."""
+    # HF snapshots can contain shard symlinks into the blob cache. Resolving
+    # the parent preserves the snapshot directory, while resolving the whole
+    # shard path follows the symlink and identifies the blob directory.
+    return frozenset(
+        {pathlib.Path(path).parent.resolve() for path in paths}
+        | {pathlib.Path(path).resolve().parent for path in paths}
+    )
 
 
 def _repack_blocks(tensor: torch.Tensor, _source_name: str) -> torch.Tensor:
@@ -246,18 +259,19 @@ def stream_gptoss_mxfp4_safetensors_to_package(
             "PyTorch weights cannot be streamed; convert the checkpoint to "
             "safetensors instead of attempting eager 120B loading."
         )
-
     model = next(iter(package.values()))
 
     def planner(key_index, initializers):
         return build_gptoss_mxfp4_streaming_plan(config, key_index, initializers)
 
     try:
+        paths = local[0] if local is not None else _resolve_shard_paths(model_id, revision)
         report = stream_preprocessed_safetensors_to_model(
             model,
             model_id,
             planner,
             revision=revision,
+            _resolved_paths=paths,
         )
     except EntryNotFoundError as exc:
         raise ValueError(
@@ -265,6 +279,17 @@ def stream_gptoss_mxfp4_safetensors_to_package(
             "the repository publishes no model.safetensors index/file. Convert "
             "the checkpoint to safetensors; eager loading is intentionally disabled."
         ) from exc
+    package._native_streaming_source_directories = _lazy_safetensors_source_parent_aliases(
+        paths
+    )
+    package._native_streaming_source_files = frozenset(
+        pathlib.Path(path).resolve() for path in paths
+    )
+    if local is not None:
+        # Local filesystem paths are needed by LazyTensor closures and the
+        # transient overlap guard only; reports and ONNX metadata stay portable.
+        report["source"] = "local-safetensors-checkpoint"
+        model.metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
     package.weight_loading_report = report
     return report
 

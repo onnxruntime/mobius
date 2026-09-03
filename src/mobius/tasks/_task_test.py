@@ -11,6 +11,9 @@ ObjectDetection, SpeechToText, and shared builder helpers
 
 from __future__ import annotations
 
+import types
+from typing import ClassVar
+
 import onnx_ir as ir
 import pytest
 
@@ -38,6 +41,152 @@ from mobius.tasks import (
     build_embedding_from_features,
     get_task,
 )
+from mobius.tasks._base import _make_model
+
+
+class TestMakeModelIrVersion:
+    _OPSETS: ClassVar[dict[str, int]] = {"": 24, "com.microsoft": 1}
+
+    def _graph(
+        self,
+        *,
+        inputs: list[ir.Value] | None = None,
+        nodes: list[ir.Node] | None = None,
+    ) -> ir.Graph:
+        return ir.Graph(
+            inputs or [],
+            [],
+            nodes=nodes or [],
+            name="ir_floor",
+            opset_imports=dict(self._OPSETS),
+        )
+
+    def test_ordinary_graph_stays_at_ir11_without_changing_opsets(self):
+        graph = self._graph(inputs=[ir.val("input", ir.DataType.FLOAT, [1])])
+
+        model = _make_model(graph)
+
+        assert model.ir_version == 11
+        assert dict(model.graph.opset_imports) == self._OPSETS
+
+    def test_float4_only_graph_stays_at_ir11_without_changing_opsets(self):
+        graph = self._graph(inputs=[ir.val("codes", ir.DataType.FLOAT4E2M1, [2])])
+
+        model = _make_model(graph)
+
+        assert model.ir_version == 11
+        assert dict(model.graph.opset_imports) == self._OPSETS
+
+    def test_e8m0_typed_value_raises_floor_to_ir12_without_changing_opsets(self):
+        graph = self._graph(inputs=[ir.val("scales", ir.DataType.FLOAT8E8M0, [2])])
+
+        model = _make_model(graph)
+
+        assert model.ir_version == 12
+        assert dict(model.graph.opset_imports) == self._OPSETS
+
+    def test_e8m0_const_tensor_raises_floor_when_value_dtype_is_unset(self):
+        value = ir.val("scales")
+        value.const_value = ir.tensor([0, 1], dtype=ir.DataType.FLOAT8E8M0)
+        assert value.dtype is None
+        graph = self._graph()
+        graph.register_initializer(value)
+
+        model = _make_model(graph)
+
+        assert model.ir_version == 12
+        assert dict(model.graph.opset_imports) == self._OPSETS
+
+    def test_e8m0_tensor_attribute_and_subgraph_raise_floor_to_ir12(self):
+        tensor_node = ir.Node(
+            "",
+            "Constant",
+            [],
+            attributes=[
+                ir.AttrTensor(
+                    "value",
+                    ir.tensor([0], dtype=ir.DataType.FLOAT8E8M0),
+                )
+            ],
+            num_outputs=1,
+        )
+        branch = self._graph(inputs=[ir.val("branch_scale", ir.DataType.FLOAT8E8M0, [1])])
+        branch_node = ir.Node(
+            "",
+            "If",
+            [],
+            attributes=[ir.AttrGraph("then_branch", branch)],
+            num_outputs=1,
+        )
+
+        for graph in (self._graph(nodes=[tensor_node]), self._graph(nodes=[branch_node])):
+            model = _make_model(graph)
+            assert model.ir_version == 12
+            assert dict(model.graph.opset_imports) == self._OPSETS
+
+    def test_e8m0_type_proto_attribute_raises_floor_to_ir12(self):
+        node = ir.Node(
+            "",
+            "TypeCarrier",
+            [],
+            attributes=[
+                ir.AttrTypeProto(
+                    "type",
+                    ir.TypeAndShape(ir.TensorType(ir.DataType.FLOAT8E8M0), None),
+                )
+            ],
+            num_outputs=0,
+        )
+
+        model = _make_model(self._graph(nodes=[node]))
+
+        assert model.ir_version == 12
+        assert dict(model.graph.opset_imports) == self._OPSETS
+
+    def test_nested_type_proto_sequence_attribute_raises_floor_to_ir12(self):
+        nested_type = ir.SequenceType(ir.OptionalType(ir.TensorType(ir.DataType.FLOAT8E8M0)))
+        node = ir.Node(
+            "",
+            "TypeCarrier",
+            [],
+            attributes=[
+                ir.AttrTypeProtos(
+                    "types",
+                    [ir.TypeAndShape(nested_type, None)],
+                )
+            ],
+            num_outputs=0,
+        )
+
+        model = _make_model(self._graph(nodes=[node]))
+
+        assert model.ir_version == 12
+        assert dict(model.graph.opset_imports) == self._OPSETS
+
+    @pytest.mark.parametrize("plural", [False, True])
+    def test_e8m0_sparse_tensor_attributes_raise_floor_to_ir12(self, plural):
+        sparse = types.SimpleNamespace(
+            values=ir.tensor([0], dtype=ir.DataType.FLOAT8E8M0),
+            indices=ir.tensor([0], dtype=ir.DataType.INT64),
+            dims=[1],
+        )
+        attribute = (
+            ir.AttrSparseTensors("values", [sparse])
+            if plural
+            else ir.AttrSparseTensor("value", sparse)
+        )
+        node = ir.Node(
+            "",
+            "SparseCarrier",
+            [],
+            attributes=[attribute],
+            num_outputs=0,
+        )
+
+        model = _make_model(self._graph(nodes=[node]))
+
+        assert model.ir_version == 12
+        assert dict(model.graph.opset_imports) == self._OPSETS
 
 
 class TestGetTask:
