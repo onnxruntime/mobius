@@ -144,7 +144,7 @@ def build_from_module(
         module: An ``onnxscript.nn.Module`` whose ``forward`` signature is
             compatible with *task*.
         config: Architecture configuration. Its ``dtype`` controls model
-            precision and its optional ``validate`` method runs before build.
+            precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
         execution_provider: Target for EP-aware optimizations.
         trace_optimization: Log optimization diagnostics when true.
