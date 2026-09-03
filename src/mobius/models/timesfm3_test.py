@@ -10,6 +10,7 @@ import onnx_ir as ir
 import pytest
 
 from mobius import build_from_module
+from mobius._configs import BaseModelConfig
 from mobius._registry import registry
 from mobius.integrations.transformers._config_resolver import _try_load_config_json
 from mobius.models.timesfm3 import TimesFM3Config, TimesFM3Model
@@ -38,6 +39,26 @@ def _build_tiny():
         task=TimeSeriesForecastingTask(),
     )
     return config, module, package
+
+
+@pytest.mark.parametrize(
+    ("input_patch_len", "output_patch_len"),
+    [(0, 8), (-1, 8), (4, 0), (4, -1)],
+)
+def test_config_rejects_nonpositive_patch_lengths(
+    input_patch_len: int, output_patch_len: int
+) -> None:
+    config = _tiny_config()
+    config.input_patch_len = input_patch_len
+    config.output_patch_len = output_patch_len
+
+    with pytest.raises(ValueError, match="must be positive"):
+        config.validate()
+
+
+def test_forecasting_task_rejects_config_without_patch_length() -> None:
+    with pytest.raises(TypeError, match="integer input_patch_len"):
+        TimeSeriesForecastingTask().build(TimesFM3Model(_tiny_config()), BaseModelConfig())
 
 
 @pytest.fixture(scope="module")

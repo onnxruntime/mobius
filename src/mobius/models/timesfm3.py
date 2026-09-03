@@ -67,6 +67,15 @@ class TimesFM3Config(BaseModelConfig):
         self.head_dim = self.model_dims // self.num_heads
 
     def validate(self) -> None:
+        if (
+            not isinstance(self.input_patch_len, int)
+            or isinstance(self.input_patch_len, bool)
+            or self.input_patch_len <= 0
+            or not isinstance(self.output_patch_len, int)
+            or isinstance(self.output_patch_len, bool)
+            or self.output_patch_len <= 0
+        ):
+            raise ValueError("input_patch_len and output_patch_len must be positive integers")
         if self.output_patch_len % self.input_patch_len:
             raise ValueError("output_patch_len must be a multiple of input_patch_len")
         if self.model_dims % self.num_heads:

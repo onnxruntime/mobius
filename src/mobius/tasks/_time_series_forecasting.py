@@ -40,10 +40,14 @@ class TimeSeriesForecastingTask(ModelTask):
     }
 
     def build(self, module: nn.Module, config: BaseModelConfig) -> ModelPackage:
+        patch_len = getattr(config, "input_patch_len", None)
+        if not isinstance(patch_len, int) or isinstance(patch_len, bool):
+            raise TypeError(
+                "TimeSeriesForecastingTask requires a config with an integer input_patch_len"
+            )
         batch = ir.SymbolicDim("batch")
         variates = ir.SymbolicDim("variates")
         patches = ir.SymbolicDim("patches")
-        patch_len = config.input_patch_len
 
         raw_graph, builder = _make_graph(name="timesfm3_raw_preprocessor")
         context = ir.SymbolicDim("context")
