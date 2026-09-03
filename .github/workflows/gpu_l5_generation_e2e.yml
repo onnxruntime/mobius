@@ -75,6 +75,7 @@ jobs:
           pip install -r requirements/ci/requirements.txt
           pip install soundfile librosa ml_dtypes flatbuffers numpy packaging protobuf sympy coloredlogs
           pip install -e '.[testing,transformers]'
+          pip install --force-reinstall --no-deps -r requirements/ci/vibevoice.txt
           # PyPI's ORT 1.27+ wheel requires CUDA 13, while these runners use CUDA 12.
           pip install --pre --no-deps --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/ onnxruntime-gpu
           pip install --no-deps onnxruntime-genai-cuda
