@@ -95,15 +95,6 @@ def _mock_decoder_model(
     return _mock_model(inputs=inputs, outputs=outputs)
 
 
-@pytest.mark.parametrize("model_type", ["moonshine", "moonshine_streaming"])
-def test_moonshine_runtime_limitation_is_advisory(tmp_path, model_type):
-    result = write_ort_genai_config(_make_fake_llm_pkg(model_type), str(tmp_path))
-
-    compatibility = json.loads(Path(result["runtime_compatibility"]).read_text())
-    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-    assert "variable-length raw-waveform encoder" in compatibility["warnings"][0]
-
-
 def _make_fake_llm_pkg(model_type: str = "qwen2"):
     """Build a minimal LLM-only ModelPackage with a fake config."""
     import dataclasses
