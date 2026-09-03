@@ -142,6 +142,70 @@ def test_vibevoice_assets_and_revision_are_forwarded(monkeypatch, tmp_path):
     } <= set(artifacts)
 
 
+def test_vibevoice_asr_writes_pinned_advisory_contract(monkeypatch, tmp_path):
+    from mobius.integrations.onnx_genai import auto_export
+    from mobius.models.vibevoice import (
+        VIBEVOICE_ASR_MODEL_ID,
+        VIBEVOICE_ASR_REVISION,
+        VibeVoiceASRForConditionalGeneration,
+    )
+    from mobius.models.vibevoice_asr_test import _config
+    from mobius.tasks import VibeVoiceASRStreamingTask
+
+    config = _config()
+    package = VibeVoiceASRStreamingTask().build(
+        VibeVoiceASRForConditionalGeneration(config), config
+    )
+    calls: list[tuple[str, str | None]] = []
+    warnings: list[str] = []
+
+    def text_assets(output_dir, source, *, revision=None):
+        calls.append(("text", revision))
+        return {"tokenizer": str(Path(output_dir) / "tokenizer.json")}
+
+    def runtime_assets(output_dir, source, names, *, revision=None):
+        calls.append(("runtime", revision))
+        assert names == (
+            "processor_config.json",
+            "preprocessor_config.json",
+            "generation_config.json",
+        )
+        return {"processor_config": str(Path(output_dir) / "processor_config.json")}
+
+    def audio_processor(output_dir, source, *, revision=None):
+        calls.append(("audio", revision))
+        return str(Path(output_dir) / "audio_processor.json")
+
+    def advisory(*args, warning, **kwargs):
+        warnings.append(warning)
+        return {"inference_metadata": str(tmp_path / "inference_metadata.yaml")}
+
+    monkeypatch.setattr(auto_export, "_write_text_runtime_assets", text_assets)
+    monkeypatch.setattr(auto_export, "_copy_runtime_assets", runtime_assets)
+    monkeypatch.setattr(auto_export, "_write_hf_audio_processor", audio_processor)
+    monkeypatch.setattr(auto_export, "_write_advisory_component_contract", advisory)
+
+    artifacts = write_onnx_genai_config(
+        package,
+        str(tmp_path),
+        source=VIBEVOICE_ASR_MODEL_ID,
+        revision=VIBEVOICE_ASR_REVISION,
+    )
+
+    assert calls == [
+        ("text", VIBEVOICE_ASR_REVISION),
+        ("runtime", VIBEVOICE_ASR_REVISION),
+        ("audio", VIBEVOICE_ASR_REVISION),
+    ]
+    assert "arbitrary left-padded attention masks" in warnings[0]
+    assert {
+        "tokenizer",
+        "processor_config",
+        "audio_processor",
+        "inference_metadata",
+    } <= set(artifacts)
+
+
 def _video_diffusion_package() -> ModelPackage:
     latent = ["batch", "frames", 4, "height", "width"]
     transformer = _model(

@@ -19,6 +19,7 @@ import torch
 from onnxscript import OpBuilder, nn
 
 from mobius._configs import (
+    VibeVoiceASRConfig,
     VibeVoiceConfig,
     VibeVoiceDiffusionConfig,
     VibeVoiceTokenizerConfig,
@@ -40,6 +41,9 @@ if TYPE_CHECKING:
 VIBEVOICE_MODEL_ID = "vibevoice/VibeVoice-1.5B-hf"
 VIBEVOICE_REVISION = "edc39f80f5cae656da37baf8faa8f5502bf7081f"
 VIBEVOICE_MICROSOFT_PROVENANCE_REVISION = "c00898d257e6b46004e3e2866a47534085fb685a"
+VIBEVOICE_ASR_MODEL_ID = "microsoft/VibeVoice-ASR-Streaming-7B"
+VIBEVOICE_ASR_REVISION = "60d858b518b4e19d404af3737f848fc185b30177"
+VIBEVOICE_ASR_SOURCE_REVISION = "505653d3873b065a488aea551c6ee3dc51d3062f"
 
 
 class _CacheAllocator:
@@ -71,13 +75,23 @@ class _ConvState:
     ) -> ir.Value:
         past = self._past[index]
         padded = op.Concat(past, hidden_states, axis=2)
+        self.update(op, padded, index=index, left_pad=left_pad)
+        return padded
+
+    def update(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        *,
+        index: int,
+        left_pad: int,
+    ) -> None:
         self._present[index] = op.Slice(
-            padded,
+            hidden_states,
             op.Constant(value_ints=[-left_pad]),
             op.Constant(value_ints=[2**63 - 1]),
             op.Constant(value_ints=[2]),
         )
-        return padded
 
     def outputs(self) -> list[ir.Value]:
         if any(value is None for value in self._present):
@@ -160,6 +174,7 @@ class _CausalConv1d(nn.Module):
         self._left_pad = (kernel_size - 1) * dilation - (stride - 1)
         if self._left_pad < 0:
             raise ValueError("VibeVoice causal convolution padding must be non-negative")
+        self._stride = stride
         self._cache_index = allocator.add(in_channels, self._left_pad)
 
     def forward(
@@ -167,6 +182,7 @@ class _CausalConv1d(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         state: _ConvState | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         if state is None:
             hidden_states = op.Pad(
@@ -180,6 +196,36 @@ class _CausalConv1d(nn.Module):
                 index=self._cache_index,
                 left_pad=self._left_pad,
             )
+        if is_final_chunk is not None:
+            # HF pads causal chunks to the next stride boundary only on the final
+            # call. For its kernel=2*stride convolutions this is ``(-length) % stride``.
+            input_length = op.Shape(hidden_states, start=2, end=3)
+            extra_padding = op.Mod(
+                op.Sub(
+                    op.Constant(value_int=self._stride),
+                    op.Mod(input_length, op.Constant(value_int=self._stride)),
+                ),
+                op.Constant(value_int=self._stride),
+            )
+            final_padding = op.Mul(
+                extra_padding,
+                op.Cast(is_final_chunk, to=ir.DataType.INT64),
+            )
+            hidden_states = op.Pad(
+                hidden_states,
+                op.Concat(
+                    op.Constant(value_ints=[0, 0, 0, 0, 0]),
+                    final_padding,
+                    axis=0,
+                ),
+            )
+            if state is not None:
+                state.update(
+                    op,
+                    hidden_states,
+                    index=self._cache_index,
+                    left_pad=self._left_pad,
+                )
         return self.conv(op, hidden_states)
 
 
@@ -206,6 +252,7 @@ class _CausalConvTranspose1d(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         state: _ConvState | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         input_length = op.Shape(hidden_states, start=2, end=3)
         if state is not None:
@@ -278,12 +325,13 @@ class _ConvNext1dLayer(nn.Module):
         op: OpBuilder,
         hidden_states: ir.Value,
         state: _ConvState | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         residual = hidden_states
         mixed = op.Transpose(hidden_states, perm=[0, 2, 1])
         mixed = self.norm(op, mixed)
         mixed = op.Transpose(mixed, perm=[0, 2, 1])
-        mixed = self.mixer(op, mixed, state)
+        mixed = self.mixer(op, mixed, state, is_final_chunk)
         mixed = op.Mul(mixed, op.Unsqueeze(self.gamma, [-1]))
         hidden_states = op.Add(residual, mixed)  # (batch, channels, frames)
 
@@ -312,10 +360,16 @@ class _EncoderStem(nn.Module):
             ]
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value, state: _ConvState | None):
-        hidden_states = self.conv(op, hidden_states, state)
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        state: _ConvState | None,
+        is_final_chunk: ir.Value | None = None,
+    ):
+        hidden_states = self.conv(op, hidden_states, state, is_final_chunk)
         for block in self.stage:
-            hidden_states = block(op, hidden_states, state)
+            hidden_states = block(op, hidden_states, state, is_final_chunk)
         return hidden_states
 
 
@@ -342,10 +396,16 @@ class _EncoderLayer(nn.Module):
             ]
         )
 
-    def forward(self, op: OpBuilder, hidden_states: ir.Value, state: _ConvState | None):
-        hidden_states = self.conv(op, hidden_states, state)
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        state: _ConvState | None,
+        is_final_chunk: ir.Value | None = None,
+    ):
+        hidden_states = self.conv(op, hidden_states, state, is_final_chunk)
         for block in self.stage:
-            hidden_states = block(op, hidden_states, state)
+            hidden_states = block(op, hidden_states, state, is_final_chunk)
         return hidden_states
 
 
@@ -375,12 +435,13 @@ class VibeVoiceTokenizerEncoder(nn.Module):
         op: OpBuilder,
         input_values: ir.Value,
         past_conv_states: Sequence[ir.Value] | None = None,
+        is_final_chunk: ir.Value | None = None,
     ):
         state = _ConvState(past_conv_states) if past_conv_states is not None else None
-        hidden_states = self.stem(op, input_values, state)
+        hidden_states = self.stem(op, input_values, state, is_final_chunk)
         for layer in self.conv_layers:
-            hidden_states = layer(op, hidden_states, state)
-        hidden_states = self.head(op, hidden_states, state)
+            hidden_states = layer(op, hidden_states, state, is_final_chunk)
+        hidden_states = self.head(op, hidden_states, state, is_final_chunk)
         latents = op.Transpose(hidden_states, perm=[0, 2, 1])  # (batch, frames, latent)
         return latents, state.outputs() if state is not None else []
 
@@ -530,19 +591,56 @@ class VibeVoiceReferenceAudioEncoder(nn.Module):
         return op.GatherND(latents, valid_indices)  # (valid_audio_frames, latent_size)
 
 
-class VibeVoiceMultiModalProjector(nn.Module):
-    """Linear -> RMSNorm -> Linear connector used by both continuous tokenizers."""
+class _VibeVoiceConnector(nn.Module):
+    """Linear -> RMSNorm -> Linear connector with checkpoint-specific field names."""
 
-    def __init__(self, input_dim: int, output_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        first_name: str,
+        norm_name: str,
+        second_name: str,
+    ):
         super().__init__()
-        self.linear_1 = Linear(input_dim, output_dim)
-        self.act = RMSNorm(output_dim, eps=1e-6)
-        self.linear_2 = Linear(output_dim, output_dim)
+        setattr(self, first_name, Linear(input_dim, output_dim))
+        setattr(self, norm_name, RMSNorm(output_dim, eps=1e-6))
+        setattr(self, second_name, Linear(output_dim, output_dim))
+        self._first_name = first_name
+        self._norm_name = norm_name
+        self._second_name = second_name
 
     def forward(self, op: OpBuilder, audio_features: ir.Value):
-        hidden_states = self.linear_1(op, audio_features)
-        hidden_states = self.act(op, hidden_states)
-        return self.linear_2(op, hidden_states)
+        hidden_states = getattr(self, self._first_name)(op, audio_features)
+        hidden_states = getattr(self, self._norm_name)(op, hidden_states)
+        return getattr(self, self._second_name)(op, hidden_states)
+
+
+class VibeVoiceMultiModalProjector(_VibeVoiceConnector):
+    """TTS connector retaining the native ``linear_1``/``act``/``linear_2`` names."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__(
+            input_dim,
+            output_dim,
+            first_name="linear_1",
+            norm_name="act",
+            second_name="linear_2",
+        )
+
+
+class VibeVoiceSpeechConnector(_VibeVoiceConnector):
+    """ASR connector matching the public source ``fc1``/``norm``/``fc2`` weights."""
+
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__(
+            input_dim,
+            output_dim,
+            first_name="fc1",
+            norm_name="norm",
+            second_name="fc2",
+        )
 
 
 class VibeVoiceAcousticProjector(nn.Module):
@@ -601,7 +699,7 @@ class VibeVoiceEmbeddingModel(nn.Module):
 class VibeVoiceDecoderModel(nn.Module):
     """Qwen2 decoder returning vocabulary logits and post-norm hidden states."""
 
-    def __init__(self, config: VibeVoiceConfig):
+    def __init__(self, config: VibeVoiceConfig | VibeVoiceASRConfig):
         super().__init__()
         self.layers = nn.ModuleList(
             [DecoderLayer(config) for _ in range(config.num_hidden_layers)]
@@ -946,4 +1044,226 @@ class VibeVoiceForConditionalGeneration(nn.Module):
                 routed[f"audio_decoder.{suffix}"] = value
             elif key == "lm_head.weight":
                 routed["decoder.lm_head.weight"] = value
+        return routed
+
+
+class VibeVoiceASRAudioEncoder(nn.Module):
+    """Encode waveform chunks with VibeVoice ASR's two causal tokenizers.
+
+    The public model samples acoustic latents from a host-provided pair of random
+    tensors, while semantic latents use their mean directly. Both tokenizer cache
+    sets are explicit graph state so the host can preserve the source's long-audio
+    causal encoding semantics.
+    """
+
+    def __init__(self, config: VibeVoiceASRConfig):
+        super().__init__()
+        self.acoustic_tokenizer = VibeVoiceTokenizerEncoder(config.acoustic_tokenizer)
+        self.semantic_tokenizer = VibeVoiceTokenizerEncoder(config.semantic_tokenizer)
+        self.acoustic_connector = VibeVoiceSpeechConnector(
+            config.acoustic_tokenizer.hidden_size,
+            config.hidden_size,
+        )
+        self.semantic_connector = VibeVoiceSpeechConnector(
+            config.semantic_tokenizer.hidden_size,
+            config.hidden_size,
+        )
+        self.acoustic_cache_specs = self.acoustic_tokenizer.cache_specs
+        self.semantic_cache_specs = self.semantic_tokenizer.cache_specs
+        self._acoustic_std_scale = config.acoustic_tokenizer.vae_std / 0.8
+        self._dtype = config.dtype
+
+    def forward(
+        self,
+        op: OpBuilder,
+        speech_tensors: ir.Value,
+        speech_masks: ir.Value,
+        acoustic_sample_noise: ir.Value,
+        acoustic_latent_noise: ir.Value,
+        acoustic_past_conv_states: Sequence[ir.Value],
+        semantic_past_conv_states: Sequence[ir.Value],
+        is_final_chunk: ir.Value,
+    ):
+        # The processor emits raw [batch, samples] speech_tensors; the reference
+        # adds the tokenizer's mono channel dimension immediately before encoding.
+        waveform = op.Cast(op.Unsqueeze(speech_tensors, [1]), to=self._dtype)
+        acoustic_mean, acoustic_present = self.acoustic_tokenizer(
+            op,
+            waveform,
+            acoustic_past_conv_states,
+            is_final_chunk,
+        )
+        # The source samples one standard deviation per batch item, then applies
+        # independent elementwise noise. Keeping both tensors host-owned makes
+        # this stage deterministic and exactly replayable.
+        acoustic_std = op.Mul(acoustic_sample_noise, self._acoustic_std_scale)
+        acoustic_latents = op.Add(
+            acoustic_mean,
+            op.Mul(op.Unsqueeze(acoustic_std, [1, 2]), acoustic_latent_noise),
+        )
+        semantic_latents, semantic_present = self.semantic_tokenizer(
+            op,
+            waveform,
+            semantic_past_conv_states,
+            is_final_chunk,
+        )
+        acoustic_embeds = self.acoustic_connector(op, acoustic_latents)
+        semantic_embeds = self.semantic_connector(op, semantic_latents)
+        speech_embeds = op.Add(acoustic_embeds, semantic_embeds)  # (batch, frames, hidden)
+        speech_indices = op.Transpose(op.NonZero(speech_masks), perm=[1, 0])
+        return (
+            op.GatherND(speech_embeds, speech_indices),  # (valid_speech_frames, hidden)
+            acoustic_present,
+            semantic_present,
+        )
+
+
+class VibeVoiceASREmbeddingModel(nn.Module):
+    """Replace ASR speech-placeholder embeddings with flattened encoded speech frames."""
+
+    def __init__(self, config: VibeVoiceASRConfig):
+        super().__init__()
+        self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
+
+    def forward(
+        self,
+        op: OpBuilder,
+        input_ids: ir.Value,
+        speech_embeds: ir.Value,
+        acoustic_input_mask: ir.Value,
+    ):
+        inputs_embeds = self.embed_tokens(op, input_ids)
+        placeholder_indices = op.Transpose(op.NonZero(acoustic_input_mask), perm=[1, 0])
+        return op.ScatterND(inputs_embeds, placeholder_indices, speech_embeds)
+
+
+class VibeVoiceASRForConditionalGeneration(nn.Module):
+    """VibeVoice streaming ASR with explicit encoder and decoder state.
+
+    Mirrors the executable reference at
+    ``microsoft/VibeVoice@505653d3873b065a488aea551c6ee3dc51d3062f`` with
+    ``transformers==4.51.3`` for checkpoint revision
+    ``60d858b518b4e19d404af3737f848fc185b30177``.
+
+    ```mermaid
+    flowchart LR
+        W[24 kHz waveform chunk] --> A[Acoustic causal tokenizer]
+        W --> S[Semantic causal tokenizer]
+        A --> AN[Gaussian acoustic sample]
+        AN --> AC[acoustic connector]
+        S --> SC[semantic connector]
+        AC --> SUM[Add and retain valid speech frames]
+        SC --> SUM
+        TOK[Prompt + speech placeholders] --> E[Token embedding replacement]
+        SUM --> E
+        E --> Q[Qwen2 decoder + KV cache]
+        Q --> TXT[Text / speaker JSON tokens]
+    ```
+
+    ``audio_encoder`` accepts the processor's 24 kHz ``speech_tensors`` [B, S]
+    and ``speech_masks`` [B, F] directly; it returns speech embeddings in
+    row-major mask order. ``embedding`` accepts the processor's
+    ``acoustic_input_mask`` directly. The host owns prompt formatting, hotword
+    text, sampling, forced ``<|text_chunk_end|>`` insertion, cache lifetime,
+    and speaker-JSON parsing.
+    """
+
+    default_task = "vibevoice-asr-streaming"
+    category = "Audio"
+    config_class = VibeVoiceASRConfig
+
+    # Acoustic tokenizer decoder tensors are part of the VAE training checkpoint,
+    # but the public ASR ``encode_speech`` path never invokes them.
+    INTENTIONALLY_UNUSED_WEIGHT_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "model.acoustic_tokenizer.decoder.",
+    )
+    HF_COMPONENT_SOURCES: ClassVar[dict[str, tuple[str, ...]]] = {
+        "audio_encoder": (
+            "model.acoustic_tokenizer.encoder",
+            "model.semantic_tokenizer.encoder",
+            "model.acoustic_connector",
+            "model.semantic_connector",
+        ),
+        "embedding": ("model.language_model.embed_tokens",),
+        "decoder": (
+            "model.language_model.layers",
+            "model.language_model.norm",
+            "lm_head",
+        ),
+    }
+
+    def __init__(self, config: VibeVoiceASRConfig):
+        super().__init__()
+        self.config = config
+        self.audio_encoder = VibeVoiceASRAudioEncoder(config)
+        self.embedding = VibeVoiceASREmbeddingModel(config)
+        self.decoder = VibeVoiceDecoderModel(config)
+
+    def forward(self, op: OpBuilder, *args, **kwargs):
+        raise NotImplementedError(
+            "VibeVoiceASRStreamingTask exports each ASR stage independently"
+        )
+
+    @staticmethod
+    def _encoder_weight_suffix(suffix: str) -> str:
+        """Map executable ASR encoder hierarchy to the shared tokenizer hierarchy."""
+        if suffix.startswith("downsample_layers."):
+            _, index_text, zero, remainder = suffix.split(".", maxsplit=3)
+            if zero != "0":
+                raise ValueError(f"Unsupported VibeVoice ASR downsample path: {suffix}")
+            index = int(index_text)
+            prefix = "stem" if index == 0 else f"conv_layers.{index - 1}"
+            return f"{prefix}.{remainder}"
+        if suffix.startswith("stages."):
+            _, index_text, remainder = suffix.split(".", maxsplit=2)
+            index = int(index_text)
+            prefix = "stem.stage" if index == 0 else f"conv_layers.{index - 1}.stage"
+            return f"{prefix}.{remainder}".replace(
+                ".mixer.conv.conv.conv.",
+                ".mixer.conv.",
+            )
+        if suffix.startswith("head."):
+            return suffix.replace("head.conv.conv.", "head.conv.")
+        raise ValueError(f"Unsupported VibeVoice ASR encoder weight: {suffix}")
+
+    def preprocess_weights(
+        self,
+        state_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Route every inference-used tensor and explicitly exclude the unused VAE decoder."""
+        routed: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("model.acoustic_tokenizer.encoder."):
+                suffix = key.removeprefix("model.acoustic_tokenizer.encoder.")
+                routed[
+                    f"audio_encoder.acoustic_tokenizer.{self._encoder_weight_suffix(suffix)}"
+                ] = value
+            elif key.startswith("model.semantic_tokenizer.encoder."):
+                suffix = key.removeprefix("model.semantic_tokenizer.encoder.")
+                routed[
+                    f"audio_encoder.semantic_tokenizer.{self._encoder_weight_suffix(suffix)}"
+                ] = value
+            elif key.startswith("model.acoustic_connector."):
+                suffix = key.removeprefix("model.acoustic_connector.")
+                routed[f"audio_encoder.acoustic_connector.{suffix}"] = value
+            elif key.startswith("model.semantic_connector."):
+                suffix = key.removeprefix("model.semantic_connector.")
+                routed[f"audio_encoder.semantic_connector.{suffix}"] = value
+            elif key.startswith("model.language_model.embed_tokens."):
+                suffix = key.removeprefix("model.language_model.embed_tokens.")
+                routed[f"embedding.embed_tokens.{suffix}"] = value
+                if suffix == "weight" and self.config.tie_word_embeddings:
+                    routed["decoder.lm_head.weight"] = value
+            elif key.startswith("model.language_model.layers."):
+                suffix = key.removeprefix("model.language_model.")
+                routed[f"decoder.{suffix}"] = value
+            elif key.startswith("model.language_model.norm."):
+                suffix = key.removeprefix("model.language_model.")
+                routed[f"decoder.{suffix}"] = value
+            elif key == "lm_head.weight":
+                routed["decoder.lm_head.weight"] = value
+            elif key.startswith(self.INTENTIONALLY_UNUSED_WEIGHT_PREFIXES):
+                continue
+            else:
+                raise ValueError(f"Unexpected VibeVoice ASR checkpoint tensor: {key}")
         return routed

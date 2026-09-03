@@ -59,6 +59,7 @@ _SPEECH_TASK_KEYS: dict[str, set[str]] = {
         "semantic_encoder",
         "semantic_projection",
     },
+    "vibevoice-asr-streaming": {"audio_encoder", "embedding", "decoder"},
 }
 
 
