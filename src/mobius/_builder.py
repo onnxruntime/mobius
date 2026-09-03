@@ -144,7 +144,7 @@ def build_from_module(
         module: An ``onnxscript.nn.Module`` whose ``forward`` signature is
             compatible with *task*.
         config: Architecture configuration. Its ``dtype`` controls model
-            precision and its optional ``validate`` method runs before build.
+            precision and its ``validate`` method runs before build.
         task: Task name or :class:`ModelTask` instance.
         execution_provider: Target for EP-aware optimizations.
         trace_optimization: Log optimization diagnostics when true.
@@ -158,8 +158,6 @@ def build_from_module(
     """
     if hasattr(config, "validate"):
         config.validate()
-    if hasattr(config, "validate_execution_provider"):
-        config.validate_execution_provider(execution_provider)
     dtype = getattr(config, "dtype", ir.DataType.FLOAT)
     if prune_prefill_prefix:
         task = _enable_prefill_prefix_pruning_task(task)

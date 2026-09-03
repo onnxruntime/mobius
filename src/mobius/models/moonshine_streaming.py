@@ -32,6 +32,8 @@ offline Moonshine and is reused directly.
 
 from __future__ import annotations
 
+from typing import overload
+
 import onnx_ir as ir
 from onnxscript import OpBuilder, nn
 
@@ -107,13 +109,25 @@ class MoonshineStreamingCausalConv1d(Conv1d):
         self._window = kernel_size
         self._stride = stride
 
-    def forward(  # type: ignore[override]
+    @overload
+    def forward(self, op: OpBuilder, hidden_states: ir.Value) -> ir.Value: ...
+
+    @overload
+    def forward(
         self,
         op: OpBuilder,
         hidden_states: ir.Value,
         mask: ir.Value,
         dtype: ir.DataType,
-    ) -> tuple[ir.Value, ir.Value]:
+    ) -> tuple[ir.Value, ir.Value]: ...
+
+    def forward(
+        self,
+        op: OpBuilder,
+        hidden_states: ir.Value,
+        mask: ir.Value | None = None,
+        dtype: ir.DataType = ir.DataType.FLOAT,
+    ) -> ir.Value | tuple[ir.Value, ir.Value]:
         """Run the convolution and downsample the mask.
 
         Args:
@@ -125,6 +139,8 @@ class MoonshineStreamingCausalConv1d(Conv1d):
             ``((B, C_out, T_out), (B, T_out))`` hidden states and mask.
         """
         hidden_states = super().forward(op, hidden_states)  # (B, C_out, T_out)
+        if mask is None:
+            return hidden_states
 
         # An output frame is valid when *any* input frame in its (left-padded)
         # receptive field is valid — max-pooling over the same window with the

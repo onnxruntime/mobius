@@ -284,6 +284,120 @@ class TestBuildGraphMoonshine:
         assert "Sigmoid" not in decoder_ops
 
 
+class TestBuildGraphMoonshineStreaming:
+    """Verify Moonshine Streaming's causal framing encoder and cached decoder."""
+
+    def _config(self, **overrides):
+        from mobius._configs import MoonshineStreamingConfig
+
+        options = dict(
+            _config_cls=MoonshineStreamingConfig,
+            num_key_value_heads=TINY_HEADS,
+            partial_rotary_factor=0.8,
+            rope_type="default",
+            rope_interleave=True,
+            mlp_bias=True,
+            tie_word_embeddings=False,
+            encoder_num_hidden_layers=TINY_LAYERS,
+            encoder_num_attention_heads=TINY_HEADS,
+            encoder_num_key_value_heads=TINY_HEADS,
+            encoder_sliding_windows=((16, 4), (16, 0)),
+            decoder_start_token_id=1,
+        )
+        options.update(overrides)
+        return _base_config(**options)
+
+    def _build(self, config):
+        from mobius.models import MoonshineStreamingForConditionalGeneration
+        from mobius.tasks import SpeechToTextTask
+
+        return build_from_module(
+            MoonshineStreamingForConditionalGeneration(config),
+            config,
+            task=SpeechToTextTask(),
+        )
+
+    def test_package_and_io(self):
+        package = self._build(self._config())
+
+        assert set(package) == {"encoder", "decoder"}
+        encoder_inputs = {value.name for value in package["encoder"].graph.inputs}
+        encoder_outputs = {value.name for value in package["encoder"].graph.outputs}
+        decoder_inputs = {value.name for value in package["decoder"].graph.inputs}
+        assert encoder_inputs == {"input_values", "attention_mask"}
+        assert encoder_outputs == {"encoder_hidden_states", "encoder_attention_mask"}
+        assert "encoder_attention_mask" in decoder_inputs
+        assert "position_ids" in decoder_inputs
+        for layer_idx in range(TINY_LAYERS):
+            assert f"past_key_values.{layer_idx}.key" in decoder_inputs
+
+    def test_architecture_initializers_match_huggingface_names(self):
+        package = self._build(self._config())
+        encoder_initializers = set(package["encoder"].graph.initializers)
+        decoder_initializers = set(package["decoder"].graph.initializers)
+
+        assert "encoder.embedder.linear.weight" in encoder_initializers
+        assert "encoder.embedder.linear.bias" not in encoder_initializers
+        assert "encoder.embedder.comp.log_k" in encoder_initializers
+        for conv in ("conv1", "conv2"):
+            assert f"encoder.embedder.{conv}.weight" in encoder_initializers
+            assert f"encoder.embedder.{conv}.bias" in encoder_initializers
+
+        assert "encoder.layers.0.input_layernorm.gamma" in encoder_initializers
+        assert "encoder.layers.0.input_layernorm.weight" not in encoder_initializers
+        assert "encoder.final_norm.gamma" in encoder_initializers
+        assert "encoder.layers.0.self_attn.q_proj.bias" not in encoder_initializers
+        assert "encoder.layers.0.mlp.fc1.bias" in encoder_initializers
+        assert not any("rotary" in name for name in encoder_initializers)
+
+        assert "decoder.pos_emb.weight" in decoder_initializers
+        assert "decoder.embed_tokens.weight" in decoder_initializers
+        assert "decoder.proj_out.weight" in decoder_initializers
+        assert "decoder.layers.0.encoder_attn.q_proj.weight" in decoder_initializers
+        assert "decoder.proj.weight" not in decoder_initializers
+
+    def test_encoder_conv_padding_is_causal(self):
+        package = self._build(self._config())
+        conv_pads = [
+            tuple(node.attributes["pads"].as_ints())
+            for node in package["encoder"].graph
+            if node.op_type == "Conv"
+        ]
+        assert conv_pads, "encoder should contain convolutions"
+        assert all(pads == (4, 0) for pads in conv_pads), conv_pads
+
+    def test_narrower_encoder_adds_projection(self):
+        config = self._config(encoder_hidden_size=32, encoder_head_dim=8)
+        package = self._build(config)
+        assert config.encoder_output_size == 32
+        decoder_initializers = set(package["decoder"].graph.initializers)
+        assert "decoder.proj.weight" in decoder_initializers
+        assert "decoder.pos_emb.weight" in decoder_initializers
+        encoder_input = next(
+            value
+            for value in package["decoder"].graph.inputs
+            if value.name == "encoder_hidden_states"
+        )
+        assert encoder_input.shape[2] == 32
+
+    def test_attention_bias_follows_upstream_gating(self):
+        package = self._build(self._config(attn_qkv_bias=True, encoder_attention_bias=True))
+        encoder_initializers = set(package["encoder"].graph.initializers)
+        decoder_initializers = set(package["decoder"].graph.initializers)
+
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            assert f"encoder.layers.0.self_attn.{projection}.bias" in encoder_initializers
+        for projection in ("q_proj", "k_proj", "v_proj"):
+            assert f"decoder.layers.0.self_attn.{projection}.bias" in decoder_initializers
+            assert f"decoder.layers.0.encoder_attn.{projection}.bias" in decoder_initializers
+        assert "decoder.layers.0.self_attn.o_proj.bias" not in decoder_initializers
+        assert "decoder.layers.0.encoder_attn.o_proj.bias" not in decoder_initializers
+
+    def test_sliding_window_length_is_validated(self):
+        with pytest.raises(ValueError, match="encoder_sliding_windows"):
+            self._config(encoder_sliding_windows=((16, 4),))
+
+
 class TestBuildGraphGlmAsr:
     """Verify GLM-ASR's audio encoder, projector, embedding, and decoder split."""
 

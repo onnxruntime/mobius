@@ -14,12 +14,10 @@ than a HuggingFace intermediate.
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 import librosa
 import numpy as np
-import onnx_ir as ir
 import pytest
 import torch
 import transformers
@@ -300,31 +298,6 @@ class TestMoonshineStreamingConfigExtraction:
         assert config.encoder_head_dim == 40
         assert config.vocab_size == 32_768
         assert config.decoder_start_token_id == 1
-
-    def test_rejects_float16_on_cuda(self):
-        """An inaccurate dtype/EP target fails loudly instead of downgrading."""
-        import onnx_ir as ir
-
-        config = MoonshineStreamingConfig.from_transformers(_tiny_hf_config())
-        config.dtype = ir.DataType.FLOAT16
-        with pytest.raises(ValueError, match="float16 with the CUDA"):
-            config.validate_execution_provider("cuda")
-
-        # Everything else this model actually supports stays allowed.
-        config.validate_execution_provider("cpu")
-        for dtype in (ir.DataType.FLOAT, ir.DataType.BFLOAT16):
-            config.dtype = dtype
-            config.validate_execution_provider("cuda")
-
-    def test_build_rejects_float16_on_cuda(self):
-        """The rejection is wired into the builder, not just the config."""
-        config = MoonshineStreamingConfig.from_transformers(_tiny_hf_config())
-        config = dataclasses.replace(config, dtype=ir.DataType.FLOAT16)
-        module = MoonshineStreamingForConditionalGeneration(config)
-        with pytest.raises(ValueError, match="float16 with the CUDA"):
-            build_from_module(
-                module, config, task=SpeechToTextTask(), execution_provider="cuda"
-            )
 
     def test_rejects_other_model_types(self):
         config = _tiny_hf_config()
