@@ -18,7 +18,6 @@ apart, so that the same divergence cannot be reintroduced silently:
 from __future__ import annotations
 
 import inspect
-import pathlib
 import re
 from types import SimpleNamespace
 from typing import ClassVar
@@ -1684,40 +1683,14 @@ class TestDocumentedSupportMatrix:
 
     ``docs/api/build_from_gguf.md`` previously claimed "Most decoder-only LLM
     architectures are supported", which is not a checkable statement. This test
-    is what makes the replacement checkable.
+    keeps the generated capability catalog checkable without inflating the user guide.
     """
-
-    _DOC = pathlib.Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
-    _BEGIN = "<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->"
-    _END = "<!-- END GGUF SUPPORT MATRIX -->"
-
-    @staticmethod
-    def _expected_rows() -> list[str]:
-        rows = []
-        for spec in sorted(iter_arch_specs(), key=lambda s: s.gguf_arch):
-            aliases = ", ".join(f"`{a}`" for a in sorted(spec.aliases)) or "—"
-            model_type = f"`{spec.model_type}`" if spec.model_type else "—"
-            core_verdicts = spec.verdicts
-            status = (
-                "supported"
-                if all(verdict is Support.SUPPORTED for verdict in spec.verdicts.values())
-                else "; ".join(
-                    f"{name} {verdict.value}"
-                    for name, verdict in core_verdicts.items()
-                    if verdict is not Support.SUPPORTED
-                )
-            )
-            reason = spec.reason or "Validated graph and runtime contract."
-            rows.append(
-                f"| `{spec.gguf_arch}` | {aliases} | {model_type} | {status} | {reason} |"
-            )
-        return rows
 
     def test_the_doc_table_matches_the_registry(self) -> None:
         from mobius.integrations.gguf._docs import check_document
 
         assert check_document(), (
-            "docs/api/build_from_gguf.md is out of date; run "
+            "docs/gguf-capability-catalog.md is out of date; run "
             "`python scripts/generate_gguf_support_docs.py`."
         )
 

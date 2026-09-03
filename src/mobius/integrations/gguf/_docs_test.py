@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Closure tests for the generated GGUF support documentation."""
+"""Closure tests for the generated GGUF capability catalog."""
 
 from __future__ import annotations
 
@@ -32,20 +32,62 @@ from mobius.integrations.gguf._tokenizer_registry import tokenizer_pre_policies
 from mobius.integrations.gguf._upstream import UPSTREAM_COMMIT, UPSTREAM_DATE
 
 
-def test_document_is_exact_generator_output() -> None:
+def test_catalog_is_exact_generator_output() -> None:
     assert check_document()
     assert check_quantization_capability_matrix()
 
 
-def test_document_is_concise_and_reason_coded() -> None:
-    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
-    assert len(document.splitlines()) < 640
+def test_each_generated_catalog_block_is_unique_and_exact() -> None:
+    document = Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
+    blocks = render_blocks()
+    markers = {
+        "summary": (
+            "<!-- BEGIN GGUF CLOSURE SUMMARY -->",
+            "<!-- END GGUF CLOSURE SUMMARY -->",
+        ),
+        "architectures": (
+            "<!-- BEGIN GGUF SUPPORT MATRIX (generated; see _arch_registry.py) -->",
+            "<!-- END GGUF SUPPORT MATRIX -->",
+        ),
+        "qtypes": (
+            "<!-- BEGIN GGUF QUANTIZATION MATRIX (generated; see _quant_registry.py) -->",
+            "<!-- END GGUF QUANTIZATION MATRIX -->",
+        ),
+        "projectors": (
+            "<!-- BEGIN GGUF MMPROJ SUPPORT MATRIX (generated; see _mmproj_registry.py) -->",
+            "<!-- END GGUF MMPROJ SUPPORT MATRIX -->",
+        ),
+        "tokenizers": (
+            "<!-- BEGIN GGUF TOKENIZER PRE SUPPORT MATRIX -->",
+            "<!-- END GGUF TOKENIZER PRE SUPPORT MATRIX -->",
+        ),
+    }
+
+    for name, (begin, end) in markers.items():
+        assert document.count(begin) == 1
+        assert document.count(end) == 1
+        documented = document.split(begin, 1)[1].split(end, 1)[0].strip()
+        assert documented == blocks[name]
+
+
+def test_catalog_is_complete_and_reason_coded() -> None:
+    document = Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
+    assert len(document.splitlines()) < 600
     assert "RUNTIME_EVIDENCE_PENDING" in document
     assert "qwen3.5-0.8b-q4-tokenizer" in document
     assert "qwen2.5-0.5b-instruct-q8-tokenizer" in document
     assert "deferred-compiled-semantics" in document
     assert "deferred-pinned-artifact-mismatch" in document
     assert "does not claim graph or runtime support." in " ".join(document.split())
+
+
+def test_user_guide_is_concise_and_links_catalog() -> None:
+    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    assert len(document.splitlines()) <= 200
+    assert "../gguf-capability-catalog.md" in document
+    assert "mobius build-gguf GGUF_PATH --output OUTPUT_DIR [options]" in document
+    assert "runtime_validation_status" in document
+    assert "<!-- BEGIN GGUF" not in document
 
 
 def test_tokenizer_evidence_rows_have_exactly_four_markdown_columns() -> None:
@@ -92,7 +134,7 @@ def test_ernie45_row_preserves_exact_admitted_subset_boundary() -> None:
 
 
 def test_manual_real_artifact_table_covers_every_registry_pin() -> None:
-    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    document = Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
     for pin in MMPROJ_ARTIFACT_PINS:
         assert f"`{pin.repository}@{pin.revision}`" in document
         assert f"`{pin.filename}`" in document
@@ -101,9 +143,9 @@ def test_manual_real_artifact_table_covers_every_registry_pin() -> None:
 
 
 def test_stale_at_style_pin_is_rejected(tmp_path: Path) -> None:
-    document = tmp_path / "build_from_gguf.md"
+    document = tmp_path / "gguf-capability-catalog.md"
     document.write_text(
-        Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+        Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
         + "\nllama.cpp@1111111111111111111111111111111111111111\n",
         encoding="utf-8",
     )
@@ -112,7 +154,7 @@ def test_stale_at_style_pin_is_rejected(tmp_path: Path) -> None:
 
 
 def test_candidate_projector_artifact_table_covers_every_availability_pin() -> None:
-    document = Path("docs/api/build_from_gguf.md").read_text(encoding="utf-8")
+    document = Path("docs/gguf-capability-catalog.md").read_text(encoding="utf-8")
     for pin in MMPROJ_ARTIFACT_AVAILABILITY_PINS:
         assert f"`{pin.repository}@{pin.revision}`" in document
         assert f"`{pin.filename}`" in document
