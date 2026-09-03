@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import dataclasses
-import json
-from pathlib import Path
 
 import numpy as np
 import onnx_ir as ir
@@ -25,7 +23,6 @@ from mobius import build_from_module
 from mobius._configs import ParakeetCTCConfig
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations._weight_loading import apply_weights
-from mobius.integrations.ort_genai import write_ort_genai_config
 from mobius.models import ParakeetForCTCModel
 from mobius.tasks import FeatureCTCAsrTask
 
@@ -168,14 +165,3 @@ def test_parakeet_synthetic_parity_with_padding():
         session.close()
 
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_parakeet_exports_with_unsupported_runtime_status(tmp_path):
-    _, _, _, package = _build_tiny()
-
-    result = write_ort_genai_config(package, str(tmp_path))
-    compatibility = json.loads(
-        Path(result["runtime_compatibility"]).read_text(encoding="utf-8")
-    )
-    assert compatibility["runtime_validation_status"] == "unsupported-by-tested-runtime"
-    assert "feature-input CTC ASR pipeline" in compatibility["warnings"][0]

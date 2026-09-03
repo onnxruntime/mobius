@@ -1987,6 +1987,11 @@ def write_ort_genai_config(
             "Diffusion models (which have no config) are not supported."
         )
     os.makedirs(directory, exist_ok=True)
+    if set(pkg) in ({"audio_encoder"}, {"speaker_encoder"}) and getattr(
+        pkg, "gguf_projector_type", None
+    ):
+        return {}
+
     # Normalize EP: 'default' and 'onnx-standard' are portable-ONNX modes
     # that carry no EP-specific session options → treat as CPU.
     if ep in ("default", "onnx-standard"):
