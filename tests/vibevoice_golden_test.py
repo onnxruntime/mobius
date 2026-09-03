@@ -305,6 +305,9 @@ def test_vibevoice_processor_contract(vibevoice_processor):
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA is required for real-weight stage parity"
+)
 def test_vibevoice_real_weight_stage_parity(
     vibevoice_package_dir,
     vibevoice_processor,
