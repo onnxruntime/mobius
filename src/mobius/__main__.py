@@ -25,12 +25,13 @@ from mobius._builder import (
     build_from_module,
     resolve_dtype,
 )
+from mobius._component_quantization import attach_hf_component_sources
 from mobius._optimizations import strip_debug_metadata
 from mobius._registry import registry
-from mobius.integrations.transformers import (
+from mobius.integrations.transformers import build
+from mobius.integrations.transformers._config_resolver import (
     _config_from_hf,
     _default_task_for_model,
-    build,
 )
 
 logger = logging.getLogger(__name__)
@@ -312,6 +313,14 @@ def _cmd_build(args: argparse.Namespace) -> None:
         task = CausalLMTask(paged_cache=True)
     trust_remote_code = args.trust_remote_code
     revision = args.revision
+    from mobius.integrations._moshi import (
+        _is_personaplex_checkpoint,
+        _personaplex_revision,
+    )
+
+    is_personaplex = bool(args.model and _is_personaplex_checkpoint(args.model))
+    if is_personaplex:
+        revision = _personaplex_revision(args.model, revision)
     if args.model == "nvidia/RE-USE" and revision is None:
         # Pin every Hub probe, including the early Diffusers detector. A
         # mutable model_index.json on Hub main must not reroute this checkpoint
@@ -330,7 +339,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
     # that flag only applies to transformers decoder exports, so we let the
     # central build() validation reject a diffusers/unsupported repo rather
     # than silently exporting a diffusion pipeline and ignoring the flag.
-    if args.model and not args.config and not args.text_only:
+    if args.model and not args.config and not args.text_only and not is_personaplex:
         pipeline_index = _load_diffusers_pipeline_index(args.model, revision=revision)
         if pipeline_index is not None:
             if input_sampling_rate is not None or bwe_sampling_rate is not None:
@@ -379,11 +388,36 @@ def _cmd_build(args: argparse.Namespace) -> None:
 
     # Build from HuggingFace model ID or local config
     if args.config:
-        import onnx_ir as ir
-        import transformers
-
         config_path = args.config
-        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+        from mobius.integrations._moshi import _is_personaplex_checkpoint
+
+        if _is_personaplex_checkpoint(config_path):
+            if static_cache_params is not None:
+                raise SystemExit(
+                    "Error: PersonaPlex does not support --features static-cache."
+                )
+            pkg = build(
+                config_path,
+                task=task,
+                dtype=dtype_override,
+                load_weights=load_weights,
+                revision=None,
+                trust_remote_code=trust_remote_code,
+                execution_provider=execution_provider,
+                text_only=args.text_only,
+                fp8_kv_cache=fp8_kv_cache,
+                kv_cache_scales=kv_cache_scales,
+                prune_prefill_prefix=prune_prefill_prefix,
+                glm_full_attention=args.glm_full_attention,
+                export_paged_attention=export_paged_attention,
+                keep_quantized=keep_quantized,
+                input_sampling_rate=input_sampling_rate,
+                bwe_sampling_rate=bwe_sampling_rate,
+            )
+            _save_package(pkg, output_dir, args, optimize, component_filter)
+            return
+
+        from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if _is_reuse_checkpoint(config_path):
             if task not in (None, "speech-enhancement"):
@@ -393,7 +427,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
                     raise SystemExit(
                         "Error: RE-USE checkpoints only support --task speech-enhancement."
                     )
-            pkg = build_reuse(
+            pkg = _build_reuse(
                 config_path,
                 dtype=dtype_override,
                 execution_provider=execution_provider,
@@ -403,6 +437,9 @@ def _cmd_build(args: argparse.Namespace) -> None:
             )
             _save_package(pkg, output_dir, args, optimize, component_filter)
             return
+        import onnx_ir as ir
+        import transformers
+
         if input_sampling_rate is not None or bwe_sampling_rate is not None:
             raise SystemExit(
                 "Error: --input-sample-rate and --bwe-sample-rate are only "
@@ -427,6 +464,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         parent_config = hf_config
         from mobius.integrations.transformers._builder import (
             _is_qwen4_exp_composite,
+            _reject_unsupported_affine_qwen4,
         )
 
         if _is_qwen4_exp_composite(parent_config):
@@ -442,7 +480,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
 
         compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
-        config = _config_from_hf(hf_config, parent_config=parent_config)
+        module_class = registry.get(model_type)
+        config = _config_from_hf(
+            hf_config,
+            parent_config=parent_config,
+            module_class=module_class,
+        )
         if dtype_override is not None:
             config = dataclasses.replace(config, dtype=dtype_override)
         elif compressed_tensors_config is not None and keep_quantized:
@@ -478,8 +521,12 @@ def _cmd_build(args: argparse.Namespace) -> None:
             task = _resolve_static_cache_task(model_type)
         elif task is None:
             task = _default_task_for_model(model_type)
-        module_class = registry.get(model_type)
         model_module = module_class(config)
+        attach_hf_component_sources(
+            model_module,
+            model_type=model_type,
+            hf_config=parent_config,
+        )
         pkg = build_from_module(
             model_module,
             config,
@@ -492,6 +539,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         for name, model in pkg.items():
             model.graph.name = f"{config_path}/{name}"
         if load_weights:
+            _reject_unsupported_affine_qwen4(model_type, config)
             if compressed_tensors_config is not None:
                 # Packed FP4 weights cannot pass through ordinary apply_weights.
                 # The same loader owns both faithful native storage and the
@@ -517,10 +565,25 @@ def _cmd_build(args: argparse.Namespace) -> None:
                 state_dict = _load_weights_from_dir(config_path)
                 if hasattr(model_module, "preprocess_weights"):
                     state_dict = model_module.preprocess_weights(state_dict)
+                from mobius._component_quantization import (
+                    preprocess_component_quantized_state_dict,
+                )
+
+                state_dict = preprocess_component_quantized_state_dict(
+                    state_dict,
+                    model_module,
+                    config,
+                    task,
+                    pkg.keys(),
+                )
                 pkg.apply_weights(state_dict)
     else:
         model_id_or_path = args.model
         if static_cache_params is not None:
+            if is_personaplex:
+                raise SystemExit(
+                    "Error: PersonaPlex does not support --features static-cache."
+                )
             # Detect model type to resolve the correct static cache task.
             import transformers
 
@@ -619,6 +682,8 @@ def _save_package(
         from mobius.integrations.onnx_genai import write_onnx_genai_config
         from mobius.integrations.onnx_genai.inference_metadata import (
             is_native_vlm_package,
+        )
+        from mobius.integrations.onnx_genai.workflow_metadata import (
             write_native_vlm_package_metadata,
         )
 

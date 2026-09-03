@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 
 from mobius._configs import (
     ArchitectureConfig,
     MoonshineConfig,
+    QuantizationConfig,
     WhisperConfig,
 )
 from mobius.integrations.transformers._config_resolver import (
@@ -46,6 +49,33 @@ def _fake_hf_config(model_type: str, **overrides):
     }
     defaults.update(overrides)
     return type("FakeHFConfig", (), defaults)()
+
+
+def test_component_overlay_does_not_reparse_deferred_block_quantization():
+    hf = _fake_hf_config(
+        "unregistered_block_model",
+        quantization_config={
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        },
+    )
+    resolved = ArchitectureConfig(block_quant_scheme=object())
+
+    with (
+        mock.patch.object(
+            ArchitectureConfig,
+            "from_transformers",
+            return_value=resolved,
+        ),
+        mock.patch.object(
+            QuantizationConfig,
+            "from_value",
+            side_effect=AssertionError("block quantization must stay deferred"),
+        ),
+    ):
+        result = _config_from_hf(hf)
+
+    assert result is resolved
 
 
 # ── Top 5 HF config formats ─────────────────────────────────────────────
@@ -428,6 +458,29 @@ class TestWhisperEncoderDecoder:
         result = _config_from_hf(hf)
         assert result.attn_qkv_bias is True
         assert result.attn_o_bias is True
+
+    def test_explicit_component_quantization_survives_custom_config_parser(self):
+        hf = self._whisper_hf_config(
+            component_quantization={
+                "encoder": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 32,
+                },
+                "decoder": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 16,
+                },
+            }
+        )
+
+        result = _config_from_hf(hf)
+
+        assert result.component_quantization is not None
+        assert result.component_quantization["encoder"].bits == 8
+        assert result.component_quantization["decoder"].bits == 4
+        assert result.quantization is result.component_quantization["decoder"]
 
     def test_whisper_tie_word_embeddings(self):
         hf = self._whisper_hf_config(tie_word_embeddings=True)

@@ -13,6 +13,10 @@ import onnx_ir as ir
 from onnxscript import nn
 
 from mobius._builder import build_from_module, resolve_dtype
+from mobius._component_quantization import (
+    attach_hf_component_sources,
+    preprocess_component_quantized_state_dict,
+)
 from mobius._model_package import ModelPackage
 from mobius._registry import registry
 from mobius.integrations._weight_loading import (
@@ -28,6 +32,40 @@ from mobius.tasks import ModelTask
 
 logger = logging.getLogger(__name__)
 
+_QWEN4_MODEL_TYPES = frozenset(
+    {
+        "qwen4_exp",
+        "qwen4_exp_text",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
+
+
+def _uses_affine_checkpoint_loader(config: object) -> bool:
+    """Whether config requires the generic Olive/GPTQ/AWQ packed loader."""
+    component_quantization = getattr(config, "component_quantization", None)
+    quantizations = (
+        component_quantization.values()
+        if component_quantization is not None
+        else (getattr(config, "quantization", None),)
+    )
+    return any(
+        quantization is not None and quantization.quant_method in {"olive", "gptq", "awq"}
+        for quantization in quantizations
+    )
+
+
+def _reject_unsupported_affine_qwen4(model_type: str, config: object) -> None:
+    """Fail before loading affine Qwen4 weights through the generic path."""
+    if model_type not in _QWEN4_MODEL_TYPES or not _uses_affine_checkpoint_loader(config):
+        return
+    raise NotImplementedError(
+        "Affine per-component Qwen4-Exp loading is blocked until its "
+        "packed expert, fused indexer, and split-embedding adapters "
+        "are implemented. Use the unquantized BF16 checkpoint or the "
+        "supported block-FP8/QDQ route."
+    )
+
 
 def _is_qwen4_exp_composite(config) -> bool:
     """Return whether *config* describes the multimodal Qwen4-Exp wrapper."""
@@ -36,7 +74,12 @@ def _is_qwen4_exp_composite(config) -> bool:
     )
 
 
-def _strip_to_text_only(config: Any, model_type: str) -> Any:
+def _strip_to_text_only(
+    config: Any,
+    model_type: str,
+    *,
+    decoder_source_paths: tuple[str, ...] = (),
+) -> Any:
     """Return a copy of *config* reduced to a pure text-only decoder."""
     if not dataclasses.is_dataclass(config):
         raise TypeError(
@@ -44,6 +87,17 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
         )
     field_names = {field.name for field in dataclasses.fields(config)}
     overrides: dict[str, Any] = {"model_type": model_type}
+    decoder_quantization = config.quantization_for("decoder")
+    if (
+        decoder_quantization is not None
+        and decoder_quantization.has_module_plan
+        and decoder_source_paths
+    ):
+        decoder_quantization = config.quantization_for_source_paths(
+            "decoder",
+            decoder_source_paths,
+        )
+    overrides["quantization"] = decoder_quantization
     for name in (
         "image_token_id",
         "video_token_id",
@@ -56,6 +110,7 @@ def _strip_to_text_only(config: Any, model_type: str) -> Any:
         "boa_token_id",
         "vision",
         "audio",
+        "component_quantization",
     ):
         if name in field_names:
             overrides[name] = None
@@ -204,6 +259,42 @@ def build_transformers_model(
     if input_sampling_rate is not None and bwe_sampling_rate is not None:
         raise ValueError("input_sampling_rate and bwe_sampling_rate are mutually exclusive")
 
+    from mobius.integrations._moshi import (
+        _build_personaplex,
+        _is_personaplex_checkpoint,
+        _personaplex_revision,
+    )
+
+    if _is_personaplex_checkpoint(model_id):
+        unsupported = {
+            "task": task is not None,
+            "module_class": module_class is not None,
+            "output_layer_indices": output_layer_indices is not None,
+            "trace_optimization": trace_optimization,
+            "dequantize": not keep_quantized,
+            "text_only": text_only,
+            "fp8_kv_cache": fp8_kv_cache,
+            "kv_cache_scales": kv_cache_scales is not None,
+            "prune_prefill_prefix": prune_prefill_prefix,
+            "glm_full_attention": glm_full_attention,
+            "export_paged_attention": export_paged_attention,
+            "input_sampling_rate": input_sampling_rate is not None,
+            "bwe_sampling_rate": bwe_sampling_rate is not None,
+        }
+        selected = sorted(name for name, enabled in unsupported.items() if enabled)
+        if selected:
+            raise ValueError(
+                "PersonaPlex checkpoints do not support these build options: "
+                + ", ".join(selected)
+            )
+        return _build_personaplex(
+            model_id,
+            dtype=dtype,
+            execution_provider=execution_provider,
+            revision=_personaplex_revision(model_id, revision),
+            load_weights=load_weights,
+        )
+
     from mobius.integrations.diffusers import build_diffusers_pipeline
     from mobius.integrations.transformers._config_resolver import (
         _config_from_hf,
@@ -225,7 +316,7 @@ def build_transformers_model(
         trust_remote_code=trust_remote_code,
     )
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
-        from mobius.models.reuse import _is_reuse_checkpoint, build_reuse
+        from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
         if module_class is None and _is_reuse_checkpoint(model_id, detection_revision):
             from mobius.tasks import SpeechEnhancementTask
@@ -249,7 +340,7 @@ def build_transformers_model(
                     "RE-USE checkpoints do not support these decoder-only options: "
                     + ", ".join(selected)
                 )
-            return build_reuse(
+            return _build_reuse(
                 model_id,
                 revision=detection_revision,
                 dtype=dtype,
@@ -292,6 +383,8 @@ def build_transformers_model(
     hf_config, parent_config, model_type = _select_primary_config(hf_config)
 
     compressed_tensors_config = CompressedTensorsConfig.from_hf_config(parent_config)
+    source_model_type = model_type
+    source_module_class = module_class
     if text_only:
         from mobius._registry import _TEXT_ONLY_MODEL_TYPE
 
@@ -302,6 +395,8 @@ def build_transformers_model(
                 "It is only available for multimodal checkpoints with a text-only "
                 f"registry sibling: {sorted(_TEXT_ONLY_MODEL_TYPE)}."
             )
+        if source_module_class is None and source_model_type in registry:
+            source_module_class = registry.get(source_model_type)
         model_type = text_type
 
     module_class, task, model_type = _resolve_module_class(
@@ -343,7 +438,27 @@ def build_transformers_model(
             )
 
     if text_only:
-        config = _strip_to_text_only(config, model_type)
+        decoder_source_paths: tuple[str, ...] = ()
+        if source_module_class is not None:
+            source_resolver = getattr(
+                source_module_class,
+                "get_hf_component_sources",
+                None,
+            )
+            source_map = (
+                source_resolver(
+                    model_type=source_model_type,
+                    hf_config=parent_config,
+                )
+                if source_resolver is not None
+                else getattr(source_module_class, "HF_COMPONENT_SOURCES", {})
+            )
+            decoder_source_paths = tuple(source_map.get("decoder", ()))
+        config = _strip_to_text_only(
+            config,
+            model_type,
+            decoder_source_paths=decoder_source_paths,
+        )
     if dtype is not None:
         config = dataclasses.replace(config, dtype=resolve_dtype(dtype))
     elif compressed_tensors_config is not None and keep_quantized:
@@ -386,6 +501,11 @@ def build_transformers_model(
         task = _default_task_for_model(model_type)
 
     model_module = module_class(config)
+    attach_hf_component_sources(
+        model_module,
+        model_type=model_type,
+        hf_config=parent_config,
+    )
     package = build_from_module(
         model_module,
         config,
@@ -398,10 +518,11 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        if model_type in _QWEN4_MODEL_TYPES:
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:
+        _reject_unsupported_affine_qwen4(model_type, config)
         if config.block_quant_scheme is not None and hasattr(
             model_module, "build_fp8_streaming_plan"
         ):
@@ -434,7 +555,7 @@ def build_transformers_model(
                     "native FP8 was not preserved. See weight-loading-report.json.",
                     model_id,
                 )
-        elif model_type in {"qwen4_exp", "qwen4_exp_text"}:
+        elif model_type in _QWEN4_MODEL_TYPES:
             from mobius.integrations.transformers._qwen4_exp_weights import (
                 stream_qwen4_exp_safetensors_to_package,
             )
@@ -459,6 +580,13 @@ def build_transformers_model(
             state_dict = _download_weights(model_id, revision=revision)
             if hasattr(model_module, "preprocess_weights"):
                 state_dict = model_module.preprocess_weights(state_dict)
+            state_dict = preprocess_component_quantized_state_dict(
+                state_dict,
+                model_module,
+                config,
+                task,
+                package.keys(),
+            )
             package.apply_weights(
                 state_dict,
                 prefix_map=getattr(model_module, "weight_prefix_map", None),

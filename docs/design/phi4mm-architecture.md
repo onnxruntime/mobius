@@ -464,7 +464,7 @@ HF: model.embed_tokens_extend.audio_embed.audio_projection.speech.0.weight
 
 **Weight Preprocessing**: Strips `.base_layer.` from LoRA keys, splits fused `qkv_proj`→q/k/v, splits fused `gate_up_proj`→gate/up, duplicates LoRA A weights, squeezes vision position embedding.
 
-**Tests**: Unit tests in `build_graph_test.py` (graph construction, LoRA initializers, alias resolution). Integration tests in `phi4mm_integration_test.py` for all 4 modality combinations (text-only, vision, audio, vision+audio) — marked `@pytest.mark.integration_slow`, numerical parity unverified.
+**Tests**: Unit tests in `tests/build_graph/vision_language_test.py` (graph construction and alias resolution) and `tests/build_graph/core_test.py` (LoRA initializers). Integration tests in `phi4mm_integration_test.py` for all 4 modality combinations (text-only, vision, audio, vision+audio) — marked `@pytest.mark.integration_slow`, numerical parity unverified.
 
 **Audio Infrastructure**: ConformerEncoder and related components in `components/_audio.py`. SpeechLanguageTask available for 3-model ASR split.
 

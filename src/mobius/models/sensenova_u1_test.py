@@ -635,7 +635,7 @@ class TestInferenceMetadataStatus:
         none, and a caller-supplied value is an override of that derivation, not
         a precondition for it.
         """
-        from mobius.integrations.onnx_genai.inference_metadata import (
+        from mobius.integrations.onnx_genai._workflow_contract import (
             published_value_references,
         )
         from mobius.integrations.onnx_genai.shared_state_flow_metadata import (

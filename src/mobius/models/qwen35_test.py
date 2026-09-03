@@ -21,10 +21,11 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius._configs import QuantizationConfig, VisionConfig
+from mobius._component_quantization import configure_component_quantization
+from mobius._configs import QuantizationConfig, QuantizationOverride, VisionConfig
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
-from mobius.components import QuantizedEmbedding
+from mobius.components import QuantizedEmbedding, QuantizedLinear
 from mobius.components._quantized_linear import TiedQuantizedLMHead
 from mobius.models.qwen35 import (
     Qwen35CausalLMModel,
@@ -926,6 +927,76 @@ class TestQwen35MixedPrecisionDecoder:
         assert tuple(layers[1].mlp.shared_expert_gate.weight.shape) == (1, _H)
         assert layers[1].mlp.shared_expert_gate.weight.dtype != ir.DataType.UINT8
         assert layers[1].self_attn.q_proj.weight.dtype == ir.DataType.UINT8
+
+    def test_component_retargeting_preserves_olive_float_subtrees(self):
+        quantization = _olive_quant()
+        config = dataclasses.replace(
+            _hybrid_moe_config(quantization),
+            component_quantization={"model": quantization},
+        )
+        model = Qwen35MoECausalLMModel(config)
+
+        configure_component_quantization(model, config, model.default_task)
+
+        linear_attn = model.model.layers[0].linear_attn
+        assert type(linear_attn.in_proj_qkv) is not QuantizedLinear
+        assert type(model.model.layers[1].mlp.shared_expert_gate) is not QuantizedLinear
+        assert isinstance(model.model.layers[1].self_attn.q_proj, QuantizedLinear)
+
+    def test_vl_decoder_override_uses_same_layout_for_graph_and_weights(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            overrides={"model.language_model": QuantizationOverride(bits=8, group_size=32)},
+        )
+        config = dataclasses.replace(
+            _moe_vl_config(quantization),
+            component_quantization={"decoder": quantization},
+        )
+        model = Qwen35VL3ModelCausalLMModel(config)
+        configure_component_quantization(model, config, model.default_task)
+        q_proj = model.decoder.model.layers[0].self_attn.q_proj
+
+        result = model.preprocess_weights(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight_qweight": torch.zeros(
+                    _H, _H, dtype=torch.uint8
+                ),
+                "model.language_model.layers.0.self_attn.q_proj.weight_scales": torch.ones(
+                    _H, 1
+                ),
+            }
+        )
+
+        assert isinstance(q_proj, QuantizedLinear)
+        assert (q_proj._bits, q_proj._block_size) == (8, 32)
+        assert result["decoder.model.layers.0.self_attn.q_proj.weight"].shape == (
+            _H,
+            1,
+            32,
+        )
+
+    def test_moe_vl_decoder_override_sizes_fused_qmoe_parameters(self):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            overrides={"model.language_model": QuantizationOverride(bits=4, group_size=32)},
+        )
+        config = dataclasses.replace(
+            _moe_vl_config(quantization),
+            moe_intermediate_size=32,
+            component_quantization={"decoder": quantization},
+        )
+
+        model = Qwen35MoEVL3ModelCausalLMModel(config)
+        block = model.decoder.model.layers[0].mlp
+
+        assert block._qmoe_quantization is not None
+        assert block._qmoe_quantization.group_size == 32
+        assert tuple(block.fc1_scales.shape) == (_E, 64, 1)
+        assert tuple(block.fc2_scales.shape) == (_E, _H, 1)
 
     def test_mixed_olive_state_dict_preprocesses_and_binds(self):
         """Post-#2630 Olive checkpoint (float deltanet + gate) binds cleanly."""

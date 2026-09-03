@@ -1,8 +1,11 @@
 # Model Catalog
 
-**mobius** supports 273 registered model types across 10 categories.
-This catalog lists every supported architecture with its module class, task type,
-and example HuggingFace model IDs.
+This user-facing catalog groups registered HuggingFace model types by task and lists
+their module classes and example model IDs. Diffusers pipeline components are described
+separately because they are not entries in the model registry. Neither list implies GGUF
+import or runtime support; see the generated
+[GGUF capability and evidence catalog](gguf-capability-catalog.md) for those
+capability-specific verdicts and statistics.
 
 > **Auto-fallback**: Models not explicitly registered but architecturally
 > compatible with Llama (standard CausalLM transformers) are automatically
@@ -278,18 +281,3 @@ Encoder GGUF imports for `bert` and `modern-bert` select
 `feature-extraction` and expose token-level `last_hidden_state` only. Pooling,
 classifier/reranker heads, generative task overrides, and cache options are
 rejected unless their exact output contracts are implemented.
-
-## Summary
-
-| Category | Count | Primary Classes |
-|---|---|---|
-| Decoder-only LLMs | ~100 | `CausalLMModel`, `GPT2CausalLMModel` |
-| Mixture of Experts | ~25 | `MoECausalLMModel`, `DeepSeekV3CausalLMModel` |
-| SSM / Hybrid | 5 | `MambaCausalLMModel`, `JambaCausalLMModel` |
-| Vision-Language | ~40 | `LLaVAModel`, `Qwen25VLCausalLMModel` |
-| Encoder-only | ~40 | `BertModel`, `DistilBertModel` |
-| Encoder-decoder | ~20 | `BartForConditionalGeneration`, `T5ForConditionalGeneration` |
-| Speech & Audio | ~20 | `WhisperForConditionalGeneration`, `Wav2Vec2Model` |
-| Vision | ~25 | `ViTModel`, `CLIPVisionModel` |
-| Diffusion | ~10 | `UNet2DConditionModel`, `FluxTransformer2DModel` |
-| **Total** | **~273** | |

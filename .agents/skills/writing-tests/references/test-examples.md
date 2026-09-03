@@ -52,7 +52,7 @@ class TestBuildGraphLoRA:
 
 ```python
 @pytest.mark.integration
-@pytest.mark.parametrize("model_id,trust_remote_code", _TEXT_MODELS)
+@pytest.mark.parametrize("model_id,trust_remote_code", TEXT_MODELS)
 class TestForwardNumerical:
     def test_prefill_logits_match(self, model_id, trust_remote_code):
         onnx_model = build(model_id, load_weights=True)
@@ -87,10 +87,10 @@ class TestGreedyGeneration:
 
 ### Adding a new model to integration tests
 
-Add a `pytest.param` to `_TEXT_MODELS`:
+Add a `pytest.param` to `TEXT_MODELS`:
 
 ```python
-_TEXT_MODELS = [
+TEXT_MODELS = [
     pytest.param("Qwen/Qwen2.5-0.5B", False, id="qwen2.5-0.5b"),
     pytest.param("my-org/my-small-model", False, id="my-model"),
     # ...
@@ -208,7 +208,7 @@ Golden files must be committed alongside new test case YAML files.
 **L1 — Graph builds:**
 1. Add `("my_model", {config_overrides}, True)` to the appropriate list in
    `tests/_test_configs.py` (or add a dedicated method if the model is a VLM/audio).
-2. Run `python -m pytest tests/build_graph_test.py -k "my_model"`.
+2. Run `python -m pytest tests/build_graph -k "my_model"`.
 
 **L2 — Config compatible:**
 1. Create `testdata/cases/<category>/my-model.yaml`.
@@ -220,8 +220,9 @@ Golden files must be committed alongside new test case YAML files.
 
 **L3 — Synthetic parity:**
 1. Add `pytest.param("org/my-model", False, id="my-model")` to the
-   appropriate parametrized list in `tests/integration_test.py`.
-2. Run `python -m pytest tests/integration_test.py -m integration -k "my-model"`.
+   appropriate focused integration suite (or `TEXT_MODELS` in
+   `tests/integration/_support.py` for a generic causal LM).
+2. Run `python -m pytest tests/integration -m integration -k "my-model"`.
 
 **L4 — Golden match:**
 1. Create/update `testdata/cases/<category>/my-model.yaml` with `level: "L4"`.

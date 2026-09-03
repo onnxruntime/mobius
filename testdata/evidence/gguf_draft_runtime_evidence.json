@@ -142,7 +142,7 @@
       },
       "independent_direct_ort_trace": {
         "filename": "gguf_dflash_independent_ort_trace.json",
-        "sha256": "d81f0d1ec7294289679a04d637c56a0c46cba0153e6e0aa6a2e079d3fb2a9519",
+        "sha256": "1062e5ed665aeafbcf0d0fb250f9b48c520091ebc4b2ad6b19dbd341518c481f",
         "mutation_discriminators": {
           "draft_mapping": "semantic.draft_mapping",
           "proposal_order": "semantic.proposal_order",
@@ -251,7 +251,7 @@
       },
       "independent_direct_ort_trace": {
         "filename": "gguf_eagle3_independent_ort_trace.json",
-        "sha256": "2f45ddddd60bbc480914b0a95c58291c209b39524517baa3f872d32df52e56c6",
+        "sha256": "9d6c6fdb630bc0a040eacc2a2357a2991609ea0d904ff16574a9b55f7d010d55",
         "mutation_discriminators": {
           "draft_mapping": "semantic.draft_mapping",
           "proposal_order": "semantic.proposal_order",

@@ -87,6 +87,33 @@ def test_jina_v3_route_fingerprint_retains_fused_qkv_semantics() -> None:
     assert fused != split
 
 
+def test_existing_routes_ignore_absent_component_quantization() -> None:
+    from mobius._configs import QuantizationConfig
+    from mobius._testing import make_config
+    from mobius.integrations.gguf._builder import _serialize_route_graph_config
+
+    config = make_config()
+    legacy = _serialize_route_graph_config(config, "llama")
+    component_quantization = {
+        "decoder": QuantizationConfig(
+            bits=4,
+            group_size=32,
+            quant_method="olive",
+        )
+    }
+    changed = _serialize_route_graph_config(
+        dataclasses.replace(
+            config,
+            component_quantization=component_quantization,
+        ),
+        "llama",
+    )
+
+    assert "component_quantization" not in json.loads(legacy)
+    assert json.loads(changed)["component_quantization"]["decoder"]["bits"] == 4
+    assert changed != legacy
+
+
 class TestReuseGgufWeights:
     """Tests for mixed GGUF references plus converted ONNX sidecar weights."""
 

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Independent quantization for multi-component packages
+
+#### Added
+
+- HuggingFace composite checkpoints can declare a `component_quantization`
+  mapping (or `quantization_config.components`) whose keys match
+  `ModelPackage` component names such as `decoder`, `encoder`,
+  `vision_encoder`, `audio_encoder`, and `embedding`. Nested
+  `vision_config.quantization_config` and `audio_config.quantization_config`
+  values are also recognized.
+- `build_from_module` now configures every component independently. Existing
+  quantized decoder modules are retargeted to the component's bit width and
+  group size, float encoder/vision/audio projections are converted to
+  `MatMulNBits`, quantized embeddings use `GatherBlockQuantized`, and components
+  omitted from the mapping remain floating point.
+- Olive mixed-precision component-wide `modules_to_not_convert` and `overrides`
+  are collapsed into component layouts. Partial module rules and genuinely
+  mixed layouts inside one ONNX component fail with an actionable error instead
+  of loading packed weights with the wrong configuration.
+
 ### Packed fused MoE experts (Olive/GPTQ/AWQ) survive HF weight renaming
 
 #### Fixed

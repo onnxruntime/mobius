@@ -773,7 +773,7 @@ _SSM_PARAMS: tuple[str, ...] = (
 )
 
 
-def build_reuse(
+def _build_reuse(
     model_id: str = "nvidia/RE-USE",
     *,
     revision: str | None = None,
@@ -787,8 +787,7 @@ def build_reuse(
 
     RE-USE is published with a bespoke ``config.json`` (no ``model_type``,
     no ``architectures``) and a ``PyTorchModelHubMixin`` checkpoint, so
-    :func:`mobius.build` — which goes through ``transformers.AutoConfig`` —
-    cannot discover it.  This function is the equivalent entry point.
+    :func:`mobius.build` detects this checkpoint shape and dispatches here.
 
     Args:
         model_id: Local directory or HuggingFace Hub repo holding
