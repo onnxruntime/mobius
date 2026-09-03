@@ -14,12 +14,10 @@ than a HuggingFace intermediate.
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import librosa
 import numpy as np
-import onnx_ir as ir
 import pytest
 import torch
 import transformers
@@ -38,7 +36,7 @@ from mobius.tasks import SpeechToTextTask
 
 _MODEL_ID = "moonshine-ai/moonshine-streaming-tiny"
 _REVISION = "f8e9dfd8c562c257c151a907b7b7f2fe8ff8511a"
-_AUDIO_PATH = Path(__file__).parent.parent / "testdata" / "652-129742-0006.flac"
+_AUDIO_PATH = Path(__file__).parent.parent.parent / "testdata" / "652-129742-0006.flac"
 _EOS_TOKEN_ID = 2
 
 pytestmark = pytest.mark.skipif(
@@ -875,30 +873,20 @@ class TestMoonshineStreamingRealWeightParity:
                 ),
             )
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = str(Path(directory) / "encoder.onnx")
-            ir.save(package["encoder"], path)
-            session = ort.InferenceSession(path, providers=["CUDAExecutionProvider"])
-            if session.get_providers()[0] != "CUDAExecutionProvider":
+        session = OnnxModelSession(package["encoder"], device="cuda")
+        try:
+            if session.providers[0] != "CUDAExecutionProvider":
                 pytest.skip("CUDAExecutionProvider could not initialize on this host")
-            outputs = dict(
-                zip(
-                    [output.name for output in session.get_outputs()],
-                    session.run(
-                        None,
-                        {
-                            "input_values": real_audio_inputs["input_values"].astype(
-                                np.float16
-                            ),
-                            "attention_mask": real_audio_inputs["attention_mask"].astype(
-                                np.int64
-                            ),
-                        },
-                    ),
-                )
+            outputs = session.run(
+                {
+                    "input_values": real_audio_inputs["input_values"].astype(np.float16),
+                    "attention_mask": real_audio_inputs["attention_mask"].astype(np.int64),
+                }
             )
             actual_hidden = outputs["encoder_hidden_states"]
             actual_mask = outputs["encoder_attention_mask"]
+        finally:
+            session.close()
 
         np.testing.assert_array_equal(
             actual_mask.astype(bool), expected.attention_mask.numpy()
