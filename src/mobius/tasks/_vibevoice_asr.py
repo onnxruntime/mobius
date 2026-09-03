@@ -19,7 +19,10 @@ from mobius._pipeline_contract import (
 )
 from mobius.tasks._base import ComponentSpec, ModelTask, _make_graph, _make_model
 from mobius.tasks._cache_utils import _make_kv_cache_inputs, _register_kv_cache_outputs
-from mobius.tasks._streaming_convolution import make_conv_cache_inputs, register_conv_cache_outputs
+from mobius.tasks._streaming_convolution import (
+    make_conv_cache_inputs,
+    register_conv_cache_outputs,
+)
 
 
 class VibeVoiceASRStreamingTask(ModelTask):

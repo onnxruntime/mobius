@@ -105,7 +105,7 @@ def _source_key_for_parameter(parameter_name: str) -> str:
         return "model.language_model.embed_tokens." + parameter_name.removeprefix(
             "embedding.embed_tokens."
         )
-    if parameter_name.startswith("decoder.layers.") or parameter_name.startswith("decoder.norm."):
+    if parameter_name.startswith(("decoder.layers.", "decoder.norm.")):
         return "model.language_model." + parameter_name.removeprefix("decoder.")
     if parameter_name == "decoder.lm_head.weight":
         return "lm_head.weight"
@@ -172,8 +172,7 @@ class TestVibeVoiceASR:
             if value.const_value is None
         }
         state_dict = {
-            _source_key_for_parameter(name): torch.zeros(1)
-            for name in parameter_names
+            _source_key_for_parameter(name): torch.zeros(1) for name in parameter_names
         }
         # The acoustic VAE decoder is present in the publication checkpoint but
         # is provably not on the executable ASR encode_speech path.
@@ -292,17 +291,21 @@ def test_vibevoice_asr_synthetic_two_chunk_prefill_and_cached_decode_parity():
         "tie_word_embeddings": False,
     }
     torch.manual_seed(7)
-    reference = modeling.VibeVoiceASRForConditionalGeneration(
-        configuration.VibeVoiceASRConfig(
-            acoustic_tokenizer_config={**source_tokenizer, "std_dist_type": "gaussian"},
-            semantic_tokenizer_config={
-                **source_tokenizer,
-                "vae_dim": 6,
-                "std_dist_type": "none",
-            },
-            decoder_config=decoder,
+    reference = (
+        modeling.VibeVoiceASRForConditionalGeneration(
+            configuration.VibeVoiceASRConfig(
+                acoustic_tokenizer_config={**source_tokenizer, "std_dist_type": "gaussian"},
+                semantic_tokenizer_config={
+                    **source_tokenizer,
+                    "vae_dim": 6,
+                    "std_dist_type": "none",
+                },
+                decoder_config=decoder,
+            )
         )
-    ).float().eval()
+        .float()
+        .eval()
+    )
 
     mobius_tokenizer = VibeVoiceTokenizerConfig(
         hidden_size=4,
@@ -367,11 +370,12 @@ def test_vibevoice_asr_synthetic_two_chunk_prefill_and_cached_decode_parity():
             use_cache=True,
             is_final_chunk=is_final_chunk,
         ).mean
-        acoustic_latents = acoustic_mean + sample_noise[:, None, None] * (0.5 / 0.8) * latent_noise
-        return (
-            reference.model.acoustic_connector(acoustic_latents)
-            + reference.model.semantic_connector(semantic_latents)
+        acoustic_latents = (
+            acoustic_mean + sample_noise[:, None, None] * (0.5 / 0.8) * latent_noise
         )
+        return reference.model.acoustic_connector(
+            acoustic_latents
+        ) + reference.model.semantic_connector(semantic_latents)
 
     with torch.no_grad():
         expected_audio = [
@@ -401,7 +405,9 @@ def test_vibevoice_asr_synthetic_two_chunk_prefill_and_cached_decode_parity():
             return_dict=True,
         )
 
-    def initial_cache(prefix: str, specs: tuple[tuple[int, int], ...]) -> dict[str, np.ndarray]:
+    def initial_cache(
+        prefix: str, specs: tuple[tuple[int, int], ...]
+    ) -> dict[str, np.ndarray]:
         return {
             f"{prefix}.{index}": np.zeros((2, channels, left_pad), dtype=np.float32)
             for index, (channels, left_pad) in enumerate(specs)
