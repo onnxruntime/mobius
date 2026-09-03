@@ -185,6 +185,8 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | Model Type | Module Class | Task | Example HuggingFace Model |
 |---|---|---|---|
 | `whisper` | `WhisperForConditionalGeneration` | `speech-to-text` | `openai/whisper-tiny` |
+| `moonshine` | `MoonshineForConditionalGeneration` | `speech-to-text` | `UsefulSensors/moonshine-tiny` |
+| `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
 | `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 | `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
 
