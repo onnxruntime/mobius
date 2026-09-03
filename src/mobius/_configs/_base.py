@@ -1620,6 +1620,7 @@ class ArchitectureConfig(BaseModelConfig):
                 "Invalid ArchitectureConfig:\n" + "\n".join(f"  - {e}" for e in errors)
             )
 
+
 def _as_attribute_config(value: object) -> object:
     """Recursively give a plain ``dict`` HF sub-config attribute access.
 
@@ -4690,6 +4691,7 @@ class MoonshineStreamingConfig(SpeechToTextConfig):
     encoder_frame_ms: float = 5.0
     #: Epsilon of the per-frame cepstral mean/variance normalisation.
     encoder_cmvn_eps: float = 1e-6
+
     def __post_init__(self):
         # A tuple keeps the config hashable and prevents accidental mutation of
         # the per-layer window schedule shared by every encoder layer.
