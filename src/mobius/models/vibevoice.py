@@ -3,11 +3,9 @@
 
 """VibeVoice text-to-speech stages for the Transformers-native HF checkpoint.
 
-The implementation mirrors ``VibeVoiceForConditionalGeneration`` as seven
-ONNX graphs: reference-audio encoder, acoustic projector, prompt embedding
-mixer, Qwen2 decoder, token-level diffusion head, streaming acoustic decoder,
-and streaming semantic encoder/projector. The host owns the deterministic
-DPM-Solver loop and the positive/negative decoder cache orchestration.
+The implementation mirrors ``VibeVoiceForConditionalGeneration`` as eight
+ONNX graphs. Host code owns the deterministic DPM-Solver loop and the
+positive/negative decoder-cache orchestration.
 """
 
 from __future__ import annotations
@@ -819,7 +817,43 @@ class VibeVoiceSemanticProjector(nn.Module):
 
 
 class VibeVoiceForConditionalGeneration(nn.Module):
-    """VibeVoice 1.5B continuous-token text-to-speech pipeline."""
+    """Eight-stage VibeVoice 1.5B continuous-token TTS pipeline.
+
+    ```{mermaid}
+    flowchart LR
+        Ref[Reference audio] --> AE[Audio encoder]
+        AE --> AP[Acoustic projector]
+        Text[Text tokens] --> Emb[Embedding mixer]
+        AP --> Emb
+        Emb --> Qwen[Qwen2 decoder]
+        Qwen --> Pos[Positive KV cache]
+        Qwen --> Neg[Negative CFG KV cache]
+        Pos --> Diff[DPM-Solver diffusion head]
+        Neg --> Diff
+        Diff --> Latent[64-D acoustic latent]
+        Latent --> AD[Streaming audio decoder]
+        AD --> Wave[3200-sample waveform chunk]
+        Wave --> SE[Semantic encoder]
+        SE --> SP[Semantic projector]
+        SP --> Qwen
+    ```
+
+    The exported package contains the audio encoder, acoustic projector,
+    embedding mixer, Qwen2 decoder, diffusion head, audio decoder, semantic
+    encoder, and semantic projector. For every generated audio token, the host
+    runs the positive and negative CFG decoder branches, samples one 64-D
+    acoustic latent with DPM-Solver, emits a 3200-sample waveform chunk, and
+    feeds its semantic embedding into the next decoder step.
+
+    The decoder owns dual Qwen KV caches. The streaming acoustic decoder and
+    semantic encoder each expose their convolution histories, for 34 explicit
+    cache slots per tokenizer stack. The negative CFG branch resets to a valid
+    suffix after audio BOS; because ``GroupQueryAttention`` only represents
+    prefix-valid lengths through ``seqlens_k``, this decoder declares an
+    arbitrary-mask contract and retains standard ONNX ``Attention``. The host,
+    rather than ONNX Runtime GenAI, owns this multi-stage orchestration; the
+    package is therefore exportable but not an OGA runnable model.
+    """
 
     default_task = "vibevoice-tts"
     category = "Audio"

@@ -87,11 +87,21 @@ def _class_description(cls: type) -> str:
     return doc
 
 
+def _class_details(cls: type) -> str:
+    """Extract all docstring content after the first paragraph."""
+    doc = inspect.getdoc(cls)
+    if not doc:
+        return ""
+    parts = doc.split("\n\n", maxsplit=1)
+    return parts[1] if len(parts) == 2 else ""
+
+
 def _generate_model_page(model_type: str, cls: type) -> str:
     """Generate a Markdown page for a single model type."""
     task = _get_task(cls)
     source = _source_file(cls)
     description = _class_description(cls)
+    details = _class_details(cls)
 
     lines = [
         f"# {model_type}",
@@ -112,6 +122,8 @@ def _generate_model_page(model_type: str, cls: type) -> str:
             description,
             "",
         ]
+    if details:
+        lines += [details, ""]
 
     lines += [
         "## Usage",

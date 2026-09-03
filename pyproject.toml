@@ -57,7 +57,7 @@ vibevoice = [
     "transformers @ git+https://github.com/huggingface/transformers.git@640a08a597034221ca1c4fc0c129cf0118179225",
 ]
 ort-genai = ["onnxruntime-genai", "Pillow"]
-docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton"]
+docs = ["furo", "myst-parser", "sphinx", "sphinx_copybutton", "sphinxcontrib-mermaid"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

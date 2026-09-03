@@ -19,7 +19,10 @@ from mobius._configs import (
     VibeVoiceTokenizerConfig,
 )
 from mobius._model_package import ModelPackage
-from mobius._pipeline_contract import optional_input_contract
+from mobius._pipeline_contract import (
+    optional_input_contract,
+    requires_arbitrary_attention_mask,
+)
 from mobius._registry import registry
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.models.vibevoice import (
@@ -485,6 +488,7 @@ class TestVibeVoiceGraphContracts:
             execution_provider="cuda",
         )
         decoder = package["decoder"]
+        assert requires_arbitrary_attention_mask(decoder.graph)
         assert "position_ids" in {value.name for value in decoder.graph.inputs}
         assert any(node.op_type == "Attention" for node in decoder.graph)
         assert not any(node.op_type == "GroupQueryAttention" for node in decoder.graph)
