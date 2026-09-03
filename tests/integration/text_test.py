@@ -217,6 +217,12 @@ def test_granite_swa_decode_step_logits_match():
         onnx_out_1 = session.run(
             _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
         )
+        for layer_idx, layer_type in enumerate(config.layer_types):
+            cached_key = onnx_out_1[f"present.{layer_idx}.key"]
+            expected_length = (
+                config.sliding_window - 1 if layer_type == "sliding_attention" else seq_len
+            )
+            assert cached_key.shape[2] == expected_length
         onnx_out_2 = session.run(
             _make_decode_feeds(
                 config,

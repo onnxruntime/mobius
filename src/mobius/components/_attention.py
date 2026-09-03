@@ -571,6 +571,12 @@ class SinkAttention(Attention):
         # Learnable sink logit: one scalar per attention head [num_heads].
         self.sinks = nn.Parameter([self.num_attention_heads])
 
+    def _cache_key_values(
+        self, op: OpBuilder, key: ir.Value, value: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        """Return the KV tensors exposed as the next decode-step cache."""
+        return key, value
+
     def _expand_kv_for_gqa(
         self,
         op: OpBuilder,
@@ -619,6 +625,11 @@ class SinkAttention(Attention):
                 "SinkAttention cannot emit GroupQueryAttention: the sink logit "
                 "must take part in the softmax denominator. Build this model "
                 "with a float additive attention bias instead."
+            )
+        if attention_bias is None:
+            raise ValueError(
+                "SinkAttention requires a float additive attention bias containing "
+                "the causal, padding, and optional sliding-window masks."
             )
         if static_cache is not None:
             raise NotImplementedError(
@@ -674,7 +685,7 @@ class SinkAttention(Attention):
         if past_key_value is not None:
             key = op.Concat(past_key_value[0], key, axis=2)  # [B, kv_heads, past+S, d]
             value = op.Concat(past_key_value[1], value, axis=2)  # [B, kv_heads, past+S, d]
-        present_key_value = (key, value)
+        present_key_value = self._cache_key_values(op, key, value)
 
         # Total KV sequence length (after cache concatenation)
         kv_len_1d = op.Shape(key, start=2, end=3)  # [S_kv]
@@ -697,6 +708,28 @@ class SinkAttention(Attention):
             # attention_bias: [B, 1, S_q, S_kv] — broadcasts over q_heads
             attn_scores = op.Add(attn_scores, attention_bias)
 
+        attn_out = self._sink_weighted_sum(
+            op, attn_scores, value_exp, batch_1d=batch_1d, seq_1d=seq_1d
+        )
+
+        # Transpose and flatten heads: [B, q_heads, S_q, d] → [B, S_q, q_heads*d]
+        attn_out = op.Transpose(attn_out, perm=[0, 2, 1, 3])  # [B, S_q, q_heads, d]
+        attn_out = op.Reshape(attn_out, [0, 0, -1])  # [B, S_q, q_heads * d]
+
+        # Output projection
+        attn_out = self.o_proj(op, attn_out)
+        return attn_out, present_key_value
+
+    def _sink_weighted_sum(
+        self,
+        op: OpBuilder,
+        attn_scores: ir.Value,
+        value_exp: ir.Value,
+        *,
+        batch_1d: ir.Value,
+        seq_1d: ir.Value,
+    ) -> ir.Value:
+        """Apply this attention implementation's sink softmax and value projection."""
         # Append the sink column: [q_heads] → [B, q_heads, S_q, 1]
         sinks_4d = op.Reshape(self.sinks, [1, self.num_attention_heads, 1, 1])
         expand_shape = op.Concat(
@@ -733,15 +766,7 @@ class SinkAttention(Attention):
             scores = op.Cast(scores, to=self._dtype)
 
         # Weighted sum with value: [B, q_heads, S_q, d]
-        attn_out = op.MatMul(scores, value_exp)
-
-        # Transpose and flatten heads: [B, q_heads, S_q, d] → [B, S_q, q_heads*d]
-        attn_out = op.Transpose(attn_out, perm=[0, 2, 1, 3])  # [B, S_q, q_heads, d]
-        attn_out = op.Reshape(attn_out, [0, 0, -1])  # [B, S_q, q_heads * d]
-
-        # Output projection
-        attn_out = self.o_proj(op, attn_out)
-        return attn_out, present_key_value
+        return op.MatMul(scores, value_exp)
 
 
 class Float32SinkAttention(SinkAttention):
@@ -767,7 +792,86 @@ class Float32SinkAttention(SinkAttention):
     For float32 builds this class emits exactly the same graph as
     :class:`SinkAttention` — the upcast would be a no-op, so no Cast is added.
     """
+
     upcast_sink_softmax: bool = True
+
+    def _sink_weighted_sum(
+        self,
+        op: OpBuilder,
+        attn_scores: ir.Value,
+        value_exp: ir.Value,
+        *,
+        batch_1d: ir.Value,
+        seq_1d: ir.Value,
+    ) -> ir.Value:
+        """Replicate GraniteSWA's separate compute-dtype LSE and fp32 softmax."""
+        del batch_1d, seq_1d
+        # Keep logsumexp in the attention compute dtype; upstream only upcasts
+        # its sink scale after subtracting the sink logit.
+        logsumexp = op.ReduceLogSumExp(attn_scores, [-1], keepdims=True)
+        sinks = op.Reshape(self.sinks, [1, self.num_attention_heads, 1, 1])
+        sink_scale = op.Sub(logsumexp, sinks)
+        if self._dtype != ir.DataType.FLOAT:
+            sink_scale = op.Cast(sink_scale, to=ir.DataType.FLOAT)
+        sink_scale = op.Sigmoid(sink_scale)  # (B, q_heads, S_q, 1)
+
+        # GraniteSWA evaluates the token softmax in fp32, then casts its
+        # probabilities back before the value MatMul and sink multiplication.
+        softmax_input = attn_scores
+        if self._dtype != ir.DataType.FLOAT:
+            softmax_input = op.Cast(softmax_input, to=ir.DataType.FLOAT)
+        probs = op.Softmax(softmax_input, axis=-1)
+        if self._dtype != ir.DataType.FLOAT:
+            probs = op.Cast(probs, to=self._dtype)
+        attn_out = op.MatMul(probs, value_exp)  # (B, q_heads, S_q, head_dim)
+        if self._dtype != ir.DataType.FLOAT:
+            sink_scale = op.Cast(sink_scale, to=self._dtype)
+        return op.Mul(attn_out, sink_scale)
+
+
+class SlidingWindowSinkAttention(SinkAttention):
+    """Sink attention that retains only the prior local-window KV entries.
+
+    The cache contains ``sliding_window - 1`` tokens because the next query
+    contributes its own key/value. Callers must supply a matching float bias
+    whose key axis contains that retained cache plus the current query chunk.
+    """
+
+    def __init__(
+        self,
+        config: ArchitectureConfig,
+        rms_norm_class: type[nn.Module] | None = None,
+        scale: float | None = None,
+        linear_class: type | None = None,
+    ):
+        super().__init__(
+            config,
+            rms_norm_class=rms_norm_class,
+            scale=scale,
+            linear_class=linear_class,
+        )
+        window = config.sliding_window
+        if window is None or window <= 1:
+            raise ValueError(
+                "SlidingWindowSinkAttention requires config.sliding_window to be at least 2."
+            )
+        self._cache_length = window - 1
+
+    def _cache_key_values(
+        self, op: OpBuilder, key: ir.Value, value: ir.Value
+    ) -> tuple[ir.Value, ir.Value]:
+        # Preserve only the tokens that can participate with the following
+        # query, matching Transformers' DynamicSlidingWindowLayer contract.
+        starts = [-self._cache_length]
+        ends = [2**63 - 1]
+        return (
+            op.Slice(key, starts, ends, [2]),
+            op.Slice(value, starts, ends, [2]),
+        )
+
+
+class Float32SlidingWindowSinkAttention(SlidingWindowSinkAttention, Float32SinkAttention):
+    """Sliding-window sink attention with GraniteSWA's fp32 softmax contract."""
 
 
 class FusedQKVAttention(Attention):

@@ -32,14 +32,14 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig, GraniteSwaConfig
 from mobius.components import (
-    Embedding,
     Float32SinkAttention,
+    Float32SlidingWindowSinkAttention,
     RMSNorm,
     create_attention_bias,
     create_decoder_layer,
     initialize_rope,
 )
-from mobius.models.base import CausalLMModel
+from mobius.models.base import CausalLMModel, embedding_for_config, linear_class_for_config
 
 if TYPE_CHECKING:
     import onnx_ir as ir
@@ -86,15 +86,22 @@ class GraniteSwaTextModel(nn.Module):
         self._sliding_window = config.sliding_window
         self.embedding_multiplier = config.embedding_multiplier
 
-        self.embed_tokens = Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
-        )
+        self.embed_tokens = embedding_for_config(config)
+        linear_class = linear_class_for_config(config)
         self.layers = nn.ModuleList(
             [
                 # Float32SinkAttention, not SinkAttention: GraniteSWA's eager
                 # kernel forces the sink scaling and the softmax to float32.
-                create_decoder_layer(config, attention_class=Float32SinkAttention)
-                for _ in range(config.num_hidden_layers)
+                create_decoder_layer(
+                    config,
+                    attention_class=(
+                        Float32SlidingWindowSinkAttention
+                        if layer_type == "sliding_attention"
+                        else Float32SinkAttention
+                    ),
+                    linear_class=linear_class,
+                )
+                for layer_type in self._layer_types
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -143,10 +150,19 @@ class GraniteSwaTextModel(nn.Module):
         )  # (B, 1, S_q, S_kv)
         sliding_attention_bias = full_attention_bias
         if self._sliding_window and "sliding_attention" in self._layer_types:
+            # Sliding layers retain only ``window - 1`` past entries. Trim the
+            # input mask to that cache plus the current query chunk so the
+            # additive-bias key axis exactly matches their local KV tensor.
+            query_len = op.Shape(mask_source, start=1, end=2)
+            local_length = op.Add(query_len, self._sliding_window - 1)
+            mask_length = op.Shape(attention_mask, start=1, end=2)
+            local_attention_mask = op.Slice(
+                attention_mask, op.Neg(local_length), mask_length, [1]
+            )
             sliding_attention_bias = create_attention_bias(
                 op,
                 input_ids=mask_source,
-                attention_mask=attention_mask,
+                attention_mask=local_attention_mask,
                 sliding_window=self._sliding_window,
                 dtype=self._dtype,
             )  # (B, 1, S_q, S_kv)
@@ -198,17 +214,7 @@ class GraniteSwaCausalLMModel(CausalLMModel):
 
     def __init__(self, config: ArchitectureConfig):
         super().__init__(config)
-        self.model = GraniteSwaTextModel(config)
-        # ``CausalLMModel.__init__`` tied ``lm_head.weight`` to the *base*
-        # ``TextModel``'s embedding table, which the assignment above just
-        # replaced.  Re-tie against the real backbone so the graph keeps a
-        # single shared initializer instead of two identical copies.
-        quantization = getattr(config, "quantization", None)
-        embed_quantized = quantization is not None and getattr(
-            quantization, "quantize_embeddings", False
-        )
-        if config.tie_word_embeddings and not embed_quantized:
-            self.lm_head.weight = self.model.embed_tokens.weight
+        self._replace_text_model(GraniteSwaTextModel(config))
         self.logits_scaling = config.logits_scaling
 
     def forward(
@@ -219,9 +225,8 @@ class GraniteSwaCausalLMModel(CausalLMModel):
         position_ids: ir.Value,
         past_key_values: list | None = None,
     ):
-        logits, present_key_values = super().forward(
+        logits, *rest = super().forward(
             op, input_ids, attention_mask, position_ids, past_key_values
         )
-        # Granite logits scaling
-        logits = op.Div(logits, self.logits_scaling)
-        return logits, present_key_values
+        # Granite logits scaling while preserving optional hidden-state outputs.
+        return op.Div(logits, self.logits_scaling), *rest

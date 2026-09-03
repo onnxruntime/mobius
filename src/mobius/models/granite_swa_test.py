@@ -19,11 +19,17 @@ import onnx_ir as ir
 import pytest
 import torch
 
-from mobius._configs import ArchitectureConfig, GraniteSwaConfig
+from mobius._configs import ArchitectureConfig, GraniteSwaConfig, QuantizationConfig
 from mobius._registry import registry
 from mobius._testing import count_op_type, create_test_builder, create_test_input
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.components import Float32SinkAttention, SinkAttention
+from mobius.components import (
+    Float32SinkAttention,
+    Float32SlidingWindowSinkAttention,
+    QuantizedEmbedding,
+    SinkAttention,
+    TiedQuantizedLMHead,
+)
 from mobius.components._attention import GQAContext
 from mobius.models.granite_swa import (
     GraniteSwaCausalLMModel,
@@ -249,6 +255,36 @@ class TestModuleStructure:
             assert layer.self_attn.upcast_sink_softmax is True
             assert layer.self_attn.scaling == pytest.approx(config.attention_multiplier)
 
+    def test_sliding_layers_retain_only_the_next_step_window(self):
+        config = _tiny_config()
+        module = GraniteSwaCausalLMModel(config)
+
+        for layer_type, layer in zip(config.layer_types, module.model.layers):
+            if layer_type == "sliding_attention":
+                assert isinstance(layer.self_attn, Float32SlidingWindowSinkAttention)
+                assert layer.self_attn._cache_length == config.sliding_window - 1
+            else:
+                assert isinstance(layer.self_attn, Float32SinkAttention)
+                assert not isinstance(layer.self_attn, Float32SlidingWindowSinkAttention)
+
+    def test_quantized_backbone_uses_quantized_projections_and_tied_table(self):
+        config = _tiny_config(
+            quantization=QuantizationConfig(
+                bits=4,
+                group_size=16,
+                quant_method="olive",
+                quantize_embeddings=True,
+                quantize_lm_head=True,
+                tie_word_embeddings=True,
+            )
+        )
+        module = GraniteSwaCausalLMModel(config)
+
+        assert isinstance(module.model.embed_tokens, QuantizedEmbedding)
+        assert isinstance(module.lm_head, TiedQuantizedLMHead)
+        graph = get_task("text-generation").build(module, config)["model"].graph
+        assert count_op_type(graph, "MatMulNBits") > 0
+
     def test_nope_layer_skips_rotary_embedding(self):
         """Three RoPE layers, two RotaryEmbedding nodes each (q, k) = 6, not 8."""
         config = _tiny_config()
@@ -299,6 +335,14 @@ class TestSinkAttention:
         with pytest.raises(TypeError, match="cannot emit GroupQueryAttention"):
             attn(op, hidden, attention_bias=ctx)
 
+    def test_rejects_missing_float_attention_bias(self):
+        config = _tiny_config()
+        attn = SinkAttention(config)
+        builder, op, _ = create_test_builder()
+        hidden = create_test_input(builder, "hidden", [1, 4, config.hidden_size])
+        with pytest.raises(ValueError, match="requires a float additive attention bias"):
+            attn(op, hidden, attention_bias=None)
+
     def test_rejects_softcapping(self):
         @dataclasses.dataclass
         class _SoftcappedConfig(GraniteSwaConfig):
@@ -325,11 +369,9 @@ class TestSinkAttention:
     def test_reduced_precision_upcasts_the_sink_softmax(self, dtype):
         """Mirror upstream's forced-fp32 sink softmax for f16/bf16 builds.
 
-        HuggingFace computes ``logsumexp``/``sigmoid`` and the softmax in
-        float32 regardless of the compute dtype. The equivalent here is to
-        upcast the extended (scores + sink) logits before the softmax and cast
-        the probabilities back, which shows up as two extra Cast nodes per
-        layer around the Softmax.
+        HuggingFace computes logsumexp in the compute dtype, then upcasts the
+        sink scale and token softmax independently. Keeping these paths
+        separate preserves its f16/bf16 rounding behavior.
         """
         config = _tiny_config(dtype=dtype)
         module = GraniteSwaCausalLMModel(config)
@@ -337,17 +379,15 @@ class TestSinkAttention:
 
         softmax_nodes = [node for node in graph if node.op_type == "Softmax"]
         assert len(softmax_nodes) == config.num_hidden_layers
+        assert count_op_type(graph, "ReduceLogSumExp") == config.num_hidden_layers
+        assert count_op_type(graph, "Sigmoid") == config.num_hidden_layers
         for softmax in softmax_nodes:
-            # Softmax <- Sub(row-max stabilise) <- Cast(to float32)
-            stabilise = softmax.inputs[0].producer()
-            assert stabilise is not None and stabilise.op_type == "Sub"
-            upcast = stabilise.inputs[0].producer()
+            # Token scores are directly upcast to float32 for Softmax.
+            upcast = softmax.inputs[0].producer()
             assert upcast is not None and upcast.op_type == "Cast"
             assert upcast.attributes["to"].as_int() == ir.DataType.FLOAT
-            # Softmax -> Slice(drop sink column) -> Cast(back to compute dtype)
-            (consumer, _), *_ = softmax.outputs[0].uses()
-            assert consumer.op_type == "Slice"
-            (downcast, _), *_ = consumer.outputs[0].uses()
+            # The fp32 probabilities are downcast before the value MatMul.
+            (downcast, _), *_ = softmax.outputs[0].uses()
             assert downcast.op_type == "Cast"
             assert downcast.attributes["to"].as_int() == dtype
 
@@ -359,15 +399,10 @@ class TestSinkAttention:
 
         softmax_nodes = [node for node in graph if node.op_type == "Softmax"]
         assert len(softmax_nodes) == config.num_hidden_layers
+        assert count_op_type(graph, "ReduceLogSumExp") == config.num_hidden_layers
         for softmax in softmax_nodes:
-            stabilise = softmax.inputs[0].producer()
-            assert stabilise is not None and stabilise.op_type == "Sub"
-            # The stabilised logits come straight from the sink Concat.
-            producer = stabilise.inputs[0].producer()
-            assert producer is not None and producer.op_type == "Concat"
-            (consumer, _), *_ = softmax.outputs[0].uses()
-            assert consumer.op_type == "Slice"
-            assert all(use[0].op_type != "Cast" for use in consumer.outputs[0].uses())
+            assert softmax.inputs[0].producer().op_type != "Cast"
+            assert all(use[0].op_type != "Cast" for use in softmax.outputs[0].uses())
 
     def test_matches_the_logsumexp_sigmoid_reference(self):
         """Run one SinkAttention layer in ORT against the upstream formula.

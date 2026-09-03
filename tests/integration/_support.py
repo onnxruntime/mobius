@@ -114,9 +114,7 @@ TEXT_MODELS = [
 ]
 
 
-def _get_config(
-    model_id: str, trust_remote_code: bool = False, revision: str | None = None
-):
+def _get_config(model_id: str, trust_remote_code: bool = False, revision: str | None = None):
     """Load ArchitectureConfig for a model from HuggingFace."""
     hf_config = transformers.AutoConfig.from_pretrained(
         model_id, trust_remote_code=trust_remote_code, revision=revision

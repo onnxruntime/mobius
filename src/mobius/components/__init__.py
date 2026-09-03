@@ -42,6 +42,7 @@ __all__ = [
     "EncoderLayer",
     "FCMLP",
     "Float32SinkAttention",
+    "Float32SlidingWindowSinkAttention",
     "FusedGateUpMLP",
     "GatedDeltaNet",
     "GatedMLP",
@@ -125,6 +126,7 @@ __all__ = [
     "Siglip2NaFlexVisionModel",
     "SigmoidTopKGate",
     "SinkAttention",
+    "SlidingWindowSinkAttention",
     "SnakeBeta",
     "SoftmaxTopKGate",
     "SparseMixerGate",
@@ -169,10 +171,12 @@ __all__ = [
 from mobius.components._activations import SiLU, get_activation
 from mobius.components._attention import (
     Attention,
-    FusedQKVAttention,
     Float32SinkAttention,
+    Float32SlidingWindowSinkAttention,
+    FusedQKVAttention,
     GQAContext,
     SinkAttention,
+    SlidingWindowSinkAttention,
     StaticCacheState,
 )
 from mobius.components._attention import (

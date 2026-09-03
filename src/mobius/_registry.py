@@ -601,7 +601,6 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "gptj": ModelRegistration(GPTJCausalLMModel),
     "granite": ModelRegistration(GraniteCausalLMModel),
     "granite_swa": ModelRegistration(GraniteSwaCausalLMModel, config_class=GraniteSwaConfig),
-    "granite_swa": ModelRegistration(GraniteSwaCausalLMModel, config_class=GraniteSwaConfig),
     "hunyuan_v1_dense": ModelRegistration(HunYuanV1DenseCausalLMModel),
     "hy_v3": ModelRegistration(
         HyV3CausalLMModel,
@@ -1221,7 +1220,6 @@ _TEST_MODEL_IDS: dict[str, str] = {
     "gemma3n_text": "google/gemma-3n-E2B-it",
     "gemma4_text": "google/gemma-4-E2B-it",
     "granite": "ibm-granite/granite-3.3-2b-instruct",
-    "granite_swa": "ibm-granite/granite-swash-2b",
     "granite_swa": "ibm-granite/granite-swash-2b",
     "internlm2": "internlm/internlm2_5-7b-chat",
     "llama_embed_gguf": "mradermacher/llama-embed-nemotron-8b-GGUF",
