@@ -79,7 +79,7 @@ def _source_classes():
     # Neither compatibility shim participates in neural execution.
     original_register = AutoModel.register
 
-    def register_with_existing_mapping(cls, config_class, model_class, exist_ok=False):
+    def register_with_existing_mapping(_cls, config_class, model_class, _exist_ok=False):
         return original_register(config_class, model_class, exist_ok=True)
 
     module_name = "transformers.models.qwen2.tokenization_qwen2_fast"

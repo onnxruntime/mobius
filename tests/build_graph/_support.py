@@ -220,6 +220,8 @@ _SPECIALIZED_TEST_MODEL_TYPES: set[str] = {
     "qwen3_forced_aligner",
     "qwen3_tts",
     "qwen3_tts_tokenizer_12hz",
+    # Realtime's source-parity tests cover this architecture-discriminating alias.
+    "VibeVoiceStreamingForConditionalGenerationInference",
     "whisper",
     # SSM dedicated tests
     "falcon_mamba",

@@ -180,9 +180,9 @@ class VibeVoiceStreamingTask(ModelTask):
             inputs_embeds,
             attention_mask,
             position_ids,
-            lm_last_hidden_state,
-            tts_text_masks,
             past,
+            lm_last_hidden_state=lm_last_hidden_state,
+            tts_text_masks=tts_text_masks,
         )
         builder.add_output(eos_logits, "eos_logits")
         builder.add_output(hidden_states, "last_hidden_state")

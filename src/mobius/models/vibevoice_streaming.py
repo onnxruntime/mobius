@@ -31,9 +31,7 @@ from mobius.models.vibevoice import VibeVoiceDiffusionHead, VibeVoiceTokenizerDe
 
 VIBEVOICE_STREAMING_MODEL_ID = "microsoft/VibeVoice-Realtime-0.5B"
 VIBEVOICE_STREAMING_REVISION = "6bce5f06044837fe6d2c5d7a71a84f0416bd57e4"
-VIBEVOICE_STREAMING_MICROSOFT_PROVENANCE_REVISION = (
-    "79e516a3e20b599f137c9da03410a2a0b473b63b"
-)
+VIBEVOICE_STREAMING_MICROSOFT_PROVENANCE_REVISION = "79e516a3e20b599f137c9da03410a2a0b473b63b"
 
 
 class VibeVoiceStreamingEmbedding(nn.Module):
@@ -123,31 +121,36 @@ class VibeVoiceStreamingTTSBackbone(_VibeVoiceStreamingBackbone):
         inputs_embeds: ir.Value,
         attention_mask: ir.Value,
         position_ids: ir.Value,
-        lm_last_hidden_state: ir.Value,
-        tts_text_masks: ir.Value,
         past_key_values: Sequence[tuple[ir.Value, ir.Value]],
+        lm_last_hidden_state: ir.Value | None = None,
+        tts_text_masks: ir.Value | None = None,
     ):
-        # Replace only the current tail: lower-LM text states or acoustic
-        # connector outputs occupy these slots; preceding pseudo tokens are retained.
-        prefix_length = op.Sub(
-            op.Shape(inputs_embeds, start=1, end=2),
-            op.Shape(lm_last_hidden_state, start=1, end=2),
-        )
-        prefix = op.Slice(
-            inputs_embeds,
-            op.Constant(value_ints=[0]),
-            prefix_length,
-            op.Constant(value_ints=[1]),
-        )
-        inputs_embeds = op.Concat(prefix, lm_last_hidden_state, axis=1)
-        # Materialize the source's [B, 1, H] broadcast to [B, S, H]. This is
-        # mathematically identical, but prevents ORT's skip-RMSNorm fusion from
-        # receiving residual inputs with mismatched trailing dimensions.
-        input_types = op.Expand(
-            self.tts_input_types(op, op.Cast(tts_text_masks, to=ir.DataType.INT64)),
-            op.Shape(inputs_embeds),
-        )
-        inputs_embeds = op.Add(inputs_embeds, input_types)
+        if (lm_last_hidden_state is None) != (tts_text_masks is None):
+            raise ValueError(
+                "lm_last_hidden_state and tts_text_masks must be provided together"
+            )
+        if lm_last_hidden_state is not None:
+            # Replace only the current tail: lower-LM text states or acoustic
+            # connector outputs occupy these slots; preceding pseudo tokens are retained.
+            prefix_length = op.Sub(
+                op.Shape(inputs_embeds, start=1, end=2),
+                op.Shape(lm_last_hidden_state, start=1, end=2),
+            )
+            prefix = op.Slice(
+                inputs_embeds,
+                op.Constant(value_ints=[0]),
+                prefix_length,
+                op.Constant(value_ints=[1]),
+            )
+            inputs_embeds = op.Concat(prefix, lm_last_hidden_state, axis=1)
+            # Materialize the source's [B, 1, H] broadcast to [B, S, H]. This is
+            # mathematically identical, but prevents ORT's skip-RMSNorm fusion from
+            # receiving residual inputs with mismatched trailing dimensions.
+            input_types = op.Expand(
+                self.tts_input_types(op, op.Cast(tts_text_masks, to=ir.DataType.INT64)),
+                op.Shape(inputs_embeds),
+            )
+            inputs_embeds = op.Add(inputs_embeds, input_types)
         hidden_states, present_key_values = super().forward(
             op,
             inputs_embeds,
@@ -340,9 +343,13 @@ class VibeVoiceStreamingForConditionalGeneration(nn.Module):
             elif source_name.startswith("model.language_model.layers."):
                 target = "lm_backbone." + source_name.removeprefix("model.language_model.")
             elif source_name.startswith("model.tts_language_model.layers."):
-                target = "tts_backbone." + source_name.removeprefix("model.tts_language_model.")
+                target = "tts_backbone." + source_name.removeprefix(
+                    "model.tts_language_model."
+                )
             elif source_name.startswith("model.tts_language_model.norm."):
-                target = "tts_backbone." + source_name.removeprefix("model.tts_language_model.")
+                target = "tts_backbone." + source_name.removeprefix(
+                    "model.tts_language_model."
+                )
             elif source_name.startswith("model.tts_input_types."):
                 target = "tts_backbone." + source_name.removeprefix("model.")
             elif source_name.startswith("tts_eos_classifier."):
