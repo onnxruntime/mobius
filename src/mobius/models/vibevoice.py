@@ -442,13 +442,22 @@ class _DecoderLayer(nn.Module):
 class VibeVoiceTokenizerDecoder(nn.Module):
     """Streaming continuous-latent decoder producing 3200 waveform samples per frame."""
 
-    def __init__(self, encoder_config: VibeVoiceTokenizerConfig):
+    def __init__(
+        self,
+        encoder_config: VibeVoiceTokenizerConfig,
+        *,
+        reverse_ratios: bool = True,
+    ):
         super().__init__()
         config = VibeVoiceTokenizerConfig(
             **{
                 **encoder_config.__dict__,
                 "depths": list(reversed(encoder_config.depths)),
-                "downsampling_ratios": list(reversed(encoder_config.downsampling_ratios)),
+                "downsampling_ratios": (
+                    list(reversed(encoder_config.downsampling_ratios))
+                    if reverse_ratios
+                    else list(encoder_config.downsampling_ratios)
+                ),
             }
         )
         allocator = _CacheAllocator()

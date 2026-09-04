@@ -211,6 +211,29 @@ def _register_kv_cache_outputs(
         builder.add_output(present_value, f"{prefix}.{i}.value")
 
 
+def _make_conv_cache_inputs(
+    builder: GraphBuilder,
+    specs: tuple[tuple[int, int], ...],
+    batch: ir.SymbolicDim,
+    dtype: ir.DataType,
+) -> list[ir.Value]:
+    """Create explicit causal-convolution history inputs for streaming audio graphs."""
+    return [
+        builder.input(
+            f"past_conv.{index}",
+            dtype=dtype,
+            shape=[batch, channels, left_pad],
+        )
+        for index, (channels, left_pad) in enumerate(specs)
+    ]
+
+
+def _register_conv_cache_outputs(builder: GraphBuilder, values: list[ir.Value]) -> None:
+    """Register causal-convolution histories for the next streaming audio call."""
+    for index, value in enumerate(values):
+        builder.add_output(value, f"present_conv.{index}")
+
+
 def _make_hybrid_cache_inputs(
     builder: GraphBuilder,
     config: BaseModelConfig,

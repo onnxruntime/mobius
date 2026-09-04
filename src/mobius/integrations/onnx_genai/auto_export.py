@@ -957,6 +957,14 @@ def write_onnx_genai_config(
         for candidate in (package_config, config)
         if candidate is not None
     }
+    if "vibevoice_streaming" in config_types:
+        warning = (
+            "VibeVoice Realtime requires host-owned text windowing, positive/negative "
+            "KV caches, DPM-Solver sampling, and prefilled voice-prompt caches. The "
+            "component contracts are exported as advisory metadata; no onnx-genai "
+            "runtime configuration is claimed."
+        )
+        return _write_advisory_component_contract(pkg, output_dir, warning=warning)
     decoder = pkg.get("decoder") or pkg.get("model")
     decoder_inputs = (
         {value.name for value in decoder.graph.inputs} if decoder is not None else set()
