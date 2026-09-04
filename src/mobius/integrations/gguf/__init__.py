@@ -22,8 +22,8 @@ Usage::
     # Multimodal (text + companion mmproj vision/audio encoder)
     pkg = build_from_gguf("path/to/model.gguf", mmproj="path/to/mmproj.gguf")
 
-    # Runtime packaging is fail-closed and available only for an exact artifact,
-    # import route, runtime version, and pinned tokenizer evidence record.
+    # Exact evidence emits a validated runtime package. Downstream runtime
+    # limitations preserve an accurate model package marked runtime-unvalidated.
 
 :func:`build_from_gguf` is the single entry point; passing ``mmproj`` delegates
 to the matching architecture-specific multimodal builder.
@@ -39,9 +39,20 @@ from mobius.integrations.gguf._config_mapping import (
     GgufArchResolutionError,
     resolve_model_type,
 )
+from mobius.integrations.gguf._draft_pair import (
+    build_draft_pair_from_gguf,
+    write_draft_pair_package,
+)
+from mobius.integrations.gguf._draft_runtime import (
+    DraftGenerationResult,
+    DraftGenerationStats,
+    DraftPairRunner,
+)
 from mobius.integrations.gguf._mmproj import (
+    build_audio_projector_from_gguf,
     build_gemma3_vlm_from_gguf,
     build_gemma4_vlm_from_gguf,
+    build_mmproj_from_gguf,
     build_qwen_vlm_from_gguf,
 )
 from mobius.integrations.gguf._preflight import (
@@ -81,8 +92,15 @@ from mobius.integrations.gguf._tokenizer_census import (
 
 __all__ = [
     "build_from_gguf",
+    "build_audio_projector_from_gguf",
+    "build_draft_pair_from_gguf",
+    "write_draft_pair_package",
+    "DraftGenerationResult",
+    "DraftGenerationStats",
+    "DraftPairRunner",
     "build_gemma3_vlm_from_gguf",
     "build_gemma4_vlm_from_gguf",
+    "build_mmproj_from_gguf",
     "build_qwen_vlm_from_gguf",
     "GGUFTokenizerAsset",
     "GGUFTokenizerRouteAudit",

@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Generate the authoritative GGUF support census in the API documentation."""
+"""Generate the authoritative GGUF capability and evidence catalog."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ __all__ = [
     "update_document",
 ]
 
+import json
 import re
 from collections import Counter
 from pathlib import Path
@@ -21,10 +22,19 @@ from mobius.integrations.gguf._arch_registry import (
     _RUNTIME_VALIDATION_PENDING,
     iter_arch_specs,
 )
+from mobius.integrations.gguf._artifact_blocker_evidence import (
+    iter_artifact_blocker_evidence,
+)
+from mobius.integrations.gguf._draft import has_direct_draft_runtime
 from mobius.integrations.gguf._mmproj_registry import (
+    LLAMA_CPP_MMPROJ_SHA,
     MMPROJ_ARTIFACT_AVAILABILITY_PINS,
     MMPROJ_ARTIFACT_PINS,
+    iter_projector_source_evidence,
     iter_projector_specs,
+)
+from mobius.integrations.gguf._mtp_runtime_evidence import (
+    iter_mtp_runtime_evidence,
 )
 from mobius.integrations.gguf._quant_registry import (
     iter_quant_specs,
@@ -52,7 +62,11 @@ from mobius.integrations.gguf._upstream import (
     upstream_architectures,
 )
 
-DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "api" / "build_from_gguf.md"
+_DRAFT_RUNTIME_EVIDENCE_PATH = (
+    Path(__file__).parents[4] / "testdata" / "evidence" / "gguf_draft_runtime_evidence.json"
+)
+
+DOC_PATH = Path(__file__).resolve().parents[4] / "docs" / "gguf-capability-catalog.md"
 
 
 def _cell(value: object) -> str:
@@ -82,7 +96,7 @@ def _summary() -> str:
     quantized_import_counts = Counter(spec.quantized_import.value for spec in architectures)
     projector_counts = {
         "graph-importable": sum(spec.is_importable for spec in projectors),
-        "runtime-supported": sum(spec.runtime is Support.SUPPORTED for spec in projectors),
+        "runtime-evidenced": sum(spec.runtime is Support.SUPPORTED for spec in projectors),
     }
     return "\n".join(
         (
@@ -114,9 +128,10 @@ def _summary() -> str:
             (
                 "`SUPPORTED` means the named capability is implemented and mechanically tested. "
                 "`DEFERRED` means it is intentionally unavailable pending the stated work. "
-                "`REJECTED` means the input or route is invalid by policy. Graph support proves "
-                "construction/execution only; runtime support additionally requires a pinned real "
-                "artifact, independent parity, and deterministic generation or stateful semantics. "
+                "`REJECTED` means the input or route is invalid by policy. Graph support controls "
+                "export. The separate runtime verdict records pinned real-artifact validation, "
+                "independent parity, and deterministic generation or stateful semantics; it never "
+                "gates export of a faithfully represented graph and package contract. "
                 "Tokenizer `copy` requires embedded ordered-vocabulary identity; `pinned-source` "
                 "also binds the complete GGUF artifact, immutable Hub assets, reconstruction "
                 "policy, semantic hashes, and representative token-ID vectors."
@@ -146,7 +161,7 @@ def _reason_code(verdicts: dict[str, Support]) -> str:
     if graph is not Support.SUPPORTED:
         return "GRAPH_DEFERRED — Executable graph construction is not implemented."
     if runtime is Support.REJECTED:
-        return "RUNTIME_REJECTED — Runtime package publication is deliberately refused."
+        return "RUNTIME_EVIDENCE_REJECTED — The recorded runtime route is invalid."
     if runtime is not Support.SUPPORTED and quantized is Support.REJECTED:
         return (
             "RUNTIME_EVIDENCE_PENDING / FLOAT_IMPORT_ONLY — Runtime evidence is incomplete, "
@@ -159,10 +174,16 @@ def _reason_code(verdicts: dict[str, Support]) -> str:
         )
     if quantized is Support.REJECTED:
         return "FLOAT_IMPORT_ONLY — Runtime is evidenced only through explicit float import."
-    return "EVIDENCED_SCOPE — Runtime publication is limited to registry-linked immutable evidence."
+    return "EVIDENCED_SCOPE — Registry-linked immutable runtime evidence is available."
 
 
 def _architecture_reason(spec: GGUFArchitectureSpec) -> str:
+    if has_direct_draft_runtime(spec.gguf_arch):
+        return (
+            "DIRECT_ORT_EVIDENCED / RUNTIME_UNVALIDATED — Exact target-coupled "
+            "direct ORT acceptance, rollback, and deterministic generation are evidenced; "
+            "higher-level runtime compatibility remains advisory."
+        )
     capabilities = dict(spec.capabilities)
     code = _reason_code(capabilities).partition(" — ")[0]
     reason = spec.reason
@@ -221,10 +242,10 @@ def _qtypes() -> str:
 def _projectors() -> str:
     rows = [
         (
-            "| Projector string | Modality | Paired text architecture | "
+            "| Projector string | Modality | Graph role / route | Paired text architecture | "
             "Metadata/tensor/graph/runtime | Exactness/evidence |"
         ),
-        "|---|---|---|---|---|",
+        "|---|---|---|---|---|---|",
     ]
     for spec in sorted(iter_projector_specs(), key=lambda item: item.projector_type):
         modalities = ", ".join(
@@ -233,13 +254,25 @@ def _projectors() -> str:
         targets = (
             ", ".join(f"`{target}`" for target in sorted(spec.target_architectures)) or "—"
         )
-        evidence = (
-            "artifact pins=" + ", ".join(f"`{item}`" for item in spec.real_artifact_ids)
-            if spec.real_artifact_ids
-            else _reason_code(dict(spec.verdicts))
+        roles = ", ".join(role.value for role in spec.model_roles)
+        route = (
+            f"{roles or 'paired package'} via `{spec.sidecar_builder or spec.builder}`"
+            if spec.sidecar_builder or spec.builder
+            else "—"
         )
+        evidence_parts = []
+        if spec.real_artifact_ids:
+            evidence_parts.append(
+                "artifact pins=" + ", ".join(f"`{item}`" for item in spec.real_artifact_ids)
+            )
+        if spec.source_evidence_ids:
+            evidence_parts.append(
+                "source evidence="
+                + ", ".join(f"`{item}`" for item in spec.source_evidence_ids)
+            )
+        evidence = "; ".join(evidence_parts) or _reason_code(dict(spec.verdicts))
         rows.append(
-            f"| `{spec.projector_type}` | {modalities} | {targets} | "
+            f"| `{spec.projector_type}` | {modalities} | {_cell(route)} | {targets} | "
             f"{_cell(_status(dict(spec.verdicts)))} | {_cell(evidence or 'none')} |"
         )
     return "\n".join(rows)
@@ -258,7 +291,14 @@ def _tokenizers() -> str:
         disposition = (
             f"`{record.evidence_id}`"
             if record.evidence_id is not None
-            else f"`{record.blocker_category}`"
+            else (
+                f"`{record.blocker_category}`"
+                + (
+                    f" (`{record.blocker_evidence_id}`)"
+                    if record.blocker_evidence_id is not None
+                    else ""
+                )
+            )
         )
         if record.candidate_disposition is not None:
             route_identity = ""
@@ -331,6 +371,51 @@ def _runtime_evidence_table() -> str:
             f"{evidence.parity_kind}; {evidence.stateful_semantics}"
             f"{'; ' + evidence.limitations if evidence.limitations else ''} |"
         )
+    for mtp_evidence in iter_mtp_runtime_evidence():
+        layouts = "<br>".join(
+            (
+                f"{layout.name}: "
+                + ", ".join(
+                    f"`{artifact.repository}@{artifact.revision}/{artifact.filename}` "
+                    f"{artifact.size:,} B `{artifact.lfs_sha256}`"
+                    for artifact in layout.artifacts
+                )
+                + f"<br>total {layout.total_size:,} B; "
+                + (
+                    "within 16 GiB"
+                    if layout.within_bounded_artifact_policy
+                    else "above 16 GiB"
+                )
+            )
+            for layout in mtp_evidence.layouts
+        )
+        discriminator = mtp_evidence.target_only_discriminator
+        if discriminator is not None:
+            layouts += (
+                f"<br>target-only discriminator: `{discriminator.filename}` "
+                f"{discriminator.size:,} B `{discriminator.lfs_sha256}`"
+            )
+        limitations = "<br>".join(mtp_evidence.downstream_limitations)
+        deferrals = "<br>".join(mtp_evidence.separate_deferrals)
+        synthetic = (
+            f"; reduced direct-ORT coordinator "
+            f"{dict(mtp_evidence.synthetic_acceptance_statistics)}"
+            if mtp_evidence.synthetic_coordinator_test is not None
+            else ""
+        )
+        rows.append(
+            f"| `{mtp_evidence.evidence_id}` | {layouts} | "
+            f"`{mtp_evidence.config_repository}@{mtp_evidence.config_revision}` "
+            f"`{mtp_evidence.config_sha256}` | "
+            f"`{mtp_evidence.tokenizer_repository}@{mtp_evidence.tokenizer_revision}`; "
+            f"separately deferred; metadata `{mtp_evidence.tokenizer_metadata_sha256}` | "
+            f"status={mtp_evidence.result}; graph/package hashes unclaimed; "
+            f"ORT {mtp_evidence.onnxruntime_version} "
+            f"`{mtp_evidence.execution_provider}`; {mtp_evidence.runtime} "
+            f"{mtp_evidence.runtime_version} source "
+            f"`{mtp_evidence.runtime_source_revision}`{synthetic}; "
+            f"{limitations}<br>{deferrals} |"
+        )
     return "\n".join(rows)
 
 
@@ -351,6 +436,16 @@ def _runtime_blocker_evidence_table() -> str:
             f"{evidence.logical_parameter_count:,} parameters; "
             f"ORT {evidence.onnxruntime_version} / {evidence.execution_provider}; "
             f"{evidence.runtime} {evidence.runtime_version}; {blockers} | {withheld} |"
+        )
+    for artifact in iter_artifact_blocker_evidence():
+        files = "<br>".join(
+            f"`{file.path}` {file.size:,} B `{file.lfs_sha256}`" for file in artifact.files
+        )
+        rows.append(
+            f"| `{artifact.evidence_id}` | `{artifact.repository}@{artifact.revision}`<br>"
+            f"{files}<br>total {artifact.total_size:,} B | blocked; "
+            f"{artifact.blocker} | real-weight full-logit parity, runtime packaging, "
+            "deterministic generation |"
         )
     return "\n".join(rows)
 
@@ -483,6 +578,15 @@ def _tokenizer_blocker_evidence_table() -> str:
                 f"GGUF chat `{evidence.chat_template_sha256}` vs source "
                 f"`{evidence.source_chat_template_sha256}`"
             )
+        if evidence.blocked_identifiers:
+            closure += (
+                f"<br>exact aliases={list(evidence.blocked_identifiers)}; "
+                f"materialized `{evidence.materialized_tokenizer_sha256}`; "
+                f"config `{evidence.source_tokenizer_config_sha256}`<br>"
+                f"pipeline components={dict(evidence.source_pipeline_component_sha256)}; "
+                f"added-token type mismatches="
+                f"{evidence.source_added_token_type_mismatch_count}"
+            )
         witness = (
             f"{evidence.disposition}<br>"
             f"`{text.encode('unicode_escape').decode()}`: llama.cpp `{list(llamacpp_ids)}` "
@@ -497,6 +601,19 @@ def _tokenizer_blocker_evidence_table() -> str:
                 f"{list(evidence.oracle_mismatch_count_by_mode)} by mode; "
                 f"source oracle `{evidence.source_oracle_sha256}`"
             )
+        if evidence.blocked_identifiers:
+            witness += (
+                f"<br>dispatch oracles={dict(evidence.dispatch_oracles)}; "
+                f"discriminator={evidence.dispatch_discriminator}; "
+                f"detokenize mismatches={evidence.oracle_detokenize_mismatch_count} "
+                f"{list(evidence.oracle_detokenize_mismatch_count_by_mode)} by mode"
+            )
+            if evidence.first_detokenize_mismatch is not None:
+                detokenize_text, llamacpp_hex, source_hex = evidence.first_detokenize_mismatch
+                witness += (
+                    f"; `{detokenize_text.encode('unicode_escape').decode()}`: "
+                    f"llama.cpp hex `{llamacpp_hex}` vs source hex `{source_hex}`"
+                )
         rows.append(
             f"- `{evidence.evidence_id}` — **GGUF/source:** {_cell(identity)}; "
             f"**closure:** {_cell(closure)}; **witness:** {_cell(witness)}"
@@ -519,6 +636,11 @@ def _projector_evidence_table() -> str:
         "|---|---|---:|---|---|---|---|",
     ]
     for pin in MMPROJ_ARTIFACT_PINS:
+        sidecar = f"`{pin.repository}@{pin.revision}`<br>`{pin.filename}`"
+        if pin.bounded_header_bytes is not None and pin.bounded_header_sha256 is not None:
+            sidecar += (
+                f"<br>first {pin.bounded_header_bytes:,} B `{pin.bounded_header_sha256}`"
+            )
         paired_text = f"`{pin.paired_text_target}`"
         if pin.paired_text_repository and pin.paired_text_revision:
             paired_text = (
@@ -531,8 +653,7 @@ def _projector_evidence_table() -> str:
         if pin.processor_repository and pin.processor_revision:
             processor = f"`{pin.processor_repository}@{pin.processor_revision}`"
         rows.append(
-            f"| `{pin.artifact_id}` | `{pin.repository}@{pin.revision}`<br>"
-            f"`{pin.filename}` | {pin.size:,} | `{pin.lfs_sha256}` | "
+            f"| `{pin.artifact_id}` | {sidecar} | {pin.size:,} | `{pin.lfs_sha256}` | "
             f"{', '.join(f'`{item}`' for item in pin.projector_types)} | "
             f"{paired_text} | {processor} |"
         )
@@ -550,6 +671,20 @@ def _projector_evidence_table() -> str:
     return "\n".join(rows)
 
 
+def _projector_source_evidence_table() -> str:
+    rows = [
+        "| Evidence ID | Immutable sources | Finding |",
+        "|---|---|---|",
+    ]
+    for evidence in iter_projector_source_evidence():
+        sources = "<br>".join(
+            f"`{repository}@{revision}` `{path}`"
+            for repository, revision, path in evidence.sources
+        )
+        rows.append(f"| `{evidence.evidence_id}` | {sources} | {evidence.finding} |")
+    return "\n".join(rows)
+
+
 def _projector_availability_table() -> str:
     rows = [
         "| Candidate route | Immutable available sidecar | Bytes | SHA-256 |",
@@ -563,8 +698,37 @@ def _projector_availability_table() -> str:
     return "\n".join(rows)
 
 
+def _draft_runtime_evidence_summary() -> str:
+    evidence = json.loads(_DRAFT_RUNTIME_EVIDENCE_PATH.read_text(encoding="utf-8"))
+    summaries = []
+    for record in evidence["routes"]:
+        result = record["direct_ort_result"]
+        fidelity = record["source_fidelity"]
+        fidelity_summary = (
+            "source tensors exact"
+            if fidelity.get("all_types_shapes_values_equal")
+            else (
+                f"source cosine={fidelity['cosine']:.6f}, "
+                f"relative-L2={fidelity['relative_l2']:.6f}"
+            )
+        )
+        summaries.append(
+            f"`{record['architecture']}`: "
+            f"{result['generated_token_count']} target-only-equal greedy tokens; "
+            f"{result['accepted_tokens']}/{result['proposed_tokens']} accepted; "
+            f"{result['multi_token_rounds']} multi-token rounds; "
+            f"{result['rollback_events']} rollbacks; {fidelity_summary}"
+        )
+    return (
+        "Pinned DFlash/EAGLE3 source, artifact, tokenizer, graph, and package hashes live in "
+        "`testdata/evidence/gguf_draft_runtime_evidence.json`: "
+        + "; ".join(summaries)
+        + ". Both use separate target/draft caches; higher-level runtime=`runtime_unvalidated`."
+    )
+
+
 def render_document() -> str:
-    """Render the complete concise API document from live registries and evidence."""
+    """Render the complete capability catalog from live registries and evidence."""
     blocks = render_blocks()
     recent_prs = "; ".join(
         f"#{record.number} ({record.state_at_audit}) — {record.dependency}"
@@ -575,22 +739,43 @@ def render_document() -> str:
             "Each row is independently artifact-scoped and proves ordered tokenizer semantics,",
             "source assets, embedding alignment, and the final materialized hash.",
             "Shared rows also require identical pinned llama.cpp dispatch.",
+            "A matching complete immutable GGUF is automatically promoted to the pinned-source",
+            "route during model and runtime package export; identifier-only inspection remains",
+            "deferred because an identifier cannot prove artifact identity.",
             "This does not claim graph or runtime support.",
         )
     )
     tokenizer_refresh_note = " ".join(
         (
-            "The MiniCPM and Gemma4 fixtures are reproducible through their",
-            "`scripts/generate_*_tokenizer_oracle.py` workflows, which validate immutable",
-            "bounded headers and official tokenizer hashes, build tokenizer-only GGUFs and the",
-            "pinned llama.cpp helper, then recompute exact outputs and mismatch witnesses.",
-            "The committed Gemma4 inputs also replay the current reconstruction network-free.",
+            "The MiniCPM, Gemma4, and final alias-group fixtures are reproducible through",
+            "`scripts/generate_*tokenizer*.py`, which validates immutable bounded headers",
+            "and official tokenizer hashes, builds tokenizer-only GGUFs and the pinned",
+            "llama.cpp helper, then recomputes exact outputs and mismatch witnesses.",
+            "Committed Gemma4 and alias-group inputs replay materialized identities",
+            "network-free; the alias oracle never calls the production reconstruction.",
         )
     )
-    return f"""# `build_from_gguf()`
+    draft_evidence_note = " ".join(
+        (
+            "The committed real-pair evidence uses a test-only direct ORT coordinator",
+            "that reads remapping metadata from the raw immutable draft GGUF and does not",
+            "import `DraftPairRunner` or its transition helpers. Per-round DFlash and",
+            "EAGLE3 traces bind proposal/remap tokens, proposal-logit hashes, accepted",
+            "prefixes, correction tokens, target replay, target/draft cache states, final",
+            "counters, and four execution-mutating discriminators. Target replay starts",
+            "from an empty cache, and final speculative rounds never process past the",
+            "requested token count. Beam reorder is reported unsupported for the",
+            "batch-size-one reference coordinator rather than inferred.",
+        )
+    )
+    return f"""# GGUF Capability and Evidence Catalog
 
-Build ONNX packages directly from GGUF metadata and tensors without tracing PyTorch.
-Support is capability-specific: graph import does not imply runtime packaging.
+This generated reference records exhaustive GGUF capability verdicts, closure statistics,
+immutable artifact identities, and evidence gaps. It is intended for maintainers and
+machine review; see [`build_from_gguf()`](api/build_from_gguf.md) for user instructions.
+
+The [model catalog](model-catalog.md) covers HuggingFace model registrations. It does not
+imply GGUF import or runtime support; those capability-specific claims live only here.
 
 <!-- BEGIN GGUF CLOSURE SUMMARY -->
 
@@ -598,59 +783,20 @@ Support is capability-specific: graph import does not imply runtime packaging.
 
 <!-- END GGUF CLOSURE SUMMARY -->
 
-## Usage
-
-```python
-from mobius.integrations.gguf import build_from_gguf
-
-package = build_from_gguf("model.gguf")
-package.save("output")
-```
-
-`keep_quantized=True` requests quantized target storage where supported; it does
-not guarantee source byte or numerical fidelity. Mobius classifies qtypes before
-payload conversion, emits one aggregate warning for lossy requantization, and
-saves the typed result as `quantization_report.json`. Use
-`keep_quantized=False` for explicit float import.
-
-Packed MatMulNBits storage may use a native op or portable nibble unpack,
-`DequantizeLinear`, and float `MatMul`; neither implies dense storage or a specific kernel.
-Use `mmproj=` only for evidenced sidecars; CLI: `mobius build model.gguf -o output`.
-Split shards validate siblings and ownership; Hub references reject partial downloads.
-
-## API
-
-```python
-build_from_gguf(
-    gguf_path,
-    *,
-    task=None,
-    dtype=None,
-    keep_quantized=True,
-    execution_provider="default",
-    mmproj=None,
-    image_token_id=None,
-    static_cache=False,
-    max_seq_len=None,
-    allow_dense_moe=None,
-    reuse_gguf_weights=False,
-    target_config=None,
-)
-```
-
-The function returns a `ModelPackage`. Import validates architecture metadata, exact tensor
-closure, shapes, qtypes, and selected graph route before publication. Source reuse requires
-the original immutable GGUF at runtime. Runtime packages additionally require an exact
-artifact, graph, tokenizer, runtime version, parity proof, and deterministic state/generation
-evidence match.
-Processor-owned `image_token_id` overrides are forwarded unchanged for `mmproj=` packages.
-
 ## Runtime evidence
+
+The first low-cost architecture batch promotes GPT-2, GPT-NeoX/Pythia, MPT, OLMo, StarCoder, and StarCoder2 using 334,238,976 bytes of GGUF payload and 346,825,051
+download bytes including tokenizer assets. Every route is explicit-float only. The
+network-free selection, budget, exclusions, and fail-closed candidate reasons are recorded in
+`testdata/evidence/gguf_low_cost_runtime_batch.json`.
 
 {_runtime_evidence_table()}
 
-Runtime support above is independent from tokenizer materialization support below.
+{_draft_runtime_evidence_summary()}
 
+{draft_evidence_note}
+
+Runtime support above is independent from tokenizer materialization support below.
 ### Fail-closed runtime evidence
 
 {_runtime_blocker_evidence_table()}
@@ -710,8 +856,13 @@ operator ABI for every tensor role, and treats dequantize/requantize as non-pres
 
 {_projector_evidence_table()}
 
+Pinned source proofs cover graph semantics that cannot be inferred from tensor names,
+including conversion-time permutations, co-resident modality roles, and processor boundaries.
+
+{_projector_source_evidence_table()}
+
 These additional immutable files prove artifact availability only. Their routes remain
-implementation work until tensor mapping and component parity are independently established.
+governed by the capability matrix until tensor mapping and component parity are established.
 
 {_projector_availability_table()}
 
@@ -751,7 +902,7 @@ def update_document(path: Path = DOC_PATH) -> str:
             flags=re.IGNORECASE,
         )
     )
-    if pins - {UPSTREAM_COMMIT}:
+    if pins - {UPSTREAM_COMMIT, LLAMA_CPP_MMPROJ_SHA}:
         raise ValueError(f"Stale llama.cpp pins outside generated blocks: {sorted(pins)}")
     return render_document()
 

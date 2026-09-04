@@ -19,6 +19,362 @@
       "test": "tests/gguf_small_model_runtime_integration_test.py::test_smollm_q4_k_m_target_storage_and_explicit_float_fidelity"
     }
   ],
+  "mtp_runtime_evidence": [
+    {
+      "architecture": "hy_v3",
+      "bounded_complete_layout_available": false,
+      "cache_topology": {
+        "mtp_namespace": "mtp",
+        "mtp_state_slots": {
+          "attention.key": 1,
+          "attention.value": 1
+        },
+        "target_namespace": "target",
+        "target_state_slots": {
+          "attention.key": 80,
+          "attention.value": 80
+        }
+      },
+      "config": {
+        "repository": "tencent/Hy3",
+        "revision": "a960ebc3da325ba167f069f76c41eb62c9280d22",
+        "sha256": "0c9daab42bff9cce1b6f058b10d7b730f76d583e583e28ad56e92b36373246f0"
+      },
+      "downstream_limitations": [
+        "The smallest pinned public complete Hunyuan-V3 MTP artifact is 91,756,066,272 bytes, above the 17,179,869,184-byte bounded-artifact policy. The matching target-only discriminator is 89,446,312,384 bytes.",
+        "ORT GenAI 0.15.2 exposes no two-model draft/target binding, independent target/MTP cache orchestration, proposal rollback, or acceptance statistics."
+      ],
+      "evidence_id": "hy3-iq1-m-mtp-runtime-unvalidated",
+      "graph_sha256": null,
+      "layouts": [
+        {
+          "artifacts": [
+            {
+              "architecture": "hy_v3",
+              "block_count": 81,
+              "bounded_header_bytes": 16777216,
+              "bounded_header_sha256": "167bf00a520da2bfdaa9362ebf5ac47b4c8966ac1128b74fba0e8ca55a51341b",
+              "data_offset": 5161440,
+              "filename": "Hy3-IQ1_M-mtp.gguf",
+              "lfs_sha256": "c1fe984fef6f23fd9eb144e41ce6824e3941ed0a8b6b8f9f3e63da0c2a1320c2",
+              "model_name": "Hy3",
+              "nextn_predict_layers": 1,
+              "nextn_tensor_count": 4,
+              "nextn_tensor_qtypes": {
+                "F32": 3,
+                "Q8_0": 1
+              },
+              "physical_blocks": {
+                "count": 81,
+                "first": 0,
+                "last": 80
+              },
+              "repository": "AngelSlim/Hy3-GGUF",
+              "revision": "31b453f4d9b647c74e4c4f5cba632eb512332c91",
+              "role": "combined",
+              "size": 91756066272,
+              "tensor_count": 1298,
+              "tensor_qtypes": {
+                "F32": 488,
+                "IQ1_M": 82,
+                "IQ2_XXS": 78,
+                "IQ3_XXS": 79,
+                "Q2_K": 1,
+                "Q4_K": 3,
+                "Q5_K": 242,
+                "Q6_K": 81,
+                "Q8_0": 244
+              },
+              "tokenizer_metadata_sha256": "bff10dd3b99c0d4098b28fbeb1af46804184cefc2920895969b6f1ad2e548fa3"
+            }
+          ],
+          "name": "combined",
+          "total_size": 91756066272,
+          "within_bounded_artifact_policy": false
+        }
+      ],
+      "result": "runtime_unvalidated",
+      "runtime": {
+        "execution_provider": "CPUExecutionProvider",
+        "missing_capabilities": [
+          "accept_reject_rollback",
+          "acceptance_statistics",
+          "independent_target_and_mtp_cache_threading",
+          "two_model_draft_target_binding"
+        ],
+        "name": "ort-genai",
+        "onnxruntime_version": "1.29.0",
+        "source_revision": "ed5f4e87147731e5b07810f9f5c90103b3603cdf",
+        "version": "0.15.2"
+      },
+      "runtime_package_sha256": null,
+      "separate_deferrals": [
+        "The embedded tokenizer uses pre=hunyuan-dense, whose compiled llama.cpp behavior is not serialized in GGUF. This is separate from the real-artifact budget and downstream two-model runtime validation gaps.",
+        "Bounded headers prove that the -mtp file has 81 physical blocks with trailing block 80 while the target-only file has exactly 80 blocks. No payload values, standalone MTP forward, graph, or package is promoted as runtime evidence."
+      ],
+      "source_fidelity": false,
+      "storage_fidelity": false,
+      "synthetic_coordinator": null,
+      "target_only_discriminator": {
+        "architecture": "hy_v3",
+        "block_count": 80,
+        "bounded_header_bytes": 16777216,
+        "bounded_header_sha256": "93b14dcd2cca8898bf295842e189d996a4d1138990ef2e275614d392eb1e4a22",
+        "data_offset": 5160128,
+        "filename": "Hy3-IQ1_M.gguf",
+        "lfs_sha256": "8c4195718dc24384a38de1c492f4bca7d21447789714d232b0a4d9cd0bb0c806",
+        "model_name": "Hy3",
+        "nextn_predict_layers": 0,
+        "nextn_tensor_count": 0,
+        "nextn_tensor_qtypes": {},
+        "physical_blocks": {
+          "count": 80,
+          "first": 0,
+          "last": 79
+        },
+        "repository": "AngelSlim/Hy3-GGUF",
+        "revision": "31b453f4d9b647c74e4c4f5cba632eb512332c91",
+        "role": "target",
+        "size": 89446312384,
+        "tensor_count": 1278,
+        "tensor_qtypes": {
+          "F32": 479,
+          "IQ1_M": 82,
+          "IQ2_XXS": 78,
+          "IQ3_XXS": 79,
+          "Q2_K": 1,
+          "Q4_K": 1,
+          "Q5_K": 238,
+          "Q6_K": 80,
+          "Q8_0": 240
+        },
+        "tokenizer_metadata_sha256": "bff10dd3b99c0d4098b28fbeb1af46804184cefc2920895969b6f1ad2e548fa3"
+      },
+      "tokenizer": {
+        "assets": [
+          {
+            "filename": "tokenizer.json",
+            "sha256": "446e0b59cd941637c0ddfd84e12ee1f49480fd12097f86a9d2fec8ebd0c7ff6c",
+            "size": 9527406
+          },
+          {
+            "filename": "tokenizer_config.json",
+            "sha256": "1af226fc70b260371ca1f08053768b80a9d58b9d79e8eab718160f52783f7ceb",
+            "size": 165971
+          }
+        ],
+        "metadata_sha256": "bff10dd3b99c0d4098b28fbeb1af46804184cefc2920895969b6f1ad2e548fa3",
+        "repository": "tencent/Hy3",
+        "revision": "a960ebc3da325ba167f069f76c41eb62c9280d22",
+        "status": "separately-deferred"
+      },
+      "withheld_checks": [
+        "real-artifact accept/reject rollback and replay/reorder",
+        "real-artifact deterministic output equality against target-only generation",
+        "real-artifact full-logit parity from an independent oracle",
+        "real-artifact multi-step acceptance statistics",
+        "serialized graph and runtime-package SHA-256 identities",
+        "source-value and target-storage fidelity"
+      ]
+    },
+    {
+      "architecture": "qwen35",
+      "bounded_complete_layout_available": true,
+      "cache_topology": {
+        "mtp_namespace": "mtp",
+        "mtp_state_slots": {
+          "attention.key": 1,
+          "attention.value": 1
+        },
+        "target_namespace": "target",
+        "target_state_slots": {
+          "attention.key": 16,
+          "attention.value": 16,
+          "linear_attention.conv_state": 48,
+          "linear_attention.recurrent_state": 48
+        }
+      },
+      "config": {
+        "repository": "Qwen/Qwen3.6-27B",
+        "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+        "sha256": "69db4eb7196bc8190813231b3018ca05d8c2e3abc7b1af19d55c157af44a9d9c"
+      },
+      "downstream_limitations": [
+        "ORT GenAI 0.15.2 constructs one Model per Generator and exposes no two-model draft/target binding, independent MTP-cache orchestration, proposal accept/reject rollback, or observable acceptance statistics. Its pinned release matrix places speculative decoding on the roadmap; Generator.rewind_to only rewinds the single target generator and is not an MTP acceptance loop."
+      ],
+      "evidence_id": "qwen3.6-27b-mtp-runtime-unvalidated",
+      "graph_sha256": null,
+      "layouts": [
+        {
+          "artifacts": [
+            {
+              "architecture": "qwen35",
+              "block_count": 65,
+              "bounded_header_bytes": 16777216,
+              "bounded_header_sha256": "ecf4be7b831ea56596022a4cd974930f59b37f5e64ce5b62bbe21686e02e07a8",
+              "data_offset": 10993760,
+              "filename": "Qwen3.6-27B-MTP-Q4_K_M-Q8nextn.gguf",
+              "lfs_sha256": "6cdb1aabb6ee711938df4192938b51228df9274f01c8d7a5ff404915ad342a7c",
+              "model_name": "Qwen3.6 27B MTPpatched",
+              "nextn_predict_layers": 1,
+              "nextn_tensor_count": 4,
+              "nextn_tensor_qtypes": {
+                "F32": 3,
+                "Q8_0": 1
+              },
+              "physical_blocks": {
+                "count": 65,
+                "first": 0,
+                "last": 64
+              },
+              "repository": "localweights/Qwen3.6-27B-MTP-Q4_K_M-Q8nextn-GGUF",
+              "revision": "bdc8bc1ca4d45e1152d54c4e5f1389bc7bf6e439",
+              "role": "combined",
+              "size": 16998719584,
+              "tensor_count": 866,
+              "tensor_qtypes": {
+                "F32": 360,
+                "Q4_K": 433,
+                "Q6_K": 65,
+                "Q8_0": 8
+              },
+              "tokenizer_metadata_sha256": "8d1070c727a7e6a03726687aa5746acece0255060a2a61a905c4c2285d353b68"
+            }
+          ],
+          "name": "combined",
+          "total_size": 16998719584,
+          "within_bounded_artifact_policy": true
+        },
+        {
+          "artifacts": [
+            {
+              "architecture": "qwen35",
+              "block_count": 64,
+              "bounded_header_bytes": 16777216,
+              "bounded_header_sha256": "a14696157c62d5cbc00cbc473f1fade79fe82a5406f0193ef9fd6839d9d75313",
+              "data_offset": 10992928,
+              "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+              "lfs_sha256": "65b753ea835627f7b511143c6ceb976525c7f21f5df8c664bc0a9c23d1c49921",
+              "model_name": "Qwen3.6-27B",
+              "nextn_predict_layers": 0,
+              "nextn_tensor_count": 0,
+              "nextn_tensor_qtypes": {},
+              "physical_blocks": {
+                "count": 64,
+                "first": 0,
+                "last": 63
+              },
+              "repository": "ggml-org/Qwen3.6-27B-GGUF",
+              "revision": "8a7ee08e8b9bfb857107ecc25a5599d2f38b76f8",
+              "role": "target",
+              "size": 19095766304,
+              "tensor_count": 851,
+              "tensor_qtypes": {
+                "F32": 353,
+                "Q4_K": 193,
+                "Q6_K": 1,
+                "Q8_0": 304
+              },
+              "tokenizer_metadata_sha256": "8d1070c727a7e6a03726687aa5746acece0255060a2a61a905c4c2285d353b68"
+            },
+            {
+              "architecture": "qwen35",
+              "block_count": 65,
+              "bounded_header_bytes": 16777216,
+              "bounded_header_sha256": "082ed312178c514db10387e2f14db5c9b91cb86e2bed9fb163298d0bc081a7e0",
+              "data_offset": 10943712,
+              "filename": "mtp-Qwen3.6-27B-Q4_0.gguf",
+              "lfs_sha256": "3d593f9e2788d59bb30d6024706b1efd5219fea466b6397c46159e3540937173",
+              "model_name": "Qwen3.6-27B",
+              "nextn_predict_layers": 1,
+              "nextn_tensor_count": 4,
+              "nextn_tensor_qtypes": {
+                "F32": 3,
+                "Q4_0": 1
+              },
+              "physical_blocks": {
+                "count": 1,
+                "first": 64,
+                "last": 64
+              },
+              "repository": "ggml-org/Qwen3.6-27B-GGUF",
+              "revision": "8a7ee08e8b9bfb857107ecc25a5599d2f38b76f8",
+              "role": "mtp",
+              "size": 1680270560,
+              "tensor_count": 18,
+              "tensor_qtypes": {
+                "F32": 8,
+                "Q4_0": 10
+              },
+              "tokenizer_metadata_sha256": "8d1070c727a7e6a03726687aa5746acece0255060a2a61a905c4c2285d353b68"
+            }
+          ],
+          "name": "split",
+          "total_size": 20776036864,
+          "within_bounded_artifact_policy": false
+        }
+      ],
+      "result": "runtime_unvalidated",
+      "runtime": {
+        "execution_provider": "CPUExecutionProvider",
+        "missing_capabilities": [
+          "accept_reject_rollback",
+          "acceptance_statistics",
+          "independent_target_and_mtp_cache_threading",
+          "two_model_draft_target_binding"
+        ],
+        "name": "ort-genai",
+        "onnxruntime_version": "1.29.0",
+        "source_revision": "ed5f4e87147731e5b07810f9f5c90103b3603cdf",
+        "version": "0.15.2"
+      },
+      "runtime_package_sha256": null,
+      "separate_deferrals": [
+        "The embedded tokenizer uses pre=qwen35, whose compiled llama.cpp behavior is not serialized in GGUF. This tokenizer limitation is separate from downstream two-model runtime validation.",
+        "The under-budget combined artifact proves immutable header, physical trailing block, and layout identity only. No payload values, production tensor mapping, quantized storage execution, standalone MTP forward, graph, or package is promoted as runtime evidence. A separate tiny direct-ORT coordinator exercises target/MTP cache threading, accept/reject rollback, replay, reorder, and target-only equality without upgrading the real-artifact status.",
+        "The 2026-08-28 qualification transfer fetched 2,167,418,880 of 16,998,719,584 bytes before measured throughput implied a multi-hour transfer ahead of any 32 GiB-host build/runtime attempt. The partial payload was deleted; this operational deferral does not restrict export support."
+      ],
+      "source_fidelity": false,
+      "storage_fidelity": false,
+      "synthetic_coordinator": {
+        "acceptance_statistics": {
+          "accepted": 1,
+          "proposal_steps": 51,
+          "rejected": 50,
+          "rollbacks": 50
+        },
+        "scope": "reduced synthetic contract; not real-artifact evidence",
+        "test": "src/mobius/integrations/gguf/_mtp_test.py::TestMtpAutoDetect::test_direct_ort_target_acceptance_threads_and_rolls_back_both_caches"
+      },
+      "target_only_discriminator": null,
+      "tokenizer": {
+        "assets": [
+          {
+            "filename": "tokenizer.json",
+            "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+            "size": 12807982
+          },
+          {
+            "filename": "tokenizer_config.json",
+            "sha256": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b",
+            "size": 16718
+          }
+        ],
+        "metadata_sha256": "8d1070c727a7e6a03726687aa5746acece0255060a2a61a905c4c2285d353b68",
+        "repository": "Qwen/Qwen3.6-27B",
+        "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+        "status": "separately-deferred"
+      },
+      "withheld_checks": [
+        "real-artifact accept/reject rollback and replay/reorder",
+        "real-artifact deterministic output equality against target-only generation",
+        "real-artifact full-logit parity from an independent oracle",
+        "real-artifact multi-step acceptance statistics",
+        "serialized graph and runtime-package SHA-256 identities",
+        "source-value and target-storage fidelity"
+      ]
+    }
+  ],
   "operator_abis": {
     "affine_embedding": "com.microsoft::GatherBlockQuantized/v1",
     "affine_projection": "com.microsoft::MatMulNBits/v1",
@@ -28,7 +384,7 @@
     "max_selected_artifact_bytes": 17179869184,
     "preserved_definition": "Only byte-identical native blocks or exact affine repacks preserve source represented values. Dequantize/requantize is never preserved.",
     "runtime_definition": "Runtime support requires immutable same-artifact full-logit parity plus deterministic prefill/decode/replay/rollback/reorder evidence.",
-    "selected_artifact_bytes": 2390132320,
+    "selected_artifact_bytes": 5752423904,
     "target_storage_definition": "Lossy affine normalization may still produce supported packed target storage while source_fidelity is false."
   },
   "qtypes": [
@@ -2595,7 +2951,7 @@
           "evidence_id": "qwen3.5-moe-0.87b-q2-k-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "8c1aa1075cee03ffd5ce5bbd283ee88b2466e6c1d645f0a41e542230951d6f09",
-          "import_route": "{\"architecture\":\"qwen35moe\",\"config_sha256\":\"f61aa39910c1b2ef27b9f8c707ef17dc7d16eff6fd97fae33d3a2eb367bf76f9\",\"execution_provider\":\"cpu\",\"model_type\":\"qwen3_5_moe\",\"module_type\":\"qwen3_5_moe\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":true,\"required_metadata\":[\"attention.layer_norm_rms_epsilon\",\"expert_count\",\"expert_used_count\",\"rope.dimension_sections\",\"ssm.conv_kernel\",\"ssm.group_count\",\"ssm.inner_size\",\"ssm.state_size\",\"ssm.time_step_rank\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":true,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"hybrid-text-generation\"},\"tensor_map_recipe\":[\"llama\",\"moe_extras\",\"qwen35_hybrid_extras\"]}",
+          "import_route": "{\"architecture\":\"qwen35moe\",\"config_sha256\":\"48019eea50654171acb6b87074d3c3a212bdf156aa6045c221067732bf25af91\",\"execution_provider\":\"cpu\",\"model_type\":\"qwen3_5_moe\",\"module_type\":\"qwen3_5_moe\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":true,\"required_metadata\":[\"attention.layer_norm_rms_epsilon\",\"expert_count\",\"expert_used_count\",\"rope.dimension_sections\",\"ssm.conv_kernel\",\"ssm.group_count\",\"ssm.inner_size\",\"ssm.state_size\",\"ssm.time_step_rank\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":true,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"hybrid-text-generation\"},\"tensor_map_recipe\":[\"llama\",\"moe_extras\",\"qwen35_hybrid_extras\"]}",
           "limitations": "Explicit-float correctness route only: source quantization is dequantized, dense MoE execution is opt-in, and the selected publisher marks this reduced checkpoint as low quality. Same-value full-logit comparison uses atol=0.35 because small backend differences can cross a routed-expert boundary; all greedy tokens match.",
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
@@ -2635,7 +2991,7 @@
           "evidence_id": "lfm2-350m-f16-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "27e4ebb4c0c8b6c01ee57fa7825f34c5ddadc8ca5dc0c75d989e4507d4dcdfdb",
-          "import_route": "{\"architecture\":\"lfm2\",\"config_sha256\":\"c961bba579ea33a2472a7c5d3f469c76f1f8c7aae8440a7eaa86bc6e878a42f4\",\"execution_provider\":\"cpu\",\"model_type\":\"lfm2\",\"module_type\":\"lfm2\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.head_count_kv\",\"attention.layer_norm_rms_epsilon\",\"shortconv.l_cache\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"hybrid-text-generation\"},\"tensor_map_recipe\":[\"lfm2\"]}",
+          "import_route": "{\"architecture\":\"lfm2\",\"config_sha256\":\"e7746a202f3679ac05311fbc7a25414e4c106008fc3bd257001e97a8d7cab575\",\"execution_provider\":\"cpu\",\"model_type\":\"lfm2\",\"module_type\":\"lfm2\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.head_count_kv\",\"attention.layer_norm_rms_epsilon\",\"shortconv.l_cache\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"hybrid-text-generation\"},\"tensor_map_recipe\":[\"lfm2\"]}",
           "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
@@ -2656,6 +3012,42 @@
     },
     {
       "evidence_ids": [
+        "apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2"
+      ],
+      "filename": "Apertus-v1.1-1.5B-Instruct-BF16.gguf",
+      "lfs_sha256": "f9ec154d0ec29dad1f6465b458b7f27bd25ad7b9a3899233ae98ca6d358501c2",
+      "repository": "MrMeOrYou/Apertus-v1.1-1.5B-Instruct-GGUF",
+      "revision": "88c75ad49566d3c2157d03709bf772262c3241ed",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "apertus-v1.1-1.5b-instruct-bf16-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "4bb91bade19d41559cb524e28692453851fe67274cc58109787ee968df3e0fe5",
+          "import_route": "{\"architecture\":\"apertus\",\"config_sha256\":\"2a9660c48656c0980e76f1b374262bf8383256603e8b4221aa99bcfa11c510b0\",\"execution_provider\":\"cpu\",\"model_type\":\"apertus\",\"module_type\":\"apertus\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"apertus\",\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.layer_norm_rms_epsilon\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\",\"apertus_extras\"]}",
+          "limitations": null,
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[apertus-v1.1-1.5b-instruct-bf16]",
+          "result": "passed",
+          "runtime_package_sha256": "97582549e9c5b4114f3bcfa81c92f16aba9d14dd0ea0d2b20acaefd9060e6486",
+          "source_fidelity": true,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 3028052608,
+      "tensor_qtypes": {
+        "BF16": 98,
+        "F32": 65
+      }
+    },
+    {
+      "evidence_ids": [
         "qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2"
       ],
       "filename": "qwen2.5-0.5b-instruct-q8_0.gguf",
@@ -2671,7 +3063,7 @@
           "evidence_id": "qwen2.5-0.5b-instruct-q8-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "240e5e374803c94efdb17eee39c09b0d3e9aed10b6d8b4e1c92e39918ea2155e",
-          "import_route": "{\"architecture\":\"qwen2\",\"config_sha256\":\"f7391f2aac9a7617c1c10e397e91b6f31b80bb3c5f338966b46e7d3935246500\",\"execution_provider\":\"cpu\",\"model_type\":\"qwen2\",\"module_type\":\"qwen2\",\"preserve_quantization\":true,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "import_route": "{\"architecture\":\"qwen2\",\"config_sha256\":\"d2b0c54fdd96c5122a344240557f6b35aafa65a0e8f8981158683c089559b29a\",\"execution_provider\":\"cpu\",\"model_type\":\"qwen2\",\"module_type\":\"qwen2\",\"preserve_quantization\":true,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
           "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
@@ -2681,13 +3073,89 @@
           "source_fidelity": true,
           "stateful_semantics": "dynamic KV cache prefill, replay, rollback, reorder, and 20 decode steps",
           "storage_quantized": true,
-          "target_storage_format": "native GGUF block storage"
+          "target_storage_format": "INT8 affine block-32"
         }
       ],
       "size": 675710816,
       "tensor_qtypes": {
         "F32": 121,
         "Q8_0": 170
+      }
+    },
+    {
+      "evidence_ids": [
+        "tiny-starcoder-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "tiny_starcoder_py.Q2_K.gguf",
+      "lfs_sha256": "aa8c2170bb9172447baba14309916cfc0d901dbffaf10f1448f4f631e10c1f41",
+      "repository": "RichardErkhov/bigcode_-_tiny_starcoder_py-gguf",
+      "revision": "fa6f9fdbc134d86d78a3ff9ce08ab14ba33d4718",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[tiny-starcoder-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "tiny-starcoder-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "ab4edee4c001e3df8f4bce477447bea1c0360221163e01dd1cb03e89737107bd",
+          "import_route": "{\"architecture\":\"starcoder\",\"config_sha256\":\"45f95ad88af3f5378bdfacd633f1717012e1f3699bbe880af4f6d29fd79f2d4f\",\"execution_provider\":\"cpu\",\"model_type\":\"gpt_bigcode\",\"module_type\":\"gpt_bigcode\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"conventional_legacy\",\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.layer_norm_epsilon\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"starcoder\"]}",
+          "limitations": "Explicit-float correctness route; source GGUF blocks are dequantized.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[tiny-starcoder-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "ecbbae525e12d250c3eaa782b9eec14dba2c09fb9dbde29a8331e741e7676171",
+          "source_fidelity": false,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 103899456,
+      "tensor_qtypes": {
+        "F32": 163,
+        "Q2_K": 40,
+        "Q3_K": 40,
+        "Q6_K": 1
+      }
+    },
+    {
+      "evidence_ids": [
+        "pythia-70m-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "pythia-70m.Q2_K.gguf",
+      "lfs_sha256": "8e331c8c8016bed8ff1863b78fafe51e86b2364f32c2d7f3e201687e081cf7f7",
+      "repository": "mradermacher/pythia-70m-GGUF",
+      "revision": "52d6f045404c9f93418df2a0144d20c9de34316b",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[pythia-70m-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "pythia-70m-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "115a5b47ae04263465e8063661381c183c0b77c870ce3c3dfc339387fbbf9c2f",
+          "import_route": "{\"architecture\":\"gptneox\",\"config_sha256\":\"19607e074d570fe92a572204c482e7fde81dd3f7d6d29758fd36dc4a89ba6153\",\"execution_provider\":\"default\",\"model_type\":\"gpt_neox\",\"module_type\":\"gguf_legacy\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"exact_legacy_gguf\",\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.layer_norm_epsilon\",\"use_parallel_residual\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"legacy_layernorm\"]}",
+          "limitations": "Explicit-float correctness route on the portable graph; source GGUF blocks are dequantized and the pinned tokenizer vocabulary is extended only with deterministic padding IDs present in the GGUF.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[pythia-70m-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "798cc7d612214b032e6354d75c282d75119b3649d603a85d49643c815c24ca77",
+          "source_fidelity": false,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 38508192,
+      "tensor_qtypes": {
+        "F32": 50,
+        "Q2_K": 13,
+        "Q3_K": 12,
+        "Q6_K": 1
       }
     },
     {
@@ -2708,7 +3176,7 @@
           "evidence_id": "smollm-135m-f16-onnxruntime-1.29.0",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
-          "import_route": "{\"architecture\":\"llama\",\"config_sha256\":\"d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886\",\"execution_provider\":\"cpu\",\"model_type\":\"llama\",\"module_type\":\"llama\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "import_route": "{\"architecture\":\"llama\",\"config_sha256\":\"9f917f4a59c907325a069735b9a5d07177f3d665b5e812c10b626ecf1c94708e\",\"execution_provider\":\"cpu\",\"model_type\":\"llama\",\"module_type\":\"llama\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":\"generic_projector\"},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
           "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
@@ -2728,7 +3196,7 @@
           "evidence_id": "smollm-135m-f16-ort-genai-0.15.2",
           "execution_provider": "CPUExecutionProvider",
           "graph_sha256": "4b608b099fb17471f342c925c20173f297abd0f8456c9e96a11b1d044272d1ad",
-          "import_route": "{\"architecture\":\"llama\",\"config_sha256\":\"d3f3f2abf531abde55e04a52b5c892c93943b7e260160c796c490618a2e84886\",\"execution_provider\":\"cpu\",\"model_type\":\"llama\",\"module_type\":\"llama\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "import_route": "{\"architecture\":\"llama\",\"config_sha256\":\"9f917f4a59c907325a069735b9a5d07177f3d665b5e812c10b626ecf1c94708e\",\"execution_provider\":\"cpu\",\"model_type\":\"llama\",\"module_type\":\"llama\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":\"generic_projector\"},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
           "limitations": null,
           "onnxruntime_version": "1.29.0",
           "parity_kind": "full-logit",
@@ -2746,6 +3214,159 @@
         "F16": 211,
         "F32": 61
       }
+    },
+    {
+      "evidence_ids": [
+        "gpt2-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "gpt2-Q2_K.gguf",
+      "lfs_sha256": "4234545f917ec1df10dab4d926796a83422b68e9010d85a4c111b8b541f32892",
+      "repository": "tensorblock/gpt2-GGUF",
+      "revision": "5b01870b15c4b2e43695d7f3f3bfb5b26106f23b",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[gpt2-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "gpt2-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "ae121ccf53782ffdc530cf96329e5eacabfc0baf5fcdbfc71925e6edc4ad1423",
+          "import_route": "{\"architecture\":\"gpt2\",\"config_sha256\":\"1e0363dbc5f3427d873aeb46c27d5713ae0668f0e7cf695b5dde00bdd4d390a6\",\"execution_provider\":\"cpu\",\"model_type\":\"gpt2\",\"module_type\":\"gpt2\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":null,\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":\"gpt2\",\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"gpt2\"]}",
+          "limitations": "Explicit-float correctness route; source GGUF blocks are dequantized.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[gpt2-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "7bfca0bcb5d5aacf39738306c15d0c27db7f7c5810fd6259609fd0d2370becde",
+          "source_fidelity": false,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 81196544,
+      "tensor_qtypes": {
+        "F32": 99,
+        "Q2_K": 25,
+        "Q3_K": 24,
+        "Q6_K": 1
+      }
+    },
+    {
+      "evidence_ids": [
+        "tiny-mpt-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "tiny-mpt-random-remote-code-Q2_K.gguf",
+      "lfs_sha256": "5627dcb0ff18f6f7200f83c0aed2056a6a7c86b5f2d865833e1b5f00b00e4daa",
+      "repository": "tensorblock/tiny-mpt-random-remote-code-GGUF",
+      "revision": "c151eb3f349485ee8ae72841d7d90b9121d5baa2",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[tiny-mpt-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "tiny-mpt-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "5daf516f886110f257105a4122cba9fbdb920fab92bedf057a4f67899e513c8a",
+          "import_route": "{\"architecture\":\"mpt\",\"config_sha256\":\"7239b094edec93d3b29e2ffc53b08be450cb7c8536dd93120c4db618d47cd4f3\",\"execution_provider\":\"default\",\"model_type\":\"mpt\",\"module_type\":\"gguf_legacy\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"exact_legacy_gguf\",\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[\"attention.layer_norm_epsilon\",\"attention.max_alibi_bias\"],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"legacy_layernorm\"]}",
+          "limitations": "Explicit-float correctness route; source GGUF blocks are dequantized.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[tiny-mpt-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "20dd912c318d8115af5a5e6e92672624c00120455346ff5c9294e9dc1a1cc234",
+          "source_fidelity": false,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 8734304,
+      "tensor_qtypes": {
+        "F32": 3,
+        "IQ4_NL": 3,
+        "Q3_K": 1,
+        "Q8_0": 1
+      }
+    },
+    {
+      "evidence_ids": [
+        "tiny-olmo-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "tiny-random-olmo-Q2_K.gguf",
+      "lfs_sha256": "be1c5a22ac0e75cd5874467ffd80bcd2c8500609d3bf7ccdb5b269373e4d6da4",
+      "repository": "tensorblock/tiny-random-olmo-GGUF",
+      "revision": "d0ee9498d082d6dc3e730b9765e6e87a9bb5d995",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[tiny-olmo-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "tiny-olmo-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "eb67fb20ae4257af04db8b1554c56ae6b3f66340f2b6ff97dd55cbd14c7bce5b",
+          "import_route": "{\"architecture\":\"olmo\",\"config_sha256\":\"c02542bb6b7c076f641ff0724409471deefb0782eab37dff076e80746a59652f\",\"execution_provider\":\"cpu\",\"model_type\":\"olmo\",\"module_type\":\"olmo\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"olmo\",\"llama_qk_permute\":true,\"offset_norm\":false,\"required_metadata\":[\"attention.layer_norm_epsilon\"],\"rope_interleave\":false,\"tensor_processor\":\"llama\",\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"olmo\"]}",
+          "limitations": "Explicit-float correctness route; source GGUF blocks are dequantized.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[tiny-olmo-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "4f2817a0af1b58922f3b82d455844664948dbc67f0ffe6af576baedf2eac3835",
+          "source_fidelity": false,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 33860576,
+      "tensor_qtypes": {
+        "IQ4_NL": 2,
+        "Q2_K": 9,
+        "Q3_K": 4,
+        "Q6_K": 1
+      }
+    },
+    {
+      "evidence_ids": [
+        "tiny-starcoder2-q2-k-ort-genai-0.15.2"
+      ],
+      "filename": "tiny-random-starcoder2-Q2_K.gguf",
+      "lfs_sha256": "ab0a4b4e79c906520808db065a00a317c8b097e2176638b34088975eada6e0ed",
+      "repository": "tensorblock/tiny-random-starcoder2-GGUF",
+      "revision": "82c9eb61d1af6ea00dff834f1ff0620144b333e8",
+      "runtime_results": [
+        {
+          "compute_mode": "float operators",
+          "deterministic_test": "test_promoted_gguf_full_runtime_evidence[tiny-starcoder2-q2-k]",
+          "downstream_runtime": "ort-genai",
+          "downstream_runtime_version": "0.15.2",
+          "evidence_id": "tiny-starcoder2-q2-k-ort-genai-0.15.2",
+          "execution_provider": "CPUExecutionProvider",
+          "graph_sha256": "34c3e58ac9d95b5d1097393782d41a942ac9b6188e6d57adff21212030897a23",
+          "import_route": "{\"architecture\":\"starcoder2\",\"config_sha256\":\"25eaa4f5baa4e4725930298aaa921804d1e6f202737a3b10ec32070c4acfcb71\",\"execution_provider\":\"cpu\",\"model_type\":\"starcoder2\",\"module_type\":\"starcoder2\",\"preserve_quantization\":false,\"registry_import\":{\"config_key_map\":null,\"config_postprocessor\":\"starcoder2\",\"llama_qk_permute\":false,\"offset_norm\":false,\"required_metadata\":[],\"rope_interleave\":false,\"tensor_processor\":null,\"v_head_reorder\":false,\"vlm_builder\":null},\"route_schema\":1,\"static_cache\":false,\"task\":{\"class\":\"builtins.str\",\"state\":\"text-generation\"},\"tensor_map_recipe\":[\"llama\"]}",
+          "limitations": "Explicit-float correctness route; source GGUF blocks are dequantized. The tiny source config declares BOS/EOS ID 50256 outside its 49152-token model vocabulary.",
+          "onnxruntime_version": "1.29.0",
+          "parity_kind": "full-logit",
+          "parity_test": "test_promoted_gguf_full_runtime_evidence[tiny-starcoder2-q2-k]",
+          "result": "passed",
+          "runtime_package_sha256": "4a9ab2edf80d8cf778fccd56d306cb56dfda5bb190068faf04c78ac5d180f564",
+          "source_fidelity": false,
+          "stateful_semantics": "dynamic KV cache prefill, full-sequence replay, rollback, reorder, and 20 decode steps",
+          "storage_quantized": false,
+          "target_storage_format": "float"
+        }
+      ],
+      "size": 68039904,
+      "tensor_qtypes": {
+        "F32": 22,
+        "Q2_K": 7,
+        "Q3_K": 4,
+        "Q4_K": 2,
+        "Q6_K": 1
+      }
     }
   ],
   "transform_evidence": {
@@ -2758,16 +3379,16 @@
       "src/mobius/integrations/gguf/_repacker_test.py::TestRepackQ10::test_round_trip_dequantize"
     ],
     "embedding-and-output-aliases": [
-      "src/mobius/integrations/gguf/_builder_test.py::test_tied_quantized_embedding_is_shared_with_output_head",
-      "src/mobius/integrations/gguf/_builder_test.py::test_quantized_untied_output_head_is_preserved"
+      "src/mobius/integrations/gguf/_builder_core_test.py::test_tied_quantized_embedding_is_shared_with_output_head",
+      "src/mobius/integrations/gguf/_builder_architectures_test.py::test_quantized_untied_output_head_is_preserved"
     ],
     "expert-stacking-and-3d-experts": [
-      "src/mobius/integrations/gguf/_builder_test.py::test_fused_experts_are_split_without_tensor_loss",
+      "src/mobius/integrations/gguf/_builder_contracts_test.py::test_fused_experts_are_split_without_tensor_loss",
       "src/mobius/integrations/gguf/_block_quantized_moe_builder_test.py::test_e2e_uniform_native_moe_fuses_through_builder",
       "src/mobius/integrations/_block_quant_test.py::test_stack_is_byte_exact_and_recoverable"
     ],
     "qkv-split-and-row-permutation": [
-      "src/mobius/integrations/gguf/_builder_test.py::test_phimoe_fused_qkv_is_split_without_loss",
+      "src/mobius/integrations/gguf/_builder_core_test.py::test_phimoe_fused_qkv_is_split_without_loss",
       "src/mobius/integrations/gguf/_minicpm_test.py::test_quantized_minicpm_loader_permutes_packed_rows_scales_and_zero_points",
       "src/mobius/integrations/gguf/_kimi_k3_test.py::test_fused_kv_b_float_values_and_quantized_import"
     ],

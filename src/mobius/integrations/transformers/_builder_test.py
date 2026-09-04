@@ -12,7 +12,7 @@ import onnx_ir as ir
 import pytest
 from onnxscript import nn
 
-from mobius._configs import QuantizationConfig
+from mobius._configs import QuantizationConfig, QuantizationOverride
 from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._block_quant import BlockQuantScheme
@@ -240,6 +240,38 @@ def test_qwen38_fp8_none_revision_uses_hugging_face_default(monkeypatch) -> None
     ]
 
 
+def test_vibevoice_none_revision_pins_first_config_probe(monkeypatch) -> None:
+    from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
+
+    calls = []
+
+    def stop_after_config(model_id, **kwargs):
+        calls.append((model_id, kwargs))
+        raise RuntimeError("stop after revision assertion")
+
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        stop_after_config,
+    )
+
+    with pytest.raises(RuntimeError, match="stop after revision assertion"):
+        transformers_builder.build_transformers_model(
+            VIBEVOICE_MODEL_ID,
+            load_weights=False,
+        )
+
+    assert calls == [
+        (
+            VIBEVOICE_MODEL_ID,
+            {
+                "revision": VIBEVOICE_REVISION,
+                "trust_remote_code": False,
+            },
+        )
+    ]
+
+
 @pytest.mark.parametrize("revision", [None, "feature/revision"])
 def test_transformers_config_forwards_only_explicit_revision(monkeypatch, revision) -> None:
     import transformers
@@ -273,6 +305,7 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
         quant_method="olive",
     )
     config = make_config(
+<<<<<<< HEAD
         quantization=decoder,
         component_quantization={
             "decoder": decoder,
@@ -282,6 +315,12 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
                 quant_method="olive",
             ),
         },
+=======
+        component_quantization={
+            "decoder": decoder,
+            "vision_encoder": decoder,
+        }
+>>>>>>> origin/refactor/typed-weight-pipeline
     )
 
     stripped = transformers_builder._strip_to_text_only(config, "qwen2")
@@ -290,6 +329,36 @@ def test_strip_to_text_only_drops_component_quantization() -> None:
     assert stripped.quantization is decoder
 
 
+<<<<<<< HEAD
+=======
+def test_strip_to_text_only_resolves_decoder_module_plan() -> None:
+    decoder = QuantizationConfig(
+        bits=4,
+        group_size=16,
+        quant_method="olive",
+        overrides={"model.language_model": QuantizationOverride(bits=8, group_size=32)},
+    )
+    config = make_config(
+        quantization=decoder,
+        component_quantization={"decoder": decoder},
+    )
+
+    stripped = transformers_builder._strip_to_text_only(
+        config,
+        "qwen2",
+        decoder_source_paths=(
+            "model.language_model.layers",
+            "model.language_model.norm",
+        ),
+    )
+
+    assert stripped.component_quantization is None
+    assert stripped.quantization is not None
+    assert (stripped.quantization.bits, stripped.quantization.group_size) == (8, 32)
+    assert stripped.quantization.overrides == {}
+
+
+>>>>>>> origin/refactor/typed-weight-pipeline
 def test_transformers_build_uses_canonical_weight_loader(monkeypatch) -> None:
     hf_config = type("HFConfig", (), {"model_type": "qwen2"})()
     config = make_config(model_type="qwen2")
@@ -486,6 +555,85 @@ def test_qwen4_multimodal_build_streams_entire_package_without_eager_loader(
     assert {model.metadata_props["mobius.source_revision"] for model in package.values()} == {
         "immutable"
     }
+
+
+def test_qwen4_affine_component_plan_fails_before_weight_loading(
+    monkeypatch,
+) -> None:
+    text_config = type("TextConfig", (), {"model_type": "qwen4_exp_text"})()
+    parent_config = type(
+        "Qwen4ExpParent",
+        (),
+        {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": text_config,
+            "vision_config": object(),
+            "quantization_config": None,
+        },
+    )()
+    decoder_quantization = QuantizationConfig(
+        bits=4,
+        group_size=32,
+        quant_method="olive",
+    )
+    config = make_config(
+        model_type="qwen4_exp",
+        quantization=decoder_quantization,
+        component_quantization={"decoder": decoder_quantization},
+    )
+    package = ModelPackage(
+        {
+            name: ir.Model(ir.Graph([], [], nodes=[], name=name), ir_version=11)
+            for name in ("decoder", "vision_encoder", "embedding")
+        },
+        config=config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_load_transformers_config",
+        lambda *args, **kwargs: (parent_config, False),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_select_primary_config",
+        lambda value: (text_config, parent_config, "qwen4_exp"),
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "_resolve_module_class",
+        lambda *args, **kwargs: (
+            _DummyModule,
+            "qwen4-exp-vision-language",
+            "qwen4_exp",
+        ),
+    )
+    monkeypatch.setattr(
+        _config_resolver,
+        "_config_from_hf",
+        lambda *args, **kwargs: config,
+    )
+    monkeypatch.setattr(
+        transformers_builder,
+        "build_from_module",
+        lambda *args, **kwargs: package,
+    )
+    download = mock.Mock()
+    monkeypatch.setattr(transformers_builder, "_download_weights", download)
+
+    with (
+        mock.patch(
+            "mobius.integrations.transformers._qwen4_exp_weights."
+            "stream_qwen4_exp_safetensors_to_package"
+        ) as stream,
+        pytest.raises(NotImplementedError, match="packed expert"),
+    ):
+        transformers_builder.build_transformers_model(
+            "Qwen/Qwen3.8-Flash-Next",
+        )
+
+    stream.assert_not_called()
+    download.assert_not_called()
 
 
 def test_transformers_build_routes_compressed_tensors_to_streaming_loader(

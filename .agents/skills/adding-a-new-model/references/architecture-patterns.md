@@ -50,7 +50,7 @@ graphs; weight-loading may need minor adjustments:
 ### NEVER safe as registry aliases
 
 These model families have fundamentally different computation that **cannot**
-be represented by standard base classes, even though `build_graph_test` passes:
+be represented by standard base classes, even though the L1 graph suite passes:
 
 | Category | Models | Why it fails |
 |----------|--------|-------------|

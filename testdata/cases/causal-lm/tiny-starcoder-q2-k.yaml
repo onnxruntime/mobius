@@ -1,0 +1,47 @@
+model_id: "bigcode/tiny_starcoder_py"
+model_type: "gpt_bigcode"
+revision: "8547527bef0bc927268c1653cce6948c5c242dd1"
+task_type: "text-generation"
+dtype: "float32"
+
+gguf:
+  repository: "RichardErkhov/bigcode_-_tiny_starcoder_py-gguf"
+  revision: "fa6f9fdbc134d86d78a3ff9ce08ab14ba33d4718"
+  filename: "tiny_starcoder_py.Q2_K.gguf"
+  size: 103899456
+  lfs_sha256: "aa8c2170bb9172447baba14309916cfc0d901dbffaf10f1448f4f631e10c1f41"
+  tensor_count: 244
+  tensor_qtypes: {F32: 163, Q2_K: 40, Q3_K: 40, Q6_K: 1}
+  execution_provider: "cpu"
+  config_sha256: "45f95ad88af3f5378bdfacd633f1717012e1f3699bbe880af4f6d29fd79f2d4f"
+  preserve_quantization: false
+  tokenizer:
+    repository: "bigcode/tiny_starcoder_py"
+    revision: "8547527bef0bc927268c1653cce6948c5c242dd1"
+    metadata_sha256: "23379a715b3983ce0f1559645984431bc039c16eaf6e062b7e62bceac6fa64cd"
+    identity_status: "exact"
+    assets:
+      - {filename: "special_tokens_map.json", size: 532, sha256: "0823292e24ea07b89317e9ede9d08da2a1b6c014290c06908a7ad04f1efd6719"}
+      - {filename: "tokenizer.json", size: 2057395, sha256: "42b5a37ba11199f024f2b8873e1ecba98da33166e16f700bf7cb2304b0a5583f"}
+      - {filename: "tokenizer_config.json", size: 677, sha256: "95684c52ad9a970dbbb17576ee2237cb62902c1eff6804c7c91a4d6219a4a6d7"}
+
+ort_genai:
+  tier: "real"
+  runtime_versions: ["0.15.2"]
+  model_type: "decoder"
+  runtime_evidence_id: "tiny-starcoder-q2-k-ort-genai-0.15.2"
+  execution_provider: "cpu"
+  max_download_bytes: 107000000
+  released_capabilities:
+    "0.15.2": {generic_decoder: true, state_groups: false}
+
+inputs:
+  prompts: ["The capital of France is"]
+
+level: "L4+L5"
+generation:
+  max_new_tokens: 20
+  do_sample: false
+  exact_match: true
+
+notes: "Independent same-value Transformers reference; explicit-float runtime evidence only."

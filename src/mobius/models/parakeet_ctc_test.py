@@ -23,7 +23,6 @@ from mobius import build_from_module
 from mobius._configs import ParakeetCTCConfig
 from mobius._testing.ort_inference import OnnxModelSession
 from mobius.integrations._weight_loading import apply_weights
-from mobius.integrations.ort_genai import write_ort_genai_config
 from mobius.models import ParakeetForCTCModel
 from mobius.tasks import FeatureCTCAsrTask
 
@@ -166,13 +165,3 @@ def test_parakeet_synthetic_parity_with_padding():
         session.close()
 
     np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5)
-
-
-def test_parakeet_rejects_unsupported_ort_genai_export(tmp_path):
-    _, _, _, package = _build_tiny()
-
-    with pytest.raises(
-        ValueError,
-        match="does not define a feature-input CTC ASR pipeline",
-    ):
-        write_ort_genai_config(package, str(tmp_path))

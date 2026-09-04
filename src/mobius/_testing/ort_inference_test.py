@@ -120,3 +120,16 @@ def test_close_releases_session_reference() -> None:
     session.close()
 
     assert not hasattr(session, "_session")
+
+
+def test_providers_returns_runtime_priority_order() -> None:
+    class _Session:
+        def get_providers(self) -> list[str]:
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    session = OnnxModelSession.__new__(OnnxModelSession)
+    session._session = _Session()  # type: ignore[attr-defined]
+    session._tmpdir = tempfile.TemporaryDirectory()  # type: ignore[attr-defined]
+
+    assert session.providers == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    session.close()

@@ -7,6 +7,7 @@ import hashlib
 import json
 import pathlib
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -530,13 +531,12 @@ def test_multimodal_embedding_preserves_global_image_order():
     np.testing.assert_array_equal(actual[0, 0], weight[input_ids[0, 0]].numpy())
 
 
-def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_path):
+def test_state_manifest_preserves_layers_and_workflows_fail_closed(tmp_path):
     from mobius._model_package import ModelPackage
     from mobius.integrations.onnx_genai.auto_export import write_onnx_genai_config
     from mobius.integrations.onnx_genai.workflow_metadata import (
         build_vlm_workflow_metadata,
     )
-    from mobius.integrations.ort_genai.auto_export import write_ort_genai_config
 
     config = _vl_config()
     package = Qwen4ExpVisionLanguageTask().build(
@@ -574,63 +574,54 @@ def test_state_manifest_preserves_layers_and_runtime_workflows_fail_closed(tmp_p
             "update": {"key": "append", "value": "append", "index_key": "replace"},
         },
     ]
-    ort_output = tmp_path / "ort"
-    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
-        write_ort_genai_config(package, str(ort_output))
-    assert not ort_output.exists()
-
     with pytest.raises(ValueError, match="cannot bind Qwen4-Exp"):
         build_vlm_workflow_metadata(package, config)
     onnx_genai_output = tmp_path / "onnx-genai"
-    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
-        write_onnx_genai_config(
-            package,
-            str(onnx_genai_output),
-            config=config,
-        )
-    assert not onnx_genai_output.exists()
+    onnx_artifacts = write_onnx_genai_config(
+        package,
+        str(onnx_genai_output),
+        config=config,
+    )
+    onnx_compatibility = json.loads(
+        Path(onnx_artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
+    )
+    assert onnx_compatibility["runtime_validation_status"] == ("unsupported-by-tested-runtime")
+    assert "past_position_ids" in onnx_compatibility["components"]["decoder"]["inputs"]
 
     override_output = tmp_path / "override"
     override_output.mkdir()
     sentinel = override_output / "sentinel.bin"
     sentinel.write_bytes(b"unchanged")
-    snapshot = {path.name: path.read_bytes() for path in override_output.iterdir()}
     non_qwen_override = SimpleNamespace(model_type="qwen2")
-    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
-        write_onnx_genai_config(
-            package,
-            str(override_output),
-            config=non_qwen_override,
-        )
-    assert {path.name: path.read_bytes() for path in override_output.iterdir()} == snapshot
+    override_artifacts = write_onnx_genai_config(
+        package,
+        str(override_output),
+        config=non_qwen_override,
+    )
+    assert sentinel.read_bytes() == b"unchanged"
+    assert (
+        json.loads(
+            Path(override_artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
+        )["runtime_validation_status"]
+        == "unsupported-by-tested-runtime"
+    )
 
     structurally_identical = ModelPackage(
         dict(package),
         config=non_qwen_override,
     )
     structural_output = tmp_path / "structural"
-    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
-        write_onnx_genai_config(
-            structurally_identical,
-            str(structural_output),
-            config=non_qwen_override,
-        )
-    assert not structural_output.exists()
-
-
-def test_ort_genai_text_export_also_fails_before_writing_artifacts(tmp_path):
-    from mobius.integrations.ort_genai.auto_export import export_package
-
-    config = _config()
-    package = build_from_module(
-        Qwen4ExpCausalLMModel(config),
-        config,
-        task="qwen4-exp-text-generation",
+    structural_artifacts = write_onnx_genai_config(
+        structurally_identical,
+        str(structural_output),
+        config=non_qwen_override,
     )
-    output_dir = tmp_path / "output"
-    with pytest.raises(ValueError, match="cannot represent Qwen4-Exp"):
-        export_package(package, str(output_dir))
-    assert not output_dir.exists()
+    assert (
+        json.loads(
+            Path(structural_artifacts["runtime_compatibility"]).read_text(encoding="utf-8")
+        )["runtime_validation_status"]
+        == "unsupported-by-tested-runtime"
+    )
 
 
 def test_processor_config_matches_qwen4exp_graph_contract(tmp_path):

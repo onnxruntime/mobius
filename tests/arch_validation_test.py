@@ -165,7 +165,7 @@ def _resolve_hf_config(hf_config, registration=None):
 def _build_graph(model_type: str, model_id: str):
     """Download config, build ONNX graph, return ``(ModelPackage, task)``.
 
-    Uses get_task().build() directly (same pattern as build_graph_test.py)
+    Uses get_task().build() directly (same pattern as the L1 graph tests)
     to bypass ArchitectureConfig.validate() which rejects non-LM configs
     (e.g. vision models with vocab_size=0).
     """

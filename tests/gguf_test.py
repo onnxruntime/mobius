@@ -9,6 +9,9 @@ test the full pipeline without network downloads.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -34,6 +37,8 @@ def _create_tiny_gguf(
     vocab: int = 256,
     ffn_size: int | None = None,
     float_type: str = "f32",
+    tokenizer_pre: str | None = None,
+    unknown_tokenizer_field: bool = False,
 ) -> str:
     """Create a minimal GGUF file with fp32 weights for testing.
 
@@ -52,6 +57,14 @@ def _create_tiny_gguf(
     writer.add_context_length(128)
     writer.add_feed_forward_length(ffn_size)
     writer.add_vocab_size(vocab)
+    if tokenizer_pre is not None:
+        tokens = [f"token-{index}" for index in range(vocab)]
+        writer.add_tokenizer_model("gpt2")
+        writer.add_string("tokenizer.ggml.pre", tokenizer_pre)
+        writer.add_token_list(tokens)
+        writer.add_token_merges([f"{tokens[0]} {tokens[1]}"])
+    if unknown_tokenizer_field:
+        writer.add_string("tokenizer.ggml.future_semantics", "opaque")
 
     # Tensors — unquantized random weights
     rng = np.random.default_rng(42)
@@ -468,6 +481,62 @@ class TestGGUFTensorProcessors:
 class TestCLIBuildGGUF:
     """Test the build-gguf CLI subcommand."""
 
+    def test_partial_cli_status_distinguishes_deferred_support_from_omission(
+        self, tmp_path, capsys
+    ):
+        from types import SimpleNamespace
+
+        from mobius.__main__ import _print_gguf_export_status
+        from mobius._export_report import (
+            ComponentExportDisposition,
+            ComponentExportReport,
+        )
+
+        report = ComponentExportReport.create(
+            (
+                ComponentExportDisposition(
+                    name="model",
+                    route="llama",
+                    requested=True,
+                    discovered=True,
+                    support="supported",
+                    output="exported",
+                ),
+                ComponentExportDisposition(
+                    name="runtime",
+                    route="ort-genai",
+                    requested=True,
+                    discovered=True,
+                    support="deferred",
+                    output="exported",
+                    runtime_validation_status="unvalidated",
+                    blocker_category="runtime-validation-unavailable",
+                    reason="runtime evidence is pending",
+                    impact="execution is unvalidated",
+                    remediation="validate before production use",
+                ),
+                ComponentExportDisposition(
+                    name="tokenizer",
+                    route="embedded",
+                    requested=True,
+                    discovered=True,
+                    support="supported",
+                    output="exported",
+                ),
+            ),
+            end_to_end_runnable=False,
+        )
+
+        _print_gguf_export_status(
+            SimpleNamespace(export_report=report),
+            str(tmp_path),
+            runtime="ort-genai",
+        )
+
+        output = capsys.readouterr().out
+        assert "all requested components were exported" in output
+        assert "components were omitted" not in output
+
     def test_help_text(self, capsys):
         """build-gguf subcommand shows in help."""
         from mobius.__main__ import main
@@ -502,6 +571,328 @@ class TestCLIBuildGGUF:
         op_types = {node.op_type for node in package["model"].graph}
         assert "MatMulNBits" not in op_types
         assert "BlockQuantizedMatMul" not in op_types
+
+    def test_authoritative_tokenizer_blocker_exports_partial_model_package(
+        self, tmp_path, caplog
+    ):
+        from mobius._model_package import ModelPackage
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._tokenizer_census import tokenizer_route_census
+
+        path = _create_tiny_gguf(
+            tmp_path / "blocked-tokenizer.gguf",
+            tokenizer_pre="bailingmoe2",
+        )
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            package = build_from_gguf(path, keep_quantized=False)
+
+        assert "model" in package
+        assert package.export_report is not None
+        assert package.export_report.status == "partial"
+        assert package.export_report.runtime_validation_status == "unvalidated"
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer is not None
+        audit = next(
+            record for record in tokenizer_route_census() if record.identifier == "bailingmoe2"
+        )
+        assert tokenizer.route == "bailingmoe2"
+        assert tokenizer.support == "blocked"
+        assert tokenizer.output == "omitted"
+        assert tokenizer.blocker_category == audit.blocker_category
+        assert tokenizer.evidence_id == audit.blocker_evidence_id
+        assert tokenizer.reason == audit.candidate_disposition
+        assert "semantics are unverified" in tokenizer.remediation
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("GGUF PARTIAL EXPORT WARNING:")
+        ]
+        assert len(warnings) == 1
+        warning = json.loads(warnings[0].partition(": ")[2])
+        assert warning["route"] == "bailingmoe2"
+        assert warning["blocker_category"] == audit.blocker_category
+        assert warning["evidence_id"] == audit.blocker_evidence_id
+        assert warning["reason"] == audit.candidate_disposition
+        assert "not end-to-end runnable" in warning["impact"]
+        assert "Provide and validate a tokenizer" in warning["remediation"]
+
+        first = tmp_path / "partial-a"
+        second = tmp_path / "partial-b"
+        package.save(first, progress_bar=False)
+        package.save(second, progress_bar=False)
+        assert (first / "model.onnx").is_file()
+        assert (first / "export_report.json").read_bytes() == (
+            second / "export_report.json"
+        ).read_bytes()
+        assert ModelPackage.load(first).export_report == package.export_report
+        assert not {
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "gguf_tokenizer_manifest.json",
+        }.intersection(path.name for path in first.iterdir())
+
+    def test_missing_tokenizer_metadata_exports_model_with_one_structured_warning(
+        self, tmp_path, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = _create_tiny_gguf(tmp_path / "no-tokenizer.gguf")
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            package = build_from_gguf(path, keep_quantized=False)
+
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer.route == "absent"
+        assert tokenizer.support == "deferred"
+        assert tokenizer.output == "omitted"
+        assert tokenizer.blocker_category == "serialized-tokenizer-pipeline-incomplete"
+        assert tokenizer.reason.endswith("contains no tokenizer metadata")
+        assert "semantics are unverified" in tokenizer.remediation
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("GGUF PARTIAL EXPORT WARNING:")
+        ]
+        assert len(warnings) == 1
+        warning = json.loads(warnings[0].partition(": ")[2])
+        assert warning["route"] == "absent"
+        assert warning["blocker_category"] == ("serialized-tokenizer-pipeline-incomplete")
+        assert warning["reason"].endswith("contains no tokenizer metadata")
+
+    def test_unknown_tokenizer_field_exports_model_with_explicit_diagnostics(
+        self, tmp_path, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = _create_tiny_gguf(
+            tmp_path / "unknown-tokenizer-field.gguf",
+            unknown_tokenizer_field=True,
+        )
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            package = build_from_gguf(path, keep_quantized=False)
+
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer.blocker_category == "unsupported-tokenizer-metadata-fields"
+        assert tokenizer.output == "omitted"
+        assert "tokenizer.ggml.future_semantics" in tokenizer.reason
+        assert caplog.text.count("GGUF PARTIAL EXPORT WARNING:") == 1
+
+    def test_unexpected_tokenizer_disposition_error_still_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = _create_tiny_gguf(
+            tmp_path / "unexpected-tokenizer.gguf",
+            tokenizer_pre="bailingmoe",
+        )
+
+        def unexpected(*_args, **_kwargs):
+            raise RuntimeError("unexpected tokenizer evidence failure")
+
+        monkeypatch.setattr(
+            "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_blocker_evidence",
+            unexpected,
+        )
+        with pytest.raises(RuntimeError, match="unexpected tokenizer evidence failure"):
+            build_from_gguf(path, keep_quantized=False)
+        assert "GGUF PARTIAL EXPORT WARNING" not in caplog.text
+
+    def test_model_route_blocker_remains_a_hard_failure(self, tmp_path, caplog):
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._errors import UnsupportedGGUFArchitectureError
+
+        path = _create_tiny_gguf(
+            tmp_path / "unsupported-model.gguf",
+            arch="future-model",
+            tokenizer_pre="bailingmoe",
+        )
+
+        with pytest.raises(UnsupportedGGUFArchitectureError):
+            build_from_gguf(path, keep_quantized=False)
+        assert "GGUF PARTIAL EXPORT WARNING" not in caplog.text
+
+    def test_exact_artifact_blocker_overrides_a_validated_route(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._tokenizer_evidence import tokenizer_blocker_evidence
+
+        blocker = tokenizer_blocker_evidence("plm-1.8b-instruct-q4-k-m-tokenizer-blocker")
+        assert blocker is not None
+        path = _create_tiny_gguf(
+            tmp_path / "exact-artifact-blocker.gguf",
+            tokenizer_pre="qwen2",
+        )
+        monkeypatch.setattr(
+            "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_blocker_evidence",
+            lambda *_args, **_kwargs: blocker,
+        )
+
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            package = build_from_gguf(path, keep_quantized=False)
+
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer.route == "qwen2"
+        assert tokenizer.evidence_id == blocker.evidence_id
+        assert tokenizer.reason == blocker.disposition
+        assert caplog.text.count("GGUF PARTIAL EXPORT WARNING:") == 1
+
+    def test_multimodal_route_records_identity_and_exact_tokenizer_blocker(
+        self, tmp_path, monkeypatch
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+        from mobius.integrations.gguf._tokenizer import GGUFTokenizerVerdict
+        from mobius.integrations.gguf._tokenizer_evidence import tokenizer_blocker_evidence
+
+        blocker = tokenizer_blocker_evidence("plm-1.8b-instruct-q4-k-m-tokenizer-blocker")
+        assert blocker is not None
+        package = mock.MagicMock()
+        package.__iter__.return_value = iter(("model", "vision"))
+        package.config = SimpleNamespace(model_type="test-vlm")
+        package.gguf_source_path = str(tmp_path / "text.gguf")
+        package.gguf_tokenizer_verdict = GGUFTokenizerVerdict(
+            route="deferred",
+            model="gpt2",
+            pre="qwen2",
+            canonical_pre="qwen2",
+            reason="base deferred reason",
+            token_count=2,
+            metadata_sha256="a" * 64,
+        )
+        package.export_report = None
+        text_model = SimpleNamespace(
+            architecture="llama",
+            metadata={},
+            source_identity=(1, 2, 3),
+            source_matches_path=lambda: True,
+        )
+        monkeypatch.setattr(
+            "mobius.integrations.gguf._mmproj.build_vlm_from_gguf",
+            lambda *_args, **_kwargs: package,
+        )
+        monkeypatch.setattr(
+            "mobius.integrations.gguf._tokenizer_evidence.matching_tokenizer_blocker_evidence",
+            lambda *_args, **_kwargs: blocker,
+        )
+
+        result = build_from_gguf(
+            "text.gguf",
+            mmproj="vision.gguf",
+            _gguf_model=text_model,
+        )
+
+        assert result is package
+        assert package.gguf_architecture == "llama"
+        assert package.gguf_execution_provider == "default"
+        assert package.gguf_source_filename == "text.gguf"
+        route = json.loads(package.gguf_import_route)
+        assert route["components"] == ["model", "vision"]
+        assert route["multimodal_projector"] is True
+        tokenizer = package.export_report.component("tokenizer")
+        assert tokenizer.evidence_id == blocker.evidence_id
+        assert tokenizer.reason == blocker.disposition
+
+    def test_validated_tokenizer_route_preserves_existing_graph_package_files(
+        self, tmp_path, caplog
+    ):
+        from mobius.integrations.gguf import build_from_gguf
+
+        path = _create_tiny_gguf(
+            tmp_path / "validated-tokenizer.gguf",
+            tokenizer_pre="gpt-2",
+        )
+        package = build_from_gguf(path, keep_quantized=False)
+        output = tmp_path / "validated-output"
+        package.save(output, progress_bar=False)
+
+        assert package.export_report is None
+        assert not (output / "export_report.json").exists()
+        assert "GGUF PARTIAL EXPORT WARNING" not in caplog.text
+
+    def test_cli_runtime_request_preserves_model_for_tokenizer_blocker(
+        self, tmp_path, caplog, capsys
+    ):
+        from mobius.__main__ import main
+        from mobius._model_package import ModelPackage
+
+        path = _create_tiny_gguf(
+            tmp_path / "runtime-blocked-tokenizer.gguf",
+            tokenizer_pre="cohere2moe",
+        )
+        output = tmp_path / "runtime-partial"
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            main(
+                [
+                    "build-gguf",
+                    path,
+                    "--output",
+                    str(output),
+                    "--dequantize",
+                    "--runtime",
+                    "ort-genai",
+                ]
+            )
+
+        stdout = capsys.readouterr().out
+        package = ModelPackage.load(output)
+        assert (output / "model.onnx").is_file()
+        assert (output / "export_report.json").is_file()
+        assert package.export_report is not None
+        assert package.export_report.component("runtime").output == "exported"
+        assert "Export status: PARTIAL" in stdout
+        assert "requested runtime: ort-genai (unvalidated)" in stdout
+        assert "omitted components: tokenizer" in stdout
+        assert caplog.text.count("GGUF PARTIAL EXPORT WARNING:") == 1
+        assert (output / "genai_config.json").is_file()
+        assert not (output / "tokenizer.json").exists()
+        assert not list(tmp_path.glob(".runtime-partial.*.tmp"))
+
+    def test_cli_unmatched_runtime_version_exports_unvalidated_model(
+        self, tmp_path, caplog, capsys
+    ):
+        from mobius.__main__ import main
+        from mobius._model_package import ModelPackage
+
+        path = _create_tiny_gguf(
+            tmp_path / "runtime-unvalidated.gguf",
+            tokenizer_pre="gpt-2",
+        )
+        output = tmp_path / "runtime-unvalidated"
+        with caplog.at_level("WARNING", logger="mobius.integrations.gguf._component_export"):
+            main(
+                [
+                    "build-gguf",
+                    path,
+                    "--output",
+                    str(output),
+                    "--dequantize",
+                    "--runtime",
+                    "ort-genai",
+                    "--runtime-version",
+                    "99.0",
+                    "--tokenizer-repository",
+                    "owner/tokenizer",
+                    "--tokenizer-revision",
+                    "a" * 40,
+                ]
+            )
+
+        stdout = capsys.readouterr().out
+        package = ModelPackage.load(output)
+        assert (output / "model.onnx").is_file()
+        assert package.export_report is not None
+        assert package.export_report.export_status == "partial"
+        assert package.export_report.runtime_validation_status == "unvalidated"
+        runtime_component = package.export_report.component("runtime")
+        assert runtime_component.blocker_category == "runtime-validation-unavailable"
+        assert runtime_component.output == "exported"
+        assert "Export status: PARTIAL" in stdout
+        assert "Runtime validation: UNVALIDATED" in stdout
+        assert "requested runtime: ort-genai (unvalidated)" in stdout
+        assert (output / "genai_config.json").is_file()
+        assert not (output / "tokenizer.json").exists()
 
     @pytest.mark.parametrize(
         ("extra_args", "expected"),
@@ -565,21 +956,74 @@ class TestCLIBuildGGUF:
 
         assert build.call_args.kwargs["reuse_gguf_weights"] is True
 
-    def test_reuse_rejects_ort_genai_runtime(self, tmp_path):
+    def test_reuse_with_ort_genai_preserves_runtime_unvalidated_model(self, tmp_path):
         from mobius.__main__ import main
+        from mobius.integrations.gguf._component_export import (
+            attach_runtime_unvalidated_report,
+        )
 
-        with pytest.raises(SystemExit, match="cannot be combined"):
+        package = mock.MagicMock()
+        package.export_report = None
+        package.gguf_architecture = "llama"
+        package.gguf_tokenizer_verdict = mock.Mock(
+            materialized=False,
+            route_identifier="gpt-2",
+            reason="tokenizer materialization was not validated",
+            blocker_category=None,
+            evidence_id=None,
+        )
+        package.__iter__.return_value = iter(("model",))
+        package.__len__.return_value = 1
+        gguf_model = mock.Mock(metadata={}, architecture="llama")
+        output = tmp_path / "output"
+
+        def publish(pkg, _source, destination, **_kwargs):
+            attach_runtime_unvalidated_report(
+                pkg,
+                "ort-genai",
+                blocker_category="runtime-executor-limitation",
+                reason="ORT GenAI cannot disable constant folding.",
+            )
+            destination = Path(destination)
+            destination.mkdir()
+            (destination / "model.onnx").write_bytes(b"model")
+            pkg.export_report.write_json(destination / "export_report.json")
+            return {"export_report": str(destination / "export_report.json")}
+
+        with (
+            mock.patch(
+                "mobius.integrations.gguf._builder._resolve_gguf_path",
+                return_value=str(tmp_path / "model.gguf"),
+            ),
+            mock.patch(
+                "mobius.integrations.gguf._shard_set.open_gguf_model",
+                return_value=gguf_model,
+            ),
+            mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
+            mock.patch(
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ) as build,
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                side_effect=publish,
+            ),
+        ):
             main(
                 [
                     "build-gguf",
                     str(tmp_path / "model.gguf"),
                     "--output",
-                    str(tmp_path / "output"),
+                    str(output),
                     "--reuse-gguf-weights",
                     "--runtime",
                     "ort-genai",
                 ]
             )
+
+        assert build.call_args.kwargs["reuse_gguf_weights"] is True
+        assert (output / "model.onnx").is_file()
+        assert package.export_report.component("runtime").output == "exported"
 
     def test_ort_genai_runtime_is_forwarded_to_package_writer(self, tmp_path):
         """build-gguf forwards one canonically opened source to build and packaging."""
@@ -650,11 +1094,41 @@ class TestCLIBuildGGUF:
             max_workers=8,
         )
 
-    def test_runtime_without_pinned_tokenizer_fails_before_graph_or_output(self, tmp_path):
+    def test_runtime_without_pinned_tokenizer_exports_unvalidated_model(
+        self, tmp_path, capsys
+    ):
         from mobius.__main__ import main
-        from mobius.integrations.gguf._spec import Support
+        from mobius.integrations.gguf._component_export import (
+            attach_runtime_unvalidated_report,
+        )
 
         output = tmp_path / "output"
+        package = mock.MagicMock()
+        package.export_report = None
+        package.gguf_architecture = "llama"
+        package.gguf_tokenizer_verdict = mock.Mock(
+            materialized=False,
+            route_identifier="gpt-2",
+            reason="tokenizer materialization was not validated",
+            blocker_category=None,
+            evidence_id=None,
+        )
+        package.__iter__.return_value = iter(("model",))
+        package.__len__.return_value = 1
+
+        def publish_unvalidated(pkg, _source, destination, **_kwargs):
+            attach_runtime_unvalidated_report(
+                pkg,
+                "ort-genai",
+                blocker_category="runtime-tokenizer-identity-unavailable",
+                reason="No immutable tokenizer identity was supplied.",
+            )
+            destination = Path(destination)
+            destination.mkdir()
+            (destination / "model.onnx").write_bytes(b"model")
+            pkg.export_report.write_json(destination / "export_report.json")
+            return {"export_report": str(destination / "export_report.json")}
+
         with (
             mock.patch(
                 "mobius.integrations.gguf._builder._resolve_gguf_path",
@@ -666,15 +1140,13 @@ class TestCLIBuildGGUF:
             ),
             mock.patch("mobius.integrations.gguf._builder._validate_gguf_model"),
             mock.patch(
-                "mobius.integrations.gguf._arch_registry.get_arch_spec",
-                return_value=mock.Mock(
-                    gguf_arch="llama",
-                    runtime=Support.SUPPORTED,
-                    reason=None,
-                ),
+                "mobius.integrations.gguf.build_from_gguf",
+                return_value=package,
+            ) as build,
+            mock.patch(
+                "mobius.integrations.gguf.write_gguf_runtime_package",
+                side_effect=publish_unvalidated,
             ),
-            mock.patch("mobius.integrations.gguf.build_from_gguf") as build,
-            pytest.raises(SystemExit, match="requires --tokenizer-repository"),
         ):
             main(
                 [
@@ -686,8 +1158,13 @@ class TestCLIBuildGGUF:
                     "ort-genai",
                 ]
             )
-        build.assert_not_called()
-        assert not output.exists()
+
+        assert build.call_count == 1
+        assert (output / "model.onnx").is_file()
+        assert (output / "export_report.json").is_file()
+        assert package.export_report.export_status == "partial"
+        assert package.export_report.runtime_validation_status == "unvalidated"
+        assert "requested runtime: ort-genai (unvalidated)" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
         ("error", "message"),

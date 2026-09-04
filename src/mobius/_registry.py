@@ -40,12 +40,14 @@ from mobius._configs import (
     MiniMaxConfig,
     MMSConfig,
     MoonshineConfig,
+    MoonshineStreamingConfig,
     MuseGlimmerConfig,
     NemotronParseConfig,
     ParakeetCTCConfig,
     Plamo2Config,
     Qwen4ExpConfig,
     SenseNovaU1Config,
+    VibeVoiceConfig,
     WhisperConfig,
     XverseConfig,
 )
@@ -90,6 +92,9 @@ from mobius.models import (
     GPTOSSCausalLMModel,
     GraniteCausalLMModel,
     GraniteMoECausalLMModel,
+    GrokGGUFCausalLMModel,
+    GroveMoEGGUFCausalLMModel,
+    HunyuanMoEGGUFCausalLMModel,
     HunYuanMoEV1CausalLMModel,
     HunYuanV1DenseCausalLMModel,
     HunYuanVLMoTModel,
@@ -108,8 +113,11 @@ from mobius.models import (
     Llama4CausalLMModel,
     MageVLForConditionalGeneration,
     MaincoderCausalLMModel,
+    MiniMaxM2GGUFCausalLMModel,
+    Mistral4GGUFCausalLMModel,
     MoECausalLMModel,
     MoonshineForConditionalGeneration,
+    MoonshineStreamingForConditionalGeneration,
     NanoChatCausalLMModel,
     NemotronCausalLMModel,
     NemotronParseForConditionalGeneration,
@@ -145,10 +153,13 @@ from mobius.models import (
     Qwen35VL3ModelCausalLMModel,
     Qwen35VLTextModel,
     QwenCausalLMModel,
+    ReUseConfig,
     RND1Model,
+    SEMambaSpeechEnhancementModel,
     SmallThinkerGGUFCausalLMModel,
     SmolLM3CausalLMModel,
     SortformerDiarizationModel,
+    VibeVoiceForConditionalGeneration,
     WhisperForConditionalGeneration,
     XverseCausalLMModel,
 )
@@ -216,6 +227,7 @@ from mobius.models.starcoder2 import StarCoder2CausalLMModel
 from mobius.models.t5 import T5EncoderModel, T5ForConditionalGeneration
 from mobius.models.talkie import TalkieForCausalLM
 from mobius.models.trocr import TrOCRForConditionalGeneration
+from mobius.models.vibevoice import VIBEVOICE_MODEL_ID, VIBEVOICE_REVISION
 from mobius.models.vit import ViTModel
 from mobius.models.wav2vec2 import Wav2Vec2Model
 from mobius.models.wav2vec2_ctc import Wav2Vec2ForCTCModel
@@ -489,6 +501,17 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         test_model_id="Maincode/Maincoder-1B",
         test_revision="088ec98640bdeb105f46a9ef6a1370ed5d0d2ea5",
     ),
+    "minimax_m2_gguf": ModelRegistration(
+        MiniMaxM2GGUFCausalLMModel,
+        family="minimax",
+        variant="gguf",
+    ),
+    "mistral4_gguf": ModelRegistration(
+        Mistral4GGUFCausalLMModel,
+        task="mistral4-gguf-text-generation",
+        family="mistral",
+        variant="gguf",
+    ),
     "bloom": ModelRegistration(BloomCausalLMModel),
     "orion": ModelRegistration(LayerNormCausalLMModel),
     "chatglm": ModelRegistration(ChatGLMCausalLMModel),
@@ -681,6 +704,9 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "granitemoe": ModelRegistration(GraniteMoECausalLMModel),
     "granitemoehybrid": ModelRegistration(GraniteMoeHybridCausalLMModel),
     "granitemoeshared": ModelRegistration(GraniteMoECausalLMModel),
+    "grok_gguf": ModelRegistration(GrokGGUFCausalLMModel),
+    "grovemoe_gguf": ModelRegistration(GroveMoEGGUFCausalLMModel),
+    "hunyuan_moe_gguf": ModelRegistration(HunyuanMoEGGUFCausalLMModel),
     "hunyuan_v1_moe": ModelRegistration(HunYuanMoEV1CausalLMModel),
     "jetmoe": ModelRegistration(JetMoeCausalLMModel),
     "kimi_linear": ModelRegistration(
@@ -871,6 +897,14 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     "sensevoice_small": ModelRegistration(SenseVoiceSmallModel, task="audio-ctc"),
     "qwen3_tts": ModelRegistration(Qwen3TTSForConditionalGeneration),
     "qwen3_tts_tokenizer_12hz": ModelRegistration(Qwen3TTSTokenizerV2Model, task="codec"),
+    "vibevoice": ModelRegistration(
+        VibeVoiceForConditionalGeneration,
+        task="vibevoice-tts",
+        config_class=VibeVoiceConfig,
+        test_model_id=VIBEVOICE_MODEL_ID,
+        test_revision=VIBEVOICE_REVISION,
+        family="vibevoice",
+    ),
     "whisper": ModelRegistration(
         WhisperForConditionalGeneration,
         task="speech-to-text",
@@ -880,6 +914,11 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
         MoonshineForConditionalGeneration,
         task="speech-to-text",
         config_class=MoonshineConfig,
+    ),
+    "moonshine_streaming": ModelRegistration(
+        MoonshineStreamingForConditionalGeneration,
+        task="speech-to-text",
+        config_class=MoonshineStreamingConfig,
     ),
     # --- Encoder-only ---
     "albert": ModelRegistration(BertModel, task="feature-extraction"),
@@ -1047,6 +1086,16 @@ _REGISTRATIONS: dict[str, ModelRegistration] = {
     ),
     "fastconformer_rnnt": ModelRegistration(EncDecRNNTModel, task="fastconformer-rnnt"),
     "sortformer": ModelRegistration(SortformerDiarizationModel, task="diarization"),
+    "reuse": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
+    "semamba": ModelRegistration(
+        SEMambaSpeechEnhancementModel,
+        task="speech-enhancement",
+        config_class=ReUseConfig,
+    ),
 }
 
 
@@ -1330,6 +1379,7 @@ _TEST_MODEL_IDS: dict[str, str] = {
 
     # --- Speech ---
     "moonshine": "moonshine-ai/moonshine-tiny",
+    "moonshine_streaming": "moonshine-ai/moonshine-streaming-tiny",
     "whisper": "openai/whisper-tiny",
     "qwen3_asr": "Qwen/Qwen3-ASR-0.6B",
     "fun_asr": "justinchuby/Fun-ASR-Nano-2512",

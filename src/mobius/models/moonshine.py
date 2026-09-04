@@ -74,7 +74,17 @@ class MoonshineRotaryEmbedding(nn.Module):
 
 
 class MoonshineAttention(nn.Module):
-    """Bias-free self/cross attention with optional partial interleaved RoPE."""
+    """Self/cross attention with optional partial interleaved RoPE.
+
+    ``hidden_size`` and ``head_dim`` default to the decoder-side values derived
+    from *config*. Encoder stacks whose width differs from the decoder (Moonshine
+    Streaming) pass them explicitly.
+
+    Hugging Face bias-gates the Q/K/V projections on ``config.attention_bias``
+    and keeps the decoder's output projection bias-free unconditionally, so the
+    two are separate switches here. Both default to ``False``, which is what
+    every published Moonshine checkpoint uses.
+    """
 
     def __init__(
         self,
@@ -83,22 +93,23 @@ class MoonshineAttention(nn.Module):
         num_heads: int,
         num_key_value_heads: int,
         is_causal: bool = False,
+        hidden_size: int | None = None,
+        head_dim: int | None = None,
+        qkv_bias: bool = False,
+        o_bias: bool = False,
     ):
         super().__init__()
+        hidden_size = config.hidden_size if hidden_size is None else hidden_size
         self._num_heads = num_heads
         self._num_key_value_heads = num_key_value_heads
-        self._head_dim = config.hidden_size // num_heads
+        self._head_dim = hidden_size // num_heads if head_dim is None else head_dim
         self._rotary_dim = int(self._head_dim * config.partial_rotary_factor)
         self._scale = self._head_dim**-0.5
         self._is_causal = is_causal
-        self.q_proj = Linear(config.hidden_size, num_heads * self._head_dim, bias=False)
-        self.k_proj = Linear(
-            config.hidden_size, num_key_value_heads * self._head_dim, bias=False
-        )
-        self.v_proj = Linear(
-            config.hidden_size, num_key_value_heads * self._head_dim, bias=False
-        )
-        self.o_proj = Linear(num_heads * self._head_dim, config.hidden_size, bias=False)
+        self.q_proj = Linear(hidden_size, num_heads * self._head_dim, bias=qkv_bias)
+        self.k_proj = Linear(hidden_size, num_key_value_heads * self._head_dim, bias=qkv_bias)
+        self.v_proj = Linear(hidden_size, num_key_value_heads * self._head_dim, bias=qkv_bias)
+        self.o_proj = Linear(num_heads * self._head_dim, hidden_size, bias=o_bias)
 
     def forward(
         self,
@@ -199,6 +210,7 @@ class MoonshineEncoderLayer(nn.Module):
             config,
             num_heads=config.encoder_num_attention_heads,
             num_key_value_heads=config.encoder_num_key_value_heads,
+            qkv_bias=config.attn_qkv_bias,
         )
         self.post_attention_layernorm = LayerNormNoBias(
             config.hidden_size, eps=config.layer_norm_eps
@@ -239,6 +251,7 @@ class MoonshineDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
             is_causal=True,
+            qkv_bias=config.attn_qkv_bias,
         )
         self.post_attention_layernorm = LayerNormNoBias(
             config.hidden_size, eps=config.layer_norm_eps
@@ -247,6 +260,7 @@ class MoonshineDecoderLayer(nn.Module):
             config,
             num_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
+            qkv_bias=config.attn_qkv_bias,
         )
         self.final_layernorm = LayerNormNoBias(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = MoonshineDecoderMLP(config)

@@ -28,11 +28,20 @@ class Eagle3DraftTask(ModelTask):
 
         graph, builder = _make_graph()
 
-        inputs_embeds = builder.input(
-            "inputs_embeds",
-            dtype=config.dtype,
-            shape=[batch, seq_len, config.hidden_size],
-        )
+        input_ids = None
+        inputs_embeds = None
+        if config.use_draft_token_embedding:
+            input_ids = builder.input(
+                "input_ids",
+                dtype=ir.DataType.INT64,
+                shape=[batch, seq_len],
+            )
+        else:
+            inputs_embeds = builder.input(
+                "inputs_embeds",
+                dtype=config.dtype,
+                shape=[batch, seq_len, config.hidden_size],
+            )
         fused_hidden = builder.input(
             "fused_hidden",
             dtype=config.dtype,
@@ -74,6 +83,7 @@ class Eagle3DraftTask(ModelTask):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            input_ids=input_ids,
         )
 
         builder.add_output(

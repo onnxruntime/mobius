@@ -36,6 +36,13 @@ class GlmMoeDsaTask(ModelTask):
     input/output wiring.
     """
 
+    def __init__(self, *, static_cache: bool = False):
+        if static_cache:
+            raise ValueError(
+                "GLM-DSA static cache is not implemented: dsa_kv_cache_specs() "
+                "describes a per-layer-varying packed dynamic cache"
+            )
+
     def build(self, module, config: ArchitectureConfig) -> ModelPackage:
         if not config.use_dsa:
             return CausalLMTask().build(module, config)
@@ -104,4 +111,12 @@ class GlmMoeDsaTask(ModelTask):
             builder.add_output(present_key, f"present.{i}.key")
             builder.add_output(present_value, f"present.{i}.value")
 
-        return ModelPackage({"model": _make_model(graph)}, config=config)
+        model = _make_model(graph)
+        model.metadata_props["mobius.cache_abi"] = (
+            "glm-dsa:per-layer=expanded-key[+indexer-key-on-full-layers],"
+            "expanded-value;dynamic-concat;shared-indexer-selection"
+        )
+        model.metadata_props["mobius.runtime_support"] = (
+            "deferred: MTP, packed expert, and real-weight package parity are not evidenced"
+        )
+        return ModelPackage({"model": model}, config=config)

@@ -46,6 +46,13 @@ from mobius.tasks import get_task
 logger = logging.getLogger(__name__)
 
 
+def test_vibevoice_synthetic_pipeline_parity():
+    """Run the dedicated eight-stage continuous-token parity harness."""
+    from mobius.models.vibevoice_test import run_vibevoice_synthetic_stage_parity
+
+    run_vibevoice_synthetic_stage_parity()
+
+
 # ---------------------------------------------------------------------------
 # Model types that cannot be tested with HF synthetic parity.
 # Each entry maps a model_type to a reason for skipping.
@@ -263,6 +270,11 @@ _PARITY_EXCLUDE: frozenset[str] = frozenset(
         "exaone",  # real HF type is exaone4
         "phi3small",  # real HF type is phi3
         "mistral3",  # our implementation maps to mistral; real mistral3 is different
+        "grok_gguf",
+        "grovemoe_gguf",
+        "hunyuan_moe_gguf",
+        "minimax_m2_gguf",
+        "mistral4_gguf",
         # gemma4_unified_text: mobius-internal alias for the gemma-4-12B text
         # backbone (reuses Gemma4CausalLMModel). No matching HF model_type is
         # registered with AutoModelForCausalLM, so a reference model cannot be

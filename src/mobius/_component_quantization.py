@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 __all__ = [
+    "attach_hf_component_sources",
     "configure_component_quantization",
     "normalize_component_quantized_weights",
+    "preprocess_component_quantized_state_dict",
 ]
 
 from collections.abc import Iterable, Mapping
@@ -567,3 +569,39 @@ def normalize_component_quantized_weights(
             "ModelPackage component"
         )
     return result
+
+
+def attach_hf_component_sources(
+    module: nn.Module,
+    *,
+    model_type: str,
+    hf_config: object,
+) -> None:
+    """Attach the runtime HF component map selected for this concrete model."""
+    resolver = getattr(type(module), "get_hf_component_sources", None)
+    if resolver is not None:
+        source_map = resolver(model_type=model_type, hf_config=hf_config)
+    else:
+        source_map = getattr(type(module), "HF_COMPONENT_SOURCES", {})
+    module._hf_component_sources = {
+        component: tuple(paths) for component, paths in source_map.items()
+    }
+
+
+def preprocess_component_quantized_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    module: nn.Module,
+    config: BaseModelConfig,
+    task: ModelTask | str | None,
+    package_components: Iterable[str],
+) -> dict[str, torch.Tensor]:
+    """Compatibility wrapper for normalize_component_quantized_weights."""
+    import torch
+    resolved_task = get_task(task) if task is not None else None
+    return normalize_component_quantized_weights(
+        state_dict,
+        module,
+        config,
+        package_components,
+        task=resolved_task,
+    )

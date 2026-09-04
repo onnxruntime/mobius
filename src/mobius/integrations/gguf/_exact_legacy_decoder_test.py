@@ -154,7 +154,10 @@ def test_exact_legacy_config_tensor_and_graph_closure(architecture: str) -> None
             "openelm": "openelm",
         }[architecture]
     )
-    assert spec.runtime is Support.DEFERRED
+    expected_runtime = (
+        Support.SUPPORTED if architecture in {"gptneox", "mpt"} else Support.DEFERRED
+    )
+    assert spec.runtime is expected_runtime
     if architecture == "ernie4_5":
         assert config.rope_interleave
 

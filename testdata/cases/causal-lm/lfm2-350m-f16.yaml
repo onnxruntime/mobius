@@ -15,7 +15,7 @@ gguf:
     F16: 93
     F32: 55
   execution_provider: "cpu"
-  config_sha256: "c961bba579ea33a2472a7c5d3f469c76f1f8c7aae8440a7eaa86bc6e878a42f4"
+  config_sha256: "e7746a202f3679ac05311fbc7a25414e4c106008fc3bd257001e97a8d7cab575"
   preserve_quantization: false
   keep_quantized: true
   tokenizer:

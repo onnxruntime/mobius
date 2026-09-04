@@ -218,7 +218,6 @@ def test_generic_decoder_end_to_end_and_reload(
     write_ort_genai_config(
         package,
         str(package_dir),
-        runtime_version=installed_version,
     )
 
     config = json.loads((package_dir / "genai_config.json").read_text(encoding="utf-8"))
@@ -261,7 +260,6 @@ def test_malformed_genai_config_is_rejected(
     write_ort_genai_config(
         package,
         str(package_dir),
-        runtime_version=version("onnxruntime-genai"),
     )
     config_path = package_dir / "genai_config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))

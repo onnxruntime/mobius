@@ -19,6 +19,8 @@ from onnxscript import OpBuilder, nn
 
 from mobius._configs import ArchitectureConfig
 from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
     vlm_decoder_weights,
     vlm_embedding_weights,
     vlm_vision_weights,
@@ -29,6 +31,7 @@ from mobius.components import (
     OffsetRMSNorm,
     VisionModel,
 )
+from mobius.models.base import effective_tie_word_embeddings
 from mobius.models.gemma3_text import (
     Gemma3TextModel,
     Gemma3TextScaledWordEmbedding,
@@ -225,7 +228,16 @@ class Gemma3MultiModalModel(nn.Module):
         is duplicated into ``embedding.embed_tokens.weight`` so that both
         the decoder and the embedding sub-model receive it.
         """
-        if self.config.tie_word_embeddings:
+        tied_embeddings = effective_tie_word_embeddings(self.config)
+        if tied_embeddings and self.config.component_quantization is not None:
+            materialize_split_tied_olive_lm_head(
+                state_dict,
+                embed_key="language_model.model.embed_tokens.weight",
+                head_key="language_model.lm_head.weight",
+                embedding_quantization=self.config.quantization_for("embedding"),
+                head_quantization=self.config.quantization_for("decoder"),
+            )
+        if tied_embeddings:
             embed_key = "language_model.model.embed_tokens.weight"
             head_key = "language_model.lm_head.weight"
             if head_key not in state_dict and embed_key in state_dict:
@@ -235,10 +247,16 @@ class Gemma3MultiModalModel(nn.Module):
         for key, value in state_dict.items():
             if key.startswith("language_model."):
                 new_key = "decoder." + key[len("language_model.") :]
-                renamed[new_key] = value
-                # Duplicate embed_tokens for the embedding sub-model
-                if key == "language_model.model.embed_tokens.weight":
-                    renamed["embedding.embed_tokens.weight"] = value
+                is_embedding = key.startswith("language_model.model.embed_tokens.")
+                if not (
+                    is_embedding
+                    and self.config.component_quantization is not None
+                    and is_packed_quant_key(key)
+                ):
+                    renamed[new_key] = value
+                if is_embedding:
+                    suffix = key[len("language_model.model.") :]
+                    renamed[f"embedding.{suffix}"] = value
             elif key.startswith("vision_tower."):
                 # Vision MLP uses ``fc1``/``fc2`` in HF; rename to the
                 # ``FCMLP`` component naming (``up_proj``/``down_proj``).

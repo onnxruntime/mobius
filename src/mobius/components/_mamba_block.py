@@ -26,7 +26,7 @@ from onnxscript import OpBuilder, nn
 
 from mobius.components._common import INT64_MAX, Linear
 from mobius.components._rms_norm import GatedRMSNorm, PostGatedRMSNorm
-from mobius.components._ssm import SelectiveScan
+from mobius.components._ssm import SelectiveScan, SequenceSelectiveScan
 
 
 class _DepthwiseConv1d(nn.Module):
@@ -171,6 +171,84 @@ class MambaBlock(nn.Module):
         output = self.out_proj(op, gated)
 
         return output, new_conv_state, new_ssm_state
+
+
+class SequenceMambaBlock(nn.Module):
+    """Mamba1 layer applied to a whole sequence, with no carried state.
+
+    Same parameters and math as :class:`MambaBlock` (input projection →
+    causal Conv1D → selective scan → SiLU gate → output projection), but the
+    entire ``(batch, seq_len, d_model)`` sequence is processed in one call
+    and both the conv and SSM states start at zero.  This mirrors the
+    reference ``mamba_ssm.Mamba`` module's offline forward pass and is what
+    non-autoregressive backbones (e.g. speech enhancement) need.
+
+    Args:
+        d_model: Model hidden dimension.
+        d_inner: Expanded inner dimension (typically ``expand * d_model``).
+        d_state: SSM state dimension (typically 16).
+        dt_rank: Rank of the SSM time-step projection.
+            Defaults to ``ceil(d_model / 16)`` (Mamba convention).
+        conv_kernel: Causal Conv1D kernel size (typically 4).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_inner: int,
+        d_state: int = 16,
+        dt_rank: int | None = None,
+        conv_kernel: int = 4,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = d_inner
+        self.d_state = d_state
+        self.conv_kernel = conv_kernel
+        self.dt_rank = dt_rank if dt_rank is not None else -(-d_model // 16)
+
+        self.in_proj = Linear(d_model, 2 * d_inner, bias=False)
+        self.conv1d = _DepthwiseConv1d(d_inner, conv_kernel, bias=True)
+        self.ssm = SequenceSelectiveScan(d_inner, d_state, self.dt_rank)
+        self.out_proj = Linear(d_inner, d_model, bias=False)
+
+    def forward(self, op: OpBuilder, hidden_states: ir.Value):
+        """Run the Mamba layer over a full sequence.
+
+        Args:
+            op: ONNX op builder.
+            hidden_states: (batch, seq_len, d_model).
+
+        Returns:
+            (batch, seq_len, d_model) output.
+        """
+        # --- Step 1: Input projection, split into SSM branch and gate ---
+        projected = self.in_proj(op, hidden_states)  # (batch, seq_len, 2*d_inner)
+        x_branch, z_gate = op.Split(
+            projected,
+            [self.d_inner, self.d_inner],
+            axis=-1,
+            _outputs=2,
+        )
+
+        # --- Step 2: Causal depthwise Conv1D over the sequence ---
+        # (batch, seq_len, d_inner) → (batch, d_inner, seq_len) for Conv.
+        x_t = op.Transpose(x_branch, perm=[0, 2, 1])
+        # Left-pad by (conv_kernel - 1) so output position t only sees inputs
+        # up to t; the conv itself uses pads=[0, 0] and keeps seq_len.
+        x_padded = op.Pad(
+            x_t,
+            op.Constant(value_ints=[0, 0, self.conv_kernel - 1, 0, 0, 0]),
+        )
+        conv_out = op.Swish(self.conv1d(op, x_padded))  # (batch, d_inner, seq_len)
+
+        # --- Step 3: Selective scan over the sequence ---
+        x_ssm = op.Transpose(conv_out, perm=[0, 2, 1])  # (batch, seq_len, d_inner)
+        y = self.ssm(op, x_ssm)  # (batch, seq_len, d_inner)
+
+        # --- Step 4: Gating and output projection ---
+        gated = op.Mul(y, op.Swish(z_gate))
+        return self.out_proj(op, gated)
 
 
 # =====================================================================
