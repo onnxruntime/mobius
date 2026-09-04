@@ -105,6 +105,7 @@ __all__ = [
     "TASK_REGISTRY",
     "TTSTask",
     "VibeVoiceTask",
+    "VibeVoiceStreamingTask",
     "T5TextEncoderTask",
     "VAETask",
     "VideoDenoisingTask",
@@ -206,6 +207,7 @@ from mobius.tasks._t5_text_encoder import T5TextEncoderTask
 from mobius.tasks._tts import TTSTask
 from mobius.tasks._vae import VAETask
 from mobius.tasks._vibevoice import VibeVoiceTask
+from mobius.tasks._vibevoice_streaming import VibeVoiceStreamingTask
 from mobius.tasks._video_denoising import VideoDenoisingTask
 from mobius.tasks._video_vae import VideoVAETask
 from mobius.tasks._vision_encoder_decoder import VisionEncoderDecoderTask
@@ -312,6 +314,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "ssm2-text-generation": SSM2CausalLMTask,
     "tts": TTSTask,
     "vibevoice-tts": VibeVoiceTask,
+    "vibevoice-streaming-tts": VibeVoiceStreamingTask,
     "video-denoising": VideoDenoisingTask,
     "video-vae": VideoVAETask,
     "world-model": WorldModelTask,
