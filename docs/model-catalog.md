@@ -197,7 +197,7 @@ Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
 | `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
 | `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
 | `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
-| `VibeVoiceForASRTraining` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | [`microsoft/VibeVoice-ASR`](vibevoice-asr.md) |
+| `VibeVoiceForASRTraining` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | [`microsoft/VibeVoice-ASR`](vibevoice-asr.md); [`microsoft/VibeVoice-ASR-BitNet`](vibevoice-asr.md) (pinned dense-F32 conversion source; native I2_S/I8_S GGUF rejected) |
 
 ### Audio Feature Extraction
 

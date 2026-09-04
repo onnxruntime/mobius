@@ -480,6 +480,7 @@ def _gguf_header_info_from_header_prefix(
         data,
         source=source,
         require_architecture=False,
+        collect_tensor_type_ids=True,
     )
 
 
@@ -598,6 +599,15 @@ def _preflight_hf_gguf_file(
         )
         return _GGUFPreflightFallbackRevision(commit_hash)
     _validate_preflight_split_header(header_info, source=source)
+    from mobius.integrations._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
+
+    reject_vibeasr_bitnet_gguf(
+        source=source,
+        repository=repo_id,
+        revision=commit_hash,
+        filename=filename,
+        header=header_info,
+    )
     architecture = header_info.architecture
     if (
         dispatch_architecture
@@ -665,6 +675,29 @@ def _validate_gguf_model(
     if not isinstance(gguf_model, GgufShardSet):
         split_count = int(gguf_model.get_metadata("split.count", 1))
         _raise_for_sharded_gguf(source=source, split_count=split_count)
+    from mobius.integrations._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
+
+    reader_tensors = getattr(gguf_model, "reader_tensors", None)
+    tensor_type_ids = frozenset()
+    if callable(reader_tensors):
+        tensor_type_ids = frozenset(
+            int(getattr(tensor.tensor_type, "value", tensor.tensor_type))
+            for tensor in reader_tensors()
+        )
+    reject_vibeasr_bitnet_gguf(
+        source=source,
+        header=GGUFHeaderInfo(
+            architecture=gguf_model.architecture,
+            tensor_count=len(gguf_model.tensor_names),
+            split_no=None,
+            split_count=None,
+            split_tensors_count=None,
+            name=gguf_model.get_metadata("general.name", None),
+            file_type=gguf_model.get_metadata("general.file_type", None),
+            quantization_version=gguf_model.get_metadata("general.quantization_version", None),
+            tensor_type_ids=tensor_type_ids,
+        ),
+    )
     from mobius.integrations.gguf._qwen4_exp import validate_qwen4exp_tensor_contract
 
     validate_qwen4exp_tensor_contract(

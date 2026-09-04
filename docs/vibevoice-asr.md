@@ -8,6 +8,22 @@ the shared `vibevoice` configuration declares
 `VibeVoiceForConditionalGeneration`; unknown or streaming VibeVoice
 architectures fail closed rather than falling through to either implementation.
 
+## BitNet conversion source
+
+[`microsoft/VibeVoice-ASR-BitNet`](https://huggingface.co/microsoft/VibeVoice-ASR-BitNet)
+is supported only at revision `66e78021ab8f5f06133d1ab421ba4d348bda97c9`. It uses the
+same staged ASR package and host contract, but it is a distinct artifact format:
+Mobius streams its three dense F32 safetensors shards as the ONNX conversion source
+and records that provenance in `weight-loading-report.json`.
+
+The release's `vibeasr-lm-i2_s-embed-q6_k.gguf` and
+`vibeasr-vae-encoder-i8_s.gguf` files are **not** supported import inputs. Their
+I2_S and I8_S tensor types require VibeASR.cpp-specific packed storage and custom
+CPU kernels; converting them through generic GGUF or affine ONNX quantization would
+not preserve their execution semantics. Mobius identifies these exact native
+artifacts during local import and Hub preflight, then fails with an explicit error
+rather than claiming a native BitNet or dequantized execution path.
+
 This is distinct from the streaming-ASR work tracked in #723. It uses the
 official offline model's Qwen2 decoder (3584 hidden width, 28 layers, 28 query
 heads, 4 KV heads) and its 24 kHz, 3200-sample waveform framing.
