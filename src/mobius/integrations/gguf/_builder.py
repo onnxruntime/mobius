@@ -692,9 +692,9 @@ def _validate_gguf_model(
             split_no=None,
             split_count=None,
             split_tensors_count=None,
-            name=gguf_model.get_metadata("general.name"),
-            file_type=gguf_model.get_metadata("general.file_type"),
-            quantization_version=gguf_model.get_metadata("general.quantization_version"),
+            name=gguf_model.get_metadata("general.name", None),
+            file_type=gguf_model.get_metadata("general.file_type", None),
+            quantization_version=gguf_model.get_metadata("general.quantization_version", None),
             tensor_type_ids=tensor_type_ids,
         ),
     )
