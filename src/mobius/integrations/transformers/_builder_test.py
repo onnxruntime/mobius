@@ -251,6 +251,16 @@ def test_vibevoice_architecture_dispatch_is_explicit_and_fail_closed() -> None:
             None,
             None,
         )
+    with pytest.raises(ValueError, match="Unsupported VibeVoice architecture"):
+        transformers_builder._resolve_module_class(
+            "vibevoice",
+            SimpleNamespace(
+                model_type="vibevoice",
+                architectures=["VibeVoiceForConditionalGeneration", "VibeVoiceForASRTraining"],
+            ),
+            None,
+            None,
+        )
 
 
 @pytest.mark.arch_validation

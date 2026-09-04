@@ -31,13 +31,17 @@ def test_processor_normalizes_pads_chunks_prompts_and_parses_diarization():
     chunks = list(processor.iter_chunks(batch))
     assert [chunk.input_values.shape for chunk in chunks] == [
         (2, 1, processor.chunk_samples),
-        (2, 1, 1),
+        (2, 1, processor.hop_length),
     ]
-    assert processor.make_prompt("Mobius is a hotword.")[1]["content"].endswith(
-        "Context information: Mobius is a hotword."
+    messages = processor.make_prompt(audio_samples=6_401, context_info="Mobius is a hotword.")
+    assert messages[1]["content"] == (
+        "<|speech_start|><|speech_pad|><|speech_pad|><|speech_pad|><|speech_end|>\n"
+        "This is a 0.27 seconds audio, with extra info: Mobius is a hotword.\n\n"
+        "Please transcribe it with these keys: Start time, End time, Speaker ID, Content"
     )
     assert processor.parse_diarization(
-        '[{"Start time": 0.0, "End_Time": 1.2, "Speaker ID": "S0", "Content": "hello"}]'
+        'assistant\n[{"Start time": 0.0, "End_Time": 1.2, '
+        '"Speaker ID": "S0", "Content": "hello"}]\n'
     ) == [{"start_time": 0.0, "end_time": 1.2, "speaker_id": "S0", "text": "hello"}]
     assert processor.parse_diarization(
         '[{"Start": 1.2, "End": 2.4, "Speaker": "S1", "Text": "world"}]'
@@ -57,6 +61,7 @@ def test_processor_rejects_wrong_rate_and_malformed_diarization():
 def test_host_preserves_chunk_cache_and_uses_seeded_connector_noise():
     processor = VibeVoiceASRProcessor()
     processor.chunk_samples = 4
+    processor.hop_length = 4
     calls: list[tuple[str, dict[str, np.ndarray]]] = []
 
     def initial_cache(stage: str, batch_size: int) -> dict[str, np.ndarray]:
@@ -90,6 +95,43 @@ def test_host_preserves_chunk_cache_and_uses_seeded_connector_noise():
     assert lengths.tolist() == [2]
     # The second encoder window must consume the first window's state.
     assert calls[2][1]["past_conv.0"].item() == 1
+    assert calls[2][1]["input_values"].shape[-1] == 4
     connector_feeds = calls[-1][1]
     assert connector_feeds["acoustic_noise_scale"].shape == (1,)
     assert connector_feeds["acoustic_latent_noise"].shape == (1, 2, 1)
+
+
+def test_processor_builds_source_chat_template_token_layout():
+    class Tokenizer:
+        def __init__(self):
+            self.messages: list[str] = []
+
+        def apply_chat_template(self, messages, *, tokenize):
+            content = messages[0]["content"]
+            self.messages.append(content)
+            if not tokenize:
+                return content
+            return [10, 11, *([42] * content.count("<|speech_pad|>")), 12]
+
+        @staticmethod
+        def encode(_text):
+            return [1, 2]
+
+        @staticmethod
+        def convert_tokens_to_ids(token):
+            assert token == "<|speech_pad|>"
+            return 42
+
+    tokenizer = Tokenizer()
+    input_ids, acoustic_input_mask = VibeVoiceASRProcessor.build_input_ids(
+        tokenizer,
+        audio_samples=3_201,
+        context_info="Alice",
+    )
+
+    assert input_ids == [1, 2, 10, 11, 42, 42, 12]
+    assert acoustic_input_mask == [False, False, False, False, True, True, False]
+    assert tokenizer.messages[1].endswith(
+        "with extra info: Alice\n\nPlease transcribe it with these keys: "
+        "Start time, End time, Speaker ID, Content"
+    )

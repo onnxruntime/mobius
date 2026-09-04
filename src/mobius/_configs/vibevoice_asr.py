@@ -36,12 +36,16 @@ def _tokenizer_config(config, *, default_hidden_size: int) -> VibeVoiceTokenizer
             getattr(source, "hidden_size", getattr(source, "vae_dim", default_hidden_size))
         ),
         kernel_size=int(getattr(source, "kernel_size", 7)),
-        num_filters=int(getattr(source, "num_filters", getattr(source, "encoder_n_filters", 32))),
+        num_filters=int(
+            getattr(source, "num_filters", getattr(source, "encoder_n_filters", 32))
+        ),
         downsampling_ratios=list(ratios),
         depths=list(depths),
         ffn_expansion=int(getattr(source, "ffn_expansion", 4)),
         hidden_act=str(getattr(source, "hidden_act", "gelu")),
-        rms_norm_eps=float(getattr(source, "rms_norm_eps", getattr(source, "layernorm_eps", 1e-5))),
+        rms_norm_eps=float(
+            getattr(source, "rms_norm_eps", getattr(source, "layernorm_eps", 1e-5))
+        ),
         layer_scale_init_value=float(getattr(source, "layer_scale_init_value", 1e-6)),
         vae_std=float(vae_std),
     )

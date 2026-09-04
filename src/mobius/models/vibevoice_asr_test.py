@@ -65,14 +65,18 @@ def _make_models():
     torch.manual_seed(7)
     hf_config = _make_tiny_hf_config()
     hf_model = modeling.VibeVoiceAsrForConditionalGeneration(hf_config).float().eval()
-    config = VibeVoiceASRConfig.from_transformers(hf_config.text_config, parent_config=hf_config)
+    config = VibeVoiceASRConfig.from_transformers(
+        hf_config.text_config, parent_config=hf_config
+    )
     module = VibeVoiceASRForConditionalGeneration(config)
     package = build_from_module(module, config, task=VibeVoiceASRTask())
     package.apply_weights(module.preprocess_weights(hf_model.state_dict()))
     return hf_model, module, package
 
 
-def _run(package: ModelPackage, name: str, feeds: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def _run(
+    package: ModelPackage, name: str, feeds: dict[str, np.ndarray]
+) -> dict[str, np.ndarray]:
     session = OnnxModelSession(package[name])
     try:
         return session.run(feeds)
@@ -117,9 +121,9 @@ def _run_encoder_chunks(
 def test_staged_asr_matches_transformers_with_batch_chunking_and_left_padding():
     """Match the pinned Transformers ASR source for every inference stage."""
     hf_model, module, package = _make_models()
-    input_values = np.random.default_rng(4).standard_normal((2, 1, 12), dtype=np.float32)
+    input_values = np.random.default_rng(4).standard_normal((2, 1, 16), dtype=np.float32)
     padding_mask = np.array(
-        [[True] * 12, [True] * 8 + [False] * 4],
+        [[True] * 13 + [False] * 3, [True] * 9 + [False] * 7],
         dtype=np.bool_,
     )
     with torch.no_grad():
@@ -150,10 +154,15 @@ def test_staged_asr_matches_transformers_with_batch_chunking_and_left_padding():
             "acoustic_latent_noise": acoustic_latent_noise,
         },
     )
-    np.testing.assert_allclose(connector["audio_features"], source_features, rtol=2e-4, atol=2e-5)
-    assert connector["audio_feature_lengths"].tolist() == [3, 2]
+    np.testing.assert_allclose(
+        connector["audio_features"], source_features, rtol=2e-4, atol=2e-5
+    )
+    assert connector["audio_feature_lengths"].tolist() == [4, 3]
 
-    input_ids = np.array([[1, 60, 60, 60, 2], [0, 1, 60, 60, 2]], dtype=np.int64)
+    input_ids = np.array(
+        [[1, 60, 60, 60, 60, 2], [0, 0, 1, 60, 60, 60]],
+        dtype=np.int64,
+    )
     attention_mask = (input_ids != 0).astype(np.int64)
     position_ids = attention_mask.cumsum(axis=-1, dtype=np.int64) - 1
     position_ids[attention_mask == 0] = 0
