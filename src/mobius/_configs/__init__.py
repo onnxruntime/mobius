@@ -115,6 +115,7 @@ from mobius._configs.vibevoice import (
     VibeVoiceStreamingTokenizerConfig,
     VibeVoiceTokenizerConfig,
 )
+from mobius._configs.vibevoice_asr import VibeVoiceASRConfig
 
 __all__ = [
     "DEFAULT_INT",
@@ -179,6 +180,7 @@ __all__ = [
     "VisionConfig",
     "VisionLanguageConfig",
     "VibeVoiceConfig",
+    "VibeVoiceASRConfig",
     "VibeVoiceDiffusionConfig",
     "VibeVoiceStreamingConfig",
     "VibeVoiceStreamingDiffusionConfig",
