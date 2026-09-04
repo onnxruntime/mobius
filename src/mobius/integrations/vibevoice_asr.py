@@ -80,18 +80,11 @@ class VibeVoiceASRProcessor:
         return VibeVoiceASRBatch(input_values=input_values, padding_mask=padding_mask)
 
     def iter_chunks(self, batch: VibeVoiceASRBatch) -> Iterator[VibeVoiceASRBatch]:
-        """Yield hop-aligned 60-second windows; encoder cache bridges adjacent windows."""
+        """Yield raw 60-second windows; encoder cache bridges adjacent windows."""
         for start in range(0, batch.input_values.shape[-1], self.chunk_samples):
             stop = min(start + self.chunk_samples, batch.input_values.shape[-1])
-            input_values = batch.input_values[:, start:stop]
-            # The source processor reserves ceil(valid_samples / hop) speech
-            # placeholders. Pad only the terminal encoder window so the causal
-            # convolution emits that final partial frame as well.
-            final_padding = (-input_values.shape[-1]) % self.hop_length
-            if stop == batch.input_values.shape[-1] and final_padding:
-                input_values = np.pad(input_values, ((0, 0), (0, final_padding)))
             yield VibeVoiceASRBatch(
-                input_values=input_values[:, None, :],
+                input_values=batch.input_values[:, None, start:stop],
                 padding_mask=batch.padding_mask[:, start:stop],
             )
 
@@ -233,14 +226,24 @@ class VibeVoiceASRHost:
         )
         acoustic_chunks: list[np.ndarray] = []
         semantic_chunks: list[np.ndarray] = []
-        for chunk in self.processor.iter_chunks(batch):
+        total_chunks = math.ceil(batch.input_values.shape[-1] / self.processor.chunk_samples)
+        for chunk_index, chunk in enumerate(self.processor.iter_chunks(batch)):
+            is_final_chunk = np.asarray([chunk_index == total_chunks - 1], dtype=np.bool_)
             acoustic = self._run_stage(
                 "acoustic_encoder",
-                {"input_values": chunk.input_values, **acoustic_cache},
+                {
+                    "input_values": chunk.input_values,
+                    "is_final_chunk": is_final_chunk,
+                    **acoustic_cache,
+                },
             )
             semantic = self._run_stage(
                 "semantic_encoder",
-                {"input_values": chunk.input_values, **semantic_cache},
+                {
+                    "input_values": chunk.input_values,
+                    "is_final_chunk": is_final_chunk,
+                    **semantic_cache,
+                },
             )
             acoustic_chunks.append(np.asarray(acoustic["audio_latents"]))
             semantic_chunks.append(np.asarray(semantic["audio_latents"]))
@@ -293,12 +296,8 @@ def _extract_json_payload(text: str) -> str:
     if not starts:
         return text
     start = min(starts)
-    depth = 0
-    for index, character in enumerate(text[start:], start):
-        if character in "[{":
-            depth += 1
-        elif character in "]}":
-            depth -= 1
-            if depth == 0:
-                return text[start : index + 1]
-    raise ValueError("VibeVoice-ASR output has an unterminated JSON value")
+    try:
+        _, end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError as error:
+        raise ValueError("VibeVoice-ASR output has an unterminated JSON value") from error
+    return text[start : start + end]

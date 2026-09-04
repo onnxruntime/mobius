@@ -31,7 +31,7 @@ def test_processor_normalizes_pads_chunks_prompts_and_parses_diarization():
     chunks = list(processor.iter_chunks(batch))
     assert [chunk.input_values.shape for chunk in chunks] == [
         (2, 1, processor.chunk_samples),
-        (2, 1, processor.hop_length),
+        (2, 1, 1),
     ]
     messages = processor.make_prompt(audio_samples=6_401, context_info="Mobius is a hotword.")
     assert messages[1]["content"] == (
@@ -59,6 +59,12 @@ def test_processor_normalizes_pads_chunks_prompts_and_parses_diarization():
     assert processor.parse_diarization(
         '[{"Start": 1.2, "End": 2.4, "Speaker": "S1", "Text": "world"}]'
     ) == [{"start_time": 1.2, "end_time": 2.4, "speaker_id": "S1", "text": "world"}]
+    assert processor.parse_diarization(
+        'assistant\n[{"Start": 0.0, "End": 1.0, "Speaker": "S0", '
+        '"Content": "literal [ bracket"}]\n'
+    ) == [
+        {"start_time": 0.0, "end_time": 1.0, "speaker_id": "S0", "text": "literal [ bracket"}
+    ]
 
 
 def test_processor_rejects_wrong_rate_and_malformed_diarization():
@@ -108,7 +114,9 @@ def test_host_preserves_chunk_cache_and_uses_seeded_connector_noise():
     assert lengths.tolist() == [2]
     # The second encoder window must consume the first window's state.
     assert calls[2][1]["past_conv.0"].item() == 1
-    assert calls[2][1]["input_values"].shape[-1] == 4
+    assert calls[2][1]["input_values"].shape[-1] == 2
+    assert not calls[0][1]["is_final_chunk"]
+    assert calls[2][1]["is_final_chunk"]
     connector_feeds = calls[-1][1]
     assert connector_feeds["acoustic_noise_scale"].shape == (1,)
     assert connector_feeds["acoustic_latent_noise"].shape == (1, 2, 1)

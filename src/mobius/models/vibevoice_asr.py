@@ -47,11 +47,17 @@ class VibeVoiceASRAudioEncoder(nn.Module):
         op: OpBuilder,
         input_values: ir.Value,
         past_conv_states: list[ir.Value],
+        is_final_chunk: ir.Value,
     ) -> tuple[ir.Value, list[ir.Value]]:
         # Processor waveforms remain float32 at the boundary; model weights and
         # explicit convolution caches use the selected package precision.
         waveform = op.Cast(input_values, to=self._dtype)  # (B, 1, samples)
-        return self.encoder(op, waveform, past_conv_states)  # (B, frames, latent)
+        return self.encoder(  # (B, frames, latent)
+            op,
+            waveform,
+            past_conv_states,
+            is_final_chunk,
+        )
 
 
 class VibeVoiceASRConnectors(nn.Module):

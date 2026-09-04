@@ -33,8 +33,8 @@ The package exports five ONNX models:
 
 | Component | Input boundary | Output |
 |---|---|---|
-| `acoustic_encoder` | `input_values` `(B, 1, samples)` `float32`, `past_conv.*` | 64-D `audio_latents`, `present_conv.*` |
-| `semantic_encoder` | same waveform and its independent convolution cache | 128-D `audio_latents`, `present_conv.*` |
+| `acoustic_encoder` | `input_values` `(B, 1, samples)` `float32`, `past_conv.*`, `is_final_chunk` `bool[1]` | 64-D `audio_latents`, `present_conv.*` |
+| `semantic_encoder` | same waveform, final flag, and independent convolution cache | 128-D `audio_latents`, `present_conv.*` |
 | `connectors` | both latent streams, full `padding_mask`, `acoustic_noise_scale`, `acoustic_latent_noise` | flattened `audio_features`, per-item valid lengths |
 | `embedding` | Qwen token IDs and flattened audio features | `inputs_embeds` |
 | `decoder` | embeddings, normal left-padded attention mask, positions, KV cache | logits and present KV cache |
@@ -42,6 +42,9 @@ The package exports five ONNX models:
 Audio is split into 1,440,000-sample (60-second) chunks. The host carries each
 encoder's `present_conv.*` values into the next chunk, concatenates the
 resulting latents, then runs `connectors` once over the full sample mask.
+It passes `is_final_chunk=[true]` only on the terminal window. The encoder
+performs the original source's right-padding independently at every causal
+convolution; hosts must **not** zero-pad the raw terminal waveform.
 `VibeVoiceASRHost` and `VibeVoiceASRProcessor` in
 `mobius.integrations.vibevoice_asr` define that behavior. The explicit noise
 inputs reproduce the source's acoustic sample
@@ -87,11 +90,15 @@ tensors. The latter are training/reconstruction-only for this source path and
 are deliberately excluded from the inference package.
 
 L1 builds every stage and cache ABI. L2 loads the exact raw config and index
-without weights. L3 compares all five stages against the pinned Transformers
-ASR source (`f62dc9bf2c90353b442a56e74391fbb8c689b55e`) using a two-item,
-two-chunk batch, seeded latent sampling, flattened replacement, and
-left-padding. The processor tests cover normalization, 3200/60-second
-framing, prompt context, and JSON parsing.
+without weights. L3 compares all five stages against the pinned Transformers ASR source
+(`f62dc9bf2c90353b442a56e74391fbb8c689b55e`) using a two-item, two-chunk
+batch, seeded latent sampling, flattened replacement, and left-padding. A
+separate source-derived terminal-frame test exercises Microsoft's pinned
+streaming implementation (`1541f590c7099820f10ea012f48d2399282df69f`):
+a raw partial chunk emits its ceiling frame only when the final-chunk flag
+causes every causal convolution to pad its own intermediate input. The
+processor tests cover normalization, 3200/60-second framing, prompt context,
+and JSON parsing.
 
 L4/L5 real-weight transcription and diarization remain unverified because the
 official BF16 checkpoint is approximately 8.67B parameters and no suitable
