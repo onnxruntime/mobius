@@ -76,6 +76,7 @@ __all__ = [
     "MiniCPMVLTask",
     "MuseGlimmerVLTask",
     "MaskedDiffusionTask",
+    "MatterGenScoreTask",
     "MoshiDepformerTask",
     "MoshiTemporalTask",
     "MiniMaxMusic3ConditionTask",
@@ -173,6 +174,7 @@ from mobius.tasks._image_classification import ImageClassificationTask
 from mobius.tasks._kimi_k3 import KimiK3CausalLMTask
 from mobius.tasks._kimi_linear import KimiLinearCausalLMTask
 from mobius.tasks._masked_diffusion import MaskedDiffusionTask
+from mobius.tasks._mattergen import MatterGenScoreTask
 from mobius.tasks._minimax_music3 import (
     MiniMaxMusic3ConditionTask,
     MiniMaxMusic3DenoisingTask,
@@ -246,6 +248,7 @@ TASK_REGISTRY: dict[str, type[ModelTask]] = {
     "gguf-embedding-feature-extraction": GGUFEmbeddingFeatureExtractionTask,
     "gguf-audio-projector": GGUFAudioProjectorTask,
     "masked-diffusion": MaskedDiffusionTask,
+    "mattergen-score": MatterGenScoreTask,
     "minimax-music3-condition": MiniMaxMusic3ConditionTask,
     "minimax-music3-denoising": MiniMaxMusic3DenoisingTask,
     "minimax-music3-language": MiniMaxMusic3LanguageTask,

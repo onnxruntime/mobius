@@ -42,7 +42,13 @@ import torch
 
 from mobius import build_from_module
 from mobius._testing.ort_inference import OnnxModelSession
-from mobius.integrations.mattergen import MatterGenConfig, MatterGenModel
+from mobius.integrations.mattergen import (
+    MatterGenConfig,
+    MatterGenHostSampler,
+    MatterGenModel,
+    build_periodic_graph,
+    create_onnxruntime_score_callback,
+)
 from mobius.integrations.mattergen._configs import MATTERGEN_SOURCE_COMMIT
 from mobius.integrations.mattergen._weights import apply_mattergen_checkpoint
 from mobius.tasks import MatterGenScoreTask
@@ -58,6 +64,13 @@ _GOLDEN_PATH = (
     / "golden"
     / "diffusion"
     / "mattergen-mp20-score.json"
+)
+_HOST_SAMPLE_GOLDEN_PATH = (
+    Path(__file__).parents[2]
+    / "testdata"
+    / "golden"
+    / "diffusion"
+    / "mattergen-mp20-host-sample.json"
 )
 _RTOL = 1e-3
 _ATOL = 1e-3
@@ -77,6 +90,9 @@ class _SourceModules:
     atom_embedding: Any
     model_utils: Any
     property_embeddings: Any
+    d3pm: Any
+    d3pm_corruption: Any
+    d3pm_predictors_correctors: Any
 
 
 @dataclass(frozen=True)
@@ -125,6 +141,7 @@ class _Mp20Runtime:
     original: dict[float, _ScoreCase]
     translated: _ScoreCase
     permuted: _ScoreCase
+    batched_graph: _SourceGraph
     checkpoint_sha256: str
 
     def close(self) -> None:
@@ -264,8 +281,9 @@ def _install_source_dependency_compatibility() -> None:
                 value: torch.Tensor,
                 sparse_sizes: tuple[torch.Tensor, torch.Tensor] | tuple[int, int],
             ):
-                del col, sparse_sizes
+                del sparse_sizes
                 self._row = row
+                self._col = col
                 self._value = value
                 self.storage = _SparseStorage(row.new_empty(0), value.new_empty(0))
 
@@ -274,6 +292,10 @@ def _install_source_dependency_compatibility() -> None:
                 result_values: list[torch.Tensor] = []
                 for output_row, source_row in enumerate(queried_rows):
                     match = torch.nonzero(self._row == source_row, as_tuple=False).squeeze(1)
+                    # torch_sparse stores COO entries in row/column order.
+                    # MatterGen's id3_ba therefore follows the edge source ID
+                    # within each target row, not the caller's incidental COO order.
+                    match = match[torch.argsort(self._col[match], stable=True)]
                     result_rows.append(
                         torch.full(
                             (len(match),),
@@ -285,6 +307,7 @@ def _install_source_dependency_compatibility() -> None:
                     result_values.append(self._value[match])
                 result = object.__new__(SparseTensor)
                 result._row = self._row
+                result._col = self._col
                 result._value = self._value
                 result.storage = _SparseStorage(
                     torch.cat(result_rows),
@@ -426,6 +449,13 @@ def _pinned_source_modules(source_dir: Path) -> Iterator[_SourceModules]:
             ),
             model_utils=importlib.import_module("mattergen.diffusion.model_utils"),
             property_embeddings=importlib.import_module("mattergen.property_embeddings"),
+            d3pm=importlib.import_module("mattergen.diffusion.d3pm.d3pm"),
+            d3pm_corruption=importlib.import_module(
+                "mattergen.diffusion.corruption.d3pm_corruption"
+            ),
+            d3pm_predictors_correctors=importlib.import_module(
+                "mattergen.diffusion.d3pm.d3pm_predictors_correctors"
+            ),
         )
     finally:
         sys.path.remove(str(source_dir))
@@ -656,7 +686,29 @@ def _source_host_feeds(
     fractional_coordinates = torch.from_numpy(crystal.fractional_coordinates)
     lattice = torch.from_numpy(crystal.cell)
     num_atoms = torch.tensor([len(atomic_numbers)], dtype=torch.long)
-    batch = torch.zeros(len(atomic_numbers), dtype=torch.long)
+    return _source_host_feeds_for_batch(
+        reference,
+        source,
+        atomic_numbers=atomic_numbers,
+        fractional_coordinates=fractional_coordinates,
+        lattice=lattice,
+        num_atoms=num_atoms,
+        timestep=timestep,
+    )
+
+
+def _source_host_feeds_for_batch(
+    reference: _ReferenceModel,
+    source: _SourceModules,
+    *,
+    atomic_numbers: torch.Tensor,
+    fractional_coordinates: torch.Tensor,
+    lattice: torch.Tensor,
+    num_atoms: torch.Tensor,
+    timestep: float,
+) -> _SourceGraph:
+    """Build one exact source graph for arbitrary packed crystals."""
+    batch = torch.repeat_interleave(torch.arange(len(num_atoms), dtype=torch.long), num_atoms)
     cartesian_coordinates = source.data_utils.frac_to_cart_coords_with_lattice(
         fractional_coordinates, num_atoms, lattice
     )
@@ -792,6 +844,26 @@ def mp20_runtime() -> Iterator[_Mp20Runtime]:
             _crystal(permutation=np.array([1, 0], dtype=np.int64)),
             0.25,
         )
+        batched_graph = _source_host_feeds_for_batch(
+            reference,
+            source,
+            atomic_numbers=torch.tensor([3, 8, 14], dtype=torch.long),
+            fractional_coordinates=torch.tensor(
+                [[0.10, 0.15, 0.20], [0.40, 0.45, 0.35], [0.25, 0.75, 0.50]],
+                dtype=torch.float32,
+            ),
+            lattice=torch.stack(
+                [
+                    torch.diag(torch.tensor([6.0, 5.5, 6.5], dtype=torch.float32)),
+                    torch.tensor(
+                        [[4.5, 0.0, 0.0], [0.4, 5.0, 0.0], [0.2, 0.3, 5.5]],
+                        dtype=torch.float32,
+                    ),
+                ]
+            ),
+            num_atoms=torch.tensor([2, 1], dtype=torch.long),
+            timestep=0.25,
+        )
         del reference
         del state
 
@@ -812,6 +884,7 @@ def mp20_runtime() -> Iterator[_Mp20Runtime]:
         original=original,
         translated=translated,
         permuted=permuted,
+        batched_graph=batched_graph,
         checkpoint_sha256=_sha256(checkpoint),
     )
     try:
@@ -875,6 +948,149 @@ def test_mp20_periodic_translation_and_permutation_invariance(
             mp20_runtime.session.run(mp20_runtime.permuted.feeds), permutation
         ),
         baseline,
+    )
+
+
+def test_host_periodic_graph_matches_source_for_batched_neighbor_truncation(
+    mp20_runtime: _Mp20Runtime,
+) -> None:
+    """Host PBC edges, symmetric pairs, and triplets match source for packed crystals."""
+    expected = mp20_runtime.batched_graph.feeds
+    graph = build_periodic_graph(
+        torch.from_numpy(
+            np.array(
+                [[0.10, 0.15, 0.20], [0.40, 0.45, 0.35], [0.25, 0.75, 0.50]],
+                dtype=np.float32,
+            )
+        ),
+        torch.from_numpy(
+            np.array(
+                [
+                    [[6.0, 0.0, 0.0], [0.0, 5.5, 0.0], [0.0, 0.0, 6.5]],
+                    [[4.5, 0.0, 0.0], [0.4, 5.0, 0.0], [0.2, 0.3, 5.5]],
+                ],
+                dtype=np.float32,
+            )
+        ),
+        torch.tensor([2, 1], dtype=torch.long),
+        cutoff=7.0,
+        max_neighbors=50,
+        max_cell_images_per_dim=5,
+    )
+    actual = {
+        "edge_index": graph.edge_index.numpy(),
+        "edge_distance": graph.edge_distance.numpy(),
+        "edge_direction": graph.edge_direction.numpy(),
+        "edge_lattice_cosines": graph.edge_lattice_cosines.numpy(),
+        "id_swap": graph.id_swap.numpy(),
+        "id3_ba": graph.id3_ba.numpy(),
+        "id3_ca": graph.id3_ca.numpy(),
+        "id3_ragged_idx": graph.id3_ragged_idx.numpy(),
+    }
+    for name, value in actual.items():
+        np.testing.assert_array_equal(
+            value,
+            expected[name],
+            err_msg=f"{name} source graph mismatch",
+        )
+
+
+def test_host_d3pm_predictor_matches_source_schedule_and_rng() -> None:
+    """Host absorbing-mask posterior and both categorical draws match the source."""
+    source_dir = _required_artifact(_SOURCE_DIR_ENV)
+    with _pinned_source_modules(source_dir) as source:
+        schedule = source.d3pm.create_discrete_diffusion_schedule(
+            kind="standard",
+            num_steps=1000,
+        )
+        corruption = source.d3pm_corruption.D3PMCorruption(
+            source.d3pm.MaskDiffusion(dim=101, schedule=schedule),
+            offset=1,
+        )
+        predictor = source.d3pm_predictors_correctors.D3PMAncestralSamplingPredictor(
+            corruption=corruption,
+            score_fn=None,
+            predict_x0=True,
+        )
+        atomic_numbers = torch.tensor([101, 3, 101], dtype=torch.long)
+        logits = torch.linspace(-2.0, 2.0, 303, dtype=torch.float32).reshape(3, 101)
+        timestep = torch.tensor([0.75], dtype=torch.float32)
+        batch = torch.zeros(3, dtype=torch.long)
+        rng_state = torch.random.get_rng_state()
+        try:
+            torch.manual_seed(814)
+            expected_sample, expected_mean = predictor.update_given_score(
+                x=atomic_numbers,
+                t=timestep,
+                dt=torch.tensor(-0.001, dtype=torch.float32),
+                batch_idx=batch,
+                score=logits,
+                batch=None,
+            )
+        finally:
+            torch.random.set_rng_state(rng_state)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(814)
+    actual_sample, actual_mean = MatterGenHostSampler(
+        lambda _inputs: (_ for _ in ()).throw(
+            AssertionError("score callback must not be used")
+        )
+    )._d3pm_ancestral(atomic_numbers, logits, timestep, batch, generator)
+
+    torch.testing.assert_close(actual_sample, expected_sample)
+    torch.testing.assert_close(actual_mean, expected_mean)
+
+
+@pytest.mark.golden
+@pytest.mark.generation
+def test_mp20_real_onnx_host_sampling_golden(mp20_runtime: _Mp20Runtime) -> None:
+    """L5: the full released scheduler yields a deterministic valid crystal artifact."""
+
+    class _NamedSession:
+        """Bridge test inference wrapper to the public ONNX Runtime callback ABI."""
+
+        def run(
+            self,
+            output_names: list[str] | None,
+            input_feed: Mapping[str, np.ndarray],
+        ) -> list[np.ndarray]:
+            if output_names is None:
+                raise AssertionError("MatterGen callback requests explicit output names")
+            outputs = mp20_runtime.session.run(dict(input_feed))
+            return [outputs[name] for name in output_names]
+
+    golden = json.loads(_HOST_SAMPLE_GOLDEN_PATH.read_text(encoding="utf-8"))
+    assert golden["source_commit"] == MATTERGEN_SOURCE_COMMIT
+    assert golden["checkpoint_sha256"] == mp20_runtime.checkpoint_sha256
+    assert golden["timesteps"] == 1000
+
+    sample = MatterGenHostSampler(create_onnxruntime_score_callback(_NamedSession())).sample(
+        torch.tensor(golden["num_atoms"], dtype=torch.long),
+        seed=golden["seed"],
+    )
+    crystal = sample.crystals()[0]
+    np.testing.assert_array_equal(
+        crystal.atomic_numbers.numpy(),
+        np.asarray(golden["sample"]["atomic_numbers"], dtype=np.int64),
+    )
+    np.testing.assert_allclose(
+        crystal.fractional_coordinates.numpy(),
+        np.asarray(golden["sample"]["fractional_coordinates"], dtype=np.float32),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    np.testing.assert_allclose(
+        crystal.cell.numpy(),
+        np.asarray(golden["sample"]["cell"], dtype=np.float32),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    assert np.isclose(
+        np.linalg.det(crystal.cell.numpy()),
+        golden["sample"]["volume"],
+        rtol=1e-4,
+        atol=1e-4,
     )
 
 

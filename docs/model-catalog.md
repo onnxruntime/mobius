@@ -263,6 +263,18 @@ from mobius import build
 pkg = build("stabilityai/stable-diffusion-xl-base-1.0")
 ```
 
+## Periodic crystal diffusion
+
+| Model | Exported component | Task | Example HuggingFace Model |
+|---|---|---|---|
+| MatterGen | GemNet-T crystal score core | `mattergen-score` | `microsoft/mattergen` |
+
+MatterGen is a native periodic-crystal diffusion integration rather than a
+Diffusers pipeline. Mobius exports its deterministic neural score core; the
+periodic neighbor graph, diffusion scheduler, sampling, and crystal validation
+remain source-compatible host responsibilities. See [MatterGen crystal
+diffusion score core](mattergen.md) for the staged contract and runtime limits.
+
 ## Quantization Support
 
 All decoder-only LLMs and MoE models support quantized weight loading:
