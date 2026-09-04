@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 
+import onnx_ir as ir
 import pytest
 
 from mobius._registry import registry
@@ -332,6 +333,7 @@ class TestArchValidation:
         assert config.num_attention_heads == q_heads
         assert config.num_key_value_heads == kv_heads
         assert config.tie_word_embeddings is tied_embeddings
+        assert config.dtype == ir.DataType.FLOAT
         assert config.acoustic_tokenizer.hidden_size == 64
         assert config.semantic_tokenizer.hidden_size == 128
         assert config.compression_ratio == 3200
