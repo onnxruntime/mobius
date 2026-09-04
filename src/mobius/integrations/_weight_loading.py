@@ -21,6 +21,7 @@ __all__ = [
     "apply_weights",
     "stream_qdq_safetensors_to_model",
     "stream_preprocessed_safetensors_to_model",
+    "stream_preprocessed_safetensors_to_package",
     "stream_safetensors_to_model",
     "external_data_checksums",
 ]
@@ -77,6 +78,7 @@ class StreamingWeightSource:
     mode: Literal["direct", "fp8_scalar", "fp8_block_128"] = "direct"
     scale_name: str | None = None
     expected_scale: float | None = None
+    expected_dtype: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -684,8 +686,8 @@ def _assign_lazy_expert_bank(
     )
 
 
-def stream_preprocessed_safetensors_to_model(
-    model: ir.Model,
+def _stream_preprocessed_safetensors(
+    initializers: Mapping[str, ir.Value],
     model_id: str,
     planner: Callable[
         [Mapping[str, tuple[str, list[int], str]], Mapping[str, ir.Value]],
@@ -704,7 +706,7 @@ def stream_preprocessed_safetensors_to_model(
     """
     paths = _resolve_shard_paths(model_id, revision)
     key_index = _shard_key_index(paths)
-    plan = planner(key_index, model.graph.initializers)
+    plan = planner(key_index, initializers)
 
     consumed = set(plan.ignored) | set(plan.constants)
     assigned: set[str] = set()
@@ -725,6 +727,11 @@ def stream_preprocessed_safetensors_to_model(
         if source.source_name not in key_index:
             raise ValueError(f"Streaming source '{source.source_name}' does not exist")
         _source_path, source_shape, source_dtype = key_index[source.source_name]
+        if source.expected_dtype is not None and source_dtype != source.expected_dtype:
+            raise ValueError(
+                f"Streaming source '{source.source_name}' has dtype {source_dtype}; "
+                f"expected {source.expected_dtype}"
+            )
         if source.mode in {"fp8_block_128", "fp8_scalar"}:
             if source_dtype not in {"F8_E4M3", "F8_E5M2"}:
                 raise ValueError(
@@ -794,7 +801,7 @@ def stream_preprocessed_safetensors_to_model(
         return source_shape, source_bytes, scale_bytes
 
     for target_name, source in plan.targets.items():
-        initializer = model.graph.initializers.get(target_name)
+        initializer = initializers.get(target_name)
         if initializer is None:
             raise ValueError(f"Streaming plan targets unknown initializer '{target_name}'")
         if initializer.const_value is not None:
@@ -882,7 +889,7 @@ def stream_preprocessed_safetensors_to_model(
 
     missing_targets = sorted(
         name
-        for name, initializer in model.graph.initializers.items()
+        for name, initializer in initializers.items()
         if initializer.const_value is None and name not in assigned
     )
     if missing_targets:
@@ -916,7 +923,66 @@ def stream_preprocessed_safetensors_to_model(
         "largest_reconstruction_working_set_bytes": (largest_reconstruction_working_set_bytes),
         **dict(plan.report),
     }
+    return report
+
+
+def stream_preprocessed_safetensors_to_model(
+    model: ir.Model,
+    model_id: str,
+    planner: Callable[
+        [Mapping[str, tuple[str, list[int], str]], Mapping[str, ir.Value]],
+        StreamingWeightPlan,
+    ],
+    *,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Stream a fully classified transformed checkpoint into one dense ONNX graph."""
+    report = _stream_preprocessed_safetensors(
+        model.graph.initializers,
+        model_id,
+        planner,
+        revision=revision,
+    )
     model.metadata_props["mobius.weight_loading"] = json.dumps(report, sort_keys=True)
+    return report
+
+
+def stream_preprocessed_safetensors_to_package(
+    package: Mapping[str, ir.Model],
+    model_id: str,
+    planner: Callable[
+        [Mapping[str, tuple[str, list[int], str]], Mapping[str, ir.Value]],
+        StreamingWeightPlan,
+    ],
+    *,
+    revision: str | None = None,
+) -> dict[str, object]:
+    """Stream one fully classified checkpoint across a staged ONNX package.
+
+    Initializer names are module-qualified and must be unique across every
+    component. Graph constants are excluded: the planner owns checkpoint
+    tensors, while fixed graph constants have no safetensors source.
+    """
+    initializers: dict[str, ir.Value] = {}
+    for component_name, model in package.items():
+        for name, initializer in model.graph.initializers.items():
+            if initializer.const_value is not None:
+                continue
+            if name in initializers:
+                raise ValueError(
+                    f"Staged streaming package has duplicate initializer {name!r} in "
+                    f"component {component_name!r}."
+                )
+            initializers[name] = initializer
+    report = _stream_preprocessed_safetensors(
+        initializers,
+        model_id,
+        planner,
+        revision=revision,
+    )
+    serialized_report = json.dumps(report, sort_keys=True)
+    for model in package.values():
+        model.metadata_props["mobius.weight_loading"] = serialized_report
     return report
 
 

@@ -253,9 +253,7 @@ class GGUFModel:
                         require_architecture=False,
                         collect_tensor_type_ids=True,
                     )
-                    from mobius.integrations.gguf._vibeasr_bitnet import (
-                        reject_vibeasr_bitnet_gguf,
-                    )
+                    from mobius.integrations._vibeasr_bitnet import reject_vibeasr_bitnet_gguf
 
                     reject_vibeasr_bitnet_gguf(source=str(self._path), header=header_info)
                 stream.seek(0)

@@ -21,10 +21,14 @@ import torch
 from onnx_ir import tensor_adapters
 
 from mobius._builder import build_from_module
+from mobius._model_package import ModelPackage
 from mobius._testing import make_config
 from mobius.integrations._weight_loading import (
+    StreamingWeightPlan,
+    StreamingWeightSource,
     _shard_key_index,
     external_data_checksums,
+    stream_preprocessed_safetensors_to_package,
     stream_safetensors_to_model,
 )
 from mobius.models.base import CausalLMModel
@@ -136,6 +140,33 @@ class TestStreamingCorrectness:
             if name in state and isinstance(init.const_value, ir.LazyTensor)
         ]
         assert lazy, "expected streamed weights to be deferred LazyTensors"
+
+    def test_preprocessed_package_streams_and_records_every_component(
+        self, tmp_path, monkeypatch
+    ):
+        def _no_hub(*_a, **_k):
+            raise AssertionError("streaming a local dir must not call the Hub")
+
+        monkeypatch.setattr("mobius.integrations._weight_loading.hf_hub_download", _no_hub)
+        model = _fresh_model()
+        state = _make_checkpoint_state(model)
+        _save_single(state, tmp_path)
+        package = ModelPackage({"decoder": model})
+
+        def plan(sources, initializers):
+            return StreamingWeightPlan(
+                targets={
+                    name: StreamingWeightSource(name, expected_dtype="F32")
+                    for name, initializer in initializers.items()
+                    if initializer.const_value is None
+                }
+            )
+
+        report = stream_preprocessed_safetensors_to_package(package, str(tmp_path), plan)
+
+        assert report["assigned_tensors"] == len(state)
+        assert model.metadata_props["mobius.weight_loading"]
+        _roundtrip_and_compare(model, state, tmp_path)
 
 
 class TestStreamingRefusals:

@@ -1,39 +1,68 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-"""Identity and import verdicts for the VibeVoice ASR BitNet GGUF artifacts.
+"""Artifact identities and import verdicts for VibeVoice ASR BitNet.
 
 The official VibeVoice ASR BitNet release contains an F32 safetensors
 conversion source alongside two execution-only GGUF files. The latter are not
 ordinary llama.cpp quantizations: ``I2_S`` needs VibeASR.cpp's packed ternary
 and activation kernels, and ``I8_S`` needs its fused VAE kernels. This module
 centralizes that artifact-level distinction without teaching generic ONNX
-components about a model-specific execution format.
+components about a model-specific execution format. The dense safetensors
+conversion source is recorded separately so its ONNX path cannot be confused
+with VibeASR.cpp-native quantized execution.
 """
 
 from __future__ import annotations
 
 __all__ = [
+    "VIBEVOICE_ASR_BITNET_DENSE_F32_TENSOR_COUNT",
+    "VIBEVOICE_ASR_BITNET_DENSE_F32_VALUE_COUNT",
+    "VIBEVOICE_ASR_BITNET_DENSE_SAFETENSORS",
     "VIBEVOICE_ASR_BITNET_ARTIFACTS",
     "VIBEVOICE_ASR_BITNET_REPOSITORY",
     "VIBEVOICE_ASR_BITNET_REVISION",
+    "build_vibeasr_bitnet_dense_weight_plan",
+    "is_vibeasr_bitnet_conversion_source",
     "VibeASRBitNetGGUFArtifact",
+    "VibeASRBitNetSafetensorsArtifact",
     "find_vibeasr_bitnet_gguf_artifact",
     "reject_vibeasr_bitnet_gguf",
 ]
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePath
+from typing import TYPE_CHECKING
 
 from mobius.integrations.gguf._errors import VibeASRBitNetGGUFImportError
 from mobius.integrations.gguf._header import GGUFHeaderInfo
 
+if TYPE_CHECKING:
+    import onnx_ir as ir
+
+    from mobius.integrations._weight_loading import StreamingWeightPlan
+    from mobius.models.vibevoice_asr import VibeVoiceASRForConditionalGeneration
+
 VIBEVOICE_ASR_BITNET_REPOSITORY = "microsoft/VibeVoice-ASR-BitNet"
 VIBEVOICE_ASR_BITNET_REVISION = "66e78021ab8f5f06133d1ab421ba4d348bda97c9"
+VIBEVOICE_ASR_BITNET_DENSE_F32_TENSOR_COUNT = 1_177
+VIBEVOICE_ASR_BITNET_DENSE_F32_VALUE_COUNT = 2_814_116_321
+_VIBEVOICE_ASR_BITNET_INDEX_REPORTED_PARAMETER_COUNT = 322_592_829
 _VIBEASR_LM_FILE_TYPE = 40
 _VIBEASR_VAE_FILE_TYPE = 41
 _VIBEASR_I2_S_TYPE_ID = 36
 _VIBEASR_I8_S_TYPE_ID = 37
+
+
+@dataclass(frozen=True, slots=True)
+class VibeASRBitNetSafetensorsArtifact:
+    """Immutable identity of one dense F32 conversion-source shard."""
+
+    filename: str
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +79,25 @@ class VibeASRBitNetGGUFArtifact:
     blocker: str
     file_type: int
     tensor_type_ids: frozenset[int]
+
+
+VIBEVOICE_ASR_BITNET_DENSE_SAFETENSORS = (
+    VibeASRBitNetSafetensorsArtifact(
+        filename="model-00001-of-00003.safetensors",
+        size_bytes=4_996_674_400,
+        sha256="58cb328634bb4b7e5afcc4f14c43261a0c636c9031b0b085bd3ef53c131aaf19",
+    ),
+    VibeASRBitNetSafetensorsArtifact(
+        filename="model-00002-of-00003.safetensors",
+        size_bytes=4_963_184_724,
+        sha256="410349401256a9a995424408f8f77a21cad5e53183e07207820d7b25e84682df",
+    ),
+    VibeASRBitNetSafetensorsArtifact(
+        filename="model-00003-of-00003.safetensors",
+        size_bytes=1_296_761_656,
+        sha256="49c2d7591f9dcbbd6fb37baa58379211f21df30dbd3c6ff39cb8c81473660cdb",
+    ),
+)
 
 
 _LM_BLOCKER = (
@@ -89,6 +137,117 @@ VIBEVOICE_ASR_BITNET_ARTIFACTS = (
         tensor_type_ids=frozenset({0, _VIBEASR_I8_S_TYPE_ID}),
     ),
 )
+
+
+def is_vibeasr_bitnet_conversion_source(model_id: str, revision: str | None) -> bool:
+    """Return whether the requested immutable source is the audited F32 release."""
+    return (
+        model_id == VIBEVOICE_ASR_BITNET_REPOSITORY
+        and revision == VIBEVOICE_ASR_BITNET_REVISION
+    )
+
+
+def build_vibeasr_bitnet_dense_weight_plan(
+    model: VibeVoiceASRForConditionalGeneration,
+    source_tensors: Mapping[str, tuple[str, list[int], str]],
+    _initializers: Mapping[str, ir.Value],
+) -> StreamingWeightPlan:
+    """Classify every source tensor for the staged dense-F32 conversion route.
+
+    The parent ASR module remains authoritative for HF-to-ONNX name alignment.
+    Marker tensors exercise that mapping without materializing any checkpoint
+    values; every non-decoder source must map to an exported initializer.
+    """
+    import torch
+
+    from mobius.integrations._weight_loading import StreamingWeightPlan, StreamingWeightSource
+
+    if len(source_tensors) != VIBEVOICE_ASR_BITNET_DENSE_F32_TENSOR_COUNT:
+        raise ValueError(
+            "VibeVoice ASR BitNet dense source tensor count changed: expected "
+            f"{VIBEVOICE_ASR_BITNET_DENSE_F32_TENSOR_COUNT}, got {len(source_tensors)}."
+        )
+    non_f32 = {
+        source_name: source_dtype
+        for source_name, (_, _, source_dtype) in source_tensors.items()
+        if source_dtype != "F32"
+    }
+    if non_f32:
+        examples = sorted(non_f32.items())[:5]
+        raise ValueError(
+            "VibeVoice ASR BitNet dense conversion source must contain only F32 tensors; "
+            f"found {examples}."
+        )
+    value_count = sum(math.prod(shape) for _, shape, _ in source_tensors.values())
+    if value_count != VIBEVOICE_ASR_BITNET_DENSE_F32_VALUE_COUNT:
+        raise ValueError(
+            "VibeVoice ASR BitNet dense source value count changed: expected "
+            f"{VIBEVOICE_ASR_BITNET_DENSE_F32_VALUE_COUNT}, got {value_count}."
+        )
+
+    markers = {name: torch.empty(0) for name in source_tensors}
+    mapped = model.preprocess_weights(markers)
+    marker_sources = {id(marker): name for name, marker in markers.items()}
+    targets: dict[str, StreamingWeightSource] = {}
+    for target_name, marker in mapped.items():
+        source_name = marker_sources.get(id(marker))
+        if source_name is None:
+            raise ValueError(
+                "VibeVoice ASR BitNet weight preprocessing transformed a source marker for "
+                f"{target_name!r}; streaming requires a one-to-one source tensor mapping."
+            )
+        if target_name in targets:
+            raise ValueError(
+                f"VibeVoice ASR BitNet maps multiple source tensors to {target_name!r}."
+            )
+        targets[target_name] = StreamingWeightSource(
+            source_name=source_name,
+            expected_dtype="F32",
+        )
+
+    used_sources = {source.source_name for source in targets.values()}
+    ignored: dict[str, str] = {}
+    for source_name in source_tensors:
+        if source_name in used_sources:
+            continue
+        if source_name.startswith("model.acoustic_tokenizer.decoder."):
+            ignored[source_name] = (
+                "The source acoustic VAE decoder is not an ASR inference stage."
+            )
+            continue
+        raise ValueError(
+            f"VibeVoice ASR BitNet source tensor {source_name!r} is not classified by "
+            "the staged inference package."
+        )
+
+    return StreamingWeightPlan(
+        targets=targets,
+        ignored=ignored,
+        report={
+            "source_format": "safetensors",
+            "source_storage_dtype": "float32",
+            "source_tensor_count": len(source_tensors),
+            "source_value_count": value_count,
+            "source_parameter_count_status": (
+                "The checkpoint index's reported 322592829 parameter count is inconsistent "
+                "with the exact dense-F32 tensor-byte census (2814116321 values); the latter "
+                "is authoritative for this export."
+            ),
+            "index_reported_parameter_count": _VIBEVOICE_ASR_BITNET_INDEX_REPORTED_PARAMETER_COUNT,
+            "native_bitnet_execution": False,
+            "native_gguf_disposition": (
+                "not imported; VibeASR.cpp I2_S/I8_S kernels and packing are unsupported"
+            ),
+            "native_gguf_artifacts": [
+                {
+                    "filename": artifact.filename,
+                    "sha256": artifact.sha256,
+                    "disposition": "unsupported_native_execution",
+                }
+                for artifact in VIBEVOICE_ASR_BITNET_ARTIFACTS
+            ],
+        },
+    )
 
 
 def _is_vibeasr_lm_header(header: GGUFHeaderInfo) -> bool:

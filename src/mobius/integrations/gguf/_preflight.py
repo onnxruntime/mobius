@@ -605,8 +605,8 @@ def preflight_hf_gguf(
             )
         )
 
-    architecture, num_experts, total_tensors, total_params = _hf_gguf_metadata(
-        api, repo_id, revision, token
+    architecture, num_experts, total_tensors, total_params, resolved_revision = (
+        _hf_gguf_metadata(api, repo_id, revision, token)
     )
     model_type = resolve_model_type(architecture) if architecture else None
     quantization = _detect_quantization(filename, *shard_files)
@@ -618,12 +618,12 @@ def preflight_hf_gguf(
         quantization=quantization,
         source=f"{repo_id}{('/' + filename) if filename else ''}",
     )
-    from mobius.integrations.gguf._vibeasr_bitnet import find_vibeasr_bitnet_gguf_artifact
+    from mobius.integrations._vibeasr_bitnet import find_vibeasr_bitnet_gguf_artifact
 
     for file in files:
         artifact = find_vibeasr_bitnet_gguf_artifact(
             repository=repo_id,
-            revision=revision,
+            revision=resolved_revision or revision,
             filename=file.filename,
             size_bytes=file.size_bytes,
             sha256=file.sha256,
@@ -770,10 +770,10 @@ def _shards_for_prefix(gguf_files: list[str], prefix: str) -> list[str]:
 
 def _hf_gguf_metadata(
     api: Any, repo_id: str, revision: str | None, token: str | bool | None
-) -> tuple[str | None, int | None, int | None, int | None]:
-    """Return ``(architecture, num_experts, total_tensors, total_params)``.
+) -> tuple[str | None, int | None, int | None, int | None, str | None]:
+    """Return architecture/count metadata plus the immutable resolved revision.
 
-    Uses ``model_info(expand=["gguf"])`` which surfaces the parsed GGUF header
+    Uses ``model_info(expand=["gguf", "sha"])`` which surfaces the parsed GGUF header
     fields without downloading tensor bytes. The Hub's ``gguf.total`` is the
     *parameter* count (not the tensor count); any field the Hub does not expose
     comes back ``None`` (the caller records a warning).
@@ -782,12 +782,15 @@ def _hf_gguf_metadata(
     num_experts: int | None = None
     total_tensors: int | None = None
     total_params: int | None = None
+    resolved_revision: str | None = None
     try:
-        info = api.model_info(repo_id, revision=revision, token=token, expand=["gguf"])
+        info = api.model_info(repo_id, revision=revision, token=token, expand=["gguf", "sha"])
     except Exception as error:
         logger.info("model_info(expand=gguf) unavailable for %s: %s", repo_id, error)
-        return architecture, num_experts, total_tensors, total_params
+        return architecture, num_experts, total_tensors, total_params, resolved_revision
 
+    sha = getattr(info, "sha", None)
+    resolved_revision = sha if isinstance(sha, str) else None
     gguf_meta = getattr(info, "gguf", None)
     if isinstance(gguf_meta, dict):
         architecture = gguf_meta.get("architecture") or gguf_meta.get("general.architecture")
@@ -808,6 +811,7 @@ def _hf_gguf_metadata(
         int(num_experts) if num_experts else None,
         int(total_tensors) if total_tensors else None,
         int(total_params) if total_params else None,
+        resolved_revision,
     )
 
 
