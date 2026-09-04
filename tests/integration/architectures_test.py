@@ -15,13 +15,127 @@ import torch
 import transformers
 
 from integration._support import (
+    _make_decode_feeds,
+    _make_prefill_feeds,
     _make_session,
 )
-from mobius import models
+from mobius import build, models
 from mobius._configs import ArchitectureConfig, VisionConfig
 from mobius._testing.comparison import (
     assert_logits_close,
 )
+from mobius._testing.prefix_lm import generated_token_type_ids, prompt_token_type_ids
+
+_HRM_TEXT_MODEL_ID = "sapientinc/HRM-Text-1B"
+_HRM_TEXT_REVISION = "9f082d68b8cd0ebc56e33f1c88c45609174c272c"
+_HRM_TEXT_PROMPT = (
+    "<|im_start|><|quad_end|><|object_ref_end|>Explain why the sky is blue.<|im_end|>"
+)
+
+
+@pytest.mark.integration
+@pytest.mark.integration_slow
+def test_hrm_text_1b_real_weight_prefill_and_decode_parity():
+    """Verify PrefixLM prefill and cached causal decode against the pinned checkpoint."""
+    import gc
+
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    from mobius._configs import HrmTextConfig
+
+    hf_config = AutoConfig.from_pretrained(_HRM_TEXT_MODEL_ID, revision=_HRM_TEXT_REVISION)
+    config = HrmTextConfig.from_transformers(hf_config)
+    assert config.num_layers_per_stack is not None
+    assert config.num_hidden_layers == (
+        config.num_layers_per_stack * config.H_cycles * (config.L_cycles + 1)
+    )
+    assert config.prefix_lm is True
+
+    tokenizer = AutoTokenizer.from_pretrained(_HRM_TEXT_MODEL_ID, revision=_HRM_TEXT_REVISION)
+    tokens = tokenizer(_HRM_TEXT_PROMPT, return_tensors="np")
+    input_ids = tokens["input_ids"].astype(np.int64)
+    attention_mask = tokens["attention_mask"].astype(np.int64)
+    seq_len = input_ids.shape[1]
+    position_ids = np.arange(seq_len, dtype=np.int64)[np.newaxis, :]
+    prefix_token_type_ids = prompt_token_type_ids(input_ids)
+
+    torch_model = AutoModelForCausalLM.from_pretrained(
+        _HRM_TEXT_MODEL_ID,
+        revision=_HRM_TEXT_REVISION,
+        dtype=torch.float32,
+    ).eval()
+    with torch.no_grad():
+        hf_prefill = torch_model(
+            input_ids=torch.from_numpy(input_ids),
+            attention_mask=torch.from_numpy(attention_mask),
+            position_ids=torch.from_numpy(position_ids),
+            token_type_ids=torch.from_numpy(prefix_token_type_ids),
+            use_cache=True,
+        )
+        hf_causal_logits = (
+            torch_model(
+                input_ids=torch.from_numpy(input_ids),
+                attention_mask=torch.from_numpy(attention_mask),
+                position_ids=torch.from_numpy(position_ids),
+                token_type_ids=torch.from_numpy(generated_token_type_ids(input_ids)),
+                use_cache=False,
+            )
+            .logits.float()
+            .numpy()
+        )
+    hf_prefill_logits = hf_prefill.logits.float().numpy()
+    assert float(np.abs(hf_prefill_logits - hf_causal_logits).max()) > 1.0
+
+    next_token = np.array([[int(hf_prefill_logits[0, -1].argmax())]], dtype=np.int64)
+    decode_mask = np.ones((1, seq_len + 1), dtype=np.int64)
+    decode_position_ids = np.array([[seq_len]], dtype=np.int64)
+    with torch.no_grad():
+        hf_decode_logits = (
+            torch_model(
+                input_ids=torch.from_numpy(next_token),
+                attention_mask=torch.from_numpy(decode_mask),
+                position_ids=torch.from_numpy(decode_position_ids),
+                token_type_ids=torch.from_numpy(generated_token_type_ids(next_token)),
+                past_key_values=hf_prefill.past_key_values,
+                use_cache=True,
+            )
+            .logits.float()
+            .numpy()
+        )
+    del torch_model, hf_prefill
+    gc.collect()
+
+    package = build(
+        _HRM_TEXT_MODEL_ID,
+        dtype="f32",
+        load_weights=True,
+        revision=_HRM_TEXT_REVISION,
+    )
+    session = _make_session(package["model"])
+    try:
+        assert "token_type_ids" in session.input_names
+        assert len(
+            [name for name in session.input_names if name.startswith("past_key_values.")]
+        ) == (2 * config.num_hidden_layers)
+
+        prefill_feeds = _make_prefill_feeds(config, input_ids, attention_mask, position_ids)
+        prefill_feeds["token_type_ids"] = prefix_token_type_ids
+        onnx_prefill = session.run(prefill_feeds)
+        assert_logits_close(onnx_prefill["logits"], hf_prefill_logits, rtol=1e-3, atol=1e-3)
+
+        decode_feeds = _make_decode_feeds(
+            config, next_token, decode_mask, decode_position_ids, onnx_prefill
+        )
+        decode_feeds["token_type_ids"] = generated_token_type_ids(next_token)
+        onnx_decode = session.run(decode_feeds)
+        assert_logits_close(onnx_decode["logits"], hf_decode_logits, rtol=1e-3, atol=1e-3)
+
+        causal_feeds = dict(prefill_feeds)
+        causal_feeds["token_type_ids"] = generated_token_type_ids(input_ids)
+        onnx_causal = session.run(causal_feeds)
+        assert_logits_close(onnx_causal["logits"], hf_causal_logits, rtol=1e-3, atol=1e-3)
+    finally:
+        session.close()
 
 
 @pytest.mark.integration

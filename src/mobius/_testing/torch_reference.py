@@ -367,6 +367,7 @@ def torch_forward(
     attention_mask: np.ndarray,
     position_ids: np.ndarray,
     past_key_values: object | None = None,
+    token_type_ids: np.ndarray | None = None,
 ) -> tuple[np.ndarray, object]:
     """Run a single forward pass on a HuggingFace causal LM model.
 
@@ -377,6 +378,10 @@ def torch_forward(
         position_ids: [batch, seq_len] int64 numpy array.
         past_key_values: Optional list of (key, value) numpy array tuples, or
             an opaque HuggingFace Cache for hybrid recurrent models.
+        token_type_ids: Optional [batch, seq_len] int64 PrefixLM block marker
+            (``1`` = bidirectional prefix position). Only forwarded when the
+            model's ``forward`` actually accepts it, so passing it for a
+            non-PrefixLM model is inert rather than an error.
 
     Returns:
         Tuple of logits and either a list of KV numpy tuples or an opaque
@@ -401,6 +406,9 @@ def torch_forward(
     fwd_sig = inspect.signature(model.forward)
     if "position_ids" in fwd_sig.parameters:
         kwargs["position_ids"] = pos_t
+
+    if token_type_ids is not None and "token_type_ids" in fwd_sig.parameters:
+        kwargs["token_type_ids"] = torch.from_numpy(token_type_ids).to(device)
 
     if past_key_values is not None:
         from transformers.cache_utils import Cache, DynamicCache

@@ -2863,6 +2863,109 @@ class Gemma2Config(CausalLMConfig):
         )
 
 
+def _as_int_or_default(value, default: int) -> int:
+    """Return ``int(value)``, falling back to *default* only when unset.
+
+    Unlike ``int(value or default)`` this preserves an explicit ``0`` so that
+    an out-of-range checkpoint value reaches the config's own validation
+    instead of being silently rewritten to the default.
+    """
+    return default if value is None else int(value)
+
+
+def _as_float_or_default(value, default: float) -> float:
+    """Float counterpart of :func:`_as_int_or_default`."""
+    return default if value is None else float(value)
+
+
+@dataclasses.dataclass
+class HrmTextConfig(CausalLMConfig):
+    """Configuration for HRM-Text hierarchical recurrent models.
+
+    Mirrors HuggingFace ``HrmTextConfig``. The checkpoint stores the real
+    per-stack block count in ``num_hidden_layers``; HuggingFace's
+    ``__post_init__`` moves it to ``num_layers_per_stack`` and rewrites
+    ``num_hidden_layers`` to the *inflated* total number of unique attention
+    invocations under the H/L recurrence::
+
+        num_hidden_layers = num_layers_per_stack * H_cycles * (L_cycles + 1)
+
+    That inflated count is what drives KV-cache slot allocation, so it is what
+    :class:`~mobius.tasks.CausalLMTask` must see. This dataclass reproduces the
+    same split so that both a trusted ``HrmTextConfig`` instance (already
+    inflated, ``num_layers_per_stack`` set) and a raw pinned ``config.json``
+    (not inflated, ``num_layers_per_stack`` absent) resolve identically.
+
+    ``embedding_scale`` defaults to ``1 / initializer_range`` exactly as
+    upstream does when the checkpoint leaves it unset.
+    """
+
+    H_cycles: int = 2
+    L_cycles: int = 3
+    num_layers_per_stack: int | None = None
+    embedding_scale: float | None = None
+    initializer_range: float = 0.02
+    prefix_lm: bool = True
+
+    def __post_init__(self):
+        if self.H_cycles <= 0 or self.L_cycles <= 0:
+            raise ValueError(
+                f"HrmTextConfig requires positive H_cycles/L_cycles, got "
+                f"H_cycles={self.H_cycles}, L_cycles={self.L_cycles}"
+            )
+        # HRM-Text attention is always MHA: upstream hardcodes
+        # ``num_key_value_groups = 1`` and sizes k_proj/v_proj by
+        # ``num_attention_heads * head_dim``, ignoring any
+        # ``num_key_value_heads`` the checkpoint happens to carry.
+        if self.num_attention_heads != DEFAULT_INT:
+            self.num_key_value_heads = self.num_attention_heads
+        if self.embedding_scale is None:
+            if not self.initializer_range:
+                raise ValueError(
+                    "HrmTextConfig needs a non-zero initializer_range to derive "
+                    "embedding_scale when the checkpoint does not supply one."
+                )
+            self.embedding_scale = 1.0 / self.initializer_range
+        if self.num_layers_per_stack is None and self.num_hidden_layers != DEFAULT_INT:
+            # Raw-config path: ``num_hidden_layers`` still carries the real
+            # per-stack count. Remember it, then inflate exactly as upstream.
+            self.num_layers_per_stack = self.num_hidden_layers
+            self.num_hidden_layers = (
+                self.num_layers_per_stack * self.H_cycles * (self.L_cycles + 1)
+            )
+
+    @classmethod
+    def from_transformers(cls, config, parent_config=None) -> HrmTextConfig:
+        base = ArchitectureConfig.from_transformers(config, parent_config)
+        fields = _shallow_fields(base)
+        # ``HrmTextRotaryEmbedding`` is unconditional upstream, so this family
+        # always uses RoPE. A raw ``config.json`` only carries the default
+        # ``rope_theta`` of 10000.0, which the generic extractor deliberately
+        # ignores as a RoPE signal (NoPE models inherit it as dead config
+        # data), leaving ``rope_type=None`` and silently exporting a
+        # position-free graph. Pin the default RoPE explicitly instead.
+        if fields.get("rope_type") is None:
+            fields["rope_type"] = "default"
+            if fields.get("rope_theta") is None:
+                fields["rope_theta"] = 10_000.0
+            if fields.get("partial_rotary_factor") is None:
+                # Upstream rotates the full head_dim.
+                fields["partial_rotary_factor"] = 1.0
+        return cls(
+            **fields,
+            H_cycles=_as_int_or_default(getattr(config, "H_cycles", None), 2),
+            L_cycles=_as_int_or_default(getattr(config, "L_cycles", None), 3),
+            # Present only on a trusted HF config that already ran its own
+            # ``__post_init__``; ``None`` for a raw ``config.json``.
+            num_layers_per_stack=getattr(config, "num_layers_per_stack", None),
+            embedding_scale=getattr(config, "embedding_scale", None),
+            initializer_range=_as_float_or_default(
+                getattr(config, "initializer_range", None), 0.02
+            ),
+            prefix_lm=bool(getattr(config, "prefix_lm", True)),
+        )
+
+
 @dataclasses.dataclass
 class NanoChatConfig(CausalLMConfig):
     """Configuration for NanoChat models with final logit soft-capping.
