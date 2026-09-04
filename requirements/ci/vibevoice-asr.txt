@@ -1,4 +1,6 @@
-# Exact executable source for the VibeVoice streaming ASR synthetic-parity tests.
-# CI installs this file with --no-deps after pinning Transformers 4.51.3.
+# Exact executable source and dependency ABI for VibeVoice streaming ASR parity tests.
+# CI force-installs this file with --no-deps after Mobius's public Transformers>=5 extra.
 transformers==4.51.3
+huggingface-hub==0.31.4
+tokenizers==0.21.4
 vibevoice @ git+https://github.com/microsoft/VibeVoice.git@505653d3873b065a488aea551c6ee3dc51d3062f
