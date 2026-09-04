@@ -122,6 +122,61 @@ def test_host_preserves_chunk_cache_and_uses_seeded_connector_noise():
     assert connector_feeds["acoustic_latent_noise"].shape == (1, 2, 1)
 
 
+def test_host_finalizes_each_variable_length_utterance_at_its_own_endpoint():
+    processor = VibeVoiceASRProcessor()
+    processor.chunk_samples = 4
+    processor.hop_length = 4
+    calls: list[tuple[str, dict[str, np.ndarray]]] = []
+
+    def initial_cache(_stage: str, batch_size: int) -> dict[str, np.ndarray]:
+        return {"past_conv.0": np.zeros((batch_size, 1, 1), dtype=np.float32)}
+
+    def run_stage(stage: str, feeds: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        calls.append((stage, feeds))
+        if stage.endswith("encoder"):
+            return {
+                "audio_latents": feeds["input_values"].mean(axis=-1)[..., None],
+                "present_conv.0": feeds["past_conv.0"] + 1,
+            }
+        return {
+            "audio_features": feeds["acoustic_latents"].reshape(-1, 1),
+            "audio_feature_lengths": np.array([feeds["acoustic_latents"].shape[1]]),
+        }
+
+    host = VibeVoiceASRHost(run_stage, initial_cache, processor)
+    features, lengths = host.encode_audio(
+        VibeVoiceASRBatch(
+            input_values=np.array([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0], [2.0] * 6]),
+            padding_mask=np.array([[True] * 5 + [False], [True] * 6]),
+        ),
+        seed=9,
+    )
+
+    encoder_calls = [feeds for stage, feeds in calls if stage.endswith("encoder")]
+    assert [feeds["input_values"].shape[-1] for feeds in encoder_calls] == [
+        4,
+        4,
+        1,
+        1,
+        4,
+        4,
+        2,
+        2,
+    ]
+    assert [bool(feeds["is_final_chunk"][0]) for feeds in encoder_calls] == [
+        False,
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert features.shape == (4, 1)
+    assert lengths.tolist() == [2, 2]
+
+
 def test_processor_builds_source_chat_template_token_layout():
     class Tokenizer:
         def __init__(self):
