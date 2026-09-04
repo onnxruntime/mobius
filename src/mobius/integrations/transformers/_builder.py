@@ -368,6 +368,7 @@ def build_transformers_model(
         VIBEVOICE_ASR_BITNET_REVISION,
         build_vibeasr_bitnet_dense_weight_plan,
         is_vibeasr_bitnet_conversion_source,
+        normalize_vibeasr_bitnet_config_for_inference,
     )
 
     if model_id == VIBEVOICE_ASR_BITNET_REPOSITORY:
@@ -395,6 +396,16 @@ def build_transformers_model(
         revision=detection_revision,
         trust_remote_code=trust_remote_code,
     )
+    if is_vibeasr_bitnet_dense_source:
+        if hf_config is None:
+            raise ValueError(
+                "The pinned VibeVoice ASR BitNet conversion source is missing a config."
+            )
+        # The BitNet release retains the legacy training config identity, while
+        # its dense source weights are converted through the native HF-only ASR
+        # topology. Validate and translate only this audited source before the
+        # parent's strict architecture guard dispatches the native model.
+        hf_config = normalize_vibeasr_bitnet_config_for_inference(hf_config)
     if hf_config is None or (loaded_from_raw_json and hf_config.model_type not in registry):
         from mobius.models.reuse import _build_reuse, _is_reuse_checkpoint
 
@@ -598,11 +609,16 @@ def build_transformers_model(
     )
     for name, model in package.items():
         model.graph.name = f"{model_id}/{name}"
-        if model_type in _QWEN4_MODEL_TYPES | {
-            "vibevoice",
-            "vibevoice_streaming",
-            "vibevoice_asr",
-        }:
+        if (
+            model_type
+            in _QWEN4_MODEL_TYPES
+            | {
+                "vibevoice",
+                "vibevoice_streaming",
+                "vibevoice_asr",
+            }
+            or is_vibeasr_bitnet_dense_source
+        ):
             model.metadata_props["mobius.source_revision"] = revision or "unpinned"
 
     if load_weights:

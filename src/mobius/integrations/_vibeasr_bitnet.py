@@ -24,6 +24,7 @@ __all__ = [
     "VIBEVOICE_ASR_BITNET_REVISION",
     "build_vibeasr_bitnet_dense_weight_plan",
     "is_vibeasr_bitnet_conversion_source",
+    "normalize_vibeasr_bitnet_config_for_inference",
     "VibeASRBitNetGGUFArtifact",
     "VibeASRBitNetSafetensorsArtifact",
     "find_vibeasr_bitnet_gguf_artifact",
@@ -31,6 +32,7 @@ __all__ = [
 ]
 
 import math
+from copy import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePath
@@ -147,6 +149,32 @@ def is_vibeasr_bitnet_conversion_source(model_id: str, revision: str | None) -> 
     )
 
 
+def normalize_vibeasr_bitnet_config_for_inference(config: object) -> object:
+    """Translate the exact legacy BitNet config into the native ASR dispatch contract.
+
+    This is deliberately scoped to the pinned BitNet conversion source. The
+    public legacy training repository remains rejected by the Transformers
+    builder; only its verified, F32 BitNet source config is normalized after
+    checking its original architecture identity.
+    """
+    source_model_type = getattr(config, "model_type", None)
+    source_architectures = tuple(getattr(config, "architectures", None) or ())
+    if (
+        source_model_type != "vibevoice"
+        or source_architectures != ("VibeVoiceForASRTraining",)
+    ):
+        raise ValueError(
+            "Unsupported VibeVoice ASR BitNet architecture. Expected the pinned "
+            "legacy config with model_type='vibevoice' and "
+            "architectures=['VibeVoiceForASRTraining']; got "
+            f"model_type={source_model_type!r}, architectures={list(source_architectures)!r}."
+        )
+    normalized = copy(config)
+    normalized.model_type = "vibevoice_asr"
+    normalized.architectures = ["VibeVoiceAsrForConditionalGeneration"]
+    return normalized
+
+
 def build_vibeasr_bitnet_dense_weight_plan(
     model: VibeVoiceASRForConditionalGeneration,
     source_tensors: Mapping[str, tuple[str, list[int], str]],
@@ -154,9 +182,10 @@ def build_vibeasr_bitnet_dense_weight_plan(
 ) -> StreamingWeightPlan:
     """Classify every source tensor for the staged dense-F32 conversion route.
 
-    The parent ASR module remains authoritative for HF-to-ONNX name alignment.
-    Marker tensors exercise that mapping without materializing any checkpoint
-    values; every non-decoder source must map to an exported initializer.
+    The parent ASR module remains authoritative for conversion into its 901
+    native inference tensors. Marker tensors exercise that mapping without
+    materializing checkpoint values; only this legacy BitNet source's 276
+    unused waveform-decoder tensors may be excluded.
     """
     import torch
 
